@@ -105,3 +105,12 @@ Finite fixture register: `tests/fixtures/metrics/golden/comparisons.json` covers
 The golden `(sourceSetId,path,sid)` uses the fixed fixture-only source set `source-set:v1:oracle-fixtures`. In the offline test, actual native extraction runs over a fresh admitted copy of these sources; the test first proves each emitted native `syntax_id` is the exact `IdentityRegistry::stable` digest of that captured source set, path, language, ancestor keys and declaration key. It then applies the **same native identity algorithm** to the stable fixture-only source-set label and verifies every committed sid and every selected metric against the actual native declaration and `metrics::compute` result. The fixture-only label is not a runtime index source set and is never sent to Store. Its purpose is to make the committed golden independent of the temporary checkout path without inventing a declaration or oracle byte span. Tests also require every actual emitted oracle function/space to appear exactly once in the register and reject any comparable emitted field left unregistered.
 
 Reason categories are finite: `anonymous` (no stable name tuple), `missing` (oracle name absent from native named callables), `lineMismatch` (name exists but physical-line boundaries differ), `ambiguous` (duplicate exact name+line candidates), and `granularityMismatch` (RCA sum includes nested spaces). The last two correlation boundary cases have dedicated synthetic negative tests, not false fixture claims. Every differing comparable cell has `ruleDivergence` and a stated explanation: branch grammar policies (switch/match heading versus arm and Boolean operators), cognitive depth/sequence/recursive-call policies, SLOC lexical/comment boundaries, Halstead token/body boundaries, explicit formal counts or implicit oracle exit counts. Rust `?` is zero here regardless of oracle policy. A missing or unbuilt oracle artifact cannot be fabricated as a measurement.
+
+## File area metadata
+
+Each per-file row also carries `physicalLines` (captured text's `str::lines().count()`)
+and `fileRole` (the stored synthetic root-module role), independent of metric role or
+aggregate. These come from the same indexed document as the callable metrics. Physical
+lines include blank/comment lines and inline test lines; zero is valid for an empty
+file. They are not summed callable LOC or physical production-only LOC. `roleCounts`
+keeps its original callable-population meaning. See [Treemap](treemap.md).

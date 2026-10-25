@@ -186,6 +186,7 @@ async function refreshStatus(followup = false) {
   if (browseChanged && nextPin) {
     void viewerMetrics?.refresh();
     if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
+    if (section === "diagrams" && !$("treemap-panel").hidden) void treemap?.refresh();
     await loadTreeRoot();
   }
   if (serial !== statusSerial || session !== epoch || status !== data) return;
@@ -546,7 +547,8 @@ $("refresh").addEventListener("click", () => perform(async () => {
       else { await selectFilesFile(file); if (basis === "working") await setFilesBasis("working"); }
     }
   }
-  if (section !== "files" && !$("architecture-panel").hidden) await architecture?.refresh();
+  if (section !== "files" && !$("treemap-panel").hidden) await treemap?.refresh();
+  else if (section !== "files" && !$("architecture-panel").hidden) await architecture?.refresh();
   else if (section !== "files" && selectedMethod) await loadSequence();
   schedulePoll();
 }, $("refresh")));
@@ -612,6 +614,7 @@ async function setSection(name) {
     target?.focus(); return;
   }
   architecture?.reset();
+  treemap?.reset();
   section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
   for (const state of fileStates.values()) if (state.outlineLoading) {
     state.serial++; state.outlineLoading = false; state.outlineError = "Symbol read interrupted. Retry to read this indexed outline.";
@@ -624,7 +627,8 @@ async function setSection(name) {
     renderFiles();
     const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
     const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
-    if (!$("architecture-panel").hidden) await architecture?.refresh();
+    if (!$("treemap-panel").hidden) await treemap?.refresh();
+    else if (!$("architecture-panel").hidden) await architecture?.refresh();
     else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
     if (cached && current()) paintCachedSource(cached.data, cached.range, current);
     return;
@@ -850,6 +854,7 @@ function clearBrowse(message = "Expand a file and select a method.") {
   clearFilesEvidence();
   window.TrellisClasses?.reset();
   architecture?.reset();
+  treemap?.reset();
   if ($("method-class")) $("method-class").disabled = true;
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
@@ -1111,19 +1116,33 @@ const viewerMetrics = window.TrellisMetrics?.create({
   onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
   onChange: () => renderFiles(),
 });
+const treemap = window.TrellisTreemap?.create({
+  request: (path, current) => api(path, "GET", undefined, current),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
+  readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
+  onConflict: () => unexpectedPair("Treemap snapshot changed. Refresh status before reopening Treemap."),
+  onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
+});
 const architecture = window.TrellisArchitecture?.create({
   request: (path, current) => api(path, "GET", undefined, current),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   onConflict: () => unexpectedPair("Architecture snapshot changed. Refresh status before reopening Architecture."),
+  openTreemap: (identity, pin) => {
+    if (!IndexPin.equal(pin, status?.revision)) return;
+    window.TrellisShell?.showView("treemap");
+    void treemap?.openFile(identity, pin);
+  },
   onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
 });
 window.TrellisShell?.setViewCallback?.(name => {
-  architecture?.clearInspection();
+  architecture?.clearInspection(); treemap?.clearInspection();
   if (name === "architecture" && section === "diagrams") void architecture?.refresh();
   else architecture?.reset();
+  if (name === "treemap" && section === "diagrams") void treemap?.refresh();
+  else treemap?.reset();
 });
-window.TrellisShell?.setInspectorClearCallback?.(() => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); });
+window.TrellisShell?.setInspectorClearCallback?.(() => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); treemap?.clearInspection(); });
 function metricDirectorySelection(path) {
   if (!treeRoot || !indexedWorkspace) return null;
   const absolute = `${treeRoot.replace(/\/$/, "")}${path ? "/" + path : ""}`;
@@ -1133,6 +1152,7 @@ function metricDirectorySelection(path) {
 }
 function inspectTreeSelection(selection) {
   architecture?.clearInspection();
+  treemap?.clearInspection();
   if (selection) void viewerMetrics?.inspect(selection);
   else viewerMetrics?.clearInspection();
 }
@@ -1622,6 +1642,7 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 function classLanguage(path) { return /\.(?:java|py)$/i.test(path || ""); }
 async function openClasses(options = {}) {
   architecture?.clearInspection();
+  treemap?.clearInspection();
   if (!token || !status || !window.TrellisClasses) return;
   viewerMetrics?.clearInspection();
   clearSource(); window.TrellisShell?.resetInspector();

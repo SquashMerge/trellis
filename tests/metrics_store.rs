@@ -665,6 +665,107 @@ fn source_only_memo_rebinds_native_calls_for_new_path_and_pin() {
 }
 
 #[test]
+fn file_metadata_uses_captured_physical_lines_and_stored_root_roles() {
+    use trellis::native_evidence::DeclarationRole;
+
+    const MIXED: &str = "fn production() {}\n\n// inline tests count toward physical area\n#[cfg(test)]\nmod tests { fn check() {} }\n";
+    let sources = [
+        ("src/empty.rs", "", 0, DeclarationRole::Production),
+        ("tests/empty.rs", "", 0, DeclarationRole::Test),
+        (
+            "src/no_final.rs",
+            "// comment",
+            1,
+            DeclarationRole::Production,
+        ),
+        (
+            "src/final.rs",
+            "// comment\n",
+            1,
+            DeclarationRole::Production,
+        ),
+        (
+            "src/blanks.rs",
+            "// comment\n\n",
+            2,
+            DeclarationRole::Production,
+        ),
+        (
+            "src/crlf.rs",
+            "// comment\r\n\r\n",
+            2,
+            DeclarationRole::Production,
+        ),
+        (
+            "src/no_callables.rs",
+            "const VALUE: usize = 1;\n",
+            1,
+            DeclarationRole::Production,
+        ),
+        ("src/stored_test.rs", "", 0, DeclarationRole::Test),
+        ("src/mixed.rs", MIXED, 5, DeclarationRole::Production),
+    ];
+    let indexed: Vec<_> = sources
+        .iter()
+        .map(|(path, text, _, _)| (*path, *text))
+        .collect();
+    let (state, root, store, pin) = fixture_with_sources(&indexed);
+    // A valid stored role is authoritative even when neither path nor callable
+    // population identifies a test file.
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute(
+        "UPDATE native_version_declarations SET role='test' WHERE kind='module' AND vid IN (SELECT vid FROM document_versions WHERE path='src/stored_test.rs')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    for (path, _, _, _) in &sources {
+        fs::write(
+            root.path().join(path),
+            "// changed checkout\n// not indexed\n",
+        )
+        .unwrap();
+    }
+    let response = store.evidence_response().unwrap();
+    for role in ["all", "production", "test"] {
+        let payload = response
+            .metrics_at(
+                &MetricsOptions {
+                    pin: Some(pin),
+                    role: role.into(),
+                    metrics: vec!["cognitive".into()],
+                    ..Default::default()
+                },
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(payload.index_generation, pin.index_generation.to_string());
+        assert_eq!(payload.index_revision, pin.index_revision);
+        assert_eq!(payload.files.len(), sources.len());
+        for (path, _, lines, file_role) in &sources {
+            let row = payload.files.iter().find(|row| row.path == *path).unwrap();
+            assert_eq!(row.physical_lines, *lines, "{role}: {path}");
+            assert_eq!(row.file_role, *file_role, "{role}: {path}");
+            let serialized = serde_json::to_value(row).unwrap();
+            assert_eq!(serialized["physicalLines"], *lines);
+            assert_eq!(
+                serialized["fileRole"],
+                serde_json::to_value(file_role).unwrap()
+            );
+            if *path == "src/mixed.rs" {
+                assert_eq!((row.role_counts.production, row.role_counts.test), (1, 1));
+                assert_eq!(row.declaration_count, if role == "all" { 2 } else { 1 });
+            } else {
+                assert_eq!((row.role_counts.production, row.role_counts.test), (0, 0));
+                assert_eq!(row.declaration_count, 0);
+                assert!(row.metrics["cognitive"].is_null());
+            }
+        }
+    }
+    response.finish(()).unwrap();
+}
+
+#[test]
 fn role_selection_folds_raw_callables_at_one_pin_and_preserves_empty_files() {
     use trellis::native_evidence::DeclarationRole;
 
@@ -752,6 +853,8 @@ fn role_selection_folds_raw_callables_at_one_pin_and_preserves_empty_files() {
             assert_eq!(measured.files[0].declaration_count, mixed_count);
             assert_eq!(measured.files[0].role_counts.production, 2);
             assert_eq!(measured.files[0].role_counts.test, 1);
+            assert_eq!(measured.files[0].physical_lines, SOURCE.lines().count());
+            assert_eq!(measured.files[0].file_role, DeclarationRole::Production);
             let serialized = serde_json::to_value(&measured).unwrap();
             assert_eq!(serialized["role"], role);
             assert_eq!(
@@ -922,6 +1025,7 @@ fn stored_roles_cover_four_languages_and_warm_source_memo_is_role_independent() 
         let production = response.metrics_at(&selected, &mut || Ok(())).unwrap();
         assert_eq!(production.declarations.len(), 1, "{language}");
         assert_eq!(production.declarations[0].role, DeclarationRole::Production);
+        assert_eq!(production.files[0].file_role, DeclarationRole::Production);
         let memo_entries = store.metrics_memo_entries_for_tests();
         selected.path = Some(format!("tests/{name}"));
         let tests = response.metrics_at(&selected, &mut || Ok(())).unwrap();
@@ -932,6 +1036,11 @@ fn stored_roles_cover_four_languages_and_warm_source_memo_is_role_independent() 
         );
         assert_eq!(tests.declarations.len(), 1, "{language}");
         assert_eq!(tests.declarations[0].role, DeclarationRole::Test);
+        assert_eq!(tests.files[0].file_role, DeclarationRole::Test);
+        assert_eq!(
+            tests.files[0].physical_lines,
+            production.files[0].physical_lines
+        );
         assert_eq!(
             tests.top_cognitive.as_ref().unwrap()[0].role,
             DeclarationRole::Test
@@ -978,6 +1087,35 @@ fn metrics_role_selection_is_closed_and_defaults_to_all() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn missing_stored_file_module_is_typed_corruption_for_an_empty_file() {
+    let (state, _root, store, pin) = fixture_with_sources(&[("tests/empty.rs", "")]);
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute(
+        "UPDATE native_version_declarations SET kind='class' WHERE kind='module'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let response = store.evidence_response().unwrap();
+    let error = response
+        .metrics_at(
+            &MetricsOptions {
+                pin: Some(pin),
+                role: "production".into(),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("metrics file module"),
+        "{error:#}"
+    );
+    assert!(store.recovery_pending_for_tests());
+    assert!(response.finish(()).is_err());
 }
 
 #[test]

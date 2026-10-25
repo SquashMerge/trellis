@@ -1238,6 +1238,14 @@ async fn pele_assets_are_local_and_keep_csp() {
             "/vendor/pele-1.10.0-trellis.2.js",
             include_bytes!("../web/vendor/pele-1.10.0-trellis.2.js").as_slice(),
         ),
+        (
+            "/treemap.js",
+            include_bytes!("../web/treemap.js").as_slice(),
+        ),
+        (
+            "/treemap-pele.js",
+            include_bytes!("../web/treemap-pele.js").as_slice(),
+        ),
     ] {
         let req = Request::builder()
             .uri(route)

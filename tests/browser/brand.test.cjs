@@ -110,7 +110,7 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     });
     await H.connect(page,server,paths.token);
     const tabs=page.getByRole("tablist",{name:"Workspace views"}).getByRole("tab");
-    assert.deepEqual(await tabs.allTextContents(),["Architecture","Sequence","Classes","Libraries"]);
+    assert.deepEqual(await tabs.allTextContents(),["Architecture","Treemap","Sequence","Classes","Libraries"]);
     async function activeTab(name) {
       const tab=tabs.filter({hasText:new RegExp(`^${name}$`)});
       assert.equal(await tab.getAttribute("aria-selected"),"true");
@@ -119,14 +119,16 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
       const panel=page.locator(`#${await tab.getAttribute("aria-controls")}`);
       assert.equal(await panel.isVisible(),true);
       assert.equal(await panel.getAttribute("aria-labelledby"),await tab.getAttribute("id"));
-      assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.getAttribute("aria-selected")==="false").length),3);
+      assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.getAttribute("aria-selected")==="false").length),4);
       assert.equal(await tabs.evaluateAll(nodes=>nodes.filter(node=>node.tabIndex===0).length),1);
     }
     await page.locator("#view-sequence").focus();
     await page.keyboard.press("ArrowRight");await activeTab("Classes");
     await page.keyboard.press("ArrowRight");await activeTab("Libraries");
     await page.keyboard.press("ArrowRight");await activeTab("Architecture");
+    await page.keyboard.press("ArrowRight");await activeTab("Treemap");
     await page.keyboard.press("ArrowRight");await activeTab("Sequence");
+    await page.keyboard.press("ArrowLeft");await activeTab("Treemap");
     await page.keyboard.press("ArrowLeft");await activeTab("Architecture");
     await page.keyboard.press("ArrowLeft");await activeTab("Libraries");
     await page.keyboard.press("Home");await activeTab("Architecture");

@@ -90,6 +90,16 @@ async fn fixture_with_identity(
         )
         .unwrap();
         fs::create_dir(root.join("tests")).unwrap();
+        for (path, text) in [
+            ("tests/empty.rs", ""),
+            ("no_final.rs", "// comment"),
+            ("final.rs", "// comment\n"),
+            ("crlf.rs", "// comment\r\n\r\n"),
+            ("no_callables.rs", "const VALUE: usize = 1;\n"),
+            ("empty.rs", ""),
+        ] {
+            fs::write(root.join(path), text).unwrap();
+        }
         fs::write(
             root.join("tests/check.js"),
             "function check() { return 1; }\n",
@@ -195,6 +205,8 @@ async fn selected_metrics_roles_share_one_pin_and_filter_every_projection() {
             assert_eq!(selected["indexGeneration"], generation);
             assert_eq!(selected["indexRevision"], revision);
             assert_eq!(selected["files"][0]["declarationCount"], count);
+            assert_eq!(selected["files"][0]["physicalLines"], 5);
+            assert_eq!(selected["files"][0]["fileRole"], "production");
             assert_eq!(
                 selected["files"][0]["roleCounts"],
                 serde_json::json!({"production":2,"test":1})
@@ -269,6 +281,8 @@ async fn selected_metrics_roles_share_one_pin_and_filter_every_projection() {
     )).await;
     assert_eq!(status, StatusCode::OK, "{empty}");
     assert_eq!(empty["payload"]["files"][0]["declarationCount"], 0);
+    assert_eq!(empty["payload"]["files"][0]["physicalLines"], 1);
+    assert_eq!(empty["payload"]["files"][0]["fileRole"], "test");
     assert_eq!(
         empty["payload"]["files"][0]["roleCounts"],
         serde_json::json!({"production":0,"test":1})
@@ -285,6 +299,53 @@ async fn selected_metrics_roles_share_one_pin_and_filter_every_projection() {
         let (status, error) = request(app.clone(), &key, query).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {error}");
         assert_eq!(error["error"]["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn selected_metrics_file_metadata_preserves_zero_area_and_no_callable_roles() {
+    let (_base, _runtime, browser, key) =
+        fixture_with_identity(None, true, false, false, true).await;
+    let app = browser.router();
+    let (status, response) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let payload = &response["payload"];
+    assert_eq!(payload["role"], "all");
+    let generation = payload["indexGeneration"].as_str().unwrap();
+    let revision = payload["indexRevision"].as_u64().unwrap();
+    let source = payload["files"][0]["sourceSetId"].as_str().unwrap();
+    for (path, physical_lines, file_role) in [
+        ("empty.rs", 0, "production"),
+        ("tests/empty.rs", 0, "test"),
+        ("no_final.rs", 1, "production"),
+        ("final.rs", 1, "production"),
+        ("crlf.rs", 2, "production"),
+        ("no_callables.rs", 1, "production"),
+    ] {
+        let expected = payload["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == path)
+            .unwrap();
+        assert_eq!(expected["physicalLines"], physical_lines, "{path}");
+        assert_eq!(expected["fileRole"], file_role, "{path}");
+        assert_eq!(
+            expected["roleCounts"],
+            serde_json::json!({"production": 0, "test": 0})
+        );
+        assert_eq!(expected["declarationCount"], 0);
+        assert!(expected["metrics"]["cognitive"].is_null());
+        for role in ["all", "production", "test"] {
+            let query = format!(
+                "?scope=file&sourceSetId={source}&language=rust&path={path}&role={role}&indexGeneration={generation}&indexRevision={revision}"
+            );
+            let (status, selected) = request(app.clone(), &key, &query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {selected}");
+            assert_eq!(selected["payload"]["indexGeneration"], generation);
+            assert_eq!(selected["payload"]["indexRevision"], revision);
+            assert_eq!(selected["payload"]["files"][0], *expected);
+        }
     }
 }
 

@@ -133,3 +133,14 @@ binary and use the same external `PLAYWRIGHT_BROWSERS_PATH`, then run:
 ```sh
 node --test --test-concurrency=1 tests/browser/architecture.test.cjs
 ```
+
+## Treemap acceptance
+
+`treemap.test.cjs` drives the real daemon, indexed per-file line/role/metric response
+and exact vendored Pele under the product CSP. It covers independent heat and
+test-file controls, native tile/file-list selection, directory navigation, empty
+files, pinned source, Architecture entry and stale async actions. Run after normal
+provisioning/build with `TRELLIS_SUITE_BINARY` and `PLAYWRIGHT_BROWSERS_PATH`. It is
+also part of `./tools/verify`. Area is physical file lines, including inline test
+lines, not callable-range LOC. Native adapter admission/mutation tests run in
+`tests/treemap-pele.test.cjs`.

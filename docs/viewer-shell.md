@@ -85,3 +85,12 @@ mutually exclusive drawers. Files source is primary, not an Escape-dismissable s
 Source navigation retains its shared keyboard/menu behavior; Git diff rows never become indexed
 navigation targets. All repository text is written with `textContent` under the existing CSP and
 local assets. Existing authentication, Host/Origin checks and token behavior remain unchanged.
+
+## Treemap
+
+The [Treemap tab](treemap.md) shows nested indexed folders and files with physical-line
+area, explicitly labelled “includes inline test lines”. Cognitive/max production heat
+is the default. Hide test files is independent of Include tests in metrics. The
+revision-bound inspector and explicit indexed-source action share the desktop panel
+and mobile drawer with the other views. Tiny and empty files remain in an equivalent
+keyboard file list. Architecture can open an exact file at the same full pin.
