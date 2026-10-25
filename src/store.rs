@@ -1217,6 +1217,172 @@ fn trace_metrics_resident(documents: usize, bytes: u64) {
 }
 
 impl EvidenceResponse {
+    /// Materialize one captured-source architecture view in this admitted snapshot.
+    pub fn architecture_response(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        ensure!(
+            matches!(kind, "references" | "check" | "explain" | "prompt"),
+            "invalid_request"
+        );
+        let pin = arguments
+            .get("expectedBasis")
+            .map(|value| {
+                serde_json::from_value::<IndexPin>(value.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid_request: expectedBasis"))
+            })
+            .transpose()?;
+        let paths: Vec<String> = arguments
+            .get("paths")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid_request: paths"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            paths
+                .iter()
+                .all(|path| crate::references::valid_path_glob(path)),
+            "invalid_request: paths"
+        );
+        let sample_limit = arguments
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|limit| (1..=50).contains(limit))
+                    .map(|limit| limit as usize)
+                    .ok_or_else(|| anyhow::anyhow!("invalid_request: limit"))
+            })
+            .transpose()?
+            .unwrap_or(5);
+        check()?;
+        let config = if kind == "references" {
+            None
+        } else {
+            crate::rules::load(Path::new(self.store.workspace_root()))?
+        };
+        if matches!(kind, "check" | "explain") && config.is_none() {
+            anyhow::bail!("rules_not_found");
+        }
+        let snapshot = self
+            .architecture_snapshot(pin, check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let references = crate::references::project(&snapshot, &paths, sample_limit, check)?;
+        let mut payload = match kind {
+            "references" => references.data,
+            "prompt" => serde_json::json!({
+                "rulesText": config.as_ref().map(|config| &config.text),
+                "rulesFile": config.as_ref().map(crate::rules::descriptor),
+                "references": references.data,
+            }),
+            "check" | "explain" => {
+                let config = config.as_ref().expect("checked rules presence");
+                let result = crate::rules::evaluate(config, &snapshot, &references, &paths, check)?;
+                if kind == "explain" {
+                    crate::rules::explain(
+                        result,
+                        arguments["rule"]
+                            .as_str()
+                            .context("invalid_request: rule")?,
+                        arguments.get("target").context("invalid_request: target")?,
+                        arguments.get("destination"),
+                    )?
+                } else {
+                    result
+                }
+            }
+            _ => unreachable!(),
+        };
+        payload["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
+        payload["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
+        check()?;
+        Ok(payload)
+    }
+
+    /// Read each selected native document once; never reopen source from the checkout.
+    fn architecture_snapshot(
+        &self,
+        pin: Option<IndexPin>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<crate::references::Snapshot> {
+        use crate::native_evidence::DocumentKey;
+        check()?;
+        let selected = self.store.read_revision_for(&self.db, pin, true)?;
+        let mut statement = self.db.prepare(
+            "SELECT r.source_set_id,m.language,m.path FROM revision_documents m
+             JOIN native_revisions r ON r.id=m.revision_id
+             WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
+        )?;
+        let mut cursor = statement.query([&selected.key])?;
+        let mut documents = Vec::new();
+        let mut source_bytes = 0u64;
+        let mut stored_bytes = 0u64;
+        while let Some(row) = cursor.next()? {
+            check()?;
+            ensure!(
+                documents.len() < 100_000,
+                "bounded_work: architecture documents"
+            );
+            let key = DocumentKey {
+                source_set_id: row.get(0)?,
+                language: row.get(1)?,
+                path: row.get(2)?,
+            };
+            let progress_failure = Mutex::new(None);
+            let check = Mutex::new(&mut *check);
+            let expired = || match (*check.lock().unwrap())() {
+                Ok(()) => false,
+                Err(error) => {
+                    *progress_failure.lock().unwrap() = Some(error);
+                    true
+                }
+            };
+            let header =
+                self.store
+                    .fetch_selected_header(&self.db, &key.path, &selected, Some(&expired));
+            if let Some(error) = progress_failure.lock().unwrap().take() {
+                return Err(error);
+            }
+            let header = header?;
+            source_bytes = source_bytes.saturating_add(header.bytes.max(0) as u64);
+            stored_bytes = stored_bytes.saturating_add(header.stored_bytes);
+            ensure!(
+                header.bytes <= 2 * 1024 * 1024
+                    && source_bytes <= 256 * 1024 * 1024
+                    && stored_bytes <= 512 * 1024 * 1024,
+                "bounded_work: architecture source"
+            );
+            let fetched =
+                self.store
+                    .fetch_selected_rows(&self.db, header, &selected, Some(&expired));
+            if let Some(error) = progress_failure.lock().unwrap().take() {
+                return Err(error);
+            }
+            let fetched = fetched?;
+            drop(check);
+            selected_ensure!(
+                fetched.file.language == key.language,
+                "incompatible_index: architecture language mismatch"
+            );
+            documents.push(crate::references::DocumentInput {
+                key,
+                file: fetched.file,
+                declarations: fetched.declarations,
+                calls: fetched.calls,
+            });
+        }
+        check()?;
+        Ok(crate::references::Snapshot {
+            pin: selected.pin,
+            documents,
+        })
+    }
+
     /// Compute metrics from one selected revision in this response's read transaction.
     pub fn metrics_at(
         &self,

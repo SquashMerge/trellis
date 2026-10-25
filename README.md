@@ -71,9 +71,9 @@ same portable MCP tools. The local `trellis mcp` stdio protocol layer is shipped
 ACP sessions and embedded terminals are **not implemented yet**. The authenticated browser
 `serve` daemon remains separate.
 
-Run `trellis mcp --workspace <path>` for the local, read-only stdio daemon client. Its five tools,
+Run `trellis mcp --workspace <path>` for the local, read-only stdio daemon client. The original six tools,
 in order, are `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_declaration`,
-`trellis_outgoing_calls` and `trellis_read_source`. The daemon serves evidence from one selected,
+`trellis_outgoing_calls`, `trellis_incoming_calls` and `trellis_read_source`. The daemon serves evidence from one selected,
 validated cached snapshot; before a valid head is ready, evidence tools return typed
 `index_not_ready`, while describe can report not-ready status. Declaration takes a `symbolId` with
 no `limit` or `view`; outgoing calls takes a `symbolId` and optional `limit`, with no `view`.
@@ -86,6 +86,13 @@ schema-valid result is in `structuredContent`. MCP does not execute repository c
 on-demand indexing, enroll grants, expose an HTTP listener or accept authenticated MCP intake.
 See the [MCP contract](docs/mcp-readonly-pilot-contract.md) for limits and schemas. Run the native
 protocol fixtures with `cargo test --locked --test mcp_protocol`.
+
+[Reviewed architecture rules](docs/rules.md) adds three read-only MCP tools
+(`trellis_references`, `trellis_rules_check`, `trellis_rules_explain`), the no-argument
+`trellis_propose_layers` proposal prompt, and CLI JSON references/rules checks.
+Code evidence remains pinned and cached; only the fixed `.trellis/rules.toml` is
+read as current configuration with its own digest. Proposals are diffs for human
+review, never server-applied changes.
 
 The daemon already watches and refreshes native evidence. Snapshot text search, versioned diagram
 artifacts, the unified terminal workbench and a browser project picker remain separate work.

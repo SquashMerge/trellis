@@ -15,6 +15,7 @@ pub enum Action {
     Discover,
     Initialize,
     List,
+    PromptList,
     Call {
         name: String,
         arguments: Option<Value>,
@@ -175,6 +176,36 @@ impl Session {
             {
                 Action::List
             }
+            "prompts/list" if modern && obj.is_some_and(|p| only(p, &["_meta"])) => {
+                Action::PromptList
+            }
+            "prompts/list"
+                if !modern
+                    && params.is_none_or(|p| p.as_object().is_some_and(|o| o.is_empty())) =>
+            {
+                Action::PromptList
+            }
+            "prompts/get" => {
+                let p = obj.ok_or_else(|| bad(-32602))?;
+                let allowed = if modern {
+                    &["name", "arguments", "_meta"][..]
+                } else {
+                    &["name", "arguments"][..]
+                };
+                if !only(p, allowed)
+                    || p.get("name").and_then(Value::as_str)
+                        != Some(super::architecture::PROMPT_NAME)
+                    || !p
+                        .get("arguments")
+                        .is_none_or(|value| value.as_object().is_some_and(|args| args.is_empty()))
+                {
+                    return Err(bad(-32602));
+                }
+                Action::Call {
+                    name: super::architecture::PROMPT_NAME.to_owned(),
+                    arguments: Some(json!({"schemaVersion":1})),
+                }
+            }
             "tools/call" => {
                 let p = obj.ok_or_else(|| bad(-32602))?;
                 let allowed = if modern {
@@ -197,7 +228,7 @@ impl Session {
                     arguments: p.get("arguments").cloned(),
                 }
             }
-            "server/discover" | "tools/list" => return Err(bad(-32602)),
+            "server/discover" | "tools/list" | "prompts/list" => return Err(bad(-32602)),
             _ => Action::Unknown,
         };
         Ok((mode, action))
@@ -810,5 +841,74 @@ mod tests {
             -32602,
             json!(2),
         );
+    }
+    #[test]
+    fn prompt_admission_both_modes_is_closed_and_cancellable() {
+        for modern in [false, true] {
+            let mut session = Session::new();
+            if !modern {
+                session.mode = Mode::LegacyReady;
+            }
+            let make = |id: i64, method: &str, mut params: Value| {
+                if modern {
+                    params["_meta"] = json!({
+                    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}});
+                }
+                let bytes = serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+                )
+                .unwrap();
+                wire::decode(wire::Frame::Line(bytes)).unwrap().unwrap()
+            };
+            let list = admitted(session.accept(make(1, "prompts/list", json!({})), |_| false));
+            assert!(matches!(list.action, Action::PromptList));
+            for (id, params) in [
+                (2, json!({"name":"unknown"})),
+                (
+                    3,
+                    json!({"name":super::super::architecture::PROMPT_NAME,"arguments":{"scope":"src"}}),
+                ),
+                (
+                    4,
+                    json!({"name":super::super::architecture::PROMPT_NAME,"arguments":null}),
+                ),
+                (
+                    5,
+                    json!({"name":super::super::architecture::PROMPT_NAME,"extra":true}),
+                ),
+            ] {
+                rejected(
+                    session.accept(make(id, "prompts/get", params), |_| false),
+                    -32602,
+                    json!(id),
+                );
+            }
+            let get = admitted(session.accept(
+                make(
+                    6,
+                    "prompts/get",
+                    json!({"name":super::super::architecture::PROMPT_NAME,"arguments":{}}),
+                ),
+                |_| false,
+            ));
+            assert!(
+                matches!(get.action, Action::Call { ref name, .. } if name == super::super::architecture::PROMPT_NAME)
+            );
+            session.cancel(&json!(6));
+            assert!(session.prepare(get.token, json!({})).is_none());
+            rejected(
+                session.accept(
+                    make(
+                        7,
+                        "tools/call",
+                        json!({"name":super::super::architecture::PROMPT_NAME,"arguments":{}}),
+                    ),
+                    super::super::catalog::known,
+                ),
+                -32602,
+                json!(7),
+            );
+        }
     }
 }

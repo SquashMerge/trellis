@@ -1974,6 +1974,7 @@ dependencies = [
  "clap",
  "directories",
  "git2",
+ "globset",
  "hex",
  "http-body-util",
  "icu_normalizer",

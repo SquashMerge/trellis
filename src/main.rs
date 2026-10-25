@@ -46,6 +46,10 @@ enum Command {
     Symbols(SymbolsArgs),
     /// Compute pinned source complexity metrics without writing the index.
     Metrics(MetricsArgs),
+    /// Check reviewed architecture rules against captured source.
+    Rules(RulesArgs),
+    /// Show captured structural file-module references, not resolved call edges.
+    References(ReferencesArgs),
     /// Query a bounded static call view. This is not a runtime sequence.
     Query(QueryArgs),
     /// Inspect existing derived indexes without changing them.
@@ -67,6 +71,39 @@ struct NativeCaptureArgs {
     source_set: Option<String>,
     #[arg(long)]
     revision: Option<String>,
+}
+#[derive(Args)]
+struct RulesArgs {
+    #[command(subcommand)]
+    command: RulesCommand,
+}
+#[derive(Subcommand)]
+enum RulesCommand {
+    Check(RulesCheckArgs),
+}
+#[derive(Args)]
+struct RulesCheckArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long, default_value = "json", value_parser = ["json"])]
+    format: String,
+    /// Full index generation:revision pair; omitted means the admitted head.
+    #[arg(long)]
+    pin: Option<String>,
+    /// Source path glob; target evidence is not restricted.
+    #[arg(long = "path")]
+    paths: Vec<String>,
+}
+#[derive(Args)]
+struct ReferencesArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long)]
+    pin: Option<String>,
+    #[arg(long = "path")]
+    paths: Vec<String>,
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
 }
 #[derive(Args)]
 struct GitReadArgs {
@@ -254,7 +291,9 @@ async fn main() -> Result<()> {
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
-        | Command::Metrics(_)) => dispatch_cli(&command)?,
+        | Command::Metrics(_)
+        | Command::Rules(_)
+        | Command::References(_)) => dispatch_cli(&command)?,
     }
     Ok(())
 }
@@ -588,6 +627,20 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
 fn dispatch_cli(command: &Command) -> Result<()> {
     let (operation, workspace, mut payload, read_only) = match command {
         Command::Status(args) => ("status", args, serde_json::json!({}), true),
+        Command::Rules(RulesArgs {
+            command: RulesCommand::Check(args),
+        }) => (
+            "rules_check",
+            &args.workspace,
+            architecture_cli_arguments(args.pin.as_deref(), &args.paths, None)?,
+            true,
+        ),
+        Command::References(args) => (
+            "references",
+            &args.workspace,
+            architecture_cli_arguments(args.pin.as_deref(), &args.paths, Some(args.limit))?,
+            true,
+        ),
         Command::Symbols(args) => {
             ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
             (
@@ -778,7 +831,47 @@ fn dispatch_cli(command: &Command) -> Result<()> {
     } else {
         print_json(&value)?;
     }
+    if matches!(command, Command::Rules(_) | Command::References(_)) && value.get("error").is_some()
+    {
+        anyhow::bail!("architecture evaluation failed");
+    }
+    if matches!(command, Command::Rules(_))
+        && value["payload"]["counts"]["deviates"].as_u64().unwrap_or(0) > 0
+    {
+        anyhow::bail!("architecture deviations");
+    }
     Ok(())
+}
+
+fn architecture_cli_arguments(
+    pin: Option<&str>,
+    paths: &[String],
+    limit: Option<usize>,
+) -> Result<serde_json::Value> {
+    let mut arguments = serde_json::json!({"paths":paths});
+    if let Some(limit) = limit {
+        ensure!(
+            (1..=50).contains(&limit),
+            "invalid_argument: limit must be 1..50"
+        );
+        arguments["limit"] = serde_json::json!(limit);
+    }
+    if let Some(pin) = pin {
+        let (generation, revision) = pin
+            .rsplit_once(':')
+            .context("invalid_argument: pin requires generation:revision")?;
+        ensure!(
+            !revision.is_empty() && revision.bytes().all(|b| b.is_ascii_digit()),
+            "invalid_argument: revision"
+        );
+        let pin: trellis::model::IndexPin = serde_json::from_value(serde_json::json!({
+            "indexGeneration":generation,
+            "indexRevision":revision.parse::<u64>().context("invalid_argument: revision")?,
+        }))
+        .context("invalid_argument: pin")?;
+        arguments["expectedBasis"] = serde_json::to_value(pin)?;
+    }
+    Ok(arguments)
 }
 
 async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
@@ -1278,7 +1371,7 @@ fn dispatch_connection(
     let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
     let read_scope = matches!(
         request.operation.as_str(),
-        "status" | "symbols" | "query" | "metrics"
+        "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
     );
     let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
@@ -1329,7 +1422,7 @@ fn dispatch_connection(
         ensure!(
             matches!(
                 request.operation.as_str(),
-                "status" | "symbols" | "query" | "index" | "metrics"
+                "status" | "symbols" | "query" | "index" | "metrics" | "rules_check" | "references"
             ),
             "unknown daemon operation"
         );
@@ -1393,6 +1486,39 @@ fn dispatch_connection(
                         .context("missing includeCallbacks")?,
                     exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
                 }),
+                "rules_check" | "references" => (|| {
+                    let (response, catching_up) = checkout.evidence_response()?;
+                    let kind = if request.operation == "references" {
+                        "references"
+                    } else {
+                        "check"
+                    };
+                    let mut check = || {
+                        ensure!(Instant::now() < request_deadline, "deadline_exceeded");
+                        Ok(())
+                    };
+                    let result = response.architecture_response(kind, args, &mut check);
+                    match result {
+                        Ok(payload) => {
+                            check()?;
+                            let value =
+                                serde_json::json!({"catchingUp":catching_up,"payload":payload});
+                            ensure!(
+                                serde_json::to_vec(&value)?.len() <= 64 * 1024 * 1024,
+                                "response_too_large"
+                            );
+                            check()?;
+                            response.finish(value)
+                        }
+                        Err(error) => {
+                            if let Some(diagnostic) = trellis::rules::diagnostic(&error) {
+                                response.finish(serde_json::json!({"catchingUp":catching_up,"error":diagnostic}))
+                            } else {
+                                Err(error)
+                            }
+                        }
+                    }
+                })(),
                 "metrics" => {
                     let options = metrics_options.as_ref().expect("metrics options validated");
                     let mut before_work = || {
@@ -1536,6 +1662,15 @@ fn dispatch_connection(
                     .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
+                #[cfg(all(feature = "test-support", unix))]
+                if let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET") {
+                    use std::io::Write;
+                    let mut signal = std::os::unix::net::UnixStream::connect(path)
+                        .expect("connect CLI startup read fixture");
+                    signal
+                        .write_all(b"W")
+                        .expect("report CLI startup read wait");
+                }
                 // Wait for startup reconciliation to progress, not a poll (#138
                 // item 16).
                 checkout.wait_state_change(

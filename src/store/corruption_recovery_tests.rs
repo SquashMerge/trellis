@@ -10,6 +10,7 @@ enum ReaderFamily {
     Navigation,
     Metrics,
     Files,
+    Architecture,
 }
 
 impl ReaderFamily {
@@ -50,6 +51,17 @@ impl ReaderFamily {
                 assert_eq!(page["items"].as_array().unwrap().len(), 1);
                 assert_eq!(page["items"][0]["path"], "f0.js");
             }
+            Self::Architecture => {
+                let response = store.evidence_response()?;
+                let result = response.architecture_response(
+                    "references",
+                    &serde_json::json!({"expectedBasis":pin}),
+                    &mut || Ok(()),
+                )?;
+                let result = response.finish(result)?;
+                assert_eq!(result["indexRevision"], pin.index_revision);
+                assert_eq!(result["modules"].as_array().unwrap().len(), 1);
+            }
         }
         Ok(())
     }
@@ -69,6 +81,9 @@ impl ReaderFamily {
             // The metrics manifest enumeration reads this before fetching a document.
             Self::Metrics => "UPDATE revision_documents SET language=x'ff'",
             Self::Files => "UPDATE revision_documents SET gid=-1",
+            Self::Architecture => {
+                "UPDATE native_version_declarations SET role='invalid' WHERE name='f0'"
+            }
         };
         assert_eq!(db.execute(sql, []).unwrap(), 1, "{self:?}");
     }
@@ -99,6 +114,7 @@ fn row_corruption_in_each_reader_family_reindexes_and_restores_reads() {
         ReaderFamily::Navigation,
         ReaderFamily::Metrics,
         ReaderFamily::Files,
+        ReaderFamily::Architecture,
     ] {
         let (_state, root, store) = published_store(1);
         let pin = store.status().unwrap().revision;
