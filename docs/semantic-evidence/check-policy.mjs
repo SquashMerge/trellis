@@ -352,7 +352,7 @@ const HARDWARE_SHAPE = {
     os: {name: nonEmpty, version: nonEmpty, build: nonEmpty},
     rustVersion: nonEmpty, cargoVersion: nonEmpty, nodeVersion: nonEmpty,
   },
-  semanticProducers: list(pin("executableHash"), "name"),
+  semanticProducers: list({...pin("executableHash"), positionEncoding: optional(text(/^(utf8|utf16|unicodeScalar)$/))}, "name"),
   // Decision 0017: each corpus PR that pins a toolchain adds its toolchains[] entry.
   toolchains: optional(list(pin("toolchainHash"), "name")),
   qualification: {producerInventoryComplete: flag, readyForAuthoritativeBaseline: flag, benchmarkEvidence: null, passingBenchmarkClaim: false},
@@ -406,6 +406,13 @@ function parseStrict(bytes, file) {
 function checkDocument(bytes, file) {
   const value = parseStrict(bytes, file);
   validateExact(value, SCHEMAS[file], `${file}:$`);
+  if (file === HARDWARE) {
+    for (const [index, producer] of value.semanticProducers.entries()) {
+      if (["scip-java", "scip-typescript", "scip-python", "rust-analyzer"].includes(producer.name) &&
+          !own(producer, "positionEncoding"))
+        fail(`${file}:$.semanticProducers[${index}].positionEncoding`, "missing field");
+    }
+  }
   return value;
 }
 function crossFileTests(documents) {
@@ -519,6 +526,11 @@ function selfTest(documents) {
           const document = structuredClone(base);
           delete document[key];
           assert.doesNotThrow(() => checkDocument(buffer(document), HARDWARE), `optional ${key}`);
+        } else if (key === "positionEncoding" && route[0] === "semanticProducers" &&
+                   !["scip-java", "scip-typescript", "scip-python", "rust-analyzer"].includes(value.name)) {
+          const document = structuredClone(base);
+          delete at(document)[key];
+          assert.doesNotThrow(() => checkDocument(buffer(document), HARDWARE), `optional ${label}.${key}`);
         } else {
           hardwareMutation(base, `${label} missing ${key}`, (document) => { delete at(document)[key]; });
         }
@@ -567,7 +579,7 @@ function selfTest(documents) {
   function hardwareRepinTests(profile) {
     const repinned = structuredClone(profile);
     const taken = repinned.semanticProducers.map((producer) => producer.name);
-    repinned.semanticProducers.push(entry(freshName(taken, "scip-go"), "executableHash", `sha256:${hex}`));
+    repinned.semanticProducers.push({...entry(freshName(taken, "scip-go"), "executableHash", `sha256:${hex}`), positionEncoding: "unicodeScalar"});
     repinned.semanticProducers[0].version += "-repin";
     repinned.semanticProducers[0].executableHash = otherHex(repinned.semanticProducers[0].executableHash);
     repinned.toolchains = [entry("node-test", "toolchainHash", `sha512-${"A".repeat(86)}==`)];
@@ -578,13 +590,21 @@ function selfTest(documents) {
   function hardwareFieldTests(profile) {
     // Fixed synthetic inventories give known positions and names that cannot collide.
     const fixture = structuredClone(profile);
-    fixture.semanticProducers = [entry("producer-a", "executableHash", `sha256:${hex}`),
-      entry("producer-b", "executableHash", `sha512-${"A".repeat(86)}==`), entry("producer-c", "executableHash", `sha256:${hex}`)];
+    fixture.semanticProducers = [
+      {...entry("producer-a", "executableHash", `sha256:${hex}`), positionEncoding: "utf8"},
+      {...entry("producer-b", "executableHash", `sha512-${"A".repeat(86)}==`), positionEncoding: "utf16"},
+      {...entry("producer-c", "executableHash", `sha256:${hex}`), positionEncoding: "unicodeScalar"},
+    ];
     fixture.toolchains = [entry("toolchain-a", "toolchainHash", `sha256:${hex}`)];
     assert.doesNotThrow(() => checkDocument(buffer(fixture), HARDWARE), "synthetic fixture");
     const shape = (label, pattern, change) => hardwareMutation(fixture, label, change, pattern);
     shape("unknown producer field", /semanticProducers\[0\]\.extra: unknown field/, (d) => { d.semanticProducers[0].extra = "x"; });
     shape("unknown top-level field", /\$\.extra: unknown field/, (d) => { d.extra = {}; });
+    shape("missing encoding", /semanticProducers\[1\]\.positionEncoding: missing field/, (d) => {
+      d.semanticProducers[1].name = "scip-java";
+      delete d.semanticProducers[1].positionEncoding;
+    });
+    shape("invalid encoding", /semanticProducers\[1\]\.positionEncoding: invalid format/, (d) => { d.semanticProducers[1].positionEncoding = "utf32"; });
     shape("missing digest", /semanticProducers\[1\]\.artifactDigest: missing field/, (d) => { delete d.semanticProducers[1].artifactDigest; });
     shape("missing toolchain hash", /toolchains\[0\]\.toolchainHash: missing field/, (d) => { delete d.toolchains[0].toolchainHash; });
     shape("missing observed field", /observed\.rustVersion: missing field/, (d) => { delete d.observed.rustVersion; });
@@ -640,14 +660,14 @@ function selfTest(documents) {
   hardwareTests("regrouped CPU", variant((p) => { p.observed.cpuCores = 18; p.observed.cpuCoreGroups = [7, 11]; }));
   hardwareTests("added scip-go", variant((p) => {
     p.semanticProducers = p.semanticProducers.filter((producer) => producer.name !== "scip-go");
-    p.semanticProducers.push(entry("scip-go", "executableHash", `sha256:${hex}`));
+    p.semanticProducers.push({...entry("scip-go", "executableHash", `sha256:${hex}`), positionEncoding: "unicodeScalar"});
   }));
   hardwareTests("one producer", variant((p) => {
     p.semanticProducers = p.semanticProducers.slice(0, 1);
     p.qualification.producerInventoryComplete = false;
   }));
   hardwareTests("only scip-go", variant((p) => {
-    p.semanticProducers = [entry("scip-go", "executableHash", `sha256:${hex}`)];
+    p.semanticProducers = [{...entry("scip-go", "executableHash", `sha256:${hex}`), positionEncoding: "utf8"}];
     p.qualification.producerInventoryComplete = false;
   }));
   policyGuardMutationTests(); cohortMutationTests();

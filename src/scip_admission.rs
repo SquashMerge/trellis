@@ -105,6 +105,8 @@ struct HardwareProducer {
     version: String,
     #[serde(rename = "executableHash")]
     executable_hash: String,
+    #[serde(rename = "positionEncoding")]
+    position_encoding: Option<String>,
 }
 fn admission(s: &str) -> ScipCaptureError {
     ScipCaptureError::InvalidAdmission(s.into())
@@ -223,11 +225,11 @@ impl<'a> ReferenceProfileAdmission<'a> {
             "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
         ))
         .map_err(|_| admission("checked-in producer profile"))?;
-        let (language, encoding) = match selection.producer_name.as_str() {
-            "scip-java" => ("java", 2),
-            "scip-typescript" => ("javascript", 2),
-            "scip-python" => ("python", 2),
-            "rust-analyzer" => ("rust", 1),
+        let language = match selection.producer_name.as_str() {
+            "scip-java" => "java",
+            "scip-typescript" => "javascript",
+            "scip-python" => "python",
+            "rust-analyzer" => "rust",
             _ => return Err(admission("unsupported producer")),
         };
         let pinned = profile
@@ -235,6 +237,12 @@ impl<'a> ReferenceProfileAdmission<'a> {
             .iter()
             .find(|p| p.name == selection.producer_name)
             .ok_or_else(|| admission("producer not pinned"))?;
+        let encoding = match pinned.position_encoding.as_deref() {
+            Some("utf8") => 1,
+            Some("utf16") => 2,
+            Some("unicodeScalar") => 3,
+            _ => return Err(admission("producer position encoding")),
+        };
         if profile.profile_id != selection.profile_id
             || manifest.producer.version != pinned.version
             || manifest.producer.executable_hash != pinned.executable_hash
@@ -593,6 +601,51 @@ mod tests {
             decode_reference_profile(&admitted, &cancel),
             Err(ScipCaptureError::Cancelled)
         ));
+    }
+    #[test]
+    fn manifest_only_encoding_change_rejected_with_unchanged_producer_pin() {
+        let (root, _capture, selection, mut manifest, cancel) = fixture();
+        let profile: Hardware = serde_json::from_str(include_str!(
+            "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+        ))
+        .unwrap();
+        let pinned = profile
+            .semantic_producers
+            .iter()
+            .find(|p| p.name == selection.producer_name)
+            .unwrap();
+        assert_eq!(pinned.position_encoding.as_deref(), Some("utf16"));
+        assert_eq!(
+            manifest.pointer("/producer/version").unwrap(),
+            &json!(pinned.version)
+        );
+        assert_eq!(
+            manifest.pointer("/producer/executableHash").unwrap(),
+            &json!(pinned.executable_hash)
+        );
+        *manifest.pointer_mut("/producer/positionEncoding").unwrap() = json!(1);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(root.path().join("manifest.json"), &bytes).unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        let capture = Capture::admit(
+            &IndexOptions {
+                workspace_root: physical.clone(),
+                scip_path: Some(physical.join("artifact.scip")),
+                manifest_path: Some(physical.join("manifest.json")),
+                max_file_bytes: 2 * 1024 * 1024,
+            },
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        let selected = TrustedSelection {
+            expected_manifest_hash: scip_raw::sha(&bytes),
+            ..selection
+        };
+        assert!(
+            matches!(ReferenceProfileAdmission::from_trusted_selection(&capture, &selected, &cancel),
+            Err(ScipCaptureError::InvalidAdmission(reason)) if reason == "producer profile pin")
+        );
     }
     #[test]
     fn scip_path_and_uri_reject_escapes() {
