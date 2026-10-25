@@ -4089,3 +4089,411 @@ fn explicit_cli_unchanged_claim_acks_done_without_new_revision() {
         assert_eq!((state.as_str(), revision), ("done", expected));
     }
 }
+
+#[test]
+fn architecture_cli_pins_layer_deviations_references_and_exact_exceptions_without_enqueue() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(root.join("src/high.rs"), "pub fn target() {}\n").unwrap();
+    fs::write(
+        root.join("src/low.rs"),
+        r#"pub fn run() { crate::high::target(); }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn check() { crate::high::target(); }
+}
+#[cfg(feature = "test-support")]
+pub fn fixture() { crate::high::target(); }
+"#,
+    )
+    .unwrap();
+    let config = r#"version = 1
+[layers.high]
+order = 1
+paths = ["src/high.rs"]
+[layers.low]
+order = 2
+paths = ["src/low.rs"]
+"#;
+    fs::write(root.join(".trellis/rules.toml"), config).unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let basis = &indexed["publishedRevision"];
+    let pin = format!(
+        "{}:{}",
+        basis["indexGeneration"].as_str().unwrap(),
+        basis["indexRevision"].as_u64().unwrap()
+    );
+    let checked = isolated_command(&home)
+        .args(["rules", "check", "--format", "json", "--workspace"])
+        .arg(&root)
+        .args(["--pin", &pin, "--path", "src/low.rs"])
+        .output()
+        .unwrap();
+    assert!(!checked.status.success(), "upward references must fail");
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let payload = &checked["payload"];
+    assert_eq!(payload["indexGeneration"], basis["indexGeneration"]);
+    assert_eq!(payload["indexRevision"], basis["indexRevision"]);
+    assert_eq!(payload["counts"]["deviates"], 1);
+    assert_eq!(payload["instances"].as_array().unwrap().len(), 1);
+    let violation = &payload["instances"][0];
+    assert_eq!(violation["rule"], "$layers");
+    assert_eq!(violation["status"], "deviates");
+    assert_eq!(violation["excepted"], false);
+    assert_eq!(violation["target"]["path"], "src/low.rs");
+    assert_eq!(violation["destination"]["path"], "src/high.rs");
+    assert_eq!(violation["referenceCount"], 2);
+    assert_eq!(payload["testOnly"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["testOnly"][0]["referenceCount"], 1);
+    assert_eq!(payload["rulesFile"]["path"], ".trellis/rules.toml");
+    assert_eq!(payload["rulesFile"]["source"], "checkout-config");
+
+    let references = command(&root, &home, "references")
+        .args(["--pin", &pin, "--path", "src/low.rs", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        references.status.success(),
+        "{}",
+        String::from_utf8_lossy(&references.stderr)
+    );
+    let references: Value = serde_json::from_slice(&references.stdout).unwrap();
+    let references = &references["payload"];
+    assert_eq!(references["indexGeneration"], basis["indexGeneration"]);
+    assert_eq!(references["indexRevision"], basis["indexRevision"]);
+    assert_eq!(references["evidenceTier"], "syntax");
+    assert_eq!(references["semanticComplete"], false);
+    assert_eq!(references["counts"]["mappedSites"], 3);
+    assert_eq!(references["counts"]["unresolvedSites"], 0);
+    assert_eq!(references["production"].as_array().unwrap().len(), 1);
+    assert_eq!(references["tests"].as_array().unwrap().len(), 1);
+    let production = &references["production"][0];
+    assert_eq!(production["source"], violation["target"]);
+    assert_eq!(production["target"], violation["destination"]);
+    assert_eq!(production["count"], 2, "test-support remains production");
+    assert_eq!(production["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(production["sites"][0]["role"], "production");
+    assert_eq!(production["omittedSites"], 1);
+    let tests = &references["tests"][0];
+    assert_eq!(tests["source"], production["source"]);
+    assert_eq!(tests["target"], production["target"]);
+    assert_eq!(tests["count"], 1);
+    assert_eq!(tests["sites"][0]["role"], "test");
+    assert_eq!(tests["omittedSites"], 0);
+
+    let target = &violation["target"];
+    let destination = &violation["destination"];
+    let exception = format!(
+        r#"
+[[exceptions]]
+rule = "$layers"
+target = {{ source_set = "{}", language = "rust", path = "src/low.rs", sid = "{}" }}
+destination = {{ source_set = "{}", language = "rust", path = "src/high.rs", sid = "{}" }}
+reason = "Reviewed upward adapter"
+"#,
+        target["sourceSetId"].as_str().unwrap(),
+        target["sid"].as_str().unwrap(),
+        destination["sourceSetId"].as_str().unwrap(),
+        destination["sid"].as_str().unwrap()
+    );
+    fs::write(
+        root.join(".trellis/rules.toml"),
+        format!("{config}{exception}"),
+    )
+    .unwrap();
+    let excepted = isolated_command(&home)
+        .args(["rules", "check", "--format", "json", "--workspace"])
+        .arg(&root)
+        .args(["--pin", &pin, "--path", "src/low.rs"])
+        .output()
+        .unwrap();
+    assert!(
+        excepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&excepted.stderr)
+    );
+    let excepted: Value = serde_json::from_slice(&excepted.stdout).unwrap();
+    let excepted = &excepted["payload"];
+    assert_eq!(excepted["indexGeneration"], basis["indexGeneration"]);
+    assert_eq!(excepted["indexRevision"], basis["indexRevision"]);
+    assert_eq!(excepted["counts"]["deviates"], 0);
+    assert_eq!(excepted["counts"]["excepted"], 1);
+    assert_eq!(excepted["instances"][0]["status"], "deviates");
+    assert_eq!(excepted["instances"][0]["excepted"], true);
+    assert_eq!(
+        excepted["instances"][0]["exceptionReason"],
+        "Reviewed upward adapter"
+    );
+    assert_eq!(excepted["instances"][0]["evidence"], violation["evidence"]);
+    assert_ne!(
+        excepted["rulesFile"]["contentHash"], payload["rulesFile"]["contentHash"],
+        "current configuration is identified separately from the code pin"
+    );
+    let status = command(&root, &home, "status").output().unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["revision"], *basis,
+        "reads must not publish a revision"
+    );
+
+    // Inspect the queue only after the sole writer has retired its SQLite handles.
+    daemon.stop_attested().unwrap();
+    let dbpath = real_index_db(&home);
+    let use_lock = dbpath.parent().unwrap().with_extension("lock");
+    let _exclusive =
+        trellis::store::topology::UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+            .expect("retired daemon retained the index-use lock");
+    let queue = rusqlite::Connection::open_with_flags(
+        dbpath.with_file_name("requests.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (requests, done): (i64, i64) = queue
+        .query_row(
+            "SELECT count(*), sum(CASE WHEN state='done' THEN 1 ELSE 0 END) FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((requests, done), (1, 1), "only index may enqueue work");
+}
+
+#[test]
+fn architecture_cli_unknown_call_rule_succeeds_without_invented_bindings() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(
+        root.join("src/flow.rs"),
+        "fn target() {}\nfn run() { target(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".trellis/rules.toml"),
+        r#"version = 1
+[roles.source]
+select = { name = "run", language = ["rust"] }
+[roles.destination]
+select = { name = "target" }
+[[rules]]
+id = "needs-target"
+for_each = "source"
+require = [{ calls = "destination" }]
+"#,
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    let checked = isolated_command(&home)
+        .args(["rules", "check", "--format", "json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "unknown-only evaluation must succeed: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let payload = &checked["payload"];
+    assert_eq!(
+        payload["indexGeneration"],
+        indexed["publishedRevision"]["indexGeneration"]
+    );
+    assert_eq!(
+        payload["indexRevision"],
+        indexed["publishedRevision"]["indexRevision"]
+    );
+    assert_eq!(payload["counts"]["deviates"], 0);
+    assert_eq!(payload["counts"]["unknown"], 1);
+    assert_eq!(payload["instances"].as_array().unwrap().len(), 1);
+    let instance = &payload["instances"][0];
+    assert_eq!(instance["rule"], "needs-target");
+    assert_eq!(instance["status"], "unknown");
+    assert_eq!(instance["constraints"][0]["kind"], "calls");
+    assert_eq!(instance["constraints"][0]["status"], "unknown");
+    assert!(
+        instance["constraints"][0]["unresolved"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("call_binding_unavailable".into()))
+    );
+    assert!(
+        instance["constraints"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|evidence| evidence["kind"] == "call" && evidence["callId"].is_string())
+    );
+}
+
+#[test]
+fn architecture_cli_invalid_rules_is_a_located_json_failure_not_a_verdict() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(root.join("src/flow.rs"), "fn run() {}\n").unwrap();
+    let config = r#"version = 1
+[roles.source]
+select = { name = "run" }
+[[rules]]
+id = "bad-role"
+for_each = "missing"
+require = [{ calls = "source" }]
+"#;
+    fs::write(root.join(".trellis/rules.toml"), config).unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let checked = isolated_command(&home)
+        .args(["rules", "check", "--format", "json", "--workspace"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!checked.status.success(), "invalid config must fail");
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert!(
+        checked.get("payload").is_none(),
+        "no partial verdict: {checked}"
+    );
+    let error = &checked["error"];
+    assert_eq!(error["code"], "invalid_rules");
+    assert_eq!(error["kind"], "reference");
+    assert_eq!(error["path"], ".trellis/rules.toml");
+    assert_eq!(error["attribution"], "token");
+    assert_eq!(error["line"], 6);
+    assert!(error["column"].as_u64().unwrap() > 0);
+    let start = usize::try_from(error["range"]["start"].as_u64().unwrap()).unwrap();
+    let end = usize::try_from(error["range"]["end"].as_u64().unwrap()).unwrap();
+    assert!(start < end && end <= config.len());
+    assert!(config[start..end].contains("missing"));
+}
+
+#[tokio::test]
+async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission_refusal() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use trellis::store::topology::UseGuard;
+
+    // Keep Unix socket paths below the platform sockaddr_un bound.
+    let temp = tempfile::Builder::new()
+        .prefix("trellis-cli-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp.path().join("source");
+    let home = temp.path().join("home");
+    let daemon = FixtureDaemon::new(&home);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/high.rs"), "pub fn target() {}\n").unwrap();
+    fs::write(
+        root.join("src/low.rs"),
+        "pub fn run() { crate::high::target(); }\n",
+    )
+    .unwrap();
+    let indexed = command(&root, &home, "index").output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+    daemon.stop_attested().unwrap();
+    let dbpath = real_index_db(&home);
+    let use_lock = dbpath.parent().unwrap().with_extension("lock");
+    {
+        let _exclusive = UseGuard::acquire_existing_readonly_exclusive(&use_lock)
+            .expect("retired daemon retained the index-use lock");
+        let db = rusqlite::Connection::open(&dbpath).unwrap();
+        // An obsolete disposable index requires normal startup recreation.
+        db.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE index_metadata SET schema_version=7;",
+        )
+        .unwrap();
+    }
+    let startup_path = home.join("startup.sock");
+    let wait_path = home.join("read-wait.sock");
+    let startup_listener = tokio::net::UnixListener::bind(&startup_path).unwrap();
+    let wait_listener = tokio::net::UnixListener::bind(&wait_path).unwrap();
+    let stdout_path = temp.path().join("references.stdout");
+    let stderr_path = temp.path().join("references.stderr");
+    let mut read = command(&root, &home, "references");
+    read.env("TRELLIS_TEST_DAEMON_STARTUP_SOCKET", &startup_path)
+        .env("TRELLIS_TEST_CLI_READ_WAIT_SOCKET", &wait_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(
+            fs::File::create(&stdout_path).unwrap(),
+        ))
+        .stderr(std::process::Stdio::from(
+            fs::File::create(&stderr_path).unwrap(),
+        ));
+    let mut child = tokio::process::Command::from(read)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut startup = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        let (mut startup, _) = startup_listener.accept().await.unwrap();
+        startup.read_exact(&mut [0]).await.unwrap();
+        let (mut waiting, _) = wait_listener.accept().await.unwrap();
+        let mut arrived = [0];
+        waiting.read_exact(&mut arrived).await.unwrap();
+        assert_eq!(arrived, *b"W");
+        startup
+    })
+    .await
+    .expect("references did not reach the typed startup-read wait");
+    // Both owner startup and the refused read have arrived before release.
+    // Successful output now must come from the same CLI's state-change retry.
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(fs::read(&stdout_path).unwrap().is_empty());
+    startup.write_all(&[1]).await.unwrap();
+    let status = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, child.wait())
+        .await
+        .expect("references did not complete after startup release")
+        .unwrap();
+    assert!(
+        status.success(),
+        "{}",
+        fs::read_to_string(&stderr_path).unwrap()
+    );
+    let references: Value = serde_json::from_slice(&fs::read(&stdout_path).unwrap()).unwrap();
+    assert_ne!(
+        references["payload"]["indexGeneration"], indexed["publishedRevision"]["indexGeneration"],
+        "old derived schema must be recreated, not read through"
+    );
+    assert_eq!(references["payload"]["indexRevision"], 1);
+    assert_eq!(references["payload"]["counts"]["mappedSites"], 1);
+    assert_eq!(
+        references["payload"]["production"][0]["source"]["path"],
+        "src/low.rs"
+    );
+    assert_eq!(
+        references["payload"]["production"][0]["target"]["path"],
+        "src/high.rs"
+    );
+}

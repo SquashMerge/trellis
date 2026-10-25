@@ -396,7 +396,8 @@
             "2025-11-25"
           ],
           "capabilities": {
-            "tools": {}
+            "tools": {},
+            "prompts": {}
           },
           "_meta": {
             "io.modelcontextprotocol/serverInfo": {
@@ -427,7 +428,8 @@
         "result": {
           "protocolVersion": "2025-11-25",
           "capabilities": {
-            "tools": {}
+            "tools": {},
+            "prompts": {}
           },
           "serverInfo": {
             "name": "trellis",

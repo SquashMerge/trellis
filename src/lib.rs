@@ -35,6 +35,8 @@ pub mod native_evidence;
 pub mod native_ids;
 pub mod navigation;
 mod parallel;
+pub mod references;
+pub mod rules;
 mod rust_sources;
 pub mod store;
 #[doc(hidden)]
