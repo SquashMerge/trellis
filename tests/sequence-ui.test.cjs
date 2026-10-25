@@ -520,7 +520,7 @@ test("Pele projection keeps human labels separate from encoded Mermaid and refus
 
 test("frozen real Pele 1.6.0 sequence and grammar output remain byte-identical", () => {
   const sandbox = {};
-  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0.js", "utf8"), sandbox);
+  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0-trellis.1.js", "utf8"), sandbox);
   assert.equal(typeof sandbox.pele.render, "function");
   for (const name of ["sequence", "representative"]) {
     const source = fs.readFileSync(`tests/fixtures/pele-1.6.0/${name}.mmd`, "utf8");
@@ -552,7 +552,7 @@ test("negative control: original step identity check detects altered projector",
 
 test("pinned Pele renders all four producer Mermaid sources and bounded near-cap input", () => {
   const sandbox = {};
-  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0.js", "utf8"), sandbox);
+  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0-trellis.1.js", "utf8"), sandbox);
   const adapter = peleProjector();
   for (const language of ["javascript", "rust", "java", "python"]) {
     const projection = adapter.project(peleFixture(language));
@@ -612,11 +612,11 @@ test("real Chromium validates pinned SVG and source note identity under unchange
     page.on("pageerror", error => errors.push(error.message));
     await page.route("http://127.0.0.1:43987/**", route => {
       const path = new URL(route.request().url()).pathname;
-      const assets = {"/vendor/pele-1.6.0.js":"web/vendor/pele-1.6.0.js", "/sequence-pele.js":"web/sequence-pele.js"};
+      const assets = {"/vendor/pele-1.6.0-trellis.1.js":"web/vendor/pele-1.6.0-trellis.1.js", "/sequence-pele.js":"web/sequence-pele.js"};
       if (assets[path]) return route.fulfill({status:200, contentType:"text/javascript; charset=utf-8", body:fs.readFileSync(assets[path])});
       if (path === "/test.css") return route.fulfill({status:200, contentType:"text/css", body:"#diagram { width:240px; height:110px; overflow:auto }"});
       return route.fulfill({status:200, contentType:"text/html; charset=utf-8", body:
-        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.6.0.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
+        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.6.0-trellis.1.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
     });
     await page.goto("http://127.0.0.1:43987/");
     await page.evaluate(() => document.addEventListener("securitypolicyviolation", event =>

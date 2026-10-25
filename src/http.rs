@@ -2088,11 +2088,11 @@ pub fn router(state: Arc<DaemonState>) -> Router {
             }),
         )
         .route(
-            "/vendor/pele-1.6.0.js",
+            "/vendor/pele-1.6.0-trellis.1.js",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_bytes!("../web/vendor/pele-1.6.0.js"),
+                    include_bytes!("../web/vendor/pele-1.6.0-trellis.1.js"),
                 )
             }),
         )
@@ -3224,11 +3224,11 @@ impl ProvisionedBrowser {
                 }),
             )
             .route(
-                "/vendor/pele-1.6.0.js",
+                "/vendor/pele-1.6.0-trellis.1.js",
                 get(|| async {
                     (
                         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                        include_bytes!("../web/vendor/pele-1.6.0.js"),
+                        include_bytes!("../web/vendor/pele-1.6.0-trellis.1.js"),
                     )
                 }),
             )
