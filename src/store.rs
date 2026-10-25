@@ -1333,38 +1333,42 @@ impl EvidenceResponse {
                 language: row.get(1)?,
                 path: row.get(2)?,
             };
-            let progress_failure = Mutex::new(None);
-            let check = Mutex::new(&mut *check);
-            let expired = || match (*check.lock().unwrap())() {
-                Ok(()) => false,
-                Err(error) => {
-                    *progress_failure.lock().unwrap() = Some(error);
-                    true
+            let fetched = {
+                let progress_failure = Mutex::new(None);
+                let check = Mutex::new(&mut *check);
+                let expired = || match (*check.lock().unwrap())() {
+                    Ok(()) => false,
+                    Err(error) => {
+                        *progress_failure.lock().unwrap() = Some(error);
+                        true
+                    }
+                };
+                let header = self.store.fetch_selected_header(
+                    &self.db,
+                    &key.path,
+                    &selected,
+                    Some(&expired),
+                );
+                if let Some(error) = progress_failure.lock().unwrap().take() {
+                    return Err(error);
                 }
+                let header = header?;
+                source_bytes = source_bytes.saturating_add(header.bytes.max(0) as u64);
+                stored_bytes = stored_bytes.saturating_add(header.stored_bytes);
+                ensure!(
+                    header.bytes <= 2 * 1024 * 1024
+                        && source_bytes <= 256 * 1024 * 1024
+                        && stored_bytes <= 512 * 1024 * 1024,
+                    "bounded_work: architecture source"
+                );
+                let fetched =
+                    self.store
+                        .fetch_selected_rows(&self.db, header, &selected, Some(&expired));
+                if let Some(error) = progress_failure.lock().unwrap().take() {
+                    return Err(error);
+                }
+                fetched?
             };
-            let header =
-                self.store
-                    .fetch_selected_header(&self.db, &key.path, &selected, Some(&expired));
-            if let Some(error) = progress_failure.lock().unwrap().take() {
-                return Err(error);
-            }
-            let header = header?;
-            source_bytes = source_bytes.saturating_add(header.bytes.max(0) as u64);
-            stored_bytes = stored_bytes.saturating_add(header.stored_bytes);
-            ensure!(
-                header.bytes <= 2 * 1024 * 1024
-                    && source_bytes <= 256 * 1024 * 1024
-                    && stored_bytes <= 512 * 1024 * 1024,
-                "bounded_work: architecture source"
-            );
-            let fetched =
-                self.store
-                    .fetch_selected_rows(&self.db, header, &selected, Some(&expired));
-            if let Some(error) = progress_failure.lock().unwrap().take() {
-                return Err(error);
-            }
-            let fetched = fetched?;
-            drop(check);
             selected_ensure!(
                 fetched.file.language == key.language,
                 "incompatible_index: architecture language mismatch"
