@@ -21,7 +21,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - run: npm ci --prefix runtime/acp --ignore-scripts
+      - run: npm ci --prefix tests/mcp --ignore-scripts
       # Keep in step with rust-toolchain.toml, which every local build uses.
       - uses: dtolnay/rust-toolchain@master
         with:
