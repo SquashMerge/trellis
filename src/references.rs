@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser, Tree};
 
+pub mod external;
+mod rust;
+
 const SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const VISITS: usize = 1_000_000;
@@ -23,6 +26,7 @@ pub struct DocumentInput {
 pub struct Snapshot {
     pub pin: IndexPin,
     pub documents: Vec<DocumentInput>,
+    pub manifests: Vec<external::ManifestInput>,
 }
 #[derive(Debug)]
 pub struct Projection {
@@ -60,12 +64,26 @@ struct RawSite {
     kind: &'static str,
     spelling: String,
     destination: std::result::Result<Vec<String>, &'static str>,
+    namespace: Option<u8>,
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Target {
+    Native(usize),
+    External(external::ExternalIdentity),
 }
 #[derive(Default)]
-struct RustLayout {
-    custom: bool,
-    wildcard: bool,
-    blocked: BTreeSet<String>,
+struct SiteResolution {
+    targets: BTreeSet<Target>,
+    proof: BTreeSet<usize>,
+    residual: Option<&'static str>,
+}
+impl SiteResolution {
+    fn unknown(reason: &'static str) -> Self {
+        Self {
+            residual: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// The closed path-glob grammar shared by architecture request surfaces.
@@ -114,9 +132,19 @@ pub fn project(
     let mut identities = Vec::new();
     let mut modules = Vec::new();
     let mut trees = Vec::new();
-    let mut layouts: BTreeMap<String, RustLayout> = BTreeMap::new();
     let mut total_bytes = 0usize;
     let mut document_map = BTreeMap::new();
+    for manifest in &snapshot.manifests {
+        check()?;
+        let bytes = manifest.bytes.as_ref().map_or(0, Vec::len);
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .context("bounded_work: reference bytes")?;
+        ensure!(
+            bytes <= SOURCE_BYTES && total_bytes <= TOTAL_BYTES,
+            "bounded_work: reference source bytes"
+        );
+    }
     for (i, doc) in docs.iter().enumerate() {
         check()?;
         ensure!(
@@ -151,23 +179,18 @@ pub fn project(
             "bounded_work: reference source bytes"
         );
         let tree = parse(doc, check)?;
-        if doc.key.language == "rust" {
-            inspect_layout(
-                doc,
-                &tree,
-                layouts.entry(doc.key.source_set_id.clone()).or_default(),
-                check,
-            )?;
-        }
         trees.push(tree);
     }
-    let mut edges: BTreeMap<(usize, usize, bool), (usize, Vec<Site>)> = BTreeMap::new();
+    let mut external_work = 0;
+    let packages = external::RustPackages::new(&snapshot.manifests, &mut external_work, check)?;
+    let mut rust = rust::Catalog::new(&docs, &trees, &document_map, external_work, check)?;
+    let mut external_packages = BTreeMap::new();
+    let mut edges: BTreeMap<(usize, Target, bool), (usize, Vec<Site>)> = BTreeMap::new();
     let mut emitted_modules = BTreeSet::new();
     let mut unresolved = Vec::new();
     let mut site_count = 0usize;
     let mut scanned = 0usize;
     let mut mapped = 0usize;
-    let mut owner_work = 0usize;
     for (source, (doc, tree)) in docs.iter().zip(&trees).enumerate() {
         if !paths.is_empty() && !globs.is_match(&doc.key.path) {
             continue;
@@ -175,13 +198,13 @@ pub fn project(
         check()?;
         emitted_modules.insert(source);
         scanned += 1;
-        let raw = extract(doc, tree, check)?;
+        let raw = extract(doc, tree, &mut rust.work, check)?;
         let declarations = RangeIndex::new(
             doc.declarations.iter().map(|d| &d.range),
-            &mut owner_work,
+            &mut rust.work,
             check,
         )?;
-        let calls = RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut owner_work, check)?;
+        let calls = RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut rust.work, check)?;
         let newlines: Vec<_> = doc
             .file
             .text
@@ -199,7 +222,7 @@ pub fn project(
             ensure!(site_count <= SITES, "bounded_work: reference site count");
             let owner = owner(
                 doc,
-                declarations.enclosing(item.start, item.end, &mut owner_work, check)?,
+                declarations.enclosing(item.start, item.end, &mut rust.work, check)?,
             );
             let role = owner.map(|d| match d.role {
                 DeclarationRole::Test => "test",
@@ -219,34 +242,47 @@ pub fn project(
                 relation_kind: item.kind,
                 spelling: item.spelling.clone(),
                 call_id: calls
-                    .enclosing(item.start, item.end, &mut owner_work, check)?
+                    .enclosing(item.start, item.end, &mut rust.work, check)?
                     .into_iter()
                     .min()
                     .map(|index| doc.calls[index].id.clone()),
             };
-            let target = if owner.is_none() {
-                Err("reference_owner_ambiguous")
-            } else {
-                map_target(
-                    doc,
+            let resolution = if owner.is_none() {
+                SiteResolution::unknown("reference_owner_ambiguous")
+            } else if doc.key.language == "rust" {
+                rust.resolve(
+                    source,
                     &item,
-                    &document_map,
-                    layouts.get(&doc.key.source_set_id),
-                )
-            };
-            match target {
-                Ok(target) => {
-                    mapped += 1;
-                    let edge = edges
-                        .entry((source, target, role == Some("test")))
-                        .or_default();
-                    edge.0 += 1;
-                    if edge.1.len() < sample_limit {
-                        edge.1.push(site);
-                    }
+                    &packages,
+                    &mut external_packages,
+                    &docs,
+                    check,
+                )?
+            } else {
+                match map_target(doc, &item, &document_map) {
+                    Ok(target) => SiteResolution {
+                        targets: BTreeSet::from([Target::Native(target)]),
+                        ..SiteResolution::default()
+                    },
+                    Err(reason) => SiteResolution::unknown(reason),
                 }
-                Err(reason) => unresolved
-                    .push(json!({"source":identities[source],"site":site,"reason":reason})),
+            };
+            if !resolution.targets.is_empty() {
+                mapped += 1;
+                emitted_modules.extend(resolution.proof);
+            }
+            for target in resolution.targets {
+                owner_step(&mut rust.work, check)?;
+                let edge = edges
+                    .entry((source, target, role == Some("test")))
+                    .or_default();
+                edge.0 += 1;
+                if edge.1.len() < sample_limit {
+                    edge.1.push(site.clone());
+                }
+            }
+            if let Some(reason) = resolution.residual {
+                unresolved.push(json!({"source":identities[source],"site":site,"reason":reason}));
             }
         }
     }
@@ -254,9 +290,15 @@ pub fn project(
     let mut tests = Vec::new();
     for ((source, target, test), (count, sites)) in edges {
         check()?;
-        emitted_modules.insert(target);
+        let target = match target {
+            Target::Native(target) => {
+                emitted_modules.insert(target);
+                json!(identities[target])
+            }
+            Target::External(identity) => json!(identity),
+        };
         let omitted = count - sites.len();
-        let edge = json!({"source":identities[source],"target":identities[target],"count":count,
+        let edge = json!({"source":identities[source],"target":target,"count":count,
             "sites":sites,"omittedSites":omitted,"mapping":"structural"});
         if test {
             tests.push(edge);
@@ -268,13 +310,13 @@ pub fn project(
     check()?;
     Ok(Projection {
         data: json!({
-            "referencesVersion":"references:v1","indexGeneration":snapshot.pin.index_generation.to_string(),
+            "referencesVersion":"references:v2","indexGeneration":snapshot.pin.index_generation.to_string(),
             "indexRevision":snapshot.pin.index_revision,"evidenceTier":"syntax","semanticComplete":false,
-            "modules":emitted_modules,"production":production,"tests":tests,"unresolved":unresolved,
-            "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":site_count-mapped},
+            "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
+            "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len()},
             "limitations":[
                 "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
-                "Rust maps explicit crate paths only; aliases, reexports, wildcards, custom path attributes and inline ambiguity remain unresolved; macros are opaque.",
+                "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
                 "JavaScript maps static relative imports/reexports using explicit files or .js/.mjs/.cjs/index.js; dynamic and bare imports remain unresolved.",
                 "Python maps explicit relative module imports using .py/__init__.py; absolute, alias, wildcard and module-versus-attribute forms remain unresolved.",
                 "Java import and qualified type sites remain unresolved; package grouping is not produced."
@@ -465,87 +507,6 @@ fn opaque(node: Node<'_>) -> bool {
             | "inner_attribute_item"
     )
 }
-fn inspect_layout(
-    doc: &DocumentInput,
-    tree: &Tree,
-    layout: &mut RustLayout,
-    check: &mut impl FnMut() -> Result<()>,
-) -> Result<()> {
-    walk(tree.root_node(), check, &mut |node, check| {
-        if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
-            let value: String = text(doc, node)
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            let mut cursor = node.walk();
-            let path_attribute = node.named_children(&mut cursor).any(|attribute| {
-                if attribute.kind() != "attribute" {
-                    return false;
-                }
-                let mut cursor = attribute.walk();
-                attribute
-                    .named_children(&mut cursor)
-                    .any(|name| name.kind() == "identifier" && text(doc, name) == "path")
-            });
-            if path_attribute || value.contains("path=") {
-                layout.custom = true;
-            }
-        }
-        if node.kind() == "mod_item"
-            && node.child_by_field_name("body").is_some()
-            && let Some(name) = node.child_by_field_name("name")
-        {
-            layout.blocked.insert(text(doc, name).to_owned());
-        }
-        if node.kind() == "use_as_clause"
-            && let Some(alias) = node.child_by_field_name("alias")
-        {
-            layout.blocked.insert(text(doc, alias).to_owned());
-        }
-        if node.kind() == "use_declaration" {
-            let mut leaves = vec![node];
-            let mut visits = 0;
-            while let Some(leaf) = leaves.pop() {
-                check()?;
-                visits += 1;
-                ensure!(visits <= VISITS, "bounded_work: reference layout");
-                if leaf.kind() == "use_wildcard" {
-                    layout.wildcard = true;
-                }
-                if matches!(leaf.kind(), "scoped_identifier" | "scoped_type_identifier") {
-                    if let Some(name) = leaf.child_by_field_name("name") {
-                        layout.blocked.insert(text(doc, name).to_owned());
-                    }
-                } else if matches!(leaf.kind(), "identifier" | "type_identifier") {
-                    layout.blocked.insert(text(doc, leaf).to_owned());
-                } else if leaf.kind() == "self" {
-                    let mut ancestor = leaf.parent();
-                    while let Some(parent) = ancestor {
-                        check()?;
-                        if parent.kind() == "scoped_use_list" {
-                            if let Some(path) = parent.child_by_field_name("path") {
-                                let name = path.child_by_field_name("name").unwrap_or(path);
-                                layout.blocked.insert(text(doc, name).to_owned());
-                            }
-                            break;
-                        }
-                        if parent.kind() == "use_declaration" {
-                            break;
-                        }
-                        ancestor = parent.parent();
-                    }
-                } else {
-                    let mut cursor = leaf.walk();
-                    leaves.extend(leaf.named_children(&mut cursor).filter(|c| {
-                        leaf.kind() != "scoped_use_list"
-                            || leaf.child_by_field_name("list") == Some(*c)
-                    }));
-                }
-            }
-        }
-        Ok(opaque(node) && !matches!(node.kind(), "attribute_item" | "inner_attribute_item"))
-    })
-}
 fn raw(
     doc: &DocumentInput,
     node: Node<'_>,
@@ -558,34 +519,23 @@ fn raw(
         kind,
         spelling: text(doc, node).to_owned(),
         destination,
+        namespace: None,
     }
 }
 fn extract(
     doc: &DocumentInput,
     tree: &Tree,
+    work: &mut usize,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<RawSite>> {
+    if doc.key.language == "rust" {
+        return rust::extract(doc, tree, work, check);
+    }
     let mut result = Vec::new();
-    walk(tree.root_node(), check, &mut |node, check| {
+    walk(tree.root_node(), check, &mut |node, _check| {
         ensure!(result.len() < SITES, "bounded_work: reference site count");
         match doc.key.language.as_str() {
-            "rust" => {
-                if opaque(node) {
-                    return Ok(true);
-                }
-                if node.kind() == "use_declaration" {
-                    let public = node.child_by_field_name("visibility").is_some()
-                        || text(doc, node).trim_start().starts_with("pub");
-                    if let Some(argument) = node.child_by_field_name("argument") {
-                        rust_use(doc, argument, "", public, &mut result, check)?;
-                    }
-                    return Ok(true);
-                }
-                if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
-                    result.push(raw(doc, node, "reference", rust_parts(text(doc, node))));
-                    return Ok(true);
-                }
-            }
+            "rust" => unreachable!("Rust has a lexical extractor"),
             "javascript" => {
                 if matches!(node.kind(), "import_statement" | "export_statement")
                     && let Some(source) = node.child_by_field_name("source")
@@ -669,139 +619,13 @@ fn extract(
     });
     Ok(result)
 }
-fn rust_parts(value: &str) -> std::result::Result<Vec<String>, &'static str> {
-    let parts: Vec<_> = value.split("::").map(str::trim).collect();
-    if parts.first() != Some(&"crate") {
-        return Err("rust_non_crate_path");
-    }
-    if parts.len() < 2
-        || parts
-            .iter()
-            .any(|p| p.is_empty() || !p.chars().all(|c| c == '_' || c.is_alphanumeric()))
-    {
-        return Err("rust_path_unsupported");
-    }
-    Ok(parts[1..].iter().map(|s| (*s).to_owned()).collect())
-}
-fn rust_use(
-    doc: &DocumentInput,
-    root: Node<'_>,
-    prefix: &str,
-    public: bool,
-    result: &mut Vec<RawSite>,
-    check: &mut impl FnMut() -> Result<()>,
-) -> Result<()> {
-    let mut stack = vec![(root, prefix.to_owned())];
-    let mut visits = 0;
-    while let Some((node, prefix)) = stack.pop() {
-        check()?;
-        visits += 1;
-        ensure!(
-            visits <= VISITS && result.len() < SITES,
-            "bounded_work: reference import work"
-        );
-        match node.kind() {
-            "scoped_use_list" => {
-                let path = node
-                    .child_by_field_name("path")
-                    .map(|n| text(doc, n))
-                    .unwrap_or("");
-                let combined = if prefix.is_empty() {
-                    path.to_owned()
-                } else {
-                    format!("{prefix}::{path}")
-                };
-                if let Some(list) = node.child_by_field_name("list") {
-                    stack.push((list, combined));
-                }
-            }
-            "use_list" => {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    stack.push((child, prefix.clone()));
-                }
-            }
-            "use_as_clause" => result.push(raw(
-                doc,
-                node,
-                "import",
-                Err("rust_import_alias_unsupported"),
-            )),
-            "use_wildcard" => result.push(raw(
-                doc,
-                node,
-                "import",
-                Err("rust_import_wildcard_unsupported"),
-            )),
-            _ => {
-                let spelling = if prefix.is_empty() {
-                    text(doc, node).to_owned()
-                } else {
-                    format!("{prefix}::{}", text(doc, node))
-                };
-                result.push(raw(
-                    doc,
-                    node,
-                    "import",
-                    if public {
-                        Err("rust_reexport_unsupported")
-                    } else {
-                        rust_parts(&spelling)
-                    },
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 fn map_target(
     doc: &DocumentInput,
     site: &RawSite,
     documents: &BTreeMap<DocumentKey, usize>,
-    layout: Option<&RustLayout>,
 ) -> std::result::Result<usize, &'static str> {
     let parts = site.destination.as_ref().map_err(|e| *e)?;
     let candidates = match doc.key.language.as_str() {
-        "rust" => {
-            let layout = layout.ok_or("rust_layout_unsupported")?;
-            if layout.custom {
-                return Err("rust_custom_path_unsupported");
-            }
-            if layout.wildcard {
-                return Err("rust_import_wildcard_unsupported");
-            }
-            if !doc.key.path.starts_with("src/")
-                || doc.key.path.starts_with("src/bin/")
-                || parts.first().is_some_and(|part| part == "bin")
-            {
-                return Err("rust_custom_root_unsupported");
-            }
-            if parts
-                .first()
-                .is_some_and(|part| layout.blocked.contains(part))
-            {
-                return Err("rust_inline_or_alias_ambiguous");
-            }
-            let mut candidates = Vec::new();
-            for length in (1..=parts.len()).rev() {
-                let prefix = parts[..length].join("/");
-                candidates = vec![format!("src/{prefix}.rs"), format!("src/{prefix}/mod.rs")];
-                let found = find(doc, &candidates, documents);
-                if found.len() > 1 {
-                    return Err("module_path_ambiguous");
-                }
-                if let Some(target) = found.first() {
-                    if parts[..length]
-                        .iter()
-                        .any(|part| layout.blocked.contains(part))
-                    {
-                        return Err("rust_inline_or_alias_ambiguous");
-                    }
-                    return Ok(*target);
-                }
-            }
-            candidates
-        }
         "javascript" => {
             let path =
                 relative_path(&doc.key.path, &parts[0]).ok_or("relative_import_outside_source")?;

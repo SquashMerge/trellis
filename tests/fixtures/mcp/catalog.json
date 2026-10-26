@@ -7309,7 +7309,7 @@
               "$ref": "#/$defs/Identity"
             },
             "target": {
-              "$ref": "#/$defs/Identity"
+              "$ref": "#/$defs/Destination"
             },
             "count": {
               "$ref": "#/$defs/UInt"
@@ -7489,7 +7489,7 @@
             "destination": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/Identity"
+                  "$ref": "#/$defs/Destination"
                 },
                 {
                   "type": "null"
@@ -7644,6 +7644,318 @@
             "attribution",
             "message"
           ]
+        },
+        "ExternalIdentity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "externalPackage"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "package": {
+              "$ref": "#/$defs/Text"
+            },
+            "standardLibrary": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "sourceSetId",
+            "language",
+            "package",
+            "standardLibrary"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_-]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "std",
+                      "core",
+                      "alloc"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z0-9._-]+:[A-Za-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "java",
+                      "javax"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![\\s\\S]*--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?:(?![._])[a-z0-9._-]+|@(?![._])[a-z0-9._-]+/(?![._])[a-z0-9._-]+)(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Destination": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Identity"
+            },
+            {
+              "$ref": "#/$defs/ExternalIdentity"
+            }
+          ]
+        },
+        "ManifestEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "manifest"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "nativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "importRoot": {
+              "$ref": "#/$defs/Text"
+            },
+            "section": {
+              "$ref": "#/$defs/Text"
+            },
+            "key": {
+              "$ref": "#/$defs/Text"
+            },
+            "versionConstraint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "sourceSetId",
+            "nativeRevisionId",
+            "dependencyHash",
+            "path",
+            "contentHash",
+            "importRoot",
+            "section",
+            "key",
+            "versionConstraint"
+          ]
+        },
+        "CatalogEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "standardLibraryCatalog"
+            },
+            "catalog": {
+              "const": "rust-standard-library:v1"
+            },
+            "entry": {
+              "enum": [
+                "std",
+                "core",
+                "alloc"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "catalog",
+            "entry"
+          ]
+        },
+        "ExternalPackage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/ExternalIdentity"
+            },
+            "ecosystem": {
+              "enum": [
+                "cargo",
+                "rust"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/ManifestEvidence"
+                  },
+                  {
+                    "$ref": "#/$defs/CatalogEvidence"
+                  }
+                ]
+              }
+            }
+          },
+          "required": [
+            "identity",
+            "ecosystem",
+            "evidence"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7656,7 +7968,7 @@
               "additionalProperties": false,
               "properties": {
                 "referencesVersion": {
-                  "const": "references:v1"
+                  "const": "references:v2"
                 },
                 "indexGeneration": {
                   "type": "string"
@@ -7719,6 +8031,12 @@
                   "items": {
                     "type": "string"
                   }
+                },
+                "externalPackages": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/ExternalPackage"
+                  }
                 }
               },
               "required": [
@@ -7732,7 +8050,8 @@
                 "tests",
                 "unresolved",
                 "counts",
-                "limitations"
+                "limitations",
+                "externalPackages"
               ]
             },
             "evidenceBasis": {
@@ -7816,7 +8135,7 @@
       ],
       "type": "object"
     },
-    "description": "Read pinned structural file references, not resolved semantic dependencies. Production and test sites are separate."
+    "description": "Read pinned structural native-module and external-package references, not resolved semantic dependencies. Production and test sites are separate."
   },
   {
     "annotations": {
@@ -8549,7 +8868,7 @@
               "$ref": "#/$defs/Identity"
             },
             "target": {
-              "$ref": "#/$defs/Identity"
+              "$ref": "#/$defs/Destination"
             },
             "count": {
               "$ref": "#/$defs/UInt"
@@ -8729,7 +9048,7 @@
             "destination": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/Identity"
+                  "$ref": "#/$defs/Destination"
                 },
                 {
                   "type": "null"
@@ -8955,6 +9274,318 @@
             "catchingUp"
           ],
           "type": "object"
+        },
+        "ExternalIdentity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "externalPackage"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "package": {
+              "$ref": "#/$defs/Text"
+            },
+            "standardLibrary": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "sourceSetId",
+            "language",
+            "package",
+            "standardLibrary"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_-]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "std",
+                      "core",
+                      "alloc"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z0-9._-]+:[A-Za-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "java",
+                      "javax"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![\\s\\S]*--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?:(?![._])[a-z0-9._-]+|@(?![._])[a-z0-9._-]+/(?![._])[a-z0-9._-]+)(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Destination": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Identity"
+            },
+            {
+              "$ref": "#/$defs/ExternalIdentity"
+            }
+          ]
+        },
+        "ManifestEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "manifest"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "nativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "importRoot": {
+              "$ref": "#/$defs/Text"
+            },
+            "section": {
+              "$ref": "#/$defs/Text"
+            },
+            "key": {
+              "$ref": "#/$defs/Text"
+            },
+            "versionConstraint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "sourceSetId",
+            "nativeRevisionId",
+            "dependencyHash",
+            "path",
+            "contentHash",
+            "importRoot",
+            "section",
+            "key",
+            "versionConstraint"
+          ]
+        },
+        "CatalogEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "standardLibraryCatalog"
+            },
+            "catalog": {
+              "const": "rust-standard-library:v1"
+            },
+            "entry": {
+              "enum": [
+                "std",
+                "core",
+                "alloc"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "catalog",
+            "entry"
+          ]
+        },
+        "ExternalPackage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/ExternalIdentity"
+            },
+            "ecosystem": {
+              "enum": [
+                "cargo",
+                "rust"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/ManifestEvidence"
+                  },
+                  {
+                    "$ref": "#/$defs/CatalogEvidence"
+                  }
+                ]
+              }
+            }
+          },
+          "required": [
+            "identity",
+            "ecosystem",
+            "evidence"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -8967,7 +9598,7 @@
               "additionalProperties": false,
               "properties": {
                 "rulesVersion": {
-                  "const": "rules:v1"
+                  "const": "rules:v2"
                 },
                 "indexGeneration": {
                   "type": "string"
@@ -8999,13 +9630,19 @@
                 "unassigned": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/Identity"
+                    "$ref": "#/$defs/Destination"
                   }
                 },
                 "limitations": {
                   "type": "array",
                   "items": {
                     "type": "string"
+                  }
+                },
+                "externalPackages": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/ExternalPackage"
                   }
                 }
               },
@@ -9019,7 +9656,8 @@
                 "counts",
                 "testCounts",
                 "unassigned",
-                "limitations"
+                "limitations",
+                "externalPackages"
               ]
             },
             "evidenceBasis": {
@@ -9138,7 +9776,7 @@
           "$ref": "#/$defs/Identity"
         },
         "destination": {
-          "$ref": "#/$defs/Identity"
+          "$ref": "#/$defs/Destination"
         }
       },
       "required": [
@@ -9213,9 +9851,227 @@
         "SyntaxId": {
           "pattern": "^sid:v1:[0-9a-f]{32}$",
           "type": "string"
+        },
+        "ExternalIdentity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "externalPackage"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "package": {
+              "$ref": "#/$defs/Text"
+            },
+            "standardLibrary": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "sourceSetId",
+            "language",
+            "package",
+            "standardLibrary"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_-]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "std",
+                      "core",
+                      "alloc"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z0-9._-]+:[A-Za-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "java",
+                      "javax"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![\\s\\S]*--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?:(?![._])[a-z0-9._-]+|@(?![._])[a-z0-9._-]+/(?![._])[a-z0-9._-]+)(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Destination": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Identity"
+            },
+            {
+              "$ref": "#/$defs/ExternalIdentity"
+            }
+          ]
         }
       },
-      "$schema": "https://json-schema.org/draft/2020-12/schema"
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "destination"
+            ]
+          },
+          "then": {
+            "properties": {
+              "rule": {
+                "enum": [
+                  "$layers",
+                  "$external"
+                ]
+              }
+            }
+          }
+        }
+      ]
     },
     "name": "trellis_rules_explain",
     "outputSchema": {
@@ -9889,7 +10745,7 @@
               "$ref": "#/$defs/Identity"
             },
             "target": {
-              "$ref": "#/$defs/Identity"
+              "$ref": "#/$defs/Destination"
             },
             "count": {
               "$ref": "#/$defs/UInt"
@@ -10069,7 +10925,7 @@
             "destination": {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/Identity"
+                  "$ref": "#/$defs/Destination"
                 },
                 {
                   "type": "null"
@@ -10295,6 +11151,318 @@
             "catchingUp"
           ],
           "type": "object"
+        },
+        "ExternalIdentity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "externalPackage"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "package": {
+              "$ref": "#/$defs/Text"
+            },
+            "standardLibrary": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "sourceSetId",
+            "language",
+            "package",
+            "standardLibrary"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_-]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "rust"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "std",
+                      "core",
+                      "alloc"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z0-9._-]+:[A-Za-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "java"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "enum": [
+                      "java",
+                      "javax"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![\\s\\S]*--)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "python"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": false
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?:(?![._])[a-z0-9._-]+|@(?![._])[a-z0-9._-]+/(?![._])[a-z0-9._-]+)(?![\\s\\S])"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "language": {
+                    "const": "javascript"
+                  },
+                  "standardLibrary": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "package": {
+                    "pattern": "^(?![._])[a-z0-9._-]+(?![\\s\\S])"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Destination": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Identity"
+            },
+            {
+              "$ref": "#/$defs/ExternalIdentity"
+            }
+          ]
+        },
+        "ManifestEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "manifest"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "nativeRevisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "importRoot": {
+              "$ref": "#/$defs/Text"
+            },
+            "section": {
+              "$ref": "#/$defs/Text"
+            },
+            "key": {
+              "$ref": "#/$defs/Text"
+            },
+            "versionConstraint": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "sourceSetId",
+            "nativeRevisionId",
+            "dependencyHash",
+            "path",
+            "contentHash",
+            "importRoot",
+            "section",
+            "key",
+            "versionConstraint"
+          ]
+        },
+        "CatalogEvidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "standardLibraryCatalog"
+            },
+            "catalog": {
+              "const": "rust-standard-library:v1"
+            },
+            "entry": {
+              "enum": [
+                "std",
+                "core",
+                "alloc"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "catalog",
+            "entry"
+          ]
+        },
+        "ExternalPackage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/ExternalIdentity"
+            },
+            "ecosystem": {
+              "enum": [
+                "cargo",
+                "rust"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/ManifestEvidence"
+                  },
+                  {
+                    "$ref": "#/$defs/CatalogEvidence"
+                  }
+                ]
+              }
+            }
+          },
+          "required": [
+            "identity",
+            "ecosystem",
+            "evidence"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -10307,7 +11475,7 @@
               "additionalProperties": false,
               "properties": {
                 "rulesVersion": {
-                  "const": "rules:v1"
+                  "const": "rules:v2"
                 },
                 "indexGeneration": {
                   "type": "string"
@@ -10339,13 +11507,19 @@
                 "unassigned": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/$defs/Identity"
+                    "$ref": "#/$defs/Destination"
                   }
                 },
                 "limitations": {
                   "type": "array",
                   "items": {
                     "type": "string"
+                  }
+                },
+                "externalPackages": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/ExternalPackage"
                   }
                 }
               },
@@ -10359,7 +11533,8 @@
                 "counts",
                 "testCounts",
                 "unassigned",
-                "limitations"
+                "limitations",
+                "externalPackages"
               ]
             },
             "evidenceBasis": {

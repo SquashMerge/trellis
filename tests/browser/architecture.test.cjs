@@ -184,7 +184,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await page.locator("#architecture-notices > summary").click();
   await page.getByRole("button", {name:"Inspect unresolved sites", exact:true}).click();
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Unresolved structural references");
-  assert.match(await page.locator("#architecture-inspector-content").textContent(), /rust_non_crate_path/);
+  assert.match(await page.locator("#architecture-inspector-content").textContent(), /external::unknown/);
   await page.getByRole("button", {name:"Inspect same-layer and unassigned references", exact:true}).click();
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /src\/unassigned\.rs/);
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /src\/top\.rs.*1 reference sites/is);

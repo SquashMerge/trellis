@@ -173,3 +173,43 @@ test("Architecture rejects wrong role echo and labels unavailable production pop
   assert.match(text(h.get("architecture-inspector-content")), /No production callables.*unavailable, not zero/);
   assert.match(text(h.get("architecture-legend")), /production callables/);
 });
+
+
+test("external package evidence and deny results display without fabricated native metrics or source", async () => {
+  const h = harness(), payload = fixture();
+  const external = {kind:"externalPackage",sourceSetId:"workspace",language:"rust",package:"legacy-db",standardLibrary:false};
+  const descriptor = {identity:external,ecosystem:"cargo",evidence:[{
+    kind:"manifest",sourceSetId:"workspace",nativeRevisionId:"native-revision",dependencyHash:"dependencies-hash",
+    path:"Cargo.toml",contentHash:"manifest-hash",importRoot:"legacy_db",section:"dependencies",key:"legacy-db",versionConstraint:"1",
+  }]};
+  const site = {role:"production",relationKind:"import",spelling:"legacy_db::*",lines:{start:2,end:2},range:{start:10,end:22},ownerSyntaxId:"owner",callId:null};
+  const pair = {source:payload.modules[0].identity,target:external,count:1,sites:[site],omittedSites:0,mapping:"structural"};
+  payload.layers.push({name:"External",order:3,shared:false});
+  payload.references.externalPackages = [descriptor];
+  payload.references.production.push(pair);
+  payload.references.counts.mappedSites++;
+  payload.rules.instances.push(
+    {rule:"$layers",target:pair.source,destination:external,sourceLayer:"UI",destinationLayer:"External",status:"conforms",excepted:false,referenceCount:1},
+    {rule:"$external",target:pair.source,destination:external,status:"deviates",excepted:false,referenceCount:1},
+  );
+  payload.edges.push({sourceLayer:"UI",destinationLayer:"External",role:"production",count:1,status:"conforms",excepted:false,exceptionReason:null,pairs:[pair]});
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  assert.equal(h.renders.length, 1);
+  const {view,options} = h.renders[0];
+  assert.equal(view.modules.length, 2, "package remains a descriptor, never a native measured module");
+  assert.equal(view.modules.some(module => module.identity.kind === "externalPackage"), false);
+  assert.equal(options.moduleValue(descriptor), undefined, "no metric value is invented for a package");
+  assert.match(text(h.get("architecture-notice-content")), /External policy results.*\$external.*legacy-db.*deviates/s);
+  assert.match(text(h.get("architecture-notice-content")), /External packages and captured evidence.*Cargo\.toml.*manifest-hash/s);
+  const layer = view.layers.find(layer => layer.name === "External");
+  assert.match(options.layerLabel(layer), /0 files · 1 external packages/);
+  options.onSelectLayer(layer);
+  const inspector = text(h.get("architecture-inspector-content"));
+  assert.match(inspector, /External packages \(no native source or metrics\)/);
+  assert.match(inspector, /src\/a\.rs → legacy-db \(rust package\)/);
+  assert.match(inspector, /legacy-db.*manifest-hash/s);
+  assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.tagName === "button" && item.textContent === "Read indexed file source"), false);
+  await h.button("Read indexed reference source").fire("click");
+  assert.equal(h.reads.length, 1);
+  assert.equal(h.reads[0].site.path, "src/a.rs", "only the genuine importing native file can be read");
+});

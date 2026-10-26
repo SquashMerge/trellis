@@ -3606,6 +3606,7 @@ fn architecture_cli_pins_layer_deviations_references_and_exact_exceptions_withou
     let daemon = FixtureDaemon::new(&home);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::create_dir(root.join(".trellis")).unwrap();
+    fs::write(root.join("src/lib.rs"), "mod high; mod low;\n").unwrap();
     fs::write(root.join("src/high.rs"), "pub fn target() {}\n").unwrap();
     fs::write(
         root.join("src/low.rs"),
@@ -3917,6 +3918,7 @@ async fn architecture_cli_waits_for_startup_reconciliation_after_typed_admission
     let home = temp.path().join("home");
     let daemon = FixtureDaemon::new(&home);
     fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "mod high; mod low;\n").unwrap();
     fs::write(root.join("src/high.rs"), "pub fn target() {}\n").unwrap();
     fs::write(
         root.join("src/low.rs"),

@@ -2,7 +2,8 @@
 
 Trellis checks human-reviewed architecture in the fixed checkout file
 `.trellis/rules.toml`. It does not infer layers during a check or write rules.
-This first slice groups indexed **file modules by path**, not packages. It exposes
+Layers select indexed **native file modules by path** and proved **external package
+identities**. Package targets are not native modules or resolved library symbols. It exposes
 read-only references, rule check/explain tools, a proposal prompt and
 `trellis rules check --format json`. See the [MCP wire contract](mcp-readonly-pilot-contract.md)
 for transport, attribution and limits.
@@ -62,6 +63,49 @@ For an observed production structural reference pair:
 Conformance describes **that observed structural pair**, not the absence of hidden
 semantic dependencies in a module. A stricter no-skipping rule is not implicit.
 
+## External package policy
+
+A layer needs a nonempty `paths` or `external` collection; either selects that
+layer. External selectors are closed objects with all three fields required:
+
+```toml
+[external_policy]
+deny = [{ language = "rust", package = "legacy-db", stdlib = false }]
+
+[layers.adapters]
+order = 2
+external = [{ language = "rust", package = "serde_json", stdlib = false }]
+
+[layers.foundation]
+shared = true
+external = [{ language = "rust", package = "std", stdlib = true }]
+```
+
+`language` is `rust`, `java`, `python` or `javascript`. `package` is a literal
+canonical identity, not a glob, import alias or version; `stdlib` is required and
+distinguishes standard-library targets from declared dependencies of the same
+spelling. Canonical dependency names are Cargo's upstream declared package name
+(preserving hyphens/underscores), Maven `groupId:artifactId`, PEP 503-normalized
+Python distribution name, and exact npm name or `@scope/name`. Import bindings
+and version constraints are evidence, not identity. Unknown fields and invalid
+identifiers are located `invalid_rules` errors. Repeats within a layer deduplicate;
+two different layers selecting one external identity are a located ambiguity.
+These arrays share existing configuration collection/work bounds.
+
+`[external_policy]` accepts only optional `deny`. An absent or empty list means no
+external bans. Every positively observed matching external edge emits a reserved
+`$external` instance with `status:"deviates"`, even if its source has no layer.
+Nonmatches emit no `$external` row; absent edges do not prove absence. Aggregate
+by source module, external identity and stored production/test role with the
+existing exact counts and bounded samples. Test-only instances never fail the
+production CLI check. Unproved roots stay unknown, never guessed to match a ban.
+
+`$layers` still checks direction for assigned external destinations. A ban and a
+layer violation can both be reported: two policy instances, not two references.
+`$external` has no exceptions. Remove or narrow a ban through a reviewed policy
+edit. Neither declaration exceptions nor module-to-module exceptions accept
+external package destinations.
+
 ## Roles and constraints
 
 ```toml
@@ -81,8 +125,8 @@ require = [{ calls = "service" }]
 forbid = [{ calls = "repository" }]
 ```
 
-The closed top-level keys are `version`, `layer_policy`, `layers`, `roles`, `rules`
-and `exceptions`. `version` is required and exactly `1`; optional collections
+The closed top-level keys are `version`, `layer_policy`, `external_policy`, `layers`,
+`roles`, `rules` and `exceptions`. `version` is required and exactly `1`; optional collections
 start empty. A selector has at least one of `paths`, `name`, `language`, `extends`
 and `implements`. Keys combine with AND; entries within `paths` or `language`
 combine with OR. Languages are `java`, `rust`, `python`, `javascript`. Name patterns
@@ -110,9 +154,9 @@ edge never establishes a violation.
 An instance is `conforms`, `deviates` or `unknown`. A proven deviation wins over
 uncertainty, but uncertainty remains in the details. Instances deduplicate by
 `(rule, sourceSetId, language, path, sid)`, even if roles/selectors overlap. Layer
-checking uses the reserved rule `$layers` and one instance per observed source to
-destination file-module pair. Absent or empty `layers` disables `$layers` checks;
-unassigned module identities remain informational. Ordinary declaration rules
+checking uses the reserved rule `$layers` and one instance per observed native
+source to native-module or external-package destination pair. Absent or empty `layers` disables `$layers` checks;
+unassigned native module and observed external identities remain informational. Ordinary declaration rules
 still run and the references view remains available.
 
 ## Path patterns
@@ -136,10 +180,14 @@ or occurrence IDs and proof; derived structural mapping is labelled as such.
 
 Supported mapping is deliberately narrow:
 
-- **Rust:** explicit maximal `crate::...` paths/use leaves; unique conventional
-  `src/x.rs` or `src/x/mod.rs` file prefixes. Nested path prefixes are not counted
-  again. Aliases/reexports, wildcard expansion, custom roots/`#[path]`, macro token
-  trees and ambiguous inline/module layouts are not compiler-resolved.
+- **Rust:** proved conventional module roots and lexical `crate`/`self`/`super`
+  paths, explicit aliases/reexports and wildcard name exposure follow at most four
+  import/reexport edges. Native final-owner mapping and real intermediate-module
+  proof stay distinct. A wildcard can provide positive native mappings while
+  residual unknowns remain; no native or external member inventory is invented.
+  Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
+  targets, never semantic calls. Custom roots/`#[path]`, macro/cfg uncertainty,
+  ambiguous ownership and depth beyond four remain unknown.
 - **JavaScript:** static relative imports/reexports/side-effect imports; unique
   explicit indexed extension or `.js`/`.mjs`/`.cjs` and `index.js` convention.
   Bare, dynamic and ambiguous imports remain unresolved.
@@ -151,9 +199,13 @@ Supported mapping is deliberately narrow:
 
 Comments and string decoys are ignored; actual import module-specifier strings
 are syntax. Unsupported coverage and unresolved counts stay visible. Paths hidden
-behind aliases are not claimed covered. This is **syntactic, structurally mapped
-reference evidence**, not a compiler dependency graph, package membership or call
-binding. A positive mapped upward reference can deviate under this syntax contract;
+behind unproved aliases are not claimed covered. Rust/Java external-name
+uncertainty does not veto an independently proved in-repo wildcard name; two
+native candidates, macro/cfg uncertainty or unproved explicit bindings still do.
+Python/JavaScript retain wildcard-only names as unknown under external-name
+uncertainty unless an explicit/local binding settles them. This is **syntactic,
+structurally mapped reference evidence**, not a compiler dependency graph,
+resolved library membership or call binding. A positive mapped upward reference can deviate under this syntax contract;
 no observed edges cannot prove no semantic dependencies.
 
 Counts aggregate `(source module, destination module, source role)`, with bounded
@@ -184,8 +236,12 @@ An exception names an existing `rule`, an exact `target` and a nonblank `reason`
 The TOML target fields are `source_set`, `language`, `path`, `sid`; use the actual
 emitted source-set ID and native SID, not a name or presentation label. For `$layers`,
 `target` identifies the source module and required `destination` identifies the
-exact destination module in the same shape. Ordinary declaration exceptions have
-no destination. JSON identities use `sourceSetId` in place of TOML `source_set`.
+exact native destination module in the same full identity shape. Ordinary
+declaration exceptions have no destination. The approved portable module-to-module
+form `{language,path}` is a **separate follow-up PR, not available in this Rust
+slice**. Until that PR lands, both module endpoints require `source_set`,
+`language`, `path` and `sid`; proposals must use only this parser-valid full form.
+The future portable form remains module-only, never a package selector. `$external` has no exceptions. JSON identities use `sourceSetId` in place of TOML `source_set`.
 
 An exact exception keeps the underlying status and evidence, sets `excepted=true`
 and records its reason. It is excluded from deviation totals. An approved module
@@ -211,7 +267,7 @@ to live source. Missing config permits a proposal from scratch; check/explain fa
 `rules_not_found`. Malformed config fails all three atomically with a located error.
 
 `trellis_rules_explain` filters the same evaluated instances by exact rule/target
-and, for `$layers`, destination; it does not interpret a rule a second way.
+and, for `$layers` or `$external`, the actual native/external destination identity; it does not interpret a rule a second way.
 `trellis rules check --format json` uses that same daemon evaluator. Unexcepted
 production deviations fail the command; unknown-only evaluation succeeds.
 Parser and operational failures retain ordinary nonzero error exits, not an
@@ -259,7 +315,12 @@ All objects below are closed; all listed fields are required. `UInt`, `Range`,
 `DocumentKey`, language tags and the complete code pin follow the
 [MCP shared types](mcp-readonly-pilot-contract.md#shared-schema-and-limits).
 `Target` is exactly `{sourceSetId,language,path,sid}`; `sid` is an actual native
-file-module/declaration SID, not a display label. A config descriptor is exactly
+file-module/declaration SID, not a display label. Sources and rule targets always
+use this native shape. `Destination` is the closed union of `Target` and
+`{kind:"externalPackage",sourceSetId,language,package,standardLibrary}`. The full
+source-set/language/package/standard-library tuple defines external equality.
+No path, SID, native declaration, DocumentKey, source metric or semantic call target
+is invented for a package. A config descriptor is exactly
 `{path:".trellis/rules.toml",source:"checkout-config",contentHash}`.
 
 ### References data
@@ -267,13 +328,21 @@ file-module/declaration SID, not a display label. A config descriptor is exactly
 `trellis_references` data is exactly:
 
 ```text
-{referencesVersion:"references:v1",indexGeneration,indexRevision,
+{referencesVersion:"references:v2",indexGeneration,indexRevision,
  evidenceTier:"syntax",semanticComplete:false,
- modules:Module[],production:Edge[],tests:Edge[],unresolved:Unresolved[],
+ modules:Module[],externalPackages:ExternalPackage[],
+ production:Edge[],tests:Edge[],unresolved:Unresolved[],
  counts:{scannedDocuments:UInt,mappedSites:UInt,unresolvedSites:UInt},
  limitations:string[]}
 Module = {identity:Target,revisionId,contentHash,provenanceId}
-Edge = {source:Target,target:Target,count:UInt,sites:Site[],
+ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust",evidence:PackageEvidence[]}
+ExternalIdentity = {kind:"externalPackage",sourceSetId,language,package,standardLibrary:boolean}
+PackageEvidence = ManifestEvidence | CatalogEvidence
+ManifestEvidence = {kind:"manifest",sourceSetId,nativeRevisionId,dependencyHash,
+                    path,contentHash,importRoot,section,key,versionConstraint:string|null}
+CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:v1",
+                   entry:"std"|"core"|"alloc"}
+Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
         omittedSites:UInt,mapping:"structural"}
 Unresolved = {source:Target,site:Site,reason:string}
 Site = {ownerSyntaxId:string|null,role:"production"|"test"|null,
@@ -281,14 +350,54 @@ Site = {ownerSyntaxId:string|null,role:"production"|"test"|null,
         spelling:string,callId:string|null}
 ```
 
+Each external descriptor has nonempty `evidence`. The current Rust producer derives
+`ecosystem:"cargo"` for declared packages and `ecosystem:"rust"` for the reviewed
+Rust standard-library catalog. Manifest evidence identifies the selected source
+set/native revision and retained dependency hash, captured manifest path/content
+hash, actual import root, declaration section/key and nullable original version
+constraint. Catalog evidence identifies a reviewed code-shipped entry, not a
+detected installed runtime. No precise source range is invented. Package evidence
+is capture/catalog evidence, not native measured syntax provenance; actual source
+sites and native intermediate-module proof remain separate.
+
+Captured root Cargo bytes come from the selected revision's retained dependencies
+through the same admitted read and transaction as source. There are no live
+manifest reads, Cargo invocations, installed-library reads or parallel caches.
+Malformed repository manifests stay unproved, not empty dependencies. Malformed
+stored components fail with the existing typed integrity failure. Manifest parsing
+shares the existing source/stored-byte and work bounds, with cancellation before
+growth and atomic typed failure on exhaustion.
+
+The first Rust slice applies root Cargo evidence only to proved conventional root
+entry/module chains. Nested/workspace members, inherited dependencies without a
+member binding, custom roots and unproved ownership remain unknown. Root
+bindings distinguish upstream package names from Cargo keys/renames (including
+hyphen normalization). Conflicting normalized bindings and local path dependencies
+are not guessed external packages. Sections, optional and target qualifiers do
+not prove installation/activation or change stored site roles. In particular,
+`build-dependencies` and `dev-dependencies` are retained declaration evidence,
+not a claim that Cargo exposes them to a production lib/bin target. Conflicting
+identities across sections stay unknown; target-applicable Cargo bindings would
+require a separate contract change. `std/core/alloc` are reviewed root labels,
+not member/API inventories. Java/Python/JavaScript
+share the external identity shape but their package adapters are later work;
+Maven groups and Python distribution names alone do not prove import prefixes.
+
+The Rust name inventory does not register foreign function-signature bindings or
+expand procedural derives. Names introduced by those forms are not a complete
+export or shadowing inventory; they are an unsupported coverage gap, not proof
+that no competing name exists. This projection is not compiler name resolution.
+
 `Lines` is the existing inclusive 1-based line shape or null. Target mapping
 always uses the full admitted snapshot module map internally. By the
 [owner's #347 ruling](https://github.com/SquashMerge/trellis/issues/347#issuecomment-6415629907),
 `modules` emits only the module/proof closure of selected sources (including
-sources with no sites) and destinations of emitted production or test edges.
+sources with no sites), native destinations of emitted production or test edges,
+and real native intermediate-module proof closure. `externalPackages` contains
+only descriptors for emitted external destinations, never inserted into `modules`.
 Every emitted module retains its native revision, content hash and provenance.
 A source filter matching no documents returns empty `modules`, `production`,
-`tests` and `unresolved` arrays with zero counts; this is a complete empty
+`tests`, `externalPackages` and `unresolved` arrays with zero counts; this is a complete empty
 structural scope, not semantic completeness. Unrelated modules do not consume
 response bytes. No cap is raised and no verdict or proof is clipped; genuinely
 oversized selected evidence still fails atomically with `response_too_large`.
@@ -306,10 +415,11 @@ is invariant, including empty results.
 Both tools return exactly:
 
 ```text
-{rulesVersion:"rules:v1",indexGeneration,indexRevision,
- rulesFile:ConfigDescriptor,instances:Instance[],testOnly:Instance[],
- counts:Counts,testCounts:Counts,unassigned:Target[],limitations:string[]}
-Instance = {rule:string,target:Target,destination:Target|null,
+{rulesVersion:"rules:v2",indexGeneration,indexRevision,
+ rulesFile:ConfigDescriptor,externalPackages:ExternalPackage[],
+ instances:Instance[],testOnly:Instance[],
+ counts:Counts,testCounts:Counts,unassigned:Destination[],limitations:string[]}
+Instance = {rule:string,target:Target,destination:Destination|null,
             sourceLayer:string|null,destinationLayer:string|null,
             status:"conforms"|"deviates"|"unknown",excepted:boolean,
             exceptionReason:string|null,constraints:ConstraintResult[],
@@ -328,7 +438,8 @@ producer exists. Layer instances have no constraints; declaration instances have
 null layer/destination fields and `referenceCount:0`. An unresolved reference
 produces a `$layers` unknown instance with null destination, aggregated by source.
 Unassigned module identities are listed even when no reference exists, using
-the full snapshot module map. Empty or absent layers disables `$layers` instances,
+the full snapshot module map and observed unassigned external identities. Empty
+or absent layers disables `$layers` instances,
 not this informational list, ordinary declaration rules or references.
 
 Counts are independent for production and tests. `comparable` includes exceptions;
@@ -342,7 +453,11 @@ explicit native document/revision/hash/provenance links rather than the existing
 find/declaration/call tools' `coverage`/`provenance` array closure; that older
 closure contract is unchanged for those tools. No new snapshot or semantic proof
 is invented. Explain filters both arrays
-by the exact identity and recomputes counts for that filtered output.
+by the exact identity and recomputes counts for that filtered output. Check and
+explain include the external descriptors needed by returned instances and
+unassigned identities; explain preserves its informational unassigned catalog.
+These pre-release `references:v2` / `rules:v2` shapes replace v1 without a
+compatibility mode.
 
 ## Proposal workflow
 
@@ -367,5 +482,5 @@ are never clipped to make them fit.
 This document does not certify production Claude Code interoperability or
 interactive command display. Those require observations against the built Trellis
 binary, not schema validation alone.
-Package entities, framework/DI/events, automatic architecture inference, mining,
+Resolved library members/APIs, framework/DI/events, automatic architecture inference, mining,
 SARIF and the #121 UI remain separate work.

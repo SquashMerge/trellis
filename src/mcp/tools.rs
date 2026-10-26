@@ -169,8 +169,8 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                     .is_some_and(super::architecture::valid_identity)
                 || !o
                     .get("destination")
-                    .is_none_or(super::architecture::valid_identity)
-                || (rule != "$layers" && o.contains_key("destination"))
+                    .is_none_or(super::architecture::valid_destination)
+                || (!matches!(rule, "$layers" | "$external") && o.contains_key("destination"))
             {
                 return Err("invalid_request");
             }

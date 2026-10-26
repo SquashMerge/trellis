@@ -17,7 +17,7 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
     for (path, source) in [
         (
             "src/lib.rs",
-            "pub fn entry() {crate::store::run();crate::peer::run();crate::shared::run();crate::entry::run();}\n",
+            "mod store; mod peer; mod shared; mod entry; mod other; mod unknown; mod empty; pub fn entry() {crate::store::run();crate::peer::run();crate::shared::run();crate::entry::run();}\n",
         ),
         (
             "src/store.rs",

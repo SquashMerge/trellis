@@ -61,6 +61,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
             index_revision: 4,
         },
         documents,
+        manifests: vec![],
     }
 }
 fn evaluate(text: &str, snapshot: &Snapshot) -> Value {
@@ -163,7 +164,7 @@ fn rules_layer_order_shared_and_explicit_policy_are_not_table_order() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "fn f(){crate::service::run();crate::peer::run();crate::shared::run();}",
+            "mod service; mod entry; mod peer; mod shared; fn f(){crate::service::run();crate::peer::run();crate::shared::run();}",
         ),
         ("src/service.rs", "pub fn run(){crate::entry::run();}"),
         ("src/entry.rs", "pub fn run(){}"),
@@ -237,7 +238,10 @@ paths=["src/shared.rs"]
 #[test]
 fn rules_absent_policy_keys_default_to_forbid_with_independent_allow_overrides() {
     let input = snapshot(&[
-        ("src/lib.rs", "fn run(){crate::peer::run();}"),
+        (
+            "src/lib.rs",
+            "mod peer; mod shared; fn run(){crate::peer::run();}",
+        ),
         ("src/peer.rs", "pub fn run(){}"),
         ("src/shared.rs", "pub fn run(){crate::peer::run();}"),
     ]);
@@ -276,7 +280,10 @@ paths=["src/shared.rs"]
 #[test]
 fn rules_layer_exceptions_are_exact_edge_pairs_and_tests_stay_separate() {
     let input = snapshot(&[
-        ("src/lib.rs", "pub fn root(){}"),
+        (
+            "src/lib.rs",
+            "mod store; mod entry; mod other; pub fn root(){}",
+        ),
         (
             "src/store.rs",
             "pub fn run(){crate::entry::run();crate::other::run();}\n#[cfg(test)] mod tests{fn f(){crate::entry::run();}}\n#[cfg(feature=\"test-support\")] fn seam(){crate::entry::run();}",
@@ -317,7 +324,14 @@ fn rules_layer_exceptions_are_exact_edge_pairs_and_tests_stay_separate() {
     assert_eq!(data["testOnly"].as_array().unwrap().len(), 1);
     assert_eq!(data["testOnly"][0]["status"], "deviates");
     assert_eq!(data["testOnly"][0]["unresolved"], json!(["test_only"]));
-    let explained = rules::explain(data.clone(), "$layers", target, Some(destination)).unwrap();
+    let explained = rules::explain(
+        data.clone(),
+        "$layers",
+        target,
+        Some(destination),
+        &mut || Ok(()),
+    )
+    .unwrap();
     assert_eq!(explained["instances"], json!([row]));
     let config = rules::parse(&text).unwrap();
     let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
@@ -477,4 +491,328 @@ fn rules_large_valid_glob_compilation_returns_located_error() {
     assert_eq!(d["attribution"], "token");
     assert_eq!(d["line"], 3);
     assert!(d["range"]["end"].as_u64().unwrap() > 1_000_000);
+}
+
+#[test]
+fn rules_external_selectors_are_literal_closed_and_allow_external_only_layers() {
+    let valid = r#"version=1
+[external_policy]
+deny=[{language="rust",package="legacy-db",stdlib=false}]
+[layers.registry]
+order=2
+external=[{language="rust",package="serde_json",stdlib=false}]
+[layers.foundation]
+shared=true
+paths=[]
+external=[{language="rust",package="std",stdlib=true}]
+"#;
+    assert!(rules::parse(valid).is_ok());
+    for selector in [
+        r#"{language="rust",package="serde"}"#,
+        r#"{language="rust",package="serde",stdlib=false,version="1"}"#,
+        r#"{language="rust",package="ser*",stdlib=false}"#,
+        r#"{language="rust",package="alias::item",stdlib=false}"#,
+        r#"{language="python",package="Some_Package",stdlib=false}"#,
+        r#"{language="javascript",package="@scope",stdlib=false}"#,
+        r#"{language="java",package="artifact",stdlib=false}"#,
+        r#"{language="kotlin",package="stdlib",stdlib=true}"#,
+    ] {
+        let text = format!("version=1\n[external_policy]\ndeny=[{selector}]");
+        let d = diagnostic(&text);
+        assert_eq!(d["code"], "invalid_rules", "{selector}");
+        assert!(d["line"].as_u64().unwrap() >= 2, "{d}");
+    }
+    for text in [
+        "version=1\n[layers.empty]\norder=1",
+        "version=1\n[layers.empty]\norder=1\npaths=[]\nexternal=[]",
+        "version=1\n[external_policy]\nallow=[]",
+        "version=1\n[roles.a]\nselect={name='a'}\n[[rules]]\nid='$external'\nfor_each='a'\nrequire=[{calls='a'}]",
+    ] {
+        assert_eq!(diagnostic(text)["code"], "invalid_rules");
+    }
+}
+
+#[test]
+fn rules_external_selector_collections_use_existing_limits() {
+    let selector = "{language='rust',package='serde',stdlib=false}";
+    let selectors = vec![selector; 1025].join(",");
+    for text in [
+        format!("version=1\n[external_policy]\ndeny=[{selectors}]"),
+        format!("version=1\n[layers.a]\norder=1\nexternal=[{selectors}]"),
+    ] {
+        assert_eq!(diagnostic(&text)["kind"], "too_large");
+    }
+    assert!(rules::parse("version=1\n[external_policy]\ndeny=[]").is_ok());
+}
+
+// Policy fixtures start with admitted native source/site evidence and substitute only
+// the projected package target. Manifest proof is exercised by references tests.
+fn projected_package(input: &Snapshot, package: &str, stdlib: bool) -> references::Projection {
+    let mut refs = references::project(input, &[], 1, &mut || Ok(())).unwrap();
+    let document = input
+        .documents
+        .iter()
+        .find(|d| d.key.path == "src/lib.rs")
+        .unwrap();
+    let module = document
+        .declarations
+        .iter()
+        .find(|d| d.kind == "module" && d.ancestors.is_empty())
+        .unwrap();
+    let source = json!({"sourceSetId":document.key.source_set_id,"language":document.key.language,
+        "path":document.key.path,"sid":module.syntax_id});
+    let target = json!({"kind":"externalPackage","sourceSetId":source["sourceSetId"],
+        "language":"rust","package":package,"standardLibrary":stdlib});
+    let site =
+        json!({"range":{"start":0,"end":1},"ownerSyntaxId":null,"callId":null,"role":"production"});
+    refs.data["production"] = json!([{"source":source,"target":target,"count":3,"sites":[site]}]);
+    refs.data["tests"] = json!([{"source":source,"target":target,"count":2,"sites":[{
+        "range":{"start":0,"end":1},"ownerSyntaxId":null,"callId":null,"role":"test"}]}]);
+    refs.data["unresolved"] = json!([]);
+    refs.data["externalPackages"] = json!([{"identity":target,"ecosystem":"cargo","evidence":[{
+        "kind":"policyFixture","importRoot":package}]}]);
+    refs
+}
+
+#[test]
+fn rules_external_bans_ignore_source_assignment_and_preserve_counts_samples_and_roles() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let refs = projected_package(&input, "legacy-db", false);
+    let config = rules::parse(
+        "version=1\n[external_policy]\ndeny=[{language='rust',package='legacy-db',stdlib=false}]",
+    )
+    .unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert_eq!(data["rulesVersion"], "rules:v2");
+    assert_eq!(data["instances"].as_array().unwrap().len(), 1);
+    let row = &data["instances"][0];
+    assert_eq!(row["rule"], "$external");
+    assert_eq!(row["status"], "deviates");
+    assert_eq!(row["sourceLayer"], Value::Null);
+    assert_eq!(row["referenceCount"], 3);
+    assert_eq!(row["evidence"].as_array().unwrap().len(), 1);
+    assert_eq!(row["excepted"], false);
+    assert_eq!(data["counts"]["deviates"], 1);
+    assert_eq!(data["testCounts"]["deviates"], 1);
+    assert_eq!(data["testOnly"][0]["rule"], "$external");
+    assert_eq!(data["testOnly"][0]["referenceCount"], 2);
+    assert_eq!(data["testOnly"][0]["unresolved"], json!(["test_only"]));
+    assert_eq!(data["externalPackages"], refs.data["externalPackages"]);
+    assert!(
+        data["unassigned"]
+            .as_array()
+            .unwrap()
+            .contains(&row["destination"])
+    );
+    for text in [
+        "version=1",
+        "version=1\n[external_policy]\ndeny=[]",
+        "version=1\n[external_policy]\ndeny=[{language='rust',package='other',stdlib=false}]",
+    ] {
+        let config = rules::parse(text).unwrap();
+        let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+        assert!(data["instances"].as_array().unwrap().is_empty());
+        assert!(data["testOnly"].as_array().unwrap().is_empty());
+    }
+    let config = rules::parse(
+        "version=1\n[external_policy]\ndeny=[{language='rust',package='legacy-db',stdlib=false}]",
+    )
+    .unwrap();
+    let data = rules::evaluate(
+        &config,
+        &input,
+        &refs,
+        &["absent.rs".into()],
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert!(data["instances"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn rules_external_layers_and_bans_are_distinct_policies_with_closed_descriptor_explain() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let refs = projected_package(&input, "legacy-db", false);
+    let text = "version=1\n[external_policy]\ndeny=[{language='rust',package='legacy-db',stdlib=false}]\n[layers.source]\norder=2\npaths=['src/lib.rs']\n[layers.package]\norder=1\nexternal=[{language='rust',package='legacy-db',stdlib=false},{language='rust',package='legacy-db',stdlib=false}]";
+    let config = rules::parse(text).unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert_eq!(data["instances"].as_array().unwrap().len(), 2);
+    for row in data["instances"].as_array().unwrap() {
+        assert_eq!(row["referenceCount"], 3);
+        assert_eq!(row["status"], "deviates");
+        assert_eq!(row["sourceLayer"], "source");
+        assert_eq!(row["destinationLayer"], "package");
+    }
+    let row = &data["instances"][0];
+    let explained = rules::explain(
+        data.clone(),
+        "$external",
+        &row["target"],
+        Some(&row["destination"]),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(explained["instances"].as_array().unwrap().len(), 1);
+    assert_eq!(explained["externalPackages"], refs.data["externalPackages"]);
+    assert_eq!(explained["testOnly"].as_array().unwrap().len(), 1);
+    let invalid = format!(
+        "{text}\n[layers.conflict]\nshared=true\nexternal=[{{language='rust',package='legacy-db',stdlib=false}}]"
+    );
+    let error = match rules::parse(&invalid) {
+        Err(error) => error,
+        Ok(config) => rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap_err(),
+    };
+    assert_eq!(rules::diagnostic(&error).unwrap()["kind"], "ambiguity");
+    let mut missing = refs;
+    missing.data["externalPackages"] = json!([]);
+    assert!(
+        rules::evaluate(&config, &input, &missing, &[], &mut || Ok(()))
+            .unwrap_err()
+            .to_string()
+            .starts_with("store_unavailable:")
+    );
+}
+
+#[test]
+fn rules_external_explain_propagates_package_closure_cancellation() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let refs = projected_package(&input, "std", true);
+    let config = rules::parse(
+        "version=1\n[external_policy]\ndeny=[{language='rust',package='std',stdlib=true}]",
+    )
+    .unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    let row = &data["instances"][0];
+    let error = rules::explain(
+        data.clone(),
+        "$external",
+        &row["target"],
+        Some(&row["destination"]),
+        &mut || anyhow::bail!("cancelled"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "cancelled");
+}
+
+#[test]
+fn rules_external_stdlib_and_dependency_names_are_disjoint_and_unknowns_are_not_bans() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let refs = projected_package(&input, "std", false);
+    let config = rules::parse(
+        "version=1\n[external_policy]\ndeny=[{language='rust',package='std',stdlib=true}]",
+    )
+    .unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert!(data["instances"].as_array().unwrap().is_empty());
+    let refs = projected_package(&input, "std", true);
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert_eq!(data["instances"][0]["rule"], "$external");
+    let mut unknown = refs;
+    unknown.data["unresolved"] = json!([{"source":unknown.data["production"][0]["source"],
+        "site":{"range":{"start":0,"end":1},"ownerSyntaxId":null,"callId":null,"role":"production"},
+        "reason":"module_path_not_indexed"}]);
+    unknown.data["production"] = json!([]);
+    unknown.data["tests"] = json!([]);
+    unknown.data["externalPackages"] = json!([]);
+    let data = rules::evaluate(&config, &input, &unknown, &[], &mut || Ok(())).unwrap();
+    assert!(data["instances"].as_array().unwrap().is_empty());
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn rules_external_bans_have_no_exception_syntax() {
+    for text in [
+        "version=1\n[[exceptions]]\nrule='$external'\ntarget={source_set='set',language='rust',path='src/lib.rs',sid='sid:v1:00000000000000000000000000000000'}\nreason='no'",
+        "version=1\n[[exceptions]]\nrule='$layers'\ntarget={source_set='set',language='rust',path='src/lib.rs',sid='sid:v1:00000000000000000000000000000000'}\ndestination={language='rust',package='std',stdlib=true}\nreason='no'",
+    ] {
+        assert_eq!(diagnostic(text)["code"], "invalid_rules");
+    }
+}
+
+#[test]
+fn rules_external_explain_preserves_unassigned_and_trims_only_unused_assigned_descriptors() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let mut refs = projected_package(&input, "std", true);
+    let mut unused = refs.data["externalPackages"][0].clone();
+    unused["identity"]["package"] = json!("core");
+    refs.data["externalPackages"]
+        .as_array_mut()
+        .unwrap()
+        .push(unused);
+    let config = rules::parse("version=1\n[external_policy]\ndeny=[{language='rust',package='std',stdlib=true}]\n[layers.foundation]\nshared=true\nexternal=[{language='rust',package='core',stdlib=true}]").unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    assert_eq!(data["externalPackages"].as_array().unwrap().len(), 1);
+    let ban = data["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["rule"] == "$external")
+        .unwrap();
+    let explained = rules::explain(
+        data.clone(),
+        "$external",
+        &ban["target"],
+        Some(&ban["destination"]),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(explained["unassigned"], data["unassigned"]);
+    assert_eq!(explained["externalPackages"], data["externalPackages"]);
+    for destination in [
+        json!({"kind":"externalPackage","sourceSetId":"s","language":"rust","package":"std","standardLibrary":true,"extra":true}),
+        json!({"kind":"externalPackage","sourceSetId":"s","language":"rust","package":"std"}),
+        json!({"kind":"externalPackage","sourceSetId":"s","language":"rust","package":"*","standardLibrary":true}),
+    ] {
+        let error = rules::explain(
+            data.clone(),
+            "$external",
+            &ban["target"],
+            Some(&destination),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().starts_with("invalid_request:"), "{error}");
+    }
+}
+
+#[test]
+fn rules_external_layers_keep_order_shared_peer_and_source_filter_policies() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let refs = projected_package(&input, "serde", false);
+    for (source_mode, destination_mode, policy, expected) in [
+        ("order=1", "order=2", "", "conforms"),
+        ("order=2", "order=1", "", "deviates"),
+        ("order=1", "order=1", "", "deviates"),
+        (
+            "order=1",
+            "order=1",
+            "[layer_policy]\npeers='allow'",
+            "conforms",
+        ),
+        ("order=1", "shared=true", "", "conforms"),
+        ("shared=true", "order=1", "", "deviates"),
+        (
+            "shared=true",
+            "order=1",
+            "[layer_policy]\nshared_outbound='allow'",
+            "conforms",
+        ),
+    ] {
+        let config = rules::parse(&format!("version=1\n{policy}\n[layers.source]\n{source_mode}\npaths=['src/lib.rs']\n[layers.destination]\n{destination_mode}\nexternal=[{{language='rust',package='serde',stdlib=false}}]")).unwrap();
+        let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+        assert_eq!(data["instances"][0]["status"], expected);
+        assert_eq!(data["instances"][0]["rule"], "$layers");
+        assert!(data["unassigned"].as_array().unwrap().is_empty());
+        let filtered =
+            rules::evaluate(
+                &config,
+                &input,
+                &refs,
+                &["absent.rs".into()],
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert!(filtered["instances"].as_array().unwrap().is_empty());
+        assert!(filtered["externalPackages"].as_array().unwrap().is_empty());
+    }
 }
