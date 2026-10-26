@@ -38,6 +38,7 @@ mod parallel;
 pub mod references;
 pub mod rules;
 mod rust_sources;
+pub mod search_embed;
 pub mod store;
 #[doc(hidden)]
 pub mod testing;
