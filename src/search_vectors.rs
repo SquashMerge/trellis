@@ -2,7 +2,7 @@
 //!
 //! The budget caps the committed main database file. FULL auto-vacuum reclaims
 //! evicted pages at commit. A transaction's temporary rollback journal is extra.
-use std::{fs, os::unix::fs::MetadataExt, path::Path, time::Duration};
+use std::{fs, path::Path, time::Duration};
 
 use anyhow::{Result, ensure};
 use rusqlite::{
@@ -101,35 +101,14 @@ fn open(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
         let path = path.as_path();
         // Reuse the index store's retained witnesses: closing a separate raw FD
         // while any SQLite connection is live would drop POSIX process locks.
-        let file = crate::store::retained_sqlite_file(path, writable, writable, true)?;
-        let held = file.metadata()?;
-        let named = fs::symlink_metadata(path)?;
-        ensure!(
-            held.is_file()
-                && held.uid() == unsafe { libc::geteuid() }
-                && held.mode() & 0o777 == 0o600
-                && held.nlink() == 1
-                && named.is_file()
-                && !named.file_type().is_symlink()
-                && (held.dev(), held.ino()) == (named.dev(), named.ino()),
-            "unsafe vector cache file"
-        );
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = path.with_file_name(format!(
-                "{}{suffix}",
-                path.file_name().unwrap().to_string_lossy()
-            ));
-            ensure!(!present(&sidecar)?, "unsupported vector cache sidecar");
-        }
+        let _file = crate::store::retained_sqlite_file(path, writable, writable, true)?;
         let access = if writable {
             OpenFlags::SQLITE_OPEN_READ_WRITE
         } else {
             OpenFlags::SQLITE_OPEN_READ_ONLY
         };
-        let db = crate::store::protected_sqlite_open(
-            path,
-            access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
+        let db =
+            crate::store::protected_sqlite_open(path, access | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         storage(db.busy_timeout(BUSY_WAIT))?;
         if !writable {
             storage(db.pragma_update(None, "query_only", "ON"))?;
@@ -137,13 +116,22 @@ fn open(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
         Ok(db)
     })())
 }
+#[derive(Debug)]
+struct CacheFormat;
+impl std::fmt::Display for CacheFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incompatible vector cache format")
+    }
+}
+impl std::error::Error for CacheFormat {}
+
 fn validate(db: &rusqlite::Connection) -> Result<()> {
     let version: i64 = storage(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
     let journal: String = storage(db.pragma_query_value(None, "journal_mode", |row| row.get(0)))?;
     let vacuum: i64 = storage(db.pragma_query_value(None, "auto_vacuum", |row| row.get(0)))?;
     ensure!(
         version == 1 && journal == "delete" && vacuum == 1,
-        StoreUnavailable
+        anyhow::Error::new(CacheFormat).context(StoreUnavailable)
     );
     let mut statement = storage(db.prepare(
         "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -158,10 +146,8 @@ fn validate(db: &rusqlite::Connection) -> Result<()> {
                 ("vectors".to_owned(), TABLE.to_owned()),
                 ("vectors_lru".to_owned(), LRU_INDEX.to_owned())
             ],
-        StoreUnavailable
+        anyhow::Error::new(CacheFormat).context(StoreUnavailable)
     );
-    let integrity: String = storage(db.query_row("PRAGMA quick_check", [], |row| row.get(0)))?;
-    ensure!(integrity == "ok", StoreUnavailable);
     Ok(())
 }
 
@@ -175,6 +161,19 @@ impl VectorCacheWriter {
         Self::open_with_budget(path, DEFAULT_BYTE_BUDGET)
     }
     pub fn open_with_budget(path: &Path, byte_budget: u64) -> Result<Self> {
+        match Self::open_once(path, byte_budget) {
+            Err(error) if error.is::<CacheFormat>() || error.chain().any(|cause| {
+                matches!(cause.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(info, _))
+                    if matches!(info.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
+            }) => {
+                unavailable(crate::store::discard_sqlite_cache(path))?;
+                Self::open_once(path, byte_budget)
+            }
+            result => result,
+        }
+    }
+    fn open_once(path: &Path, byte_budget: u64) -> Result<Self> {
         let mut db = open(path, true)?;
         storage(db.pragma_update(None, "synchronous", "FULL"))?;
         let version: i64 = storage(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
@@ -184,7 +183,10 @@ impl VectorCacheWriter {
             let tx = storage(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
             let count: i64 =
                 storage(tx.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0)))?;
-            ensure!(count == 0, StoreUnavailable);
+            ensure!(
+                count == 0,
+                anyhow::Error::new(CacheFormat).context(StoreUnavailable)
+            );
             storage(tx.execute_batch(TABLE))?;
             storage(tx.execute_batch(LRU_INDEX))?;
             storage(tx.pragma_update(None, "user_version", 1))?;
@@ -567,23 +569,60 @@ mod tests {
     }
 
     #[test]
-    fn wrong_schema_and_damaged_database_are_unavailable() {
+    fn writer_recreates_invalid_cache_while_readers_fail_typed() {
+        let (directory, writer) = cache(32 * 1024);
+        let path = directory.path().join("vectors.db");
+        drop(writer);
+        for damage in ["version", "schema", "corrupt"] {
+            if damage == "corrupt" {
+                fs::write(&path, b"not a SQLite database").unwrap();
+            } else {
+                let db = open(&path, true).unwrap();
+                if damage == "version" {
+                    db.pragma_update(None, "user_version", 2).unwrap();
+                } else {
+                    db.execute_batch("DROP INDEX vectors_lru").unwrap();
+                }
+            }
+            let error = match VectorCacheReader::open_existing(&path) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid cache accepted: {damage}"),
+            };
+            assert!(error.is::<StoreUnavailable>(), "{damage}: {error:#}");
+            let mut writer = VectorCacheWriter::open(&path).unwrap();
+            assert_eq!(writer.snapshot().unwrap().entry_count(), 0);
+            writer.put(&key(1), &key(2), &[1, -2]).unwrap();
+            assert_eq!(
+                writer.snapshot().unwrap().get(&key(1), &key(2)).unwrap(),
+                Some(vec![1, -2]),
+                "{damage}"
+            );
+        }
+    }
+
+    #[test]
+    fn recreation_defers_while_a_reader_connection_is_live() {
         let (directory, writer) = cache(32 * 1024);
         let path = directory.path().join("vectors.db");
         writer.db.pragma_update(None, "user_version", 2).unwrap();
         drop(writer);
-        let error = match VectorCacheReader::open_existing(&path) {
-            Err(error) => error,
-            Ok(_) => panic!("wrong schema accepted"),
-        };
-        assert!(error.is::<StoreUnavailable>());
-        // No SQLite connections remain when deliberately damaging this fixture.
-        fs::write(&path, b"not a SQLite database").unwrap();
+        let reader = open(&path, false).unwrap();
         let error = match VectorCacheWriter::open(&path) {
             Err(error) => error,
-            Ok(_) => panic!("damaged database accepted"),
+            Ok(_) => panic!("recreated a cache with a live reader"),
         };
-        assert!(error.is::<StoreUnavailable>());
+        assert!(error.is::<StorageBusy>(), "{error:#}");
+        let version: i64 = reader
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        drop(reader);
+        let mut writer = VectorCacheWriter::open(&path).unwrap();
+        writer.put(&key(1), &key(2), &[3]).unwrap();
+        assert_eq!(
+            writer.snapshot().unwrap().get(&key(1), &key(2)).unwrap(),
+            Some(vec![3])
+        );
     }
 
     #[test]

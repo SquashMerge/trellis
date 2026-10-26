@@ -43,10 +43,13 @@ The daemon owns one machine-wide `<cache>/vectors.db`, shared across checkouts. 
 The default LRU budget is 1 GiB for the database file, not just the vector payload. No checkout publication or evidence coverage depends on
 this optional derived cache. Reads do not write cache or age metadata.
 
-A row that fails typed decoding is a cache miss. Database integrity/schema/I/O failures are
-`store_unavailable`, not lexical-only success or partial results. Contention stays typed
-`storage_busy` with bounded waiting. `trellis gc --report` reports cache bytes and entry count
-without creating a database, touching LRU state or changing open age.
+A row that fails typed decoding is a cache miss. Database corruption/schema/I/O failures are
+`store_unavailable` for readers, not lexical-only success or partial results. Reads trust
+published rows and do not run a whole-database integrity scan. The daemon writer recreates
+a corrupt or incompatible disposable cache on open; it does not migrate old formats.
+I/O failures are not permission to discard the cache. Contention stays typed `storage_busy`
+with bounded waiting. `trellis gc --report` reports cache bytes and entry count without
+creating a database, touching LRU state or changing open age.
 
 Exact descriptor values and cache accounting are documented alongside their implementation.
 The chosen saved-card CPU/Metal parity remains the runtime evidence; a changed production
