@@ -887,6 +887,7 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
         )
         .unwrap();
     let revision = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    assert!(store.methods_at("flow.java", Some(pin)).unwrap().is_some());
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     // A wrong-length parent key deliberately violates FKs. Disable them only
     // on this mutation connection; the selected reader opens its own handle.
@@ -895,33 +896,102 @@ fn every_encoded_selected_id_rejects_wrong_length_blob() {
     // including nullable parent keys. The fixture must populate every one.
     // Reads trust the published index (#261), but a row that will not decode
     // is corruption: it fails typed and schedules a re-index.
+    // Pin each mutation to the Java fixture that populates all columns. When
+    // changing a grouping key, remove the group's final ordinal: removing an
+    // earlier row can expose a gap before the malformed key is decoded.
     let cases = [
-        ("graph_display_labels", "id", "gid"),
-        ("native_version_declarations", "syntax_id", "vid"),
-        ("native_version_declarations", "owner_syntax_id", "vid"),
-        ("native_version_declaration_ancestors", "syntax_id", "vid"),
-        ("native_version_own_signature_types", "syntax_id", "vid"),
+        ("graph_display_labels", "id", "gid", "t.id"),
+        (
+            "native_version_declarations",
+            "syntax_id",
+            "vid",
+            "t.syntax_id",
+        ),
+        (
+            "native_version_declarations",
+            "owner_syntax_id",
+            "vid",
+            "t.syntax_id",
+        ),
+        (
+            "native_version_declaration_ancestors",
+            "syntax_id",
+            "vid",
+            "t.syntax_id,t.ordinal DESC",
+        ),
+        (
+            "native_version_own_signature_types",
+            "syntax_id",
+            "vid",
+            "t.syntax_id,t.ordinal DESC",
+        ),
         (
             "native_version_ancestor_signature_types",
             "syntax_id",
             "vid",
+            "t.syntax_id,t.ancestor_ordinal,t.ordinal DESC",
         ),
-        ("native_version_headers", "syntax_id", "vid"),
-        ("native_version_header_items", "syntax_id", "vid"),
-        ("native_version_parameters", "syntax_id", "vid"),
-        ("native_version_calls", "id", "vid"),
-        ("native_version_calls", "owner_syntax_id", "vid"),
-        ("native_version_control_regions", "id", "vid"),
-        ("native_version_control_regions", "owner_syntax_id", "vid"),
-        ("native_version_control_regions", "parent_id", "vid"),
-        ("native_version_call_regions", "call_id", "vid"),
-        ("native_version_call_regions", "region_id", "vid"),
+        ("native_version_headers", "syntax_id", "vid", "t.syntax_id"),
+        (
+            "native_version_header_items",
+            "syntax_id",
+            "vid",
+            "t.syntax_id,t.item_kind,t.ordinal DESC",
+        ),
+        (
+            "native_version_parameters",
+            "syntax_id",
+            "vid",
+            "t.syntax_id,t.ordinal DESC",
+        ),
+        (
+            "native_version_calls",
+            "id",
+            "vid",
+            "t.owner_syntax_id,t.ordinal",
+        ),
+        (
+            "native_version_calls",
+            "owner_syntax_id",
+            "vid",
+            "t.owner_syntax_id,t.ordinal DESC",
+        ),
+        (
+            "native_version_control_regions",
+            "id",
+            "vid",
+            "t.owner_syntax_id,t.ordinal",
+        ),
+        (
+            "native_version_control_regions",
+            "owner_syntax_id",
+            "vid",
+            "t.owner_syntax_id,t.ordinal DESC",
+        ),
+        (
+            "native_version_control_regions",
+            "parent_id",
+            "vid",
+            "t.owner_syntax_id,t.ordinal",
+        ),
+        (
+            "native_version_call_regions",
+            "call_id",
+            "vid",
+            "t.call_id,t.ordinal DESC",
+        ),
+        (
+            "native_version_call_regions",
+            "region_id",
+            "vid",
+            "t.call_id,t.ordinal",
+        ),
     ];
-    for (table, column, scope) in cases {
+    for (table, column, scope, order) in cases {
         let selected = format!(
             "SELECT t.rowid,d.path FROM {table} t JOIN revision_documents d \
-             ON t.{scope}=d.{scope} WHERE d.revision_id=?1 \
-             AND t.{column} IS NOT NULL ORDER BY d.path,t.rowid LIMIT 1"
+             ON t.{scope}=d.{scope} WHERE d.revision_id=?1 AND d.path='flow.java' \
+             AND t.{column} IS NOT NULL ORDER BY {order} LIMIT 1"
         );
         let (rowid, path): (i64, String) = db
             .query_row(&selected, [&revision], |r| Ok((r.get(0)?, r.get(1)?)))
