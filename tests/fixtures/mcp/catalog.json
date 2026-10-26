@@ -9261,27 +9261,54 @@
           ]
         },
         "CatalogEvidence": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "standardLibraryCatalog"
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "rust-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "std",
+                    "core",
+                    "alloc"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             },
-            "catalog": {
-              "const": "rust-standard-library:v1"
-            },
-            "entry": {
-              "enum": [
-                "std",
-                "core",
-                "alloc"
-              ]
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "java-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "java",
+                    "javax"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             }
-          },
-          "required": [
-            "kind",
-            "catalog",
-            "entry"
           ]
         },
         "ExternalPackage": {
@@ -9294,7 +9321,8 @@
             "ecosystem": {
               "enum": [
                 "cargo",
-                "rust"
+                "rust",
+                "java"
               ]
             },
             "evidence": {
@@ -10891,27 +10919,54 @@
           ]
         },
         "CatalogEvidence": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "standardLibraryCatalog"
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "rust-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "std",
+                    "core",
+                    "alloc"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             },
-            "catalog": {
-              "const": "rust-standard-library:v1"
-            },
-            "entry": {
-              "enum": [
-                "std",
-                "core",
-                "alloc"
-              ]
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "java-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "java",
+                    "javax"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             }
-          },
-          "required": [
-            "kind",
-            "catalog",
-            "entry"
           ]
         },
         "ExternalPackage": {
@@ -10924,7 +10979,8 @@
             "ecosystem": {
               "enum": [
                 "cargo",
-                "rust"
+                "rust",
+                "java"
               ]
             },
             "evidence": {
@@ -12768,27 +12824,54 @@
           ]
         },
         "CatalogEvidence": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "standardLibraryCatalog"
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "rust-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "std",
+                    "core",
+                    "alloc"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             },
-            "catalog": {
-              "const": "rust-standard-library:v1"
-            },
-            "entry": {
-              "enum": [
-                "std",
-                "core",
-                "alloc"
-              ]
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "java-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "java",
+                    "javax"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             }
-          },
-          "required": [
-            "kind",
-            "catalog",
-            "entry"
           ]
         },
         "ExternalPackage": {
@@ -12801,7 +12884,8 @@
             "ecosystem": {
               "enum": [
                 "cargo",
-                "rust"
+                "rust",
+                "java"
               ]
             },
             "evidence": {

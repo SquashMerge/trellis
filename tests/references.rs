@@ -101,6 +101,27 @@ fn module_paths(data: &Value) -> Vec<&str> {
 }
 
 #[test]
+fn references_java_direct_package_wildcard_expands_public_type_owner() {
+    let input = snapshot(&[
+        ("app/Use.java", "package app; import pkg.*; class Use {}"),
+        ("types/Thing.java", "package pkg; public class Thing {}"),
+    ]);
+    let data = references::project(&input, &["app/Use.java".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(
+        has_edge(&data, "app/Use.java", "types/Thing.java"),
+        "{data}"
+    );
+    assert_eq!(
+        edge(&data, "production", "app/Use.java", "types/Thing.java")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
 fn references_rust_direct_wildcard_expands_public_declaration_owner() {
     let input = snapshot(&[
         ("src/lib.rs", "mod m; use crate::m::*;"),
@@ -278,7 +299,14 @@ fn references_relative_imports_and_java_unresolved_are_honest() {
         .map(|u| u["reason"].as_str().unwrap())
         .collect();
     assert!(reasons.contains(&"module_or_attribute_ambiguous"));
-    assert!(reasons.contains(&"java_package_mapping_unavailable"));
+    let java_unknowns: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["source"]["path"] == "A.java")
+        .map(|row| row["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert_eq!(java_unknowns, ["import example.B;", "example.B"]);
     assert!(reasons.contains(&"dynamic_import_unsupported"));
 }
 
@@ -1789,5 +1817,1031 @@ fn references_rust_repository_src_projects_within_existing_work_budget() {
         for path in ["src/store.rs", "src/model.rs"] {
             assert!(modules.contains(&path), "{paths:?}: {path}");
         }
+    }
+}
+
+fn project_java_source(input: &Snapshot, limit: usize) -> Value {
+    references::project(input, &["app/Use.java".into()], limit, &mut || Ok(()))
+        .unwrap()
+        .data
+}
+
+#[test]
+fn references_java_public_top_level_inventory_uses_declared_package_and_final_owners() {
+    let input = snapshot(&[
+        ("app/Use.java", "package app; import pkg.*; class Use {}"),
+        (
+            "odd/Class.java",
+            "package pkg; public class C { public class Nested {} }",
+        ),
+        ("odd/Interface.java", "package pkg; public interface I {}"),
+        ("odd/Enum.java", "package pkg; public enum E { VALUE }"),
+        (
+            "odd/Record.java",
+            "package pkg; public record R(int value) {}",
+        ),
+        ("odd/Hidden.java", "package pkg; class Hidden {}"),
+        ("odd/Child.java", "package pkg.child; public class Child {}"),
+        ("pkg/Decoy.java", "package elsewhere; public class Decoy {}"),
+        ("pkg/Default.java", "public class Default {}"),
+    ]);
+    let data = project_java_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 4, "{data}");
+    for target in [
+        "odd/Class.java",
+        "odd/Enum.java",
+        "odd/Interface.java",
+        "odd/Record.java",
+    ] {
+        assert_eq!(
+            edge(&data, "production", "app/Use.java", target)["count"],
+            1
+        );
+    }
+    assert_eq!(
+        module_paths(&data),
+        [
+            "app/Use.java",
+            "odd/Class.java",
+            "odd/Enum.java",
+            "odd/Interface.java",
+            "odd/Record.java"
+        ]
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_java_single_import_and_top_level_type_shadow_only_the_matching_name() {
+    for (source, explicit_target, unknowns) in [
+        (
+            "package app; import other.T; import pkg.*; class Use {}",
+            Some("other/T.java"),
+            0,
+        ),
+        (
+            "package app; import pkg.*; import other.T; class Use {}",
+            Some("other/T.java"),
+            0,
+        ),
+        (
+            "package app; import missing.T; import pkg.*; class Use {}",
+            None,
+            1,
+        ),
+        (
+            "package app; import pkg.*; class T {} class Use {}",
+            None,
+            0,
+        ),
+    ] {
+        let input = snapshot(&[
+            ("app/Use.java", source),
+            ("types/T.java", "package pkg; public class T {}"),
+            ("types/Keep.java", "package pkg; public class Keep {}"),
+            ("other/T.java", "package other; public class T {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        assert!(
+            !has_edge(&data, "app/Use.java", "types/T.java"),
+            "{source}: {data}"
+        );
+        assert_eq!(
+            edge(&data, "production", "app/Use.java", "types/Keep.java")["count"],
+            1
+        );
+        assert_eq!(
+            has_edge(&data, "app/Use.java", "other/T.java"),
+            explicit_target.is_some()
+        );
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            1 + usize::from(explicit_target.is_some())
+        );
+        assert_eq!(
+            data["counts"]["mappedSites"],
+            1 + usize::from(explicit_target.is_some())
+        );
+        assert_eq!(data["counts"]["unresolvedSites"], unknowns);
+    }
+}
+
+#[test]
+fn references_java_inner_and_unrelated_types_do_not_shadow_compilation_unit_imports() {
+    for source in [
+        "package app; import pkg.*; class Use { void f() { class T {} } }",
+        "package app; import pkg.*; class Use { class T {} }",
+        "package app; import pkg.*; class Use<T> { <Keep> void f() {} }",
+    ] {
+        let input = snapshot(&[
+            ("app/Use.java", source),
+            ("app/Unrelated.java", "package elsewhere; class T {}"),
+            ("types/T.java", "package pkg; public class T {}"),
+            ("types/Keep.java", "package pkg; public class Keep {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            2,
+            "{source}: {data}"
+        );
+        for target in ["types/T.java", "types/Keep.java"] {
+            assert_eq!(
+                edge(&data, "production", "app/Use.java", target)["count"],
+                1
+            );
+        }
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+}
+
+#[test]
+fn references_java_duplicate_qualified_types_keep_partial_positives_and_full_catalog_collisions() {
+    let mut input = snapshot(&[
+        ("app/Use.java", "package app; import pkg.*; class Use {}"),
+        ("types/Good.java", "package pkg; public class Good {}"),
+        ("types/Also.java", "package pkg; public class Also {}"),
+        ("one/T.java", "package pkg; public class T {}"),
+        ("two/T.java", "package pkg; public class T {}"),
+        (
+            "unrelated/Other.java",
+            "package other; import missing.*; public class Other {}",
+        ),
+    ]);
+    let data = project_java_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 2, "{data}");
+    for target in ["types/Good.java", "types/Also.java"] {
+        assert_eq!(
+            edge(&data, "production", "app/Use.java", target)["count"],
+            1
+        );
+    }
+    for target in ["one/T.java", "two/T.java"] {
+        assert!(!has_edge(&data, "app/Use.java", target));
+    }
+    assert_eq!(data["counts"]["scannedDocuments"], 1);
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+    assert_eq!(data["unresolved"][0]["site"]["spelling"], "import pkg.*;");
+    assert_eq!(
+        module_paths(&data),
+        ["app/Use.java", "types/Also.java", "types/Good.java"]
+    );
+    let all = project(&input);
+    let source_rows: Vec<_> = all["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["source"]["path"] == "app/Use.java")
+        .cloned()
+        .collect();
+    assert_eq!(data["production"], serde_json::json!(source_rows));
+    let source_unknowns: Vec<_> = all["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["source"]["path"] == "app/Use.java")
+        .cloned()
+        .collect();
+    assert_eq!(data["unresolved"], serde_json::json!(source_unknowns));
+    input.documents.reverse();
+    for doc in &mut input.documents {
+        doc.declarations.reverse();
+    }
+    assert_eq!(data, project_java_source(&input, 20));
+}
+
+#[test]
+fn references_java_competing_package_wildcards_never_choose_distinct_same_named_types() {
+    for source in [
+        "package app; import left.*; import right.*; class Use {}",
+        "package app; import right.*; import left.*; class Use {}",
+    ] {
+        let input = snapshot(&[
+            ("app/Use.java", source),
+            ("left/T.java", "package left; public class T {}"),
+            ("right/T.java", "package right; public class T {}"),
+            ("left/Good.java", "package left; public class Good {}"),
+            ("right/Other.java", "package right; public class Other {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        assert_eq!(data["production"].as_array().unwrap().len(), 2, "{data}");
+        for target in ["left/Good.java", "right/Other.java"] {
+            assert_eq!(
+                edge(&data, "production", "app/Use.java", target)["count"],
+                1
+            );
+        }
+        for target in ["left/T.java", "right/T.java"] {
+            assert!(!has_edge(&data, "app/Use.java", target));
+        }
+        assert_eq!(data["counts"]["mappedSites"], 2);
+        assert_eq!(data["counts"]["unresolvedSites"], 2);
+        let spellings: Vec<_> = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["site"]["spelling"].as_str().unwrap())
+            .collect();
+        assert_eq!(spellings.len(), 2);
+        assert!(spellings.contains(&"import left.*;"));
+        assert!(spellings.contains(&"import right.*;"));
+    }
+}
+
+#[test]
+fn references_java_repeated_identical_imports_deduplicate_candidates_not_observed_sites() {
+    let source = "package app;\nimport pkg.*;\nimport pkg.*;\nclass Use { T value; }";
+    let input = snapshot(&[
+        ("app/Use.java", source),
+        ("types/T.java", "package pkg; public class T {}"),
+    ]);
+    let complete = project_java_source(&input, 20);
+    let clipped = project_java_source(&input, 1);
+    for data in [&complete, &clipped] {
+        let pair = edge(data, "production", "app/Use.java", "types/T.java");
+        assert_eq!(pair["count"], 2, "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 2);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        assert_eq!(data["production"].as_array().unwrap().len(), 1);
+        assert_eq!(module_paths(data), ["app/Use.java", "types/T.java"]);
+    }
+    assert_eq!(complete["modules"], clipped["modules"]);
+    assert_eq!(
+        edge(&complete, "production", "app/Use.java", "types/T.java")["sites"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        edge(&clipped, "production", "app/Use.java", "types/T.java")["sites"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        edge(&clipped, "production", "app/Use.java", "types/T.java")["omittedSites"],
+        1
+    );
+
+    let named = snapshot(&[
+        (
+            "app/Use.java",
+            "package app; import pkg.T; import pkg.T; class Use { T value; }",
+        ),
+        ("types/T.java", "package pkg; public class T {}"),
+    ]);
+    let data = project_java_source(&named, 20);
+    let pair = edge(&data, "production", "app/Use.java", "types/T.java");
+    assert_eq!(pair["count"], 2, "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    let spellings: Vec<_> = pair["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|site| site["spelling"].as_str().unwrap())
+        .collect();
+    assert_eq!(spellings, ["import pkg.T;", "import pkg.T;"]);
+}
+
+#[test]
+fn references_java_empty_and_fully_shadowed_packages_keep_distinct_visible_coverage() {
+    let mut reasons = Vec::new();
+    for (source, provider) in [
+        (
+            "package app; import pkg.*; class Use {}",
+            "package pkg; class Hidden {}",
+        ),
+        (
+            "package app; import pkg.*; class T {} class Use {}",
+            "package pkg; public class T {}",
+        ),
+    ] {
+        let input = snapshot(&[("app/Use.java", source), ("types/Provider.java", provider)]);
+        let data = project_java_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+        reasons.push(data["unresolved"][0]["reason"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(reasons[0], reasons[1]);
+}
+
+#[test]
+fn references_java_single_type_and_maximal_qualified_type_are_independent_sites() {
+    let input = snapshot(&[
+        (
+            "app/Use.java",
+            "package app; import pkg.T; class Use { pkg.T value; }",
+        ),
+        ("types/T.java", "package pkg; public class T {}"),
+    ]);
+    let data = project_java_source(&input, 20);
+    let pair = edge(&data, "production", "app/Use.java", "types/T.java");
+    assert_eq!(pair["count"], 2, "{data}");
+    assert_eq!(pair["sites"][0]["spelling"], "import pkg.T;");
+    assert_eq!(pair["sites"][0]["relationKind"], "import");
+    assert_eq!(pair["sites"][1]["spelling"], "pkg.T");
+    assert_eq!(pair["sites"][1]["relationKind"], "reference");
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_java_static_and_nested_type_imports_remain_unsupported() {
+    let input = snapshot(&[
+        (
+            "app/Use.java",
+            "package app; import static pkg.Outer.*; import static pkg.Outer.member; import pkg.Outer.Inner; class Use {}",
+        ),
+        (
+            "types/Outer.java",
+            "package pkg; public class Outer { public static class Inner {} public static int member; }",
+        ),
+    ]);
+    let data = project_java_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 3);
+    let spellings: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        spellings,
+        [
+            "import static pkg.Outer.*;",
+            "import static pkg.Outer.member;",
+            "import pkg.Outer.Inner;"
+        ]
+    );
+}
+
+#[test]
+fn references_java_unsupported_known_export_and_missing_native_proof_keep_other_names() {
+    for remove_native in [false, true] {
+        let uncertain = if remove_native {
+            "package pkg; public class Uncertain {}"
+        } else {
+            "package pkg; public @interface Uncertain {}"
+        };
+        let mut input = snapshot(&[
+            ("app/Use.java", "package app; import pkg.*; class Use {}"),
+            ("types/Good.java", "package pkg; public class Good {}"),
+            ("types/Uncertain.java", uncertain),
+        ]);
+        if remove_native {
+            let doc = input
+                .documents
+                .iter_mut()
+                .find(|doc| doc.key.path == "types/Uncertain.java")
+                .unwrap();
+            doc.declarations
+                .retain(|row| row.name.as_deref() != Some("Uncertain"));
+        }
+        let data = project_java_source(&input, 20);
+        assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+        assert_eq!(
+            edge(&data, "production", "app/Use.java", "types/Good.java")["count"],
+            1
+        );
+        assert!(!has_edge(&data, "app/Use.java", "types/Uncertain.java"));
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn references_java_source_roles_ranges_and_native_proof_closure_survive_clipping() {
+    let input = snapshot(&[
+        (
+            "src/main/java/app/Use.java",
+            "package app;\nimport pkg.*;\nimport pkg.*;\nclass Use {}",
+        ),
+        (
+            "src/test/java/app/UseTest.java",
+            "package app;\nimport pkg.*;\nclass UseTest {}",
+        ),
+        ("providers/T.java", "package pkg; public class T {}"),
+        (
+            "providers/Unrelated.java",
+            "package other; public class Unrelated {}",
+        ),
+    ]);
+    let paths = [
+        "src/main/java/app/Use.java".into(),
+        "src/test/java/app/UseTest.java".into(),
+    ];
+    let complete = references::project(&input, &paths, 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let clipped = references::project(&input, &paths, 1, &mut || Ok(()))
+        .unwrap()
+        .data;
+    for data in [&complete, &clipped] {
+        assert_eq!(
+            module_paths(data),
+            [
+                "providers/T.java",
+                "src/main/java/app/Use.java",
+                "src/test/java/app/UseTest.java"
+            ]
+        );
+        assert_eq!(data["counts"]["mappedSites"], 3);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        for (section, role, path, count) in [
+            ("production", "production", "src/main/java/app/Use.java", 2),
+            ("tests", "test", "src/test/java/app/UseTest.java", 1),
+        ] {
+            let pair = edge(data, section, path, "providers/T.java");
+            assert_eq!(pair["count"], count);
+            let doc = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == path)
+                .unwrap();
+            let owner = doc
+                .declarations
+                .iter()
+                .find(|row| row.kind == "module" && row.ancestors.is_empty())
+                .unwrap();
+            assert_eq!(serde_json::to_value(owner.role).unwrap(), role);
+            for site in pair["sites"].as_array().unwrap() {
+                let start = site["range"]["start"].as_u64().unwrap() as usize;
+                let end = site["range"]["end"].as_u64().unwrap() as usize;
+                assert_eq!(&doc.file.text[start..end], "import pkg.*;");
+                assert_eq!(site["spelling"], "import pkg.*;");
+                assert_eq!(site["ownerSyntaxId"], owner.syntax_id);
+                assert_eq!(site["role"], role);
+                assert_eq!(site["relationKind"], "import");
+                assert!(site["callId"].is_null());
+                assert_eq!(
+                    site["lines"]["start"],
+                    doc.file.text[..start]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1
+                );
+                assert_eq!(site["lines"]["end"], site["lines"]["start"]);
+            }
+        }
+        for module in data["modules"].as_array().unwrap() {
+            let path = module["identity"]["path"].as_str().unwrap();
+            let doc = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == path)
+                .unwrap();
+            let native = doc
+                .declarations
+                .iter()
+                .find(|row| row.kind == "module" && row.ancestors.is_empty())
+                .unwrap();
+            assert_eq!(module["identity"]["sid"], native.syntax_id);
+            assert_eq!(module["revisionId"], native.revision_id);
+            assert_eq!(module["provenanceId"], native.provenance_id);
+            assert_eq!(module["contentHash"], doc.file.hash);
+        }
+    }
+    assert_eq!(complete["modules"], clipped["modules"]);
+    assert_eq!(
+        edge(
+            &clipped,
+            "production",
+            "src/main/java/app/Use.java",
+            "providers/T.java"
+        )["omittedSites"],
+        1
+    );
+}
+
+#[test]
+fn references_java_standard_library_labels_are_package_only_and_share_descriptor_identity() {
+    let input = snapshot(&[(
+        "app/Use.java",
+        "package app; import java.util.*; import java.util.List; import javax.swing.*; class Use { java.util.List value; }",
+    )]);
+    let data = project_java_source(&input, 20);
+    assert_eq!(data["referencesVersion"], "references:v2");
+    assert_eq!(data["production"].as_array().unwrap().len(), 2, "{data}");
+    assert_eq!(data["externalPackages"].as_array().unwrap().len(), 2);
+    assert_eq!(data["counts"]["mappedSites"], 4);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(module_paths(&data), ["app/Use.java"]);
+    let source_set = &input.documents[0].key.source_set_id;
+    for package in ["java", "javax"] {
+        let pair = data["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["target"]["package"] == package)
+            .unwrap();
+        assert_eq!(
+            pair["target"],
+            serde_json::json!({"kind":"externalPackage", "sourceSetId":source_set, "language":"java", "package":package, "standardLibrary":true})
+        );
+        assert_eq!(pair["count"], if package == "java" { 3 } else { 1 });
+        let descriptor = data["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["identity"] == pair["target"])
+            .unwrap();
+        assert_eq!(descriptor["ecosystem"], "java");
+        let evidence = descriptor["evidence"].as_array().unwrap();
+        assert!(!evidence.is_empty());
+        for item in evidence {
+            assert_eq!(item["kind"], "standardLibraryCatalog");
+            assert_eq!(item["entry"], package);
+            assert!(!item["catalog"].as_str().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn references_java_external_wildcards_do_not_erase_proved_local_names_or_fix_local_collisions() {
+    for (external, unknowns) in [("java.util", 0), ("thirdparty", 1)] {
+        let source =
+            format!("package app; import pkg.*; import {external}.*; class Use {{ Local value; }}");
+        let input = snapshot(&[
+            ("app/Use.java", &source),
+            ("types/Local.java", "package pkg; public class Local {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "app/Use.java", "types/Local.java")["count"],
+            1,
+            "{data}"
+        );
+        assert_eq!(
+            data["counts"]["mappedSites"],
+            if unknowns == 0 { 2 } else { 1 }
+        );
+        assert_eq!(data["counts"]["unresolvedSites"], unknowns);
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            if unknowns == 0 { 2 } else { 1 }
+        );
+    }
+    let input = snapshot(&[
+        (
+            "app/Use.java",
+            "package app; import pkg.*; import java.util.*; class Use {}",
+        ),
+        ("one/T.java", "package pkg; public class T {}"),
+        ("two/T.java", "package pkg; public class T {}"),
+    ]);
+    let data = project_java_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    assert_eq!(data["production"][0]["target"]["package"], "java");
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(module_paths(&data), ["app/Use.java"]);
+}
+
+#[test]
+fn references_java_undeclared_and_near_standard_library_roots_stay_unknown() {
+    let input = snapshot(&[(
+        "app/Use.java",
+        "package app; import org.example.*; import javaish.T; import javaxfoo.*; class Use {}",
+    )]);
+    let data = project_java_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 3);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn references_java_cancellation_is_atomic_with_a_native_backed_inventory() {
+    let input = snapshot(&[
+        ("app/Use.java", "package app; import pkg.*; class Use {}"),
+        ("types/T.java", "package pkg; public class T {}"),
+    ]);
+    let error =
+        references::project(&input, &[], 20, &mut || anyhow::bail!("cancelled")).unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+}
+
+#[test]
+fn references_java_qualified_type_roots_respect_lexical_type_binders_and_block_boundaries() {
+    for (body, positive_occurrences) in [
+        (
+            "class Use<pkg> { pkg.T blocked; } class After { pkg.T good; }",
+            vec![1],
+        ),
+        (
+            "class Use { <pkg> void f() { pkg.T blocked; } void g() { pkg.T good; } }",
+            vec![1],
+        ),
+        (
+            "class Use { <pkg> Use() { pkg.T blocked; } void g() { pkg.T good; } }",
+            vec![1],
+        ),
+        (
+            "class Use { void f() { pkg.T before; { class pkg {} pkg.T blocked; } pkg.T after; } }",
+            vec![0, 2],
+        ),
+        (
+            "class Use { void f(int x) { switch (x) { case 0: class pkg {} break; default: pkg.T blocked; } pkg.T after; } }",
+            vec![1],
+        ),
+        (
+            "class Use { pkg.T blocked; class pkg {} } class After { pkg.T good; }",
+            vec![1],
+        ),
+        (
+            "enum Use { A; class pkg {} pkg.T blocked; } class After { pkg.T good; }",
+            vec![1],
+        ),
+        (
+            "record Use<pkg>() { void f() { pkg.T blocked; } } class After { pkg.T good; }",
+            vec![1],
+        ),
+    ] {
+        let source = format!("package app; import pkg.*; {body}");
+        let input = snapshot(&[
+            ("app/Use.java", &source),
+            ("types/T.java", "package pkg; public class T {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        let pair = edge(&data, "production", "app/Use.java", "types/T.java");
+        let qualified_starts: Vec<_> = source
+            .match_indices("pkg.T")
+            .map(|(start, _)| start)
+            .collect();
+        let mut expected_positive_starts = vec![source.find("import pkg.*;").unwrap()];
+        expected_positive_starts.extend(
+            positive_occurrences
+                .iter()
+                .map(|&index| qualified_starts[index]),
+        );
+        let actual_positive_starts: Vec<_> = pair["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| site["range"]["start"].as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(
+            actual_positive_starts, expected_positive_starts,
+            "{body}: {data}"
+        );
+        assert_eq!(pair["count"], expected_positive_starts.len());
+        let expected_unknown_starts: Vec<_> = qualified_starts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !positive_occurrences.contains(index))
+            .map(|(_, &start)| start)
+            .collect();
+        let actual_unknown_starts: Vec<_> = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["site"]["range"]["start"].as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(
+            actual_unknown_starts, expected_unknown_starts,
+            "{body}: {data}"
+        );
+        assert_eq!(
+            data["counts"]["mappedSites"],
+            expected_positive_starts.len()
+        );
+        assert_eq!(
+            data["counts"]["unresolvedSites"],
+            expected_unknown_starts.len()
+        );
+    }
+}
+
+#[test]
+fn references_java_same_package_types_shadow_on_demand_but_not_single_type_imports() {
+    for (source, explicit) in [
+        ("package app; import pkg.*; class Use {}", false),
+        (
+            "package app; import other.T; import pkg.*; class Use {}",
+            true,
+        ),
+    ] {
+        let input = snapshot(&[
+            ("app/Use.java", source),
+            ("app/T.java", "package app; public class T {}"),
+            ("types/T.java", "package pkg; public class T {}"),
+            ("types/Keep.java", "package pkg; public class Keep {}"),
+            ("other/T.java", "package other; public class T {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        assert!(!has_edge(&data, "app/Use.java", "types/T.java"), "{data}");
+        assert!(!has_edge(&data, "app/Use.java", "app/T.java"));
+        assert_eq!(has_edge(&data, "app/Use.java", "other/T.java"), explicit);
+        assert_eq!(
+            edge(&data, "production", "app/Use.java", "types/Keep.java")["count"],
+            1
+        );
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            1 + usize::from(explicit)
+        );
+        assert_eq!(data["counts"]["mappedSites"], 1 + usize::from(explicit));
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+}
+
+#[test]
+fn references_java_test_only_type_cannot_prove_a_production_wildcard_export() {
+    let input = snapshot(&[
+        ("app/Use.java", "package app; import pkg.*; class Use {}"),
+        ("types/Good.java", "package pkg; public class Good {}"),
+        (
+            "tests/TestOnly.java",
+            "package pkg; public class TestOnly {}",
+        ),
+    ]);
+    let test_doc = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "tests/TestOnly.java")
+        .unwrap();
+    let test_type = test_doc
+        .declarations
+        .iter()
+        .find(|row| row.name.as_deref() == Some("TestOnly"))
+        .unwrap();
+    assert_eq!(serde_json::to_value(test_type.role).unwrap(), "test");
+    let data = project_java_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+    assert_eq!(
+        edge(&data, "production", "app/Use.java", "types/Good.java")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "app/Use.java", "tests/TestOnly.java"));
+    assert!(data["tests"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_java_conflicting_single_type_imports_block_wildcard_fallback() {
+    let input = snapshot(&[
+        (
+            "app/Use.java",
+            "package app; import left.T; import right.T; import pkg.*; class Use {}",
+        ),
+        ("left/T.java", "package left; public class T {}"),
+        ("right/T.java", "package right; public class T {}"),
+        ("types/T.java", "package pkg; public class T {}"),
+        ("types/Keep.java", "package pkg; public class Keep {}"),
+    ]);
+    let data = project_java_source(&input, 20);
+    for target in ["types/T.java", "left/T.java", "right/T.java"] {
+        assert!(!has_edge(&data, "app/Use.java", target), "{data}");
+    }
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    let pair = edge(&data, "production", "app/Use.java", "types/Keep.java");
+    assert_eq!(pair["count"], 1);
+    assert_eq!(pair["sites"][0]["spelling"], "import pkg.*;");
+    assert!(
+        data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["site"]["spelling"] == "import pkg.*;")
+    );
+}
+
+#[test]
+fn references_java_unknown_static_on_demand_type_bindings_block_qualified_package_roots() {
+    let input = snapshot(&[
+        (
+            "app/Use.java",
+            "package app; import static unknown.Outer.*; class Use { pkg.T field; }",
+        ),
+        ("pkg/T.java", "package pkg; public class T {}"),
+    ]);
+    let data = project_java_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+    let sites: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["site"]["spelling"].as_str().unwrap(),
+                row["site"]["relationKind"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sites,
+        [
+            ("import static unknown.Outer.*;", "import"),
+            ("pkg.T", "reference"),
+        ]
+    );
+    assert_eq!(module_paths(&data), ["app/Use.java"]);
+}
+
+fn java_review_maven_snapshot() -> &'static Snapshot {
+    static INPUT: std::sync::OnceLock<Snapshot> = std::sync::OnceLock::new();
+    INPUT.get_or_init(|| {
+        let sources: Vec<_> = (0..500)
+            .map(|index| {
+                let next: Vec<_> = (1..=3).map(|offset| (index + offset) % 500).collect();
+                let mut text = format!("package com.example.p{index:03};\n");
+                for target in &next {
+                    text.push_str(&format!("import com.example.p{target:03}.*;\n"));
+                }
+                text.push_str(&format!("\npublic class Service{index:03} {{\n"));
+                for (field, target) in next.iter().enumerate() {
+                    text.push_str(&format!(
+                        "    private Service{target:03} dependency{field};\n"
+                    ));
+                }
+                text.push_str("    private int value;\n\n");
+                for method in 0..20 {
+                    text.push_str(&format!(
+                        r#"    public int calculate{method}(int amount, int multiplier) {{
+        int base = (value + amount) * (multiplier + 1);
+        int weight = (amount + value) * (multiplier + 2) + (amount & 255);
+        int result = (base + weight) * (multiplier + 3) - (value & 15);
+        for (int step = 0; step < 4; step++) {{
+            result = (result * 31 + amount * step) ^ (multiplier + step + weight);
+        }}
+        return (result + base) * (multiplier + value) + (weight & 1023);
+    }}
+"#
+                    ));
+                }
+                text.push_str("}\n");
+                assert_eq!(text.lines().count(), 192);
+                (
+                    format!("src/main/java/com/example/p{index:03}/Service{index:03}.java"),
+                    text,
+                )
+            })
+            .collect();
+        let files: Vec<_> = sources
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let input = snapshot(&files);
+        assert_eq!(input.documents.len(), 500);
+        input
+    })
+}
+
+fn assert_java_review_maven_projection(paths: &[String], all: bool) {
+    let input = java_review_maven_snapshot();
+    let result = references::project(input, paths, 1, &mut || Ok(()));
+    assert!(
+        result.is_ok(),
+        "500-file Maven Java projection {paths:?} must fit the unchanged work budget: {result:?}"
+    );
+    let data = result.unwrap().data;
+    let scanned = if all { 500 } else { 1 };
+    assert_eq!(data["counts"]["scannedDocuments"], scanned);
+    assert_eq!(data["counts"]["mappedSites"], scanned * 3);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
+    assert!(data["tests"].as_array().unwrap().is_empty());
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["production"].as_array().unwrap().len(), scanned * 3);
+    assert_eq!(module_paths(&data).len(), if all { 500 } else { 4 });
+    for index in 0..scanned {
+        let source = format!("src/main/java/com/example/p{index:03}/Service{index:03}.java");
+        let doc = input
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == source)
+            .unwrap();
+        let owner = doc
+            .declarations
+            .iter()
+            .find(|row| row.kind == "module" && row.ancestors.is_empty())
+            .unwrap();
+        for offset in 1..=3 {
+            let target = (index + offset) % 500;
+            let target_path =
+                format!("src/main/java/com/example/p{target:03}/Service{target:03}.java");
+            let pair = edge(&data, "production", &source, &target_path);
+            assert_eq!(pair["count"], 1);
+            assert_eq!(pair["mapping"], "structural");
+            assert_eq!(pair["omittedSites"], 0);
+            assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+            let site = &pair["sites"][0];
+            let spelling = format!("import com.example.p{target:03}.*;");
+            assert_eq!(site["spelling"], spelling);
+            assert_eq!(site["relationKind"], "import");
+            assert_eq!(site["role"], "production");
+            assert_eq!(site["ownerSyntaxId"], owner.syntax_id);
+            let start = site["range"]["start"].as_u64().unwrap() as usize;
+            let end = site["range"]["end"].as_u64().unwrap() as usize;
+            assert_eq!(&doc.file.text[start..end], spelling);
+        }
+    }
+    for module in data["modules"].as_array().unwrap() {
+        let path = module["identity"]["path"].as_str().unwrap();
+        let doc = input
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == path)
+            .unwrap();
+        let native = doc
+            .declarations
+            .iter()
+            .find(|row| row.kind == "module" && row.ancestors.is_empty())
+            .unwrap();
+        assert_eq!(module["identity"]["sid"], native.syntax_id);
+        assert_eq!(module["revisionId"], native.revision_id);
+        assert_eq!(module["provenanceId"], native.provenance_id);
+        assert_eq!(module["contentHash"], doc.file.hash);
+    }
+}
+
+#[test]
+fn references_java_review_maven_one_file_fits_unchanged_work_budget() {
+    assert_java_review_maven_projection(
+        &["src/main/java/com/example/p000/Service000.java".into()],
+        false,
+    );
+}
+
+#[test]
+fn references_java_review_maven_all_files_fit_unchanged_work_budget() {
+    assert_java_review_maven_projection(&["**".into()], true);
+}
+
+#[test]
+fn references_java_review_nested_on_demand_collision_keeps_explicit_proof() {
+    for explicit_t in [false, true] {
+        let source = format!(
+            "package app; import pkg.*; import other.Outer.*; import known.Keep; {} class Use {{ T value; }}",
+            if explicit_t { "import pkg.T;" } else { "" }
+        );
+        let input = snapshot(&[
+            ("app/Use.java", &source),
+            ("pkg/T.java", "package pkg; public class T {}"),
+            (
+                "other/Outer.java",
+                "package other; public class Outer { public static class T {} }",
+            ),
+            ("known/Keep.java", "package known; public class Keep {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "app/Use.java", "pkg/T.java"),
+            explicit_t,
+            "nested and package on-demand imports must not select wildcard-only T: {data}"
+        );
+        assert!(!has_edge(&data, "app/Use.java", "other/Outer.java"));
+        let keep = edge(&data, "production", "app/Use.java", "known/Keep.java");
+        assert_eq!(keep["count"], 1);
+        assert_eq!(keep["sites"][0]["spelling"], "import known.Keep;");
+        if explicit_t {
+            let pair = edge(&data, "production", "app/Use.java", "pkg/T.java");
+            assert_eq!(pair["count"], 1);
+            assert_eq!(pair["sites"][0]["spelling"], "import pkg.T;");
+        }
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            1 + usize::from(explicit_t)
+        );
+        assert_eq!(data["counts"]["scannedDocuments"], 1);
+        assert_eq!(data["counts"]["mappedSites"], 1 + usize::from(explicit_t));
+        assert_eq!(data["counts"]["unresolvedSites"], 2);
+        let unknowns: Vec<_> = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["site"]["spelling"].as_str().unwrap())
+            .collect();
+        assert_eq!(unknowns, ["import pkg.*;", "import other.Outer.*;"]);
+        assert!(data["tests"].as_array().unwrap().is_empty());
+        assert!(data["externalPackages"].as_array().unwrap().is_empty());
+        assert_eq!(
+            module_paths(&data),
+            if explicit_t {
+                vec!["app/Use.java", "known/Keep.java", "pkg/T.java"]
+            } else {
+                vec!["app/Use.java", "known/Keep.java"]
+            }
+        );
     }
 }

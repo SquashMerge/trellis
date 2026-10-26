@@ -194,8 +194,14 @@ Supported mapping is deliberately narrow:
 - **Python:** explicit relative imports with a unique `.py`/`__init__.py` directory
   convention. Module-versus-attribute ambiguity is not guessed. Absolute roots,
   aliases and wildcards remain unresolved.
-- **Java:** import/qualified-type syntax is visible, but no package-to-file resolver
-  is invented; non-path imports remain unresolved.
+- **Java:** captured declared packages and public top-level class/interface/enum/record
+  declarations prove ordinary single-type and on-demand imports and qualified-type
+  paths. On-demand imports enumerate only the exact package, not subpackages.
+  Explicit/local type bindings shadow on-demand names; distinct competing native
+  types remain unknown, while independent names can still map. Static imports,
+  nested/member types and unproved bindings stay unknown. Reviewed `java`/`javax`
+  roots supply package-family labels, not selected-JDK member availability.
+  Maven/Gradle coordinates alone do not prove third-party import prefixes.
 
 Comments and string decoys are ignored; actual import module-specifier strings
 are syntax. Unsupported coverage and unresolved counts stay visible. Paths hidden
@@ -335,13 +341,15 @@ is invented for a package. A config descriptor is exactly
  counts:{scannedDocuments:UInt,mappedSites:UInt,unresolvedSites:UInt},
  limitations:string[]}
 Module = {identity:Target,revisionId,contentHash,provenanceId}
-ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust",evidence:PackageEvidence[]}
+ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust"|"java",evidence:PackageEvidence[]}
 ExternalIdentity = {kind:"externalPackage",sourceSetId,language,package,standardLibrary:boolean}
 PackageEvidence = ManifestEvidence | CatalogEvidence
 ManifestEvidence = {kind:"manifest",sourceSetId,nativeRevisionId,dependencyHash,
                     path,contentHash,importRoot,section,key,versionConstraint:string|null}
 CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:v1",
                    entry:"std"|"core"|"alloc"}
+                | {kind:"standardLibraryCatalog",catalog:"java-standard-library:v1",
+                   entry:"java"|"javax"}
 Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
         omittedSites:UInt,mapping:"structural"}
 Unresolved = {source:Target,site:Site,reason:string}
@@ -350,9 +358,12 @@ Site = {ownerSyntaxId:string|null,role:"production"|"test"|null,
         spelling:string,callId:string|null}
 ```
 
-Each external descriptor has nonempty `evidence`. The current Rust producer derives
+Each external descriptor has nonempty `evidence`. Rust derives
 `ecosystem:"cargo"` for declared packages and `ecosystem:"rust"` for the reviewed
-Rust standard-library catalog. Manifest evidence identifies the selected source
+Rust standard-library catalog. Java uses `ecosystem:"java"` and the reviewed
+`java-standard-library:v1` catalog, with exact entries `java` and `javax`.
+These Java entries label package families; they do not claim every subpackage or
+type exists on the selected JDK. Lookalike roots are not catalog matches. Manifest evidence identifies the selected source
 set/native revision and retained dependency hash, captured manifest path/content
 hash, actual import root, declaration section/key and nullable original version
 constraint. Catalog evidence identifies a reviewed code-shipped entry, not a
@@ -379,9 +390,10 @@ not prove installation/activation or change stored site roles. In particular,
 not a claim that Cargo exposes them to a production lib/bin target. Conflicting
 identities across sections stay unknown; target-applicable Cargo bindings would
 require a separate contract change. `std/core/alloc` are reviewed root labels,
-not member/API inventories. Java/Python/JavaScript
-share the external identity shape but their package adapters are later work;
-Maven groups and Python distribution names alone do not prove import prefixes.
+not member/API inventories. Java's `java`/`javax` labels share this external
+identity shape; no third-party Maven/Gradle prefix mapping is inferred. Python
+and JavaScript package adapters are later work. Maven groups and Python
+distribution names alone do not prove import prefixes.
 
 The Rust name inventory does not register foreign function-signature bindings or
 expand procedural derives. Names introduced by those forms are not a complete
