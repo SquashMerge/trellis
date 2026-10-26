@@ -32,6 +32,15 @@ impl<'a> MeasuredFacts<'a> {
         native: &'a native::Artifact,
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
     ) -> Result<Self> {
+        #[cfg(feature = "test-support")]
+        count_publication_work(|work| {
+            if work.destination_revision == native.revision.id {
+                work.destination_index_builds += 1;
+                work.destination_document_rows += native.revision.documents.len();
+            } else {
+                work.original_index_builds += 1;
+            }
+        });
         let mut documents = BTreeMap::new();
         let mut source_text = BTreeMap::new();
         for doc in &native.revision.documents {
@@ -247,6 +256,14 @@ impl<'a> MeasuredFacts<'a> {
         range: native::Range,
         kind: semantic::JoinKind,
     ) -> Result<semantic::Join> {
+        #[cfg(feature = "test-support")]
+        count_publication_work(|work| {
+            if work.destination_revision == self.native.revision.id
+                && work.reused_documents.contains(document)
+            {
+                work.destination_joins_on_reused_documents += 1;
+            }
+        });
         let doc = self
             .documents
             .get(document)
@@ -565,6 +582,49 @@ fn complexity_work(update: impl FnOnce(&mut ComplexityWork)) {
     COMPLEXITY_WORK.with(|work| update(&mut work.borrow_mut()));
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicationWork {
+    destination_index_builds: usize,
+    full_fallbacks: usize,
+    original_index_builds: usize,
+    destination_role_parses: usize,
+    original_role_parses: usize,
+    destination_joins_on_reused_documents: usize,
+    destination_document_rows: usize,
+    #[serde(skip)]
+    destination_revision: String,
+    #[serde(skip)]
+    reused_documents: BTreeSet<native::DocumentKey>,
+}
+#[cfg(feature = "test-support")]
+thread_local! { static PUBLICATION_WORK: std::cell::RefCell<PublicationWork> =
+std::cell::RefCell::new(PublicationWork::default()); }
+#[cfg(feature = "test-support")]
+pub(crate) fn reset_publication_work(revision: &str, reused: BTreeSet<native::DocumentKey>) {
+    PUBLICATION_WORK.with(|cell| {
+        *cell.borrow_mut() = PublicationWork {
+            destination_revision: revision.to_owned(),
+            reused_documents: reused,
+            ..PublicationWork::default()
+        }
+    });
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_full_fallback() {
+    count_publication_work(|work| work.full_fallbacks += 1);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn publication_work() -> serde_json::Value {
+    PUBLICATION_WORK
+        .with(|cell| serde_json::to_value(&*cell.borrow()).expect("work counters serialize"))
+}
+#[cfg(feature = "test-support")]
+fn count_publication_work(update: impl FnOnce(&mut PublicationWork)) {
+    PUBLICATION_WORK.with(|cell| update(&mut cell.borrow_mut()));
+}
+
 fn scoped_key(
     symbol: &str,
     document: &native::DocumentKey,
@@ -589,7 +649,7 @@ fn symbol_key(symbol: &str, document: &native::DocumentKey) -> semantic::SymbolK
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct JoinedFacts {
     pub symbols: Vec<semantic::Symbol>,
     pub declaration_bindings: Vec<semantic::DeclarationBinding>,
@@ -611,6 +671,7 @@ pub fn join_inventory(
 ) -> Result<JoinedFacts> {
     let raw_index = InventoryIndex::new(inventory)?;
     let coordinates = CoordinateMaps::new(inventory, native, sources, admitted_encoding)?;
+    let measured = MeasuredFacts::new(native, sources)?;
     join_inventory_indexed(
         inventory,
         native,
@@ -618,6 +679,7 @@ pub fn join_inventory(
         admitted_encoding,
         &raw_index,
         &coordinates,
+        &measured,
     )
 }
 
@@ -628,8 +690,8 @@ fn join_inventory_indexed(
     admitted_encoding: u8,
     raw_index: &InventoryIndex<'_>,
     coordinates: &CoordinateMaps,
+    measured: &MeasuredFacts<'_>,
 ) -> Result<JoinedFacts> {
-    let measured = MeasuredFacts::new(native, sources)?;
     let mut out = JoinedFacts::default();
     let mut declarations: LocalDeclarations = BTreeMap::new();
     let mut type_uses: BTreeMap<(native::DocumentKey, usize, usize), BTreeSet<String>> =
@@ -655,6 +717,14 @@ fn join_inventory_indexed(
                 .filter(|s| !s.is_empty())
                 .context("missing occurrence symbol")?;
             let range = coordinates.range(claim, admitted_encoding)?;
+            #[cfg(feature = "test-support")]
+            count_publication_work(|work| {
+                if work.destination_revision == native.revision.id {
+                    work.destination_role_parses += 1;
+                } else {
+                    work.original_role_parses += 1;
+                }
+            });
             let roles = claim.envelope.raw["symbolRoles"]
                 .as_u64()
                 .context("invalid occurrence roles")?;
@@ -1733,6 +1803,72 @@ fn direct_script_types(
     Ok(result)
 }
 
+fn reuse_captured_source_associations(
+    captured: &JoinedFacts,
+    reusable: &BTreeSet<native::DocumentKey>,
+    inventory: &CapturedScipInventory,
+    source_set_id: &str,
+    revision: &str,
+) -> JoinedFacts {
+    let mut facts = captured.clone();
+    let is_reused = |doc: &native::DocumentKey| reusable.contains(doc);
+    let proof_documents: BTreeMap<_, _> = inventory
+        .claims
+        .iter()
+        .map(|claim| {
+            (
+                claim.captured_proof_id.as_str(),
+                native::DocumentKey {
+                    source_set_id: source_set_id.to_owned(),
+                    language: claim.language.clone(),
+                    path: claim.envelope.relative_path.clone(),
+                },
+            )
+        })
+        .collect();
+    facts.symbols.retain(|row| {
+        proof_documents
+            .get(row.provenance_id.as_str())
+            .is_some_and(is_reused)
+    });
+    facts
+        .declaration_bindings
+        .retain(|row| is_reused(&row.join.anchor.document));
+    facts.references.retain(|row| is_reused(&row.document));
+    facts
+        .reference_claims
+        .retain(|_, row| is_reused(&row.document));
+    facts
+        .call_bindings
+        .retain(|row| is_reused(&row.join.anchor.document));
+    facts.type_relationships.retain(|row| {
+        proof_documents
+            .get(row.provenance_id.as_str())
+            .is_some_and(is_reused)
+    });
+    facts
+        .joins
+        .retain(|(_, join)| is_reused(&join.anchor.document));
+    facts.diagnostics.retain(|doc, _| is_reused(doc));
+    for (_, join) in &mut facts.joins {
+        join.anchor.revision_id = revision.to_owned();
+    }
+    for binding in &mut facts.declaration_bindings {
+        binding.join.anchor.revision_id = revision.to_owned();
+    }
+    for call in &mut facts.call_bindings {
+        call.join.anchor.revision_id = revision.to_owned();
+    }
+    for reference in facts
+        .references
+        .iter_mut()
+        .chain(facts.reference_claims.values_mut())
+    {
+        reference.revision_id = revision.to_owned();
+    }
+    facts
+}
+
 /// Publication-time rejoin uses only retained, authenticated source and measured snapshots.
 /// The Store validates the returned publication and its raw links before its paired-pin CAS.
 #[derive(Debug)]
@@ -1752,13 +1888,65 @@ pub fn rejoin_inventory(
     basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
     admitted_encoding: u8,
 ) -> Result<RejoinResult> {
+    let r2 = MeasuredFacts::new(destination_native, destination_sources)?;
+    rejoin_inventory_with_destination(
+        inventory,
+        captured_native,
+        captured_sources,
+        destination_native,
+        destination_sources,
+        producer,
+        basis,
+        admitted_encoding,
+        &r2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rejoin_inventory_with_destination(
+    inventory: &CapturedScipInventory,
+    captured_native: &native::Artifact,
+    captured_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    destination_native: &native::Artifact,
+    destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    producer: semantic::Producer,
+    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
+    admitted_encoding: u8,
+    r2: &MeasuredFacts<'_>,
+) -> Result<RejoinResult> {
+    rejoin_inventory_with_reuse(
+        inventory,
+        captured_native,
+        captured_sources,
+        destination_native,
+        destination_sources,
+        producer,
+        basis,
+        admitted_encoding,
+        r2,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rejoin_inventory_with_reuse(
+    inventory: &CapturedScipInventory,
+    captured_native: &native::Artifact,
+    captured_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    destination_native: &native::Artifact,
+    destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    producer: semantic::Producer,
+    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
+    admitted_encoding: u8,
+    r2: &MeasuredFacts<'_>,
+    reusable: Option<&BTreeSet<native::DocumentKey>>,
+) -> Result<RejoinResult> {
     ensure!(
         inventory.source_manifest_hash == manifest_hash(&captured_native.revision)
             && captured_native.revision.source_set_id == destination_native.revision.source_set_id,
         "captured source manifest/source set mismatch"
     );
     let r1 = MeasuredFacts::new(captured_native, captured_sources)?;
-    let r2 = MeasuredFacts::new(destination_native, destination_sources)?;
     let raw_index = InventoryIndex::new(inventory)?;
     let coordinates = CoordinateMaps::new(
         inventory,
@@ -1773,6 +1961,7 @@ pub fn rejoin_inventory(
         admitted_encoding,
         &raw_index,
         &coordinates,
+        &r1,
     )?;
     let captured_declaration_proofs: BTreeSet<_> = captured
         .declaration_bindings
@@ -1862,6 +2051,8 @@ pub fn rejoin_inventory(
         }
         if claim.envelope.record_kind == "occurrence" {
             let range = coordinates.range(claim, admitted_encoding)?;
+            #[cfg(feature = "test-support")]
+            count_publication_work(|work| work.original_role_parses += 1);
             let roles = claim.envelope.raw["symbolRoles"]
                 .as_u64()
                 .context("invalid raw roles")?;
@@ -1878,8 +2069,20 @@ pub fn rejoin_inventory(
             } else {
                 semantic::JoinKind::Reference
             };
+            let reused_source = reusable.is_some_and(|docs| docs.contains(&doc));
+            let measured = if reused_source {
+                // The authenticated selected version witnesses the same measured
+                // source association; only targets still consult the current r2.
+                &r1
+            } else {
+                r2
+            };
             let first = r1.join(&doc, range.clone(), required)?;
-            let second = r2.join(&doc, range, required)?;
+            let second = if reused_source {
+                first.clone()
+            } else {
+                measured.join(&doc, range, required)?
+            };
             // Only claims without a captured semantic association may keep their
             // unavailable outcome without failing the caller tuple.
             let authored_association =
@@ -1908,11 +2111,15 @@ pub fn rejoin_inventory(
                     first.anchor.range.clone(),
                     semantic::JoinKind::Reference,
                 )?;
-                let second_reference = r2.join(
-                    &doc,
-                    first.anchor.range.clone(),
-                    semantic::JoinKind::Reference,
-                )?;
+                let second_reference = if reused_source {
+                    first_reference.clone()
+                } else {
+                    measured.join(
+                        &doc,
+                        first.anchor.range.clone(),
+                        semantic::JoinKind::Reference,
+                    )?
+                };
                 exact &= first_reference.status == semantic::JoinStatus::Exact
                     && second_reference.status == semantic::JoinStatus::Exact;
             }
@@ -1920,23 +2127,28 @@ pub fn rejoin_inventory(
                 .get(claim.captured_proof_id.as_str())
                 .copied();
             if let Some(binding) = captured_call {
-                let call = r2.join(
+                let call = measured.join(
                     &doc,
                     binding.join.anchor.range.clone(),
                     binding.join.anchor.kind,
                 )?;
-                let first_call = r1.join(
-                    &doc,
-                    binding.join.anchor.range.clone(),
-                    binding.join.anchor.kind,
-                )?;
+                let first_call = if reused_source {
+                    call.clone()
+                } else {
+                    r1.join(
+                        &doc,
+                        binding.join.anchor.range.clone(),
+                        binding.join.anchor.kind,
+                    )?
+                };
                 exact &= call.status == semantic::JoinStatus::Exact
                     && first_call.status == semantic::JoinStatus::Exact
                     && first_call.candidate_ids == binding.join.candidate_ids;
                 // The selected reference and invocation must belong to that same
                 // measured call, not merely be independent exact spans.
                 exact &= second.candidate_ids.first().is_some_and(|id| {
-                    r2.references
+                    measured
+                        .references
                         .get(id)
                         .into_iter()
                         .flatten()
@@ -1946,7 +2158,7 @@ pub fn rejoin_inventory(
                                     .candidate_ids
                                     .first()
                                     .into_iter()
-                                    .flat_map(|id| r2.calls.get(id).into_iter().flatten())
+                                    .flat_map(|id| measured.calls.get(id).into_iter().flatten())
                                     .any(|candidate| {
                                         call.candidate_ids == vec![candidate.id.clone()]
                                             && candidate.owner_syntax_id
@@ -1978,14 +2190,72 @@ pub fn rejoin_inventory(
             .any(|doc| doc.language == claim.language && doc.path == claim.envelope.relative_path)
     });
     let filtered_index = InventoryIndex::new(&filtered)?;
-    let destination = join_inventory_indexed(
-        &filtered,
-        destination_native,
-        destination_sources,
-        admitted_encoding,
-        &filtered_index,
-        &coordinates,
-    )?;
+    let destination = if let Some(reusable) = reusable {
+        let mut facts = reuse_captured_source_associations(
+            &captured,
+            reusable,
+            inventory,
+            &destination_native.revision.source_set_id,
+            &destination_native.revision.id,
+        );
+        let mut delta = filtered.clone();
+        delta.claims.retain(|claim| {
+            !reusable.iter().any(|doc| {
+                doc.language == claim.language && doc.path == claim.envelope.relative_path
+            })
+        });
+        if !delta.claims.is_empty() {
+            let delta_index = InventoryIndex::new(&delta)?;
+            let joined = join_inventory_indexed(
+                &delta,
+                destination_native,
+                destination_sources,
+                admitted_encoding,
+                &delta_index,
+                &coordinates,
+                r2,
+            )?;
+            facts.symbols.extend(joined.symbols);
+            facts
+                .declaration_bindings
+                .extend(joined.declaration_bindings);
+            facts.references.extend(joined.references);
+            facts.reference_claims.extend(joined.reference_claims);
+            facts.call_bindings.extend(joined.call_bindings);
+            facts.type_relationships.extend(joined.type_relationships);
+            facts.joins.extend(joined.joins);
+            facts.diagnostics.extend(joined.diagnostics);
+        }
+        let order: BTreeMap<_, _> = inventory
+            .claims
+            .iter()
+            .enumerate()
+            .map(|(index, claim)| (claim.captured_proof_id.as_str(), index))
+            .collect();
+        facts
+            .symbols
+            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
+        facts
+            .declaration_bindings
+            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
+        facts
+            .call_bindings
+            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
+        facts
+            .type_relationships
+            .sort_by_key(|row| order.get(row.provenance_id.as_str()).copied());
+        facts
+    } else {
+        join_inventory_indexed(
+            &filtered,
+            destination_native,
+            destination_sources,
+            admitted_encoding,
+            &filtered_index,
+            &coordinates,
+            r2,
+        )?
+    };
     let mut captured_targets: BTreeMap<(native::DocumentKey, String), Vec<semantic::Target>> =
         BTreeMap::new();
     for binding in &captured.declaration_bindings {

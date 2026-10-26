@@ -6293,6 +6293,290 @@ fn write_import_semantic(
     Ok(())
 }
 
+fn native_version_at(
+    db: &Connection,
+    pin: IndexPin,
+    doc: &crate::native_evidence::DocumentKey,
+) -> Result<Option<String>> {
+    db.query_row(
+        "SELECT v.id FROM revision_documents m JOIN document_versions v ON v.vid=m.vid
+         WHERE m.revision_id=?1 AND m.language=?2 AND m.path=?3 LIMIT 2",
+        params![semantic_pin_key(pin), doc.language, doc.path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn append_reconciled_document(
+    db: &Connection,
+    selected: &ReadRevision,
+    doc: &crate::native_evidence::DocumentKey,
+    next: &mut crate::native_evidence::Artifact,
+    sources: &mut BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+) -> Result<()> {
+    let scope = v8_native_scope_for(db, doc, selected)?
+        .context("reused native document missing from selected pin")?;
+    let file = Store::selected_source_row_bounded_for(db, &doc.path, 256 * 1024 * 1024, selected)?
+        .context("reused native source missing from selected pin")?;
+    selected_ensure!(
+        file.language == doc.language,
+        "incompatible_index: reused language differs"
+    );
+    sources.insert(doc.clone(), file.text.into_bytes());
+    let mut coverage = read_native_coverage_v8(db, &scope)?;
+    coverage.revision_id.clone_from(&next.revision.id);
+    next.coverage.push(coverage);
+    let mut declarations = read_native_declarations_v8(db, &scope, None, true)?;
+    for row in &mut declarations {
+        row.revision_id.clone_from(&next.revision.id);
+    }
+    next.declarations.extend(declarations);
+    let mut calls = read_native_calls_v8(db, &scope, None)?;
+    for row in &mut calls {
+        row.revision_id.clone_from(&next.revision.id);
+    }
+    next.calls.extend(calls);
+    let mut regions = read_native_control_regions_v8(db, &scope, None)?;
+    for row in &mut regions {
+        row.revision_id.clone_from(&next.revision.id);
+    }
+    next.control_regions.extend(regions);
+    let mut references = read_native_references(db, &scope, None)?;
+    for row in &mut references {
+        row.revision_id.clone_from(&next.revision.id);
+    }
+    next.references.extend(references);
+    let mut report = read_native_capability_report(db, &scope)?;
+    report.revision_id.clone_from(&next.revision.id);
+    next.capability_reports.push(report);
+    Ok(())
+}
+
+fn append_captured_document(
+    r1: &crate::native_evidence::Artifact,
+    doc: &crate::native_evidence::DocumentKey,
+    next: &mut crate::native_evidence::Artifact,
+) {
+    let revision = &next.revision.id;
+    next.coverage.extend(
+        r1.coverage
+            .iter()
+            .filter(|row| {
+                row.document_path == doc.path
+                    && row.language == doc.language
+                    && row.source_set_id == doc.source_set_id
+            })
+            .cloned()
+            .map(|mut row| {
+                row.revision_id.clone_from(revision);
+                row
+            }),
+    );
+    next.declarations.extend(
+        r1.declarations
+            .iter()
+            .filter(|row| row.document == *doc)
+            .cloned()
+            .map(|mut row| {
+                row.revision_id.clone_from(revision);
+                row
+            }),
+    );
+    next.calls.extend(
+        r1.calls
+            .iter()
+            .filter(|row| row.document == *doc)
+            .cloned()
+            .map(|mut row| {
+                row.revision_id.clone_from(revision);
+                row
+            }),
+    );
+    next.control_regions.extend(
+        r1.control_regions
+            .iter()
+            .filter(|row| row.document == *doc)
+            .cloned()
+            .map(|mut row| {
+                row.revision_id.clone_from(revision);
+                row
+            }),
+    );
+    next.references.extend(
+        r1.references
+            .iter()
+            .filter(|row| row.document == *doc)
+            .cloned()
+            .map(|mut row| {
+                row.revision_id.clone_from(revision);
+                row
+            }),
+    );
+    next.capability_reports.extend(
+        r1.capability_reports
+            .iter()
+            .filter(|row| row.document == *doc)
+            .cloned()
+            .map(|mut row| {
+                row.revision_id.clone_from(revision);
+                row
+            }),
+    );
+}
+
+type IncrementalDestination = (
+    crate::native_evidence::Artifact,
+    BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+    Vec<BTreeSet<crate::native_evidence::DocumentKey>>,
+);
+
+fn incremental_native_destination(
+    tx: &Connection,
+    selected: &[SelectedNativeInput],
+    native: &crate::native_evidence::Artifact,
+    sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+    reuse: &PreflightReuse,
+    prior: IndexPin,
+) -> Result<Option<IncrementalDestination>> {
+    let old = ReadRevision::new(prior, semantic_pin_key(prior));
+    let mut candidate = native.clone();
+    let mut selected_sources = BTreeMap::new();
+    for doc in &native.revision.documents {
+        if !reuse.for_path(&doc.key.path).native {
+            selected_sources.insert(
+                doc.key.clone(),
+                sources
+                    .get(&doc.key)
+                    .context("changed native source missing")?
+                    .clone(),
+            );
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut reused_by_producer = Vec::new();
+    let documents: BTreeMap<_, _> = native
+        .revision
+        .documents
+        .iter()
+        .map(|doc| (&doc.key, doc))
+        .collect();
+    for input in selected {
+        if input.raw.is_err() || input.captured.is_err() {
+            return Ok(None);
+        }
+        let reusable = BTreeSet::new();
+        if let (Ok(raw), Ok((r1, r1_sources, _))) = (&input.raw, &input.captured) {
+            if raw.producer_id != input.producer.id
+                || native.producer != r1.producer
+                || native.revision.toolchain_hash != r1.revision.toolchain_hash
+                || native.revision.config_hash != r1.revision.config_hash
+                || native.revision.dependency_hash != r1.revision.dependency_hash
+            {
+                return Ok(None);
+            }
+            for doc in &r1.revision.documents {
+                let Some(current) = documents.get(&doc.key) else {
+                    continue;
+                };
+                if !seen.insert(doc.key.clone()) {
+                    continue;
+                }
+                let new_version = reuse.for_path(&doc.key.path).native;
+                if !new_version {
+                    selected_sources.insert(
+                        doc.key.clone(),
+                        sources
+                            .get(&doc.key)
+                            .context("changed native source missing")?
+                            .clone(),
+                    );
+                    continue;
+                }
+                let current_version = native_version_at(tx, prior, &doc.key)?
+                    .context("selected native version missing")?;
+                let captured_version = native_version_at(tx, raw.captured_pin, &doc.key)?
+                    .context("captured native version missing")?;
+                if current.content_hash == doc.content_hash
+                    && current_version == captured_version
+                    && native.producer == r1.producer
+                {
+                    append_captured_document(r1, &doc.key, &mut candidate);
+                    selected_sources.insert(
+                        doc.key.clone(),
+                        r1_sources
+                            .get(&doc.key)
+                            .context("captured native source missing")?
+                            .clone(),
+                    );
+                } else if current.content_hash == doc.content_hash {
+                    return Ok(None);
+                } else {
+                    append_reconciled_document(
+                        tx,
+                        &old,
+                        &doc.key,
+                        &mut candidate,
+                        &mut selected_sources,
+                    )?;
+                }
+            }
+        }
+        reused_by_producer.push(reusable);
+    }
+    // A later selected producer can share the same source document. Its witness
+    // must be checked independently even when another producer supplied the rows.
+    for (input, reusable) in selected.iter().zip(&mut reused_by_producer) {
+        if let (Ok(raw), Ok((r1, _, _))) = (&input.raw, &input.captured) {
+            for doc in &r1.revision.documents {
+                let Some(current) = documents.get(&doc.key) else {
+                    continue;
+                };
+                if current.content_hash != doc.content_hash || !reuse.for_path(&doc.key.path).native
+                {
+                    continue;
+                }
+                let current_version = native_version_at(tx, prior, &doc.key)?
+                    .context("selected native version missing")?;
+                let captured_version = native_version_at(tx, raw.captured_pin, &doc.key)?
+                    .context("captured native version missing")?;
+                if current_version == captured_version && native.producer == r1.producer {
+                    reusable.insert(doc.key.clone());
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    candidate
+        .revision
+        .documents
+        .retain(|doc| selected_sources.contains_key(&doc.key));
+    Ok(Some((candidate, selected_sources, reused_by_producer)))
+}
+
+fn complete_local_destination(
+    tx: &Connection,
+    native: &crate::native_evidence::Artifact,
+    sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+    reuse: &PreflightReuse,
+    prior: IndexPin,
+) -> Result<(
+    crate::native_evidence::Artifact,
+    BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+)> {
+    let old = ReadRevision::new(prior, semantic_pin_key(prior));
+    let mut candidate = native.clone();
+    let mut selected_sources = sources.clone();
+    for doc in &native.revision.documents {
+        if reuse.for_path(&doc.key.path).native {
+            append_reconciled_document(tx, &old, &doc.key, &mut candidate, &mut selected_sources)?;
+        }
+    }
+    Ok((candidate, selected_sources))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn selected_native_rejoin(
     store: &Store,
     tx: &Connection,
@@ -6301,13 +6585,67 @@ fn selected_native_rejoin(
     sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
     pin: IndexPin,
     cancel: &CancelFlag,
+    local_reuse: Option<&PreflightReuse>,
+    prior_pin: Option<IndexPin>,
 ) -> Result<()> {
     use crate::{native_ids, semantic_evidence as sem};
     let key = semantic_pin_key(pin);
     // The destination is shared by every selected producer. A corrupt measured
     // candidate must abort this publication, never become one producer's failure.
-    crate::semantic_import::MeasuredFacts::new(native, sources)?;
-    for input in selected {
+    #[cfg(feature = "test-support")]
+    let force_full = std::env::var_os("TRELLIS_TEST_FORCE_FULL_REJOIN").is_some();
+    #[cfg(not(feature = "test-support"))]
+    let force_full = false;
+    let incremental = if let (Some(reuse), Some(prior)) = (local_reuse, prior_pin)
+        && !force_full
+    {
+        incremental_native_destination(tx, selected, native, sources, reuse, prior)?
+    } else {
+        None
+    };
+    #[cfg(feature = "test-support")]
+    let used_full_fallback =
+        incremental.is_none() && local_reuse.is_some() && prior_pin.is_some() && !force_full;
+    let (candidate, selected_sources, reusable) = match incremental {
+        Some((candidate, sources, reusable)) => (candidate, sources, Some(reusable)),
+        None if let (Some(reuse), Some(prior)) = (local_reuse, prior_pin) => {
+            let (candidate, sources) =
+                complete_local_destination(tx, native, sources, reuse, prior)?;
+            (candidate, sources, None)
+        }
+        None => (native.clone(), sources.clone(), None),
+    };
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE").is_some() {
+        let reused = reusable
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .flat_map(|docs| docs.iter().cloned())
+            .collect();
+        crate::semantic_import::reset_publication_work(&native.revision.id, reused);
+        if used_full_fallback {
+            crate::semantic_import::note_full_fallback();
+        }
+    }
+    let destination = crate::semantic_import::MeasuredFacts::new(&candidate, &selected_sources)?;
+    #[cfg(feature = "test-support")]
+    let full_oracle = if std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE").is_some()
+        && let (Some(reuse), Some(prior)) = (local_reuse, prior_pin)
+    {
+        ensure!(
+            reusable
+                .as_ref()
+                .is_some_and(|per_producer| per_producer.iter().any(|docs| !docs.is_empty())),
+            "test oracle expected at least one witnessed source association",
+        );
+        Some(complete_local_destination(
+            tx, native, sources, reuse, prior,
+        )?)
+    } else {
+        None
+    };
+    for (index, input) in selected.iter().enumerate() {
         check_cancel(cancel)?;
         let attempt = (|| -> Result<(sem::SemanticPublication, sem::CapturedComponents)> {
             let raw = input
@@ -6429,19 +6767,53 @@ fn selected_native_rejoin(
                     );
                 }
             }
-            let outcome = crate::semantic_import::rejoin_inventory(
+            let mut validated_native = candidate.clone();
+            validated_native
+                .revision
+                .documents
+                .clone_from(&native.revision.documents);
+            let outcome = crate::semantic_import::rejoin_inventory_with_reuse(
                 &inventory,
                 r1,
                 r1_sources,
-                native,
-                sources,
+                &validated_native,
+                &selected_sources,
                 input.producer.clone(),
                 &basis,
                 encoding,
+                &destination,
+                reusable.as_ref().map(|per_producer| &per_producer[index]),
             )?;
+            #[cfg(feature = "test-support")]
+            if let Some(file) = std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE") {
+                std::fs::write(
+                    file,
+                    serde_json::to_vec(&crate::semantic_import::publication_work())?,
+                )?;
+            }
+            #[cfg(feature = "test-support")]
+            if let Some((oracle_native, oracle_sources)) = &full_oracle {
+                let full = crate::semantic_import::rejoin_inventory(
+                    &inventory,
+                    r1,
+                    r1_sources,
+                    oracle_native,
+                    oracle_sources,
+                    input.producer.clone(),
+                    &basis,
+                    encoding,
+                )?;
+                ensure!(
+                    serde_json::to_vec(&outcome.publication)?
+                        == serde_json::to_vec(&full.publication)?
+                        && serde_json::to_vec(&outcome.report)?
+                            == serde_json::to_vec(&full.report)?,
+                    "incremental LOCAL publication differs from independent FULL rejoin oracle"
+                );
+            }
             sem::validate_evidence_with_attested_raw(
                 &outcome.publication,
-                native,
+                &validated_native,
                 &captured,
                 &raw_capture,
                 &attested,
@@ -12461,11 +12833,7 @@ impl Store {
             "native_evidence_required: incomplete selected capture"
         );
         let mut native = prepared.native.clone();
-        if semantic.is_some()
-            || (expected.compatible
-                && expected.pin().is_some_and(|pin| pin.index_revision > 0)
-                && self.selected_links_for_reconciliation(prepared.prior_pin)?)
-        {
+        if semantic.is_some() {
             // Reused versions belong to the selected, previously validated pin.
             // Read their measured rows through that pin, not from the changed-only
             // artifact or from a newly fabricated measurement.
@@ -15050,7 +15418,15 @@ impl Store {
                 self.publication_before_semantic_hook.run();
                 check_cancel(cancel)?;
                 selected_native_rejoin(
-                    self, &tx, &selected, candidate, &sources, revision, cancel,
+                    self,
+                    &tx,
+                    &selected,
+                    candidate,
+                    &sources,
+                    revision,
+                    cancel,
+                    local.map(|_| &reuse),
+                    old_pin.filter(|_| !rebaseline),
                 )?;
                 if let Some(prior) = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0) {
                     fill_semantic_coverage(
