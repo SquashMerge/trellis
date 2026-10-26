@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, atomic::AtomicBool};
 use trellis::{
     indexer::{IndexOptions, index_workspace_with_native},
@@ -61,6 +62,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
             index_revision: 7,
         },
         documents,
+        manifests: Vec::new(),
     }
 }
 fn project(snapshot: &Snapshot) -> Value {
@@ -77,12 +79,49 @@ fn edge<'a>(data: &'a Value, role: &str, source: &str, target: &str) -> &'a Valu
         .unwrap()
 }
 
+fn project_rust_source(snapshot: &Snapshot, limit: usize) -> Value {
+    references::project(snapshot, &["src/lib.rs".into()], limit, &mut || Ok(()))
+        .unwrap()
+        .data
+}
+fn has_edge(data: &Value, source: &str, target: &str) -> bool {
+    data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|pair| pair["source"]["path"] == source && pair["target"]["path"] == target)
+}
+fn module_paths(data: &Value) -> Vec<&str> {
+    data["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|module| module["identity"]["path"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn references_rust_direct_wildcard_expands_public_declaration_owner() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; use crate::m::*;"),
+        ("src/m.rs", "pub fn a() {}"),
+    ]);
+    let data = project(&input);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/m.rs")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
+}
+
 #[test]
 fn references_count_maximal_paths_and_use_stored_roles() {
     let input = snapshot(&[
         (
             "src/lib.rs",
             r#"
+mod store;
 fn production() { crate::store::run(); crate::store::run(); }
 #[cfg(test)] mod tests { fn helper() { crate::store::run(); } }
 #[cfg(feature = "test-support")] fn seam() { crate::store::run(); }
@@ -115,7 +154,7 @@ fn references_sample_limit_does_not_change_exact_counts_and_source_filter_keeps_
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "fn f() { crate::store::one(); crate::store::two(); }",
+            "mod store; fn f() { crate::store::one(); crate::store::two(); }",
         ),
         ("src/store.rs", "pub fn one() {} pub fn two() {}"),
     ]);
@@ -136,7 +175,7 @@ fn references_filtered_closure_keeps_selected_sources_and_both_role_destinations
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "fn f() { crate::store::run(); } #[cfg(test)] mod tests { fn t() { crate::helper::run(); } }",
+            "mod store; mod helper; fn f() { crate::store::run(); } #[cfg(test)] mod tests { fn t() { crate::helper::run(); } }",
         ),
         ("src/store.rs", "pub fn run() {}"),
         ("src/helper.rs", "pub fn run() {}"),
@@ -181,7 +220,7 @@ fn references_filtered_resolution_keeps_unselected_ambiguity_and_rust_layout() {
         ("web/a.js", "import './b';"),
         ("web/b.js", ""),
         ("web/b.mjs", ""),
-        ("src/lib.rs", "fn f() { crate::store::run(); }"),
+        ("src/lib.rs", "mod store; fn f() { crate::store::run(); }"),
         ("src/store.rs", "pub fn run() {}"),
         ("src/layout.rs", r#"#[path = "other.rs"] mod store;"#),
     ]);
@@ -193,7 +232,10 @@ fn references_filtered_resolution_keeps_unselected_ambiguity_and_rust_layout() {
     )
     .unwrap()
     .data;
-    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/store.rs")["count"],
+        1
+    );
     let mut reasons: Vec<_> = data["unresolved"]
         .as_array()
         .unwrap()
@@ -201,11 +243,8 @@ fn references_filtered_resolution_keeps_unselected_ambiguity_and_rust_layout() {
         .map(|u| u["reason"].as_str().unwrap())
         .collect();
     reasons.sort_unstable();
-    assert_eq!(
-        reasons,
-        ["module_path_ambiguous", "rust_custom_path_unsupported"]
-    );
-    assert_eq!(data["modules"].as_array().unwrap().len(), 2);
+    assert_eq!(reasons, ["module_path_ambiguous"]);
+    assert_eq!(data["modules"].as_array().unwrap().len(), 3);
 }
 
 #[test]
@@ -266,30 +305,24 @@ fn references_ambiguous_import_files_never_choose_arbitrary_target() {
 }
 
 #[test]
-fn references_rust_alias_reexport_inline_and_custom_layouts_stay_unresolved() {
-    for source in [
-        "use crate::store::run as alias; fn f() { alias(); }",
-        "pub use crate::store::run;",
-        "mod store { pub fn run() {} } fn f() { crate::store::run(); }",
-        "#[path = \"elsewhere.rs\"] mod store; fn f() { crate::store::run(); }",
-    ] {
-        let input = snapshot(&[("src/lib.rs", source), ("src/store.rs", "pub fn run() {}")]);
-        let data = project(&input);
-        assert!(
-            data["production"].as_array().unwrap().is_empty(),
-            "{source}: {data}"
-        );
-        assert!(
-            !data["unresolved"].as_array().unwrap().is_empty(),
-            "{source}"
-        );
-    }
+fn references_rust_relevant_custom_layout_stays_unresolved() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            r#"#[path = "elsewhere.rs"] mod store; fn f() { crate::store::run(); }"#,
+        ),
+        ("src/store.rs", "pub fn run() {}"),
+        ("src/elsewhere.rs", "pub fn run() {}"),
+    ]);
+    let data = project(&input);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert!(!data["unresolved"].as_array().unwrap().is_empty());
 }
 
 #[test]
 fn references_grouped_imports_are_leaf_sites_not_nested_prefixes() {
     let input = snapshot(&[
-        ("src/lib.rs", "use crate::store::{A, B};"),
+        ("src/lib.rs", "mod store; use crate::store::{A, B};"),
         ("src/store.rs", "pub struct A; pub struct B;"),
     ]);
     let data = project(&input);
@@ -325,7 +358,7 @@ fn references_bad_syntax_work_bounds_and_cancellation_fail_atomically() {
 #[test]
 fn references_missing_or_ambiguous_owner_never_guesses_production() {
     let mut input = snapshot(&[
-        ("src/lib.rs", "fn f() { crate::store::run(); }"),
+        ("src/lib.rs", "mod store; fn f() { crate::store::run(); }"),
         ("src/store.rs", "pub fn run() {}"),
     ]);
     let source = input
@@ -376,21 +409,14 @@ fn references_rust_binary_crate_paths_do_not_map_to_root_modules() {
     let data = project(&input);
     assert!(data["production"].as_array().unwrap().is_empty());
     assert_eq!(data["unresolved"].as_array().unwrap().len(), 2);
-    assert!(
-        data["unresolved"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|site| site["reason"] == "rust_custom_root_unsupported")
-    );
 }
 
 #[test]
-fn references_private_imported_module_names_do_not_become_file_edges() {
+fn references_rust_imported_inline_module_maps_owner_not_decoy() {
     let input = snapshot(&[
         (
             "src/lib.rs",
-            "use crate::actual::store; fn f() { crate::store::run(); }",
+            "mod actual; use crate::actual::store; fn f() { crate::store::run(); }",
         ),
         ("src/actual.rs", "pub mod store { pub fn run() {} }"),
         ("src/store.rs", "pub fn run() {}"),
@@ -404,21 +430,16 @@ fn references_private_imported_module_names_do_not_become_file_edges() {
             .any(|edge| edge["source"]["path"] == "src/lib.rs"
                 && edge["target"]["path"] == "src/store.rs")
     );
-    assert!(
-        data["unresolved"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|site| site["site"]["spelling"] == "crate::store::run"
-                && site["reason"] == "rust_inline_or_alias_ambiguous")
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/actual.rs")["count"],
+        2
     );
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
 }
 
 #[test]
-fn references_rust_wildcards_and_spaced_path_attributes_cannot_prove_file_edges() {
+fn references_rust_spaced_path_attributes_cannot_prove_decoy_file_edges() {
     for source in [
-        "use crate::actual::*; fn f() { crate::store::run(); }",
-        "pub use crate::actual::*; fn f() { crate::store::run(); }",
         "#[path\t=\t\"actual.rs\"] mod store; fn f() { crate::store::run(); }",
         "#[path /* chosen module */ = \"actual.rs\"] mod store; fn f() { crate::store::run(); }",
     ] {
@@ -456,21 +477,18 @@ fn references_grouped_self_import_does_not_map_a_decoy_file() {
             .any(|edge| edge["source"]["path"] == "src/lib.rs"
                 && edge["target"]["path"] == "src/store.rs")
     );
-    assert!(
-        data["unresolved"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|site| site["site"]["spelling"] == "crate::store::run"
-                && site["reason"] == "rust_inline_or_alias_ambiguous")
-    );
+    assert!(data["production"].as_array().unwrap().iter().any(|pair| {
+        pair["source"]["path"] == "src/lib.rs" && pair["target"]["path"] == "src/actual/store.rs"
+    }));
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
 }
 
 #[test]
 fn references_modest_file_with_many_calls_keeps_exact_counts() {
-    let source = (0..600)
-        .map(|i| format!("fn f{i}() {{ {} }}\n", "crate::target::run(); ".repeat(4)))
-        .collect::<String>();
+    let source = "mod target;\n".to_owned()
+        + &(0..600)
+            .map(|i| format!("fn f{i}() {{ {} }}\n", "crate::target::run(); ".repeat(4)))
+            .collect::<String>();
     let input = snapshot(&[
         ("src/lib.rs", &source),
         ("src/target.rs", "pub fn run() {}"),
@@ -488,7 +506,7 @@ fn references_modest_file_with_many_calls_keeps_exact_counts() {
 #[test]
 fn references_indexed_owners_preserve_linear_selection_and_call_order() {
     let mut input = snapshot(&[
-        ("src/lib.rs", "fn f() { crate::target::run(); }"),
+        ("src/lib.rs", "mod target; fn f() { crate::target::run(); }"),
         ("src/target.rs", "pub fn run() {}"),
     ]);
     let source_index = input
@@ -543,4 +561,1068 @@ fn references_indexed_owners_preserve_linear_selection_and_call_order() {
         edge(&data, "production", "src/lib.rs", "src/target.rs")["sites"][0]["callId"],
         "occ:v2:first-stored"
     );
+}
+
+#[test]
+fn references_rust_conventional_directory_and_inline_wildcards_expand() {
+    for files in [
+        vec![
+            ("src/lib.rs", "mod m; use crate::m::*;"),
+            ("src/m/mod.rs", "pub fn a() {} pub fn b() {}"),
+        ],
+        vec![("src/lib.rs", "mod m { pub fn a() {} } use crate::m::*;")],
+    ] {
+        let input = snapshot(&files);
+        let data = project_rust_source(&input, 20);
+        let target = if files.len() == 1 {
+            "src/lib.rs"
+        } else {
+            "src/m/mod.rs"
+        };
+        assert_eq!(edge(&data, "production", "src/lib.rs", target)["count"], 1);
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert!(data["unresolved"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn references_rust_nested_self_super_and_inline_file_ancestry_are_proved() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod outer;"),
+        (
+            "src/outer.rs",
+            "pub fn a() {} mod inner { mod leaf; use self::leaf::*; use super::a; }",
+        ),
+        ("src/outer/inner/leaf.rs", "pub fn b() {}"),
+        ("src/inner/leaf.rs", "pub fn decoy() {}"),
+    ]);
+    let data = references::project(&input, &["src/outer.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(
+        edge(
+            &data,
+            "production",
+            "src/outer.rs",
+            "src/outer/inner/leaf.rs"
+        )["count"],
+        1
+    );
+    assert_eq!(
+        edge(&data, "production", "src/outer.rs", "src/outer.rs")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "src/outer.rs", "src/inner/leaf.rs"));
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn references_rust_missing_duplicate_and_ambiguous_module_proof_stay_unknown() {
+    for files in [
+        vec![
+            ("src/lib.rs", "use crate::m::*;"),
+            ("src/m.rs", "pub fn a() {}"),
+        ],
+        vec![
+            ("src/lib.rs", "mod m; mod m; use crate::m::*;"),
+            ("src/m.rs", "pub fn a() {}"),
+        ],
+        vec![
+            ("src/lib.rs", "mod m; use crate::m::*;"),
+            ("src/m.rs", "pub fn a() {}"),
+            ("src/m/mod.rs", "pub fn b() {}"),
+        ],
+    ] {
+        let input = snapshot(&files);
+        let data = project_rust_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn references_rust_private_methods_and_function_locals_are_not_exports() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; use crate::m::*; fn visible() {}"),
+        (
+            "src/m.rs",
+            "pub fn visible() { fn nested() {} } fn hidden() {} struct Private; impl Private { pub fn method() {} }",
+        ),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_rust_explicit_import_and_proved_alias_shadow_only_matching_name() {
+    for binding in ["use crate::local::a;", "use crate::local::original as a;"] {
+        let source = format!("mod local; mod m; {binding} use crate::m::*; fn f() {{ a(); }}");
+        let input = snapshot(&[
+            ("src/lib.rs", &source),
+            ("src/local.rs", "pub fn a() {} pub fn original() {}"),
+            ("src/m.rs", "pub fn a() {}"),
+        ]);
+        let data = project_rust_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "src/lib.rs", "src/local.rs")["count"],
+            1
+        );
+        assert!(!has_edge(&data, "src/lib.rs", "src/m.rs"));
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        let site = &edge(&data, "production", "src/lib.rs", "src/local.rs")["sites"][0];
+        assert!(site["callId"].is_null());
+        assert_eq!(site["relationKind"], "import");
+    }
+}
+
+#[test]
+fn references_rust_unproved_explicit_alias_blocks_fallback_but_underscore_does_not() {
+    for (binding, expected_target) in [
+        ("use crate::missing::a as a;", false),
+        ("use crate::local::a as _;", true),
+    ] {
+        let source = format!("mod local; mod m; {binding} use crate::m::*;");
+        let input = snapshot(&[
+            ("src/lib.rs", &source),
+            ("src/local.rs", "pub fn a() {}"),
+            ("src/m.rs", "pub fn a() {}"),
+        ]);
+        let data = project_rust_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "src/lib.rs", "src/m.rs"),
+            expected_target,
+            "{data}"
+        );
+    }
+}
+
+#[test]
+fn references_rust_shadowing_obeys_lexical_scope_and_constructor_namespace() {
+    for (declaration, survives) in [
+        ("fn a() {}", false),
+        ("struct a {}", true),
+        ("struct a;", false),
+        ("struct a(u8);", false),
+        ("mod sibling { fn a() {} }", true),
+        ("fn f() { fn a() {} }", true),
+    ] {
+        let source = format!("mod m; use crate::m::*; {declaration}");
+        let input = snapshot(&[("src/lib.rs", &source), ("src/m.rs", "pub fn a() {}")]);
+        let data = project_rust_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "src/lib.rs", "src/m.rs"),
+            survives,
+            "{declaration}: {data}"
+        );
+        assert_eq!(
+            data["counts"]["unresolvedSites"],
+            if survives { 0 } else { 1 }
+        );
+    }
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod m; fn f() { use crate::m::*; fn a() {} } fn g() { use crate::m::*; }",
+        ),
+        ("src/m.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/m.rs")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_rust_named_module_export_uses_declaration_owner_not_members() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; use crate::m::*;"),
+        ("src/m.rs", "pub mod child;"),
+        ("src/m/child.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/m.rs")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "src/lib.rs", "src/m/child.rs"));
+}
+
+#[test]
+fn references_rust_named_and_renamed_public_forwarding_keep_final_owner() {
+    for forwarding in [
+        "pub use crate::origin::a;",
+        "pub use crate::origin::a as renamed;",
+    ] {
+        let input = snapshot(&[
+            (
+                "src/lib.rs",
+                "mod origin; mod facade; use crate::facade::*;",
+            ),
+            ("src/facade.rs", forwarding),
+            ("src/origin.rs", "pub fn a() {}"),
+        ]);
+        let data = project_rust_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "src/lib.rs", "src/origin.rs")["count"],
+            1
+        );
+        assert!(!has_edge(&data, "src/lib.rs", "src/facade.rs"));
+        assert_eq!(
+            module_paths(&data),
+            ["src/facade.rs", "src/lib.rs", "src/origin.rs"]
+        );
+        assert!(data["unresolved"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn references_rust_forwarding_depth_four_resolves_but_fifth_edge_is_unknown() {
+    for (last_forward, resolves) in [("pub fn a() {}", true), ("pub use crate::e::*;", false)] {
+        let input = snapshot(&[
+            (
+                "src/lib.rs",
+                "mod a; mod b; mod c; mod d; mod e; use crate::a::*;",
+            ),
+            ("src/a.rs", "pub use crate::b::*;"),
+            ("src/b.rs", "pub use crate::c::*;"),
+            ("src/c.rs", "pub use crate::d::*;"),
+            ("src/d.rs", last_forward),
+            ("src/e.rs", "pub fn a() {}"),
+        ]);
+        let data = project_rust_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "src/lib.rs", "src/d.rs"),
+            resolves,
+            "{data}"
+        );
+        assert!(!has_edge(&data, "src/lib.rs", "src/e.rs"));
+        assert_eq!(
+            data["counts"]["unresolvedSites"],
+            if resolves { 0 } else { 1 }
+        );
+        if resolves {
+            assert_eq!(
+                module_paths(&data),
+                ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/lib.rs"]
+            );
+        }
+    }
+}
+
+#[test]
+fn references_rust_cycle_keeps_independent_direct_export_and_residual_unknown() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod a; mod b; use crate::a::*;"),
+        ("src/a.rs", "pub fn good() {} pub use crate::b::*;"),
+        ("src/b.rs", "pub use crate::a::*;"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/a.rs")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn references_rust_diamond_deduplicates_original_identity_not_spelling() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod facade; mod left; mod right; mod origin; use crate::facade::*;",
+        ),
+        (
+            "src/facade.rs",
+            "pub use crate::left::*; pub use crate::right::*;",
+        ),
+        ("src/left.rs", "pub use crate::origin::a;"),
+        ("src/right.rs", "pub use crate::origin::a;"),
+        ("src/origin.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/origin.rs")["count"],
+        1
+    );
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
+    assert_eq!(
+        module_paths(&data),
+        [
+            "src/facade.rs",
+            "src/left.rs",
+            "src/lib.rs",
+            "src/origin.rs",
+            "src/right.rs"
+        ]
+    );
+}
+
+#[test]
+fn references_rust_filtered_catalog_retains_distinct_wildcard_collision() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod facade; mod left; mod right; use crate::facade::*;",
+        ),
+        (
+            "src/facade.rs",
+            "pub use crate::left::*; pub use crate::right::*;",
+        ),
+        ("src/left.rs", "pub fn a() {}"),
+        ("src/right.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["scannedDocuments"], 1);
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn references_rust_conditional_known_name_keeps_other_positive_and_stored_role() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod m; use crate::m::*; #[cfg(test)] mod tests { use crate::m::*; }",
+        ),
+        (
+            "src/m.rs",
+            "pub fn good() {} #[cfg(feature = \"optional\")] pub fn bad() {}",
+        ),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/m.rs")["count"],
+        1
+    );
+    assert_eq!(edge(&data, "tests", "src/lib.rs", "src/m.rs")["count"], 1);
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+    let roles: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|unknown| unknown["site"]["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["production", "test"]);
+}
+
+#[test]
+fn references_rust_opaque_exports_block_wildcard_uniqueness_not_explicit_names() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod m; mod opaque; mod facade; use crate::facade::*;",
+        ),
+        ("src/m.rs", "pub fn good() {}"),
+        ("src/opaque.rs", "make_items!();"),
+        (
+            "src/facade.rs",
+            "pub use crate::m::good; pub use crate::opaque::*;",
+        ),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/m.rs")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+
+    let blocked = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod m; mod opaque; use crate::m::*; use crate::opaque::*;",
+        ),
+        ("src/m.rs", "pub fn good() {}"),
+        ("src/opaque.rs", "make_items!();"),
+    ]);
+    let data = project_rust_source(&blocked, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+}
+
+#[test]
+fn references_rust_fanout_counts_once_per_site_and_once_per_final_owner() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod facade; mod left; mod right; use crate::facade::*;",
+        ),
+        (
+            "src/facade.rs",
+            "pub use crate::left::*; pub use crate::right::*; #[cfg(test)] pub fn conditional() {}",
+        ),
+        ("src/left.rs", "pub fn a() {} pub fn b() {}"),
+        ("src/right.rs", "pub fn c() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/left.rs")["count"],
+        1
+    );
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/right.rs")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "src/lib.rs", "src/facade.rs"));
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    let counts: u64 = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| pair["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(counts, 2);
+}
+
+#[test]
+fn references_rust_empty_and_fully_shadowed_expansions_have_distinct_coverage() {
+    let mut reasons = Vec::new();
+    for (source, target) in [
+        ("mod m; use crate::m::*;", "fn private() {}"),
+        ("mod m; use crate::m::*; fn a() {}", "pub fn a() {}"),
+    ] {
+        let input = snapshot(&[("src/lib.rs", source), ("src/m.rs", target)]);
+        let data = project_rust_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty());
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+        reasons.push(data["unresolved"][0]["reason"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(reasons[0], reasons[1]);
+}
+
+#[test]
+fn references_rust_clipped_samples_keep_proof_closure_ranges_and_exact_counts() {
+    let source = "mod first; mod second; mod origin; fn f() { use crate::first::*; } fn g() { use crate::second::*; }";
+    let input = snapshot(&[
+        ("src/lib.rs", source),
+        ("src/first.rs", "pub use crate::origin::a;"),
+        ("src/second.rs", "pub use crate::origin::a;"),
+        ("src/origin.rs", "pub fn a() {}"),
+        ("src/unrelated.rs", "pub fn unused() {}"),
+    ]);
+    let data = project_rust_source(&input, 1);
+    let pair = edge(&data, "production", "src/lib.rs", "src/origin.rs");
+    assert_eq!(pair["count"], 2);
+    assert_eq!(pair["omittedSites"], 1);
+    assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(
+        module_paths(&data),
+        [
+            "src/first.rs",
+            "src/lib.rs",
+            "src/origin.rs",
+            "src/second.rs"
+        ]
+    );
+    let site = &pair["sites"][0];
+    let start = site["range"]["start"].as_u64().unwrap() as usize;
+    let end = site["range"]["end"].as_u64().unwrap() as usize;
+    assert_eq!(&source[start..end], site["spelling"].as_str().unwrap());
+    assert!(site["callId"].is_null());
+    let owner = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/lib.rs")
+        .unwrap()
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name.as_deref() == Some("f"))
+        .unwrap();
+    assert_eq!(site["ownerSyntaxId"], owner.syntax_id);
+    assert_eq!(site["role"], "production");
+    assert_eq!(project_rust_source(&input, 20)["modules"], data["modules"]);
+    for module in data["modules"].as_array().unwrap() {
+        let document = input
+            .documents
+            .iter()
+            .find(|document| document.key.path == module["identity"]["path"].as_str().unwrap())
+            .unwrap();
+        let native = document
+            .declarations
+            .iter()
+            .find(|declaration| declaration.kind == "module" && declaration.ancestors.is_empty())
+            .unwrap();
+        assert_eq!(module["identity"]["sid"], native.syntax_id);
+        assert_eq!(module["revisionId"], native.revision_id);
+        assert_eq!(module["provenanceId"], native.provenance_id);
+        assert_eq!(module["contentHash"], document.file.hash);
+    }
+}
+
+#[test]
+fn references_rust_expansion_order_is_stable_across_document_and_declaration_order() {
+    let mut input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod facade; mod left; mod right; use crate::facade::*;",
+        ),
+        (
+            "src/facade.rs",
+            "pub use crate::right::*; pub use crate::left::*;",
+        ),
+        ("src/left.rs", "pub fn a() {}"),
+        ("src/right.rs", "pub fn b() {} #[cfg(test)] pub fn c() {}"),
+    ]);
+    let expected = project_rust_source(&input, 1);
+    input.documents.reverse();
+    for doc in &mut input.documents {
+        doc.declarations.reverse();
+    }
+    assert_eq!(project_rust_source(&input, 1), expected);
+    assert_eq!(project_rust_source(&input, 1), expected);
+}
+
+#[test]
+fn references_rust_competing_consumer_wildcards_do_not_select_by_source_order() {
+    for imports in [
+        "use crate::left::*; use crate::right::*;",
+        "use crate::right::*; use crate::left::*;",
+    ] {
+        let source = format!("mod left; mod right; {imports}");
+        let input = snapshot(&[
+            ("src/lib.rs", &source),
+            ("src/left.rs", "pub fn a() {}"),
+            ("src/right.rs", "pub fn a() {}"),
+        ]);
+        let data = project_rust_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty());
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 2);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn references_rust_restricted_visibility_is_not_promoted_outside_its_scope() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; use crate::m::inner::*;"),
+        ("src/m.rs", "pub mod inner;"),
+        (
+            "src/m/inner.rs",
+            "pub fn good() {} pub(in crate::m) fn restricted() {} fn private() {}",
+        ),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/m/inner.rs")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_rust_conditional_module_edge_does_not_certify_unconditional_export() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "#[cfg(feature = \"optional\")] mod m; use crate::m::*;",
+        ),
+        ("src/m.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_rust_shared_file_with_unproved_crate_membership_stays_unknown() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod shared;"),
+        ("src/main.rs", "mod shared; fn main() {}"),
+        ("src/shared.rs", "mod child; use crate::shared::child::*;"),
+        ("src/shared/child.rs", "pub fn a() {}"),
+    ]);
+    let data = references::project(&input, &["src/shared.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_rust_external_wildcard_does_not_erase_proved_local_name_or_bind_bare_call() {
+    let source = "mod local; use crate::local::*; use dep::*; fn f() { local_name(); }";
+    let mut input = snapshot(&[
+        ("src/lib.rs", source),
+        ("src/local.rs", "pub fn local_name() {}"),
+    ]);
+    let source_set_id = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/lib.rs")
+        .unwrap()
+        .key
+        .source_set_id
+        .clone();
+    let manifest = b"[package]\nname = 'fixture'\nversion = '0.1.0'\n[dependencies]\ndep = '1'\n";
+    input.manifests.push(references::external::ManifestInput {
+        source_set_id,
+        native_revision_id: "selected-native-revision".into(),
+        dependency_hash: "captured-dependencies".into(),
+        path: "Cargo.toml".into(),
+        content_hash: Some(hex::encode(Sha256::digest(manifest))),
+        bytes: Some(manifest.to_vec()),
+    });
+    let data = project_rust_source(&input, 20);
+    let local = edge(&data, "production", "src/lib.rs", "src/local.rs");
+    assert_eq!(local["count"], 1);
+    assert_eq!(local["sites"][0]["relationKind"], "import");
+    assert!(local["sites"][0]["callId"].is_null());
+    let package = data["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pair| pair["target"]["kind"] == "externalPackage")
+        .unwrap();
+    assert_eq!(package["count"], 1);
+    assert_eq!(package["target"]["package"], "dep");
+    assert_eq!(package["target"]["standardLibrary"], false);
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(data["production"].as_array().unwrap().len(), 2);
+    assert_eq!(data["externalPackages"].as_array().unwrap().len(), 1);
+    assert_eq!(module_paths(&data), ["src/lib.rs", "src/local.rs"]);
+    assert!(
+        data["production"].as_array().unwrap().iter().all(|pair| {
+            pair["sites"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|site| site["relationKind"] == "import")
+        }),
+        "the bare call is not a new structural site or semantic call binding"
+    );
+}
+
+#[test]
+fn references_rust_opaque_binding_in_importing_scope_blocks_wildcard_fallback() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; make_bindings!(); use crate::m::*;"),
+        ("src/m.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn references_rust_test_only_inline_export_cannot_prove_production_availability() {
+    let input = snapshot(&[(
+        "src/lib.rs",
+        "mod m { #[test] pub fn a() {} } use crate::m::*;",
+    )]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert!(data["tests"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"][0]["site"]["role"], "production");
+}
+
+#[test]
+fn references_rust_forwarded_module_alias_keeps_final_owner_and_intermediate_proof() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod alias; mod bridge; use crate::alias::renamed::*;",
+        ),
+        ("src/alias.rs", "pub use crate::bridge::m as renamed;"),
+        ("src/bridge.rs", "pub mod m;"),
+        ("src/bridge/m.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/bridge/m.rs")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "src/lib.rs", "src/alias.rs"));
+    assert!(!has_edge(&data, "src/lib.rs", "src/bridge.rs"));
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(
+        module_paths(&data),
+        [
+            "src/alias.rs",
+            "src/bridge.rs",
+            "src/bridge/m.rs",
+            "src/lib.rs"
+        ]
+    );
+}
+
+#[test]
+fn references_rust_file_module_super_uses_lexical_parent_not_file_itself() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; mod n;"),
+        ("src/m.rs", "use super::n::*;"),
+        ("src/n.rs", "pub fn a() {}"),
+        ("src/m/n.rs", "pub fn decoy() {}"),
+    ]);
+    let data = references::project(&input, &["src/m.rs".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(
+        edge(&data, "production", "src/m.rs", "src/n.rs")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "src/m.rs", "src/m/n.rs"));
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_rust_inner_cfg_applies_to_whole_module_export_scope() {
+    for files in [
+        vec![
+            ("src/lib.rs", "mod m; use crate::m::*;"),
+            (
+                "src/m.rs",
+                r##"#![cfg(feature = "x")] pub fn a() {} pub fn b() {}"##,
+            ),
+        ],
+        vec![(
+            "src/lib.rs",
+            r##"mod m { #![cfg(feature = "x")] pub fn a() {} pub fn b() {} } use crate::m::*;"##,
+        )],
+    ] {
+        let input = snapshot(&files);
+        let data = project_rust_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert!(data["tests"].as_array().unwrap().is_empty());
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+        assert_eq!(data["unresolved"][0]["site"]["role"], "production");
+    }
+}
+
+#[test]
+fn references_rust_inner_cfg_prevents_explicit_later_item_availability() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod m; use crate::m::b; fn f() { crate::m::b(); }",
+        ),
+        (
+            "src/m.rs",
+            r##"#![cfg(feature = "x")] pub fn a() {} pub fn b() {}"##,
+        ),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert!(data["tests"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 2);
+    assert!(
+        data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|unknown| { unknown["site"]["role"] == "production" })
+    );
+}
+
+#[test]
+fn references_rust_qualified_type_context_keeps_only_type_namespace_owner() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod types; mod values; mod x; fn f(_: crate::x::A) {}",
+        ),
+        ("src/types.rs", "pub type A = u8;"),
+        ("src/values.rs", "pub fn A() {}"),
+        (
+            "src/x.rs",
+            "pub use crate::types::A; pub use crate::values::A;",
+        ),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/types.rs")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "src/lib.rs", "src/values.rs"));
+    assert!(!has_edge(&data, "src/lib.rs", "src/x.rs"));
+    assert_eq!(data["counts"]["scannedDocuments"], 1);
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_rust_generic_type_binder_blocks_same_spelled_module_path() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod T; trait Tr { fn a(); } fn f<T: Tr>() { T::a(); }",
+        ),
+        ("src/T.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(!has_edge(&data, "src/lib.rs", "src/T.rs"));
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+    assert_eq!(data["unresolved"][0]["site"]["spelling"], "T::a");
+    assert_eq!(data["unresolved"][0]["site"]["role"], "production");
+}
+
+#[test]
+fn references_rust_unqualified_module_lookup_stops_at_inline_module_boundary() {
+    let input = snapshot(&[("src/lib.rs", "mod m { pub fn a() {} } mod n { use m::a; }")]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+    assert_eq!(data["unresolved"][0]["site"]["spelling"], "m::a");
+    assert_eq!(data["unresolved"][0]["site"]["role"], "production");
+}
+
+#[test]
+fn references_rust_private_local_binding_shadows_public_star_forwarding() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; mod n; use crate::n::*;"),
+        ("src/m.rs", "pub fn a() {}"),
+        ("src/n.rs", "fn a() {} pub use crate::m::*;"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert!(!has_edge(&data, "src/lib.rs", "src/m.rs"));
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn references_rust_wildcard_imported_local_std_module_precedes_standard_library() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod local; use crate::local::*; use std::Item;",
+        ),
+        ("src/local.rs", "pub mod std { pub struct Item; }"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/local.rs")["count"],
+        2
+    );
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn references_rust_extern_crate_alias_blocks_standard_library_spelling_fallback() {
+    let input = snapshot(&[("src/lib.rs", "extern crate serde as std; use std::Item;")]);
+    let data = project_rust_source(&input, 20);
+    assert!(!data["production"].as_array().unwrap().iter().any(|pair| {
+        pair["target"]["kind"] == "externalPackage" && pair["target"]["standardLibrary"] == true
+    }));
+    assert!(
+        !data["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| { package["identity"]["standardLibrary"] == true })
+    );
+    assert!(
+        data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|unknown| { unknown["site"]["spelling"] == "std::Item" })
+    );
+}
+
+#[test]
+fn references_rust_follow_depth_is_consumed_across_multiple_module_alias_segments() {
+    for (path, middle, resolves) in [
+        ("crate::A::B::C::*", "pub fn good() {}", true),
+        ("crate::A::B::C::D::*", "pub use crate::d as D;", false),
+    ] {
+        let consumer = format!("use {path};");
+        let input = snapshot(&[
+            (
+                "src/lib.rs",
+                "pub mod a; pub mod b; pub mod c; pub mod d; mod consumer; pub use crate::a as A;",
+            ),
+            ("src/a.rs", "pub use crate::b as B;"),
+            ("src/b.rs", "pub use crate::c as C;"),
+            ("src/c.rs", middle),
+            ("src/d.rs", "pub fn good() {}"),
+            ("src/consumer.rs", &consumer),
+        ]);
+        let data = references::project(&input, &["src/consumer.rs".into()], 20, &mut || Ok(()))
+            .unwrap()
+            .data;
+        assert_eq!(
+            has_edge(&data, "src/consumer.rs", "src/c.rs"),
+            resolves,
+            "{data}"
+        );
+        assert!(!has_edge(&data, "src/consumer.rs", "src/d.rs"));
+        assert_eq!(data["counts"]["mappedSites"], if resolves { 1 } else { 0 });
+        assert_eq!(
+            data["counts"]["unresolvedSites"],
+            if resolves { 0 } else { 1 }
+        );
+        if resolves {
+            assert_eq!(
+                module_paths(&data),
+                [
+                    "src/a.rs",
+                    "src/b.rs",
+                    "src/c.rs",
+                    "src/consumer.rs",
+                    "src/lib.rs"
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn references_rust_unsupported_attribute_item_cannot_prove_explicit_availability() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod m; use crate::m::a; fn f() { crate::m::a(); }",
+        ),
+        ("src/m.rs", "#[custom_attr] pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn references_rust_root_only_standard_library_import_does_not_shadow_itself() {
+    let input = snapshot(&[("src/lib.rs", "use std;")]);
+    let data = project_rust_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    let pair = &data["production"][0];
+    assert_eq!(pair["source"]["path"], "src/lib.rs");
+    assert_eq!(pair["target"]["kind"], "externalPackage");
+    assert_eq!(pair["target"]["package"], "std");
+    assert_eq!(pair["target"]["standardLibrary"], true);
+    assert_eq!(pair["count"], 1);
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(data["externalPackages"].as_array().unwrap().len(), 1);
+    assert_eq!(module_paths(&data), ["src/lib.rs"]);
+}
+
+#[test]
+fn references_rust_private_named_import_shadows_public_star_forwarding() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod m; mod n; mod other; use crate::n::*;"),
+        ("src/m.rs", "pub fn a() {}"),
+        ("src/n.rs", "use crate::other::a; pub use crate::m::*;"),
+        ("src/other.rs", "pub fn a() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_rust_private_item_cannot_be_imported_from_parent_scope() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod n; use crate::n::private;"),
+        ("src/n.rs", "fn private() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_rust_root_only_dependency_import_does_not_shadow_itself() {
+    let mut input = snapshot(&[("src/lib.rs", "use serde;")]);
+    let source_set_id = input.documents[0].key.source_set_id.clone();
+    let manifest = b"[package]\nname = 'fixture'\nversion = '0.1.0'\n[dependencies]\nserde = '1'\n";
+    input.manifests.push(references::external::ManifestInput {
+        source_set_id,
+        native_revision_id: "selected-native-revision".into(),
+        dependency_hash: "captured-dependencies".into(),
+        path: "Cargo.toml".into(),
+        content_hash: Some(hex::encode(Sha256::digest(manifest))),
+        bytes: Some(manifest.to_vec()),
+    });
+    let data = project_rust_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1);
+    let pair = &data["production"][0];
+    assert_eq!(pair["target"]["kind"], "externalPackage");
+    assert_eq!(pair["target"]["package"], "serde");
+    assert_eq!(pair["target"]["standardLibrary"], false);
+    assert_eq!(pair["count"], 1);
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(data["externalPackages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn references_rust_conditional_local_wildcard_blocks_standard_library_fallback() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod local; use crate::local::*; use std::Item;",
+        ),
+        (
+            "src/local.rs",
+            "#[cfg(feature = \"optional\")] pub mod std { pub struct Item; }",
+        ),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert!(
+        data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|unknown| { unknown["site"]["spelling"] == "std::Item" })
+    );
+}
+
+#[test]
+fn references_rust_opaque_local_bindings_block_standard_library_fallback() {
+    let input = snapshot(&[("src/lib.rs", "make_bindings!(); use std::Item;")]);
+    let data = project_rust_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty());
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"][0]["site"]["spelling"], "std::Item");
 }

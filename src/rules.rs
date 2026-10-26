@@ -79,6 +79,8 @@ struct Raw {
     #[serde(default)]
     layer_policy: Policy,
     #[serde(default)]
+    external_policy: ExternalPolicy,
+    #[serde(default)]
     layers: BTreeMap<String, Spanned<RawLayer>>,
     #[serde(default)]
     roles: BTreeMap<String, Spanned<RawRole>>,
@@ -98,7 +100,33 @@ struct Policy {
 struct RawLayer {
     order: Option<i64>,
     shared: Option<bool>,
+    #[serde(default)]
     paths: Vec<Spanned<String>>,
+    #[serde(default)]
+    external: Vec<Spanned<ExternalSelector>>,
+}
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ExternalPolicy {
+    #[serde(default)]
+    deny: Vec<Spanned<ExternalSelector>>,
+}
+#[derive(Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct ExternalSelector {
+    language: String,
+    package: String,
+    stdlib: bool,
+}
+impl ExternalSelector {
+    fn from_identity(identity: &Value) -> Option<Self> {
+        (identity["kind"] == "externalPackage").then_some(())?;
+        Some(Self {
+            language: identity["language"].as_str()?.into(),
+            package: identity["package"].as_str()?.into(),
+            stdlib: identity["standardLibrary"].as_bool()?,
+        })
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +176,7 @@ struct RawException {
 struct Layer {
     order: Option<i64>,
     patterns: Vec<GlobSet>,
+    external: BTreeSet<ExternalSelector>,
     span: std::ops::Range<usize>,
 }
 struct Selector {
@@ -182,6 +211,7 @@ pub struct Config {
     exceptions: Vec<Exception>,
     peers: Option<String>,
     shared_outbound: Option<String>,
+    external_deny: BTreeSet<ExternalSelector>,
 }
 
 pub fn load(root: &Path) -> Result<Option<Config>> {
@@ -242,6 +272,50 @@ fn pattern(text: &str, value: &Spanned<String>, path: bool, budget: &mut usize) 
     set.add(glob);
     set.build()
         .map_err(|e| error(text, value.span(), "glob", "token", e.to_string()))
+}
+fn external_selectors(
+    text: &str,
+    selectors: &[Spanned<ExternalSelector>],
+    budget: &mut usize,
+) -> Result<BTreeSet<ExternalSelector>> {
+    if selectors.len() > COLLECTION_LIMIT {
+        return Err(error(
+            text,
+            selectors[COLLECTION_LIMIT].span(),
+            "too_large",
+            "token",
+            "external selector collection exceeds 1024 entries",
+        ));
+    }
+    let mut selected = BTreeSet::new();
+    for selector in selectors {
+        *budget += 1;
+        if *budget > PATTERN_LIMIT {
+            return Err(error(
+                text,
+                selector.span(),
+                "too_large",
+                "token",
+                "aggregate selector and glob pattern limit exceeded",
+            ));
+        }
+        let value = selector.get_ref();
+        if !crate::references::external::valid_package(
+            &value.language,
+            &value.package,
+            value.stdlib,
+        ) {
+            return Err(error(
+                text,
+                selector.span(),
+                "selector",
+                "token",
+                "invalid canonical external package identity",
+            ));
+        }
+        selected.insert(value.clone());
+    }
+    Ok(selected)
 }
 fn target_valid(t: &ConfigTarget) -> bool {
     !t.source_set.is_empty()
@@ -324,12 +398,14 @@ pub fn parse(text: &str) -> Result<Config> {
     let peers = policy(raw.layer_policy.peers)?;
     let shared_outbound = policy(raw.layer_policy.shared_outbound)?;
     let mut patterns = 0;
+    let external_deny = external_selectors(text, &raw.external_policy.deny, &mut patterns)?;
     let mut layers = BTreeMap::new();
+    let mut external_owners = BTreeMap::new();
     for (name, raw) in raw.layers {
         let span = raw.span();
         let layer = raw.into_inner();
         if name.trim().is_empty()
-            || layer.paths.is_empty()
+            || (layer.paths.is_empty() && layer.external.is_empty())
             || !matches!(
                 (layer.order, layer.shared),
                 (Some(_), None) | (None, Some(true))
@@ -340,7 +416,7 @@ pub fn parse(text: &str) -> Result<Config> {
                 span,
                 "schema",
                 "token",
-                "layer requires paths and exactly one integer order or shared=true",
+                "layer requires nonempty paths or external and exactly one integer order or shared=true",
             ));
         }
         let globs = layer
@@ -348,11 +424,27 @@ pub fn parse(text: &str) -> Result<Config> {
             .iter()
             .map(|v| pattern(text, v, true, &mut patterns))
             .collect::<Result<Vec<_>>>()?;
+        let external = external_selectors(text, &layer.external, &mut patterns)?;
+        for selector in &external {
+            if let Some(previous) = external_owners.insert(selector.clone(), name.clone()) {
+                return Err(error(
+                    text,
+                    span.clone(),
+                    "ambiguity",
+                    "token",
+                    format!(
+                        "external package {} matches layers {previous} and {name}",
+                        selector.package
+                    ),
+                ));
+            }
+        }
         layers.insert(
             name,
             Layer {
                 order: layer.order,
                 patterns: globs,
+                external,
                 span,
             },
         );
@@ -442,7 +534,10 @@ pub fn parse(text: &str) -> Result<Config> {
     for raw in raw.rules {
         let r = raw.get_ref();
         let id = r.id.get_ref();
-        if id.trim().is_empty() || id == "$layers" || !ids.insert(id.clone()) {
+        if id.trim().is_empty()
+            || matches!(id.as_str(), "$layers" | "$external")
+            || !ids.insert(id.clone())
+        {
             return Err(error(
                 text,
                 r.id.span(),
@@ -588,6 +683,7 @@ pub fn parse(text: &str) -> Result<Config> {
         exceptions,
         peers,
         shared_outbound,
+        external_deny,
     })
 }
 
@@ -871,6 +967,49 @@ fn selection(selector: &Selector, d: &Declaration, bases: Option<&Bases>) -> Opt
     }
     if unknown { None } else { Some(true) }
 }
+fn package_closure(
+    packages: &[Value],
+    instances: &[Value],
+    test_only: &[Value],
+    unassigned: &[Value],
+    work: &mut usize,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<Value>> {
+    let mut needed = BTreeSet::new();
+    for identity in instances
+        .iter()
+        .chain(test_only)
+        .map(|row| &row["destination"])
+        .chain(unassigned)
+    {
+        check()?;
+        *work = work.saturating_add(1);
+        ensure!(
+            *work <= 5_000_000,
+            "bounded_work: rules external package closure budget"
+        );
+        if identity["kind"] == "externalPackage" {
+            needed.insert(identity.to_string());
+        }
+    }
+    let mut retained = Vec::new();
+    for package in packages {
+        check()?;
+        *work = work.saturating_add(1);
+        ensure!(
+            *work <= 5_000_000,
+            "bounded_work: rules external package closure budget"
+        );
+        if needed.remove(&package["identity"].to_string()) {
+            retained.push(package.clone());
+        }
+    }
+    ensure!(
+        needed.is_empty(),
+        "store_unavailable: rules external package closure absent"
+    );
+    Ok(retained)
+}
 pub fn evaluate(
     config: &Config,
     snapshot: &Snapshot,
@@ -913,59 +1052,107 @@ pub fn evaluate(
             unassigned.push(module["identity"].clone());
         }
     }
-    let mut work = 0usize;
+    let mut work = modules.len().saturating_mul(layer_patterns);
+    let mut external_assignments = BTreeMap::new();
+    let external_packages = refs.data["externalPackages"]
+        .as_array()
+        .context("store_unavailable: external package descriptors absent")?;
+    for package in external_packages {
+        check()?;
+        let identity = &package["identity"];
+        let selector = ExternalSelector::from_identity(identity)
+            .context("store_unavailable: external package identity absent")?;
+        work = work.saturating_add(config.layers.len());
+        ensure!(
+            work <= 5_000_000,
+            "bounded_work: external layer assignment budget"
+        );
+        let layer = config
+            .layers
+            .iter()
+            .find(|(_, layer)| layer.external.contains(&selector))
+            .map(|(name, _)| name.as_str());
+        external_assignments.insert(identity.to_string(), layer);
+        if layer.is_none() {
+            unassigned.push(identity.clone());
+        }
+    }
     let mut unresolved_positions = BTreeMap::new();
     let mut instances = Vec::new();
     let mut test_only = Vec::new();
-    if !config.layers.is_empty() {
-        for (field, test) in [("production", false), ("tests", true)] {
-            for edge in refs.data[field]
-                .as_array()
-                .context("store_unavailable: references edges absent")?
-            {
-                check()?;
-                let source = &edge["source"];
-                let target = &edge["target"];
-                let path = source["path"]
-                    .as_str()
-                    .context("store_unavailable: edge source path absent")?;
-                if !glob_matches(&filter, path) {
-                    continue;
-                }
-                let source_layer = assignments.get(path).copied().flatten();
-                let target_layer = assignments
+    for (field, test) in [("production", false), ("tests", true)] {
+        for edge in refs.data[field]
+            .as_array()
+            .context("store_unavailable: references edges absent")?
+        {
+            check()?;
+            let source = &edge["source"];
+            let target = &edge["target"];
+            let path = source["path"]
+                .as_str()
+                .context("store_unavailable: edge source path absent")?;
+            if !glob_matches(&filter, path) {
+                continue;
+            }
+            let source_layer = assignments.get(path).copied().flatten();
+            let external = ExternalSelector::from_identity(target);
+            let target_layer = if external.is_some() {
+                *external_assignments
+                    .get(&target.to_string())
+                    .context("store_unavailable: edge external package descriptor absent")?
+            } else {
+                assignments
                     .get(
                         target["path"]
                             .as_str()
                             .context("store_unavailable: edge target path absent")?,
                     )
                     .copied()
-                    .flatten();
+                    .flatten()
+            };
+            let denied = external
+                .as_ref()
+                .is_some_and(|s| config.external_deny.contains(s));
+            if config.layers.is_empty() && !denied {
+                continue;
+            }
+            let module = module_by_id
+                .get(&source.to_string())
+                .context("store_unavailable: edge source module absent")?;
+            let sites = edge["sites"]
+                .as_array()
+                .context("store_unavailable: edge sites absent")?;
+            work = work.saturating_add(1 + sites.len());
+            ensure!(
+                work <= 5_000_000,
+                "bounded_work: rules reference evidence budget"
+            );
+            let mut evidence = Vec::new();
+            for site in sites {
+                check()?;
+                evidence.push(reference_evidence(module, site));
+            }
+            let rows = if test { &mut test_only } else { &mut instances };
+            if !config.layers.is_empty() {
                 let (status, mut unresolved) = layer_status(config, source_layer, target_layer);
                 if test {
                     unresolved.push("test_only".into());
                 }
-                let module = module_by_id
-                    .get(&source.to_string())
-                    .context("store_unavailable: edge source module absent")?;
-                let evidence = edge["sites"]
-                    .as_array()
-                    .context("store_unavailable: edge sites absent")?
-                    .iter()
-                    .map(|s| reference_evidence(module, s))
-                    .collect::<Vec<_>>();
                 let mut row = json!({"rule":"$layers","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":status,
-                "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]});
+                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]});
                 work = work.saturating_add(config.exceptions.len());
                 ensure!(work <= 5_000_000, "bounded_work: exception match budget");
                 decorate(config, &mut row);
-                if test {
-                    test_only.push(row)
-                } else {
-                    instances.push(row)
-                }
+                rows.push(row);
+            }
+            if denied {
+                let unresolved = if test { vec!["test_only"] } else { vec![] };
+                rows.push(json!({"rule":"$external","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":"deviates",
+                    "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]}));
             }
         }
+    }
+    if !config.layers.is_empty() {
         for unresolved in refs.data["unresolved"]
             .as_array()
             .context("store_unavailable: unresolved references absent")?
@@ -1116,9 +1303,18 @@ pub fn evaluate(
     sort_rows(&mut instances);
     sort_rows(&mut test_only);
     check()?;
+    let external_packages = package_closure(
+        external_packages,
+        &instances,
+        &test_only,
+        &unassigned,
+        &mut work,
+        check,
+    )?;
+    check()?;
     Ok(
-        json!({"rulesVersion":"rules:v1","indexGeneration":snapshot.pin.index_generation.to_string(),"indexRevision":snapshot.pin.index_revision,"rulesFile":descriptor(config),
-        "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,
+        json!({"rulesVersion":"rules:v2","indexGeneration":snapshot.pin.index_generation.to_string(),"indexRevision":snapshot.pin.index_revision,"rulesFile":descriptor(config),
+        "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"externalPackages":external_packages,
         "limitations":["Layer results describe observed structurally mapped syntax references, not absence of semantic dependencies.","Calls and type relationships have no admitted bindings and remain unknown.","testOnly policy statuses are hypothetical and never production violations.","Structural reference provenance attests captured source bytes, not a semantic target association."]}),
     )
 }
@@ -1128,6 +1324,22 @@ pub fn explain(
     target: &Value,
     destination: Option<&Value>,
 ) -> Result<Value> {
+    if let Some(destination) = destination.filter(|d| {
+        d.get("kind").is_some() || d.get("package").is_some() || d.get("standardLibrary").is_some()
+    }) {
+        let identity: crate::references::external::ExternalIdentity =
+            serde_json::from_value(destination.clone())
+                .context("invalid_request: malformed external destination identity")?;
+        ensure!(
+            !identity.source_set_id.is_empty()
+                && crate::references::external::valid_package(
+                    &identity.language,
+                    &identity.package,
+                    identity.standard_library
+                ),
+            "invalid_request: malformed external destination identity"
+        );
+    }
     let mut found = false;
     for (field, count_field) in [("instances", "counts"), ("testOnly", "testCounts")] {
         let rows = payload[field]
@@ -1143,5 +1355,17 @@ pub fn explain(
         payload[count_field] = count;
     }
     ensure!(found, "not_found: rule instance");
+    payload["externalPackages"] = json!(package_closure(
+        payload["externalPackages"]
+            .as_array()
+            .context("store_unavailable: external package descriptors absent")?,
+        payload["instances"].as_array().expect("checked instances"),
+        payload["testOnly"].as_array().expect("checked test rows"),
+        payload["unassigned"]
+            .as_array()
+            .context("store_unavailable: unassigned catalog absent")?,
+        &mut 0,
+        &mut || Ok(()),
+    )?);
     Ok(payload)
 }

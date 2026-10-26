@@ -206,18 +206,30 @@ meaning, clipping rules and errors unchanged. The three new flat closed inputs a
 | --- | --- |
 | `trellis_references` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[],limit?:UInt}` |
 | `trellis_rules_check` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[]}` |
-| `trellis_rules_explain` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,rule:string,target:Target,destination?:Target}` |
+| `trellis_rules_explain` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,rule:string,target:Target,destination?:Destination}` |
 
 `Target` is exactly `{sourceSetId,language,path,sid}` with native canonical SID,
 full document identity and indexed checkout-relative path. `rule` is nonempty,
-at most 256 UTF-8 bytes. `destination` is only valid for `$layers`; it selects a
-mapped destination pair, while unresolved-source layer instances have no
-destination. Explicit null optional fields and unknown fields fail
+at most 256 UTF-8 bytes. Sources and rule `target` remain native. `Destination`
+is the closed union of `Target` and
+`{kind:"externalPackage",sourceSetId,language,package,standardLibrary}`. All five
+external fields are required; `language` accepts `java`, `rust`, `python` and
+`javascript`, `standardLibrary` is Boolean and package names are literal canonical
+identities, not aliases, versions or globs. No native path, SID or metric is
+invented for a package. `destination` is only valid for `$layers` and `$external`;
+it selects the actual mapped destination identity, while unresolved-source layer
+instances have no destination. Explicit null optional fields and unknown fields fail
 `invalid_request`. `paths` are anchored positive source path globs, each 1–4096
 UTF-8 bytes; omitted/empty selects all sources. Filters do not shrink the internal
 full-snapshot destination map or target roles. References emit only the
-module/proof closure of selected sources (even those without sites) and emitted
-production/test destinations, in full document-key order (#347 owner amendment).
+native module/proof closure of selected sources (even those without sites),
+emitted native production/test destinations and native intermediate proof modules,
+in full document-key order (#347 owner amendment). The required `externalPackages`
+array contains descriptors for emitted external destinations only. References use
+`references:v2` and check/explain use `rules:v2`; these closed pre-release shapes
+replace v1 without compatibility. Check/explain descriptors close all returned
+external destinations and informational unassigned external identities, including
+a preserved unassigned catalog after explain filtering.
 A no-match source scope returns complete empty structural arrays and zero counts,
 while `semanticComplete:false` remains invariant. Module revision/hash/provenance
 links and all selected unresolved sites remain intact. Rules' informational
@@ -234,8 +246,14 @@ equals the outer `evidenceBasis`; there is no second head sample. The preceding
 `coverage`/`provenance` array-closure requirements apply to find, declaration,
 outgoing calls and incoming calls, not these new structural DTOs. The new DTOs
 instead carry explicit native document-key/revision/hash/provenance links; these
-identify the captured syntax and never prove the derived target mapping. They
-add no fabricated snapshot or semantic relationship proof. Code comes only
+identify the captured syntax and never prove the derived target mapping.
+External descriptors instead carry identity, ecosystem and nonempty captured
+manifest or reviewed standard-library catalog evidence, with the exact closed
+shapes in rules.md. Captured manifests are selected through the same admitted
+transaction and revision as source, never read live. Package evidence is not
+native measured syntax provenance or library member/API resolution. Browser source
+and metric joins use genuine native modules only. These DTOs add no fabricated
+snapshot or semantic relationship proof. Code comes only
 from captured bytes/native rows in that admitted snapshot. Structural mapping is
 syntax, not compiler resolution; `semanticComplete:false` is invariant. Stored
 Decision 0011 roles separate production and tests: feature-only `test-support`

@@ -1651,10 +1651,99 @@ impl EvidenceResponse {
                 calls: fetched.calls,
             });
         }
+        // Retained manifests belong to this selected row and this admitted transaction.
+        // Charge stored bytes before fetching JSON, and source bytes before hex decoding.
+        let dependency_bytes: i64 = self.db.query_row(
+            "SELECT length(CAST(retained_dependencies AS BLOB)) FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |row| row.get(0),
+        )?;
+        let dependency_bytes = u64::try_from(dependency_bytes).context(SelectedIntegrity(
+            "incompatible_index: invalid retained dependencies length".into(),
+        ))?;
+        stored_bytes = stored_bytes.saturating_add(dependency_bytes);
+        ensure!(
+            stored_bytes <= 512 * 1024 * 1024,
+            "bounded_work: architecture source"
+        );
+        check()?;
+        let (source_set_id, native_revision_id, dependency_hash, retained): (String, String, String, String) = self.db.query_row(
+            "SELECT source_set_id,native_revision_id,dependency_hash,retained_dependencies FROM native_revisions WHERE id=?1",
+            [&selected.key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+        enum RetainedInput<'a> {
+            Present {
+                #[serde(borrow)]
+                path: &'a str,
+                #[serde(borrow)]
+                bytes: &'a str,
+                #[serde(rename = "byteLength")]
+                byte_length: u64,
+            },
+            Absent {
+                #[serde(borrow)]
+                path: &'a str,
+            },
+        }
+        let inputs: Vec<RetainedInput<'_>> = serde_json::from_str(&retained).context(
+            SelectedIntegrity("incompatible_index: corrupt retained dependencies".into()),
+        )?;
+        check()?;
+        let mut cargo = None;
+        for input in inputs {
+            check()?;
+            let path = match &input {
+                RetainedInput::Present { path, .. } | RetainedInput::Absent { path } => *path,
+            };
+            if path != "Cargo.toml" {
+                continue;
+            }
+            selected_ensure!(
+                cargo.is_none(),
+                "incompatible_index: duplicate retained Cargo manifest"
+            );
+            let (bytes, content_hash) = match input {
+                RetainedInput::Absent { .. } => (None, None),
+                RetainedInput::Present {
+                    bytes, byte_length, ..
+                } => {
+                    source_bytes = source_bytes.saturating_add(byte_length);
+                    ensure!(
+                        byte_length <= 2 * 1024 * 1024 && source_bytes <= 256 * 1024 * 1024,
+                        "bounded_work: architecture source"
+                    );
+                    selected_ensure!(
+                        byte_length.checked_mul(2) == Some(bytes.len() as u64),
+                        "incompatible_index: corrupt retained Cargo length"
+                    );
+                    check()?;
+                    let bytes = hex::decode(bytes).context(SelectedIntegrity(
+                        "incompatible_index: corrupt retained Cargo bytes".into(),
+                    ))?;
+                    use sha2::{Digest, Sha256};
+                    let hash = hex::encode(Sha256::digest(&bytes));
+                    (Some(bytes), Some(hash))
+                }
+            };
+            cargo = Some(crate::references::external::ManifestInput {
+                source_set_id: source_set_id.clone(),
+                native_revision_id: native_revision_id.clone(),
+                dependency_hash: dependency_hash.clone(),
+                path: path.into(),
+                bytes,
+                content_hash,
+            });
+        }
+        let cargo = cargo.ok_or_else(|| {
+            SelectedIntegrity("incompatible_index: missing retained Cargo entry".into())
+        })?;
         check()?;
         Ok(crate::references::Snapshot {
             pin: selected.pin,
             documents,
+            manifests: vec![cargo],
         })
     }
 

@@ -10,7 +10,12 @@
   };
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const display = value => finite(value) ? String(value) : "—";
-  const moduleKey = identity => JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
+  const external = identity => identity.kind === "externalPackage";
+  const moduleKey = identity => external(identity)
+    ? JSON.stringify([identity.kind, identity.sourceSetId, identity.language, identity.package, identity.standardLibrary])
+    : JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
+  const targetLabel = identity => external(identity)
+    ? `${identity.package} (${identity.language}${identity.standardLibrary ? " stdlib" : " package"})` : identity.path;
   const metricValue = (metrics, name) => name.split(".").reduce((value, key) => value?.[key], metrics);
   const quartiles = values => {
     const sorted = values.filter(finite).sort((a, b) => a - b);
@@ -77,10 +82,18 @@
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
       const unassigned = view.modules.filter(module => module.layer === null);
       paragraph(target, `${unassigned.length} unassigned native file modules remain unknown.`);
+      if (references?.externalPackages?.length) disclosure(target, "External packages and captured evidence", references.externalPackages);
+      const bans = [...(view.rules?.instances || []), ...(view.rules?.testOnly || [])].filter(instance => instance.rule === "$external");
+      if (bans.length) disclosure(target, "External policy results (production and test-only)", bans);
       const choose = (label, action) => { const button = make("button", label); button.type = "button"; button.addEventListener("click", action); target.append(button); };
       const c = basis;
       choose("Inspect same-layer and unassigned references", () => { if (current(c) && usable()) inspect("unknown", null); });
       choose("Inspect unresolved sites", () => { if (current(c) && usable()) inspect("unresolved", null); });
+    }
+    function layerOf(identity) {
+      if (!external(identity)) return view.modules.find(module => same(module.identity, identity))?.layer;
+      return [...(view.rules?.instances || []), ...(view.rules?.testOnly || [])]
+        .find(instance => instance.rule === "$layers" && instance.destination && same(instance.destination, identity))?.destinationLayer;
     }
     function layerLabel(layer) {
       const modules = view.modules.filter(module => module.layer === layer.name);
@@ -99,7 +112,8 @@
         }
         else if (edge.status === "deviates" && !edge.excepted) other += edge.count;
       }
-      return [layer.name, `${prefix} · ${modules.length} files`,
+      const packages = (view.references?.externalPackages || []).filter(item => layerOf(item.identity) === layer.name);
+      return [layer.name, `${prefix} · ${modules.length} files${packages.length ? ` · ${packages.length} external packages` : ""}`,
         ...(metric === "layer" ? [] : [`Max module ${metric} (${aggregate})`, values.length ? String(values.reduce((max, value) => Math.max(max, value), -Infinity)) : "—"]),
         `Prod refs down: ${down}`, `Prod refs up: ${up}`, `Up deviation: ${upDeviation}`, `Peer/shared deviation: ${other}`, `Excepted refs: ${exceptions}`].join("\n");
     }
@@ -178,9 +192,13 @@
     function pairs(target, values, active) {
       if (!values.length) { paragraph(target, "No mapped pairs in this scope. This does not prove absence."); return; }
       for (const pair of values) {
-        const details = make("details"); details.append(make("summary", `${pair.source.path} → ${pair.target.path} · ${pair.count} reference sites`));
+        const details = make("details"); details.append(make("summary", `${targetLabel(pair.source)} → ${targetLabel(pair.target)} · ${pair.count} reference sites`));
         paragraph(details, `${pair.sites.length} sampled sites · ${pair.omittedSites} omitted sites. Counts remain exact; samples are not exhaustive.`);
-        disclosure(details, "Exact module-pair identity", {source:pair.source, target:pair.target, mapping:pair.mapping});
+        disclosure(details, "Exact reference-pair identity", {source:pair.source, target:pair.target, mapping:pair.mapping});
+        if (external(pair.target)) {
+          const descriptor = view.references.externalPackages.find(item => same(item.identity, pair.target));
+          disclosure(details, "External package evidence", descriptor);
+        }
         for (const site of pair.sites) {
           const sample = make("details"); sample.append(make("summary", `${site.role} · ${site.relationKind} · ${site.spelling}`));
           sample.append(make("pre", JSON.stringify(site, null, 2))); inspectorSource(sample, pair.source, site, active); details.append(sample);
@@ -232,7 +250,9 @@
         for (const module of payload.modules.filter(item => item.layer === record.name)) {
           const button = make("button", module.identity.path); button.type = "button"; button.addEventListener("click", () => { if (active()) inspect("module", module); }); target.append(button);
         }
-        const member = identity => payload.modules.some(module => module.layer === record.name && same(module.identity, identity));
+        const packages = (references.externalPackages || []).filter(item => layerOf(item.identity) === record.name);
+        if (packages.length) disclosure(target, "External packages (no native source or metrics)", packages);
+        const member = identity => layerOf(identity) === record.name;
         pairs(target, [...references.production, ...references.tests].filter(pair => member(pair.source) || member(pair.target)), active);
         disclosure(target, "Owned layer policy and exceptions", payload.rules);
       } else if (kind === "unresolved") {
@@ -243,9 +263,8 @@
         }
       } else {
         title.textContent = "Same-layer and unassigned references";
-        const membership = new Map(payload.modules.map(module => [moduleKey(module.identity), module.layer]));
         pairs(target, [...references.production, ...references.tests].filter(pair => {
-          const source = membership.get(moduleKey(pair.source)), destination = membership.get(moduleKey(pair.target));
+          const source = layerOf(pair.source), destination = layerOf(pair.target);
           return source == null || destination == null || source === destination;
         }), active);
         disclosure(target, "Unassigned native file modules", payload.modules.filter(module => module.layer === null));

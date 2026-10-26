@@ -65,6 +65,7 @@ async fn fixture_with_roles(
     fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
     if role_fixture {
         fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "mod roles; mod target;\n").unwrap();
         fs::write(
             root.join("src/roles.rs"),
             r#"fn production() { crate::target::run(); }
