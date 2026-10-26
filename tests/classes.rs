@@ -972,7 +972,7 @@ fn production_class_limits_are_fixed_at_decision_0004_values() {
     assert_eq!(limits.output_text, 64 * 1024 * 1024);
     assert_eq!(limits.registry_text, 32 * 1024 * 1024);
     assert_eq!(limits.files, 100_000);
-    assert_eq!(limits.symbols, 1_000_000);
+    assert_eq!(limits.symbols, 2_000_000);
 }
 
 #[test]

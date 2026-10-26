@@ -1,5 +1,5 @@
-//! R-1 (#199): reused projections compare fresh hashes with stored witnesses.
-//! Non-reused class hashes are replaced by fresh, validated projections.
+//! #225: equal document/graph/class IDs trust the no-drift validated head.
+//! Drift and partial-family reuse keep R-1's witness checks.
 use super::*;
 use crate::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
 use std::{fs, sync::atomic::AtomicBool};
@@ -80,18 +80,13 @@ fn corrupt(store: &Store, pin: IndexPin, sql: &str) {
     tx.commit().unwrap();
 }
 
-/// A new file makes the next capture a FULL publication that reuses A.java.
+/// Force the production full stream seam, independently of local eligibility.
 fn publish_full(store: &Store, options: &IndexOptions) -> Result<IndexPin> {
-    fs::write(
-        options.workspace_root.join("c.js"),
-        "function c(){ return 3; }\n",
-    )
-    .unwrap();
-    IndexJobCoordinator::prepare(store, None)?.run(
-        options,
-        &Arc::new(AtomicBool::new(false)),
-        |_| {},
-    )
+    let pin = store
+        .publication_index_baseline()?
+        .pin()
+        .context("selected pin missing")?;
+    publish_full_route(store, options, pin, true)
 }
 
 fn stored_mismatch_fails_typed_then_rebaselines(sql: &str, message: &str) {
@@ -139,13 +134,231 @@ fn stored_mismatch_fails_typed_then_rebaselines(sql: &str, message: &str) {
 }
 
 #[test]
-fn a_stored_native_witness_mismatch_fails_typed_then_rebaselines() {
-    stored_mismatch_fails_typed_then_rebaselines(
-        "UPDATE document_versions SET native_witness=printf('%064d',0)
-         WHERE vid=(SELECT vid FROM revision_documents
-                   WHERE revision_id=?1 AND path=?2)",
-        "reusable normalized native witness mismatch",
-    );
+fn native_v9_rows_survive_both_full_routes_and_local_reuse() {
+    for stream in [false, true] {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("flow.rs"),
+            "fn main() { run(); opaque!(hidden); }\n",
+        )
+        .unwrap();
+        fs::write(work.path().join("b.js"), "function b(){ return 1; }\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        let key = crate::native_evidence::DocumentKey {
+            source_set_id: format!("source-set:v1:{}", store.root_id()),
+            language: "rust".into(),
+            path: "flow.rs".into(),
+        };
+        let snapshot = |pin| {
+            store.native_at(pin, |db, selected| {
+                let scope = v8_native_scope_for(db, &key, selected)?.unwrap();
+                let ids: (i64, i64, i64) = db.query_row(
+                    "SELECT vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path='flow.rs'",
+                    [&selected.key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                let mut rows = vec![];
+                for table in [
+                    "native_version_references",
+                    "native_version_capability_families",
+                    "native_version_capability_gaps",
+                ] {
+                    let mut statement = db.prepare(&format!("SELECT * FROM {table} WHERE vid=?1 ORDER BY 1,2,3"))?;
+                    let columns = statement.column_count();
+                    let values = statement.query_map([scope.vid], |row| {
+                        (0..columns).map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert!(!values.is_empty(), "fixture must exercise {table}");
+                    rows.push(values);
+                }
+                Ok((ids, rows, read_native_references(db, &scope, None)?,
+                    read_native_capability_report(db, &scope)?,
+                    read_native_coverage_v8(db, &scope)?))
+            }).unwrap()
+        };
+        let original = snapshot(first);
+        assert_eq!(original.4.state, "partial");
+        assert!(!original.4.observed_roles.is_empty());
+        let full = publish_full_route(&store, &options, first, stream).unwrap();
+        assert_eq!(
+            store
+                .last_writer_counters()
+                .unwrap()
+                .reused_occurrence_reads,
+            0
+        );
+        fs::write(
+            work.path().join("b.js"),
+            "function changed(){ return 2; }\n",
+        )
+        .unwrap();
+        let local = AtomicBool::new(false);
+        let current = IndexJobCoordinator::prepare(&store, Some(full))
+            .unwrap()
+            .run(&options, &cancel, |progress| {
+                if progress.phase == "mode:local" {
+                    local.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+        assert!(local.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            store
+                .last_writer_counters()
+                .unwrap()
+                .reused_occurrence_reads,
+            0
+        );
+        for pin in [full, current] {
+            let (ids, rows, mut references, mut report, mut coverage) = snapshot(pin);
+            assert_eq!(ids, original.0);
+            assert_eq!(rows, original.1);
+            assert_ne!(report.revision_id, original.3.revision_id);
+            for reference in &mut references {
+                assert_eq!(reference.revision_id, report.revision_id);
+                reference.revision_id.clone_from(&original.3.revision_id);
+                reference
+                    .provenance_id
+                    .clone_from(&original.2[0].provenance_id);
+            }
+            report.revision_id.clone_from(&original.3.revision_id);
+            coverage.revision_id.clone_from(&original.3.revision_id);
+            assert_eq!(references, original.2);
+            assert_eq!(report, original.3);
+            assert_eq!(coverage, original.4);
+        }
+        assert_eq!(snapshot(first), original, "retained pin must not change");
+        assert_eq!(store.status().unwrap().stats.parse_error_files, 0);
+    }
+}
+
+#[test]
+fn no_drift_matching_ids_trust_stored_native_and_extraction_witnesses() {
+    for stream in [false, true] {
+        let (_state, _work, store, options, pin) = fixture();
+        corrupt(
+            &store,
+            pin,
+            "UPDATE document_versions SET native_witness=printf('%064d',0)
+             WHERE vid=(SELECT vid FROM revision_documents
+                       WHERE revision_id=?1 AND path=?2)",
+        );
+        corrupt(
+            &store,
+            pin,
+            "UPDATE graph_projections SET class_extraction_payload='{}'
+             WHERE gid=(SELECT gid FROM revision_documents
+                       WHERE revision_id=?1 AND path=?2)",
+        );
+        let next = publish_full_route(&store, &options, pin, stream).unwrap();
+        assert_eq!(next.index_generation, pin.index_generation);
+        assert_eq!(next.index_revision, pin.index_revision + 1);
+    }
+}
+
+fn publish_full_route(
+    store: &Store,
+    options: &IndexOptions,
+    pin: IndexPin,
+    stream: bool,
+) -> Result<IndexPin> {
+    fs::write(
+        options.workspace_root.join("c.js"),
+        "function c(){ return 3; }\n",
+    )?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let leader = store.writer()?;
+    if stream {
+        let capture = crate::capture::Capture::admit(options, &cancel, &|_| {})?;
+        let spool = crate::native_evidence::spool_full_capture(
+            options,
+            &capture,
+            &options.workspace_root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            &store.native_spool_dir()?,
+        )?;
+        store.publish_validated_stream_recovery(
+            &spool,
+            &capture,
+            &leader,
+            store.publication_index_baseline()?,
+            &cancel,
+        )
+    } else {
+        let (graph, native, capture) =
+            crate::indexer::index_workspace_bundle(options, store.root_id(), &cancel, |_| {})?;
+        store.publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+    }
+}
+
+#[test]
+fn producer_drift_keeps_native_witness_comparison_for_both_full_routes() {
+    for stream in [false, true] {
+        let (_state, _work, store, options, pin) = fixture();
+        // Model a validated prior publication from a different executable.
+        let db = store.cache_write().unwrap();
+        let selected = store.read_revision_for(&db, Some(pin), true).unwrap();
+        assert_eq!(db.execute(
+            "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash',printf('%064d',0))
+             WHERE revision_id=?1 AND input_key LIKE 'executable:%'",
+            [&selected.key],
+        ).unwrap(), 1);
+        let (producer, binding) = revision_producer_binding(&db, &selected.key).unwrap();
+        assert_eq!(db.execute(
+            "UPDATE revision_producer_bindings SET producer_sha=?2,binding_sha=?3 WHERE revision_id=?1",
+            params![selected.key, producer, binding],
+        ).unwrap(), 1);
+        drop(db);
+        corrupt(
+            &store,
+            pin,
+            "UPDATE document_versions SET native_witness=printf('%064d',0)
+             WHERE vid=(SELECT vid FROM revision_documents
+                       WHERE revision_id=?1 AND path=?2)",
+        );
+        let error = publish_full_route(&store, &options, pin, stream).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("native_producer_version_required"),
+            "{error:#}"
+        );
+        assert_eq!(store.index_baseline().unwrap(), pin);
+    }
+}
+
+#[test]
+fn partial_family_reuse_keeps_native_witness_comparison_for_both_full_routes() {
+    for stream in [false, true] {
+        let (_state, _work, store, options, pin) = fixture();
+        corrupt(
+            &store,
+            pin,
+            "UPDATE document_versions SET native_witness=printf('%064d',0)
+             WHERE vid=(SELECT vid FROM revision_documents WHERE revision_id=?1 AND path=?2)",
+        );
+        corrupt(
+            &store,
+            pin,
+            "UPDATE class_projections SET content_hash=printf('%064d',0)
+             WHERE cid=(SELECT cid FROM revision_documents WHERE revision_id=?1 AND path=?2)",
+        );
+        let error = publish_full_route(&store, &options, pin, stream).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reusable normalized native witness mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
+    }
 }
 
 #[test]

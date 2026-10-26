@@ -426,9 +426,9 @@ fn compute_source(
                 let _parser_progress = ParserProgressMarker::enter();
                 if let Err(error) = check() {
                     aborted = Some(error);
-                    true
+                    std::ops::ControlFlow::Break(())
                 } else {
-                    false
+                    std::ops::ControlFlow::Continue(())
                 }
             }),
         ),

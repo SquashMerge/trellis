@@ -314,7 +314,7 @@ function freshness(proof, loaded, producer) {
     requested.producerHash = null;
   return assertFreshnessComponents(captured, requested, proof.freshness);
 }
-function coverageState(row, intent) {
+function coverageState(row, intent, nativeProducerId) {
   const requested = intent.requestedRoles,
     support = new Map(
       intent.measurementSupport.map((x) => [x.kind, x.available]),
@@ -349,7 +349,11 @@ function coverageState(row, intent) {
     return effective.length ? "omitted" : "unsupported";
   }
   if (row.state === "failed" && !row.observedRoles.length) return "failed";
-  return unsupported || missing ? "partial" : "complete";
+  const nativeGap = row.producerId === nativeProducerId && requested.some((role) => {
+    const required = role === "call" ? ["callee", "invocation"] : families(role);
+    return required.some((kind) => intent.measurementSupport.some((entry) => entry.kind === kind && entry.gaps.length > 0));
+  });
+  return unsupported || missing || nativeGap ? "partial" : "complete";
 }
 
 export function checkCoverage(loaded, records) {
@@ -529,7 +533,7 @@ export function checkCoverage(loaded, records) {
         "coverage",
         "requested or selected contradicts intent",
       );
-    const state = coverageState(row, intent);
+    const state = coverageState(row, intent, loaded.native.producerId);
     if (
       row.state !== state ||
       (row.diagnostic === null) !== ["notRequested", "complete"].includes(state)

@@ -2,7 +2,6 @@
 //! Syntax never supplies a target, candidate edge, dispatch resolution or callback traversal.
 use crate::{capture::Capture, model::*, native_evidence};
 use anyhow::{Context, Result, ensure};
-use protobuf::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,8 +14,6 @@ use tree_sitter::Node;
 #[derive(Clone, Debug)]
 pub struct IndexOptions {
     pub workspace_root: PathBuf,
-    pub scip_path: Option<PathBuf>,
-    pub manifest_path: Option<PathBuf>,
     pub max_file_bytes: u64,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -24,72 +21,21 @@ pub struct IndexOptions {
 pub struct ReconcileOptions {
     pub version: u8,
     pub max_file_bytes: u64,
-    pub scip_path: Option<String>,
-    pub manifest_path: Option<String>,
 }
 impl From<&IndexOptions> for ReconcileOptions {
     fn from(options: &IndexOptions) -> Self {
         Self {
-            version: 1,
+            version: 2,
             max_file_bytes: options.max_file_bytes.min(256 * 1024 * 1024),
-            scip_path: options
-                .scip_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            manifest_path: options
-                .manifest_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
         }
     }
 }
-
 impl IndexOptions {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             workspace_root,
-            scip_path: None,
-            manifest_path: None,
             max_file_bytes: 2 * 1024 * 1024,
         }
-    }
-
-    /// Fix optional input identity at explicit CLI ingress, even when the input
-    /// does not exist. Never canonicalize: absence is a valid captured state.
-    pub fn anchor_optional_inputs(&mut self, cwd: &Path) -> Result<()> {
-        ensure!(cwd.is_absolute(), "index input cwd must be absolute");
-        for path in [&mut self.scip_path, &mut self.manifest_path]
-            .into_iter()
-            .flatten()
-        {
-            let absolute = if path.is_absolute() {
-                path.clone()
-            } else {
-                cwd.join(&*path)
-            };
-            ensure!(
-                absolute.to_str().is_some(),
-                "optional index input path cannot be persisted without UTF-8 identity"
-            );
-            *path = absolute;
-        }
-        Ok(())
-    }
-}
-
-impl ReconcileOptions {
-    /// Legacy relative options cannot be replayed from a different process cwd.
-    pub fn require_absolute_optional_inputs(&self) -> Result<()> {
-        for path in [self.scip_path.as_deref(), self.manifest_path.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            ensure!(
-                Path::new(path).is_absolute(),
-                "incompatible_index: relative optional index input identity"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -230,181 +176,6 @@ fn graph_provenance() -> Provenance {
         semantic: SemanticState::Unavailable,
     }
 }
-/// Validated optional SCIP display documents indexed by admitted source path.
-pub(crate) struct PreparedDisplayLabels<'a> {
-    documents: Vec<(scip::types::Document, &'a SourceFile)>,
-    by_path: BTreeMap<String, usize>,
-}
-
-/// A SCIP symbol is strictly untrusted UI copy, keyed only to a captured native SyntaxId.
-/// A malformed/missing/stale optional display artifact contributes no labels.
-/// Parse optional display-only SCIP input once for a full or spooled run. Keep
-/// only first-in-SCIP-order documents with admitted matching source hashes;
-/// malformed inputs and the >1,000-document cutoff still contribute no labels.
-pub(crate) fn prepare_display_labels<'a>(
-    options: &IndexOptions,
-    capture: &'a Capture,
-) -> PreparedDisplayLabels<'a> {
-    let empty = || PreparedDisplayLabels {
-        documents: Vec::new(),
-        by_path: BTreeMap::new(),
-    };
-    let (Some(scip_path), Some(manifest_path)) = (&options.scip_path, &options.manifest_path)
-    else {
-        return empty();
-    };
-    let Some((index, manifest)) = capture
-        .bytes(scip_path)
-        .and_then(|bytes| scip::types::Index::parse_from_bytes(bytes).ok())
-        .zip(
-            capture
-                .bytes(manifest_path)
-                .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, String>>(bytes).ok()),
-        )
-    else {
-        return empty();
-    };
-    if index.documents.len() > 1_000 {
-        return empty();
-    }
-    let files: BTreeMap<_, _> = capture.files.iter().map(|f| (f.path.as_str(), f)).collect();
-    let mut seen = BTreeSet::new();
-    let mut prepared = empty();
-    for doc in index.documents {
-        // A later duplicate cannot replace an invalid or stale first document.
-        if !seen.insert(doc.relative_path.clone()) {
-            continue;
-        }
-        let Some(file) = files.get(doc.relative_path.as_str()) else {
-            continue;
-        };
-        if !matches!(file.language.as_str(), "javascript" | "java" | "python")
-            || manifest.get(&file.path) != Some(&file.hash)
-            || doc.occurrences.len() > 10_000
-            || !matches!(doc.position_encoding.value(), 0..=3)
-        {
-            continue;
-        }
-        prepared
-            .by_path
-            .insert(doc.relative_path.clone(), prepared.documents.len());
-        prepared.documents.push((doc, *file));
-    }
-    prepared
-}
-
-fn measured_display_labels(
-    options: &IndexOptions,
-    capture: &Capture,
-    native: &native_evidence::Artifact,
-) -> BTreeMap<String, String> {
-    let prepared = prepare_display_labels(options, capture);
-    measured_display_labels_prepared(native, &prepared, None)
-}
-
-fn measured_display_labels_prepared(
-    native: &native_evidence::Artifact,
-    prepared: &PreparedDisplayLabels<'_>,
-    selected: Option<&str>,
-) -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::new();
-    if prepared.documents.is_empty() {
-        return labels;
-    }
-    let mut declarations: BTreeMap<&str, Vec<&native_evidence::Declaration>> = BTreeMap::new();
-    for d in &native.declarations {
-        declarations.entry(&d.document.path).or_default().push(d);
-    }
-    let indexes: Box<dyn Iterator<Item = usize> + '_> = if let Some(path) = selected {
-        Box::new(prepared.by_path.get(path).copied().into_iter())
-    } else {
-        Box::new(0..prepared.documents.len())
-    };
-    for index in indexes {
-        let (doc, file) = &prepared.documents[index];
-        // Optional captured SCIP labels are presentation only. Join them to one
-        // measured native declaration at the captured name coordinate; never use
-        // them to mint IDs, infer relationships, or add unsupported Rust labels.
-        let encoding = doc.position_encoding.value();
-        let measured = declarations
-            .get(file.path.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if measured.len() > 1_000 {
-            continue;
-        }
-        let mut ranges: BTreeMap<Vec<i32>, Vec<&native_evidence::Declaration>> = BTreeMap::new();
-        for d in measured {
-            let Some(range) = d.name_range.as_ref() else {
-                continue;
-            };
-            if file.text.get(range.start..range.end) != d.name.as_deref() {
-                continue;
-            }
-            let Some(start) = scip_coordinate(&file.text, range.start, encoding) else {
-                continue;
-            };
-            let Some(end) = scip_coordinate(&file.text, range.end, encoding) else {
-                continue;
-            };
-            let coordinates = if start.0 == end.0 {
-                vec![start.0, start.1, end.1]
-            } else {
-                vec![start.0, start.1, end.0, end.1]
-            };
-            ranges.entry(coordinates).or_default().push(d);
-        }
-        let mut matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for occurrence in &doc.occurrences {
-            if occurrence.symbol_roles & 1 == 0
-                || occurrence.symbol.is_empty()
-                || occurrence.symbol.len() > 256
-                || occurrence.symbol.chars().any(char::is_control)
-            {
-                continue;
-            }
-            let Some(ds) = ranges.get(&occurrence.range) else {
-                continue;
-            };
-            if ds.len() != 1 {
-                continue;
-            }
-            for d in ds {
-                // A symbol's text is never a source name; require it at least spells
-                // the exact witnessed name before allowing an unauthenticated label.
-                if d.name
-                    .as_ref()
-                    .is_some_and(|name| occurrence.symbol.contains(name))
-                {
-                    matches
-                        .entry(d.syntax_id.clone())
-                        .or_default()
-                        .push(occurrence.symbol.clone());
-                }
-            }
-        }
-        for (id, candidates) in matches {
-            if candidates.len() == 1 {
-                labels.insert(id, candidates[0].clone());
-            }
-        }
-    }
-    labels
-}
-
-fn scip_coordinate(text: &str, byte: usize, encoding: i32) -> Option<(i32, i32)> {
-    let prefix = text.get(..byte)?;
-    let line = i32::try_from(prefix.bytes().filter(|b| *b == b'\n').count()).ok()?;
-    let part = prefix.rsplit('\n').next()?;
-    let column = match encoding {
-        1 => part.len(),                      // UTF-8
-        3 => part.chars().count(),            // UTF-32
-        0 | 2 => part.encode_utf16().count(), // SCIP default UTF-16
-        _ => return None,
-    };
-    Some((line, i32::try_from(column).ok()?))
-}
-
 /// Decision made before a delta writer may reuse any prior native or graph rows.
 /// The old capture is an immutable *admitted* snapshot, not a live filesystem read.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -587,9 +358,11 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
             // the edited leaf itself is the last named child of this exact
             // function body's block. Headers, calls and nested expressions do
             // not gain a new proof from this rule.
-            if language == "rust" && kind == "block" && parent.named_child_count() > 0 {
+            if language == "rust" && kind == "block" {
+                let mut cursor = parent.walk();
                 returned |= parent
-                    .named_child(parent.named_child_count() - 1)
+                    .named_children(&mut cursor)
+                    .last()
                     .is_some_and(|last| last.id() == node.id())
                     && parent.parent().is_some_and(|owner| {
                         owner.kind() == "function_item"
@@ -635,7 +408,7 @@ fn proved_body_only(old: &SourceFile, new: &SourceFile) -> bool {
     }
     // Identical tree shape is necessary, not sufficient: the exact bytes outside the
     // one measured leaf must also be unchanged, including the enclosing header/scope.
-    fn shape(node: Node<'_>, result: &mut Vec<&'static str>) {
+    fn shape<'tree>(node: Node<'tree>, result: &mut Vec<&'tree str>) {
         result.push(node.kind());
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
@@ -741,11 +514,9 @@ pub(crate) fn measure_persisted_change(
     previous_options: &ReconcileOptions,
     previous_inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>,
     current: &Capture,
-) -> Result<CapturedChange> {
+) -> Result<Option<BTreeSet<String>>> {
     if previous_options != current.reconcile_options() {
-        return Ok(CapturedChange::FullNative {
-            reason: "capture admission changed",
-        });
+        return Ok(None);
     }
     let current_inputs = current.persisted_inputs()?;
     let native_inputs = |inputs: &BTreeMap<String, crate::capture::CaptureInputObservation>| {
@@ -761,44 +532,20 @@ pub(crate) fn measure_persisted_change(
             .collect::<BTreeMap<_, _>>()
     };
     if native_inputs(previous_inputs) != native_inputs(&current_inputs) {
-        return Ok(CapturedChange::FullNative {
-            reason: "captured native input changed",
-        });
+        return Ok(None);
     }
     let before: BTreeMap<_, _> = previous.iter().map(|f| (f.path.as_str(), f)).collect();
     let after: BTreeMap<_, _> = current.files.iter().map(|f| (f.path.as_str(), f)).collect();
-    if before.keys().ne(after.keys()) {
-        return Ok(CapturedChange::FullNative {
-            reason: "source inventory changed (add/delete/rename)",
-        });
-    }
-    let mut changed = None;
-    for (path, old) in before {
-        let new = after[path];
-        if old.language != new.language {
-            return Ok(CapturedChange::FullNative {
-                reason: "source language changed",
-            });
-        }
-        if old.hash == new.hash {
-            continue;
-        }
-        if changed.is_some() {
-            return Ok(CapturedChange::FullNative {
-                reason: "multiple source documents changed",
-            });
-        }
-        changed = Some((path, old, new));
-    }
-    Ok(match changed {
-        None => CapturedChange::Unchanged,
-        Some((path, old, new)) if proved_body_only(old, new) => CapturedChange::DocumentLocal {
-            path: path.to_owned(),
-        },
-        Some(_) => CapturedChange::FullNative {
-            reason: "cross-file effect not proved local",
-        },
-    })
+    let changed = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| match (before.get(**path), after.get(**path)) {
+            (Some(old), Some(new)) => old.language != new.language || old.hash != new.hash,
+            _ => true,
+        })
+        .map(|path| (*path).to_owned())
+        .collect();
+    Ok(Some(changed))
 }
 
 /// A diagnostic selected-document measurement for two caller-supplied captures.
@@ -831,7 +578,6 @@ pub fn measure_captured_native_change(
 /// Fingerprints are internal reuse *conditions*, not a new public source of authority.
 /// The native fingerprint excludes revision-scoped IDs only; it includes authenticated
 /// bytes, admission/config/toolchain, producer, coverage roles and measured owners.
-/// A display-label change can preserve native identity but must change projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocumentFingerprint {
     pub native: String,
@@ -853,7 +599,7 @@ pub fn measure_document_fingerprint(
     native: &native_evidence::Artifact,
     graph: &Graph,
     path: &str,
-    options: &IndexOptions,
+    _options: &IndexOptions,
 ) -> Result<DocumentFingerprint> {
     let file = capture
         .files
@@ -937,24 +683,11 @@ pub fn measure_document_fingerprint(
         b"trellis.local-native-fingerprint.v1\0",
         &crate::native_ids::canonical(&native_value),
     );
-    let labels = measured_display_labels(options, capture, native);
     let nodes: Vec<_> = graph.nodes.iter().filter(|n| n.path == path).collect();
     let graph_calls: Vec<_> = graph.calls.iter().filter(|c| c.path == path).collect();
     let graph_regions: Vec<_> = graph.regions.iter().filter(|r| r.path == path).collect();
-    let scip_over_cutoff = matches!(file.language.as_str(), "javascript" | "java" | "python")
-        && options
-            .scip_path
-            .as_ref()
-            .and_then(|p| capture.bytes(p))
-            .and_then(|bytes| scip::types::Index::parse_from_bytes(bytes).ok())
-            .is_some_and(|index| index.documents.len() > 1_000);
-    let selected_labels: BTreeMap<_, _> = labels
-        .into_iter()
-        .filter(|(id, _)| nodes.iter().any(|node| &node.id == id))
-        .collect();
     let projection_value = serde_json::json!({
         "nativeFingerprint":&native_hash,"nodes":nodes,"calls":graph_calls,"regions":graph_regions,
-        "displayLabels":selected_labels,"scipOverCutoff":scip_over_cutoff,
     });
     Ok(DocumentFingerprint {
         native: native_hash,
@@ -972,7 +705,7 @@ pub(crate) fn project_native(
     cancel: &CancelFlag,
     progress: &impl Fn(IndexProgress),
 ) -> Result<Graph> {
-    project_native_selected(options, capture, native, cancel, progress, None, None)
+    project_native_selected(options, capture, native, cancel, progress, None)
 }
 
 /// The fast local path projects only the fully validated changed document.
@@ -984,40 +717,6 @@ pub(crate) fn project_native_document(
     path: &str,
     cancel: &CancelFlag,
     progress: &impl Fn(IndexProgress),
-) -> Result<Graph> {
-    project_native_document_with_labels(options, capture, native, path, cancel, progress, None)
-}
-
-/// Internal full-spool projection uses the same selected-document transform,
-/// but optional SCIP and manifest inputs were parsed once for this capture.
-pub(crate) fn project_native_spooled_document(
-    options: &IndexOptions,
-    capture: &Capture,
-    native: &native_evidence::Artifact,
-    path: &str,
-    cancel: &CancelFlag,
-    progress: &impl Fn(IndexProgress),
-    labels: &PreparedDisplayLabels<'_>,
-) -> Result<Graph> {
-    project_native_document_with_labels(
-        options,
-        capture,
-        native,
-        path,
-        cancel,
-        progress,
-        Some(labels),
-    )
-}
-
-fn project_native_document_with_labels(
-    options: &IndexOptions,
-    capture: &Capture,
-    native: &native_evidence::Artifact,
-    path: &str,
-    cancel: &CancelFlag,
-    progress: &impl Fn(IndexProgress),
-    labels: Option<&PreparedDisplayLabels<'_>>,
 ) -> Result<Graph> {
     ensure!(
         native.declarations.iter().all(|d| d.document.path == path)
@@ -1036,9 +735,19 @@ fn project_native_document_with_labels(
         native,
         cancel,
         progress,
-        Some(path),
-        labels,
+        Some(&BTreeSet::from([path.to_owned()])),
     )
+}
+
+pub(crate) fn project_native_documents(
+    options: &IndexOptions,
+    capture: &Capture,
+    native: &native_evidence::Artifact,
+    paths: &BTreeSet<String>,
+    cancel: &CancelFlag,
+    progress: &impl Fn(IndexProgress),
+) -> Result<Graph> {
+    project_native_selected(options, capture, native, cancel, progress, Some(paths))
 }
 
 /// Borrowed facts for exactly one document. Group the writer's full artifact by
@@ -1077,7 +786,6 @@ pub(crate) fn project_document(
     path: &str,
     source: &[u8],
     native: NativeDocument<'_>,
-    labels: &BTreeMap<String, String>,
 ) -> Result<(Vec<Symbol>, Vec<CallSite>, Vec<ControlRegion>)> {
     let text = std::str::from_utf8(source).context("invalid graph source UTF-8")?;
     let lines = LineIndex::new(text);
@@ -1127,7 +835,7 @@ pub(crate) fn project_document(
                     format!("<{}@{}>", d.kind, d.range.start)
                 }
             }),
-            display_label: labels.get(&d.syntax_id).cloned(),
+            display_label: None,
             kind: graph_kind(&d.kind)?,
             path: d.document.path.clone(),
             range: range(&d.range)?,
@@ -1177,13 +885,12 @@ pub(crate) fn project_document(
 }
 
 fn project_native_selected(
-    options: &IndexOptions,
+    _options: &IndexOptions,
     capture: &Capture,
     native: &native_evidence::Artifact,
     cancel: &CancelFlag,
     progress: &impl Fn(IndexProgress),
-    selected: Option<&str>,
-    prepared_labels: Option<&PreparedDisplayLabels<'_>>,
+    selected: Option<&BTreeSet<String>>,
 ) -> Result<Graph> {
     ensure!(!cancel.load(Ordering::Relaxed), "indexing cancelled");
     if selected.is_none() {
@@ -1192,21 +899,16 @@ fn project_native_selected(
     let selected_files: Vec<_> = capture
         .files
         .iter()
-        .filter(|f| selected.is_none_or(|path| f.path == path))
+        .filter(|f| selected.is_none_or(|paths| paths.contains(&f.path)))
         .cloned()
         .collect();
     ensure!(
-        selected.is_none() || selected_files.len() == 1,
+        selected.is_none_or(|paths| selected_files.len() == paths.len()),
         "selected graph source is missing or ambiguous"
     );
     let mut graph = Graph {
         files: selected_files.clone(),
         ..Graph::default()
-    };
-    let display_labels = if let Some(prepared) = prepared_labels {
-        measured_display_labels_prepared(native, prepared, selected)
-    } else {
-        measured_display_labels(options, capture, native)
     };
     let mut by_path: BTreeMap<&str, NativeDocument<'_>> = selected_files
         .iter()
@@ -1237,8 +939,7 @@ fn project_native_selected(
         let facts = by_path
             .remove(file.path.as_str())
             .context("missing graph source")?;
-        let (nodes, calls, regions) =
-            project_document(&file.path, file.text.as_bytes(), facts, &display_labels)?;
+        let (nodes, calls, regions) = project_document(&file.path, file.text.as_bytes(), facts)?;
         graph.nodes.extend(nodes);
         graph.calls.extend(calls);
         graph.regions.extend(regions);
@@ -1293,7 +994,6 @@ fn project_native_selected(
 }
 
 /// Verify every public graph row against the exact captured native syntax projection.
-/// Display labels are presentation-only SCIP text and cannot authorize a graph edge.
 pub fn validate_native_graph(
     graph: &Graph,
     capture: &Capture,
@@ -1359,12 +1059,10 @@ pub(crate) fn validate_native_graph_records(
         } else {
             None
         };
-        if let Some(label) = &symbol.display_label {
-            ensure!(
-                label.len() <= 256 && !label.chars().any(char::is_control),
-                "invalid display-only label"
-            );
-        }
+        ensure!(
+            symbol.display_label.is_none(),
+            "native graph has no display labels"
+        );
         ensure!(
             symbol.name
                 == d.name.clone().unwrap_or_else(|| if d.kind == "module" {
@@ -1496,6 +1194,14 @@ pub(crate) fn native_js_kind(n: Node<'_>) -> Option<&'static str> {
         "variable_declarator" => "variable",
         "field_definition" => "field",
         "formal_parameter" => "parameter",
+        "import_specifier"
+            if n.child_by_field_name("name")
+                .is_some_and(|n| n.kind() == "identifier")
+                && n.child_by_field_name("alias")
+                    .is_some_and(|n| n.kind() == "identifier") =>
+        {
+            "alias"
+        }
         _ => return None,
     })
 }
@@ -1708,7 +1414,7 @@ mod local_classification_tests {
                 "{:x}",
                 Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
             ),
-            "03faaaa04c61ba7c18051e12386201898cd31625758c36a0202ff8da65da8882"
+            "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259"
         );
         let mut paths = 0;
         for size in ["medium", "large"] {
@@ -1775,7 +1481,6 @@ mod projection_document_tests {
     use super::{NativeDocument, compare_reader_calls, compare_writer_calls, project_document};
     use crate::model::{CallSite, SourceRange};
     use crate::native_evidence::{Declaration, DeclarationRole, DocumentKey, Header, Key, Range};
-    use std::collections::BTreeMap;
 
     fn declaration(path: &str, language: &str, id: &str, child: bool) -> Declaration {
         let parent_key = Key {
@@ -1847,7 +1552,6 @@ mod projection_document_tests {
                 "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 true,
             );
-            let labels = BTreeMap::new();
             let project = |declarations: Vec<&Declaration>| {
                 project_document(
                     path,
@@ -1857,7 +1561,6 @@ mod projection_document_tests {
                         calls: vec![],
                         control_regions: vec![],
                     },
-                    &labels,
                 )
                 .unwrap()
             };
@@ -1940,7 +1643,6 @@ mod projection_document_tests {
                     calls: vec![],
                     control_regions: vec![],
                 },
-                &BTreeMap::new(),
             )
             .unwrap_err()
             .to_string()

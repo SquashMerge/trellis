@@ -186,7 +186,13 @@ pub(crate) fn scan_file(
         || started.elapsed() >= FILE_TIME_LIMIT || total_started.elapsed() >= TOTAL_TIME_LIMIT;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language)?;
-    let mut progress = |_: &tree_sitter::ParseState| expired();
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if expired() {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
     let tree = parser.parse_with_options(
         &mut |offset, _| &file.text.as_bytes()[offset..],
         None,

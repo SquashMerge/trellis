@@ -216,6 +216,69 @@ export function buildAnchorIndex(measurements) {
   }
   return index;
 }
+function nativeCapabilities(loaded, measurements) {
+  const production = loaded.native.producerId === "trellis.native.syntax";
+  const reports = [...loaded.native.capabilityReports];
+  if (!production)
+    for (const intent of loaded.fixture.coverageIntents.filter((x) => x.producerId === loaded.native.producerId))
+      if (!reports.some((x) => x.revisionId === intent.revisionId && same(x.document, intent.document)))
+        reports.push({ document: intent.document, revisionId: intent.revisionId, families: intent.measurementSupport });
+  const seen = new Set();
+  for (const report of reports) {
+    const snapshot = loaded.revisions.get(tuple(report.document.sourceSetId, report.revisionId));
+    const document = snapshot?.documents.find((x) => same(x.key, report.document));
+    const source = loaded.sources.get(sourceKey(report));
+    const id = encode([report.document, report.revisionId]);
+    if (!document || !source || seen.has(id))
+      fail("JOIN.SUPPORT", "capabilityReports", "duplicate or unadmitted capability tuple");
+    seen.add(id);
+    if (report.families.length !== 4 || new Set(report.families.map((x) => x.kind)).size !== 4)
+      fail("JOIN.SUPPORT", "capabilityReports", "exactly four distinct families required");
+    const intent = loaded.fixture.coverageIntents.find((x) => x.producerId === loaded.native.producerId && x.revisionId === report.revisionId && same(x.document, report.document));
+    if (intent && !same([...report.families].sort(compare), [...intent.measurementSupport].sort(compare)))
+      fail("JOIN.SUPPORT", "measurementSupport", "intent differs from captured capability report");
+    for (const support of report.families) {
+      if ((production && !support.available) || support.available !== (support.diagnostic === null) || (!support.available && support.gaps.length))
+        fail("JOIN.SUPPORT", "capabilityReports", "invalid availability/diagnostic/gaps");
+      const gaps = support.gaps.map((gap) => {
+        if (production && gap.range.encoding !== "utf8")
+          fail("JOIN.SUPPORT", "capabilityReports", "captured gap must use UTF-8 coordinates");
+        const range = toByteRange(source, gap.range);
+        if (range.start === range.end)
+          fail("JOIN.SUPPORT", "capabilityReports", "empty capability gap");
+        return range;
+      });
+      for (const measurement of measurements) {
+        const anchor = measurement.anchor;
+        if (anchor.kind !== support.kind || anchor.revisionId !== report.revisionId || !same(anchor.document, report.document)) continue;
+        if ((loaded.native.capabilityReports.includes(report) && !support.available) || gaps.some((gap) => gap.start <= anchor.range.start && anchor.range.end <= gap.end))
+          fail("JOIN.SUPPORT", "measurementSupport", "capability report contradicts measured candidate");
+      }
+    }
+  }
+  if (production)
+    for (const revision of loaded.fixture.revisions)
+      for (const document of revision.documents)
+        if (!seen.has(encode([document.key, revision.id])))
+          fail("JOIN.SUPPORT", "capabilityReports", "production document capability report missing");
+}
+
+function anchorSupport(loaded, selector, source, range) {
+  const report = loaded.native.capabilityReports.find((x) => x.revisionId === selector.revisionId && same(x.document, selector.document));
+  const intent = loaded.fixture.coverageIntents.find((x) => x.producerId === loaded.native.producerId && x.revisionId === selector.revisionId && same(x.document, selector.document));
+  const support = (report?.families ?? (loaded.native.producerId === "trellis.native.syntax" ? [] : intent?.measurementSupport))?.find((x) => x.kind === selector.kind);
+  if (!support) {
+    if (loaded.native.producerId === "trellis.native.syntax")
+      fail("JOIN.SUPPORT", "measurementSupport", "native family capability absent");
+    return { support: { available: true, diagnostic: null, gaps: [] }, gap: null };
+  }
+  const gap = support.gaps.find((gap) => {
+    const span = toByteRange(source, gap.range);
+    return span.start <= range.start && range.end <= span.end;
+  });
+  return { support, gap };
+}
+
 export function joinAnchor(
   selector,
   index,
@@ -257,15 +320,7 @@ export function joinAnchor(
     range,
     kind: selector.kind,
   };
-  const intent = loaded.fixture.coverageIntents.find(
-    (x) =>
-      x.producerId === loaded.native.producerId &&
-      x.revisionId === selector.revisionId &&
-      same(x.document, selector.document),
-  );
-  const support = intent?.measurementSupport.find(
-    (x) => x.kind === selector.kind,
-  );
+  const { support, gap } = anchorSupport(loaded, selector, source, range);
   const matches = index.get(encode([anchor, selector.ownerRef])) ?? [];
   const candidateIds = [
     ...new Set(
@@ -274,14 +329,14 @@ export function joinAnchor(
       ),
     ),
   ].sort(order);
-  if (support?.available === false && candidateIds.length)
+  if ((!support.available || gap) && candidateIds.length)
     fail(
       "JOIN.SUPPORT",
       "measurementSupport",
       "unsupported measured family has candidates",
     );
   const status =
-    support?.available === false
+    !support.available || gap
       ? "unsupported"
       : candidateIds.length === 0
         ? "unmatched"
@@ -296,7 +351,7 @@ export function joinAnchor(
       status === "exact"
         ? null
         : status === "unsupported"
-          ? support.diagnostic
+          ? gap?.diagnostic ?? support.diagnostic
           : status,
   };
 }
@@ -708,6 +763,7 @@ export function normalizeOccurrences(loaded, keys) {
   });
   for (const x of [...regions, ...calls])
     validate(x.regionIds ? "Call" : "ControlRegion", x);
+  nativeCapabilities(loaded, measurements);
   return {
     calls: sortRecords(calls),
     controlRegions: sortRecords(regions),
@@ -795,11 +851,9 @@ export function normalizeFixture(loaded) {
   const records = {
     formatVersion: 1,
     comparison: structuredClone(loaded.comparison),
-    producers: sortRecords(structuredClone(loaded.fixture.producers)),
-    sourceSets: sortRecords(structuredClone(loaded.fixture.sourceSets)),
-    revisions: sortRecords(
-      [...loaded.revisions.values()].map((x) => structuredClone(x)),
-    ),
+    producers: structuredClone(loaded.fixture.producers).sort(compare),
+    sourceSets: structuredClone(loaded.fixture.sourceSets).sort(compare),
+    revisions: [...loaded.revisions.values()].map((x) => structuredClone(x)).sort(compare),
     coverage: [],
     provenance: [],
     declarations: keys.records,
@@ -942,7 +996,11 @@ export function normalizeFixture(loaded) {
         role === "call"
           ? supports("callee") || supports("invocation")
           : families(role).every(supports);
-      const unsupported = roles.some(
+      const nativeGap = value.producerId === loaded.native.producerId && roles.some((role) => {
+        const requestedFamilies = role === "call" ? ["callee", "invocation"] : families(role);
+        return requestedFamilies.some((kind) => intent?.measurementSupport.some((x) => x.kind === kind && x.gaps.length > 0));
+      });
+      const unsupported = nativeGap || roles.some(
         (x) => !value.supportedRoles.includes(x) || !available(x),
       );
       const missing = roles.some(

@@ -188,10 +188,16 @@ impl DaemonState {
         let explicit = config.explicit_options;
         // The FIFO head is read first, even when unused: a typed failure to
         // read it defers this attempt rather than reconciling around it.
-        let head = self
-            .startup_head()?
-            .map(|head| head.options(std::path::Path::new(self.store.workspace_root())))
-            .transpose()?;
+        let head = match self.startup_head()? {
+            Some(head) if head.request_kind == crate::store::requests::RequestKind::Index => {
+                Some(head.options(std::path::Path::new(self.store.workspace_root()))?)
+            }
+            Some(head) => {
+                head.semantic_options()?;
+                None
+            }
+            None => None,
+        };
         if self.store.is_recreate_pending() {
             if explicit {
                 return Ok(config.options.clone());
@@ -613,6 +619,23 @@ impl DaemonState {
         Ok(row)
     }
 
+    /// Semantic work joins the same admission lease, durable FIFO and inbox wake.
+    pub(crate) fn enqueue_semantic_import(
+        &self,
+        options: &crate::store::requests::SemanticImportOptions,
+    ) -> anyhow::Result<crate::store::requests::Request> {
+        let lease = self.admission_lease()?;
+        let row = self
+            .store
+            .enqueue_semantic_import(std::path::Path::new(self.store.workspace_root()), options)?;
+        self.fifo_pending.store(true, Ordering::Release);
+        drop(lease);
+        self.pending_requests.lock().unwrap().push(row.id.clone());
+        *self.recovery_retry_after.lock().unwrap() = None;
+        self.inbox.wake();
+        Ok(row)
+    }
+
     /// Take an admission lease unless the runtime is retired. Release declines
     /// while a lease is held, and both decide under the runtime state lock.
     /// A lease taken while retirement is requested cancels it (Decision 0009
@@ -981,6 +1004,13 @@ mod missing_index_tests {
         std::fs::write(
             options.workspace_root.join("new.js"),
             "function changed() {}\n",
+        )
+        .unwrap();
+        // Inventory changes can publish locally; changed native configuration
+        // keeps this purge at the full spool admission boundary.
+        std::fs::write(
+            options.workspace_root.join("package.json"),
+            r#"{"type":"module"}"#,
         )
         .unwrap();
         store.enqueue_request(&options, None).unwrap();

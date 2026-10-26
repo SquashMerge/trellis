@@ -22,9 +22,34 @@ function rustRoots(size, ordinary) {
   return roots;
 }
 
-// Alter call-bearing return expressions, not comments, blank lines or call-free filler.
-// Their numeric terms are seeded and alter the function's actual return value.
+// LARGE spends its byte budget on longer call-bearing bodies, not more calls or declarations.
+function fillLarge(body, target, language, index) {
+  let remaining = target - Buffer.byteLength(body);
+  if (remaining < 2) throw new Error(`Insufficient LARGE body budget: ${language}/${index}: ${remaining}`);
+  const marker = language === "rust" ? "local+peer_value+revision+f0()" :
+    language === "python" ? "return local+peer_value+revision+f0()" : "return local+peerValue+revision+f0()";
+  const parts = body.split(marker);
+  const workers = parts.length - 1;
+  if (workers !== 36) throw new Error(`Expected 36 LARGE workers: ${language}/${index}: ${workers}`);
+  const additions = Array(workers).fill("");
+  const offset = parseInt(sha256(`${seed}\0large\0${language}\0${index}`).slice(0, 8), 16) % workers;
+  for (let term = 0; remaining > 0; term++) {
+    let width = Math.min(7, remaining);
+    if (remaining - width === 1) width--;
+    const digits = width - 1;
+    const minimum = 10 ** (digits - 1);
+    const number = minimum + parseInt(sha256(`${seed}\0large\0${language}\0${index}\0term\0${term}`).slice(0, 8), 16) % (9 * minimum);
+    additions[(offset + term) % workers] += `+${number}`;
+    remaining -= width;
+  }
+  body = parts.map((part, n) => n === workers ? part : part + marker + additions[n]).join("");
+  if (Buffer.byteLength(body) !== target) throw new Error("Source length mismatch");
+  return Buffer.from(body, "utf8");
+}
+
+// Preserve the original small/medium byte stream, including its seeded body calls.
 function fill(body, target, language, size, index) {
+  if (size === "large") return fillLarge(body, target, language, index);
   let remaining = target - Buffer.byteLength(body);
   if (remaining < 0) throw new Error(`Source body exceeds target: ${size}/${language}/${index}: ${-remaining}`);
   const marker = language === "rust" ? "local+peer_value+revision+f0()" :
@@ -122,7 +147,7 @@ function main(args) {
       writeFileSync(filename, content, { flag: "wx" });
       return { path, sourceBytes: content.length, sha256: sha256(content) };
     });
-    writeFileSync(join(out, "manifest.json"), JSON.stringify({ version: 1, seed, hashAlgorithm: "sha256", totals, files: manifest }, null, 2) + "\n", { flag: "wx" });
+    writeFileSync(join(out, "manifest.json"), JSON.stringify({ version: 2, seed, hashAlgorithm: "sha256", totals, files: manifest }, null, 2) + "\n", { flag: "wx" });
   } catch (error) {
     rmSync(out, { recursive: true, force: true });
     throw error;

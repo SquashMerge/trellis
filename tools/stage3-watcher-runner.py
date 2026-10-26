@@ -34,10 +34,10 @@ import time
 from urllib.request import urlopen
 
 REPO = Path(__file__).resolve().parents[1]
-PINNED = REPO / "tools/synthetic-cohorts/manifest-v1.json"
+PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BINARY = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release/trellis"
-MANIFEST_SHA = "03faaaa04c61ba7c18051e12386201898cd31625758c36a0202ff8da65da8882"
+MANIFEST_SHA = "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259"
 POLL_S = .020
 SETUP_TIMEOUT_S = 1800
 SAMPLE_TIMEOUT_S = 45
@@ -99,7 +99,7 @@ def pinned():
     raw = PINNED.read_bytes()
     need(sha(raw) == MANIFEST_SHA, "canonical manifest SHA mismatch")
     doc = json.loads(raw)
-    need(doc["version"] == 1 and doc["seed"] == "trellis-synthetic-cohorts-v1", "unexpected manifest")
+    need(doc["version"] == 2 and doc["seed"] == "trellis-synthetic-cohorts-v1", "unexpected manifest")
     for size, count, byte_count in (("medium", 1000, 16777216), ("large", 10000, 134217728)):
         need(doc["totals"][size] == {"files": count, "sourceBytes": byte_count}, "cohort totals changed")
         rows = [row for row in doc["files"] if row["path"].startswith(size + "/")]
@@ -160,7 +160,7 @@ def prepare(args):
                     "manifest_sha256": MANIFEST_SHA, "generator_sha256": file_sha(GENERATOR),
                     "binary_sha256": file_sha(BINARY), "binary": str(BINARY),
                     "runner_sha256": file_sha(Path(__file__)), "poll_seconds": POLL_S,
-                    "source_note": "canonical generated file-list and per-file hashes: pinned manifest-v1.json"}
+                    "source_note": "canonical generated file-list and per-file hashes: pinned manifest-v2.json"}
         (scratch / "prepared.json").write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n")
         print(json.dumps({"prepared": str(scratch), **metadata}, sort_keys=True))
     except BaseException:

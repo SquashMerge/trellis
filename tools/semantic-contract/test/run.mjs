@@ -35,6 +35,7 @@ const shared = [
   "record-relationships",
   "warnings",
   "fixture",
+  "captured-scip",
 ].map((name) => join(here, `${name}.test.mjs`));
 
 export function parseRunnerArgs(args) {

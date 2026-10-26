@@ -12,6 +12,9 @@ pub(crate) fn native_kind(n: Node<'_>) -> Option<&'static str> {
         "method_declaration" | "annotation_type_element_declaration" => "method",
         "constructor_declaration" | "compact_constructor_declaration" => "constructor",
         "lambda_expression" => "anonymousFunction",
+        "variable_declarator" if n.parent().is_some_and(|p| p.kind() == "spread_parameter") => {
+            return None;
+        }
         "variable_declarator" if n.parent().is_some_and(|p| p.kind() == "field_declaration") => {
             "field"
         }

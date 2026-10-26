@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        14
+        23
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,12 +739,12 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Schema 14 keeps the derived graph and labels, and compacts native IDs
+    // Schema 20 keeps the derived graph and labels, and compacts native IDs
     // and document/projection references into BLOB keys and surrogates.
     // Supersession state and the paired producer bindings are additive.
     // Check exact names, not just a count: an unknown table must not escape the
     // independent cold-source comparison.
-    const REQUIRED_V14_TABLES: [&str; 31] = [
+    const REQUIRED_V20_TABLES: [&str; 57] = [
         "native_producers",
         "native_producer_languages",
         "native_producer_inputs",
@@ -769,6 +769,9 @@ fn sqlite_snapshot(
         "native_version_headers",
         "native_version_header_items",
         "native_version_parameters",
+        "native_version_references",
+        "native_version_capability_families",
+        "native_version_capability_gaps",
         "native_version_calls",
         "native_version_control_regions",
         "native_version_call_regions",
@@ -776,38 +779,64 @@ fn sqlite_snapshot(
         "native_release_candidate_versions",
         "native_release_candidate_graphs",
         "native_release_candidate_classes",
+        "semantic_producers",
+        "semantic_producer_languages",
+        "semantic_revision_producers",
+        "semantic_requested_producers",
+        "semantic_requested_producer_languages",
+        "semantic_coverage",
+        "semantic_coverage_roles",
+        "semantic_basis",
+        "semantic_basis_lookup_dependencies",
+        "semantic_provenance",
+        "semantic_symbols",
+        "semantic_symbol_targets",
+        "semantic_declaration_bindings",
+        "semantic_declaration_binding_symbols",
+        "semantic_declaration_join_candidates",
+        "semantic_references",
+        "semantic_reference_roles",
+        "semantic_reference_candidates",
+        "semantic_call_bindings",
+        "semantic_call_candidates",
+        "semantic_call_possible_dispatch",
+        "semantic_call_join_candidates",
+        "semantic_type_relationships",
     ];
-    let required: std::collections::BTreeSet<_> = REQUIRED_V14_TABLES.into_iter().collect();
+    let required: std::collections::BTreeSet<_> = REQUIRED_V20_TABLES.into_iter().collect();
     let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
     let optional = [
         "native_revision_supersessions",
         "native_binding_epoch",
         "revision_producer_bindings",
+        "semantic_import_reports",
+        "semantic_raw_captures",
+        "semantic_raw_proofs",
     ];
     assert_eq!(
         required.len(),
-        31,
-        "v14 mandatory table list must be unique"
+        57,
+        "v20 mandatory table list must be unique"
     );
     assert!(
         required.is_subset(&actual),
-        "missing v14 evidence tables: {:?}",
+        "missing v20 evidence tables: {:?}",
         required.difference(&actual).collect::<Vec<_>>()
     );
     assert!(
         actual
             .difference(&required)
             .all(|table| optional.contains(table)),
-        "unexpected v14 evidence table: {:?}",
+        "unexpected v20 evidence table: {:?}",
         actual.difference(&required).collect::<Vec<_>>()
     );
     assert_eq!(
         actual.len(),
-        31 + optional
+        57 + optional
             .iter()
             .filter(|name| actual.contains(*name))
             .count(),
-        "exact v14 base and optional table count"
+        "exact v20 base and optional table count"
     );
     assert_eq!(
         actual.contains("native_binding_epoch"),
@@ -858,7 +887,8 @@ fn sqlite_snapshot(
                     ("cid IN (SELECT cid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
-                _ => panic!("unhandled v14 evidence table: {table}"),
+                name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
+                _ => panic!("unhandled v20 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
@@ -900,6 +930,9 @@ fn sqlite_snapshot(
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            if table.starts_with("semantic_") {
+                assert!(rows.is_empty(), "native-only selected snapshot has semantic rows in {table}");
+            }
             // A retained old pin may carry its own pending debt. Compare those
             // rows raw; only the currently published head must be empty.
             if pin.index_revision as i64 == published_revision
@@ -919,10 +952,10 @@ fn sqlite_snapshot(
             if table == "native_revisions" {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], format!("t:{revision_id}"));
-                assert_eq!(rows[0][13], format!("i:{}", pin.index_revision));
+                assert_eq!(rows[0][16], format!("i:{}", pin.index_revision));
                 if normalize_current_publication {
                     rows[0][0] = "t:<current-pin>".into();
-                    rows[0][13] = "i:<current-revision>".into();
+                    rows[0][16] = "i:<current-revision>".into();
                 }
             } else if matches!(table.as_str(), "revision_capture_inputs" | "revision_documents") {
                 for row in &mut rows {
@@ -1255,266 +1288,524 @@ fn current_producer_binding_preserves_old_pin_and_queue() {
     );
 }
 
-#[test]
-fn document_local_delta_and_cross_file_fallback_match_independent_cold_publications() {
+#[cfg(feature = "test-support")]
+fn assert_selected_native_matches(
+    store: &Store,
+    pin: trellis::model::IndexPin,
+    measured: &trellis::native_evidence::Artifact,
+) {
+    use std::collections::BTreeSet;
+    use trellis::native_evidence::MeasurementKind;
+    let lookups = measured
+        .declarations
+        .iter()
+        .filter_map(|declaration| {
+            declaration
+                .lookup_key
+                .as_ref()
+                .map(|lookup| (declaration.document.language.clone(), lookup.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    for (language, lookup) in lookups {
+        let mut actual = store
+            .native_declarations_at(pin, &language, &lookup)
+            .unwrap();
+        let mut expected = measured
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.document.language == language
+                    && declaration.lookup_key.as_deref() == Some(lookup.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        actual.sort_by(|left, right| left.syntax_id.cmp(&right.syntax_id));
+        expected.sort_by(|left, right| left.syntax_id.cmp(&right.syntax_id));
+        assert_eq!(actual, expected, "native declarations {language}/{lookup}");
+    }
+    assert_eq!(
+        measured.capability_reports.len(),
+        measured.revision.documents.len()
+    );
+    for document in &measured.revision.documents {
+        assert_eq!(
+            store
+                .native_source_at(pin, &document.key)
+                .unwrap()
+                .unwrap()
+                .0,
+            *document
+        );
+        assert_eq!(
+            store
+                .native_coverage_at(pin, &document.key)
+                .unwrap()
+                .as_ref(),
+            measured.coverage.iter().find(|coverage| {
+                coverage.document_path == document.key.path
+                    && coverage.language == document.key.language
+            })
+        );
+        let expected = measured
+            .capability_reports
+            .iter()
+            .find(|report| report.document == document.key)
+            .unwrap();
+        assert_eq!(expected.families.len(), MeasurementKind::ALL.len());
+        for kind in MeasurementKind::ALL {
+            assert_eq!(
+                expected
+                    .families
+                    .iter()
+                    .filter(|family| family.kind == kind)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            store
+                .native_capability_report_at(pin, &document.key)
+                .unwrap()
+                .as_ref(),
+            Some(expected)
+        );
+    }
+    for declaration in &measured.declarations {
+        let mut references = store
+            .native_references_at(pin, &declaration.syntax_id)
+            .unwrap();
+        let mut expected_references = measured
+            .references
+            .iter()
+            .filter(|reference| reference.owner_syntax_id == declaration.syntax_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        references.sort_by(|left, right| left.id.cmp(&right.id));
+        expected_references.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(references, expected_references);
+        let mut calls = store.native_calls_at(pin, &declaration.syntax_id).unwrap();
+        let mut expected_calls = measured
+            .calls
+            .iter()
+            .filter(|call| call.owner_syntax_id == declaration.syntax_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        calls.sort_by(|left, right| left.id.cmp(&right.id));
+        expected_calls.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(calls, expected_calls);
+        let mut regions = store
+            .native_control_regions_at(pin, &declaration.syntax_id)
+            .unwrap();
+        let mut expected_regions = measured
+            .control_regions
+            .iter()
+            .filter(|region| region.owner_syntax_id == declaration.syntax_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        regions.sort_by(|left, right| left.id.cmp(&right.id));
+        expected_regions.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(regions, expected_regions);
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn measure_native_for_parity(
+    workspace: &Path,
+    store: &Store,
+) -> trellis::native_evidence::Artifact {
     use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
-    let (state, workspace) = fixture();
-    let padding = "x".repeat(145_000);
-    let js = |value: &str, name: &str| {
-        format!(
-            "function {name}() {{ return {value}; /*{padding}*/ }}\nfunction checked() {{ const local=1, other=2; return local+other; }}\n"
+    trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
+        store.root_id(),
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap()
+    .1
+}
+
+#[cfg(feature = "test-support")]
+fn assert_native_reference_and_gap_fixture(measured: &trellis::native_evidence::Artifact) {
+    assert!(
+        !measured.references.is_empty(),
+        "reference parity must be nonvacuous"
+    );
+    assert!(
+        measured.capability_reports.iter().any(|report| {
+            report.document.language == "rust"
+                && report.families.iter().any(|family| !family.gaps.is_empty())
+        }),
+        "Rust macro must produce a genuine measured gap"
+    );
+}
+
+fn assert_selected_matches_cold(
+    state: &Path,
+    workspace: &Path,
+    store: &Store,
+    pin: trellis::model::IndexPin,
+) {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
+    let cold_state = tempfile::tempdir().unwrap();
+    fs::set_permissions(cold_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let cold = Store::open_for_tests(cold_state.path(), workspace).unwrap();
+    let cold_pin = IndexJobCoordinator::prepare(&cold, None)
+        .unwrap()
+        .run(
+            &IndexOptions::new(workspace.to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
         )
-    };
-    for (name, source) in [
-        ("local.js", js("1", "local")),
+        .unwrap();
+    assert_eq!(
+        sqlite_snapshot(&index_dir(state).join("index.db"), pin, true),
+        sqlite_snapshot(
+            &index_dir(cold_state.path()).join("index.db"),
+            cold_pin,
+            true
+        ),
+        "complete selected SQL must equal an independent same-root cold publication"
+    );
+    #[cfg(feature = "test-support")]
+    {
+        let measured = measure_native_for_parity(workspace, &cold);
+        assert_native_reference_and_gap_fixture(&measured);
+        assert_selected_native_matches(store, pin, &measured);
+        assert_selected_native_matches(&cold, cold_pin, &measured);
+    }
+    let graph = store.graph_at(Some(pin)).unwrap();
+    assert_eq!(graph, cold.graph_at(Some(cold_pin)).unwrap());
+    let mut status = serde_json::to_value(store.status().unwrap()).unwrap();
+    let mut cold_status = serde_json::to_value(cold.status().unwrap()).unwrap();
+    for value in [&mut status, &mut cold_status] {
+        let object = value.as_object_mut().unwrap();
+        object.remove("revision");
+        object.remove("indexedAt");
+    }
+    assert_eq!(status, cold_status);
+    for path in std::iter::once(None).chain(graph.files.iter().map(|file| Some(file.path.as_str())))
+    {
+        let mut page =
+            serde_json::to_value(store.classes_at(path, "", Some(pin), 0, 100).unwrap()).unwrap();
+        let mut cold_page =
+            serde_json::to_value(cold.classes_at(path, "", Some(cold_pin), 0, 100).unwrap())
+                .unwrap();
+        page.as_object_mut().unwrap().remove("revision");
+        cold_page.as_object_mut().unwrap().remove("revision");
+        assert_eq!(page, cold_page, "class page {path:?}");
+    }
+    for file in &graph.files {
+        assert_eq!(
+            store.source_at(&file.path, Some(pin)).unwrap().unwrap().1,
+            cold.source_at(&file.path, Some(cold_pin))
+                .unwrap()
+                .unwrap()
+                .1,
+            "source API {}",
+            file.path
+        );
+    }
+}
+
+fn selected_document_ids(
+    state: &Path,
+    pin: trellis::model::IndexPin,
+) -> std::collections::BTreeMap<String, (String, i64, i64)> {
+    let db = rusqlite::Connection::open(index_dir(state).join("index.db")).unwrap();
+    let mut statement = db
+        .prepare(
+            "SELECT m.path,v.content_hash,m.vid,m.gid FROM revision_documents m
+         JOIN document_versions v ON v.vid=m.vid WHERE m.revision_id=?1 ORDER BY m.path",
+        )
+        .unwrap();
+    statement
+        .query_map(
+            [format!(
+                "pin:v1:{}:{}",
+                pin.index_generation, pin.index_revision
+            )],
+            |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?))),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn document_local_any_shape_and_inventory_match_independent_cold_publications() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
+    let (state, workspace) = fixture();
+    for (path, source) in [
+        (
+            "local.js",
+            "function local() { return 1; }\nfunction checked() { const local=1, other=2; return local+other; }\n",
+        ),
         (
             "A.java",
-            format!(
-                "class A {{ int run() {{ return 1; /*{padding}*/ }} int checked() {{ int local=1, other=2; return local+other; }} }}\n"
-            ),
+            "class A { int run() { return 1; } int checked() { int local=1, other=2; return local+other; } }\n",
         ),
         (
             "run.py",
-            format!(
-                "class A:\n    def run(self):\n        return 1\n        # {padding}\n    def checked(self):\n        local=1; other=2\n        return local+other\n"
-            ),
+            "class A:\n    def run(self):\n        return 1\n    def checked(self):\n        local=1; other=2\n        return local+other\n",
         ),
         (
             "run.rs",
-            format!(
-                "fn run()->i32 {{ return 1; /*{padding}*/ }}\nfn checked()->i32 {{ let local=1; let other=2; return local+other; }}\n"
-            ),
+            "fn run()->i32 { opaque!(hidden); return 1; }\nfn checked()->i32 { let local=1; let other=2; return local+other; }\n",
         ),
+        ("anchor.js", "function anchor() {}\n"),
     ] {
-        assert!(source.len() > 50_000);
-        fs::write(workspace.path().join(name), source).unwrap();
+        fs::write(workspace.path().join(path), source).unwrap();
     }
-    assert!(
-        fs::read_dir(workspace.path())
-            .unwrap()
-            .map(|e| e.unwrap().metadata().unwrap().len())
-            .sum::<u64>()
-            > 500_000
-    );
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
-    let session = job.session();
-    let first = job.run(&options, &cancel, |_| {}).unwrap();
+    let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = first_job.session();
+    let first = first_job.run(&options, &cancel, |_| {}).unwrap();
+    #[cfg(feature = "test-support")]
+    let old_families = {
+        let measured = measure_native_for_parity(workspace.path(), &store);
+        assert_native_reference_and_gap_fixture(&measured);
+        assert_selected_native_matches(&store, first, &measured);
+        measured
+    };
+    let index = index_dir(state.path()).join("index.db");
+    let old_sql = sqlite_snapshot(&index, first, false);
+    let old_graph = store.graph_at(Some(first)).unwrap();
     let old_source = store.source_at("local.js", Some(first)).unwrap().unwrap().1;
-    let old_graph = serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap();
-    let old_classes = serde_json::to_value(
-        store
-            .classes_at(Some("A.java"), "", Some(first), 0, 100)
-            .unwrap(),
-    )
-    .unwrap();
-    let old_declarations = serde_json::to_value(
+    let old_classes =
+        serde_json::to_value(store.classes_at(None, "", Some(first), 0, 100).unwrap()).unwrap();
+    let old_native = serde_json::to_value(
         store
             .native_declarations_at(first, "javascript", "local")
             .unwrap(),
     )
     .unwrap();
-    fs::write(workspace.path().join("local.js"), js("2", "local")).unwrap();
-    let local_phases = std::sync::Mutex::new(Vec::new());
-    let local = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |progress| {
-            local_phases.lock().unwrap().push(progress.phase)
-        })
-        .unwrap_or_else(|error| panic!("local publication: {error:#}"));
-    let local_phases = local_phases.into_inner().unwrap();
-    assert!(
-        local_phases.iter().any(|phase| phase == "mode:local"),
-        "a successful local edit must take the measured local branch: {local_phases:?}"
-    );
-    let identity = trellis::store::topology::WorkspaceIdentity::discover(
-        Some(workspace.path()),
-        workspace.path(),
-    )
-    .unwrap();
-    let db = rusqlite::Connection::open(
-        state
-            .path()
-            .join("cache/indexes")
-            .join(identity.root_key)
-            .join("index.db"),
-    )
-    .unwrap();
-    let stamp: i64 = db
-        .query_row(
-            "SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1",
-            [format!(
-                "pin:v1:{}:{}",
-                first.index_generation, first.index_revision
-            )],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(stamp > 0, "local publication stamps its predecessor");
-    assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM native_revision_supersessions WHERE revision_id=?1",
-            [format!(
-                "pin:v1:{}:{}",
-                local.index_generation, local.index_revision
-            )],
-            |row| row.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
+    let mut latest = first;
+    for stage in [
+        "single body",
+        "several bodies",
+        "declaration surfaces",
+        "all documents",
+        "add",
+        "delete",
+        "rename",
+    ] {
+        let prior_ids = selected_document_ids(state.path(), latest);
+        match stage {
+            "single body" => {
+                let source = fs::read_to_string(workspace.path().join("local.js")).unwrap();
+                fs::write(
+                    workspace.path().join("local.js"),
+                    source.replacen("return 1", "return 10000", 1),
+                )
+                .unwrap();
+            }
+            "several bodies" => {
+                for path in ["local.js", "A.java", "run.py", "run.rs"] {
+                    let source = fs::read_to_string(workspace.path().join(path)).unwrap();
+                    fs::write(
+                        workspace.path().join(path),
+                        source.replace("return local+other", "return other+other"),
+                    )
+                    .unwrap();
+                }
+            }
+            "declaration surfaces" => {
+                for (path, source) in [
+                    (
+                        "local.js",
+                        "import { external } from './missing.js';\nexport function renamed(input) { if (input) { external(); } return input; }\n// appended top-level comment\n",
+                    ),
+                    (
+                        "A.java",
+                        "class Base {}\nclass Renamed extends Base { int field; int run(int value) { if (value > 0) { helper(); } return value; } void helper() {} }\n",
+                    ),
+                    (
+                        "run.py",
+                        "from missing import external\nclass Base: pass\nclass Renamed(Base):\n    def run(self, value):\n        if value:\n            external()\n        return value\n",
+                    ),
+                    (
+                        "run.rs",
+                        "use crate::external;\npub fn renamed(value: i32)->i32 { opaque!(hidden); if value > 0 { external(); } value }\n",
+                    ),
+                ] {
+                    fs::write(workspace.path().join(path), source).unwrap();
+                }
+            }
+            "all documents" => {
+                for path in prior_ids.keys() {
+                    let source = fs::read_to_string(workspace.path().join(path)).unwrap();
+                    let comment = if path.ends_with(".py") {
+                        "# all changed\n"
+                    } else {
+                        "// all changed\n"
+                    };
+                    fs::write(workspace.path().join(path), format!("{source}{comment}")).unwrap();
+                }
+            }
+            "add" => fs::write(
+                workspace.path().join("added.py"),
+                "class Added:\n    def go(self):\n        return 1\n",
+            )
+            .unwrap(),
+            "delete" => fs::remove_file(workspace.path().join("A.java")).unwrap(),
+            "rename" => fs::rename(
+                workspace.path().join("added.py"),
+                workspace.path().join("moved.py"),
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        let phases = std::sync::Mutex::new(Vec::new());
+        let next = IndexJobCoordinator::prepare_with_session(&store, Some(latest), session.clone())
+            .unwrap()
+            .run(&options, &cancel, |progress| {
+                phases.lock().unwrap().push(progress.phase)
+            })
+            .unwrap_or_else(|error| panic!("{stage}: {error:#}"));
+        let phases = phases.into_inner().unwrap();
+        assert!(
+            phases.contains(&"mode:local".to_owned()),
+            "{stage}: {phases:?}"
+        );
+        let db = rusqlite::Connection::open(&index).unwrap();
+        let stamp: i64 = db
+            .query_row(
+                "SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1",
+                [format!(
+                    "pin:v1:{}:{}",
+                    latest.index_generation, latest.index_revision
+                )],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stamp > 0,
+            "{stage}: local publication stamps its predecessor"
+        );
+        drop(db);
+        let next_ids = selected_document_ids(state.path(), next);
+        for (path, (hash, vid, gid)) in prior_ids {
+            if let Some((next_hash, next_vid, next_gid)) = next_ids.get(&path)
+                && hash == *next_hash
+            {
+                assert_eq!(
+                    (vid, gid),
+                    (*next_vid, *next_gid),
+                    "{stage}: unchanged native/graph {path}"
+                );
+            }
+        }
+        match stage {
+            "add" => assert!(next_ids.contains_key("added.py")),
+            "delete" => assert!(!next_ids.contains_key("A.java")),
+            "rename" => {
+                assert!(!next_ids.contains_key("added.py"));
+                assert!(next_ids.contains_key("moved.py"));
+            }
+            _ => {}
+        }
+        assert_selected_matches_cold(state.path(), workspace.path(), &store, next);
+        #[cfg(feature = "test-support")]
+        {
+            assert_selected_native_matches(&store, first, &old_families);
+        }
+        assert_eq!(
+            sqlite_snapshot(&index, first, false),
+            old_sql,
+            "{stage}: retained SQL"
+        );
+        assert_eq!(store.graph_at(Some(first)).unwrap(), old_graph);
+        assert_eq!(
+            store.source_at("local.js", Some(first)).unwrap().unwrap().1,
+            old_source
+        );
+        assert_eq!(
+            serde_json::to_value(store.classes_at(None, "", Some(first), 0, 100).unwrap()).unwrap(),
+            old_classes
+        );
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .native_declarations_at(first, "javascript", "local")
+                    .unwrap()
+            )
+            .unwrap(),
+            old_native
+        );
+        latest = next;
+    }
+}
 
-    assert_eq!(
-        store.source_at("local.js", Some(first)).unwrap().unwrap().1,
-        old_source
-    );
-    assert_eq!(
-        serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap(),
-        old_graph
-    );
-    assert_eq!(
-        serde_json::to_value(
-            store
-                .classes_at(Some("A.java"), "", Some(first), 0, 100)
-                .unwrap()
-        )
-        .unwrap(),
-        old_classes
-    );
-    assert_eq!(
-        serde_json::to_value(
-            store
-                .native_declarations_at(first, "javascript", "local")
-                .unwrap()
-        )
-        .unwrap(),
-        old_declarations
-    );
-    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    for path in ["A.java", "run.py", "run.rs"] {
-        let version = |pin: trellis::model::IndexPin| -> i64 {
-            db.query_row(
-                "SELECT vid FROM revision_documents WHERE revision_id=?1 AND path=?2",
-                rusqlite::params![
-                    format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision),
-                    path
-                ],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(
-            version(first),
-            version(local),
-            "{path}: unchanged native version must be reused"
-        );
+#[test]
+fn local_partial_coverage_transitions_match_independent_cold_publications() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
+    let (state, workspace) = fixture();
+    for (path, source) in [
+        ("a.js", "function a() { return 1; }\n"),
+        ("b.js", "function b() { return 2; }\n"),
+        ("unchanged.js", "function unchanged() { return ( ; }\n"),
+        (
+            "gap.rs",
+            "fn gap(value: i32) -> i32 { opaque!(hidden); value }\n",
+        ),
+    ] {
+        fs::write(workspace.path().join(path), source).unwrap();
     }
-    drop(db);
-    let compare_cold = |pin| {
-        let fresh_state = tempfile::tempdir().unwrap();
-        fs::set_permissions(fresh_state.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let cold = Store::open_for_tests(fresh_state.path(), workspace.path()).unwrap();
-        let cold_job = IndexJobCoordinator::prepare(&cold, None).unwrap();
-        let _cold_session = cold_job.session();
-        let cold_pin = cold_job.run(&options, &cancel, |_| {}).unwrap();
-        assert_eq!(
-            sqlite_snapshot(&index_dir(state.path()).join("index.db"), pin, true),
-            sqlite_snapshot(
-                &index_dir(fresh_state.path()).join("index.db"),
-                cold_pin,
-                true
-            )
-        );
-        assert_eq!(
-            store.graph_at(Some(pin)).unwrap().nodes,
-            cold.graph().unwrap().nodes
-        );
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+    let session = job.session();
+    let mut latest = job.run(&options, &cancel, |_| {}).unwrap();
+    #[cfg(feature = "test-support")]
+    let old_families = {
+        let measured = measure_native_for_parity(workspace.path(), &store);
+        assert_native_reference_and_gap_fixture(&measured);
+        measured
     };
-    compare_cold(local);
-    let mut latest = local;
-    for path in ["A.java", "run.py", "run.rs", "local.js"] {
-        let source = fs::read_to_string(workspace.path().join(path)).unwrap();
-        let edited =
-            source
-                .replacen("return 1", "return 10000", 1)
-                .replacen("return 2", "return 10000", 1);
-        assert_ne!(source, edited, "{path}: real length-changing body edit");
-        fs::write(workspace.path().join(path), edited).unwrap();
+    #[cfg(feature = "test-support")]
+    let first = latest;
+    assert_eq!(store.status().unwrap().stats.parse_error_files, 1);
+    for (partial, errors) in [(true, 3), (false, 1)] {
+        let prior_ids = selected_document_ids(state.path(), latest);
+        for (path, name) in [("a.js", "a"), ("b.js", "b")] {
+            let source = if partial {
+                format!("function {name}() {{ return ( ; }}\n")
+            } else {
+                format!("function {name}(value) {{ return value; }}\n")
+            };
+            fs::write(workspace.path().join(path), source).unwrap();
+        }
         let phases = std::sync::Mutex::new(Vec::new());
         let next = IndexJobCoordinator::prepare_with_session(&store, Some(latest), session.clone())
             .unwrap()
             .run(&options, &cancel, |progress| {
                 phases.lock().unwrap().push(progress.phase)
             })
-            .unwrap_or_else(|error| panic!("{path}: local length edit: {error:#}"));
-        let phases = phases.into_inner().unwrap();
+            .unwrap();
         assert!(
-            phases.contains(&"mode:local".to_owned()),
-            "{path}: a method/function-body edit must stay local: {phases:?}"
+            phases
+                .into_inner()
+                .unwrap()
+                .contains(&"mode:local".to_owned())
         );
-        compare_cold(next);
+        assert_eq!(store.status().unwrap().stats.parse_error_files, errors);
+        assert_eq!(
+            selected_document_ids(state.path(), next)["unchanged.js"],
+            prior_ids["unchanged.js"]
+        );
+        assert_selected_matches_cold(state.path(), workspace.path(), &store, next);
+        #[cfg(feature = "test-support")]
+        {
+            assert_selected_native_matches(&store, first, &old_families);
+        }
         latest = next;
     }
-    // Locally bound return identifiers are nonnumeric body edits. The complete
-    // persisted graph, references, native facts, classes and F must equal an
-    // independent same-root FULL cold publication for every changed language.
-    for path in ["A.java", "run.py", "run.rs", "local.js"] {
-        let source = fs::read_to_string(workspace.path().join(path)).unwrap();
-        let edited = source.replacen("return local+other", "return other+other", 1);
-        assert_ne!(source, edited, "{path}: real nonnumeric body edit");
-        fs::write(workspace.path().join(path), edited).unwrap();
-        let phases = std::sync::Mutex::new(Vec::new());
-        let next = IndexJobCoordinator::prepare_with_session(&store, Some(latest), session.clone())
-            .unwrap()
-            .run(&options, &cancel, |progress| {
-                phases.lock().unwrap().push(progress.phase)
-            })
-            .unwrap_or_else(|error| panic!("{path}: local nonnumeric edit: {error:#}"));
-        let phases = phases.into_inner().unwrap();
-        assert!(
-            phases.contains(&"mode:local".to_owned()),
-            "{path}: a local-binding return edit must stay local: {phases:?}"
-        );
-        compare_cold(next);
-        latest = next;
-    }
-    fs::write(workspace.path().join("local.js"), js("2", "renamed")).unwrap();
-    let fallback = IndexJobCoordinator::prepare_with_session(&store, Some(latest), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    assert_eq!(
-        store.source_at("local.js", Some(first)).unwrap().unwrap().1,
-        old_source
-    );
-    assert_eq!(
-        serde_json::to_value(store.graph_at(Some(first)).unwrap()).unwrap(),
-        old_graph
-    );
-    assert_eq!(
-        serde_json::to_value(
-            store
-                .classes_at(Some("A.java"), "", Some(first), 0, 100)
-                .unwrap()
-        )
-        .unwrap(),
-        old_classes
-    );
-    assert_eq!(
-        serde_json::to_value(
-            store
-                .native_declarations_at(first, "javascript", "local")
-                .unwrap()
-        )
-        .unwrap(),
-        old_declarations
-    );
-    compare_cold(fallback);
 }
 
 #[test]
@@ -2201,7 +2492,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
     for mutation in [
         "DELETE FROM revision_capture_inputs WHERE input_key='config:package.json'",
         "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) SELECT id,'unknown:slot','{\"state\":\"absent\"}' FROM native_revisions WHERE published_index_revision=(SELECT index_revision FROM index_metadata)",
-        "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',2)",
+        "UPDATE index_metadata SET reconcile_options=json_set(reconcile_options,'$.version',3)",
         "UPDATE revision_capture_inputs SET payload=json_set(payload,'$.hash','invalid-digest') WHERE input_key='config:package.json'",
     ] {
         let (state, workspace) = fixture();
@@ -2215,9 +2506,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
         let manifest = workspace.path().join("labels.json");
         fs::write(&scip, b"captured presentation bytes").unwrap();
         fs::write(&manifest, b"{}").unwrap();
-        let mut options = IndexOptions::new(workspace.path().to_owned());
-        options.scip_path = Some(scip.clone());
-        options.manifest_path = Some(manifest.clone());
+        let options = IndexOptions::new(workspace.path().to_owned());
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
         let job = IndexJobCoordinator::prepare(&store, None).unwrap();
@@ -2253,8 +2542,7 @@ fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert!(keys.contains(&format!("presentation-scip:{}", scip.display())));
-        assert!(keys.contains(&format!("presentation-manifest:{}", manifest.display())));
+        assert!(!keys.iter().any(|key| key.starts_with("presentation-")));
         assert!(keys.contains(&"config:package.json".to_owned()));
         assert!(!keys.iter().any(|key| key.starts_with("unknown:")));
     }
@@ -3016,569 +3304,25 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
 }
 
 #[test]
-fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinates() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{
-        indexer::{IndexOptions, index_workspace_bundle},
-        model::{CancelFlag, SymbolKind},
-    };
-    let (state, workspace) = fixture();
-    let java = "/*é*/ class A {}\n";
-    let python = "class P: pass\n";
-    fs::write(workspace.path().join("A.java"), java).unwrap();
-    fs::write(workspace.path().join("a.py"), python).unwrap();
-    fs::write(workspace.path().join("a.js"), "class J {}\n").unwrap();
-    fs::write(workspace.path().join("a.rs"), "struct R {}\n").unwrap();
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let scip = state.path().join("labels.scip");
-    let manifest = state.path().join("labels.json");
-    let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some(scip.clone());
-    options.manifest_path = Some(manifest.clone());
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let occurrences = |version: &str| {
-        let mut index = scip::types::Index::new();
-        for (path, range, name) in [
-            ("A.java", vec![0, 12, 13], "A"), // default UTF-16; UTF-8 byte columns are 13..14.
-            ("a.py", vec![0, 6, 7], "P"),
-            ("a.js", vec![0, 6, 7], "J"),
-            ("a.rs", vec![0, 7, 8], "R"),
-        ] {
-            let mut doc = scip::types::Document::new();
-            doc.relative_path = path.into();
-            let mut occurrence = scip::types::Occurrence::new();
-            occurrence.range = range;
-            occurrence.symbol_roles = 1;
-            occurrence.symbol = format!("scip {version} {name}");
-            doc.occurrences.push(occurrence);
-            index.documents.push(doc);
-        }
-        index
-    };
-    let correct_hashes = serde_json::json!({
-        "A.java":hex::encode(Sha256::digest(java.as_bytes())),
-        "a.py":hex::encode(Sha256::digest(python.as_bytes())),
-        "a.js":hex::encode(Sha256::digest(b"class J {}\n")),
-        "a.rs":hex::encode(Sha256::digest(b"struct R {}\n")),
-    });
-    let run = |index: &scip::types::Index, hashes: &serde_json::Value| {
-        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
-        fs::write(&manifest, serde_json::to_vec(hashes).unwrap()).unwrap();
-        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
-    };
-    let valid = occurrences("valid");
-    let (baseline, base_native, _) = run(&valid, &correct_hashes);
-    let node = |graph: &trellis::model::Graph, path: &str, name: &str| {
-        graph
-            .nodes
-            .iter()
-            .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
-            .unwrap()
-            .clone()
-    };
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        assert_eq!(
-            node(&baseline, path, name).display_label.as_deref(),
-            Some(format!("scip valid {name}").as_str())
-        );
-    }
-    assert!(
-        baseline
-            .nodes
-            .iter()
-            .filter(|n| n.path == "a.rs")
-            .all(|n| n.display_label.is_none())
-    );
-    let baseline_ids: Vec<_> = baseline
-        .nodes
-        .iter()
-        .map(|n| (&n.id, &n.provenance))
-        .collect();
-    for scenario in [
-        "stale-manifest",
-        "missing-manifest",
-        "wrong-range",
-        "wrong-name",
-        "reference-role",
-        "duplicate",
-        "ambiguous-range",
-        "unicode-byte-column",
-    ] {
-        let mut index = valid.clone();
-        let mut hashes = correct_hashes.clone();
-        let java_doc = index
-            .documents
-            .iter_mut()
-            .find(|d| d.relative_path == "A.java")
-            .unwrap();
-        match scenario {
-            "stale-manifest" => hashes["A.java"] = serde_json::json!("deadbeef"),
-            "missing-manifest" => {
-                hashes.as_object_mut().unwrap().remove("A.java");
-            }
-            "wrong-range" => java_doc.occurrences[0].range = vec![0, 5, 6],
-            "wrong-name" => java_doc.occurrences[0].symbol = "scip wrong Q".into(),
-            "reference-role" => java_doc.occurrences[0].symbol_roles = 0,
-            "duplicate" => java_doc.occurrences.push(java_doc.occurrences[0].clone()),
-            "ambiguous-range" => {
-                // A second, same-coordinate presentation cannot choose a label.
-                let mut other = java_doc.occurrences[0].clone();
-                other.symbol = "scip second A".into();
-                java_doc.occurrences.push(other);
-            }
-            "unicode-byte-column" => java_doc.occurrences[0].range = vec![0, 13, 14],
-            _ => unreachable!(),
-        }
-        let (graph, native, _) = run(&index, &hashes);
-        assert_eq!(
-            node(&graph, "A.java", "A").display_label,
-            None,
-            "{scenario}"
-        );
-        assert_eq!(
-            node(&graph, "a.py", "P").display_label,
-            node(&baseline, "a.py", "P").display_label
-        );
-        assert_eq!(
-            node(&graph, "a.js", "J").display_label,
-            node(&baseline, "a.js", "J").display_label
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .filter(|n| n.path == "a.rs")
-                .all(|n| n.display_label.is_none())
-        );
-        assert_eq!(
-            graph
-                .nodes
-                .iter()
-                .map(|n| (&n.id, &n.provenance))
-                .collect::<Vec<_>>(),
-            baseline_ids,
-            "native IDs and provenance must not change with SCIP presentation: {scenario}"
-        );
-        assert_eq!(native.producer, base_native.producer);
-        assert_eq!(
-            native
-                .declarations
-                .iter()
-                .map(|d| &d.syntax_id)
-                .collect::<Vec<_>>(),
-            base_native
-                .declarations
-                .iter()
-                .map(|d| &d.syntax_id)
-                .collect::<Vec<_>>()
-        );
-    }
-}
-
-#[test]
-fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinned_revisions() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{
-        index_coordinator::IndexJobCoordinator,
-        indexer::IndexOptions,
-        model::{CancelFlag, IndexPin, SymbolKind},
-    };
-    let (state, workspace) = fixture();
-    let java = "class A {}\n";
-    fs::write(workspace.path().join("A.java"), java).unwrap();
-    let scip = state.path().join("labels.scip");
-    let manifest = state.path().join("labels.json");
-    fs::write(
-        &manifest,
-        serde_json::to_vec(&serde_json::json!({
-            "A.java":hex::encode(Sha256::digest(java.as_bytes()))
-        }))
-        .unwrap(),
+fn native_index_does_not_project_optional_scip_labels() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.js"), "function f() {}\n").unwrap();
+    let options = trellis::indexer::IndexOptions::new(root.path().to_owned());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (before, _) =
+        trellis::indexer::index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+    std::fs::write(
+        root.path().join("artifact.scip"),
+        b"old optional artifact ignored",
     )
     .unwrap();
-    let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some(scip.clone());
-    options.manifest_path = Some(manifest);
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let job = IndexJobCoordinator::prepare(&store, None).unwrap();
-    let session = job.session();
-    let write_label = |label: &str, cutoff: bool| {
-        let mut index = scip::types::Index::new();
-        let mut document = scip::types::Document::new();
-        document.relative_path = "A.java".into();
-        let mut occurrence = scip::types::Occurrence::new();
-        occurrence.range = vec![0, 6, 7];
-        occurrence.symbol_roles = 1;
-        occurrence.symbol = format!("scip {label} A");
-        document.occurrences.push(occurrence);
-        index.documents.push(document);
-        if cutoff {
-            for ordinal in 0..1000 {
-                let mut extra = scip::types::Document::new();
-                extra.relative_path = format!("extra-{ordinal}.java");
-                index.documents.push(extra);
-            }
-        }
-        fs::write(&scip, index.write_to_bytes().unwrap()).unwrap();
-    };
-    let label = |pin: IndexPin| {
-        store
-            .graph_at(Some(pin))
-            .unwrap()
-            .nodes
-            .into_iter()
-            .find(|n| n.path == "A.java" && n.kind == SymbolKind::Class)
-            .unwrap()
-    };
-    let ids = |pin: IndexPin| {
-        let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-        db.query_row(
-            "SELECT vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path='A.java'",
-            [format!(
-                "pin:v1:{}:{}",
-                pin.index_generation, pin.index_revision
-            )],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .unwrap()
-    };
-    write_label("one", false);
-    let first = job.run(&options, &cancel, |_| {}).unwrap();
-    write_label("two", false);
-    let second = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    assert_eq!(label(first).display_label.as_deref(), Some("scip one A"));
-    assert_eq!(label(second).display_label.as_deref(), Some("scip two A"));
-    assert_eq!(label(first).id, label(second).id);
-    assert_eq!(label(first).provenance, label(second).provenance);
-    let (native_first, graph_first, class_first) = ids(first);
-    let (native_second, graph_second, class_second) = ids(second);
-    assert_eq!(
-        native_first, native_second,
-        "same captured source reuses native version"
-    );
-    assert_ne!(graph_first, graph_second, "label is graph presentation");
-    assert_ne!(
-        class_first, class_second,
-        "class projection follows graph label"
-    );
-    write_label("cutoff", true);
-    let third = IndexJobCoordinator::prepare_with_session(&store, Some(second), session.clone())
-        .unwrap()
-        .run(&options, &cancel, |_| {})
-        .unwrap();
-    assert_eq!(
-        label(third).display_label,
-        None,
-        "over-1000 SCIP docs refuse all labels"
-    );
-    assert_eq!(
-        ids(third).0,
-        native_first,
-        "presentation cutoff never alters native version"
-    );
-    assert_eq!(
-        label(second).display_label.as_deref(),
-        Some("scip two A"),
-        "old pin keeps label"
-    );
+    let (after, _) =
+        trellis::indexer::index_workspace_with_capture(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(before.nodes, after.nodes);
+    assert!(after.nodes.iter().all(|node| node.display_label.is_none()));
 }
 
 #[cfg(feature = "test-support")]
-#[test]
-fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_labels() {
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
-    use trellis::{
-        classes::{Catalog, FileExtraction, Limits},
-        indexer::{IndexOptions, index_workspace_bundle},
-        model::{CancelFlag, Graph, SymbolKind},
-    };
-    let (state, workspace) = fixture();
-    let sources = [
-        ("A.java", "/*é*/ class A {}\n"),
-        ("a.py", "class P: pass\n"),
-        ("a.js", "class J {}\n"),
-        ("a.rs", "struct R {}\n"),
-    ];
-    for (path, text) in sources {
-        fs::write(workspace.path().join(path), text).unwrap();
-    }
-    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let session = store.writer_session_for_tests().unwrap();
-    let scip = state.path().join("cutoff.scip");
-    let manifest = state.path().join("cutoff.json");
-    let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some(scip.clone());
-    options.manifest_path = Some(manifest.clone());
-    let hashes: serde_json::Map<String, serde_json::Value> = sources
-        .iter()
-        .map(|(path, text)| {
-            (
-                (*path).to_owned(),
-                serde_json::json!(hex::encode(Sha256::digest(text.as_bytes()))),
-            )
-        })
-        .collect();
-    fs::write(&manifest, serde_json::to_vec(&hashes).unwrap()).unwrap();
-    let mut index = scip::types::Index::new();
-    for (path, range, name) in [
-        ("A.java", vec![0, 12, 13], "A"),
-        ("a.py", vec![0, 6, 7], "P"),
-        ("a.js", vec![0, 6, 7], "J"),
-        ("a.rs", vec![0, 7, 8], "R"),
-    ] {
-        let mut doc = scip::types::Document::new();
-        doc.relative_path = path.into();
-        let mut occurrence = scip::types::Occurrence::new();
-        occurrence.range = range;
-        occurrence.symbol_roles = 1;
-        occurrence.symbol = format!("scip cutoff {name}");
-        doc.occurrences.push(occurrence);
-        index.documents.push(doc);
-    }
-    for n in 0..996 {
-        let mut doc = scip::types::Document::new();
-        doc.relative_path = format!("absent{n:04}.java");
-        index.documents.push(doc);
-    }
-    assert_eq!(index.documents.len(), 1_000);
-    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let run = |index: &scip::types::Index| {
-        let bytes = index.write_to_bytes().unwrap();
-        assert!(
-            bytes.len() < 128 * 1024,
-            "tiny captured SCIP fixture must stay bounded"
-        );
-        fs::write(&scip, bytes).unwrap();
-        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
-    };
-    let (positive, positive_native, positive_capture) = run(&index);
-    fn node<'a>(graph: &'a Graph, path: &str, name: &str) -> &'a trellis::model::Symbol {
-        graph
-            .nodes
-            .iter()
-            .find(|n| n.path == path && n.name == name && n.kind == SymbolKind::Class)
-            .unwrap()
-    }
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        assert_eq!(
-            node(&positive, path, name).display_label.as_deref(),
-            Some(format!("scip cutoff {name}").as_str())
-        );
-    }
-    assert!(
-        positive
-            .nodes
-            .iter()
-            .filter(|n| n.path == "a.rs")
-            .all(|n| n.display_label.is_none())
-    );
-    let extract = |graph: &Graph, capture: &trellis::capture::Capture| {
-        let files: Vec<_> = capture
-            .files
-            .iter()
-            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-            .map(|f| {
-                FileExtraction::extract_file(f, &graph.nodes, &cancel, Limits::default()).unwrap()
-            })
-            .collect();
-        let catalog = Catalog::compose(
-            &files,
-            capture.files.len(),
-            graph.nodes.len(),
-            Limits::default(),
-        )
-        .unwrap();
-        (files, catalog)
-    };
-    let (positive_f, positive_classes) = extract(&positive, &positive_capture);
-    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
-        assert_eq!(
-            positive_classes
-                .classes
-                .iter()
-                .find(|c| c.symbol.path == path && c.symbol.name == name)
-                .unwrap()
-                .symbol
-                .display_label
-                .as_deref(),
-            Some(format!("scip cutoff {name}").as_str())
-        );
-    }
-    let first_pin = store
-        .publish_native(
-            &positive,
-            &positive_capture,
-            &positive_native,
-            session.writer_guard().unwrap(),
-            store.index_baseline().unwrap(),
-            &cancel,
-        )
-        .unwrap();
-    assert_eq!(first_pin.index_revision, 1);
-
-    let mut extra = scip::types::Document::new();
-    extra.relative_path = "absent0996.java".into();
-    index.documents.push(extra);
-    assert_eq!(index.documents.len(), 1_001);
-    let (cutoff, cutoff_native, cutoff_capture) = run(&index);
-    assert_eq!(positive_capture.files, cutoff_capture.files);
-    assert_eq!(
-        positive_capture.hashes.get("A.java"),
-        cutoff_capture.hashes.get("A.java")
-    );
-    assert_eq!(positive_native.producer, cutoff_native.producer);
-    assert_eq!(
-        positive_native
-            .declarations
-            .iter()
-            .map(|d| &d.syntax_id)
-            .collect::<Vec<_>>(),
-        cutoff_native
-            .declarations
-            .iter()
-            .map(|d| &d.syntax_id)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        positive
-            .nodes
-            .iter()
-            .map(|n| (&n.id, &n.provenance))
-            .collect::<Vec<_>>(),
-        cutoff
-            .nodes
-            .iter()
-            .map(|n| (&n.id, &n.provenance))
-            .collect::<Vec<_>>()
-    );
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        assert_eq!(
-            node(&cutoff, path, name).display_label,
-            None,
-            "global 1001-document cutoff: {path}"
-        );
-    }
-    assert!(
-        cutoff
-            .nodes
-            .iter()
-            .filter(|n| n.path == "a.rs")
-            .all(|n| n.display_label.is_none())
-    );
-    let mut without_labels = positive.nodes.clone();
-    for n in &mut without_labels {
-        n.display_label = None;
-    }
-    assert_eq!(
-        without_labels, cutoff.nodes,
-        "SCIP only changes optional graph presentation"
-    );
-    let (cutoff_f, cutoff_classes) = extract(&cutoff, &cutoff_capture);
-    assert_eq!(positive_f.len(), cutoff_f.len());
-    let mut unlabelled_f = positive_f.clone();
-    for f in &mut unlabelled_f {
-        for class in &mut f.classes {
-            class.symbol.display_label = None;
-        }
-    }
-    assert_eq!(
-        unlabelled_f, cutoff_f,
-        "F must retain native classes/relations without labels"
-    );
-    let mut unlabelled_classes = positive_classes.clone();
-    for class in &mut unlabelled_classes.classes {
-        class.symbol.display_label = None;
-    }
-    assert_eq!(
-        unlabelled_classes, cutoff_classes,
-        "composed classes must follow label cutoff only"
-    );
-    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
-        assert_eq!(
-            cutoff_classes
-                .classes
-                .iter()
-                .find(|c| c.symbol.path == path && c.symbol.name == name)
-                .unwrap()
-                .symbol
-                .display_label,
-            None
-        );
-    }
-    let second_pin = store
-        .publish_native(
-            &cutoff,
-            &cutoff_capture,
-            &cutoff_native,
-            session.writer_guard().unwrap(),
-            first_pin,
-            &cancel,
-        )
-        .unwrap();
-    assert_eq!(second_pin.index_revision, 2);
-    let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
-    let current = format!(
-        "pin:v1:{}:{}",
-        second_pin.index_generation, second_pin.index_revision
-    );
-    for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
-        let expected = node(&cutoff, path, name);
-        let (name, kind): (String, String) = db.query_row(
-            "SELECT n.name,n.kind FROM graph_nodes n JOIN revision_documents m ON n.gid=m.gid WHERE m.revision_id=?1 AND m.path=?2 AND n.id=unhex(substr(?3,8))",
-            rusqlite::params![current,path,expected.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(name, expected.name);
-        assert_eq!(
-            kind.as_str(),
-            serde_json::to_value(expected.kind)
-                .unwrap()
-                .as_str()
-                .unwrap()
-        );
-        assert!(expected.display_label.is_none());
-    }
-    for f in &cutoff_f {
-        let (state,payload):(String,String)=db.query_row(
-            "SELECT g.class_extraction_state,g.class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.revision_id=?1 AND m.path=?2",
-            rusqlite::params![current,f.path],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(state, "ready");
-        assert_eq!(
-            serde_json::from_str::<FileExtraction>(&payload).unwrap(),
-            *f
-        );
-    }
-    for (path, name) in [("A.java", "A"), ("a.py", "P")] {
-        let expected = cutoff_classes
-            .classes
-            .iter()
-            .find(|c| c.symbol.path == path && c.symbol.name == name)
-            .unwrap();
-        let payload:String=db.query_row(
-            "SELECT c.payload FROM classes c JOIN revision_documents m ON m.cid=c.cid WHERE m.revision_id=?1 AND m.path=?2 AND c.id=unhex(substr(?3,8))",
-            rusqlite::params![current,path,expected.symbol.id],|r|r.get(0)).unwrap();
-        assert_eq!(
-            serde_json::from_str::<trellis::classes::ClassDefinition>(&payload).unwrap(),
-            *expected
-        );
-        assert!(expected.symbol.display_label.is_none());
-    }
-}
-
 #[test]
 #[ignore = "pinned medium Cmedium0000 Java prefix insertion requires two cold indices; run explicitly"]
 fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retains_old_pin() {
@@ -3610,7 +3354,7 @@ fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retai
             "{:x}",
             Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
         ),
-        "03faaaa04c61ba7c18051e12386201898cd31625758c36a0202ff8da65da8882"
+        "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259"
     );
     let workspace = corpus.join("medium");
     let relative = "java/Cmedium0000.java";
@@ -3795,5 +3539,104 @@ fn exported_javascript_and_bare_rust_tail_local_match_independent_cold() {
             ),
             "{path}: native/graph/class/reference selected facts must equal same-root cold"
         );
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn full_reuse_small_edit_plain_and_stream_match_independent_cold_publication() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        index_coordinator::IndexJobCoordinator,
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{CancelFlag, IndexPin},
+    };
+    for stream in [false, true] {
+        let (state, workspace) = fixture();
+        fs::write(
+            workspace.path().join("A.java"),
+            "class A { int run(){ return helper(); } int helper(){ return 1; } }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("a.py"),
+            "class Base: pass\nclass A(Base):\n    def run(self):\n        return 1\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("edit.js"),
+            "function edit(){ return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("gap.rs"),
+            "fn gap(value: i32) -> i32 { opaque!(hidden); value }\n",
+        )
+        .unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let first = IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        let ids = |pin: IndexPin| {
+            let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
+            let mut statement = db.prepare("SELECT path,vid,gid,cid FROM revision_documents WHERE revision_id=?1 AND path!='edit.js' ORDER BY path").unwrap();
+            statement
+                .query_map(
+                    [format!(
+                        "pin:v1:{}:{}",
+                        pin.index_generation, pin.index_revision
+                    )],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let prior_ids = ids(first);
+        assert_eq!(prior_ids.len(), 3);
+        let first_families = measure_native_for_parity(workspace.path(), &store);
+        assert_native_reference_and_gap_fixture(&first_families);
+        assert_selected_native_matches(&store, first, &first_families);
+        fs::write(
+            workspace.path().join("edit.js"),
+            "function renamed(){ return 2; }\nrenamed();\n",
+        )
+        .unwrap();
+        // Force the two FULL entrypoints so the later local-path widening
+        // cannot turn this reuse regression into a local-publication test.
+        let session = store.writer_session_for_tests().unwrap();
+        let leader = session.writer_guard().unwrap();
+        let next = if stream {
+            let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            store
+                .publish_stream_native_only_for_tests(&options, &capture, leader, &cancel)
+                .unwrap()
+        } else {
+            let (graph, native, capture) =
+                index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+            store
+                .publish_native(&graph, &capture, &native, leader, first, &cancel)
+                .unwrap()
+        };
+        drop(session);
+        assert_eq!(next.index_generation, first.index_generation);
+        assert_eq!(next.index_revision, first.index_revision + 1);
+        assert_eq!(
+            ids(next),
+            prior_ids,
+            "stream={stream}: reuse all three stored IDs"
+        );
+        assert_selected_matches_cold(state.path(), workspace.path(), &store, next);
+        assert_selected_native_matches(&store, first, &first_families);
     }
 }

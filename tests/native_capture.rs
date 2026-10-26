@@ -51,7 +51,28 @@ fn real_native_capture_normalizes_and_preserves_a_fresh_output() {
     let first = fs::read(&output).unwrap();
     let capture: Value = serde_json::from_slice(&first).unwrap();
     assert!(!capture["calls"].as_array().unwrap().is_empty());
-    assert_eq!(capture["references"], json!([]));
+    assert!(!capture["references"].as_array().unwrap().is_empty());
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.join("fixture.json")).unwrap()).unwrap();
+    let expected_reports = manifest["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|revision| {
+            revision["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|document| json!({"document":document["key"],"revisionId":revision["id"]}))
+        })
+        .collect::<Vec<_>>();
+    let actual_reports = capture["capabilityReports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|report| json!({"document":report["document"],"revisionId":report["revisionId"]}))
+        .collect::<Vec<_>>();
+    assert_eq!(actual_reports, expected_reports);
     assert!(!cli(&args).status.success());
     assert_eq!(first, fs::read(&output).unwrap());
     let second = temp.path().join("second.json");
@@ -148,6 +169,30 @@ fn all_production_languages_emit_source_witnesses_and_test_roles() {
             !capture["controls"].as_array().unwrap().is_empty(),
             "{language}"
         );
+        let references = capture["references"].as_array().unwrap();
+        assert!(!references.is_empty(), "{language}");
+        for row in references {
+            let start = row["range"]["start"].as_u64().unwrap() as usize;
+            let end = row["range"]["end"].as_u64().unwrap() as usize;
+            assert_eq!(row["range"]["encoding"], "utf8");
+            assert_eq!(row["spelling"], &source[start..end]);
+            assert_witness(row, "spelling", source, start, end);
+            assert!(declarations.iter().any(|d| d["ref"] == row["ownerRef"]));
+        }
+        let reports = capture["capabilityReports"].as_array().unwrap();
+        assert_eq!(reports.len(), 1, "{language}");
+        let families = reports[0]["families"].as_array().unwrap();
+        assert_eq!(families.len(), 4, "{language}");
+        for kind in ["declarationName", "callee", "invocation", "reference"] {
+            let entries = families
+                .iter()
+                .filter(|f| f["kind"] == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1, "{language} {kind}");
+            assert_eq!(entries[0]["available"], true);
+            assert_eq!(entries[0]["diagnostic"], Value::Null);
+            assert_eq!(entries[0]["gaps"], json!([]));
+        }
         node("check-all", &root, Some(&descriptor));
     }
 }
@@ -334,7 +379,7 @@ fn opaque_rust_capture_surfaces_partial_coverage_and_keeps_measured_output() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
         temp.path().join("source"),
-        "fn main() { some_macro!(hidden()); }",
+        "fn main() { ordinary(); some_macro!(hidden()); }",
     )
     .unwrap();
     manifest(
@@ -368,6 +413,221 @@ fn opaque_rust_capture_surfaces_partial_coverage_and_keeps_measured_output() {
             .iter()
             .any(|row| row["name"] == "main")
     );
-    assert_eq!(capture["calls"], json!([]));
+    let calls = capture["calls"].as_array().unwrap();
+    assert!(calls.iter().any(|row| row["spelling"] == "ordinary"));
+    assert!(!calls.iter().any(|row| row["spelling"] == "hidden"));
+    let references = capture["references"].as_array().unwrap();
+    assert!(references.iter().any(|row| row["spelling"] == "ordinary"));
+    assert!(!references.iter().any(|row| row["spelling"] == "hidden"));
+    let reports = capture["capabilityReports"].as_array().unwrap();
+    assert_eq!(reports.len(), 1);
+    let families = reports[0]["families"].as_array().unwrap();
+    assert_eq!(families.len(), 4);
+    assert!(families.iter().all(|family| family["available"] == true));
+    let gaps = families
+        .iter()
+        .flat_map(|f| f["gaps"].as_array().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!gaps.is_empty());
+    let source = "fn main() { ordinary(); some_macro!(hidden()); }";
+    for gap in gaps {
+        assert_eq!(gap["range"]["encoding"], "utf8");
+        let start = gap["range"]["start"].as_u64().unwrap() as usize;
+        let end = gap["range"]["end"].as_u64().unwrap() as usize;
+        assert!(source[start..end].contains("hidden"));
+        assert!(!source[start..end].contains("ordinary"));
+        assert!(!gap["diagnostic"].as_str().unwrap().is_empty());
+    }
     assert!(capture.get("coverage").is_none());
+}
+
+#[test]
+fn callable_values_and_explicit_import_aliases_keep_exact_reference_sites() {
+    let temp = tempfile::tempdir().unwrap();
+    let samples = [
+        (
+            "java",
+            "A.java",
+            "class A { void target() {} void run() { scheduler(this::target); } }",
+            "target);",
+            None,
+        ),
+        (
+            "rust",
+            "a.rs",
+            "use module::original as local; fn target() {} fn run() { scheduler(target); }",
+            "target);",
+            Some("local"),
+        ),
+        (
+            "python",
+            "a.py",
+            "def target():\n    pass\ndef run():\n    scheduler(target)\n",
+            "target)",
+            None,
+        ),
+        (
+            "javascript",
+            "a.js",
+            "import {original as local} from 'module'; function target() {} function run() { scheduler(target); }",
+            "target);",
+            Some("local"),
+        ),
+    ];
+    for (language, path, source, marker, alias) in samples {
+        fs::write(temp.path().join("source"), source).unwrap();
+        manifest(
+            temp.path(),
+            json!([{"key":{"sourceSetId":"main","language":language,"path":path},"revisionId":"r0","sourceFile":"source"}]),
+        );
+        let output = temp.path().join(format!("{language}.json"));
+        success(cli(&[
+            "native-capture",
+            "--fixture",
+            temp.path().to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ]));
+        let capture: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        let references = capture["references"].as_array().unwrap();
+        let start = source.find(marker).unwrap();
+        let candidate = references
+            .iter()
+            .find(|r| r["range"]["start"] == start && r["spelling"] == "target")
+            .unwrap();
+        assert_witness(candidate, "spelling", source, start, start + "target".len());
+        let calls = capture["calls"].as_array().unwrap();
+        assert!(
+            calls.iter().any(|c| c["spelling"] == "scheduler"),
+            "{language}"
+        );
+        assert!(
+            !calls.iter().any(|c| c["spelling"] == "target"),
+            "{language}"
+        );
+        if let Some(alias) = alias {
+            let declaration = capture["declarations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["kind"] == "alias" && d["name"] == alias)
+                .unwrap();
+            let reference = references
+                .iter()
+                .find(|r| r["range"] == declaration["nameRange"])
+                .unwrap();
+            assert_eq!(reference["ownerRef"], declaration["parentRef"]);
+            assert_eq!(reference["spelling"], alias);
+            assert!(references.iter().any(|r| r["spelling"] == "original"));
+        }
+    }
+}
+
+#[test]
+fn java_varargs_capture_exports_unique_parameter_name_joins() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = "class A { void f(int... rest) {} void f(String... rest) {} A(long... rest) {} }";
+    fs::write(temp.path().join("source"), source).unwrap();
+    manifest(
+        temp.path(),
+        json!([{"key":{"sourceSetId":"main","language":"java","path":"A.java"},"revisionId":"r0","sourceFile":"source"}]),
+    );
+    let output = temp.path().join("native.json");
+    success(cli(&[
+        "native-capture",
+        "--fixture",
+        temp.path().to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]));
+    let capture: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    let declarations = capture["declarations"].as_array().unwrap();
+    let references = capture["references"].as_array().unwrap();
+    for (kind, parameter_type) in [
+        ("method", "int"),
+        ("method", "String"),
+        ("constructor", "long"),
+    ] {
+        let callable = declarations
+            .iter()
+            .find(|row| {
+                row["kind"] == kind && row["signature"]["parameterTypes"] == json!([parameter_type])
+            })
+            .unwrap();
+        assert_eq!(callable["signature"]["variadic"], true);
+        assert_eq!(
+            callable["header"]["parameters"],
+            json!([{"name":"rest","type":parameter_type,"variadic":true}])
+        );
+        let parameters = declarations
+            .iter()
+            .filter(|row| row["parentRef"] == callable["ref"] && row["kind"] == "parameter")
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 1, "{kind} {parameter_type}");
+        let parameter = parameters[0];
+        assert_eq!(parameter["name"], "rest");
+        let marker = format!("{parameter_type}... rest");
+        let type_start = source.find(&marker).unwrap();
+        let name_start = type_start + parameter_type.len() + 4;
+        assert_eq!(
+            parameter["range"],
+            json!({"start":type_start,"end":name_start+4,"encoding":"utf8"})
+        );
+        assert_witness(
+            callable,
+            "header.parameters[0].type",
+            source,
+            type_start,
+            type_start + parameter_type.len(),
+        );
+        assert_witness(
+            callable,
+            "signature.parameterTypes[0]",
+            source,
+            type_start,
+            type_start + parameter_type.len(),
+        );
+        assert_witness(
+            callable,
+            "header.parameters[0].name",
+            source,
+            name_start,
+            name_start + 4,
+        );
+        assert_witness(parameter, "name", source, name_start, name_start + 4);
+        let declaration_names = declarations
+            .iter()
+            .filter(|row| row["nameRange"] == parameter["nameRange"])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declaration_names.len(),
+            1,
+            "unambiguous declarationName join"
+        );
+        let candidates = references
+            .iter()
+            .filter(|row| row["range"] == parameter["nameRange"])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "one native reference at parameter name"
+        );
+        assert_eq!(candidates[0]["ownerRef"], callable["ref"]);
+        assert_eq!(candidates[0]["spelling"], "rest");
+        assert_witness(
+            candidates[0],
+            "spelling",
+            source,
+            name_start,
+            name_start + 4,
+        );
+    }
+    assert_eq!(
+        declarations
+            .iter()
+            .filter(|row| row["kind"] == "parameter")
+            .count(),
+        3
+    );
 }

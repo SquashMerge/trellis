@@ -244,7 +244,7 @@ async function specimen(
             "callee",
             "invocation",
             "reference",
-          ].map((kind) => ({ kind, available: true, diagnostic: null })),
+          ].map((kind) => ({ kind, gaps: [], available: true, diagnostic: null })),
         });
       }
     }
@@ -279,6 +279,7 @@ async function specimen(
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [],
     calls: [],
     controls: [],

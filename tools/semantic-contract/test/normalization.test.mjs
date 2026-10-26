@@ -60,6 +60,7 @@ async function specimen() {
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [],
     calls: [],
     controls: [],
@@ -169,6 +170,7 @@ function setNative(s, rows) {
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: rows,
     calls: [],
     controls: [],
@@ -209,6 +211,7 @@ test("NORMALIZE.OCCURRENCE source-derived call/reference ordinals and exact tupl
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [row(s)],
     calls: [
       {
@@ -272,6 +275,7 @@ test("NORMALIZE.CALLEE does not guess a range from the separate spelling witness
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [row(s)],
     calls: [call],
     controls: [],
@@ -330,6 +334,7 @@ test("NORMALIZE.REFERENCE_JOIN non-exact diagnostics do not fabricate reference 
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [row(s)],
     calls: [],
     controls: [],
@@ -473,6 +478,7 @@ function measured(s) {
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [row(s)],
     calls: [
       {
@@ -730,6 +736,7 @@ async function invocationFixture(t) {
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: [
       declaration("main", "main", 0, 29, 9),
       declaration("target", "target", 30, 50, 39),
@@ -1040,7 +1047,7 @@ test("semantic proof, symbol, declaration binding, relationship, reference, call
       "callee",
       "invocation",
       "reference",
-    ].map((kind) => ({ kind, available: true, diagnostic: null })),
+    ].map((kind) => ({ kind, gaps: [], available: true, diagnostic: null })),
   });
   loaded.anchors.cases.push({
     id: "baseline-anchor",
@@ -1195,7 +1202,7 @@ test("join matching does not cross owner, family, bytes, revision or producer su
   const support = ["declarationName", "callee", "invocation", "reference"].map(
     (kind) => ({
       kind,
-      available: kind !== "reference",
+      gaps: [], available: kind !== "reference",
       diagnostic: kind === "reference" ? "unsupported by native" : null,
     }),
   );
@@ -1705,7 +1712,7 @@ test("coverage tuple, state, roles, diagnostics and producer partitions", async 
       "callee",
       "invocation",
       "reference",
-    ].map((kind) => ({ kind, available: true, diagnostic: null })),
+    ].map((kind) => ({ kind, gaps: [], available: true, diagnostic: null })),
   });
   assert.equal(normalize(loaded).records.coverage[0].state, "complete");
   for (const [field, value] of [
@@ -2018,7 +2025,7 @@ test("coverage intent requires partial diagnostic for unsupported or missing req
   const { loaded } = await loadedMeasured(t),
     doc = loaded.native.declarations[0].document;
   const support = ["declarationName", "callee", "invocation", "reference"].map(
-    (kind) => ({ kind, available: true, diagnostic: null }),
+    (kind) => ({ kind, gaps: [], available: true, diagnostic: null }),
   );
   loaded.fixture.coverageIntents = [
     {
@@ -2221,7 +2228,7 @@ test("coverage requires role-specific measurement families and either call ancho
   const { loaded } = await loadedMeasured(t),
     doc = loaded.native.declarations[0].document;
   const support = ["declarationName", "callee", "invocation", "reference"].map(
-    (kind) => ({ kind, available: true, diagnostic: null }),
+    (kind) => ({ kind, gaps: [], available: true, diagnostic: null }),
   );
   const intent = {
     producerId: "native",
@@ -2319,7 +2326,7 @@ test("coverage intent reconciles all six states and unrelated unavailable famili
   const support = ["declarationName", "callee", "invocation", "reference"].map(
     (kind) => ({
       kind,
-      available: kind !== "invocation",
+      gaps: [], available: kind !== "invocation",
       diagnostic: kind === "invocation" ? "unavailable" : null,
     }),
   );

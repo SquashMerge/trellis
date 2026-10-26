@@ -167,15 +167,10 @@ struct Signal {
 
 /// Whether an event can affect the checkout. This may read file metadata, so
 /// a callback runs it before taking its liveness lock.
-fn relevant(
-    event: &notify::Result<Event>,
-    root: &Path,
-    selected: &BTreeSet<PathBuf>,
-    executable: Option<&Path>,
-) -> bool {
-    !event.as_ref().is_ok_and(|event| {
-        read_only(event.kind) || certainly_excluded(event, root, selected, executable)
-    })
+fn relevant(event: &notify::Result<Event>, root: &Path, executable: Option<&Path>) -> bool {
+    !event
+        .as_ref()
+        .is_ok_and(|event| read_only(event.kind) || certainly_excluded(event, root, executable))
 }
 
 /// Accept an event: bump the generation, queue it, wake the worker. Only short,
@@ -203,14 +198,9 @@ fn accept(
 }
 
 /// Discard only paths inside a subtree capture always excludes. A disappeared
-/// endpoint, symlink ancestor, selected input or running executable is uncertain
+/// endpoint, symlink ancestor or running executable is uncertain
 /// and must retain its full inventory intent. A mixed rename is never discarded.
-fn certainly_excluded(
-    event: &Event,
-    root: &Path,
-    selected: &BTreeSet<PathBuf>,
-    executable: Option<&Path>,
-) -> bool {
+fn certainly_excluded(event: &Event, root: &Path, executable: Option<&Path>) -> bool {
     if event.paths.is_empty() || matches!(event.kind, EventKind::Any | EventKind::Other) {
         return false;
     }
@@ -226,19 +216,13 @@ fn certainly_excluded(
         } else {
             root.join(path)
         };
-        if selected.contains(&absolute) || executable == absolute {
+        if executable == absolute {
             return false;
         }
-        // For an existing selected input, compare both literal and canonical
-        // spellings; a failed canonicalization is uncertainty, not exclusion.
         let Ok(canonical) = fs::canonicalize(&absolute) else {
             return false;
         };
-        if selected
-            .iter()
-            .any(|path| fs::canonicalize(path).ok().as_ref() == Some(&canonical))
-            || canonical_executable == canonical
-        {
+        if canonical_executable == canonical {
             return false;
         }
         let Ok(relative) = absolute.strip_prefix(root) else {
@@ -416,7 +400,6 @@ impl Drop for WatchSignals {
 /// Owned by the elected leader, never by a reader or a second durable work queue.
 pub struct WatchSignals {
     root: PathBuf,
-    captured_inputs: BTreeSet<PathBuf>,
     watcher: Option<RecommendedWatcher>,
     sender: SyncSender<Signal>,
     receiver: Receiver<Signal>,
@@ -455,67 +438,26 @@ pub struct WatchSignals {
 }
 
 impl WatchSignals {
-    /// `root` must already be selected and identity-verified by the leader.
-    /// Optional captured SCIP/manifest paths may be ignored by the walker or
-    /// outside this root; their paths still demand a full input reconciliation.
     /// The adapter does not elect a leader or retry registration on its own.
-    pub fn new(root: PathBuf, scip_path: Option<PathBuf>, manifest_path: Option<PathBuf>) -> Self {
-        Self::publishing(
-            root,
-            scip_path,
-            manifest_path,
-            Arc::new(WatcherHealth::default()),
-        )
+    pub fn new(root: PathBuf) -> Self {
+        Self::publishing(root, Arc::new(WatcherHealth::default()))
     }
 
-    /// A native watcher whose health is also published through `health`.
-    pub fn publishing(
-        root: PathBuf,
-        scip_path: Option<PathBuf>,
-        manifest_path: Option<PathBuf>,
-        health: Arc<WatcherHealth>,
-    ) -> Self {
-        Self::construct(root, scip_path, manifest_path, true, health)
+    pub fn publishing(root: PathBuf, health: Arc<WatcherHealth>) -> Self {
+        Self::construct(root, true, health)
     }
 
-    /// Fixture-only ingress with no asynchronous OS backend. Synthetic events
-    /// still exercise the production channel, overflow, and acknowledgment path.
     #[doc(hidden)]
-    pub fn synthetic_for_tests(
-        root: PathBuf,
-        scip_path: Option<PathBuf>,
-        manifest_path: Option<PathBuf>,
-    ) -> Self {
-        Self::construct(
-            root,
-            scip_path,
-            manifest_path,
-            false,
-            Arc::new(WatcherHealth::default()),
-        )
+    pub fn synthetic_for_tests(root: PathBuf) -> Self {
+        Self::construct(root, false, Arc::new(WatcherHealth::default()))
     }
 
-    fn construct(
-        root: PathBuf,
-        scip_path: Option<PathBuf>,
-        manifest_path: Option<PathBuf>,
-        native: bool,
-        health: Arc<WatcherHealth>,
-    ) -> Self {
-        Self::construct_in(
-            root,
-            scip_path,
-            manifest_path,
-            native,
-            health,
-            NativeBudget::global(),
-        )
+    fn construct(root: PathBuf, native: bool, health: Arc<WatcherHealth>) -> Self {
+        Self::construct_in(root, native, health, NativeBudget::global())
     }
 
     fn construct_in(
         root: PathBuf,
-        scip_path: Option<PathBuf>,
-        manifest_path: Option<PathBuf>,
         native: bool,
         health: Arc<WatcherHealth>,
         budget: Arc<NativeBudget>,
@@ -529,17 +471,6 @@ impl WatchSignals {
         let callback_generation = Arc::clone(&generation);
         let callback_overflow = Arc::clone(&overflow);
         let callback_root = root.clone();
-        let callback_selected = [scip_path.clone(), manifest_path.clone()]
-            .into_iter()
-            .flatten()
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    root.join(path)
-                }
-            })
-            .collect::<BTreeSet<_>>();
         let callback_executable = std::env::current_exe().ok();
         let waker = Arc::new(std::sync::OnceLock::new());
         let callback_waker = Arc::clone(&waker);
@@ -564,12 +495,7 @@ impl WatchSignals {
                     pause();
                 }
             }
-            let relevant = relevant(
-                &event,
-                &callback_root,
-                &callback_selected,
-                callback_executable.as_deref(),
-            );
+            let relevant = relevant(&event, &callback_root, callback_executable.as_deref());
             // A released watcher has no authority over the checkout. The
             // lock is held only through the short effects below, so a
             // release waits for a callback already past this check.
@@ -627,20 +553,8 @@ impl WatchSignals {
             .flatten();
         let degraded = native && watcher.is_none();
         health.publish_setup(epoch, watcher.is_some(), degraded);
-        let captured_inputs = [scip_path, manifest_path]
-            .into_iter()
-            .flatten()
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    root.join(path)
-                }
-            })
-            .collect();
         Self {
             root,
-            captured_inputs,
             watcher,
             sender,
             receiver,
@@ -767,12 +681,7 @@ impl WatchSignals {
     /// Feed the same bounded ingress used by notify's actual callback. A
     /// runtime error or a dropped signal forces a full inventory.
     pub fn submit_event(&self, event: notify::Result<Event>) {
-        if relevant(
-            &event,
-            &self.root,
-            &self.captured_inputs,
-            self.executable.as_deref(),
-        ) {
+        if relevant(&event, &self.root, self.executable.as_deref()) {
             // Fixture ingress uses the callback's claim fence, including
             // after a test disables native delivery. Classification stays outside.
             let _ingress = self.lock_ingress();
@@ -872,12 +781,7 @@ impl WatchSignals {
     /// goes through `submit`; both paths share event classification.
     pub fn observe_event(&mut self, event: &Event) {
         if read_only(event.kind)
-            || certainly_excluded(
-                event,
-                &self.root,
-                &self.captured_inputs,
-                self.executable.as_deref(),
-            )
+            || certainly_excluded(event, &self.root, self.executable.as_deref())
         {
             return;
         }
@@ -912,9 +816,6 @@ impl WatchSignals {
             } else {
                 self.root.join(path)
             };
-            if self.captured_inputs.contains(&absolute) {
-                self.pending.full = true;
-            }
             let Ok(relative) = absolute.strip_prefix(&self.root) else {
                 self.pending.full = true;
                 continue;
@@ -996,13 +897,11 @@ mod ingress_tests {
         assert!(certainly_excluded(
             &event(other),
             root.path(),
-            &BTreeSet::new(),
             Some(&executable)
         ));
         assert!(!certainly_excluded(
             &event(executable.clone()),
             root.path(),
-            &BTreeSet::new(),
             Some(&executable)
         ));
         let alias = target.join("alias");
@@ -1010,7 +909,6 @@ mod ingress_tests {
         assert!(!certainly_excluded(
             &event(alias),
             root.path(),
-            &BTreeSet::new(),
             Some(&executable)
         ));
     }
@@ -1138,8 +1036,6 @@ mod reaper_tests {
         fn signals(&self, root: &Path, health: &Arc<WatcherHealth>) -> WatchSignals {
             WatchSignals::construct_in(
                 root.to_path_buf(),
-                None,
-                None,
                 true,
                 Arc::clone(health),
                 Arc::clone(&self.0),
@@ -1201,13 +1097,8 @@ mod reaper_tests {
     fn a_release_waits_for_an_in_flight_callback_and_silences_later_ones() {
         let temp = tempfile::tempdir().unwrap();
         let health = Arc::new(WatcherHealth::default());
-        let watched = WatchSignals::construct(
-            temp.path().to_path_buf(),
-            None,
-            None,
-            false,
-            Arc::clone(&health),
-        );
+        let watched =
+            WatchSignals::construct(temp.path().to_path_buf(), false, Arc::clone(&health));
         let wakes = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&wakes);
         watched.set_waker(Arc::new(move || {
@@ -1262,8 +1153,6 @@ mod reaper_tests {
         let temp = tempfile::tempdir().unwrap();
         let watched = WatchSignals::construct(
             temp.path().to_path_buf(),
-            None,
-            None,
             false,
             Arc::new(WatcherHealth::default()),
         );

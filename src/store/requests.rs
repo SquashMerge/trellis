@@ -198,7 +198,180 @@ fn unfinished_exists(db: &rusqlite::Connection) -> rusqlite::Result<bool> {
     )
 }
 
-const SCHEMA: &str = "CREATE TABLE requests (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, options_json TEXT NOT NULL, expected_generation TEXT, expected_revision INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','running','done','failed')), claim_incarnation TEXT, result_generation TEXT, result_revision INTEGER, error_code TEXT, submitted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, CHECK ((expected_generation IS NULL) = (expected_revision IS NULL)), CHECK ((result_generation IS NULL) = (result_revision IS NULL)), CHECK ((state='queued' AND claim_incarnation IS NULL AND started_at IS NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='running' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='done' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NOT NULL AND error_code IS NULL) OR (state='failed' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NULL AND error_code IS NOT NULL))); CREATE INDEX requests_state_seq ON requests(state,seq); CREATE INDEX requests_root_state_seq ON requests(root_device,root_inode,state,seq); CREATE TABLE queue_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_spelling TEXT NOT NULL, root_key TEXT NOT NULL); PRAGMA user_version=1";
+const V1_SCHEMA: &str = "CREATE TABLE requests (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, options_json TEXT NOT NULL, expected_generation TEXT, expected_revision INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','running','done','failed')), claim_incarnation TEXT, result_generation TEXT, result_revision INTEGER, error_code TEXT, submitted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, CHECK ((expected_generation IS NULL) = (expected_revision IS NULL)), CHECK ((result_generation IS NULL) = (result_revision IS NULL)), CHECK ((state='queued' AND claim_incarnation IS NULL AND started_at IS NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='running' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='done' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NOT NULL AND error_code IS NULL) OR (state='failed' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NULL AND error_code IS NOT NULL))); CREATE INDEX requests_state_seq ON requests(state,seq); CREATE INDEX requests_root_state_seq ON requests(root_device,root_inode,state,seq); CREATE TABLE queue_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_spelling TEXT NOT NULL, root_key TEXT NOT NULL); PRAGMA user_version=1";
+const SCHEMA: &str = "CREATE TABLE requests (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, options_json TEXT NOT NULL, request_kind TEXT NOT NULL CHECK(request_kind IN ('index','semanticImport')), expected_generation TEXT, expected_revision INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','running','done','failed')), claim_incarnation TEXT, result_generation TEXT, result_revision INTEGER, error_code TEXT, submitted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, CHECK ((expected_generation IS NULL) = (expected_revision IS NULL)), CHECK ((result_generation IS NULL) = (result_revision IS NULL)), CHECK ((state='queued' AND claim_incarnation IS NULL AND started_at IS NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='running' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='done' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NOT NULL AND error_code IS NULL) OR (state='failed' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NULL AND error_code IS NOT NULL))); CREATE INDEX requests_state_seq ON requests(state,seq); CREATE INDEX requests_root_state_seq ON requests(root_device,root_inode,state,seq); CREATE TABLE queue_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_spelling TEXT NOT NULL, root_key TEXT NOT NULL); PRAGMA user_version=2";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct V1ReconcileOptions {
+    version: u8,
+    max_file_bytes: u64,
+    scip_path: Option<String>,
+    manifest_path: Option<String>,
+}
+
+fn migrate_v1_queue(db: &mut Connection) -> Result<()> {
+    let tx = super::storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let version: i64 =
+        super::storage_result(tx.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if version != 1 {
+        return Ok(());
+    }
+    let actual: Vec<(String, String, String, Option<String>)> = tx
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(V1_SCHEMA)?;
+    let canonical: Vec<(String, String, String, Option<String>)> = expected
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure!(actual == canonical, "incompatible_queue: v1 schema");
+    let mut stmt = tx.prepare("SELECT seq,id,root_device,root_inode,options_json,expected_generation,expected_revision,state,claim_incarnation,result_generation,result_revision,error_code,submitted_at,started_at,finished_at FROM requests ORDER BY seq")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<i64>>(10)?,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, String>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut converted = Vec::with_capacity(rows.len());
+    for (
+        seq,
+        id,
+        device,
+        inode,
+        options,
+        eg,
+        er,
+        state,
+        claim,
+        rg,
+        rr,
+        error,
+        submitted,
+        started,
+        finished,
+    ) in rows
+    {
+        ensure!(
+            seq > 0 && Uuid::parse_str(&id).is_ok(),
+            "incompatible_queue: v1 row identity"
+        );
+        let old: V1ReconcileOptions = serde_json::from_str(&options)
+            .map_err(|_| anyhow::anyhow!("incompatible_queue: v1 options"))?;
+        ensure!(
+            old.version == 1
+                && (1..=16_777_216).contains(&old.max_file_bytes)
+                && options.len() <= 4096,
+            "incompatible_queue: v1 options"
+        );
+        for path in [old.scip_path.as_deref(), old.manifest_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                Path::new(path).is_absolute(),
+                "incompatible_queue: v1 optional input identity"
+            );
+        }
+        ensure!(
+            (eg.is_none() == er.is_none()) && (rg.is_none() == rr.is_none()),
+            "incompatible_queue: v1 pin"
+        );
+        for (generation, revision) in [(&eg, er), (&rg, rr)] {
+            if let Some(generation) = generation {
+                ensure!(
+                    Uuid::parse_str(generation).is_ok() && revision.is_some_and(|n| n >= 0),
+                    "incompatible_queue: v1 pin"
+                );
+            }
+        }
+        ensure!(
+            match state.as_str() {
+                "queued" =>
+                    claim.is_none()
+                        && started.is_none()
+                        && finished.is_none()
+                        && rg.is_none()
+                        && error.is_none(),
+                "running" =>
+                    claim.is_some()
+                        && started.is_some()
+                        && finished.is_none()
+                        && rg.is_none()
+                        && error.is_none(),
+                "done" =>
+                    claim.is_some()
+                        && started.is_some()
+                        && finished.is_some()
+                        && rg.is_some()
+                        && error.is_none(),
+                "failed" =>
+                    claim.is_some()
+                        && started.is_some()
+                        && finished.is_some()
+                        && rg.is_none()
+                        && error.is_some(),
+                _ => false,
+            },
+            "incompatible_queue: v1 state"
+        );
+        let native = serde_json::to_string(&ReconcileOptions {
+            version: 2,
+            max_file_bytes: old.max_file_bytes,
+        })?;
+        converted.push((
+            seq, id, device, inode, native, eg, er, state, claim, rg, rr, error, submitted,
+            started, finished,
+        ));
+    }
+    tx.execute_batch("ALTER TABLE requests RENAME TO requests_v1; DROP INDEX requests_state_seq; DROP INDEX requests_root_state_seq;")?;
+    let definition = SCHEMA
+        .split("; CREATE TABLE queue_identity")
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid queue schema"))?;
+    tx.execute_batch(definition)?;
+    for (
+        seq,
+        id,
+        device,
+        inode,
+        options,
+        eg,
+        er,
+        state,
+        claim,
+        rg,
+        rr,
+        error,
+        submitted,
+        started,
+        finished,
+    ) in converted
+    {
+        tx.execute("INSERT INTO requests(seq,id,root_device,root_inode,options_json,request_kind,expected_generation,expected_revision,state,claim_incarnation,result_generation,result_revision,error_code,submitted_at,started_at,finished_at) VALUES (?1,?2,?3,?4,?5,'index',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![seq,id,device,inode,options,eg,er,state,claim,rg,rr,error,submitted,started,finished])?;
+    }
+    tx.execute_batch("DROP TABLE requests_v1; PRAGMA user_version=2")?;
+    tx.commit()?;
+    Ok(())
+}
 
 /// GC must not turn the queue's version pragma into permission to unlink an
 /// unknown schema. Compare every object, including SQLite-generated indexes.
@@ -219,7 +392,7 @@ pub(crate) fn validate_gc_queue(db: &Connection, spelling: &str, key: &str) -> R
         "incompatible_queue: unknown GC schema"
     );
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    ensure!(version == 1, "incompatible_queue: GC schema version");
+    ensure!(version == 2, "incompatible_queue: GC schema version");
     let count: i64 = db.query_row("SELECT count(*) FROM queue_identity", [], |row| row.get(0))?;
     ensure!(count == 1, "incompatible_queue: GC identity cardinality");
     let identity: (String, String) = db.query_row(
@@ -236,12 +409,39 @@ pub(crate) fn validate_gc_queue(db: &Connection, spelling: &str, key: &str) -> R
     Ok(())
 }
 
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SemanticImportOptions {
+    pub version: u8,
+    pub scip: String,
+    pub manifest: String,
+    pub profile_id: String,
+    pub producer_name: String,
+    pub manifest_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestKind {
+    Index,
+    SemanticImport,
+}
+impl RequestKind {
+    fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "index" => Ok(Self::Index),
+            "semanticImport" => Ok(Self::SemanticImport),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
     #[serde(skip)]
     pub seq: i64,
     pub id: String,
+    #[serde(skip)]
+    pub request_kind: RequestKind,
     pub state: String,
     #[serde(skip)]
     pub root_device: String,
@@ -305,21 +505,39 @@ pub(crate) struct PendingCompletion {
 }
 
 impl Request {
+    pub fn semantic_options(&self) -> Result<SemanticImportOptions> {
+        ensure!(
+            self.request_kind == RequestKind::SemanticImport,
+            "invalid request kind for semantic import"
+        );
+        ensure!(
+            self.options_json.len() <= 4096,
+            "invalid request options length"
+        );
+        let options: SemanticImportOptions = serde_json::from_str(&self.options_json)?;
+        ensure!(
+            options.version == 1,
+            "invalid semantic import options version"
+        );
+        Ok(options)
+    }
+
     pub fn options(&self, root: &Path) -> Result<IndexOptions> {
+        ensure!(
+            self.request_kind == RequestKind::Index,
+            "invalid request kind for native index"
+        );
         ensure!(
             self.options_json.len() <= 4096,
             "invalid request options length"
         );
         let value: ReconcileOptions = serde_json::from_str(&self.options_json)?;
         ensure!(
-            value.version == 1 && (1..=16_777_216).contains(&value.max_file_bytes),
+            value.version == 2 && (1..=16_777_216).contains(&value.max_file_bytes),
             "invalid request options"
         );
-        value.require_absolute_optional_inputs()?;
         let mut options = IndexOptions::new(root.to_owned());
         options.max_file_bytes = value.max_file_bytes;
-        options.scip_path = value.scip_path.map(Into::into);
-        options.manifest_path = value.manifest_path.map(Into::into);
         Ok(options)
     }
 }
@@ -331,10 +549,10 @@ fn now() -> String {
         .to_string()
 }
 fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
-    let generation: Option<String> = row.get(5)?;
-    let revision: Option<i64> = row.get(6)?;
-    let result_generation: Option<String> = row.get(9)?;
-    let result_revision: Option<i64> = row.get(10)?;
+    let generation: Option<String> = row.get(6)?;
+    let revision: Option<i64> = row.get(7)?;
+    let result_generation: Option<String> = row.get(10)?;
+    let result_revision: Option<i64> = row.get(11)?;
     let pin = |generation: Option<String>,
                revision: Option<i64>|
      -> rusqlite::Result<Option<IndexPin>> {
@@ -353,14 +571,15 @@ fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
         root_device: row.get(2)?,
         root_inode: row.get(3)?,
         options_json: row.get(4)?,
+        request_kind: RequestKind::from_db(&row.get::<_, String>(5)?)?,
         expected: pin(generation, revision)?,
-        state: row.get(7)?,
-        claim_incarnation: row.get(8)?,
+        state: row.get(8)?,
+        claim_incarnation: row.get(9)?,
         revision: pin(result_generation, result_revision)?,
-        error_code: row.get(11)?,
-        submitted_at: row.get(12)?,
-        started_at: row.get(13)?,
-        finished_at: row.get(14)?,
+        error_code: row.get(12)?,
+        submitted_at: row.get(13)?,
+        started_at: row.get(14)?,
+        finished_at: row.get(15)?,
     };
     if Uuid::parse_str(&request.id).is_err()
         || !matches!(
@@ -374,7 +593,7 @@ fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Request> {
     }
     Ok(request)
 }
-const COLUMNS: &str = "seq,id,root_device,root_inode,options_json,expected_generation,expected_revision,state,claim_incarnation,result_generation,result_revision,error_code,submitted_at,started_at,finished_at";
+const COLUMNS: &str = "seq,id,root_device,root_inode,options_json,request_kind,expected_generation,expected_revision,state,claim_incarnation,result_generation,result_revision,error_code,submitted_at,started_at,finished_at";
 // The protected opener has legacy raw SQLite calls. Convert only an exact
 // SQLite lock conflict when this settlement path invokes it.
 fn settlement_open_error(error: anyhow::Error) -> anyhow::Error {
@@ -586,7 +805,7 @@ impl Store {
             "storage_busy: queue journal format"
         );
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure!(version == 1, "storage_busy: unknown or virgin queue schema");
+        ensure!(version == 2, "storage_busy: unknown or virgin queue schema");
         let queue_identity: (String, String) = db.query_row(
             "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
             [],
@@ -868,7 +1087,7 @@ impl Store {
         // Only the local Arc is released. The process-wide check handle must
         // remain open while any SQLite connection may hold fcntl locks.
         drop(file);
-        let db = super::protected_sqlite_open(
+        let mut db = super::protected_sqlite_open(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
@@ -876,13 +1095,16 @@ impl Store {
         db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON")?;
         // The public queue inode is published only after its complete staged
         // transaction commits. Existing-only and normal callers open it under
-        // SH for hot-journal recovery, then validate v1, identity and integrity
+        // SH for hot-journal recovery, then migrate v1 atomically and validate identity and integrity
         // before interpreting any row; no bootstrap mutates a public v0 inode.
         let version: i64 =
             super::storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
         // Even an empty v0 inode may be an accidentally truncated accepted
         // queue. No caller, including a verified writer, can recover it safely.
-        ensure!(version == 1, "incompatible_queue: schema version");
+        ensure!(
+            matches!(version, 1 | 2),
+            "incompatible_queue: schema version"
+        );
         let identity: (String, String) = db.query_row(
             "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
             [],
@@ -894,6 +1116,9 @@ impl Store {
         );
         let check: String = db.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
         ensure!(check == "ok", "incompatible_queue: integrity check failed");
+        if version == 1 {
+            migrate_v1_queue(&mut db).map_err(settlement_open_error)?;
+        }
         // Retain an in-process inode witness across all Store clones. A fresh
         // process relies on the durable queue singleton, not a guessed inode.
         let current = fs::symlink_metadata(&path)?;
@@ -990,23 +1215,73 @@ impl Store {
         after_write_lock: impl FnOnce(),
         after_insert: impl FnOnce(),
     ) -> Result<Request> {
+        ensure!(
+            (1..=16_777_216).contains(&options.max_file_bytes),
+            "invalid request options"
+        );
+        self.enqueue_typed_request(
+            &options.workspace_root,
+            &ReconcileOptions::from(options),
+            RequestKind::Index,
+            expected,
+            after_write_lock,
+            after_insert,
+        )
+    }
+
+    /// Accept a closed semantic job without reading mutable SCIP inputs yet.
+    pub fn enqueue_semantic_import(
+        &self,
+        root: &Path,
+        options: &SemanticImportOptions,
+    ) -> Result<Request> {
+        ensure!(
+            options.version == 1
+                && !options.scip.is_empty()
+                && !options.manifest.is_empty()
+                && !options.profile_id.is_empty()
+                && !options.producer_name.is_empty()
+                && options.manifest_sha256.len() == 64
+                && options
+                    .manifest_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "invalid_request: semantic import options"
+        );
+        crate::scip_admission::validate_selected_role(root, Path::new(&options.scip))
+            .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+        crate::scip_admission::validate_selected_role(root, Path::new(&options.manifest))
+            .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+        self.enqueue_typed_request(
+            root,
+            options,
+            RequestKind::SemanticImport,
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    fn enqueue_typed_request<T: Serialize>(
+        &self,
+        root: &Path,
+        options: &T,
+        request_kind: RequestKind,
+        expected: Option<IndexPin>,
+        after_write_lock: impl FnOnce(),
+        after_insert: impl FnOnce(),
+    ) -> Result<Request> {
         // In flight from before the transaction until after the wake.
         let _in_flight = self.enqueue_in_flight();
         self.identity.verify()?;
-        let selected = std::fs::symlink_metadata(&options.workspace_root)?;
+        let selected = std::fs::symlink_metadata(root)?;
         ensure!(
             selected.is_dir()
                 && !selected.file_type().is_symlink()
                 && (selected.dev(), selected.ino()) == (self.identity.device, self.identity.inode)
-                && std::fs::canonicalize(&options.workspace_root)? == self.identity.root,
+                && std::fs::canonicalize(root)? == self.identity.root,
             "root_changed: request workspace mismatch"
         );
-        let options = ReconcileOptions::from(options);
-        ensure!(
-            options.version == 1 && (1..=16_777_216).contains(&options.max_file_bytes),
-            "invalid request options"
-        );
-        options.require_absolute_optional_inputs()?;
         let encoded = serde_json::to_string(&options)?;
         ensure!(encoded.len() <= 4096, "invalid request options length");
         // Retry only queue admission. No request has been inserted yet; once
@@ -1020,7 +1295,11 @@ impl Store {
         let submitted_at = now();
         let root_device = self.identity.device.to_string();
         let root_inode = self.identity.inode.to_string();
-        tx.execute("INSERT INTO requests (id,root_device,root_inode,options_json,expected_generation,expected_revision,state,submitted_at) VALUES (?1,?2,?3,?4,?5,?6,'queued',?7)", params![id,root_device,root_inode,encoded,expected.map(|p|p.index_generation.to_string()),expected.map(|p|p.index_revision as i64),submitted_at])?;
+        let kind = match request_kind {
+            RequestKind::Index => "index",
+            RequestKind::SemanticImport => "semanticImport",
+        };
+        tx.execute("INSERT INTO requests (id,root_device,root_inode,options_json,request_kind,expected_generation,expected_revision,state,submitted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',?8)", params![id,root_device,root_inode,encoded,kind,expected.map(|p|p.index_generation.to_string()),expected.map(|p|p.index_revision as i64),submitted_at])?;
         let seq = tx.last_insert_rowid();
         after_insert();
         tx.commit()?;
@@ -1036,6 +1315,7 @@ impl Store {
         Ok(Request {
             seq,
             id,
+            request_kind,
             state: "queued".into(),
             root_device,
             root_inode,

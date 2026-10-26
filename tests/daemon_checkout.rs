@@ -1187,7 +1187,7 @@ async fn root_loss_during_paused_reattach_startup_waits_for_worker_then_releases
 }
 
 #[tokio::test]
-async fn cold_activation_preserves_recorded_scip_option() {
+async fn cold_activation_preserves_recorded_native_limit() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
@@ -1201,7 +1201,6 @@ async fn cold_activation_preserves_recorded_scip_option() {
     let topology = roots(base.path());
     let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
     let mut options = trellis::indexer::IndexOptions::new(checkout.clone());
-    options.scip_path = Some(checkout.join("recorded.scip"));
     options.max_file_bytes = 8192;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let owner =
@@ -1219,7 +1218,6 @@ async fn cold_activation_preserves_recorded_scip_option() {
         .recorded_index_options()
         .unwrap()
         .unwrap();
-    assert_eq!(observed.scip_path, options.scip_path);
     assert_eq!(observed.max_file_bytes, options.max_file_bytes);
 
     registry.disconnect(1);
@@ -1243,7 +1241,6 @@ async fn cold_activation_preserves_recorded_scip_option() {
         default_selected.max_file_bytes, 2_097_152,
         "explicit default is an instruction, not implicit fallback"
     );
-    assert!(default_selected.scip_path.is_none());
     registry.disconnect(2);
     release_when_idle(&mut registry, &id.root_key).await;
     assert!(!explicit_default.has_active_resources());
@@ -1262,10 +1259,6 @@ async fn cold_activation_preserves_recorded_scip_option() {
         .unwrap()
         .unwrap();
     assert_eq!(selected.max_file_bytes, 4096);
-    assert!(
-        selected.scip_path.is_none(),
-        "explicit browser options override recorded inputs"
-    );
 }
 
 #[cfg(feature = "test-support")]
@@ -1804,46 +1797,23 @@ async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses()
     assert!(active.has_active_resources());
 }
 
-#[tokio::test]
-async fn explicit_null_scip_clears_recorded_input_on_cold_activation() {
+#[test]
+fn browser_options_reject_removed_optional_inputs() {
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     fs::create_dir(&checkout).unwrap();
-    fs::write(
-        checkout.join("a.js"),
-        "function oldScip() {}
-",
-    )
-    .unwrap();
     let id = identity(&checkout);
-    let topology = roots(base.path());
-    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let mut options = trellis::indexer::IndexOptions::new(checkout.clone());
-    options.scip_path = Some(checkout.join("old.scip"));
-    let owner = trellis::index_coordinator::establish_serving_session(
-        &store,
-        Some(&options),
-        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )
-    .unwrap();
-    drop(owner);
-    drop(store);
-    let mut registry = CheckoutRegistry::with_roots(topology.clone());
-    registry
-        .register(&id, CheckoutOptions(serde_json::json!({"scip":null})))
-        .unwrap();
-    registry.attach_launch(1, &id).unwrap();
-    let runtime = registry.activate(&id.root_key).unwrap();
-    ready(&runtime).await;
-    let selected = Store::open(topology, identity(&checkout))
-        .unwrap()
-        .recorded_index_options()
-        .unwrap()
-        .unwrap();
-    assert!(
-        selected.scip_path.is_none(),
-        "explicit null clears prior SCIP selection"
-    );
+    for key in ["scip", "manifest"] {
+        let mut value = serde_json::Map::new();
+        value.insert(key.to_owned(), serde_json::Value::Null);
+        assert!(
+            CheckoutRegistry::validate_browser_options(
+                &id,
+                &CheckoutOptions(serde_json::Value::Object(value))
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

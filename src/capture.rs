@@ -725,20 +725,6 @@ impl Capture {
             hash(executable_bytes.as_ref().unwrap())
         };
         check(cancel)?;
-        for path in [options.scip_path.as_ref(), options.manifest_path.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            admit_input(
-                path.clone(),
-                256 * 1024 * 1024,
-                cancel,
-                &source_identities,
-                &mut input_identities,
-                &mut inputs,
-                &mut input_bytes,
-            )?;
-        }
         let mut files = Vec::new();
         let mut hashes = BTreeMap::new();
         let mut source_operations = BTreeMap::new();
@@ -809,14 +795,14 @@ impl Capture {
         capture.verify(cancel)?;
         Ok(capture)
     }
-    /// Confirm that the complete captured walk and selected inputs belong to
-    /// these effective watcher options and this accepted request root.
+    /// Match an already verified capture to the watcher options and request root.
+    /// The coordinator supplies its fresh admission or verified publication capture;
+    /// this identity check must not repeat the capture's full inventory verification.
     pub(crate) fn covers_watcher_request(
         &self,
         options: &IndexOptions,
         root_device: &str,
         root_inode: &str,
-        cancel: &CancelFlag,
     ) -> bool {
         #[cfg(unix)]
         if self.root_stamp.dev.to_string() != root_device
@@ -829,7 +815,6 @@ impl Capture {
         (self.admission_root == options.workspace_root
             || std::fs::canonicalize(&options.workspace_root).ok() == Some(self.root.clone()))
             && self.reconcile_options == crate::indexer::ReconcileOptions::from(options)
-            && self.verify(cancel).is_ok()
     }
 
     /// A capture may feed exactly one graph projection. Cross-link validation is not projection.
@@ -888,13 +873,12 @@ impl Capture {
     fn input_cap(&self, path: &Path) -> u64 {
         if path == self.executable_path {
             512 * 1024 * 1024
-        } else if self.reconcile_options.scip_path.as_deref() == path.to_str()
-            || self.reconcile_options.manifest_path.as_deref() == path.to_str()
-        {
-            256 * 1024 * 1024
         } else {
             16 * 1024 * 1024
         }
+    }
+    pub(crate) fn physical_root(&self) -> &Path {
+        &self.root
     }
     pub fn bytes(&self, path: &Path) -> Option<&[u8]> {
         self.input_bytes.get(path).and_then(|b| b.as_deref())
@@ -923,10 +907,8 @@ impl Capture {
         };
         admitted.then_some(self.executable_digest.as_str())
     }
-    /// Compare the native roles of admitted inputs, not presentation pathnames. A single
-    /// optional SCIP/manifest pathname can also be a root config, nested ignore file,
-    /// toolchain selector, or this executable. Its native role must never be filtered.
-    /// The executable uses its admitted Arc digest; do not rehash its bytes.
+    /// Fingerprint native inputs by their admitted roles. The executable uses
+    /// its admitted Arc digest; do not rehash its bytes.
     pub(crate) fn native_input_fingerprints(&self) -> Result<BTreeMap<String, Option<String>>> {
         let mut result = BTreeMap::new();
         for (path, expected) in &self.inputs {
@@ -1057,12 +1039,6 @@ impl Capture {
             if path == &self.executable_path {
                 roles.push(format!("executable:{}", path.to_string_lossy()));
             }
-            if self.reconcile_options.scip_path.as_deref() == path.to_str() {
-                roles.push(format!("presentation-scip:{}", path.to_string_lossy()));
-            }
-            if self.reconcile_options.manifest_path.as_deref() == path.to_str() {
-                roles.push(format!("presentation-manifest:{}", path.to_string_lossy()));
-            }
             if path.starts_with(&self.root) {
                 let rel = relative(&self.root, path)?;
                 if matches!(
@@ -1118,6 +1094,40 @@ impl Capture {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn verified_capture_matches_only_its_watcher_options_and_request_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let binary = exe.path().join("extractor");
+        fs::write(&binary, b"binary").unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture = Capture::admit_with_executable(&options, &cancel, &|_| {}, binary).unwrap();
+        #[cfg(unix)]
+        let (device, inode) = (
+            capture.root_stamp.dev.to_string(),
+            capture.root_stamp.ino.to_string(),
+        );
+        #[cfg(not(unix))]
+        let (device, inode) = (String::new(), String::new());
+
+        assert!(capture.covers_watcher_request(&options, &device, &inode));
+        let mut different = options.clone();
+        different.max_file_bytes /= 2;
+        assert!(!capture.covers_watcher_request(&different, &device, &inode));
+        let other_root = tempfile::tempdir().unwrap();
+        different = options.clone();
+        different.workspace_root = other_root.path().to_owned();
+        assert!(!capture.covers_watcher_request(&different, &device, &inode));
+        #[cfg(unix)]
+        {
+            assert!(!capture.covers_watcher_request(&options, "different", &inode));
+            assert!(!capture.covers_watcher_request(&options, &device, "different"));
+        }
+    }
+
     #[test]
     fn input_inventory_drift_is_typed_without_source_inventory_change() {
         let workspace = tempfile::tempdir().unwrap();

@@ -2,7 +2,7 @@
 use crate::{
     capture::Capture,
     model::{CancelFlag, Diagnostic, IndexProgress, IndexStats, SourceFile},
-    native_ids::{IdentityRegistry, canonical, digest, extraction_context},
+    native_ids::{IdentityRegistry, OccurrenceInputRef, canonical, digest, extraction_context},
 };
 use anyhow::{Context, Result, ensure};
 use icu_normalizer::ComposingNormalizerBorrowed;
@@ -31,7 +31,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v8.1";
+pub(crate) const NATIVE_VERSION: &str = "native-v10";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -475,6 +475,57 @@ pub struct ControlRegion {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Reference {
+    pub id: String,
+    pub owner_syntax_id: String,
+    pub ordinal: usize,
+    pub document: DocumentKey,
+    pub revision_id: String,
+    pub range: Range,
+    pub spelling: String,
+    pub lookup_key: String,
+    pub provenance_id: String,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum MeasurementKind {
+    DeclarationName,
+    Callee,
+    Invocation,
+    Reference,
+}
+impl MeasurementKind {
+    pub const ALL: [Self; 4] = [
+        Self::DeclarationName,
+        Self::Callee,
+        Self::Invocation,
+        Self::Reference,
+    ];
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MeasurementGap {
+    pub range: Range,
+    pub diagnostic: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MeasurementSupport {
+    pub kind: MeasurementKind,
+    pub available: bool,
+    #[serde(deserialize_with = "required_nullable")]
+    pub diagnostic: Option<String>,
+    pub gaps: Vec<MeasurementGap>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityReport {
+    pub document: DocumentKey,
+    pub revision_id: String,
+    pub families: Vec<MeasurementSupport>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Artifact {
     pub producer: Producer,
     pub source_set: SourceSet,
@@ -484,36 +535,44 @@ pub struct Artifact {
     pub declarations: Vec<Declaration>,
     pub calls: Vec<Call>,
     pub control_regions: Vec<ControlRegion>,
+    pub references: Vec<Reference>,
+    pub capability_reports: Vec<CapabilityReport>,
+}
+
+fn stable_witness_rows<'a, T: Serialize + 'a>(
+    items: impl IntoIterator<Item = &'a T>,
+) -> Result<Vec<Value>> {
+    let mut facts: Vec<Value> = items
+        .into_iter()
+        .map(|item| {
+            let mut value = serde_json::to_value(item)?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("revisionId");
+                object.remove("provenanceId");
+            }
+            Ok(value)
+        })
+        .collect::<Result<_>>()?;
+    // Canonicalization walks and sorts nested JSON. Compute each sort key
+    // once; recalculating it for every comparison dominates reuse checks.
+    facts.sort_by_cached_key(canonical);
+    Ok(facts)
 }
 
 /// Canonical evidence checksum for a document version. Revision-scoped proof IDs are
 /// deliberately projected at the requested pin rather than stored in this witness.
 /// The caller must independently bind source bytes, producer and manifest identity.
-pub(crate) fn document_witness(
+#[allow(clippy::too_many_arguments)] // Bind each measured family explicitly to the document witness.
+pub(crate) fn document_witness<'a>(
     document: &Document,
     producer: &Producer,
     coverage: &Coverage,
-    declarations: &[Declaration],
-    calls: &[Call],
-    regions: &[ControlRegion],
+    declarations: impl IntoIterator<Item = &'a Declaration>,
+    calls: impl IntoIterator<Item = &'a Call>,
+    regions: impl IntoIterator<Item = &'a ControlRegion>,
+    references: impl IntoIterator<Item = &'a Reference>,
+    capability_report: &CapabilityReport,
 ) -> Result<String> {
-    fn stable<T: Serialize>(items: &[T]) -> Result<Vec<Value>> {
-        let mut facts: Vec<Value> = items
-            .iter()
-            .map(|item| {
-                let mut value = serde_json::to_value(item)?;
-                if let Some(object) = value.as_object_mut() {
-                    object.remove("revisionId");
-                    object.remove("provenanceId");
-                }
-                Ok(value)
-            })
-            .collect::<Result<_>>()?;
-        // Canonicalization walks and sorts nested JSON. Compute each sort key
-        // once; recalculating it for every comparison dominates reuse checks.
-        facts.sort_by_cached_key(canonical);
-        Ok(facts)
-    }
     let mut coverage = serde_json::to_value(coverage)?;
     coverage
         .as_object_mut()
@@ -526,8 +585,9 @@ pub(crate) fn document_witness(
             "byteLength": document.byte_length, "producerId": producer.id,
             "producerVersion": producer.version,
             "extractionContext": extraction_context(&document.key.language, &[])?,
-            "coverage": coverage, "declarations": stable(declarations)?,
-            "calls": stable(calls)?, "regions": stable(regions)?,
+            "coverage": coverage, "declarations": stable_witness_rows(declarations)?,
+            "calls": stable_witness_rows(calls)?, "regions": stable_witness_rows(regions)?,
+            "references": stable_witness_rows(references)?, "capabilityReports": stable_witness_rows(std::slice::from_ref(capability_report))?,
         })),
     ))
 }
@@ -674,6 +734,8 @@ pub(crate) fn measure_fixture(
         declarations: vec![],
         calls: vec![],
         control_regions: vec![],
+        references: vec![],
+        capability_reports: vec![],
     };
     let mut ids = IdentityRegistry::default();
     let mut witnesses = FixtureHeaderWitnesses::new();
@@ -775,6 +837,48 @@ pub(crate) fn captured_revision_header(
     Ok((artifact.source_set, artifact.revision))
 }
 
+/// The canonical captured root-input components used in the native revision ID.
+/// Store retains these original values for imports after mutable files change.
+pub(crate) fn captured_components(
+    capture: &Capture,
+    executable_hash: &str,
+) -> Result<(Value, Vec<Value>, Vec<Value>)> {
+    let root = capture.physical_root();
+    let root_inputs: Vec<_> = crate::capture::ROOT_INPUTS[..22]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    let dependencies: Vec<Value> = root_inputs
+        .iter()
+        .map(|p| entry(root, p, capture.bytes(p)))
+        .collect::<Result<_>>()?;
+    let mut config = dependencies.clone();
+    let selectors: Vec<_> = crate::capture::ROOT_INPUTS[22..]
+        .iter()
+        .map(|n| root.join(n))
+        .collect();
+    for p in &selectors {
+        config.push(entry(root, p, capture.bytes(p))?);
+    }
+    config.push(
+        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
+    );
+    for (p, b) in capture.admitted_inputs() {
+        if p.file_name()
+            .is_some_and(|n| n == ".gitignore" || n == ".ignore")
+            && p.starts_with(root)
+        {
+            config.push(entry(root, p, b)?);
+        }
+    }
+    let selectors: Vec<Value> = selectors
+        .iter()
+        .map(|p| entry(root, p, capture.bytes(p)))
+        .collect::<Result<_>>()?;
+    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":selectors[0],"rootRustToolchainToml":selectors[1]});
+    Ok((toolchain, config, dependencies))
+}
+
 /// The full captured revision header is shared by full and selected measurement.
 /// Selecting one file must never change the source-set, producer or revision ID.
 fn build_native_header<'a>(
@@ -808,38 +912,7 @@ fn build_native_header<'a>(
         languages: producer.languages.clone(),
         dependencies: vec![],
     };
-    let root_inputs: Vec<_> = crate::capture::ROOT_INPUTS[..22]
-        .iter()
-        .map(|name| root.join(name))
-        .collect();
-    let dependencies: Vec<Value> = root_inputs
-        .iter()
-        .map(|p| entry(root, p, capture.bytes(p)))
-        .collect::<Result<_>>()?;
-    let mut config = dependencies.clone();
-    let selectors: Vec<_> = crate::capture::ROOT_INPUTS[22..]
-        .iter()
-        .map(|n| root.join(n))
-        .collect();
-    for p in &selectors {
-        config.push(entry(root, p, capture.bytes(p))?);
-    }
-    config.push(
-        json!({"nativeAdmission":{"maxFileBytes":capture.reconcile_options().max_file_bytes}}),
-    );
-    for (p, b) in capture.admitted_inputs() {
-        if p.file_name()
-            .is_some_and(|n| n == ".gitignore" || n == ".ignore")
-            && p.starts_with(root)
-        {
-            config.push(entry(root, p, b)?);
-        }
-    }
-    let selectors: Vec<Value> = selectors
-        .iter()
-        .map(|p| entry(root, p, capture.bytes(p)))
-        .collect::<Result<_>>()?;
-    let toolchain = json!({"nativeExecutable":executable_hash,"rootRustToolchain":selectors[0],"rootRustToolchainToml":selectors[1]});
+    let (toolchain, config, dependencies) = captured_components(capture, &executable_hash)?;
     let mut files: Vec<_> = capture.files.iter().collect();
     files.sort_by(|a, b| {
         language_order(&a.language)
@@ -881,6 +954,8 @@ fn build_native_header<'a>(
         declarations: vec![],
         calls: vec![],
         control_regions: vec![],
+        references: vec![],
+        capability_reports: vec![],
     };
     Ok((artifact, files))
 }
@@ -1043,12 +1118,110 @@ fn build_native_with(
             artifact.declarations.extend(shell.declarations);
             artifact.calls.extend(shell.calls);
             artifact.control_regions.extend(shell.control_regions);
+            artifact.references.extend(shell.references);
+            artifact.capability_reports.extend(shell.capability_reports);
             on_extract(&document.key);
         }
     }
     drop(pairs);
     artifact.revision.documents = documents;
     Ok(artifact)
+}
+
+// The private spool omits only reference fields shared by its validated document.
+// Public Artifact/Reference JSON remains unchanged.
+#[derive(Serialize)]
+struct SpoolFactsRef<'a> {
+    artifact: &'a Artifact,
+    references: SpoolReferencesRef<'a>,
+}
+
+struct SpoolReferencesRef<'a>(&'a [Reference]);
+impl Serialize for SpoolReferencesRef<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for reference in self.0 {
+            let lookup_override = (reference.lookup_key != reference.spelling)
+                .then_some(reference.lookup_key.as_str());
+            sequence.serialize_element(&(
+                reference.id.as_str(),
+                reference.owner_syntax_id.as_str(),
+                reference.ordinal,
+                reference.range.start,
+                reference.range.end,
+                reference.spelling.as_str(),
+                lookup_override,
+            ))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpoolFacts {
+    artifact: Artifact,
+    references: Vec<SpoolReference>,
+}
+
+#[derive(Deserialize)]
+struct SpoolReference(String, String, usize, usize, usize, String, Option<String>);
+
+fn spool_proof<'a>(artifact: &'a Artifact, document: &Document) -> Result<&'a str> {
+    ensure!(
+        artifact.provenance.len() == 1,
+        "native spool proof cardinality"
+    );
+    let proof = &artifact.provenance[0];
+    let expected = format!(
+        "native-proof:v1:{}",
+        digest(
+            b"trellis.native-proof.v1\0",
+            &canonical(
+                &json!({"producerId":PRODUCER,"document":document.key,"revisionId":artifact.revision.id})
+            )
+        )
+    );
+    ensure!(
+        proof.id == expected
+            && proof.producer_id == PRODUCER
+            && proof.document == document.key
+            && proof.revision_id == artifact.revision.id
+            && proof.content_hash == document.content_hash
+            && proof.evidence_kind == "measuredSyntax"
+            && proof.basis.is_none()
+            && proof.derived_from.is_none()
+            && proof.freshness == "fresh",
+        "native spool proof/document mismatch"
+    );
+    Ok(&proof.id)
+}
+
+fn encode_spool_facts(mut artifact: Artifact, document: &Document) -> Result<Vec<u8>> {
+    ensure!(
+        artifact.revision.documents.as_slice() == std::slice::from_ref(document),
+        "native spool facts/document mismatch"
+    );
+    let proof = spool_proof(&artifact, document)?;
+    ensure!(
+        artifact.references.iter().all(|reference| {
+            reference.document == document.key
+                && reference.revision_id == artifact.revision.id
+                && reference.provenance_id == proof
+        }),
+        "native spool reference context mismatch"
+    );
+    let references = std::mem::take(&mut artifact.references);
+    artifact.revision.documents.clear();
+    serde_json::to_vec(&SpoolFactsRef {
+        artifact: &artifact,
+        references: SpoolReferencesRef(&references),
+    })
+    .context("encode native spool facts")
 }
 
 /// Disposable, disk-backed full extraction. Only the captured header and aggregate
@@ -1099,9 +1272,13 @@ impl FullDocumentSpool {
             rusqlite::params![i64::try_from(index)?],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut artifact: Artifact = serde_json::from_slice(&facts)?;
+        let SpoolFacts {
+            mut artifact,
+            references,
+        } = serde_json::from_slice(&facts)?;
         ensure!(
-            artifact.revision.documents.is_empty()
+            artifact.references.is_empty()
+                && artifact.revision.documents.is_empty()
                 && artifact.producer == self.header.producer
                 && artifact.source_set == self.header.source_set
                 && artifact.revision.id == self.header.revision.id
@@ -1109,6 +1286,33 @@ impl FullDocumentSpool {
                 && artifact.coverage[0].document_path == document.key.path,
             "native spool document/header mismatch"
         );
+        let proof_id = spool_proof(&artifact, document)?.to_owned();
+        artifact.references = references
+            .into_iter()
+            .map(
+                |SpoolReference(
+                    id,
+                    owner_syntax_id,
+                    ordinal,
+                    start,
+                    end,
+                    spelling,
+                    lookup_override,
+                )| {
+                    Reference {
+                        id,
+                        owner_syntax_id,
+                        ordinal,
+                        document: document.key.clone(),
+                        revision_id: artifact.revision.id.clone(),
+                        range: Range { start, end },
+                        lookup_key: lookup_override.unwrap_or_else(|| spelling.clone()),
+                        spelling,
+                        provenance_id: proof_id.clone(),
+                    }
+                },
+            )
+            .collect();
         artifact.revision.documents.push(document.clone());
         let graph: crate::model::Graph = serde_json::from_slice(&graph)?;
         ensure!(
@@ -1221,22 +1425,18 @@ fn prepare_spooled_document(
     document: &Document,
     file: &SourceFile,
     cancel: &CancelFlag,
-    labels: &crate::indexer::PreparedDisplayLabels<'_>,
     before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
     after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
 ) -> Result<PreparedSpoolDocument> {
-    // The spool keeps facts without their document row; read() restores it.
-    let encoded_facts = serde_json::to_vec(&facts)?;
     before_validate(document, &mut facts)?;
     validate_spooled_document(&mut facts, document, file)?;
-    let graph = crate::indexer::project_native_spooled_document(
+    let graph = crate::indexer::project_native_document(
         options,
         capture,
         &facts,
         &document.key.path,
         cancel,
         &|_| {},
-        labels,
     )?;
     crate::indexer::validate_native_graph_records(&graph, &facts, cancel)?;
     let extraction = if matches!(file.language.as_str(), "java" | "python") {
@@ -1265,7 +1465,7 @@ fn prepare_spooled_document(
         None
     };
     Ok(PreparedSpoolDocument {
-        facts: encoded_facts,
+        facts: encode_spool_facts(facts, document)?,
         graph: serde_json::to_vec(&graph)?,
         extraction,
         stats: graph.stats.clone(),
@@ -1364,13 +1564,14 @@ fn spool_full_capture_with(
         declarations: Vec::new(),
         calls: Vec::new(),
         control_regions: Vec::new(),
+        references: Vec::new(),
+        capability_reports: Vec::new(),
     };
     let documents = &spool.header.revision.documents;
     let pairs: Vec<(&SourceFile, &Document)> = files.into_iter().zip(documents).collect();
     // Only one graph projection is allowed for this capture. Per-document
     // projection does not claim again. Keep source/producer checks before work.
     capture.claim_graph_projection()?;
-    let prepared_labels = crate::indexer::prepare_display_labels(options, capture);
     let mut ids = IdentityRegistry::default();
     spool.conn.execute_batch("BEGIN IMMEDIATE")?;
     for (chunk_index, chunk) in pairs.chunks(plan.chunk.max(1)).enumerate() {
@@ -1397,7 +1598,6 @@ fn spool_full_capture_with(
                             document,
                             file,
                             cancel,
-                            &prepared_labels,
                             before_validate,
                             after_class,
                         )
@@ -1459,6 +1659,8 @@ pub struct SelectedDocument {
     pub declarations: Vec<Declaration>,
     pub calls: Vec<Call>,
     pub control_regions: Vec<ControlRegion>,
+    pub references: Vec<Reference>,
+    pub capability_report: CapabilityReport,
 }
 
 /// Extract only the selected admitted source; all header fields retain the full
@@ -1508,6 +1710,12 @@ pub(crate) fn measure_captured_document(
     extract(&mut artifact, file, &mut ids)?;
     ensure!(
         artifact.coverage.len() == 1
+            && artifact.capability_reports.len() == 1
+            && artifact.capability_reports[0].document == document.key
+            && artifact
+                .references
+                .iter()
+                .all(|row| row.document == document.key)
             && artifact.provenance.len() == 1
             && artifact.coverage[0].document_path == path
             && artifact.provenance[0].document == document.key
@@ -1537,37 +1745,60 @@ pub(crate) fn measure_captured_document(
         declarations: artifact.declarations,
         calls: artifact.calls,
         control_regions: artifact.control_regions,
+        references: artifact.references,
+        capability_report: artifact.capability_reports.remove(0),
     })
 }
 
-/// Authenticate a newly measured document on its own. Unchanged rows in the
-/// captured revision are already validated immutable rows of this generation;
-/// callers carry only their manifest identities, not their occurrence records.
-pub(crate) fn validated_changed_artifact(
+/// Measure the current changed documents once against one full revision header.
+/// Unchanged documents retain their validated stored facts; an empty selection
+/// represents a deletion-only publication.
+pub(crate) fn measure_captured_documents(
     capture: &Capture,
-    selected: SelectedDocument,
+    root: &Path,
+    root_id: &str,
+    paths: &BTreeSet<String>,
     cancel: &CancelFlag,
+    mut on_extract: impl FnMut(&DocumentKey),
 ) -> Result<Artifact> {
-    let file = capture
-        .files
+    capture.verify(cancel)?;
+    let (mut artifact, files) = build_native_header(capture, root, root_id)?;
+    let full_documents = std::mem::take(&mut artifact.revision.documents);
+    artifact.revision.documents = full_documents
         .iter()
-        .find(|file| file.path == selected.document.key.path)
-        .context("changed native source missing from capture")?;
-    let full_documents = selected.revision.documents.clone();
-    let mut artifact = Artifact {
-        producer: selected.producer,
-        source_set: selected.source_set,
-        revision: Revision {
-            documents: vec![selected.document],
-            ..selected.revision
-        },
-        coverage: vec![selected.coverage],
-        provenance: vec![selected.provenance],
-        declarations: selected.declarations,
-        calls: selected.calls,
-        control_regions: selected.control_regions,
-    };
-    artifact.validate_structure(std::slice::from_ref(file))?;
+        .filter(|document| paths.contains(&document.key.path))
+        .cloned()
+        .collect();
+    ensure!(
+        artifact.revision.documents.len() == paths.len(),
+        "selected native source must be unique and admitted"
+    );
+    let selected: Vec<_> = files
+        .into_iter()
+        .filter(|file| paths.contains(&file.path))
+        .collect();
+    let mut ids = IdentityRegistry::default();
+    let documents = std::mem::take(&mut artifact.revision.documents);
+    for (file, document) in selected.iter().zip(&documents) {
+        ensure!(
+            file.path == document.key.path,
+            "selected native source path mismatch"
+        );
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "indexing cancelled"
+        );
+        ensure!(
+            capture.hashes.get(&file.path) == Some(&file.hash)
+                && file.hash == hash(file.text.as_bytes()),
+            "selected native source bytes/hash mismatch"
+        );
+        extract_known(&mut artifact, file, document, &mut ids)?;
+        on_extract(&document.key);
+    }
+    artifact.revision.documents = documents;
+    let selected_files: Vec<_> = selected.into_iter().cloned().collect();
+    artifact.validate_structure(&selected_files)?;
     capture.verify(cancel)?;
     artifact.revision.documents = full_documents;
     Ok(artifact)
@@ -1629,6 +1860,11 @@ pub(crate) fn assemble_selected_revision(
             entry.document.revision_id == *old_revision
                 && entry.coverage.revision_id == *old_revision
                 && entry.provenance.revision_id == *old_revision
+                && entry.capability_report.document == document.key
+                && entry.capability_report.revision_id == *old_revision
+                && entry.references.iter().all(|r| r.document == document.key
+                    && r.revision_id == *old_revision
+                    && r.provenance_id == *old_proof)
                 && entry.provenance.document == document.key
                 && entry.provenance.content_hash == document.content_hash
                 && entry.declarations.iter().all(|d| d.document == document.key
@@ -1656,6 +1892,11 @@ pub(crate) fn assemble_selected_revision(
             )
         );
         entry.coverage.revision_id.clone_from(new_revision);
+        entry.capability_report.revision_id.clone_from(new_revision);
+        for r in &mut entry.references {
+            r.revision_id.clone_from(new_revision);
+            r.provenance_id.clone_from(&proof);
+        }
         entry.provenance.revision_id.clone_from(new_revision);
         entry.provenance.id = proof.clone();
         for d in &mut entry.declarations {
@@ -1675,6 +1916,8 @@ pub(crate) fn assemble_selected_revision(
         artifact.declarations.extend(entry.declarations);
         artifact.calls.extend(entry.calls);
         artifact.control_regions.extend(entry.control_regions);
+        artifact.references.extend(entry.references);
+        artifact.capability_reports.push(entry.capability_report);
     }
     artifact.validate_structure(&capture.files)?;
     capture.verify(cancel)?;
@@ -1913,29 +2156,45 @@ fn child_nodes(n: Node<'_>) -> Vec<Node<'_>> {
     n.named_children(&mut cursor).collect()
 }
 fn name(n: Node<'_>, f: &SourceFile) -> Option<(String, Range)> {
-    let node = n
-        .child_by_field_name("name")
-        .or_else(|| {
-            (n.kind() == "assignment")
-                .then(|| n.child_by_field_name("left"))
-                .flatten()
-        })
-        .or_else(|| {
-            (n.kind() == "field_definition")
-                .then(|| n.child_by_field_name("property"))
-                .flatten()
-        })
-        .or_else(|| {
-            (n.kind() == "parameter" && n.named_child_count() > 0)
-                .then(|| n.named_child(0))
-                .flatten()
-        })
-        .or_else(|| {
-            matches!(n.kind(), "formal_parameter" | "typed_parameter")
-                .then(|| n.named_child(0))
-                .flatten()
-        })
-        .or_else(|| (n.kind() == "identifier").then_some(n))?;
+    if f.language == "rust"
+        && n.kind() == "use_as_clause"
+        && n.child_by_field_name("alias")
+            .and_then(|alias| f.text.get(alias.byte_range()))
+            == Some("_")
+    {
+        return None;
+    }
+    let node = if matches!(n.kind(), "import_specifier" | "use_as_clause") {
+        n.child_by_field_name("alias")
+    } else {
+        n.child_by_field_name("name")
+    }
+    .or_else(|| {
+        (n.kind() == "assignment")
+            .then(|| n.child_by_field_name("left"))
+            .flatten()
+    })
+    .or_else(|| {
+        (n.kind() == "field_definition")
+            .then(|| n.child_by_field_name("property"))
+            .flatten()
+    })
+    .or_else(|| {
+        (n.kind() == "parameter" && n.named_child_count() > 0)
+            .then(|| n.named_child(0))
+            .flatten()
+    })
+    .or_else(|| {
+        matches!(n.kind(), "formal_parameter" | "typed_parameter")
+            .then(|| n.named_child(0))
+            .flatten()
+    })
+    .or_else(|| {
+        (n.kind() == "spread_parameter")
+            .then(|| java_parameter_parts(n).1)
+            .flatten()
+    })
+    .or_else(|| (n.kind() == "identifier").then_some(n))?;
     if !matches!(
         node.kind(),
         "identifier" | "property_identifier" | "field_identifier" | "type_identifier"
@@ -1948,6 +2207,31 @@ fn name(n: Node<'_>, f: &SourceFile) -> Option<(String, Range)> {
     }
     Some((value.to_owned(), Range::node(node)))
 }
+fn java_parameter_parts(n: Node<'_>) -> (Option<Node<'_>>, Option<Node<'_>>) {
+    let type_node = n.child_by_field_name("type").or_else(|| {
+        (n.kind() == "spread_parameter")
+            .then(|| {
+                child_nodes(n).into_iter().find(|child| {
+                    !matches!(
+                        child.kind(),
+                        "modifiers" | "annotation" | "marker_annotation" | "variable_declarator"
+                    )
+                })
+            })
+            .flatten()
+    });
+    let name_node = n.child_by_field_name("name").or_else(|| {
+        (n.kind() == "spread_parameter")
+            .then(|| {
+                child_nodes(n)
+                    .into_iter()
+                    .find(|child| child.kind() == "variable_declarator")
+                    .and_then(|declarator| declarator.child_by_field_name("name"))
+            })
+            .flatten()
+    });
+    (type_node, name_node)
+}
 fn java_signature(n: Node<'_>, f: &SourceFile) -> Signature {
     let parameters = n
         .child_by_field_name("parameters")
@@ -1959,8 +2243,8 @@ fn java_signature(n: Node<'_>, f: &SourceFile) -> Signature {
         if !parameter.kind().contains("parameter") {
             continue;
         }
-        if let Some(t) = parameter
-            .child_by_field_name("type")
+        if let Some(t) = java_parameter_parts(parameter)
+            .0
             .and_then(|part| f.text.get(part.byte_range()))
         {
             types.push(t.to_owned());
@@ -2089,18 +2373,24 @@ fn header_with_witnesses(
         })
         .enumerate()
         .map(|(_i, p)| {
-            let pname = p
-                .child_by_field_name("name")
-                .or_else(|| {
-                    child_nodes(p)
-                        .into_iter()
-                        .find(|c| c.kind() == "identifier")
-                })
-                .or_else(|| (p.kind() == "identifier").then_some(p))
-                .and_then(|node| measured!(format!("header.parameters[{_i}].name"), node));
-            let type_name = p
-                .child_by_field_name("type")
-                .and_then(|node| measured!(format!("header.parameters[{_i}].type"), node));
+            let pname = (if f.language == "java" {
+                java_parameter_parts(p).1
+            } else {
+                p.child_by_field_name("name")
+            })
+            .or_else(|| {
+                child_nodes(p)
+                    .into_iter()
+                    .find(|c| c.kind() == "identifier")
+            })
+            .or_else(|| (p.kind() == "identifier").then_some(p))
+            .and_then(|node| measured!(format!("header.parameters[{_i}].name"), node));
+            let type_name = (if f.language == "java" {
+                java_parameter_parts(p).0
+            } else {
+                p.child_by_field_name("type")
+            })
+            .and_then(|node| measured!(format!("header.parameters[{_i}].type"), node));
             Parameter {
                 name: pname,
                 type_name,
@@ -2153,11 +2443,22 @@ fn callee(n: Node<'_>, f: &SourceFile) -> (Option<String>, Option<Range>) {
     let Some(expr) = expr else {
         return (None, None);
     };
+    let token_expr = if f.language == "rust" && expr.kind() == "generic_function" {
+        expr.child_by_field_name("function").unwrap_or(expr)
+    } else {
+        expr
+    };
     let member = match f.language.as_str() {
         "java" => Some(expr),
         "python" if expr.kind() == "attribute" => expr.child_by_field_name("attribute"),
         "javascript" if expr.kind() == "member_expression" => expr.child_by_field_name("property"),
-        "rust" if expr.kind() == "field_expression" => expr.child_by_field_name("field"),
+        "rust" if token_expr.kind() == "field_expression" => {
+            token_expr.child_by_field_name("field")
+        }
+        "rust" if token_expr.kind() == "scoped_identifier" => {
+            token_expr.child_by_field_name("name")
+        }
+        "rust" => Some(token_expr),
         _ => Some(expr),
     };
     if let Some(member) = member
@@ -2300,6 +2601,7 @@ fn extract_known_with_witnesses(
     let mut state = ParserState {
         call_start: a.calls.len(),
         control_start: a.control_regions.len(),
+        reference_start: a.references.len(),
         artifact: a,
         file: f,
         ids,
@@ -2314,6 +2616,9 @@ fn extract_known_with_witnesses(
         saw_call: false,
         visits: 0,
         opaque_rust: false,
+        gaps: Vec::new(),
+        name_owners: BTreeMap::new(),
+        lexical_owners: BTreeMap::from([(canonical(&json!([])), module_id.clone())]),
         header_witness,
     };
     state.walk(
@@ -2325,6 +2630,19 @@ fn extract_known_with_witnesses(
         (file_test, false),
     )?;
     state.finish_occurrences()?;
+    state.artifact.capability_reports.push(CapabilityReport {
+        document: state.document.clone(),
+        revision_id: state.artifact.revision.id.clone(),
+        families: MeasurementKind::ALL
+            .into_iter()
+            .map(|kind| MeasurementSupport {
+                kind,
+                available: true,
+                diagnostic: None,
+                gaps: state.gaps.clone(),
+            })
+            .collect(),
+    });
     let observed_roles = [
         (state.saw_definition, "definition"),
         (state.saw_call, "call"),
@@ -2359,20 +2677,29 @@ fn extract_known_with_witnesses(
 }
 /// Decision 0003 `occ:v2` input: document version, extraction context and native producer
 /// descriptor, never the containing revision.
-fn occurrence_input(
-    content_hash: &str,
-    extraction_context: &str,
-    producer: &Producer,
-    owner: &str,
-    kind: &str,
+fn occurrence_input<'a>(
+    content_hash: &'a str,
+    extraction_context: &'a str,
+    producer: &'a Producer,
+    owner: &'a str,
+    kind: &'a str,
     ordinal: usize,
-) -> Value {
-    json!({"contentHash":content_hash,"extractionContext":extraction_context,"nativeProducerId":producer.id,"nativeProducerVersion":producer.version,"ownerSyntaxId":owner,"kind":kind,"ordinal":ordinal})
+) -> OccurrenceInputRef<'a> {
+    OccurrenceInputRef {
+        content_hash,
+        extraction_context,
+        native_producer_id: &producer.id,
+        native_producer_version: &producer.version,
+        owner_syntax_id: owner,
+        kind,
+        ordinal: ordinal as u64,
+    }
 }
 struct ParserState<'a> {
     artifact: &'a mut Artifact,
     call_start: usize,
     control_start: usize,
+    reference_start: usize,
     file: &'a SourceFile,
     ids: &'a mut IdentityRegistry,
     document: DocumentKey,
@@ -2386,19 +2713,12 @@ struct ParserState<'a> {
     saw_call: bool,
     visits: usize,
     opaque_rust: bool,
+    gaps: Vec<MeasurementGap>,
+    name_owners: BTreeMap<(usize, usize), String>,
+    lexical_owners: BTreeMap<Vec<u8>, String>,
     header_witness: &'a mut dyn FnMut(&str, String, Range),
 }
 impl ParserState<'_> {
-    fn occurrence_input(&self, owner: &str, kind: &str, ordinal: usize) -> Value {
-        occurrence_input(
-            &self.file.hash,
-            &self.extraction_context,
-            &self.artifact.producer,
-            owner,
-            kind,
-            ordinal,
-        )
-    }
     fn finish_occurrences(&mut self) -> Result<()> {
         let mut replacements = BTreeMap::new();
         let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -2421,12 +2741,15 @@ impl ParserState<'_> {
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
-                let input = self.occurrence_input(
+                let input = occurrence_input(
+                    &self.file.hash,
+                    &self.extraction_context,
+                    &self.artifact.producer,
                     &self.artifact.control_regions[*i].owner_syntax_id,
                     "control",
                     ordinal,
                 );
-                let id = self.ids.occurrence(&input)?;
+                let id = self.ids.occurrence_ref(&input)?;
                 let region = &mut self.artifact.control_regions[*i];
                 replacements.insert(std::mem::replace(&mut region.id, id.clone()), id);
                 region.ordinal = ordinal;
@@ -2457,12 +2780,15 @@ impl ParserState<'_> {
                 (r.start, r.end)
             });
             for (ordinal, i) in indexes.iter().enumerate() {
-                let input = self.occurrence_input(
+                let input = occurrence_input(
+                    &self.file.hash,
+                    &self.extraction_context,
+                    &self.artifact.producer,
                     &self.artifact.calls[*i].owner_syntax_id,
                     "call",
                     ordinal,
                 );
-                let id = self.ids.occurrence(&input)?;
+                let id = self.ids.occurrence_ref(&input)?;
                 let call = &mut self.artifact.calls[*i];
                 call.ordinal = ordinal;
                 call.id = id;
@@ -2472,6 +2798,36 @@ impl ParserState<'_> {
                         .context("native call region not measured")?
                         .clone();
                 }
+            }
+        }
+        let mut by_owner: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (offset, reference) in self.artifact.references[self.reference_start..]
+            .iter()
+            .enumerate()
+        {
+            by_owner
+                .entry(reference.owner_syntax_id.clone())
+                .or_default()
+                .push(self.reference_start + offset);
+        }
+        for indexes in by_owner.values_mut() {
+            indexes.sort_by_key(|i| {
+                let r = &self.artifact.references[*i].range;
+                (r.start, r.end)
+            });
+            for (ordinal, i) in indexes.iter().enumerate() {
+                let input = occurrence_input(
+                    &self.file.hash,
+                    &self.extraction_context,
+                    &self.artifact.producer,
+                    &self.artifact.references[*i].owner_syntax_id,
+                    "reference",
+                    ordinal,
+                );
+                let id = self.ids.occurrence_ref(&input)?;
+                let reference = &mut self.artifact.references[*i];
+                reference.ordinal = ordinal;
+                reference.id = id;
             }
         }
         Ok(())
@@ -2505,6 +2861,17 @@ impl ParserState<'_> {
             )
         {
             self.opaque_rust = true;
+            self.gaps.push(MeasurementGap {
+                range: Range::node(n),
+                diagnostic: format!(
+                    "opaque Rust {} skipped; contents require macro/attribute interpretation",
+                    n.kind()
+                ),
+            });
+            return Ok(());
+        }
+        if self.file.language == "rust" && matches!(n.kind(), "lifetime" | "label" | "metavariable")
+        {
             return Ok(());
         }
         let test_context = test_flags.0 || test_flags.1 || local_test_marker(n, self.file);
@@ -2527,6 +2894,18 @@ impl ParserState<'_> {
             }
             let id=self.ids.stable(&json!({"sourceSet":self.artifact.source_set.id,"path":self.file.path,"language":self.file.language,"ancestors":ancestry,"declaration":key}))?;
             let named = name(n, self.file);
+            if let Some((_, range)) = &named {
+                let parent = self
+                    .lexical_owners
+                    .get(&canonical(&json!(ancestry)))
+                    .context("native reference declaration parent missing")?;
+                self.name_owners
+                    .insert((range.start, range.end), parent.clone());
+            }
+            let mut lexical_ancestry = ancestry.clone();
+            lexical_ancestry.push(key.clone());
+            self.lexical_owners
+                .insert(canonical(&json!(lexical_ancestry)), id.clone());
             #[cfg(feature = "test-support")]
             if key.signature.is_some() {
                 for (i, parameter) in n
@@ -2535,7 +2914,7 @@ impl ParserState<'_> {
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|p| p.kind().contains("parameter"))
-                    .filter_map(|p| p.child_by_field_name("type"))
+                    .filter_map(|p| java_parameter_parts(p).0)
                     .enumerate()
                 {
                     (self.header_witness)(
@@ -2638,6 +3017,52 @@ impl ParserState<'_> {
                 provenance_id: self.proof_id.clone(),
             });
         }
+        let reference_kind = match self.file.language.as_str() {
+            "java" => matches!(n.kind(), "identifier" | "type_identifier"),
+            "rust" => matches!(
+                n.kind(),
+                "identifier" | "type_identifier" | "field_identifier"
+            ),
+            "python" => n.kind() == "identifier",
+            "javascript" => matches!(
+                n.kind(),
+                "identifier"
+                    | "property_identifier"
+                    | "shorthand_property_identifier"
+                    | "shorthand_property_identifier_pattern"
+            ),
+            _ => false,
+        };
+        if reference_kind
+            && n.named_child_count() == 0
+            && let Some(spelling) = self.file.text.get(n.byte_range())
+            && let Ok(lookup_key) = lookup(&self.file.language, spelling)
+        {
+            let range = Range::node(n);
+            let reference_owner = self
+                .name_owners
+                .get(&(range.start, range.end))
+                .unwrap_or(&owner)
+                .clone();
+            if self.seen.insert((
+                reference_owner.clone(),
+                "reference".into(),
+                range.start,
+                range.end,
+            )) {
+                self.artifact.references.push(Reference {
+                    id: String::new(),
+                    owner_syntax_id: reference_owner,
+                    ordinal: 0,
+                    document: self.document.clone(),
+                    revision_id: self.artifact.revision.id.clone(),
+                    range,
+                    spelling: spelling.to_owned(),
+                    lookup_key,
+                    provenance_id: self.proof_id.clone(),
+                });
+            }
+        }
         let mut marked = false;
         for child in child_nodes(n) {
             if self.file.language == "rust" && child.kind() == "attribute_item" {
@@ -2680,9 +3105,8 @@ impl ParserState<'_> {
 }
 
 impl Artifact {
-    /// Validates a selectively assembled revision. The caller already checked each
-    /// reused stored witness against captured source and normalized immutable rows;
-    /// this checks all resulting IDs/ownership and the full current capture header.
+    /// Validates an assembled revision against the full current capture header
+    /// and checks all resulting IDs, ownership and structure without re-extraction.
     pub(crate) fn validate_selective(
         &self,
         capture: &Capture,
@@ -2710,9 +3134,9 @@ impl Artifact {
         capture.verify(cancel)?;
         self.validate_structure(&capture.files)
     }
-    /// Reconstruct the native syntax from already-admitted immutable buffers; no source file
-    /// is opened or hashed again. Comparison forbids well-shaped fabricated evidence.
-    /// Honors the caller's cancellation before and after the re-derivation.
+    /// Validate the captured header and native structure once, without re-extracting
+    /// facts. Determinism is covered by `native_build_is_deterministic` instead.
+    /// Honors the caller's cancellation before and after validation.
     pub fn validate(
         &self,
         capture: &Capture,
@@ -2720,18 +3144,7 @@ impl Artifact {
         root_id: &str,
         cancel: &CancelFlag,
     ) -> Result<()> {
-        capture.verify(cancel)?;
-        self.validate_structure(&capture.files)?;
-        #[cfg(test)]
-        FULL_VALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let expected = build_native(capture, root, root_id, cancel)?;
-        capture.verify(cancel)?;
-        expected.validate_structure(&capture.files)?;
-        ensure!(
-            self == &expected,
-            "native evidence differs from captured source or inputs"
-        );
-        Ok(())
+        self.validate_selective(capture, root, root_id, cancel)
     }
     fn validate_structure(&self, files: &[SourceFile]) -> Result<()> {
         ensure!(
@@ -2762,7 +3175,8 @@ impl Artifact {
         ensure!(
             self.revision.documents.len() == files.len()
                 && self.coverage.len() == files.len()
-                && self.provenance.len() == files.len(),
+                && self.provenance.len() == files.len()
+                && self.capability_reports.len() == files.len(),
             "native document tuple cardinality"
         );
         let mut docs = BTreeMap::new();
@@ -2830,13 +3244,13 @@ impl Artifact {
                 text(d)?;
             }
         }
-        let mut proofs = BTreeSet::new();
+        let mut proofs = BTreeMap::new();
         for proof in &self.provenance {
             let f = docs
                 .get(&proof.document)
                 .context("native proof dangling document")?;
             ensure!(
-                proofs.insert(proof.id.clone())
+                proofs.insert(proof.id.as_str(), &proof.document).is_none()
                     && proof.producer_id == PRODUCER
                     && proof.revision_id == self.revision.id
                     && proof.content_hash == f.hash
@@ -2886,7 +3300,7 @@ impl Artifact {
                     .context("native declaration dangling document")?;
                 ensure!(
                     d.revision_id == self.revision.id
-                        && proofs.contains(&d.provenance_id)
+                        && proofs.get(d.provenance_id.as_str()) == Some(&&d.document)
                         && matches!(
                             d.kind.as_str(),
                             "module"
@@ -2990,6 +3404,26 @@ impl Artifact {
                 }
             }
         }
+        let mut reference_ordinals: BTreeMap<(&DocumentKey, &str), Vec<&Reference>> =
+            BTreeMap::new();
+        for r in &self.references {
+            reference_ordinals
+                .entry((&r.document, r.owner_syntax_id.as_str()))
+                .or_default()
+                .push(r);
+        }
+        for group in reference_ordinals.values_mut() {
+            group.sort_by_key(|r| (r.range.start, r.range.end));
+            for (ordinal, r) in group.iter().enumerate() {
+                ensure!(r.ordinal == ordinal, "native reference ordinal mismatch");
+                if ordinal != 0 {
+                    ensure!(
+                        group[ordinal - 1].range != r.range,
+                        "duplicate reference range"
+                    );
+                }
+            }
+        }
         let mut control_ordinals: BTreeMap<(DocumentKey, String), Vec<&ControlRegion>> =
             BTreeMap::new();
         for r in &self.control_regions {
@@ -3010,15 +3444,29 @@ impl Artifact {
                 }
             }
         }
+        // Keep authentication results local to this producer/revision validation.
+        // Failures are surfaced at the existing occurrence-mint boundary.
+        let contexts: BTreeMap<_, _> = docs
+            .keys()
+            .map(|document| {
+                (
+                    document,
+                    native_extraction_context(&self.producer, &document.language, &self.revision),
+                )
+            })
+            .collect();
         let occurrence_of = |document: &DocumentKey, owner: &str, kind: &str, ordinal: usize| {
             let file = docs
                 .get(document)
                 .context("native occurrence dangling document")?;
-            let context =
-                native_extraction_context(&self.producer, &document.language, &self.revision)?;
-            crate::native_ids::mint_occurrence(&occurrence_input(
+            let context = contexts
+                .get(document)
+                .context("native occurrence dangling context")?
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            crate::native_ids::mint_occurrence_ref(&occurrence_input(
                 &file.hash,
-                &context,
+                context,
                 &self.producer,
                 owner,
                 kind,
@@ -3046,7 +3494,7 @@ impl Artifact {
                 ensure!(
                     owner.document == c.document
                         && c.revision_id == self.revision.id
-                        && proofs.contains(&c.provenance_id)
+                        && proofs.get(c.provenance_id.as_str()) == Some(&&c.document)
                         && calls.insert(c.id.clone()),
                     "native call ownership/duplicate"
                 );
@@ -3073,6 +3521,112 @@ impl Artifact {
                 );
             }
         }
+        let mut references: BTreeSet<&str> = BTreeSet::new();
+        for r in &self.references {
+            let file = docs
+                .get(&r.document)
+                .context("native reference dangling document")?;
+            let owner = declarations
+                .get(&r.owner_syntax_id)
+                .context("native reference dangling owner")?;
+            ensure!(
+                owner.document == r.document
+                    && r.revision_id == self.revision.id
+                    && proofs.get(r.provenance_id.as_str()) == Some(&&r.document)
+                    && references.insert(r.id.as_str()),
+                "native reference ownership/duplicate"
+            );
+            span(&file.text, &r.range, false)?;
+            ensure!(
+                file.text.get(r.range.start..r.range.end) == Some(r.spelling.as_str())
+                    && r.lookup_key == lookup(&r.document.language, &r.spelling)?,
+                "native reference not source-measured"
+            );
+            ensure!(
+                r.id == occurrence.admit(occurrence_of(
+                    &r.document,
+                    &r.owner_syntax_id,
+                    "reference",
+                    r.ordinal
+                )?)?,
+                "native reference occurrence mismatch"
+            );
+        }
+        let mut candidates: BTreeMap<(DocumentKey, MeasurementKind), Vec<&Range>> = BTreeMap::new();
+        for d in &self.declarations {
+            if let Some(range) = &d.name_range {
+                candidates
+                    .entry((d.document.clone(), MeasurementKind::DeclarationName))
+                    .or_default()
+                    .push(range);
+            }
+        }
+        for c in &self.calls {
+            candidates
+                .entry((c.document.clone(), MeasurementKind::Invocation))
+                .or_default()
+                .push(&c.range);
+            if let Some(range) = &c.callee_range {
+                candidates
+                    .entry((c.document.clone(), MeasurementKind::Callee))
+                    .or_default()
+                    .push(range);
+            }
+        }
+        for r in &self.references {
+            candidates
+                .entry((r.document.clone(), MeasurementKind::Reference))
+                .or_default()
+                .push(&r.range);
+        }
+        for ranges in candidates.values_mut() {
+            ranges.sort_by_key(|range| (range.start, range.end));
+        }
+        let mut reports = BTreeSet::new();
+        for report in &self.capability_reports {
+            let file = docs
+                .get(&report.document)
+                .context("native capability dangling document")?;
+            ensure!(
+                reports.insert(report.document.clone()) && report.revision_id == self.revision.id,
+                "native capability document/revision mismatch"
+            );
+            let mut families = BTreeSet::new();
+            for family in &report.families {
+                ensure!(
+                    families.insert(family.kind) && family.available && family.diagnostic.is_none(),
+                    "invalid native capability convention"
+                );
+                let mut last = None;
+                for gap in &family.gaps {
+                    span(&file.text, &gap.range, false)?;
+                    text(&gap.diagnostic)?;
+                    let range_key = (gap.range.start, gap.range.end);
+                    ensure!(
+                        last.is_none_or(|previous| previous < range_key),
+                        "duplicate or unsorted native capability gaps"
+                    );
+                    last = Some(range_key);
+                    let ranges = candidates
+                        .get(&(report.document.clone(), family.kind))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let first = ranges.partition_point(|range| range.start < gap.range.start);
+                    let contradiction = ranges[first..]
+                        .iter()
+                        .take_while(|range| range.start < gap.range.end)
+                        .any(|range| range.end <= gap.range.end);
+                    ensure!(
+                        !contradiction,
+                        "native capability gap contradicts measured candidate"
+                    );
+                }
+            }
+            ensure!(
+                families == MeasurementKind::ALL.into_iter().collect(),
+                "native capability family cardinality"
+            );
+        }
         let mut regions = BTreeMap::new();
         for chunk in self.control_regions.chunks(MINT_CHUNK) {
             let mut minted =
@@ -3088,7 +3642,7 @@ impl Artifact {
                 ensure!(
                     owner.document == region.document
                         && region.revision_id == self.revision.id
-                        && proofs.contains(&region.provenance_id),
+                        && proofs.get(region.provenance_id.as_str()) == Some(&&region.document),
                     "native control ownership"
                 );
                 span(&file.text, &region.range, false)?;
@@ -3133,6 +3687,245 @@ impl Artifact {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod borrowed_witness_tests {
+    use super::*;
+
+    #[derive(Clone, Deserialize)]
+    struct Fixture {
+        document: Document,
+        producer: Producer,
+        coverage: Coverage,
+        declarations: Vec<Declaration>,
+        calls: Vec<Call>,
+        regions: Vec<ControlRegion>,
+        references: Vec<Reference>,
+        capability: CapabilityReport,
+    }
+
+    fn fixture() -> Fixture {
+        let text = "quoted\"\\\n\t\r\0é中";
+        let document = json!({"sourceSetId": "source-set", "language": "javascript", "path": text});
+        let range = json!({"start": 1, "end": 9});
+        let key = json!({"kind": "function", "name": text, "signature": {
+            "parameterTypes": [text], "typeParameterCount": 1, "variadic": true
+        }, "ordinal": 0});
+        let declaration = json!({
+            "role": "production", "syntaxId": "sid", "document": document,
+            "revisionId": "revision", "kind": "function", "name": text,
+            "lookupKey": "lookup", "ancestors": [key], "key": key, "range": range,
+            "nameRange": range, "header": {"kind": "function", "name": text,
+                "modifiers": ["static"], "typeParameters": [text], "parameters": [
+                    {"name": null, "type": text, "variadic": true},
+                    {"name": text, "type": null, "variadic": false}
+                ], "resultType": null, "bases": [text]}, "provenanceId": "proof"
+        });
+        let mut anonymous = declaration.clone();
+        anonymous["syntaxId"] = json!("anonymous");
+        anonymous["name"] = Value::Null;
+        anonymous["lookupKey"] = Value::Null;
+        anonymous["nameRange"] = Value::Null;
+        anonymous["key"]["name"] = Value::Null;
+        anonymous["key"]["signature"] = Value::Null;
+        anonymous["header"]["name"] = Value::Null;
+        anonymous["header"]["resultType"] = json!(text);
+        let call = json!({"id": "call", "ownerSyntaxId": "sid", "ordinal": 0,
+            "document": document, "revisionId": "revision", "range": range,
+            "calleeRange": range, "spelling": text, "regionIds": ["outer", "inner"],
+            "provenanceId": "proof"});
+        let mut dynamic = call.clone();
+        dynamic["id"] = json!("dynamic");
+        dynamic["calleeRange"] = Value::Null;
+        dynamic["spelling"] = Value::Null;
+        let region = json!({"id": "outer", "ownerSyntaxId": "sid", "ordinal": 0,
+            "document": document, "revisionId": "revision", "kind": "if", "range": range,
+            "parentId": null, "arm": null, "provenanceId": "proof"});
+        let mut inner = region.clone();
+        inner["id"] = json!("inner");
+        inner["parentId"] = json!("outer");
+        inner["arm"] = json!(text);
+        let reference = json!({"id": "reference", "ownerSyntaxId": "sid", "ordinal": 0,
+            "document": document, "revisionId": "revision", "range": range,
+            "spelling": text, "lookupKey": text, "provenanceId": "proof"});
+        let mut normalized = reference.clone();
+        normalized["id"] = json!("normalized");
+        normalized["lookupKey"] = json!("different");
+        serde_json::from_value(json!({
+            "document": {"key": document, "revisionId": "revision", "contentHash": "a".repeat(64), "byteLength": 20},
+            "producer": {"id": PRODUCER, "version": NATIVE_VERSION, "executableHash": "e".repeat(64),
+                "kind": "native", "languages": ["javascript"], "positionEncoding": "utf8"},
+            "coverage": {"producerId": PRODUCER, "language": "javascript", "sourceSetId": "source-set",
+                "documentPath": text, "revisionId": "revision", "requested": true, "selected": true,
+                "state": "partial", "supportedRoles": ["production", "test"],
+                "observedRoles": ["production"], "diagnostic": text},
+            "declarations": [declaration, declaration, anonymous], "calls": [call, call, dynamic],
+            "regions": [region, region, inner], "references": [reference, reference, normalized],
+            "capability": {"document": document, "revisionId": "revision", "families": [
+                {"kind": "declarationName", "available": true, "diagnostic": null, "gaps": []},
+                {"kind": "callee", "available": true, "diagnostic": text,
+                    "gaps": [{"range": range, "diagnostic": text}]},
+                {"kind": "invocation", "available": false, "diagnostic": text, "gaps": []},
+                {"kind": "reference", "available": true, "diagnostic": null, "gaps": []}
+            ]}
+        })).unwrap()
+    }
+
+    // Original owned-slice normalizer, independent of the borrowed implementation.
+    fn legacy_rows<T: Serialize>(items: &[T]) -> Result<Vec<Value>> {
+        let mut facts: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                let mut value = serde_json::to_value(item)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("revisionId");
+                    object.remove("provenanceId");
+                }
+                Ok(value)
+            })
+            .collect::<Result<_>>()?;
+        facts.sort_by_cached_key(canonical);
+        Ok(facts)
+    }
+
+    fn family_parity<T: Serialize>(rows: &[T]) -> Vec<Value> {
+        let legacy = legacy_rows(rows).unwrap();
+        let owned = stable_witness_rows(rows).unwrap();
+        let grouped: Vec<_> = rows.iter().collect();
+        let borrowed = stable_witness_rows(grouped.iter().copied()).unwrap();
+        assert_eq!(legacy, owned);
+        assert_eq!(legacy, borrowed);
+        assert_eq!(canonical(&json!(legacy)), canonical(&json!(owned)));
+        assert_eq!(canonical(&json!(legacy)), canonical(&json!(borrowed)));
+        legacy
+    }
+
+    // The original witness envelope and checksum path; candidate rows have separately
+    // passed the actual production normalizer's Value and canonical-byte parity checks.
+    fn legacy_bytes(f: &Fixture) -> Vec<u8> {
+        let declarations = family_parity(&f.declarations);
+        let calls = family_parity(&f.calls);
+        let regions = family_parity(&f.regions);
+        let references = family_parity(&f.references);
+        let capability = family_parity(std::slice::from_ref(&f.capability));
+        let mut coverage = serde_json::to_value(&f.coverage).unwrap();
+        coverage.as_object_mut().unwrap().remove("revisionId");
+        canonical(&json!({
+            "documentKey": f.document.key, "contentHash": f.document.content_hash,
+            "byteLength": f.document.byte_length, "producerId": f.producer.id,
+            "producerVersion": f.producer.version,
+            "extractionContext": extraction_context(&f.document.key.language, &[]).unwrap(),
+            "coverage": coverage, "declarations": declarations,
+            "calls": calls, "regions": regions,
+            "references": references, "capabilityReports": capability,
+        }))
+    }
+
+    fn witness(f: &Fixture) -> Result<String> {
+        document_witness(
+            &f.document,
+            &f.producer,
+            &f.coverage,
+            &f.declarations,
+            &f.calls,
+            &f.regions,
+            &f.references,
+            &f.capability,
+        )
+    }
+
+    #[test]
+    fn borrowed_witness_matches_original_bytes_and_checksum() {
+        let f = fixture();
+        let bytes = legacy_bytes(&f);
+        let expected = digest(b"trellis.native-version-witness.v1\0", &bytes);
+        assert_eq!(
+            expected,
+            "a1c38429dafd4187a92fb25f5c300f438e0908cb4b9810bed72c098ffe4a9122"
+        );
+        assert_eq!(witness(&f).unwrap(), expected);
+        let declarations: Vec<_> = f.declarations.iter().collect();
+        let calls: Vec<_> = f.calls.iter().collect();
+        let regions: Vec<_> = f.regions.iter().collect();
+        let references: Vec<_> = f.references.iter().collect();
+        assert_eq!(
+            document_witness(
+                &f.document,
+                &f.producer,
+                &f.coverage,
+                declarations.iter().copied(),
+                calls.iter().copied(),
+                regions.iter().copied(),
+                references.iter().copied(),
+                &f.capability,
+            )
+            .unwrap(),
+            expected
+        );
+        let mut reordered = f.clone();
+        reordered.declarations.reverse();
+        reordered.calls.reverse();
+        reordered.regions.reverse();
+        reordered.references.reverse();
+        assert_eq!(legacy_bytes(&reordered), bytes);
+        assert_eq!(witness(&reordered).unwrap(), expected);
+        let mut empty = f;
+        empty.declarations.clear();
+        empty.calls.clear();
+        empty.regions.clear();
+        empty.references.clear();
+        assert_eq!(
+            witness(&empty).unwrap(),
+            digest(
+                b"trellis.native-version-witness.v1\0",
+                &legacy_bytes(&empty)
+            )
+        );
+    }
+
+    #[test]
+    fn borrowed_witness_omits_proof_labels_but_keeps_measured_fields() {
+        let f = fixture();
+        let expected = witness(&f).unwrap();
+        let mut relabeled = f.clone();
+        relabeled.document.revision_id = "another revision".into();
+        relabeled.coverage.revision_id = "another revision".into();
+        relabeled.capability.revision_id = "another revision".into();
+        macro_rules! relabel {
+            ($rows:expr) => {
+                for row in &mut $rows {
+                    row.revision_id = "another revision".into();
+                    row.provenance_id = "another proof".into();
+                }
+            };
+        }
+        relabel!(relabeled.declarations);
+        relabel!(relabeled.calls);
+        relabel!(relabeled.regions);
+        relabel!(relabeled.references);
+        assert_eq!(legacy_bytes(&f), legacy_bytes(&relabeled));
+        assert_eq!(witness(&relabeled).unwrap(), expected);
+        let mutations: [fn(&mut Fixture); 6] = [
+            |f| f.declarations[0].role = DeclarationRole::Test,
+            |f| f.calls[0].spelling = Some("changed".into()),
+            |f| f.regions[0].arm = Some("changed".into()),
+            |f| f.references[0].lookup_key = "changed".into(),
+            |f| f.coverage.diagnostic = None,
+            |f| f.capability.families[0].available = false,
+        ];
+        for mutate in mutations {
+            let mut changed = f.clone();
+            mutate(&mut changed);
+            assert_ne!(witness(&changed).unwrap(), expected);
+        }
+        let mut invalid = f;
+        invalid.document.key.language = "invalid".into();
+        assert_eq!(
+            witness(&invalid).unwrap_err().to_string(),
+            "invalid extraction-context language"
+        );
     }
 }
 
@@ -3184,6 +3977,8 @@ mod occurrence_identity_tests {
             declarations: vec![],
             calls: vec![],
             control_regions: vec![],
+            references: vec![],
+            capability_reports: vec![],
         };
         let document = artifact.revision.documents[0].clone();
         extract_known(
@@ -3389,13 +4184,29 @@ console.log(JSON.stringify(productionInventoryEntries()));
                 &artifact.declarations,
                 &artifact.calls,
                 &artifact.control_regions,
+                &artifact.references,
+                &artifact.capability_reports[0],
             )
             .unwrap()
         };
-        assert_eq!(
+        let mut altered = a.clone();
+        altered.references.pop();
+        assert_ne!(
             witness(&a),
-            "990ae82c7d80950f788d604ed1bf7fd9a25ee8de7f732dbdb0f67eeb7fbdebe4",
-            "native-v8.1 witness includes declaration role and the producer version"
+            witness(&altered),
+            "reference inventory enters native witness"
+        );
+        let mut altered = a.clone();
+        altered.capability_reports[0].families[0]
+            .gaps
+            .push(MeasurementGap {
+                range: Range { start: 0, end: 1 },
+                diagnostic: "measured gap".into(),
+            });
+        assert_ne!(
+            witness(&a),
+            witness(&altered),
+            "capabilities enter native witness"
         );
         assert_eq!(
             witness(&a),
@@ -3875,6 +4686,120 @@ mod parallel_extraction_tests {
         )
     }
 
+    #[test]
+    fn changed_batch_extracts_exact_selection_and_keeps_full_header() {
+        let f = fixture(&[
+            (
+                "a.java",
+                "class A { int value; int read(){ return value; } }\n".into(),
+            ),
+            ("b.py", "def broken(:\n".into()),
+            ("c.js", "function c(){ return value; }\n".into()),
+            (
+                "d.rs",
+                "fn read(value: i32) -> i32 { opaque!(value); value }\n".into(),
+            ),
+        ]);
+        let full = from_capture(&f.capture, &f.root, &f.root_id, &f.cancel).unwrap();
+        assert!(!full.references.is_empty());
+        assert!(
+            full.capability_reports
+                .iter()
+                .any(|report| report.document.path == "d.rs"
+                    && report.families.iter().any(|family| !family.gaps.is_empty()))
+        );
+        let all: BTreeSet<_> = full
+            .revision
+            .documents
+            .iter()
+            .map(|document| document.key.path.clone())
+            .collect();
+        for paths in [
+            BTreeSet::new(),
+            BTreeSet::from(["b.py".to_owned()]),
+            BTreeSet::from(["c.js".to_owned(), "d.rs".to_owned()]),
+            all,
+        ] {
+            let mut extracted = Vec::new();
+            let artifact = measure_captured_documents(
+                &f.capture,
+                &f.root,
+                &f.root_id,
+                &paths,
+                &f.cancel,
+                |key| extracted.push(key.path.clone()),
+            )
+            .unwrap();
+            let expected_order: Vec<_> = full
+                .revision
+                .documents
+                .iter()
+                .filter(|document| paths.contains(&document.key.path))
+                .map(|document| document.key.path.clone())
+                .collect();
+            assert_eq!(extracted, expected_order);
+            assert_eq!(artifact.revision, full.revision);
+            assert_eq!(artifact.coverage.len(), paths.len());
+            assert_eq!(artifact.capability_reports.len(), paths.len());
+            assert!(
+                artifact
+                    .declarations
+                    .iter()
+                    .all(|row| paths.contains(&row.document.path))
+            );
+            assert_eq!(
+                artifact.references,
+                full.references
+                    .iter()
+                    .filter(|row| paths.contains(&row.document.path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                artifact.capability_reports,
+                full.capability_reports
+                    .iter()
+                    .filter(|row| paths.contains(&row.document.path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            if paths.contains("b.py") {
+                assert_eq!(
+                    artifact
+                        .coverage
+                        .iter()
+                        .find(|c| c.document_path == "b.py")
+                        .unwrap()
+                        .state,
+                    "partial"
+                );
+            }
+            let mut selected = artifact.clone();
+            selected
+                .revision
+                .documents
+                .retain(|document| paths.contains(&document.key.path));
+            let files: Vec<_> = f
+                .capture
+                .files
+                .iter()
+                .filter(|file| paths.contains(&file.path))
+                .cloned()
+                .collect();
+            selected.validate_structure(&files).unwrap();
+            if !paths.is_empty() {
+                let mut missing_report = selected.clone();
+                missing_report.capability_reports.pop();
+                assert!(missing_report.validate_structure(&files).is_err());
+            }
+            if !selected.references.is_empty() {
+                selected.references[0].spelling.push('x');
+                assert!(selected.validate_structure(&files).is_err());
+            }
+        }
+        assert_eq!(f.capture.graph_projection_count(), 0);
+    }
+
     const SEQUENTIAL: ExtractionPlan = ExtractionPlan {
         workers: 1,
         chunk: usize::MAX,
@@ -3898,6 +4823,37 @@ mod parallel_extraction_tests {
 
     fn file_name(file: &SourceFile) -> &str {
         file.path.rsplit('/').next().unwrap()
+    }
+
+    #[test]
+    fn plain_artifact_validation_does_not_extract_again() {
+        let f = fixture(&[("main.js", "// No identifier occurrences.\n".into())]);
+        let artifact = from_capture(&f.capture, &f.root, &f.root_id, &f.cancel).unwrap();
+        assert_eq!(artifact.declarations.len(), 1);
+        assert_eq!(artifact.declarations[0].kind, "module");
+        assert!(
+            artifact.references.is_empty()
+                && artifact.calls.is_empty()
+                && artifact.control_regions.is_empty()
+        );
+        // Extraction always authenticates its context. With no occurrences,
+        // structural validation has no reason to request an extraction context.
+        let _fault = inject_extraction_auth_fault(
+            &artifact.revision.id,
+            "javascript",
+            ExtractionAuthFault::Undeclared,
+        );
+        assert!(build_native(&f.capture, &f.root, &f.root_id, &f.cancel).is_err());
+        artifact
+            .validate(&f.capture, &f.root, &f.root_id, &f.cancel)
+            .unwrap();
+        let mut invalid = artifact.clone();
+        invalid.declarations[0].range.end = f.capture.files[0].text.len() + 1;
+        assert!(
+            invalid
+                .validate(&f.capture, &f.root, &f.root_id, &f.cancel)
+                .is_err()
+        );
     }
 
     /// Several files in each of the four languages, with calls, control
@@ -4095,15 +5051,30 @@ mod full_document_spool_tests {
         .unwrap();
         fs::write(
             workspace.path().join("c.js"),
-            "function café() { return café(); }\n",
+            "const café = 1; function use() { return caf\\u00e9 + café; }\n",
         )
         .unwrap();
+        fs::write(
+            workspace.path().join("d.rs"),
+            "fn f(r#type: i32) -> i32 { r#type }\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("empty.js"), "").unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
         let options = IndexOptions::new(workspace.path().to_owned());
         let root = fs::canonicalize(workspace.path()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let baseline_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         let baseline = from_capture(&baseline_capture, &root, store.root_id(), &cancel).unwrap();
+        assert!(!baseline.references.is_empty());
+        assert!(baseline.references.iter().any(|reference| {
+            reference.spelling == "caf\\u00e9" && reference.lookup_key == "café"
+        }));
+        assert!(
+            baseline.references.iter().any(|reference| {
+                reference.spelling == "r#type" && reference.lookup_key == "type"
+            })
+        );
         let plain = crate::indexer::project_native(
             &options,
             &baseline_capture,
@@ -4160,6 +5131,50 @@ mod full_document_spool_tests {
             let path = &spool.header().revision.documents[index].key.path;
             let (native, graph) = spool.read(index).unwrap();
             assert_eq!(spool.read(index).unwrap(), (native.clone(), graph.clone()));
+            let expected_references: Vec<_> = baseline
+                .references
+                .iter()
+                .filter(|reference| &reference.document.path == path)
+                .cloned()
+                .collect();
+            assert_eq!(native.references, expected_references);
+            let selected = measure_captured_document(
+                &baseline_capture,
+                &root,
+                store.root_id(),
+                path,
+                &cancel,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(native.references, selected.references);
+            let encoded: Vec<u8> = spool
+                .conn
+                .query_row(
+                    "SELECT facts FROM documents WHERE ordinal=?1",
+                    [i64::try_from(index).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let encoded: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(encoded["artifact"]["references"], json!([]));
+            let tuples = encoded["references"].as_array().unwrap();
+            assert_eq!(tuples.len(), expected_references.len());
+            for (tuple, reference) in tuples.iter().zip(&expected_references) {
+                assert_eq!(tuple.as_array().unwrap().len(), 7);
+                assert_eq!(tuple[5], json!(reference.spelling));
+                assert_eq!(
+                    tuple[6],
+                    if reference.lookup_key == reference.spelling {
+                        Value::Null
+                    } else {
+                        json!(reference.lookup_key)
+                    }
+                );
+            }
+            if path == "empty.js" {
+                assert!(native.references.is_empty());
+            }
             assert_eq!(
                 native.revision,
                 Revision {
@@ -4256,6 +5271,66 @@ mod full_document_spool_tests {
             .iter()
             .position(|document| document.key.path == "c.js")
             .unwrap();
+        let encoded: Vec<u8> = spool
+            .conn
+            .query_row(
+                "SELECT facts FROM documents WHERE ordinal=?1",
+                [i64::try_from(js).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&encoded).unwrap();
+        let replace_facts = |bytes: &[u8]| {
+            spool
+                .conn
+                .execute(
+                    "UPDATE documents SET facts=?1 WHERE ordinal=?2",
+                    rusqlite::params![bytes, i64::try_from(js).unwrap()],
+                )
+                .unwrap();
+        };
+        let (native, _) = spool.read(js).unwrap();
+        for (path, value) in [
+            ("/unexpected", json!(true)),
+            ("/references", json!([["truncated"]])),
+            ("/references/0/2", json!(-1)),
+            ("/references/0/6", json!(false)),
+            ("/artifact/references", json!([native.references[0]])),
+            (
+                "/artifact/revision/documents",
+                json!([native.revision.documents[0]]),
+            ),
+            ("/artifact/producer/id", json!("wrong")),
+            ("/artifact/coverage/0/documentPath", json!("wrong.js")),
+            ("/artifact/provenance", json!([])),
+            ("/artifact/provenance/0/id", json!("native-proof:v1:wrong")),
+            ("/artifact/provenance/0/document/path", json!("wrong.js")),
+            ("/artifact/provenance/0/revisionId", json!("wrong")),
+            ("/artifact/provenance/0/contentHash", json!("0".repeat(64))),
+        ] {
+            let mut corrupt = payload.clone();
+            if path == "/unexpected" {
+                corrupt["unexpected"] = value;
+            } else {
+                *corrupt.pointer_mut(path).unwrap() = value;
+            }
+            replace_facts(&serde_json::to_vec(&corrupt).unwrap());
+            assert!(spool.read(js).is_err(), "accepted corrupt spool {path}");
+        }
+        let mut extra_tuple_field = payload.clone();
+        extra_tuple_field["references"][0]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::Null);
+        replace_facts(&serde_json::to_vec(&extra_tuple_field).unwrap());
+        assert!(
+            spool.read(js).is_err(),
+            "accepted oversized reference tuple"
+        );
+        replace_facts(&encoded[..encoded.len() - 1]);
+        assert!(spool.read(js).is_err(), "accepted truncated spool");
+        replace_facts(&encoded);
+        assert_eq!(spool.read(js).unwrap().0.references, native.references);
         spool.corrupt_graph_json_for_tests(js);
         assert!(spool.read(js).is_err(), "malformed scratch graph is typed");
         assert_eq!(spool._file.as_file().metadata().unwrap().nlink(), 0);
@@ -4274,7 +5349,7 @@ mod full_document_spool_tests {
     }
 
     #[test]
-    fn prepared_multifile_scip_labels_match_full_projection_and_first_duplicate_wins() {
+    fn native_multifile_spool_ignores_unselected_scip_documents() {
         use protobuf::Message;
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -4290,21 +5365,15 @@ mod full_document_spool_tests {
             manifest.insert(*path, hash(source.as_bytes()));
             let mut doc = scip::types::Document::new();
             doc.relative_path = (*path).into();
+            doc.position_encoding =
+                scip::types::PositionEncoding::UTF16CodeUnitOffsetFromLineStart.into();
             let mut occurrence = scip::types::Occurrence::new();
             occurrence.range = range.clone();
-            occurrence.symbol_roles = if *path == "c.js" { 0 } else { 1 };
+            occurrence.symbol_roles = 1;
             occurrence.symbol = format!("scip display {name}()");
             doc.occurrences.push(occurrence);
             index.documents.push(doc);
         }
-        let mut duplicate = scip::types::Document::new();
-        duplicate.relative_path = "c.js".into();
-        let mut occurrence = scip::types::Occurrence::new();
-        occurrence.range = vec![0, 9, 10];
-        occurrence.symbol_roles = 1;
-        occurrence.symbol = "scip later f()".into();
-        duplicate.occurrences.push(occurrence);
-        index.documents.push(duplicate);
         fs::write(
             workspace.path().join("index.scip"),
             index.write_to_bytes().unwrap(),
@@ -4316,9 +5385,7 @@ mod full_document_spool_tests {
         )
         .unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let mut options = IndexOptions::new(workspace.path().to_owned());
-        options.scip_path = Some(workspace.path().join("index.scip"));
-        options.manifest_path = Some(workspace.path().join("manifest.json"));
+        let options = IndexOptions::new(workspace.path().to_owned());
         let root = fs::canonicalize(workspace.path()).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let baseline_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
@@ -4351,17 +5418,57 @@ mod full_document_spool_tests {
         }
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(nodes, baseline.nodes);
-        for name in ["A", "g"] {
-            assert!(
-                nodes
-                    .iter()
-                    .any(|node| node.name == name && node.display_label.is_some())
-            );
+        assert!(nodes.iter().all(|node| node.display_label.is_none()));
+        let mut duplicate = scip::types::Document::new();
+        duplicate.relative_path = "c.js".into();
+        duplicate.language = "java".into();
+        index.documents.push(duplicate);
+        fs::write(
+            workspace.path().join("index.scip"),
+            index.write_to_bytes().unwrap(),
+        )
+        .unwrap();
+        let duplicate_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let duplicate_native =
+            from_capture(&duplicate_capture, &root, store.root_id(), &cancel).unwrap();
+        let duplicate_graph = crate::indexer::project_native(
+            &options,
+            &duplicate_capture,
+            &duplicate_native,
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        let duplicate_spool_capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let duplicate_spool = spool_full_capture(
+            &options,
+            &duplicate_spool_capture,
+            &root,
+            store.root_id(),
+            &cancel,
+            &|_| {},
+            |_, _| {},
+            &store.native_spool_dir().unwrap(),
+        )
+        .unwrap();
+        let mut duplicate_nodes = Vec::new();
+        for index in 0..duplicate_spool.len() {
+            let (_, graph) = duplicate_spool.read(index).unwrap();
+            duplicate_nodes.extend(graph.nodes);
         }
+        duplicate_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(duplicate_nodes, duplicate_graph.nodes);
         assert!(
-            nodes
+            duplicate_nodes
                 .iter()
-                .any(|node| node.name == "f" && node.display_label.is_none())
+                .all(|node| node.display_label.is_none())
+        );
+        assert_eq!(
+            nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
+            duplicate_nodes
+                .iter()
+                .map(|node| &node.id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4742,6 +5849,78 @@ mod full_document_spool_tests {
     #[test]
     fn fallible_allocation_after_private_spool_write_preserves_prior_head() {
         private_spool_failure_preserves_prior_head(true);
+    }
+
+    #[test]
+    fn spool_packing_never_hides_corrupt_reference_fields() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.py"), "def f(x):\n    return x\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for field in ["document", "revision", "proof", "range", "owner", "lookup"] {
+            let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+            let error = spool_full_capture_with(
+                &options,
+                &capture,
+                &root,
+                store.root_id(),
+                &cancel,
+                &|_| {},
+                |_, _| {},
+                ExtractionPlan {
+                    workers: 1,
+                    chunk: 1,
+                },
+                &|_, _| Ok(()),
+                &|_, artifact| {
+                    assert!(!artifact.references.is_empty());
+                    let reference = &mut artifact.references[0];
+                    match field {
+                        "document" => reference.document.path = "wrong.py".into(),
+                        "revision" => reference.revision_id = "wrong".into(),
+                        "proof" => reference.provenance_id = "wrong".into(),
+                        "range" => reference.range.end = usize::MAX,
+                        "owner" => reference.owner_syntax_id = "sid:v1:missing".into(),
+                        "lookup" => reference.lookup_key = "wrong".into(),
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                },
+                &|_, _, _| Ok(()),
+                &|_, _| Ok(()),
+                &store.native_spool_dir().unwrap(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("packing hid corrupt reference {field}"));
+            assert!(!error.to_string().is_empty());
+        }
+
+        let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+        let native = from_capture(&capture, &root, store.root_id(), &cancel).unwrap();
+        for fault in [
+            ExtractionAuthFault::Undeclared,
+            ExtractionAuthFault::Mismatched,
+        ] {
+            let _guard = inject_extraction_auth_fault(&native.revision.id, "python", fault);
+            assert!(native.validate_structure(&capture.files).is_err());
+        }
+        let document = &native.revision.documents[0];
+        for field in ["document", "revision", "proof"] {
+            let mut corrupt = native.clone();
+            match field {
+                "document" => corrupt.references[0].document.path = "wrong.py".into(),
+                "revision" => corrupt.references[0].revision_id = "wrong".into(),
+                "proof" => corrupt.references[0].provenance_id = "wrong".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                encode_spool_facts(corrupt, document).is_err(),
+                "encoder elided corrupt reference {field}"
+            );
+        }
     }
 
     #[test]

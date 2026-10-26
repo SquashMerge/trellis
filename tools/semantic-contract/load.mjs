@@ -1,4 +1,4 @@
-import { readFile, readdir, realpath, lstat } from "node:fs/promises";
+import { readFile, readdir, realpath, lstat, open } from "node:fs/promises";
 import { basename, resolve, relative, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validate } from "./formats.mjs";
@@ -57,6 +57,46 @@ export async function confinedFile(root, path) {
   if ((await realpath(target)) !== target)
     reject("IDENTITY.PATH", path, "escaped fixture");
   return readFile(target);
+}
+export async function confinedFileCapped(root, path, maxBytes) {
+  validate("Path", path);
+  const physical = await realpath(root);
+  const target = resolve(physical, path);
+  if (target === physical || relative(physical, target).startsWith(".."))
+    reject("IDENTITY.PATH", path, "outside fixture");
+  let cursor = physical;
+  for (const part of path.split("/")) {
+    cursor = join(cursor, part);
+    const info = await lstat(cursor);
+    if (info.isSymbolicLink() || (cursor === target ? !info.isFile() : !info.isDirectory()))
+      reject("IDENTITY.PATH", path, "symlink or non-file");
+  }
+  if ((await realpath(target)) !== target) reject("IDENTITY.PATH", path, "escaped fixture");
+  const handle = await open(target, "r");
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) reject("IDENTITY.PATH", path, "non-file");
+    if (info.size > maxBytes) {
+      const error = new Error(`input exceeds ${maxBytes} bytes: ${path}`);
+      error.code = "LimitExceeded";
+      throw error;
+    }
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      total += bytesRead;
+      if (total > maxBytes) {
+        const error = new Error(`input exceeds ${maxBytes} bytes: ${path}`);
+        error.code = "LimitExceeded";
+        throw error;
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    return Buffer.concat(chunks, total);
+  } finally { await handle.close(); }
 }
 async function jsonFile(root, path, type) {
   const bytes = await confinedFile(root, path);
@@ -120,7 +160,7 @@ const pinSections = {
   executable: ["semanticProducers", "executableHash"],
   toolchain: ["toolchains", "toolchainHash"],
 };
-async function verifyPin(repository, capture) {
+async function verifyPin(repository, capture, producers) {
   const [path, name, extra] = capture.pinned.split("#");
   if (
     !name ||
@@ -140,6 +180,12 @@ async function verifyPin(repository, capture) {
       capture.pinned,
       `pinned digest differs: expected ${capture.hash}, profile ${entry[field]}`,
     );
+  if (capture.kind === "executable" && producers.some((producer) =>
+    producer.kind === "semantic" && producer.executableHash === capture.hash &&
+    (!Object.hasOwn(entry, "positionEncoding") ||
+      !["utf8", "utf16", "unicodeScalar"].includes(entry.positionEncoding) ||
+      entry.positionEncoding !== producer.positionEncoding)))
+    reject("IDENTITY.PRODUCER", capture.pinned, "pinned position encoding differs");
 }
 export async function loadFixture(root, { repository = repositoryRoot } = {}) {
   root = await realpath(root);
@@ -261,7 +307,7 @@ export async function loadFixture(root, { repository = repositoryRoot } = {}) {
       );
     unique(intent.measurementSupport, (x) => x.kind, "measurementSupport");
     for (const entry of intent.measurementSupport)
-      if (entry.available !== (entry.diagnostic === null))
+      if (entry.available !== (entry.diagnostic === null) || (!entry.available && entry.gaps.length))
         reject(
           "IDENTITY.COVERAGE",
           "measurementSupport",
@@ -332,7 +378,8 @@ export async function loadFixture(root, { repository = repositoryRoot } = {}) {
   for (const capture of fixture.captures) {
     captures.set(capture.ref, capture);
     if (capture.pinned !== undefined) {
-      await verifyPin(repository, capture);
+      await verifyPin(repository, capture,
+        [...fixture.producers, ...fixture.comparison.producers]);
       continue;
     }
     const bytes = await confinedFile(root, capture.file);

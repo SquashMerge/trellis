@@ -102,6 +102,7 @@ const native = {
   formatVersion: 1,
   producerId: "native",
   extractionInputs: [],
+  capabilityReports: [],
   declarations: [
     declaration("main", "main", 0, 39, 9),
     declaration("target", "target", 40, 60, 49),
@@ -512,7 +513,7 @@ async function specimen(
   const support = ["declarationName", "callee", "invocation", "reference"].map(
     (kind) => ({
       kind,
-      available: !(status === "unsupported" && kind === unsupportedFamily),
+      gaps: [], available: !(status === "unsupported" && kind === unsupportedFamily),
       diagnostic:
         status === "unsupported" && kind === unsupportedFamily
           ? "native family unavailable"
@@ -1943,4 +1944,81 @@ test("captured-but-unselected semantic producer cannot use valid proof, includin
     ]);
     await runControl(row);
   }
+});
+
+function reportGap(s, kind, start, end) {
+  const intent = s.loaded.fixture.coverageIntents.find((row) => row.producerId === "native");
+  const families = structuredClone(intent.measurementSupport);
+  const family = families.find((row) => row.kind === kind);
+  family.gaps.push({ range: span(start, end), diagnostic: "synthetic opaque identifier construct" });
+  s.loaded.native.capabilityReports = [{ document, revisionId: "r1", families }];
+  intent.measurementSupport = structuredClone(families);
+  const nativeCoverage = s.loaded.annotations.flatMap((row) => row.facts).find((fact) => fact.kind === "coverage" && fact.record.producerId === "native").record;
+  nativeCoverage.state = "partial";
+  nativeCoverage.diagnostic = "native requested family has a construct gap";
+  return families;
+}
+
+function independentlyCheckGaps(s) {
+  const records = normalizeFixture(s.loaded).records;
+  const coverage = checkCoverage(s.loaded, records);
+  const measurement = checkMeasurement(s.loaded, records);
+  return { records, joins: checkJoins(s.loaded, records, coverage, measurement) };
+}
+
+test("range gaps contain whole anchors, preserve boundary-crossing/outside and enclosing measurements", async (t) => {
+  for (const [name, start, end, expected] of [
+    ["contained", 0, 8, "unsupported"],
+    ["crossing", 1, 8, "unmatched"],
+    ["touching", 8, 9, "unmatched"],
+    ["outside", 10, 12, "unmatched"],
+  ]) await t.test(name, async (t) => {
+    const s = await specimen(t, { status: "unmatched" });
+    reportGap(s, "reference", start, end);
+    const { records, joins } = independentlyCheckGaps(s);
+    const join = joins.joined.get("fact").join;
+    assert.equal(join.status, expected);
+    assert.deepEqual(join.candidateIds, []);
+    assert.equal(join.diagnostic, expected === "unsupported" ? "synthetic opaque identifier construct" : "unmatched");
+    assert.equal(records.references.length, 0);
+    const nativeCoverage = records.coverage.find((row) => row.producerId === "native");
+    assert.equal(nativeCoverage.state, "partial");
+    assert.deepEqual(nativeCoverage.observedRoles, ["read", "call"]);
+    assert.equal(records.coverage.find((row) => row.producerId === "semantic").state, "complete");
+  });
+  for (const family of ["reference", "invocation"]) await t.test(`enclosing or outside ${family}`, async (t) => {
+    const s = await specimen(t, { family });
+    reportGap(s, family, family === "invocation" ? 20 : 0, family === "invocation" ? 22 : 8);
+    const { joins } = independentlyCheckGaps(s);
+    assert.equal(joins.joined.get("fact").join.status, "exact");
+  });
+});
+
+test("captured capability report mutations fail independently before a join can hide candidates", async (t) => {
+  for (const [name, mutate, field, assertion = "JOIN.SUPPORT"] of [
+    ["candidate in gap", (s) => {
+      const report = s.loaded.native.capabilityReports[0];
+      report.families.find((row) => row.kind === "reference").gaps[0].range = span(18, 24);
+      s.loaded.fixture.coverageIntents.find((row) => row.producerId === "native").measurementSupport = structuredClone(report.families);
+    }, "measurementSupport"],
+    ["false authored override", (s) => { s.loaded.fixture.coverageIntents.find((row) => row.producerId === "native").measurementSupport[0].available = false; }, "measurementSupport"],
+    ["wrong revision", (s) => { s.loaded.native.capabilityReports[0].revisionId = "absent"; }, "capabilityReports"],
+    ["wrong document", (s) => { s.loaded.native.capabilityReports[0].document = { ...document, path: "src/absent.js" }; }, "capabilityReports"],
+    ["duplicate tuple", (s) => { s.loaded.native.capabilityReports.push(structuredClone(s.loaded.native.capabilityReports[0])); }, "capabilityReports"],
+    ["duplicate family", (s) => { s.loaded.native.capabilityReports[0].families[0] = structuredClone(s.loaded.native.capabilityReports[0].families[1]); }, "capabilityReports"],
+    ["empty gap", (s) => {
+      const report = s.loaded.native.capabilityReports[0];
+      report.families.find((row) => row.kind === "reference").gaps[0].range = span(1, 1);
+      s.loaded.fixture.coverageIntents.find((row) => row.producerId === "native").measurementSupport = structuredClone(report.families);
+    }, "capabilityReports"],
+    ["missing diagnostic", (s) => { delete s.loaded.native.capabilityReports[0].families.find((row) => row.kind === "reference").gaps[0].diagnostic; }, "NativeArtifact.capabilityReports[0].families[3].gaps[0].diagnostic", "FORMAT.SHAPE"],
+  ]) await t.test(name, async (t) => {
+    const s = await specimen(t, { status: "unmatched" });
+    reportGap(s, "reference", 0, 8);
+    const baseline = independentlyCheckGaps(s);
+    mutate(s);
+    const rejects = (error) => error.assertion === assertion && error.field === field;
+    assert.throws(() => normalizeFixture(s.loaded), rejects);
+    assert.throws(() => checkJoins(s.loaded, baseline.records, s.coverageResult, s.measurement), rejects);
+  });
 });

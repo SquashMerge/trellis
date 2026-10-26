@@ -39,9 +39,13 @@ mod parallel;
 pub mod references;
 pub mod rules;
 mod rust_sources;
+pub mod scip_admission;
+mod scip_raw;
 pub mod search_embed;
 pub mod search_model;
 pub mod search_vectors;
+pub mod semantic_evidence;
+pub mod semantic_import;
 pub mod store;
 #[doc(hidden)]
 pub mod testing;
