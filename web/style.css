@@ -464,6 +464,11 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 @media (max-height: 560px) { #notice { display: none; } .sequence-toolbar { padding-top: 8px; } .sequence-context { padding-bottom: 3px; } #source-dock { min-height: 110px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
 
+.retained-pin-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--sm-gold); padding: 6px 0; }
+.retained-pin-status[hidden] { display: none; }
+.retained-pin-status span { overflow-wrap: anywhere; }
+.retained-pin-status button { min-height: 44px; }
+
 /* Class diagrams use the full canvas; their node menus replace the call inspector. */
 .classes-view:not(.metric-inspector-active) #call-inspector, .classes-view:not(.metric-inspector-active) #inspector-toggle { display: none; }
 @media (min-width: 901px) {

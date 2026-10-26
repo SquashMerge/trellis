@@ -28,7 +28,7 @@ function harness({saved, blocked = false, routes} = {}) {
     setItem(key, value) { if (blocked) throw new Error("Storage blocked"); writes.push([key,value]); stored.set(key,value); },
     removeItem(key) { if (blocked) throw new Error("Storage blocked"); stored.delete(key); }
   };
-  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController,
+  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController, URLSearchParams,
     setTimeout() { return 1; }, clearTimeout() {}, localStorage:storage, window:{localStorage:storage, location:{host:"127.0.0.1:43127"}, confirm:() => true},
     document:{addEventListener() {}, getElementById:get, createElement:node, createElementNS:(_,tag) => node(tag), createDocumentFragment:node, createTextNode:text => ({textContent:text}), body:node()},
     fetch:async (url, options) => {

@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback) {
+async function published(callback, signal) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -74,6 +74,7 @@ async function published(callback) {
     server = await H.startDaemon(paths, pin.indexRevision);
     browser = await chromium.launch();
     context = await browser.newContext({viewport:{width:1440, height:900}});
+    signal?.addEventListener("abort", () => { void context.close().catch(() => {}); }, {once:true});
     const page = await context.newPage(), requests = [], errors = [];
     page.on("pageerror", error => errors.push(error.message));
     page.on("request", request => {
@@ -93,15 +94,16 @@ async function published(callback) {
     await page.locator("#workspace").waitFor({state:"visible"});
     await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("Indexed snapshot · max"));
     await page.locator('.directory-pick[title="src/"]').waitFor();
-    await callback({page, paths, server, pin, requests});
+    const reloadedPin = await callback({page, paths, server, pin, requests});
+    const observedPins = reloadedPin ? [pin, reloadedPin] : [pin];
     assert.deepEqual(errors, []);
     const metricsRequests = requests.filter(row => row.url.pathname.endsWith("/metrics"));
     assert.ok(metricsRequests.length > 0);
     for (const {url, method} of metricsRequests) {
       assert.equal(method, "GET");
       assert.equal(url.pathname, H.scoped(server.rootKey, "metrics"));
-      assert.equal(url.searchParams.get("indexGeneration"), pin.indexGeneration);
-      assert.equal(url.searchParams.get("indexRevision"), String(pin.indexRevision));
+      assert.ok(observedPins.some(value => url.searchParams.get("indexGeneration") === value.indexGeneration &&
+        url.searchParams.get("indexRevision") === String(value.indexRevision)), "metrics use a complete displayed pin");
       assert.ok(["production", "all"].includes(url.searchParams.get("role")), "browser explicitly selects its metric population");
     }
   } finally {
@@ -455,3 +457,112 @@ test("390px drawers and explicit Files section retain selected evidence without 
   assert.equal(sourceCount(), before, "drawer and filename interactions never read source");
   await noOverflow(page, 390);
 }));
+
+
+async function assertExactSource(page, text) {
+  await page.waitForFunction(expected => [...document.querySelectorAll("#source .source-line")].map(line =>
+    [...line.childNodes].filter(node => !node.classList?.contains("line-number")).map(node => node.textContent).join("")).join("\n") === expected, text);
+  const actual = await page.locator("#source .source-line").evaluateAll(lines => lines.map(line =>
+    [...line.childNodes].filter(node => !node.classList?.contains("line-number")).map(node => node.textContent).join("")).join("\n"));
+  assert.equal(actual, text, "source keeps the exact indexed bytes, excluding line-number decoration");
+}
+
+test("retained Files and diagram evidence names the newer head until explicit keyboard reload", {timeout:240000}, async t => published(async ({page, paths, server, pin, requests}) => {
+  const label = value => `${value.indexGeneration.slice(0, 8)}:${value.indexRevision}`;
+  const atPin = (response, suffix, expected) => {
+    const url = new URL(response.url());
+    return url.pathname === H.scoped(server.rootKey, suffix) &&
+      url.searchParams.get("indexGeneration") === expected.indexGeneration &&
+      url.searchParams.get("indexRevision") === String(expected.indexRevision);
+  };
+  await expandSources(page);
+  await page.locator('.file-pick[title="src/flow.js"]').click();
+  await page.locator(".method-pick").filter({hasText:"measured"}).click();
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  const initialSource = page.waitForResponse(response => atPin(response, "source", pin));
+  await page.locator("#method-source").click();
+  const initial = await initialSource;
+  assert.equal(initial.status(), 200);
+  assert.deepEqual((await initial.json()).revision, pin);
+  assert.equal((await initial.json()).file.text, flowSource);
+  await assertExactSource(page, flowSource);
+  assert.equal(await page.locator("#retained-pin-status").isVisible(), false, "equal full pins do not claim older evidence");
+  await capture(page, "viewer-at-pin-desktop");
+
+  const flowQ = flowSource.replace("value + 1", "value + 20");
+  writeFileSync(join(paths.workspace, "src", "flow.js"), flowQ);
+  const head = await H.indexThroughApi(server, paths.token, pin, "src/flow.js", flowQ);
+  const sequenceRead = page.waitForResponse(response => response.url().endsWith(H.scoped(server.rootKey, "sequence")) &&
+    response.request().postDataJSON()?.showAll === true);
+  await page.locator("#all-steps").check();
+  const retainedSequence = await sequenceRead;
+  assert.equal(retainedSequence.status(), 200, "the next actual pinned read still succeeds after head advances");
+  assert.deepEqual(retainedSequence.request().postDataJSON().expectedRevision, pin);
+  assert.deepEqual((await retainedSequence.json()).revision, pin);
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  await page.waitForFunction(() => document.querySelector("#retained-pin-status")?.hidden === false);
+  const older = `Viewing revision ${label(pin)} · Older than head ${label(head)}`;
+  assert.equal(await page.locator("#retained-pin-label").textContent(), older);
+  assert.match(await page.locator("#sequence-state").textContent(), new RegExp(`revision ${label(pin)}`));
+  await capture(page, "viewer-retained-diagram-desktop");
+  await page.locator("#method-source").click();
+  await assertExactSource(page, flowSource);
+  assert.equal(await page.locator("#retained-pin-label").textContent(), older, "cache-hit source retains the same advisory comparison");
+
+  await page.locator("#section-files").click();
+  await page.waitForFunction(() => document.body.classList.contains("files-section"));
+  const sourceRead = page.waitForResponse(response => atPin(response, "source", pin) &&
+    new URL(response.url()).searchParams.get("path") === "src/nested/other.js");
+  await page.locator('.file-pick[title="src/nested/other.js"]').click();
+  const retainedSource = await sourceRead;
+  assert.equal(retainedSource.status(), 200, "uncached Files source is read from the retained pin, not head");
+  const retained = await retainedSource.json();
+  assert.deepEqual(retained.revision, pin);
+  assert.equal(retained.file.text, otherSource);
+  await assertExactSource(page, otherSource);
+  assert.equal(await page.locator("#retained-pin-label").textContent(), older, "Files and diagrams share the retained-pin status");
+  assert.ok((await page.locator("#files-basis-note").textContent()).includes(label(pin)));
+  await capture(page, "viewer-retained-pin-desktop");
+
+  await page.setViewportSize({width:390, height:844});
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, "390px Files has no page overflow");
+  const banner = page.locator("#retained-pin-status");
+  const box = await banner.boundingBox();
+  assert.ok(box && box.x >= 0 && box.x + box.width <= 391, "the retained-pin banner fits a 390px viewport");
+  assert.equal(await banner.getAttribute("role"), "status");
+  assert.equal(await banner.getAttribute("aria-live"), "polite");
+  const reload = page.locator("#reload-head");
+  await reload.focus();
+  assert.equal(await reload.evaluate(node => document.activeElement === node), true);
+  assert.equal(await reload.textContent(), "Reload at head");
+  await capture(page, "viewer-retained-pin-mobile");
+  const reloadRequestStart = requests.length;
+  const reloadGit = page.waitForResponse(response => new URL(response.url()).pathname === H.scoped(server.rootKey, "git"));
+  await reload.press("Enter");
+  assert.equal((await reloadGit).status(), 200);
+  await page.waitForFunction(() => !document.querySelector("#reload-head").disabled);
+  const actualHead = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"));
+  assert.equal(actualHead.status, 200);
+  assert.deepEqual(actualHead.data.revision, head, "explicit reload adopts the current head, independently verified from the daemon");
+  await page.waitForFunction(expected => document.querySelector("#workspace-index-label")?.textContent.includes(`revision ${expected}`), label(head));
+  assert.equal(await page.locator(".method-pick.selected").count(), 0, "reload does not carry an old symbol selection into head");
+  assert.equal(await page.locator("#source .source-line").count(), 0, "reload clears old source before a new file selection");
+  assert.equal(await banner.isVisible(), false);
+  if (await page.locator("#explorer-toggle").getAttribute("aria-expanded") !== "true") await page.locator("#explorer-toggle").click();
+  const headSource = page.waitForResponse(response => atPin(response, "source", head) &&
+    new URL(response.url()).searchParams.get("path") === "src/flow.js");
+  await page.locator('.file-pick[title="src/flow.js"]').click();
+  const selectedHead = await headSource;
+  assert.equal(selectedHead.status(), 200);
+  const current = await selectedHead.json();
+  assert.deepEqual(current.revision, head);
+  assert.equal(current.file.text, flowQ);
+  await assertExactSource(page, flowQ);
+  assert.equal(await banner.isVisible(), false, "an at-head source read has no older-than-head indication");
+  assert.ok(requests.slice(reloadRequestStart).filter(row => row.url.pathname.endsWith("/source")).every(row =>
+    row.url.searchParams.get("indexGeneration") === head.indexGeneration && row.url.searchParams.get("indexRevision") === String(head.indexRevision)));
+  assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "comparison and reload never index automatically");
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, "390px Files has no page overflow");
+  await capture(page, "viewer-reloaded-head-mobile");
+  return head;
+}, t.signal));
