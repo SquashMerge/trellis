@@ -250,8 +250,8 @@ def db_for(home):
 
 
 def published(db, output, size):
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 23,
-            "mixed performance requires schema23")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 24,
+            "mixed performance requires schema24")
     index_result = json.loads(output)
     pin = index_result["publishedRevision"]
     revision = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
@@ -595,7 +595,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# 57 native-v9/schema21 tables, immutable surrogate keys, and current pin normalization.
+# schema24 tables, immutable surrogate keys, and current pin normalization.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
 native_source_sets native_source_set_languages native_source_set_dependencies
@@ -616,7 +616,7 @@ semantic_symbol_targets semantic_declaration_bindings semantic_declaration_bindi
 semantic_declaration_join_candidates semantic_references semantic_reference_roles
 semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
-semantic_raw_captures semantic_revision_raw_selections semantic_raw_proofs semantic_import_reports
+semantic_raw_captures semantic_revision_raw_selections semantic_raw_proofs semantic_raw_documents semantic_import_reports
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
 DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_versions",
@@ -635,7 +635,7 @@ def typed_cells(value):
 
 def parity_digest(db, revision, physical_root):
     view = SelectedView(db, revision, physical_root)
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 23, "selected parity requires schema23")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 24, "selected parity requires schema24")
     generation, number = revision.removeprefix("pin:v1:").rsplit(":", 1)
     require(db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
             == (generation, int(number)), "parity pin is not frozen head")
@@ -643,7 +643,7 @@ def parity_digest(db, revision, physical_root):
     tables = {row[0] for row in db.execute("""SELECT name FROM sqlite_master WHERE type='table'
         AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%'""")}
     require(tables == REQUIRED_TABLES | CONTROL_TABLES,
-            f"schema23 selected inventory mismatch: missing={REQUIRED_TABLES|CONTROL_TABLES-tables}, "
+            f"schema24 selected inventory mismatch: missing={REQUIRED_TABLES|CONTROL_TABLES-tables}, "
             f"extra={tables-REQUIRED_TABLES-CONTROL_TABLES}")
     output = {}
     selected = "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?"
@@ -689,7 +689,7 @@ def parity_digest(db, revision, physical_root):
             where = f"tuple_id IN ({selected})"
         elif table in {"semantic_call_candidates", "semantic_call_possible_dispatch", "semantic_call_join_candidates"}:
             where = f"binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id IN ({selected}))"
-        elif table == "semantic_raw_captures":
+        elif table in {"semantic_raw_captures", "semantic_raw_documents"}:
             where = "capture_id IN (SELECT capture_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
         elif table == "semantic_raw_proofs":
             where = "capture_id IN (SELECT capture_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
@@ -700,7 +700,7 @@ def parity_digest(db, revision, physical_root):
                      "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
                      "AND r.producer_id=selected.producer_id)")
         else:
-            raise RuntimeError(f"unclassified schema23 selected table: {table}")
+            raise RuntimeError(f"unclassified schema24 selected table: {table}")
         columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
         require(columns, f"empty table schema: {table}")
         digest, count = hashlib.sha256(), 0
@@ -917,7 +917,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-23 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-24 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
