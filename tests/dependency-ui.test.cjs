@@ -28,7 +28,7 @@ function harness() {
       click() { downloads.push(this.download); }};
   }
   function get(id) { if (!elements.has(id)) elements.set(id, node()); return elements.get(id); }
-  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController,
+  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController, URLSearchParams,
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; }, clearTimeout(id) { timers.delete(id); },
     window: {confirm: () => true},
     URL: {createObjectURL(blob) { blobs.push(blob); return "blob:synthetic"; }, revokeObjectURL() {}},

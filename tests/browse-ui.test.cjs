@@ -32,7 +32,7 @@ function harness(windowOptions = {}, withMetrics = false) {
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; }, clearTimeout(id) { timers.delete(id); },
     window: {confirm: () => true, ...windowOptions},
     URL: {createObjectURL(blob) { blobs.push(blob); return "blob:synthetic"; }, revokeObjectURL() {}},
-    document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
+    document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text,children:[]}), body: node()},
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   if (withMetrics) run(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"));
@@ -1000,4 +1000,230 @@ test("a listed generation-only snapshot change clears derived UI before awaiting
   assert.equal(h.run("selectedRootKey"),ROOT);
   assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),nextPin);
   assert.equal(h.get("error").hidden,true);
+});
+
+
+// Retained-pin comparisons observe head without replacing the displayed evidence.
+const retainedPin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+const newerHead = {...retainedPin,indexRevision:2};
+const rebuiltHead = {indexGeneration:"87654321-4321-4321-8321-cba987654321",indexRevision:0};
+const settleHead = () => new Promise(resolve => setImmediate(resolve));
+function retainedHarness() {
+  const h = harness();
+  h.run("status.workspaceRoot='/synthetic'; selectedWorkspaceRoot='/synthetic'; selectedMethod={id:'retained-method'}; sourceCache.set('retained',{text:'retained bytes'}); $('source').append(document.createTextNode('retained bytes'))");
+  return h;
+}
+function assertRetained(h) {
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),retainedPin);
+  assert.equal(h.run("selectedMethod.id"),"retained-method");
+  assert.equal(h.get("source").children[0].textContent,"retained bytes");
+  assert.equal(h.run("sourceCache.get('retained').text"),"retained bytes");
+}
+const pinnedRoutes = [
+  ["GET","files"], ["GET","methods"], ["GET","source"], ["GET","symbols"],
+  ["GET","classes"], ["GET","metrics"], ["GET","architecture"],
+  ["POST","sequence"], ["POST","syntax-matches"], ["POST","class-diagram"], ["POST","navigation"],
+];
+for (const [method, route] of pinnedRoutes) test(`successful retained-pin ${method} ${route} observes head without adopting it`, async () => {
+  const h = retainedHarness(), requests = [];
+  const returned = ["metrics","architecture"].includes(route) ? {payload:retainedPin} : {revision:retainedPin};
+  h.context.fetch = async (request, options) => {
+    requests.push({request,method:options.method,body:options.body});
+    if (request === "/api/status") return response({workspaceRoot:"/synthetic",revision:newerHead,catchingUp:true});
+    if (request.split("?",1)[0] === `/api/${route}`) return response(returned);
+    throw new Error("Unexpected " + request);
+  };
+  const query = new URLSearchParams(retainedPin).toString();
+  const result = await h.run(`api('/api/${route}${method === "GET" ? "?" + query : ""}', '${method}', ${method === "POST" ? JSON.stringify({expectedRevision:retainedPin}) : "undefined"})`);
+  await settleHead();
+  assert.deepEqual(JSON.parse(JSON.stringify(result)),returned);
+  assert.equal(requests.length,2);
+  assert.equal(requests[0].method,method);
+  assert.equal(requests[1].request,"/api/status"); assert.equal(requests[1].method,"GET");
+  assertRetained(h);
+  assert.equal(h.get("retained-pin-status").hidden,false);
+  assert.match(h.get("retained-pin-label").textContent,/Viewing revision 12345678:1 · Older than head 12345678:2/);
+  assert.equal(h.get("catching-up").hidden,true,"comparison does not replace checkout freshness");
+  assert.equal(h.timers.size,0,"comparison has no polling timer");
+});
+
+test("unpaired, mismatched, failed and unrelated reads do not claim a head comparison", async () => {
+  const h = retainedHarness(), requests = [];
+  h.context.fetch = async request => { requests.push(request); return response({workspaceRoot:"/synthetic",revision:newerHead}); };
+  h.run(`observePinnedResponse('/api/files','GET',undefined,{revision:status.revision});
+    observePinnedResponse('/api/tree?'+IndexPin.query(status.revision),'GET',undefined,{revision:status.revision});
+    observePinnedResponse('/api/files?'+IndexPin.query(status.revision),'GET',undefined,{revision:${JSON.stringify(newerHead)}});
+    observePinnedResponse('/api/files?'+IndexPin.query(${JSON.stringify(newerHead)}),'GET',undefined,{revision:${JSON.stringify(newerHead)}});
+    observePinnedResponse('/api/sequence','POST',{expectedRevision:${JSON.stringify(newerHead)}},{revision:status.revision});
+    observePinnedResponse('/api/sequence','POST',{expectedRevision:status.revision},{revision:${JSON.stringify(newerHead)}});
+    observePinnedResponse('/api/metrics?'+IndexPin.query(status.revision),'GET',undefined,{revision:status.revision});`);
+  await settleHead();
+  assert.deepEqual(requests,[]);
+  h.context.fetch = async request => { requests.push(request); return {ok:false,status:409,json:async()=>({error:{code:"revision_conflict",message:"not retained"}})}; };
+  await assert.rejects(h.run("api('/api/files?'+IndexPin.query(status.revision))"),/not retained/);
+  assert.equal(requests.length,1); assert.match(requests[0],/^\/api\/files\?/);
+  assertRetained(h); assert.equal(h.get("retained-pin-status").hidden,true);
+});
+
+test("equal head hides the indication, later reads discover newer head and lower observations do not erase it", async () => {
+  const h = retainedHarness(), requests = [], heads = [retainedPin,newerHead,retainedPin];
+  h.context.fetch = async request => { requests.push(request); return response({workspaceRoot:"/synthetic",revision:heads.shift()}); };
+  h.run("observePinnedHead()"); await settleHead();
+  assert.equal(h.get("retained-pin-status").hidden,true); assert.equal(h.get("retained-pin-label").textContent,"");
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
+  assert.deepEqual(requests,["/api/status","/api/status","/api/status"]);
+  assertRetained(h); assert.equal(h.timers.size,0);
+});
+
+test("different generation is rebuilt, never numerically ordered or silently adopted", async () => {
+  const h = retainedHarness();
+  h.context.fetch = async () => response({workspaceRoot:"/synthetic",revision:rebuiltHead});
+  h.run("observePinnedHead()"); await settleHead();
+  assert.equal(h.get("retained-pin-status").hidden,false);
+  assert.match(h.get("retained-pin-label").textContent,/Viewing revision 12345678:1 · Index rebuilt\. Reload at head\./);
+  assert.doesNotMatch(h.get("retained-pin-label").textContent,/Older than head/); assertRetained(h);
+});
+
+for (const failure of ["network","http","json","workspace","invalid-pin"]) test(`failed ${failure} head comparison preserves evidence and the next read retries`, async () => {
+  const h = retainedHarness(), requests = [];
+  h.context.fetch = async request => {
+    requests.push(request);
+    if (requests.length > 1) return response({workspaceRoot:"/synthetic",revision:newerHead});
+    if (failure === "network") throw new Error("offline");
+    if (failure === "http") return {ok:false,status:503,json:async()=>({error:{code:"storage_busy",message:"busy"}})};
+    if (failure === "json") return {ok:true,status:200,json:async()=>{ throw new Error("bad JSON"); }};
+    return response({workspaceRoot:failure === "workspace" ? "/other" : "/synthetic",revision:failure === "invalid-pin" ? {indexRevision:2} : newerHead});
+  };
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Head comparison unavailable/);
+  assertRetained(h); assert.equal(h.get("error").hidden,true);
+  h.run("observePinnedHead()"); await settleHead();
+  assert.deepEqual(requests,["/api/status","/api/status"]);
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
+});
+
+for (const transition of ["epoch++",`selectedRootKey='${"b".repeat(64)}'`,"status.workspaceRoot='/other'",`status.revision=${JSON.stringify(newerHead)}`,`status.revision=${JSON.stringify({...rebuiltHead,indexRevision:1})}`]) {
+  for (const outcome of ["success","failure"]) test(`late head ${outcome} is inert after ${transition}`, async () => {
+    const h = retainedHarness(), pending = deferred();
+    h.context.fetch = () => pending.promise;
+    h.run("observePinnedHead()"); h.run(transition);
+    if (outcome === "success") pending.resolve(response({workspaceRoot:"/synthetic",revision:newerHead}));
+    else pending.reject(new Error("obsolete failure"));
+    await settleHead();
+    assert.equal(h.get("retained-pin-status").hidden,true); assert.equal(h.get("retained-pin-label").textContent,"");
+    assert.equal(h.get("source").children[0].textContent,"retained bytes"); assert.equal(h.get("error").hidden,true);
+  });
+}
+
+test("overlapping reads coalesce to one pending observation and one follow-up", async () => {
+  const h = retainedHarness(), first = deferred(), second = deferred(), requests = [];
+  h.context.fetch = request => { requests.push(request); return requests.length === 1 ? first.promise : second.promise; };
+  h.run("observePinnedHead(); observePinnedHead(); observePinnedHead()");
+  assert.deepEqual(requests,["/api/status"]);
+  first.resolve(response({workspaceRoot:"/synthetic",revision:retainedPin})); await settleHead();
+  assert.deepEqual(requests,["/api/status","/api/status"]); assert.equal(h.get("retained-pin-status").hidden,true);
+  h.run("observePinnedHead(); observePinnedHead()");
+  second.resolve(response({workspaceRoot:"/synthetic",revision:newerHead})); await settleHead();
+  assert.deepEqual(requests,["/api/status","/api/status"]);
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
+  h.run("observePinnedHead()"); await settleHead();
+  assert.deepEqual(requests,["/api/status","/api/status","/api/status"],"a later idle read starts a fresh comparison");
+});
+
+test("an obsolete observation cannot erase a successor's completed comparison", async () => {
+  const h = retainedHarness(), old = deferred(); let calls = 0;
+  h.context.fetch = () => ++calls === 1 ? old.promise : response({workspaceRoot:"/synthetic",revision:newerHead});
+  h.run("observePinnedHead(); epoch++; resetHeadObservation(); observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
+  old.resolve(response({workspaceRoot:"/synthetic",revision:retainedPin})); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
+});
+
+test("cached source reads compare head without refetching or replacing retained source bytes", async () => {
+  const h = retainedHarness(), requests = [];
+  h.run(`sourceCache.set(IndexPin.key(status.revision)+':src/a.js',{revision:status.revision,file:{path:'src/a.js',text:'retained cached bytes'}})`);
+  h.context.fetch = async request => { requests.push(request); return response({workspaceRoot:"/synthetic",revision:newerHead}); };
+  await h.run("showCachedSource('src/a.js',{startLine:1,endLine:1},status.revision)"); await settleHead();
+  assert.deepEqual(requests,["/api/status"]);
+  assert.match(text(h.get("source")),/retained cached bytes/);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run("workspaceSource.data.revision"))),retainedPin);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),retainedPin);
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
+});
+
+test("Reload at head reads actual current status and clears old selection, source and cached identities", async () => {
+  const h = retainedHarness(), requests = [], actualHead = {...retainedPin,indexRevision:3};
+  h.context.fetch = async request => { requests.push(request); return response({workspaceRoot:"/synthetic",revision:newerHead}); };
+  h.run("observePinnedHead()"); await settleHead();
+  h.run("section='files'; filesFile={path:'src/a.js'}; filesSymbol={id:'old-symbol'}; filesCatalogLoaded=true");
+  h.context.fetch = async request => {
+    requests.push(request);
+    if (request === "/api/git") return response({git:null});
+    if (request === "/api/status") return response({workspaceRoot:"/synthetic",revision:actualHead,stats:{}});
+    if (request.startsWith("/api/files?")) return response({revision:actualHead,items:[{path:"src/a.js",methodCount:1}],nextOffset:null});
+    if (request === "/api/dependencies") return response({state:"disabled",workspaceRevision:actualHead,catalogId:null,packages:[],warnings:[]});
+    throw new Error("Unexpected " + request);
+  };
+  h.get("reload-head").listeners.click(); await settleHead();
+  const routes = requests.map(request => request.split("?",1)[0]);
+  assert.equal(routes.filter(route => route === "/api/status").length,3,"initial comparison, explicit refresh and at-head comparison");
+  assert.deepEqual(routes.filter(route => route !== "/api/status").sort(),["/api/dependencies","/api/files","/api/git"]);
+  assert.equal(requests.some(request => /source|symbols|sequence|index|provider/.test(request.split("?",1)[0])),false,"reload does not reuse old source or symbol identities");
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),actualHead);
+  assert.equal(h.run("selectedMethod"),null); assert.equal(h.run("filesSymbol"),null); assert.equal(h.run("filesFile"),null);
+  assert.equal(h.run("sourceCache.size"),0); assert.equal(h.get("source").children.length,0);
+  assert.equal(h.get("retained-pin-status").hidden,true); assert.equal(h.get("retained-pin-label").textContent,"");
+  assert.equal(h.get("reload-head").disabled,false); assert.equal(h.get("error").hidden,true);
+});
+
+
+test("a failed later comparison keeps an already known older head and retained evidence", async () => {
+  const h = retainedHarness(); let calls = 0;
+  h.context.fetch = async () => {
+    if (++calls === 1) return response({workspaceRoot:"/synthetic",revision:newerHead});
+    throw new Error("head unavailable");
+  };
+  h.run("observePinnedHead()"); await settleHead();
+  h.run("observePinnedHead()"); await settleHead();
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
+  assert.equal(h.get("retained-pin-status").hidden,false); assertRetained(h);
+});
+
+for (const statusCode of [401,403]) test(`head comparison ${statusCode} preserves authoritative authentication invalidation`, async () => {
+  const h = retainedHarness();
+  h.context.fetch = async request => {
+    assert.equal(request,"/api/status");
+    return {ok:false,status:statusCode,json:async()=>({error:{code:"unauthorized",message:"Authentication required"}})};
+  };
+  h.run("observePinnedHead()"); await settleHead();
+  assert.equal(h.run("token"),""); assert.equal(h.run("selectedRootKey"),null); assert.equal(h.run("status"),null);
+  assert.equal(h.run("selectedMethod"),null); assert.equal(h.run("sourceCache.size"),0); assert.equal(h.get("source").children.length,0);
+  assert.equal(h.get("retained-pin-status").hidden,true); assert.equal(h.get("retained-pin-label").textContent,"");
+  assert.equal(h.get("connect-form").hidden,false); assert.equal(h.get("error").hidden,false);
+  assert.match(h.get("error").textContent,/Authentication failed/);
+});
+
+
+test("a pinned read queued at comparison completion starts the next head observation", async () => {
+  const h = retainedHarness(), requests = [];
+  let label = "", notified = false;
+  // Queue the next successful-read notification at the presentation boundary,
+  // before a detached promise.finally handler would release pending ownership.
+  Object.defineProperty(h.get("retained-pin-label"),"textContent",{get:()=>label,set(value) {
+    label = value;
+    if (!notified) {
+      notified = true;
+      Promise.resolve().then(() => h.run("observePinnedResponse('/api/files?'+IndexPin.query(status.revision),'GET',undefined,{revision:status.revision})"));
+    }
+  }});
+  h.context.fetch = async request => {
+    requests.push(request);
+    return response({workspaceRoot:"/synthetic",revision:requests.length === 1 ? retainedPin : newerHead});
+  };
+  h.run("observePinnedHead()"); await settleHead();
+  assert.deepEqual(requests,["/api/status","/api/status"]);
+  assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
 });

@@ -26,6 +26,69 @@ const IndexPin = Object.freeze({
 window.TrellisIndexPin = IndexPin;
 const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
 const sourceCache = new Map();
+let headObservation = null;
+function resetHeadObservation() {
+  headObservation = null;
+  $("retained-pin-status").hidden = true;
+  $("retained-pin-label").textContent = "";
+}
+function showHeadObservation(observation) {
+  const {pin, head, failed} = observation;
+  const rebuilt = head && head.indexGeneration !== pin.indexGeneration;
+  const older = head && !rebuilt && head.indexRevision > pin.indexRevision;
+  $("retained-pin-status").hidden = !older && !rebuilt && !failed;
+  $("retained-pin-label").textContent = older
+    ? `Viewing revision ${IndexPin.label(pin)} · Older than head ${IndexPin.label(head)}`
+    : rebuilt ? `Viewing revision ${IndexPin.label(pin)} · Index rebuilt. Reload at head.`
+      : failed ? `Viewing revision ${IndexPin.label(pin)} · Head comparison unavailable.` : "";
+}
+function observePinnedHead() {
+  if (!token || !selectedRootKey || !status?.revision || !status.workspaceRoot) return;
+  const pin = IndexPin.copy(status.revision), session = epoch, root = selectedRootKey, workspace = status.workspaceRoot;
+  const current = () => session === epoch && root === selectedRootKey && workspace === status?.workspaceRoot && IndexPin.equal(pin, status?.revision);
+  if (!headObservation || !currentHeadContext(headObservation, session, root, workspace, pin)) {
+    headObservation = {session, root, workspace, pin, head:null, pending:false, again:false, failed:false};
+  }
+  const observation = headObservation;
+  if (observation.pending) { observation.again = true; return; }
+  observation.pending = true;
+  void (async () => {
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        observation.again = false;
+        try {
+          const data = await api("/api/status", "GET", undefined, () => current() && headObservation === observation);
+          if (!current() || headObservation !== observation) return;
+          if (data.workspaceRoot !== workspace || !data.revision) throw new Error("Head unavailable");
+          const head = IndexPin.copy(data.revision);
+          // A later response cannot erase a newer same-generation observation.
+          if (!observation.head || head.indexGeneration !== observation.head.indexGeneration || head.indexRevision >= observation.head.indexRevision) observation.head = head;
+          observation.failed = false;
+        } catch (error) {
+          if (!current() || headObservation !== observation || error.name === "AbortError") return;
+          observation.failed = true;
+        }
+        showHeadObservation(observation);
+        if (!observation.again || !current() || headObservation !== observation) break;
+      }
+    } finally { observation.pending = false; }
+  })();
+}
+function currentHeadContext(value, session, root, workspace, pin) {
+  return value.session === session && value.root === root && value.workspace === workspace && IndexPin.equal(value.pin, pin);
+}
+function observePinnedResponse(path, method, body, data) {
+  const query = new URLSearchParams(path.split("?", 2)[1] || "");
+  const route = path.split("?", 1)[0];
+  const reads = new Set(["/api/files", "/api/methods", "/api/source", "/api/symbols", "/api/classes", "/api/metrics", "/api/architecture"]);
+  const posts = new Set(["/api/sequence", "/api/syntax-matches", "/api/class-diagram", "/api/navigation"]);
+  const requested = method === "GET" && reads.has(route) && query.has("indexGeneration") && query.has("indexRevision")
+    ? {indexGeneration:query.get("indexGeneration"), indexRevision:Number(query.get("indexRevision"))}
+    : method === "POST" && posts.has(route) ? body?.expectedRevision : null;
+  const returned = ["/api/metrics", "/api/architecture"].includes(route) ? data?.payload : data?.revision;
+  if (requested && IndexPin.equal(requested, status?.revision) && IndexPin.equal(returned, requested)) observePinnedHead();
+}
+
 let section = "diagrams", sectionSerial = 0, filesSerial = 0, filesDiffSerial = 0, filesMatchesSerial = 0;
 let filesFile = null, filesSymbol = null, filesBasis = "indexed", filesMini = null, filesMatches = null;
 let filesGitStatus = null, filesDiff = null, filesCatalogLoaded = false;
@@ -100,6 +163,7 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
     throw error;
   }
+  observePinnedResponse(path, method, body, data);
   return data;
 }
 async function perform(action, control) {
@@ -175,6 +239,7 @@ async function refreshStatus(followup = false) {
   const browseChanged = !status || workspaceChanged || !IndexPin.equal(status.revision, nextPin);
   if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); clearSource(); }
   if (browseChanged) clearDependencyCatalog();
+  resetHeadObservation();
   status = {...data, revision:nextPin};
   data = status;
   updateFilesBasis();
@@ -270,6 +335,7 @@ function resetCheckout() {
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
   status = null; job = null; waitingForJob = false;
+  resetHeadObservation();
   ["status", "diagnostics", "job"].forEach(id => $(id).textContent = "");
   $("file-filter").value = "";
   $("stale").hidden = true; $("catching-up").hidden = true;
@@ -516,7 +582,9 @@ async function showCachedSource(path, range, revision, callerCurrent = () => tru
   const key = `${IndexPin.key(revision)}:${path}`;
   window.TrellisNavigation?.reset(); workspaceSource = null;
   $("source-path").textContent = `Loading ${path}…`; $("source").replaceChildren();
-  const data = sourceCache.get(key) || await api(`/api/source?path=${encodeURIComponent(path)}&${IndexPin.query(revision)}`, "GET", undefined, current);
+  const cached = sourceCache.get(key);
+  const data = cached || await api(`/api/source?path=${encodeURIComponent(path)}&${IndexPin.query(revision)}`, "GET", undefined, current);
+  if (cached && current()) observePinnedHead();
   if (!current()) return;
   if (!IndexPin.equal(data.revision, revision)) { unexpectedPair("Source snapshot changed. Refresh status.", data.revision); return; }
   if (data.file.path !== path) throw new Error("Source path mismatch. Nothing displayed.");
@@ -534,7 +602,8 @@ async function showCachedSource(path, range, revision, callerCurrent = () => tru
     highlight.scrollIntoView?.({block:"start", inline:"nearest"});
   }
 }
-$("refresh").addEventListener("click", () => perform(async () => {
+async function refreshView() {
+  resetHeadObservation();
   const revision = status?.revision, session = epoch, root = selectedRootKey;
   const file = filesFile, basis = filesBasis;
   clearSource(); filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
@@ -551,7 +620,9 @@ $("refresh").addEventListener("click", () => perform(async () => {
   else if (section !== "files" && !$("architecture-panel").hidden) await architecture?.refresh();
   else if (section !== "files" && selectedMethod) await loadSequence();
   schedulePoll();
-}, $("refresh")));
+}
+$("refresh").addEventListener("click", () => perform(refreshView, $("refresh")));
+$("reload-head").addEventListener("click", () => perform(refreshView, $("reload-head")));
 function activeJob(value) { return ["queued", "running"].includes(value.state); }
 function showJob() {
   if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }

@@ -24,7 +24,7 @@ function harness() {
   const get = id => { if(!elements.has(id)) elements.set(id,node()); return elements.get(id); };
   const document = {getElementById:get,createElement:node,createElementNS:(_,tag)=>node(tag),createTextNode:value=>({...node("#text"),textContent:value}),createDocumentFragment:()=>node("fragment"),body:node("body"),addEventListener(){}};
   let network = () => { throw new Error("Unexpected request"); };
-  const context = vm.createContext({document, window:{}, console, AbortController, DOMException, TextEncoder,
+  const context = vm.createContext({document, window:{}, console, AbortController, DOMException, TextEncoder, URLSearchParams,
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(url, options){ requests.push({url,options}); assert.ok(url.startsWith(`/api/checkouts/${ROOT}/`)); return network("/api/" + url.slice(`/api/checkouts/${ROOT}/`.length),options); }});
   const run = code => vm.runInContext(code, context); run(source);
@@ -39,6 +39,7 @@ const matches = (item, items = [], extra = {}) => ({revision:pin,symbolId:item.s
 function indexedNetwork(h, item = outline("measured"), extra = () => undefined) {
   h.network((url, options) => {
     const supplied = extra(url, options); if (supplied) return supplied;
+    if(url === "/api/status") return response({revision:pin,workspaceRoot:"/fixture"});
     if(url.startsWith("/api/files?")) return response({revision:pin,items:[{path:item.symbol.path,language:"java",methodCount:1}],nextOffset:null});
     if(url === "/api/git") return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if(url.startsWith("/api/symbols?")) return response({revision:pin,path:item.symbol.path,items:[item],nextOffset:null,truncated:false,warnings:[]});

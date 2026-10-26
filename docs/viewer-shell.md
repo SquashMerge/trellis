@@ -35,6 +35,25 @@ Connecting never picks a checkout. Checkout, session or full pin changes clear m
 source callbacks and open views before rebinding; equal revision numbers in different generations
 are not equal pins. Existing busy/replacement and authentication semantics remain intact.
 
+## Displayed revision and observed head
+
+A successful retained-pin read keeps its exact displayed revision and evidence. After a
+pinned browser read (including cached source), the app separately observes current status.
+If the same generation has a newer head, the shared frame shows the viewed revision,
+“Older than head”, the observed head and an explicit **Reload at head** action. At-head
+results show no older indication. A different generation is labelled rebuilt, not ordered
+by revision number. Catching up and Git state remain separate observations.
+
+Head observation never adopts a pin, writes state or starts indexing. It is advisory,
+not an atomic head-at-result-admission guarantee. Failed comparison keeps valid displayed
+evidence; a later pinned read can try again. Session, checkout and full-pin guards prevent
+late observations from changing another view. There is no background comparison timer.
+
+Reload at head re-reads status through the existing explicit refresh path. A changed pin
+clears revision-bound selections before rebinding; choose the file or method again at the
+new head. Old symbol IDs and ranges are never carried across pins. Retired saved views
+and notes are not restored by this presentation behavior.
+
 ## Metric tree and inspector
 
 Use [`metrics:v1`](metrics.md), explicitly scoped to **production callables** by default. The

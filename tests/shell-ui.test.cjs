@@ -18,7 +18,7 @@ function harness(withApp = false) {
   }
   const get = id => { if(!elements.has(id))elements.set(id,node("div"));return elements.get(id); };
   const document = {getElementById:get,createElement:node,createElementNS:(_,tag)=>node(tag),createTextNode:text=>({...node("#text"),textContent:text}),createDocumentFragment:()=>node("fragment"),body:node("body"),listeners:{},addEventListener(k,v){this.listeners[k]=v;}};
-  const context = vm.createContext({document,window:{confirm:()=>true},console,AbortController,DOMException,TextEncoder,
+  const context = vm.createContext({document,window:{confirm:()=>true},console,AbortController,DOMException,TextEncoder,URLSearchParams,
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(path){requests.push(path);throw new Error("Unexpected request "+path);}});
   const run = code => vm.runInContext(code,context);
@@ -138,16 +138,16 @@ test("responsive drawers use classes rather than hiding desktop panels",()=>{
 });
 async function selectedHarness() {
   const h=harness(true),step=call(),data=view([step]);
-  h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path.startsWith("/api/source?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};
+  h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path==="/api/status")return response({revision:data.revision,workspaceRoot:"/repo"});if(path.startsWith("/api/source?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};
   await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
   const pick=all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source"));assert.ok(pick);
   pick.listeners.click();
   return h;
 }
 test("app row selection inspects without fetch; explicit Open call site reads guarded snapshot",async()=>{
-  const h=await selectedHarness();assert.deepEqual(h.requests,["/api/sequence"]);
+  const h=await selectedHarness();assert.deepEqual(h.requests,["/api/sequence","/api/status"]);
   assert.equal(h.get("inspector-content").hidden,false);
-  await h.get("inspector-open-source").listeners.click();assert.equal(h.requests.length,2);assert.match(h.requests[1],/^\/api\/source\?/);
+  await h.get("inspector-open-source").listeners.click();assert.equal(h.requests.length,4);assert.match(h.requests[2],/^\/api\/source\?/);assert.equal(h.requests[3],"/api/status");
   assert.equal(h.get("source-dock").hidden,false);assert.equal(h.get("workspace-source-panel").hidden,false);
 });
 for(const change of ["method","revision","disconnect","index"] ) test(`app invalidates inspector callbacks after ${change}`,async()=>{
@@ -162,7 +162,7 @@ for(const change of ["method","revision","disconnect","index"] ) test(`app inval
 test("captured app source callback rejects revision/session changes even without a shell reset",async()=>{
   const h=harness(true);let callback;
   h.context.window.TrellisShell.selectStep=(_,__,source)=>{callback=source;};
-  h.context.fetch=async()=>response(view([call()]));await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
+  h.context.fetch=async path=>{if(path==="/api/status")return response({revision:view().revision,workspaceRoot:"/repo"});assert.equal(path,"/api/sequence");return response(view([call()]));};await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
   all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source")).listeners.click();
   h.context.fetch=()=>{throw new Error("Stale source fetch");};h.run("status.revision=2;epoch++;");
   await callback();assert.equal(h.get("source-dock").hidden,true);
