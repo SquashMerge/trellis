@@ -250,8 +250,8 @@ def db_for(home):
 
 
 def published(db, output, size):
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 21,
-            "merged native-v9 gate requires owner-directed schema21")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 23,
+            "mixed performance requires schema23")
     index_result = json.loads(output)
     pin = index_result["publishedRevision"]
     revision = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
@@ -616,81 +616,539 @@ semantic_symbol_targets semantic_declaration_bindings semantic_declaration_bindi
 semantic_declaration_join_candidates semantic_references semantic_reference_roles
 semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
+semantic_raw_captures semantic_revision_raw_selections semantic_raw_proofs semantic_import_reports
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
 DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_versions",
                "native_release_candidate_graphs", "native_release_candidate_classes"}
 
 
+def typed_cells(value):
+    if isinstance(value, bytes):
+        return {"blob": value.hex()}
+    if isinstance(value, dict):
+        return {key: typed_cells(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [typed_cells(item) for item in value]
+    return value
+
+
 def parity_digest(db, revision):
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 21,
-            "independent merged native-v9 parity requires schema21")
+    view = SelectedView(db, revision)
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 23, "selected parity requires schema23")
     generation, number = revision.removeprefix("pin:v1:").rsplit(":", 1)
     require(db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
             == (generation, int(number)), "parity pin is not frozen head")
     require(db.execute("PRAGMA foreign_key_check").fetchone() is None, "retained evidence foreign-key violation")
     tables = {row[0] for row in db.execute("""SELECT name FROM sqlite_master WHERE type='table'
         AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%'""")}
-    require(REQUIRED_TABLES <= tables and tables <= REQUIRED_TABLES | CONTROL_TABLES,
-            f"unhandled evidence schema: missing={REQUIRED_TABLES-tables}, extra={tables-REQUIRED_TABLES-CONTROL_TABLES}")
-    require(("native_binding_epoch" in tables) == ("revision_producer_bindings" in tables),
-            "producer binding tables must be paired")
-    if "native_binding_epoch" in tables:
-        first = db.execute("SELECT first_revision FROM native_binding_epoch").fetchone()[0]
-        bound = db.execute("SELECT count(*) FROM revision_producer_bindings WHERE revision_id=?", (revision,)).fetchone()[0]
-        require(bound == int(int(number) >= first), "selected revision producer binding missing")
-    result = {}
-    for table in sorted(tables - CONTROL_TABLES):
+    require(tables == REQUIRED_TABLES | CONTROL_TABLES,
+            f"schema23 selected inventory mismatch: missing={REQUIRED_TABLES|CONTROL_TABLES-tables}, "
+            f"extra={tables-REQUIRED_TABLES-CONTROL_TABLES}")
+    output = {}
+    selected = "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?"
+    for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES):
         if table == "native_revisions":
             where = "id=?"
-        elif table in DEBT_TABLES | {"revision_capture_inputs", "revision_documents"}:
+        elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
+                       "semantic_requested_producers", "semantic_requested_producer_languages",
+                       "semantic_coverage", "semantic_revision_raw_selections"}:
             where = "revision_id=?"
         elif table == "native_source_sets":
             where = "id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
         elif table in {"native_source_set_languages", "native_source_set_dependencies"}:
             where = "source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
         elif table.startswith("native_producer"):
-            id_column, version_column = ("id", "version") if table == "native_producers" else ("producer_id", "producer_version")
+            id_col, ver_col = (("id", "version") if table == "native_producers" else
+                               ("producer_id", "producer_version"))
             where = ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.vid=v.vid "
-                     f"WHERE d.revision_id=? AND v.producer_id=selected.{id_column} AND v.producer_version=selected.{version_column})")
+                     f"WHERE d.revision_id=? AND v.producer_id=selected.{id_col} AND "
+                     f"v.producer_version=selected.{ver_col})")
+        elif table.startswith("semantic_producer"):
+            id_col, ver_col = (("id", "version") if table == "semantic_producers" else
+                               ("id", "version"))
+            where = ("EXISTS(SELECT 1 FROM semantic_revision_producers r WHERE r.revision_id=? "
+                     f"AND r.id=selected.{id_col} AND r.version=selected.{ver_col})")
         elif table == "document_versions" or table.startswith("native_version_"):
             where = "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?)"
         elif table in {"graph_projections", "graph_nodes", "graph_display_labels"}:
             where = "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?)"
         elif table in {"class_projections", "classes", "class_relations"}:
             where = "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?)"
-        elif table.startswith("semantic_"):
-            where = "? IS NOT NULL"
+        elif table in {"semantic_coverage_roles", "semantic_basis", "semantic_provenance",
+                       "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
+                       "semantic_call_bindings", "semantic_type_relationships"}:
+            where = f"tuple_id IN ({selected})"
+        elif table in {"semantic_basis_lookup_dependencies"}:
+            where = f"basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id IN ({selected}))"
+        elif table in {"semantic_symbol_targets"}:
+            where = f"symbol_id IN (SELECT symbol_id FROM semantic_symbols WHERE tuple_id IN ({selected}))"
+        elif table in {"semantic_declaration_binding_symbols", "semantic_declaration_join_candidates"}:
+            where = f"binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE tuple_id IN ({selected}))"
+        elif table in {"semantic_reference_roles", "semantic_reference_candidates"}:
+            where = f"tuple_id IN ({selected})"
+        elif table in {"semantic_call_candidates", "semantic_call_possible_dispatch", "semantic_call_join_candidates"}:
+            where = f"binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id IN ({selected}))"
+        elif table == "semantic_raw_captures":
+            where = "capture_id IN (SELECT capture_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
+        elif table == "semantic_raw_proofs":
+            where = "capture_id IN (SELECT capture_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
+        elif table == "semantic_import_reports":
+            where = "revision_id=(SELECT captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?)"
         else:
-            raise RuntimeError(f"unhandled evidence table: {table}")
+            raise RuntimeError(f"unclassified schema23 selected table: {table}")
         columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
-        expressions = []
-        for column in columns:
-            expression = f'selected."{column}"'
-            if column in ("vid", "gid", "cid"):
-                parent, key = {"vid": ("document_versions", "id"),
-                               "gid": ("graph_projections", "'graph:v1:'||graph_hash"),
-                               "cid": ("class_projections", "'class-projection:v1:'||content_hash")}[column]
-                expression = f'(SELECT {key} FROM {parent} immutable WHERE immutable.{column}=selected.{column})'
-            elif column == "revision_id" or (table == "native_revisions" and column == "id"):
-                expression = "'<current-pin>'"
-            elif table == "native_revisions" and column == "published_index_revision":
-                expression = "'<current-revision>'"
-            expressions.append(expression)
-        # Order by normalized complete rows, not history-dependent rowids.
-        query = (f'SELECT {",".join(expressions)} FROM "{table}" selected WHERE {where} ORDER BY '
-                 + ",".join(str(i+1) for i in range(len(columns))))
+        require(columns, f"empty table schema: {table}")
         digest, count = hashlib.sha256(), 0
-        for row in db.execute(query, (revision,)):
-            typed = [["blob", value.hex()] if isinstance(value, bytes) else
-                     [type(value).__name__, value] for value in row]
-            digest.update(json.dumps(typed, ensure_ascii=False, separators=(",", ":")).encode() + b"\n")
+        # Each row retains all columns; sorted hashes preserve multiplicity without
+        # depending on SQLite rowids, insertion order, or root-derived IDs.
+        rows = []
+        for row in db.execute(f'SELECT * FROM "{table}" selected WHERE {where}', (revision,)):
+            cells = {column: value for column, value in zip(columns, row)}
+            cells = view.row(table, cells)
+            encoded = canonical(typed_cells(cells))
+            rows.append(hashlib.sha256(encoded).digest())
             count += 1
-        require(not (table.startswith("semantic_") or table in DEBT_TABLES) or count == 0,
-                f"native-only current head unexpectedly contains {table}")
-        require(table != "native_revisions" or count == 1, "missing/duplicate selected header")
-        result[table] = {"columns": columns, "rows": count, "sha256": digest.hexdigest()}
+        for encoded_hash in sorted(rows):
+            digest.update(encoded_hash)
+        output[table] = {"columns": columns, "rows": count, "sha256": digest.hexdigest()}
+    require(output["native_revisions"]["rows"] == 1
+            and output["revision_documents"]["rows"] in (1000, 10000),
+            "selected native corpus incomplete")
+    require(output["semantic_raw_proofs"]["rows"] > 0
+            and output["semantic_provenance"]["rows"] > 0
+            and output["semantic_coverage"]["rows"] > 0, "no selected semantic/raw-linked evidence")
+    return output
+
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def field(number, value, wire=2):
+    def varint(n):
+        out = bytearray()
+        while n > 127:
+            out.append((n & 127) | 128)
+            n >>= 7
+        out.append(n)
+        return bytes(out)
+    return varint(number * 8 + wire) + (varint(value) if wire == 0 else
+                                         varint(len(value)) + value)
+
+
+def scip_anchor(anchor, relative):
+    raw = anchor.read_bytes()
+    declaration = re.search(rb"export function f0\(\)", raw)
+    require(declaration is not None, f"missing frozen f0 declaration: {anchor}")
+    line = raw[:declaration.start()].count(b"\n")
+    column = declaration.start() - raw.rfind(b"\n", 0, declaration.start()) - 1 + len(b"export function ")
+    symbol = b"pkg f0()."
+    occurrence = (field(1, b"".join(field(1, n, 0)[1:] for n in (line, column, column + 2)))
+                  + field(2, symbol) + field(3, 1, 0))
+    information = field(1, symbol) + field(5, 26, 0) + field(6, b"f0")
+    document = (field(1, relative.as_posix().encode()) + field(2, occurrence)
+                + field(3, information) + field(4, b"javascript") + field(6, 2, 0))
+    return field(2, document)
+
+
+def capture_r1(db, revision):
+    header = db.execute("""SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,
+        native_revision_id,source_inventory FROM native_revisions WHERE id=?""", (revision,)).fetchone()
+    require(header is not None, "missing retained r1 header")
+    source_set, toolchain, config, dependency, native_id, inventory = header
+    rows = json.loads(inventory)
+    source_rows = [{"language": item["key"]["language"], "relativePath": item["key"]["path"],
+                    "contentHash": item["contentHash"]} for item in rows]
+    require(len(source_rows) == 4, f"small r1 must contain exactly four sources: {source_rows}")
+    manifest_rows = [{"document": {"sourceSetId": source_set, "language": row["language"],
+                                    "path": row["relativePath"]}, "contentHash": row["contentHash"]}
+                     for row in source_rows]
+    root_id = db.execute("SELECT root_id FROM native_source_sets WHERE id=?", (source_set,)).fetchone()[0]
+    languages = db.execute("SELECT language FROM native_source_set_languages WHERE source_set_id=? ORDER BY ordinal",
+                           (source_set,)).fetchall()
+    return {"source_set": {"id": source_set, "rootId": root_id,
+                            "languages": [row[0] for row in languages], "dependencies": []},
+            "native_id": native_id, "source_rows": source_rows,
+            "manifest_hash": hashlib.sha256(canonical(manifest_rows)).hexdigest(),
+            "components": {"toolchainHash": toolchain, "configHash": config, "dependencyHash": dependency}}
+
+
+def selected_proof(db, revision, anchor_path, artifact_hash):
+    rows = db.execute("""SELECT s.producer_id,c.artifact_hash,s.captured_pin,p.proof_id,
+        v.derived_from_provenance_id,v.derived_from_fact_digest,b.artifact_hash,
+        cov.state,cov.selected,cov.requested,b.captured_native_revision_id,r.native_revision_id
+        FROM semantic_revision_raw_selections s
+        JOIN semantic_raw_captures c ON c.capture_id=s.capture_id
+        JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id AND p.path=?
+        JOIN semantic_coverage cov ON cov.revision_id=s.revision_id AND cov.producer_id=s.producer_id
+            AND cov.path=p.path AND cov.language=p.language
+        JOIN semantic_provenance v ON v.tuple_id=cov.tuple_id AND v.capture_id=c.capture_id
+            AND v.derived_from_provenance_id=p.proof_id AND v.derived_from_fact_digest=p.fact_digest
+        JOIN semantic_basis b ON b.basis_id=v.basis_id AND b.tuple_id=cov.tuple_id
+        JOIN native_revisions r ON r.id=s.revision_id
+        WHERE s.revision_id=?""", (anchor_path, revision)).fetchall()
+    require(rows and all(row[0] == "scip-typescript" and row[1] == artifact_hash
+                         and row[3] == row[4] and row[6] == artifact_hash
+                         and row[7] in ("complete", "partial") and row[8:10] == (1, 1)
+                         for row in rows),
+            f"{revision}: selected raw-linked proof, basis, coverage or distinct r1/r2 missing: {rows}")
+    require(db.execute("SELECT count(*) FROM native_revisions WHERE id=?", (revision,)).fetchone()[0] == 1,
+            "selected raw proof lacks native pin")
+    require(db.execute("SELECT count(*) FROM semantic_revision_raw_selections WHERE revision_id=? "
+                       "AND captured_pin!=revision_id", (revision,)).fetchone()[0] == 1,
+            "selected capture does not retain distinct authenticated r1 pin")
+    result = {"pin": revision, "producer": rows[0][0], "artifact_hash": artifact_hash,
+              "captured_pin": rows[0][2], "proof_count": len({r[3] for r in rows}), "raw_proof_ids": sorted({r[3] for r in rows})}
+    record("selected_proof", **result)
     return result
+
+
+def import_fixture(binary, root, daemon, size, r1):
+    anchor = Path("javascript") / f"C{size}0010.js"
+    raw = scip_anchor(root / anchor, anchor)
+    (root / "artifact.scip").write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
+        captured = capture_r1(db, r1)
+    rows = captured["source_rows"]
+    covered = [row for row in rows if row["language"] == "javascript"]
+    require(len(covered) == 1 and covered[0]["relativePath"] == anchor.as_posix(),
+            "r1 JavaScript closure must contain exactly the frozen anchor")
+    profile = json.loads((REPO / "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json").read_text())
+    producer = next(p for p in profile["semanticProducers"] if p["name"] == "scip-typescript")
+    manifest = {"formatVersion": 1, "trustOrigin": "referenceProfile", "completion": "complete",
+                "decoderVersion": "scip-0.10.0/CapturedScipFactV1/1", "profileId": profile["profileId"],
+                "producer": {"name": producer["name"], "version": producer["version"],
+                             "executableHash": producer["executableHash"], "positionEncoding": 2},
+                "sourceSet": captured["source_set"], "sourceRevision": captured["native_id"],
+                "sourceManifestHash": captured["manifest_hash"], "components": captured["components"],
+                "metadata": {"protocolVersion": 0, "projectRoot": root.as_uri(), "textDocumentEncoding": 1},
+                "sourceDocuments": rows, "documents": covered, "exclusions": [],
+                "artifacts": [{"kind": "scipBinary", "path": "artifact.scip", "hash": digest,
+                               "language": "javascript", "documents": [anchor.as_posix()]}]}
+    serialized = canonical(manifest)
+    (root / "manifest.json").write_bytes(serialized)
+    manifest_hash = hashlib.sha256(serialized).hexdigest()
+    output = command([str(binary), "semantic", "import", "--workspace", str(root),
+                      "--scip", str(root / "artifact.scip"), "--manifest", str(root / "manifest.json"),
+                      "--profile", profile["profileId"], "--producer", producer["name"],
+                      "--manifest-sha256", manifest_hash], env=env_for(daemon.home))
+    pin = json.loads(output)["publishedRevision"]
+    selected = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
+    with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
+        proof = selected_proof(db, selected, anchor.as_posix(), digest)
+    record("fixture_import", size=size, r1=r1, selection_pin=selected, manifest_sha256=manifest_hash,
+           source_manifest_hash=captured["manifest_hash"], artifact_sha256=digest,
+           requested_tuple=(producer["name"], "javascript", anchor.as_posix()), proof=proof)
+    return digest, selected
+
+
+def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
+    anchor = Path("javascript") / f"C{size}0010.js"
+    sentinels = [anchor, Path("java") / f"C{size}0010.java",
+                 Path("python") / f"C{size}0010.py", Path("rust/g00") / f"C{size}0010.rs"]
+    workspace.mkdir()
+    for relative in sentinels:
+        dest = workspace / relative
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(corpus / size / relative, dest)
+    anchor_digest = sha_file(workspace / anchor)
+    expected = {"medium": "7b08f0b2aad6ef5e309cb480fdb17d83539e2273d45aa74c83fe9bd58084c08b",
+                "large": "e061783a302f0007e0f05881570f1041697516a22bb357a09df5eeebc71d724d"}[size]
+    require(anchor_digest == expected, "frozen ordinal-10 anchor differs from pinned manifest")
+    output = command([str(binary), "index", "--workspace", str(workspace)], env=env_for(daemon.home))
+    pin = json.loads(output)["publishedRevision"]
+    r1 = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
+    with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
+        require(db.execute("SELECT count(*) FROM revision_documents WHERE revision_id=?", (r1,)).fetchone()[0] == 4,
+                "r1 failed to capture all four sentinels")
+    artifact, imported = import_fixture(binary, workspace, daemon, size, r1)
+    shutil.copytree(corpus / size, workspace, dirs_exist_ok=True)
+    if edited is not None:
+        for relative, source in edited.items():
+            shutil.copyfile(source, workspace / relative)
+    require(sha_file(workspace / anchor) == expected, "full r2 changed frozen anchor")
+    output = command([str(binary), "index", "--workspace", str(workspace)], env=env_for(daemon.home))
+    full = json.loads(output)["publishedRevision"]
+    r2 = f"pin:v1:{full['indexGeneration']}:{full['indexRevision']}"
+    with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
+        selected_proof(db, r2, anchor.as_posix(), artifact)
+        published(db, output, size)
+    require(r2 not in (r1, imported), "untimed full r2 must publish a new selected pin")
+    with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
+        native_ids = db.execute("SELECT native_revision_id FROM native_revisions WHERE id IN (?,?)",
+                                (r1, r2)).fetchall()
+        require(len(native_ids) == 2 and native_ids[0] != native_ids[1],
+                "full r2 must differ from captured native r1")
+    record("untimed_full_r2", size=size, r1=r1, import_pin=imported, r2=r2,
+           anchor_sha256=expected, artifact_sha256=artifact)
+    return r2, artifact, anchor, expected
+
+
+class SelectedView:
+    """Closed schema-23 selected-output view; every cell is kept after explicit identity mapping."""
+    def __init__(self, db, revision):
+        self.db, self.revision = db, revision
+        header = db.execute("SELECT source_set_id,native_revision_id,source_inventory FROM native_revisions WHERE id=?",
+                            (revision,)).fetchone()
+        require(header is not None, "missing selected native header")
+        self.source_set, self.native_revision, inventory = header
+        self.docs = {(d["key"]["language"], d["key"]["path"]): d["contentHash"]
+                     for d in json.loads(inventory)}
+        self.ids = {"source-set": {self.source_set: "<source-set>"},
+                    "native-revision": {self.native_revision: "<r2>"},
+                    "pin": {revision: "<r2-pin>"},
+                    "vid": {}, "gid": {}, "cid": {}, "syntax": {}, "occurrence": {},
+                    "region": {}, "class": {}, "class-ref": {}, "graph-node": {},
+                    "tuple": {}, "basis": {}, "capture": {}, "proof": {},
+                    "provenance": {}, "symbol": {}, "binding": {}}
+        self.r1 = None
+        for language, path, vid, gid, cid in db.execute(
+                "SELECT language,path,vid,gid,cid FROM revision_documents WHERE revision_id=?",
+                (revision,)):
+            key = (language, path, self.docs[(language, path)])
+            for family, value in (("vid", vid), ("gid", gid), ("cid", cid)):
+                if value is not None:
+                    self.ids[family][value] = key
+        for vid, syntax, kind, name, ordinal, start, end, name_start, name_end in db.execute(
+                "SELECT vid,syntax_id,kind,name,key_ordinal,start_byte,end_byte,name_start,name_end "
+                "FROM native_version_declarations WHERE vid IN (SELECT vid FROM revision_documents WHERE revision_id=?)",
+                (revision,)):
+            self.ids["syntax"][syntax] = (self.ids["vid"][vid], kind, name, ordinal,
+                                           start, end, name_start, name_end)
+        for table, family, parts in (
+            ("native_version_calls", "occurrence", "ordinal,start_byte,end_byte,spelling"),
+            ("native_version_references", "occurrence", "ordinal,start_byte,end_byte,spelling"),
+            ("native_version_control_regions", "region", "ordinal,start_byte,end_byte,kind")):
+            for vid, raw, *rest in db.execute(
+                    f"SELECT vid,id,{parts} FROM {table} WHERE vid IN "
+                    "(SELECT vid FROM revision_documents WHERE revision_id=?)", (revision,)):
+                key = (self.ids["vid"][vid], table, *rest)
+                previous = self.ids[family].get(raw)
+                require(previous is None or previous == key, f"conflicting native {family} mapping")
+                self.ids[family][raw] = key
+        for gid, raw, name, kind in db.execute(
+                "SELECT gid,id,name,kind FROM graph_nodes WHERE gid IN "
+                "(SELECT gid FROM revision_documents WHERE revision_id=?)", (revision,)):
+            self.ids["graph-node"][raw] = (self.ids["gid"][gid], name, kind)
+        for cid, raw, name, qualified, path in db.execute(
+                "SELECT cid,id,name,qualified_name,path FROM classes WHERE cid IN "
+                "(SELECT cid FROM revision_documents WHERE revision_id=?)", (revision,)):
+            self.ids["class"][raw] = (self.ids["cid"][cid], name, qualified, path)
+        for cid, raw, owner, payload in db.execute(
+                "SELECT cid,id,owner,payload FROM class_relations WHERE cid IN "
+                "(SELECT cid FROM revision_documents WHERE revision_id=?)", (revision,)):
+            parsed = json.loads(payload)
+            self.ids["class-ref"][raw] = (self.ids["cid"][cid], self.ids["class"][owner],
+                                           parsed["typeName"], parsed["kind"], parsed["range"])
+        for raw, producer, language, path in db.execute(
+                "SELECT tuple_id,producer_id,language,path FROM semantic_coverage WHERE revision_id=?", (revision,)):
+            self.ids["tuple"][raw] = (producer, language, path, self.docs[(language, path)])
+        selections = db.execute("""SELECT c.capture_id,c.producer_id,c.artifact_hash,c.source_set_id,
+            c.captured_revision,s.captured_pin,c.manifest_bytes FROM semantic_revision_raw_selections s
+            JOIN semantic_raw_captures c ON c.capture_id=s.capture_id WHERE s.revision_id=?""",
+            (revision,)).fetchall()
+        require(len(selections) == 1, f"expected exactly one selected capture: {selections}")
+        for capture, producer, artifact, source_set, captured_revision, captured_pin, manifest_bytes in selections:
+            manifest = json.loads(manifest_bytes)
+            require(source_set == self.source_set and manifest["sourceSet"]["id"] == source_set
+                    and manifest["sourceRevision"] == captured_revision
+                    and manifest["artifacts"][0]["hash"] == artifact,
+                    "selected raw manifest disagrees with admitted capture")
+            r1_doc = [(d["language"], d["relativePath"], d["contentHash"])
+                      for d in manifest["sourceDocuments"]]
+            require(len(r1_doc) == 4 and len(set(r1_doc)) == 4, "r1 document closure missing")
+            self.r1 = captured_revision
+            self.ids["pin"][captured_pin] = "<captured-r1-pin>"
+            self.ids["native-revision"][captured_revision] = "<captured-r1>"
+            self.ids["capture"][capture] = (producer, artifact, tuple(r1_doc))
+            self.capture_manifest = manifest
+            self.capture_pin = captured_pin
+            self.capture_bytes = manifest_bytes
+            self.r1_docs = r1_doc
+            for raw, kind, language, path, fact, canonical_bytes in db.execute(
+                    "SELECT proof_id,record_kind,language,path,fact_digest,canonical_bytes "
+                    "FROM semantic_raw_proofs WHERE capture_id=?", (capture,)):
+                self.ids["proof"][raw] = (self.ids["capture"][capture], kind, language,
+                                           path, fact, canonical_bytes.hex())
+        for raw, tuple_id, producer, artifact, language, source_revision, source_hash in db.execute(
+                "SELECT basis_id,tuple_id,producer_id,artifact_hash,language,"
+                "captured_native_revision_id,source_manifest_hash FROM semantic_basis "
+                "WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+            require(source_revision == self.r1 and source_hash == self.capture_manifest["sourceManifestHash"],
+                    "basis not bound to admitted r1")
+            self.ids["basis"][raw] = (self.ids["tuple"][tuple_id], producer, artifact, language,
+                                       tuple(self.r1_docs))
+        for tuple_id, raw, evidence, basis, proof in db.execute(
+                "SELECT tuple_id,provenance_id,evidence_kind,basis_id,derived_from_provenance_id "
+                "FROM semantic_provenance WHERE tuple_id IN "
+                "(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+            require(proof in self.ids["proof"], "provenance not linked to selected raw proof")
+            self.ids["provenance"][raw] = (self.ids["tuple"][tuple_id], evidence,
+                                            self.ids["basis"][basis], self.ids["proof"][proof])
+        for raw, tuple_id, ordinal, scheme, symbol, scope in db.execute(
+                "SELECT symbol_id,tuple_id,ordinal,key_scheme,key_symbol,key_scope FROM semantic_symbols "
+                "WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+            self.ids["symbol"][raw] = (self.ids["tuple"][tuple_id], ordinal, scheme, symbol, scope)
+        for table in ("semantic_declaration_bindings", "semantic_call_bindings"):
+            for raw, tuple_id, ordinal in db.execute(
+                    f"SELECT binding_id,tuple_id,ordinal FROM {table} WHERE tuple_id IN "
+                    "(SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
+                self.ids["binding"][raw] = (table, self.ids["tuple"][tuple_id], ordinal)
+
+    def map(self, family, value):
+        if value is None:
+            return None
+        require(value in self.ids[family], f"unmapped {family} identity: {value!r}")
+        return (family, self.ids[family][value])
+
+    def embedded(self, value):
+        if isinstance(value, list):
+            return [self.embedded(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self.embedded(item) for key, item in value.items()}
+        if isinstance(value, str):
+            for family in ("syntax", "class-ref"):
+                if family == "syntax" and value.startswith("sid:v1:"):
+                    return self.map(family, bytes.fromhex(value[7:]))
+                if family == "class-ref" and value.startswith("class-ref:"):
+                    return self.map(family, value)
+            return value
+        return value
+
+    def manifest(self):
+        manifest = json.loads(self.capture_bytes)
+        require(set(manifest) == {"formatVersion", "trustOrigin", "completion", "decoderVersion",
+                                 "profileId", "producer", "sourceSet", "sourceRevision",
+                                 "sourceManifestHash", "components", "metadata", "sourceDocuments",
+                                 "documents", "exclusions", "artifacts"}, "unknown admitted manifest field")
+        manifest["sourceSet"]["id"] = self.map("source-set", manifest["sourceSet"]["id"])
+        manifest["sourceSet"]["rootId"] = "<physical-root>"
+        manifest["sourceRevision"] = self.map("native-revision", manifest["sourceRevision"])
+        manifest["metadata"]["projectRoot"] = "file://<physical-root>"
+        manifest["sourceManifestHash"] = hashlib.sha256(canonical([
+            {"document": {"sourceSetId": "<source-set>", "language": language, "path": path},
+             "contentHash": content} for language, path, content in self.r1_docs])).hexdigest()
+        return manifest
+
+    @staticmethod
+    def stat(stat):
+        require(set(stat) == {"version", "kind", "size", "device", "inode",
+                              "mtimeSeconds", "mtimeNanoseconds", "ctimeSeconds",
+                              "ctimeNanoseconds"}, "unknown captured filesystem stat field")
+        require(stat["version"] == 1 and stat["kind"] in ("directory", "file"),
+                "unexpected captured filesystem stat")
+        for field_name in ("device", "inode", "mtimeSeconds", "mtimeNanoseconds",
+                           "ctimeSeconds", "ctimeNanoseconds"):
+            require(isinstance(stat[field_name], int), f"non-integer capture {field_name}")
+            stat[field_name] = "<root-local-stat>"
+        return stat
+
+    def row(self, table, cells):
+        # A per-table selected scope is established by parity_digest before this point.
+        if table == "native_source_sets":
+            require(cells["id"] == self.source_set and self.source_set.endswith(cells["root_id"]),
+                    "native source set is not tied to root identity")
+            cells["root_id"] = "<physical-root>"
+            cells["id"] = self.map("source-set", cells["id"])
+        if table == "native_revisions":
+            inventory = json.loads(cells["source_inventory"])
+            require(len(inventory) == len(self.docs), "selected native inventory is incomplete")
+            for item in inventory:
+                require(item["key"]["sourceSetId"] == self.source_set
+                        and item["revisionId"] == self.native_revision,
+                        "native inventory is not from selected root/revision")
+                item["key"]["sourceSetId"] = "<source-set>"
+                item["revisionId"] = "<r2>"
+            cells["source_inventory"] = inventory
+            cells["published_index_revision"] = "<current-revision>"
+        if table == "revision_documents":
+            if cells["capture_stat"] is not None:
+                stat = json.loads(cells["capture_stat"])
+                cells["capture_stat"] = self.stat(stat)
+        if table == "revision_capture_inputs":
+            key = cells["input_key"]
+            payload = json.loads(cells["payload"])
+            if key.startswith("executable:"):
+                require(key == "executable:" + str(BINARY), "unexpected native executable capture")
+                cells["input_key"] = "executable:<pinned-binary>"
+            if "stat" in payload:
+                payload["stat"] = self.stat(payload["stat"])
+            cells["payload"] = payload
+        if table == "semantic_raw_captures":
+            require(cells["binary_bytes"] == (self.db.execute(
+                "SELECT binary_bytes FROM semantic_raw_captures WHERE capture_id=?",
+                (cells["capture_id"],)).fetchone()[0]), "selected raw bytes changed")
+            cells["manifest_bytes"] = self.manifest()
+        if table == "semantic_import_reports":
+            report = json.loads(cells["report_json"])
+            require(set(report) == {"capturedRevision", "destinationRevision", "documents",
+                                    "languages", "producerId", "sourceSetId"},
+                    "unknown import report field")
+            report["capturedRevision"] = self.map("native-revision", report["capturedRevision"])
+            report["destinationRevision"] = self.map("native-revision", report["destinationRevision"])
+            report["sourceSetId"] = self.map("source-set", report["sourceSetId"])
+            cells["report_json"] = report
+        if table == "semantic_basis":
+            cells["source_manifest_hash"] = self.manifest()["sourceManifestHash"]
+        if table in {"graph_projections", "classes", "class_relations"}:
+            for column in ("class_extraction_payload", "class_summary_payload", "payload"):
+                if column in cells and cells[column] is not None:
+                    cells[column] = self.embedded(json.loads(cells[column]))
+        if table == "class_projections":
+            # The projection hash is a content digest of native root-derived IDs.
+            # It is replaced by the exact normalized class rows through cid linkage.
+            cells["content_hash"] = ("normalized-class-projection", self.map("cid", cells["cid"]))
+        if table == "graph_projections":
+            cells["graph_hash"] = ("normalized-graph-projection", self.map("gid", cells["gid"]))
+        if table == "document_versions":
+            cells["id"] = ("normalized-document-version", self.map("vid", cells["vid"]))
+            cells["extraction_context"] = ("normalized-native-context", cells["producer_id"],
+                                            cells["producer_version"], cells["language"])
+            cells["native_witness"] = ("normalized-native-witness", self.map("vid", cells["vid"]))
+        for column, value in list(cells.items()):
+            if value is None:
+                continue
+            family = None
+            if column in ("vid", "gid", "cid", "tuple_id", "basis_id", "capture_id", "symbol_id", "binding_id"):
+                family = column.removesuffix("_id") if column.endswith("_id") else column
+            elif column == "source_set_id":
+                family = "source-set"
+            elif column in ("revision_id", "captured_pin") or (table == "native_revisions" and column == "id"):
+                family = "pin"
+            elif column in ("native_revision_id", "captured_revision", "captured_native_revision_id",
+                            "join_native_revision_id", "internal_native_revision_id",
+                            "declared_internal_native_revision_id", "source_internal_native_revision_id",
+                            "target_internal_native_revision_id"):
+                family = "native-revision"
+            elif column in ("syntax_id", "owner_syntax_id", "internal_syntax_id",
+                            "declared_internal_syntax_id", "source_internal_syntax_id",
+                            "target_internal_syntax_id", "candidate_id"):
+                family = "syntax"
+            elif column in ("reference_id", "call_id", "region_id", "parent_id", "owner_id"):
+                family = ("occurrence" if column in ("reference_id", "call_id") else
+                          "syntax" if column == "owner_id" else "region")
+            elif column in ("provenance_id", "derived_from_provenance_id"):
+                family = "proof" if column == "derived_from_provenance_id" else "provenance"
+            elif column == "proof_id":
+                family = "proof"
+            elif table in ("native_version_references", "native_version_calls", "native_version_control_regions") and column == "id":
+                family = "region" if table == "native_version_control_regions" else "occurrence"
+            elif table == "graph_nodes" and column == "id":
+                family = "graph-node"
+            elif table == "graph_display_labels" and column == "id":
+                family = "graph-node"
+            elif table == "classes" and column == "id":
+                family = "class"
+            elif table == "class_relations" and column in ("owner", "target"):
+                family = "class"
+            elif table == "class_relations" and column == "id":
+                family = "class-ref"
+            if family:
+                cells[column] = self.map(family, value)
+        return cells
 
 
 def sha_file(path):
@@ -708,12 +1166,18 @@ def interrupt(signum, _frame):
 def main():
     global BINARY, EVIDENCE
     parser = argparse.ArgumentParser(description="#225 frozen mixed single-file gate; run sizes separately")
-    parser.add_argument("--size", choices=("medium", "large"), required=True)
+    parser.add_argument("--size", choices=("medium", "large"))
+    parser.add_argument("--smoke", action="store_true", help="untimed authenticated import/full/local probe")
     parser.add_argument("--binary", type=Path, help="already-built release binary; skips untimed cargo build")
     parser.add_argument("--evidence-dir", type=Path,
-                        help="new retained evidence directory (default: temporary directory, never auto-deleted)")
+                        help="new retained evidence directory (default: external target sibling, never auto-deleted)")
     args = parser.parse_args()
-    EVIDENCE = args.evidence_dir.resolve() if args.evidence_dir else Path(tempfile.mkdtemp(prefix="trellis-225-mixed-evidence-"))
+    require(args.smoke or args.size is not None, "--size required for measurements")
+    evidence_root = Path(os.environ.get("TRELLIS_PERFORMANCE_EVIDENCE_DIR",
+                                        str(TARGET_DIR.resolve().parent)))
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    EVIDENCE = (args.evidence_dir.resolve() if args.evidence_dir else
+                Path(tempfile.mkdtemp(prefix="trellis-90-mixed-", dir=evidence_root)))
     if args.evidence_dir:
         EVIDENCE.mkdir(parents=True, exist_ok=False)
     record("evidence", directory=str(EVIDENCE))
@@ -745,17 +1209,59 @@ def main():
     command(["node", str(GENERATOR), "--out", str(corpus)])
     require((corpus / "manifest.json").read_bytes() == pinned,
             "generator output does not exactly match pinned manifest bytes/hashes")
-    size = args.size
+    size = args.size or "medium"
     workspace, home = scratch / f"{size}-workspace", scratch / f"{size}-private-home"
     home.mkdir(mode=0o700)
-    shutil.copytree(corpus / size, workspace)
     daemon = Daemon(BINARY, home, "warm")
     measurements = {}
     try:
         daemon.start()
-        setup_seconds, initial = index(BINARY, workspace, daemon, size, cold_setup=True)
-        record("initial_cold", size=size, seconds=setup_seconds, **initial)
-        prior = initial["revision"]
+        prior, artifact, anchor, anchor_hash = seed_workspace(BINARY, corpus, workspace, daemon, size)
+        untimed_full_setup_revision = prior
+        if args.smoke:
+            language, relative, kind = planned_edit(size, "body", 0)
+            before = request_rows(home)
+            generation, number = prior.rsplit(":", 1)
+            started = time.monotonic()
+            wall = time.time_ns() / 1_000_000
+            edit_leaf(workspace / relative, language, kind)
+            _, local = index(BINARY, workspace, daemon, size, sample={
+                "before_requests": before, "start": started, "start_wall_ms": wall,
+                "expected_revision": f"{generation}:{int(number)+1}"})
+            require(local["publication_mode"] == "local", "smoke edit did not publish LOCAL")
+            with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
+                selected_proof(db, local["revision"], anchor.as_posix(), artifact)
+                check_changed_source(db, local["revision"], relative.as_posix(),
+                                     (workspace / relative).read_bytes())
+            require(sha_file(workspace / anchor) == anchor_hash, "local edit modified frozen anchor")
+            daemon.stop()
+            oracle_home = scratch / f"{size}-smoke-oracle-home"
+            oracle_home.mkdir(mode=0o700)
+            oracle_root = scratch / f"{size}-smoke-oracle-root"
+            oracle = Daemon(BINARY, oracle_home, "smoke-oracle")
+            try:
+                oracle.start()
+                oracle_revision, oracle_artifact, oracle_anchor, oracle_hash = seed_workspace(
+                    BINARY, corpus, oracle_root, oracle, size,
+                    edited={relative.as_posix(): workspace / relative})
+                require(sha_file(oracle_root / oracle_anchor) == oracle_hash == anchor_hash,
+                        "smoke oracle anchor changed")
+                with closing(sqlite3.connect(f"file:{db_for(oracle_home)}?mode=ro", uri=True)) as db:
+                    selected_proof(db, oracle_revision, oracle_anchor.as_posix(), oracle_artifact)
+            finally:
+                oracle.stop()
+            with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
+                selected_digest = parity_digest(db, local["revision"])
+            with closing(sqlite3.connect(f"file:{db_for(oracle_home)}?mode=ro", uri=True)) as db:
+                oracle_digest = parity_digest(db, oracle_revision)
+            (EVIDENCE / "smoke-selected-digest.json").write_text(json.dumps(selected_digest, indent=2) + "\n")
+            (EVIDENCE / "smoke-oracle-digest.json").write_text(json.dumps(oracle_digest, indent=2) + "\n")
+            require(selected_digest == oracle_digest, "smoke selected/native/raw-linked FULL oracle mismatch: " +
+                    json.dumps([table for table in selected_digest if selected_digest[table] != oracle_digest[table]]))
+            record("smoke_pass", r2=prior, local=local["revision"], oracle=oracle_revision,
+                   parity_tables=len(selected_digest), timed=False)
+            return
+        all_edited_paths = set()
         for shape in ("body", "declaration-surface", "class-projection"):
             samples = []
             edited_paths = set()
@@ -765,6 +1271,7 @@ def main():
                 path = relative.as_posix()
                 require(path not in edited_paths, f"duplicate path in {shape}: {path}")
                 edited_paths.add(path)
+                all_edited_paths.add(path)
                 before_sha = sha_file(leaf)
                 before_requests = request_rows(home)
                 prior_generation, prior_number = prior.rsplit(":", 1)
@@ -786,6 +1293,8 @@ def main():
                 require(own["revision"] == expected_revision, "sample did not publish exactly the next revision")
                 with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
                     check_changed_source(db, own["revision"], path, leaf.read_bytes())
+                    selected_proof(db, own["revision"], anchor.as_posix(), artifact)
+                    require(sha_file(workspace / anchor) == anchor_hash, "sample changed frozen anchor")
                     reuse = check_selected_local_ids(db, prior, own["revision"], path, size, n, shape)
                     if shape == "class-projection":
                         before_class = class_output(db, prior, path)
@@ -807,28 +1316,38 @@ def main():
             p95 = sorted(s["seconds"] for s in samples)[math.ceil(.95 * len(samples)) - 1]
             require(p95 <= limit, f"{size} {shape} p95 {p95}s exceeds {limit}s")
             # Stop the warm writer before the complete selected snapshot and
-            # independent same-root FULL oracle. Restart is untimed, never a
+            # separately rooted, independently admitted FULL oracle. Restart is untimed, never a
             # substitute for an edit publication.
             daemon.stop()
             with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
                 warm_digest = parity_digest(db, prior)
             oracle_home = scratch / f"{size}-{shape}-independent-home"
             oracle_home.mkdir(mode=0o700)
+            oracle_root = scratch / f"{size}-{shape}-independent-root"
             oracle = Daemon(BINARY, oracle_home, shape + "-oracle")
             try:
                 oracle.start()
-                cold_seconds, cold = index(BINARY, workspace, oracle, size, cold_setup=True)
+                oracle_revision, oracle_artifact, oracle_anchor, oracle_hash = seed_workspace(
+                    BINARY, corpus, oracle_root, oracle, size,
+                    edited={relative: workspace / relative for relative in all_edited_paths})
+                require(sha_file(oracle_root / oracle_anchor) == oracle_hash == anchor_hash,
+                        "oracle anchor not frozen")
+                with closing(sqlite3.connect(f"file:{db_for(oracle_home)}?mode=ro", uri=True)) as db:
+                    selected_proof(db, oracle_revision, oracle_anchor.as_posix(), oracle_artifact)
+                    cold = {"revision": oracle_revision, "mode": "full",
+                            "produced_native_facts": dict(db.execute(FACTS, (oracle_revision,)).fetchall())}
+                cold_seconds = None  # oracle setup is deliberately untimed
             finally:
                 oracle.stop()
             with closing(sqlite3.connect(f"file:{db_for(oracle_home)}?mode=ro", uri=True)) as db:
-                cold_digest = parity_digest(db, cold["revision"])
+                cold_digest = parity_digest(db, oracle_revision)
             (EVIDENCE / f"{shape}-warm-digest.json").write_text(json.dumps(warm_digest, indent=2, sort_keys=True) + "\n")
             (EVIDENCE / f"{shape}-full-digest.json").write_text(json.dumps(cold_digest, indent=2, sort_keys=True) + "\n")
             require(warm_digest == cold_digest, f"{size} {shape}: complete selected output differs from FULL: " +
                     json.dumps({key: [warm_digest.get(key), cold_digest.get(key)] for key in warm_digest.keys() | cold_digest.keys()
                                 if warm_digest.get(key) != cold_digest.get(key)}))
             measurements[shape] = {"runs": samples, "local_p95_seconds": p95, "local_threshold_seconds": limit,
-                                   "independent_cold_seconds": cold_seconds, "independent_cold": cold,
+                                   "independent_full_setup_seconds": cold_seconds, "independent_full": cold,
                                    "complete_selected_parity": warm_digest}
             record("shape_pass", size=size, shape=shape, local_p95_seconds=p95, samples=20, parity="complete selected FULL")
             if shape != "class-projection":
@@ -853,7 +1372,9 @@ def main():
                          "actual LOCAL watcher/request publisher recorded with pin-scoped diagnostics "
                          "and durable terminal-pin correlation; complete selected FULL parity after "
                          "each shape; no excluded failures"),
-              "cold_setup_seconds": setup_seconds, "cold_setup": initial, "measurements": measurements,
+              "untimed_full_setup_revision": untimed_full_setup_revision,
+              "selected_artifact_sha256": artifact,
+              "measurements": measurements,
               "evidence": str(EVIDENCE)}
     (EVIDENCE / "result.json").write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     print("REFERENCE_67_MIXED_RESULT=" + json.dumps(report, sort_keys=True), flush=True)
