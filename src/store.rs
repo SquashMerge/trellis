@@ -7730,6 +7730,7 @@ fn write_native(
         .iter()
         .map(|document| (&document.key, document))
         .collect();
+    let mut stored_sources: BTreeMap<i64, String> = BTreeMap::new();
     for c in &a.calls {
         check_cancel(cancel)?;
         if reuse.for_path(&c.document.path).native {
@@ -7743,30 +7744,28 @@ fn write_native(
             .get(&c.document)
             .copied()
             .context("native call missing validated document")?;
-        // A new streamed version was inserted above from this exact admitted
-        // file. Avoid one SQLite source BLOB read per native call. The public
-        // plain-artifact path still checks stored source bytes as before;
-        // reused native versions skip this loop entirely.
-        let stored_source: Option<Vec<u8>> = if captured_file.is_none() {
-            #[cfg(test)]
-            WRITER_SOURCE_SQL_READS.with(|reads| reads.set(reads.get() + 1));
-            Some(db.query_row(
-                "SELECT source_bytes FROM document_versions WHERE vid=?1 AND language=?2 AND path=?3",
-                params![vid, document.key.language, document.key.path],
-                |row| row.get(0),
-            )?)
-        } else {
-            None
-        };
+        // These versions were inserted above from the admitted captured files.
+        // Streamed writes borrow that text; plain artifacts read and decode each
+        // call-bearing version once. Reused native versions skip this loop.
         let source = if let Some(file) = captured_file {
             file.text.as_str()
         } else {
-            std::str::from_utf8(
-                stored_source
-                    .as_deref()
-                    .context("native stored source missing")?,
-            )
-            .context("native stored source is not UTF-8")?
+            match stored_sources.entry(vid) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut().as_str(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    #[cfg(test)]
+                    WRITER_SOURCE_SQL_READS.with(|reads| reads.set(reads.get() + 1));
+                    let bytes: Vec<u8> = db.query_row(
+                        "SELECT source_bytes FROM document_versions WHERE vid=?1 AND language=?2 AND path=?3",
+                        params![vid, document.key.language, document.key.path],
+                        |row| row.get(0),
+                    )?;
+                    let source = String::from_utf8(bytes)
+                        .map_err(|error| error.utf8_error())
+                        .context("native stored source is not UTF-8")?;
+                    entry.insert(source).as_str()
+                }
+            }
         };
         let callee_lookup_key =
             crate::native_evidence::verified_callee_lookup(&document.key.language, c, source);
