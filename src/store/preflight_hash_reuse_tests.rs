@@ -41,32 +41,62 @@ fn call_lookups(store: &Store) -> Vec<(String, Vec<u8>, Option<String>)> {
 }
 
 #[test]
-fn streamed_callee_lookups_equal_plain_without_source_blob_reads() {
-    let before = writer_source_sql_reads_for_tests();
-    let (_state, work, streamed, options, _pin) = fixture();
+fn streamed_callee_lookups_equal_plain_without_repeated_source_blob_reads() {
+    let stream_state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    fs::write(
+        work.path().join("A.java"),
+        "class A { int helper() { return 1; } int run() { return helper() + helper() + helper(); } }\n",
+    )
+    .unwrap();
+    fs::write(
+        work.path().join("b.js"),
+        "function helper() { return 1; } function b() { return helper() + helper(); }\n",
+    )
+    .unwrap();
+    fs::write(work.path().join("empty.rs"), "fn no_calls() {}\n").unwrap();
+    let options = IndexOptions::new(work.path().to_owned());
+    let streamed = Store::open_for_tests(stream_state.path(), work.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let before_stream = writer_source_sql_reads_for_tests();
+    IndexJobCoordinator::prepare(&streamed, None)
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
     let stream_lookups = call_lookups(&streamed);
-    assert!(
-        !stream_lookups.is_empty(),
-        "fixture must contain a native call"
-    );
-    assert_eq!(writer_source_sql_reads_for_tests() - before, 0);
+    assert_eq!(writer_source_sql_reads_for_tests() - before_stream, 0);
 
     let state = tempfile::tempdir().unwrap();
     let plain = Store::open_for_tests(state.path(), work.path()).unwrap();
-    let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
         crate::indexer::index_workspace_bundle(&options, plain.root_id(), &cancel, |_| {}).unwrap();
+    let mut calls_by_path = BTreeMap::new();
+    for call in &native.calls {
+        *calls_by_path
+            .entry(call.document.path.as_str())
+            .or_insert(0) += 1;
+    }
+    assert_eq!(calls_by_path, BTreeMap::from([("A.java", 3), ("b.js", 2)]));
+    assert!(graph.files.iter().any(|file| file.path == "empty.rs"));
     let baseline = plain.index_baseline().unwrap();
     let leader = plain.writer().unwrap();
-    plain
+    let before_plain = writer_source_sql_reads_for_tests();
+    let pin = plain
         .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
         .unwrap();
     assert_eq!(call_lookups(&plain), stream_lookups);
     assert_eq!(
-        writer_source_sql_reads_for_tests() - before,
-        native.calls.len(),
-        "plain artifact still checks stored source bytes for each call"
+        writer_source_sql_reads_for_tests() - before_plain,
+        2,
+        "plain artifact reads each call-bearing document once"
     );
+
+    let before_reuse = writer_source_sql_reads_for_tests();
+    plain
+        .publish_native(&graph, &capture, &native, &leader, pin, &cancel)
+        .unwrap();
+    assert_eq!(writer_source_sql_reads_for_tests() - before_reuse, 0);
+    assert_eq!(call_lookups(&plain), stream_lookups);
 }
 
 /// Overwrite one stored hash of A.java's selected rows with zeros.
