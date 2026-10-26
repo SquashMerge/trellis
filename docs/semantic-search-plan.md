@@ -7,6 +7,8 @@ issue, authorize implementation or a Feature Factory run, or amend the
 contract changes it implies (see [Contract fit](#contract-fit)) need their own review when the work
 is scheduled.
 
+The owner’s #211 D1–D13 rulings and later runtime/backend rulings are recorded in [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md), [#23](local-topology.md) and [#24](mcp-readonly-pilot-contract.md). Those records govern search; this plan/proposal is not ratified wholesale. Historical alternatives and counts below are not current implementation authority.
+
 ## Goal
 
 Let agents and people find code by meaning — "where do we validate the pin?", "code that retries on

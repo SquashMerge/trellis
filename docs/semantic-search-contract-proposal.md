@@ -5,6 +5,8 @@ search ([#211](https://github.com/SquashMerge/trellis/issues/211)) would need. I
 The ratified documents keep governing until the owner rules on each item below, and each ruling
 lands as an amendment to the record it changes, or as a new decision record:
 
+The owner’s #211 D1–D13 rulings and later runtime/backend rulings are recorded in [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md), [#23](local-topology.md) and [#24](mcp-readonly-pilot-contract.md). Those records govern search; this plan/proposal is not ratified wholesale. Historical alternatives and counts below are not current implementation authority.
+
 - [`semantic-evidence/contract-v1.md`](semantic-evidence/contract-v1.md) (#22);
 - [`local-topology.md`](local-topology.md) (#23);
 - [`mcp-readonly-pilot-contract.md`](mcp-readonly-pilot-contract.md) (#24);

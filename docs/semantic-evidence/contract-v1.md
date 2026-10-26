@@ -24,6 +24,8 @@ A document-level measured `module` owns top-level occurrences. Records resolve w
 
 ## Identity and coverage
 
+Semantic search’s vector completeness and selected backend are retrieval metadata, not evidence coverage, freshness or provenance. [Decision 0018](decisions/0018-semantic-symbol-retrieval.md) and [#24](../mcp-readonly-pilot-contract.md#trellis_search_symbols-211) define their separate `searchIndex` projection. No field is added to a #22 evidence record, and no warnings-v1 code is added.
+
 | Record.field | Type / nullability | Invariant | Failure or disposition |
 |---|---|---|---|
 | `Producer.id` | `Text` | Stable nonempty producer identity. | Invalid text rejects descriptor. |
