@@ -302,15 +302,14 @@ fn evidence_failure_code(error: &anyhow::Error) -> &'static str {
 
 /// One tool's read and projection inside an admitted snapshot. An error is
 /// either retryable contention or a failure to report with its wire code.
-type EvidenceToolRead<'a> = Box<
-    dyn Fn(
-            &crate::daemon::registry::CheckoutRuntime,
-            &crate::daemon::registry::CheckoutEvidence,
-            bool,
-            Option<&crate::daemon::search::SearchQuery>,
-        ) -> anyhow::Result<serde_json::Value>
-        + 'a,
->;
+type EvidenceToolReadFn<'a> = dyn Fn(
+        &crate::daemon::registry::CheckoutRuntime,
+        &crate::daemon::registry::CheckoutEvidence,
+        bool,
+        Option<&crate::daemon::search::SearchQuery>,
+    ) -> anyhow::Result<serde_json::Value>
+    + 'a;
+type EvidenceToolRead<'a> = Box<EvidenceToolReadFn<'a>>;
 
 #[cfg(feature = "test-support")]
 fn capture_evidence_error(
@@ -369,12 +368,7 @@ fn evidence_read(
     id: &serde_json::Value,
     #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
     query: Option<&str>,
-    read: &dyn Fn(
-        &crate::daemon::registry::CheckoutRuntime,
-        &crate::daemon::registry::CheckoutEvidence,
-        bool,
-        Option<&crate::daemon::search::SearchQuery>,
-    ) -> anyhow::Result<serde_json::Value>,
+    read: &EvidenceToolReadFn<'_>,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
     let cancelled = || cancel.load(std::sync::atomic::Ordering::Acquire);
     let runtime = loop {

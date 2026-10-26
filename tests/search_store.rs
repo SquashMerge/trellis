@@ -587,12 +587,17 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
     read.finish(()).unwrap();
     drop(read);
     store.corrupt_search_fts_for_tests(&leader).unwrap();
-    let read = store.evidence_response().unwrap();
-    assert!(
-        read.mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
-            .is_err(),
-        "termless query cannot hide required head table failure"
-    );
+    match store.evidence_response() {
+        Ok(read) => assert!(
+            read.mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
+                .is_err(),
+            "termless query cannot hide required head table failure"
+        ),
+        Err(error) => assert!(
+            error.to_string().starts_with("incompatible_index:"),
+            "missing required search table must fail admission: {error:#}"
+        ),
+    }
 }
 
 #[test]

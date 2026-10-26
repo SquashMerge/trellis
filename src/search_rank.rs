@@ -340,7 +340,7 @@ mod tests {
         assert!(
             rank(
                 &[],
-                &[candidate.key.clone()],
+                std::slice::from_ref(&candidate.key),
                 &BTreeMap::new(),
                 None,
                 &mut || Ok(())

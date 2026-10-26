@@ -1203,7 +1203,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        9
+        10
     );
     assert!(peer.finish().0.success());
     // Topology overlap is refused before marker attachment.
