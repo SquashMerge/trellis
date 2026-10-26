@@ -40,7 +40,7 @@ fn build_identity() {
             );
             commit
         }
-        Err(env::VarError::NotPresent) => git_commit().unwrap_or_else(|| "unknown".into()),
+        Err(env::VarError::NotPresent) => "dev".into(),
         Err(error) => panic!("TRELLIS_BUILD_COMMIT: {error}"),
     };
     let mut features: Vec<_> = env::vars()
@@ -69,30 +69,4 @@ fn build_identity() {
         "cargo:rustc-env=TRELLIS_BUILD_TOOLCHAIN={}",
         toolchain.trim()
     );
-}
-
-fn git_output(args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
-}
-
-fn git_commit() -> Option<String> {
-    // HEAD is per-worktree; branch refs and packed-refs can live in the common
-    // directory. Track both so branch switches, commits and ref packing refresh
-    // the descriptor even when no source file changed.
-    let mut paths = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
-    if let Some(reference) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
-        paths.push(reference);
-    }
-    for path in paths {
-        if let Some(path) = git_output(&["rev-parse", "--git-path", &path]) {
-            // An absent loose ref can appear after a commit on a packed branch.
-            // Watching it even while absent avoids retaining the previous commit.
-            println!("cargo:rerun-if-changed={path}");
-        }
-    }
-    git_output(&["rev-parse", "--verify", "HEAD"])
 }

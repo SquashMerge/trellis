@@ -41,7 +41,10 @@ fn executable_version_reports_compiled_identity_without_starting_a_daemon() {
         cfg!(feature = "metal")
     );
     assert!(build.embedding_capabilities.contains(&"cpu"));
-    assert!(!build.commit.is_empty());
+    assert_eq!(
+        build.commit,
+        option_env!("TRELLIS_BUILD_COMMIT").unwrap_or("dev")
+    );
     assert!(build.toolchain.starts_with("rustc "));
 }
 

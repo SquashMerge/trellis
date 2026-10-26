@@ -31,7 +31,9 @@ docker run --rm -v "$PWD:/work" trellis-release-glibc231 \
 ```
 
 Use `x86_64-unknown-linux-gnu` on the x86-64 runner. Set `TRELLIS_BUILD_COMMIT`
-to the tagged commit in CI. Do not enable `test-support` in a shipping binary.
+to the tagged commit in CI. Ordinary builds use the fixed commit label `dev`;
+Git commits and branch switches do not refresh build identity. Do not enable
+`test-support` in a shipping binary.
 Run the native suite separately on each supported platform. The browser suite
 can use a current native host; this is distinct from testing the packaged
 binary inside the baseline userspace.
