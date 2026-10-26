@@ -316,7 +316,10 @@ impl Peer {
                 .env("TRELLIS_TEST_MCP_PHASE_SOCKET", socket);
         }
         if let Some(socket) = causal_socket {
-            cmd.env("TRELLIS_TEST_MCP_CAUSAL_SOCKET", socket);
+            cmd.env("TRELLIS_TEST_MCP_CAUSAL_SOCKET", socket).env(
+                "TRELLIS_TEST_DAEMON_STDERR",
+                home.path().join("daemon-stderr.log"),
+            );
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -3685,6 +3688,7 @@ struct CausalReadiness {
     lineage: Option<(String, String)>,
     h_ready: bool,
     acked: Option<u64>,
+    minimum_request_seq: u64,
     pending: Option<u64>,
     announced_generations: std::collections::HashSet<u64>,
 }
@@ -3774,7 +3778,8 @@ impl CausalReadiness {
                 );
                 // CLI row completion is not startup/watch settlement. Earlier startup reconciliation ACKs
                 // may be observed, but only the accepted CLI pin binds this ACK.
-                if event["pin"] == *published {
+                let request_seq = event["requestSeq"].as_u64().expect("ACK request sequence");
+                if event["pin"] == *published && request_seq >= self.minimum_request_seq {
                     self.acked = Some(self.acked.map_or(generation, |prior| prior.max(generation)));
                 }
             }
@@ -3906,13 +3911,22 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     // emitted for a later accepted hint, so an ACK is never a future quiet lease.
     // The socket is read-only, private to HOME, and does not address a PID.
     let deadline = tokio::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
-    let mut events = 0;
-    let mut readiness = CausalReadiness::default();
+    let mut events = Vec::new();
+    // This fixture submits exactly one FIFO request. An earlier same-pin
+    // startup ACK cannot certify the public status after that no-op completes.
+    let mut readiness = CausalReadiness {
+        minimum_request_seq: 1,
+        ..Default::default()
+    };
     let mut next_event = async || {
-        events += 1;
-        assert!(events <= 24, "causal witness transition budget exhausted");
+        assert!(
+            events.len() < 24,
+            "causal witness transition budget exhausted"
+        );
+        println!("waiting for causal witness; CLI pin={published}; events={events:?}");
         let event = next_causal_event(&witness, deadline).await;
         assert_eq!(event["rootKey"], root_key, "foreign causal witness");
+        events.push(event.clone());
         event
     };
     // startup reconciliation and ACK must be from the SAME verified owner and watch epoch. If a
@@ -4126,7 +4140,30 @@ fn causal_fixture_event(
     json!({"kind":kind,"rootKey":"fixture","streamId":stream.to_string(),
       "streamSeq":seq,"lineageOrdinal":ordinal,
       "ownerIncarnation":owner.to_string(),"watchEpoch":epoch.to_string(),"pin":pin,
-      "watchGeneration":generation,"queueEmpty":kind == "WATCH_ACK"})
+      "watchGeneration":generation,"queueEmpty":kind == "WATCH_ACK","requestSeq":0})
+}
+
+#[test]
+fn causal_readiness_requires_post_request_ack_even_at_unchanged_pin() {
+    let stream = uuid::Uuid::new_v4();
+    let owner = uuid::Uuid::new_v4();
+    let epoch = uuid::Uuid::new_v4();
+    let pin = json!({"indexGeneration":uuid::Uuid::new_v4().to_string(),"indexRevision":1});
+    let mut state = CausalReadiness {
+        minimum_request_seq: 1,
+        ..Default::default()
+    };
+    for (seq, kind) in [(1, "WATCH_PENDING"), (2, "H_READY"), (3, "WATCH_ACK")] {
+        state.observe(
+            &causal_fixture_event(stream, seq, 1, owner, epoch, kind, &pin, 1),
+            &pin,
+        );
+    }
+    assert!(!state.settled(), "startup ACK predates the queued no-op");
+    let mut completed = causal_fixture_event(stream, 4, 1, owner, epoch, "WATCH_ACK", &pin, 1);
+    completed["requestSeq"] = json!(1);
+    state.observe(&completed, &pin);
+    assert!(state.settled(), "same-generation post-request ACK settles");
 }
 
 #[test]

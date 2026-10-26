@@ -265,6 +265,8 @@ pub struct DaemonState {
     causal_lineage_ordinal: Arc<AtomicU64>,
     #[cfg(feature = "test-support")]
     causal_startup_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
+    #[cfg(feature = "test-support")]
+    causal_watch_reported: Mutex<Option<crate::daemon::causal_witness::WatchAck>>,
     recovery_retry_after: Mutex<Option<Instant>>,
     /// Watcher health, published by the current watcher through one flag that
     /// lives as long as this state. Readers never wait for watcher work.
@@ -463,6 +465,8 @@ pub fn new_with_config(
         causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
         #[cfg(feature = "test-support")]
         causal_startup_reported: Mutex::new(None),
+        #[cfg(feature = "test-support")]
+        causal_watch_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         watcher_health: Arc::new(crate::watch::WatcherHealth::default()),
         retention_last_run: Mutex::new(Instant::now()),
@@ -1148,7 +1152,7 @@ impl DaemonState {
                 work.reconcile_queue_gate(&self.store, session, &selected, &self.watcher_cancel)?;
             self.publish_watch_status(work, &selected);
             if accounted {
-                self.finalize_watcher_gate(work, &selected, explicit.as_ref());
+                self.finalize_watcher_gate(explicit.as_ref());
             }
             // The gate's attempt is spent; a failed one defers this claim to
             // the next step, which claims unless the options changed again.
@@ -1165,6 +1169,17 @@ impl DaemonState {
     fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
         #[cfg(feature = "test-support")]
         let _held = self.worker_hold.read().unwrap();
+        let result = self.worker_step_inner();
+        self.publish_fifo_pending();
+        #[cfg(feature = "test-support")]
+        if result.is_ok() {
+            self.report_causal_startup_ready();
+            self.report_causal_watch_ack();
+        }
+        result
+    }
+
+    fn worker_step_inner(self: &Arc<Self>) -> anyhow::Result<()> {
         if self.retired() {
             return Ok(());
         }
@@ -1411,11 +1426,7 @@ impl DaemonState {
                         self.publish_watch_status(scheduler, &selected_options);
                         let accounted = reconciled?;
                         if accounted {
-                            self.finalize_watcher_gate(
-                                scheduler,
-                                &selected_options,
-                                explicit.as_ref(),
-                            );
+                            self.finalize_watcher_gate(explicit.as_ref());
                         }
                         #[cfg(test)]
                         self.test_queue_current_phase.store(5, Ordering::Release);
@@ -1431,12 +1442,7 @@ impl DaemonState {
         }
         Ok(())
     }
-    fn finalize_watcher_gate(
-        &self,
-        work: &crate::index_coordinator::WatcherWork,
-        selected: &IndexOptions,
-        explicit: Option<&Arc<IndexOptions>>,
-    ) {
+    fn finalize_watcher_gate(&self, explicit: Option<&Arc<IndexOptions>>) {
         // A later registration must not be cleared by an older completed gate.
         if let Some(applied) = explicit {
             let mut pending = self.explicit_pending.lock().unwrap();
@@ -1447,26 +1453,71 @@ impl DaemonState {
                 *pending = None;
             }
         }
-        #[cfg(not(feature = "test-support"))]
-        let _ = (work, selected);
-        #[cfg(feature = "test-support")]
-        if let Some(reporter) = self.causal_witness.lock().unwrap().clone()
-            && !work.accepted_watch_intent(selected)
-            && matches!(self.store.earliest_unfinished_request(), Ok(None))
-            && let (Some(lineage), Some(generation), Some(certified_pin)) = (
-                work.causal_lineage(),
-                work.accounted_watch_generation(),
-                work.accounted_watch_pin(),
-            )
-            && let Ok(session) = self.retained_serving_session()
-            && self.store.verify_writer_session(&session).is_ok()
-            && self
+    }
+
+    /// Certify the public status only after the owning step publishes it. The
+    /// request sequence prevents a same-pin startup ACK certifying a later no-op.
+    #[cfg(feature = "test-support")]
+    fn report_causal_watch_ack(&self) {
+        let Some(reporter) = self.causal_witness.lock().unwrap().clone() else {
+            return;
+        };
+        if self.fifo_pending() || self.checkout_watch_pending() {
+            return;
+        }
+        let explicit = self.explicit_pending.lock().unwrap().clone();
+        let Ok(selected) = self.selected_watch_options(explicit.as_ref()) else {
+            return;
+        };
+        let guard = self.watcher_work.lock().unwrap();
+        let Some((_, work)) = guard.as_ref() else {
+            return;
+        };
+        if work.accepted_watch_intent(&selected)
+            || !matches!(self.store.earliest_unfinished_request(), Ok(None))
+        {
+            return;
+        }
+        let (Some(lineage), Some(generation), Some(pin)) = (
+            work.causal_lineage(),
+            work.accounted_watch_generation(),
+            work.accounted_watch_pin(),
+        ) else {
+            return;
+        };
+        let Ok(request) = self.store.current_request() else {
+            return;
+        };
+        if request
+            .as_ref()
+            .is_some_and(|row| row.finished_at.is_none())
+        {
+            return;
+        }
+        let request_seq = request.map_or(0, |row| row.seq);
+        let Ok(session) = self.retained_serving_session() else {
+            return;
+        };
+        if lineage.owner_incarnation != session.incarnation()
+            || self.store.verify_writer_session(&session).is_err()
+            || !self
                 .store
                 .index_baseline()
-                .is_ok_and(|pin| pin == certified_pin)
-            && self.store.verify_writer_session(&session).is_ok()
+                .is_ok_and(|current| current == pin)
+            || self.store.verify_writer_session(&session).is_err()
         {
-            reporter.watch_ack(lineage, generation, certified_pin, true);
+            return;
+        }
+        let ack = crate::daemon::causal_witness::WatchAck {
+            lineage,
+            generation,
+            pin,
+            request_seq,
+        };
+        let mut reported = self.causal_watch_reported.lock().unwrap();
+        if reported.as_ref() != Some(&ack) {
+            reporter.watch_ack(lineage, generation, pin, true, request_seq);
+            *reported = Some(ack);
         }
     }
 

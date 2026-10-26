@@ -25,11 +25,19 @@ const MAX_RECORD_BYTES: usize = 512;
 const IO_DEADLINE: Duration = Duration::from_millis(500);
 
 /// The owner and watcher identities which make generation numbers comparable.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lineage {
     pub owner_incarnation: Uuid,
     pub watch_epoch: Uuid,
     pub ordinal: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WatchAck {
+    pub lineage: Lineage,
+    pub generation: u64,
+    pub pin: IndexPin,
+    pub request_seq: i64,
 }
 
 #[derive(Serialize)]
@@ -49,6 +57,8 @@ struct Event {
     pin: Option<IndexPin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue_empty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_seq: Option<i64>,
     #[serde(serialize_with = "serialize_uuid")]
     stream_id: Uuid,
     stream_seq: u64,
@@ -66,6 +76,7 @@ pub(crate) struct QueuedEvent {
     pub(crate) watch_generation: Option<u64>,
     pub(crate) pin: Option<IndexPin>,
     pub(crate) queue_empty: Option<bool>,
+    pub(crate) request_seq: Option<i64>,
 }
 
 /// Clone the `Arc<CausalWitness>` into each producer; it holds no root owner.
@@ -120,6 +131,7 @@ impl CausalWitness {
             watch_generation: None,
             pin: Some(pin),
             queue_empty: None,
+            request_seq: None,
         });
     }
 
@@ -130,11 +142,19 @@ impl CausalWitness {
             watch_generation: Some(generation),
             pin: None,
             queue_empty: None,
+            request_seq: None,
         });
     }
 
     /// A nonempty FIFO is not acknowledged; emit only after inventory drains.
-    pub fn watch_ack(&self, lineage: Lineage, generation: u64, pin: IndexPin, queue_empty: bool) {
+    pub fn watch_ack(
+        &self,
+        lineage: Lineage,
+        generation: u64,
+        pin: IndexPin,
+        queue_empty: bool,
+        request_seq: i64,
+    ) {
         if !queue_empty {
             return;
         }
@@ -144,6 +164,7 @@ impl CausalWitness {
             watch_generation: Some(generation),
             pin: Some(pin),
             queue_empty: Some(true),
+            request_seq: Some(request_seq),
         });
     }
 
@@ -182,6 +203,7 @@ async fn write_events(
             watch_generation: queued.watch_generation,
             pin: queued.pin,
             queue_empty: queued.queue_empty,
+            request_seq: queued.request_seq,
             stream_id,
             stream_seq,
         };
@@ -248,6 +270,7 @@ async fn send_error(
         watch_generation: None,
         pin: None,
         queue_empty: None,
+        request_seq: None,
         stream_id,
         stream_seq,
     };
@@ -308,7 +331,7 @@ mod tests {
         let owner = lineage();
         reporter.watch_pending(owner, 1);
         reporter.h_ready(owner, pin());
-        reporter.watch_ack(owner, 1, pin(), true);
+        reporter.watch_ack(owner, 1, pin(), true, 0);
         let mut stream_id = None;
         for (seq, kind) in [(1, "WATCH_PENDING"), (2, "H_READY"), (3, "WATCH_ACK")] {
             let event = receive_event(&listener).await;
@@ -346,7 +369,7 @@ mod tests {
         let owner = lineage();
         reporter.watch_pending(owner, 1);
         reporter.watch_pending(owner, 2); // deterministic backpressure before writer starts
-        reporter.watch_ack(owner, 2, pin(), true);
+        reporter.watch_ack(owner, 2, pin(), true, 0);
         assert!(failed.load(Ordering::Acquire));
         let writer = tokio::spawn(write_events(
             socket,
@@ -377,7 +400,7 @@ mod tests {
         reporter.watch_pending(owner, 1);
         reporter.watch_pending(owner, 2); // overflow cannot silently discard this hint
         assert!(failed.load(Ordering::Acquire));
-        reporter.watch_ack(owner, 2, pin(), true);
+        reporter.watch_ack(owner, 2, pin(), true, 0);
         assert_eq!(receiver.try_recv().unwrap().kind, "WATCH_PENDING");
         assert!(receiver.try_recv().is_err(), "no ACK after a lost hint");
     }
@@ -405,7 +428,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(failed.load(Ordering::Acquire));
-        reporter.watch_ack(owner, 1, pin(), true);
+        reporter.watch_ack(owner, 1, pin(), true, 0);
         assert!(failed.load(Ordering::Acquire));
     }
 }
