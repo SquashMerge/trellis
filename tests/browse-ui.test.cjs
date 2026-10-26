@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const source = fs.readFileSync(path.join(__dirname, "../web/sequence.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+const source = ["sequence.js", "shell.js", "files.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;
@@ -14,12 +14,12 @@ function deferred() {
 }
 const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SCOPED = `/api/checkouts/${ROOT}`;
-function harness(windowOptions = {}) {
+function harness(windowOptions = {}, withMetrics = false) {
   const elements = new Map(), blobs = [], downloads = [], timers = new Map();
   let nextTimer = 0;
   function node(tagName) {
     const classes = new Set();
-    return {tagName, classList: {add(value) { classes.add(value); }, contains(value) { return classes.has(value); }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
+    return {tagName, classList: {add(value) { classes.add(value); }, remove(value) { classes.delete(value); }, contains(value) { return classes.has(value); }, toggle(value, force) { const on = force ?? !classes.has(value); if (on) classes.add(value); else classes.delete(value); return on; }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
       addEventListener(type, handler) { this.listeners[type] = handler; },
       replaceChildren(...items) { this.children = items; },
       append(...items) { this.children.push(...items); },
@@ -28,15 +28,16 @@ function harness(windowOptions = {}) {
       click() { downloads.push(this.download); }};
   }
   function get(id) { if (!elements.has(id)) elements.set(id, node()); return elements.get(id); }
-  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController,
+  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController, URLSearchParams,
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; }, clearTimeout(id) { timers.delete(id); },
     window: {confirm: () => true, ...windowOptions},
     URL: {createObjectURL(blob) { blobs.push(blob); return "blob:synthetic"; }, revokeObjectURL() {}},
-    document: {getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
+    document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
+  if (withMetrics) run(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"));
   run(source);
-  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   // The app receives the production scoped URL; legacy suffixes below remain the
   // fixture handlers' semantic route names, never an unscoped network fallback.
   let handler = context.fetch;
@@ -53,18 +54,7 @@ function harness(windowOptions = {}) {
     if (!url.startsWith(`${SCOPED}/status`)) return result;
     return Promise.resolve(result).then(reply => reply.ok ? {...reply, json:async () => ({workspaceRoot:"/synthetic", ...await reply.json()})} : reply);
   };
-  const preserveNewFocus = () => {
-    run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
-      packet = {packetId:'new'}; focused = {marker:'new'};
-      $('focus-state').textContent = 'new valid focus'; $('error').hidden = true;`);
-    return run("packet");
-  };
-  const assertPreserved = newer => {
-    assert.equal(run("packet"), newer);
-    assert.equal(get("focus-state").textContent, "new valid focus");
-    assert.equal(get("error").hidden, true);
-  };
-  return {context, run, get, blobs, downloads, timers, networkUrls, preserveNewFocus, assertPreserved};
+  return {context, run, get, blobs, downloads, timers, networkUrls};
 }
 
 
@@ -460,7 +450,7 @@ test("successful reconnect clears an earlier authentication error", async () => 
   h.get('token').value='synthetic';
   h.context.fetch = async url => url === "/api/checkouts" ? response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]})
     : url === "/api/daemon/status" ? response({activeCheckouts:0}) : response(null);
-  h.run('refreshStatus=async()=>{}; loadSaved=async()=>{}; refreshJevStatus=async()=>{}; refreshAcpStatus=async()=>{}');
+  h.run('refreshStatus=async()=>{}');
   h.get('connect-form').listeners.submit({preventDefault(){}});
   await new Promise(resolve=>setImmediate(resolve));
   h.get('checkout-select').value=ROOT; await h.get('checkout-select').listeners.change({target:h.get('checkout-select')});
@@ -468,10 +458,11 @@ test("successful reconnect clears an earlier authentication error", async () => 
   assert.equal(h.get('workspace').hidden,false);
 });
 
-test("file browser puts optional controls behind collapsed details and reserves mobile tree space", () => {
+test("file browser keeps filtering visible, display options collapsed and mobile tree space reserved", () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'),'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'),'utf8');
-  assert.match(html, /<details class="browse-options"><summary>Filter &amp; display options<\/summary><label for="file-filter">/);
+  assert.match(html, /<label class="file-filter-label" for="file-filter">Filter loaded entries<\/label><input id="file-filter"/);
+  assert.match(html, /<details class="browse-options"><summary>Display options<\/summary>/);
   assert.doesNotMatch(html, /<details class="browse-options" open/);
   assert.match(css, /@media\s*\(max-width:\s*900px\)/);
   assert.match(css, /\.file-browser,\s*\.call-inspector\s*\{[^}]*position:\s*absolute;[^}]*top:\s*0;[^}]*bottom:\s*0;[^}]*width:\s*min\(310px,\s*88%\)/);
@@ -520,8 +511,7 @@ test("index scope mismatch stays in primary roots and action label, same root ad
 
 test("workspace change invalidates selections and source even when revision stays equal", async () => {
   const h = harness(), requests = [];
-  h.run(`status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, workspaceRoot:'/old'}; seed='old';
-    result={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},calls:[],nodes:[]}; packet={packetId:'old'}; focused={};
+  h.run(`status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, workspaceRoot:'/old'};
     selectedMethod={id:'old'}; sourceCache.set('old','cached');
     $('source').append(element('span','old source'));`);
   h.context.fetch = async path => {
@@ -530,7 +520,7 @@ test("workspace change invalidates selections and source even when revision stay
       : {...treePage('',[treeFile('new.rs')]),root:'/new',indexedWorkspace:'/new'});
   };
   await h.run('refreshStatus()');
-  for (const name of ['seed','result','packet','focused','selectedMethod']) assert.equal(h.run(name), null, name);
+  for (const name of ['selectedMethod']) assert.equal(h.run(name), null, name);
   assert.equal(h.run('sourceCache.size'), 0);
   assert.equal(h.get('source').children.length, 0);
   assert.ok(requests.some(path => path.startsWith('/api/tree')));
@@ -636,10 +626,10 @@ test("navigation source action forwards measured range and snapshot without sele
 test("same numeric revision with new generation clears browse and source state", async () => {
   const h = harness(), old = deferred();
   h.run(`status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:'/same'};
-    seed='old'; result={revision:status.revision,calls:[],nodes:[]}; sourceCache.set(IndexPin.key(status.revision)+':old.js',{file:{text:'old'}});`);
+    selectedMethod={id:'old'}; sourceCache.set(IndexPin.key(status.revision)+':old.js',{file:{text:'old'}});`);
   h.context.fetch = async url => url === '/api/status' ? response({revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1},workspaceRoot:'/same',stats:{}}) : response({...treePage('',[]),revision:{indexGeneration:'87654321-4321-4321-8321-abcdef123456',indexRevision:1}});
   await h.run('refreshStatus()');
-  assert.equal(h.run('seed'),null); assert.equal(h.run('result'),null);
+  assert.equal(h.run('selectedMethod'),null);
   assert.equal(h.run('sourceCache.size'),0);
   assert.equal(h.run('status.revision.indexGeneration'),'87654321-4321-4321-8321-abcdef123456');
 });
@@ -656,7 +646,7 @@ test("non-revision 409 preserves the loaded tree and reports its exact error", a
   h.context.fetch = async url => {
     requests.push(url);
     if (url.startsWith("/api/tree")) return response(treePage("", [treeFile("README.md", "README.md")]));
-    if (url.startsWith("/api/files") || url.startsWith("/api/methods") || url === "/api/query") return {ok:false,status:409,json:async()=>({error:{code:"storage_busy",message:"Storage is busy"}})};
+    if (url.startsWith("/api/files") || url.startsWith("/api/methods")) return {ok:false,status:409,json:async()=>({error:{code:"storage_busy",message:"Storage is busy"}})};
     if (url === "/api/status") return response({revision:oldPair,stats:{}});
     if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:oldPair,catalogId:null,packages:[],warnings:[]});
     throw Error(`Unexpected request ${url}`);
@@ -670,7 +660,7 @@ test("non-revision 409 preserves the loaded tree and reports its exact error", a
   await h.run("toggleFile({path:'README.md',methodCount:1})");
   assert.match(text(h.get("file-tree")), /Storage is busy/);
   assert.match(text(h.get("file-tree")), /README.md/);
-  await h.run("perform(() => api('/api/query'))");
+  await h.run("perform(() => api('/api/files'))");
   assert.match(text(h.get("file-tree")), /README.md/);
   assert.equal(h.get("error").textContent, "Storage is busy");
   assert.equal(requests.filter(url => url === "/api/status").length, 0);
@@ -704,157 +694,10 @@ test("revision_conflict reloads the complete new pair after clearing browse", as
 const oldPair = {indexGeneration:"12345678-1234-4123-8123-123456789abc", indexRevision:1};
 const newPair = {indexGeneration:"87654321-4321-4321-8321-abcdef123456", indexRevision:1};
 
-function canonicalSaved(kind, attachment, pair = oldPair) {
-  if (kind === "view") return {view:{id:"view-a",title:"Saved A",query:{seed:"target-a",depth:2,maxNodes:41,maxCalls:201,includeCallbacks:false,excludePaths:["vendor/"]},pins:{"target-a":{x:1,y:2}},hidden:["hidden-a"],anchor:{never:"echo"}},orphanedIds:[],...pair,attachment};
-  return {annotation:{id:"note-a",nodeId:"target-a",title:"Note A",body:"Body A",anchor:{never:"echo"}},orphaned:false,...pair,attachment};
-}
-const attached = () => ({availability:"ready",result:{status:"attached",targetId:"target-a",reason:"none"}});
-
-for (const kind of ["view", "note"]) test(`${kind} saved response normalization fails closed for legacy and malformed metadata`, () => {
-  const h=harness();
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'}`);
-  const raw=kind==="view"
-    ? {id:"raw",title:"Raw",query:{seed:"target-a"},anchor:{untrusted:true}}
-    : {id:"raw",nodeId:"target-a",body:"Raw",anchor:{untrusted:true}};
-  h.context.saved=raw;
-  assert.equal(h.run(`normalizeSavedState(saved,'${kind}').attachment.availability`),"anchorless");
-  const nested=kind==="view" ? {view:raw,orphanedIds:[]} : {annotation:raw,orphaned:false};
-  h.context.saved=nested;
-  assert.equal(h.run(`normalizeSavedState(saved,'${kind}').attachment.availability`),"anchorless");
-  const valid=canonicalSaved(kind,attached());h.context.saved=valid;
-  assert.equal(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').enabled`),true);
-  const partial={...valid,indexRevision:null};h.context.saved=partial;
-  assert.equal(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').enabled`),false);
-  const mismatch=canonicalSaved(kind,{availability:"ready",result:{status:"attached",targetId:"other",reason:"none"}});h.context.saved=mismatch;
-  assert.match(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').reason`),/does not match/);
-  for(const reason of ["missing","headerMismatch","groupChanged","unprovenContinuity"]){
-    h.context.saved=canonicalSaved(kind,{availability:"ready",result:{status:"orphaned",targetId:null,reason}});
-    const decision=h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}')`);
-    assert.equal(decision.enabled,false,reason);assert.notEqual(decision.reason,"",reason);
-  }
-  h.context.saved=canonicalSaved(kind,{availability:"indexUnavailable",result:null},{indexGeneration:null,indexRevision:null});
-  assert.match(h.run(`savedLoadDecision(normalizeSavedState(saved,'${kind}'),'${kind}').reason`),/unavailable/);
-});
-
-test("attached view and note Load send one immutable full-pin query for the original target", async () => {
-  const h=harness(), requests=[];
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='target-a'`);
-  h.context.viewSaved=canonicalSaved("view",attached());h.context.noteSaved=canonicalSaved("note",attached());
-  h.run("views=[normalizeSavedState(viewSaved,'view')];annotations=[normalizeSavedState(noteSaved,'note')];renderViews();renderNotes()");
-  h.context.fetch=async(url,opts)=>{requests.push({url,body:opts.body&&JSON.parse(opts.body)});return response({revision:oldPair,query:JSON.parse(opts.body),calls:[],nodes:[]});};
-  const viewLoad=descendants(h.get("views")).find(n=>n.attrs?.['data-action']==='load');
-  await viewLoad.listeners.click();
-  h.run("seed='wrong-selection'");
-  const noteLoad=descendants(h.get("annotations")).find(n=>n.attrs?.['data-action']==='load');
-  await noteLoad.listeners.click();
-  assert.equal(requests.length,2);
-  for(const request of requests){
-    const url=new URL(request.url,"http://local");
-    assert.equal(url.pathname,"/api/query");assert.equal(url.searchParams.get("indexGeneration"),oldPair.indexGeneration);assert.equal(url.searchParams.get("indexRevision"),"1");
-    assert.equal(request.body.seed,"target-a");assert.equal(request.body.depth,1);assert.equal(request.body.includeCallbacks,false);
-  }
-});
-
-for (const kind of ["view","note"]) test(`${kind} stale replay race keeps copied P and never retries at Q`, async () => {
-  const h=harness(), requests=[];
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='target-a'`);
-  h.context.saved=canonicalSaved(kind,attached());
-  h.run(kind==="view" ? "views=[normalizeSavedState(saved,'view')];renderViews()" : "annotations=[normalizeSavedState(saved,'note')];renderNotes()");
-  h.context.fetch=async(url,opts)=>{
-    requests.push({url,method:opts.method});
-    if(url.startsWith('/api/query?')) return {ok:false,status:409,json:async()=>({error:{code:'revision_conflict',message:'Index changed'}})};
-    if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',evidenceFormat:'native-v6',stats:{}});
-    if(url.startsWith('/api/tree?')) return response({...treePage('',[]),revision:newPair});
-    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
-    throw Error(`Unexpected request ${url}`);
-  };
-  h.run("globalThis.originalRunQuery=runQuery;runQuery=(query,pin)=>{status={...status,revision:"+JSON.stringify(newPair)+"};return globalThis.originalRunQuery(query,pin)}");
-  const load=descendants(h.get(kind==="view"?"views":"annotations")).find(n=>n.attrs?.['data-action']==='load');
-  await load.listeners.click();await new Promise(setImmediate);await new Promise(setImmediate);
-  const queries=requests.filter(r=>r.url.startsWith('/api/query?'));
-  assert.equal(queries.length,1);
-  const url=new URL(queries[0].url,"http://local");assert.equal(url.searchParams.get('indexGeneration'),oldPair.indexGeneration);assert.equal(url.searchParams.get('indexRevision'),'1');
-  assert.equal(h.run('result'),null);assert.match(h.get('error').textContent,/Index changed/);
-});
-
-for (const kind of ["view","note"]) test(`${kind} edit uses original identity, strips server metadata, and preserves a 409 draft`, async () => {
-  const h=harness(), requests=[];
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='wrong-selection';result={revision:status.revision,query:{seed:'wrong-selection'},calls:[],nodes:[]}`);
-  h.context.saved=canonicalSaved(kind,attached());
-  h.run(kind==="view" ? "views=[normalizeSavedState(saved,'view')];renderViews()" : "seed='target-a';annotations=[normalizeSavedState(saved,'note')];renderNotes()");
-  h.run("seed='wrong-selection'");
-  const listId=kind==="view"?"views":"annotations";
-  const editControl=descendants(h.get(listId)).find(n=>n.attrs?.['data-action']==='edit');
-  await editControl.listeners.click();
-  if(kind==="view") h.get('view-title').value='Edited title';
-  else {h.get('note-title').value='Edited note';h.get('note').value='Edited body';}
-  h.context.fetch=async(url,opts)=>{
-    const parsed=new URL(url,'http://local');requests.push({url,pathname:parsed.pathname,method:opts.method,body:opts.body&&JSON.parse(opts.body)});
-    if(opts.method==='PUT') return {ok:false,status:409,json:async()=>({error:{code:'revision_conflict',message:'Index changed'}})};
-    if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',evidenceFormat:'native-v6',stats:{}});
-    if(url.startsWith('/api/tree?')) return response({...treePage('',[]),revision:newPair});
-    if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
-    throw Error(`Unexpected request ${url}`);
-  };
-  h.get(kind==="view"?'save-form':'annotation-form').listeners.submit({preventDefault(){}});
-  await new Promise(setImmediate);await new Promise(setImmediate);
-  const puts=requests.filter(r=>r.method==='PUT');assert.equal(puts.length,1);
-  const put=puts[0], parsed=new URL(put.url,'http://local');assert.equal(parsed.searchParams.get('indexGeneration'),oldPair.indexGeneration);assert.equal(parsed.searchParams.get('indexRevision'),'1');
-  if(kind==="view"){
-    assert.deepEqual(put.body,{id:'view-a',title:'Edited title',query:{seed:'target-a',depth:2,maxNodes:41,maxCalls:201,includeCallbacks:false,excludePaths:['vendor/']},pins:{'target-a':{x:1,y:2}},hidden:['hidden-a']});
-    assert.equal(h.run('editingView.id'),'view-a');assert.equal(h.get('view-title').value,'Edited title');
-  } else {
-    assert.deepEqual(put.body,{id:'note-a',nodeId:'target-a',body:'Edited body',title:'Edited note'});
-    assert.equal(h.run('editingNote.id'),'note-a');assert.equal(h.get('note').value,'Edited body');
-  }
-  assert.equal(JSON.stringify(put.body).includes('anchor'),false);assert.equal(requests.filter(r=>r.method==='PUT').length,1);
-});
-
-test("saved list requests share one copied pin and a racing P batch cannot paint after Q", async () => {
-  const h=harness(), pendingViews=deferred(), pendingNotes=deferred(), urls=[];
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};views=[normalizeSavedState({id:'old',title:'Old',query:{seed:'target-a'}},'view')]`);
-  h.context.fetch=url=>{urls.push(url);return url.startsWith('/api/views?')?pendingViews.promise:pendingNotes.promise;};
-  const pending=h.run('loadSaved()');h.run(`status={...status,revision:${JSON.stringify(newPair)}}`);
-  pendingViews.resolve(response([canonicalSaved('view',attached())]));pendingNotes.resolve(response([canonicalSaved('note',attached())]));await pending;
-  assert.equal(h.run('views[0].view.id'),'old');
-  assert.equal(urls.length,2);
-  for(const raw of urls){const url=new URL(raw,'http://local');assert.equal(url.searchParams.get('indexGeneration'),oldPair.indexGeneration);assert.equal(url.searchParams.get('indexRevision'),'1');}
-});
-test("same-workspace conflict refresh keeps persisted views and notes while invalidating Load", async () => {
-  const h = harness(), requests = [];
-  const savedView = {view:{id:"v",title:"Keep view",query:{seed:"root",depth:1,includeCallbacks:false}},orphanedIds:[],...oldPair,
-    attachment:{availability:"ready",result:{status:"attached",targetId:"root",reason:"none"}}};
-  const savedNote = {annotation:{id:"n",nodeId:"root",body:"Keep note"},orphaned:false,...oldPair,
-    attachment:{availability:"ready",result:{status:"attached",targetId:"root",reason:"none"}}};
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'};seed='root';result={revision:status.revision,calls:[],nodes:[]}`);
-  h.context.fetch = async url => {
-    requests.push(url);
-    if (url.startsWith("/api/views?")) return response([savedView]);
-    if (url.startsWith("/api/annotations?")) return response([savedNote]);
-    if (url === "/api/status") return response({revision:newPair,workspaceRoot:"/same",evidenceFormat:"native-v6",stats:{}});
-    if (url === "/api/tree?path=&offset=0&limit=200") return response({...treePage("",[]),revision:newPair});
-    if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:newPair,catalogId:null,packages:[],warnings:[]});
-    return {ok:false,status:409,json:async()=>({error:{code:"revision_conflict",message:"Index changed"}})};
-  };
-  await h.run("loadSaved()");
-  assert.equal(descendants(h.get("views")).find(n=>n.attrs?.['data-action']==='load').disabled,false);
-  assert.equal(descendants(h.get("annotations")).find(n=>n.attrs?.['data-action']==='load').disabled,false);
-  await h.run("perform(() => api('/api/query','POST',{seed:'root'}))");
-  await new Promise(setImmediate);
-  assert.equal(h.run("status.revision.indexGeneration"),newPair.indexGeneration);
-  assert.equal(h.run("result"),null);
-  assert.match(text(h.get("views")),/Keep view/);
-  assert.equal(h.run("views[0].view.id"),"v");
-  assert.equal(h.run("annotations[0].annotation.body"),"Keep note");
-  assert.equal(descendants(h.get("views")).find(n=>n.attrs?.['data-action']==='load').disabled,true);
-  assert.equal(descendants(h.get("annotations")).find(n=>n.attrs?.['data-action']==='load').disabled,true);
-  assert.ok(requests.includes("/api/status"));
-});
-
 test("producer and browse boundaries use complete pairs and reject reused revision responses", async () => {
-  for (const operation of ["search", "query", "files", "methods", "sequence", "tree"]) {
+  for (const operation of ["files", "methods", "sequence", "tree"]) {
     const h=harness(), requests=[];
-    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root'`);
+    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}`);
     h.context.fetch=async (url,opts) => {
       requests.push({url,body:opts.body && JSON.parse(opts.body)});
       if (url==="/api/status") return response({revision:newPair,workspaceRoot:"/same",stats:{}});
@@ -862,13 +705,9 @@ test("producer and browse boundaries use complete pairs and reject reused revisi
       if (url.startsWith("/api/tree") && requests.some(r=>r.url==="/api/status")) return response({...treePage("",[]),revision:newPair});
       if (url.startsWith("/api/tree")) return response({...treePage("",[]),revision:newPair});
       if (url==="/api/sequence") return response({...view("root"),revision:newPair});
-      if (url==="/api/query") return response({revision:newPair,calls:[],nodes:[],seed:"root"});
-      if (url==="/api/symbols?q=&limit=80") return response({revision:newPair,items:[]});
       return response({revision:newPair,items:[],nextOffset:null});
     };
     const file={path:"src/a.js",methodCount:1};
-    if(operation==="search") await h.run(`perform(() => $('search-form').listeners.submit({preventDefault(){}}))`);
-    if(operation==="query") await h.run("perform(() => runQuery())");
     if(operation==="files") await h.run("loadFiles(true)");
     if(operation==="methods") await h.run(`toggleFile(${JSON.stringify(file)})`);
     if(operation==="sequence") {h.run(`selectedMethod=${JSON.stringify(symbol("root"))}`);await h.run("loadSequence()");}
@@ -881,10 +720,10 @@ test("producer and browse boundaries use complete pairs and reject reused revisi
       assert.equal(query.get("indexRevision"),"1",operation);
     }
     if(operation==="sequence") assert.deepEqual(first.body.expectedRevision,oldPair);
-    if (["search","query","tree"].includes(operation)) assert.doesNotMatch(first.url, /indexGeneration|indexRevision/);
+    if (["tree"].includes(operation)) assert.doesNotMatch(first.url, /indexGeneration|indexRevision/);
     assert.ok(requests.some(r=>r.url==="/api/status"),operation);
     assert.equal(h.run("status.revision.indexGeneration"),newPair.indexGeneration,operation);
-    assert.equal(h.run("result"),null,operation);
+    assert.equal(h.run("selectedMethod"),null,operation);
   }
 });
 
@@ -926,20 +765,18 @@ test("tree mismatch discovered during status reconciliation gets one bounded fol
 
 test("late source generation mismatch clears every derived panel before status resolves", async () => {
   const h=harness(), source=deferred(), statusRead=deferred(), requests=[];
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}; seed='root';
-    result={revision:status.revision,calls:[],nodes:[]}; packet={packetId:'p',revision:status.revision};
-    focused={revision:status.revision,calls:[],nodes:[]}; selectedMethod={id:'m'};`);
+  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'}; selectedMethod={id:'m'};`);
   h.get('source').scrollIntoView=()=>{};
   h.context.fetch=url=>{requests.push(url);return url==='/api/status'?statusRead.promise:source.promise;};
   const pending=h.run(`perform(() => showSource({path:'x.rs',range:{startLine:1,endLine:1}},status.revision))`);
   source.resolve(response({revision:newPair,file:{path:'x.rs',text:'old'}}));
   await pending;
   assert.ok(requests.includes('/api/status'));
-  for (const value of ['result','packet','focused','selectedMethod','seed']) assert.equal(h.run(value),null,value);
+  for (const value of ['selectedMethod']) assert.equal(h.run(value),null,value);
   assert.equal(h.get('source').children.length,0);
   statusRead.resolve(response({revision:oldPair,workspaceRoot:'/same',stats:{}}));
   await new Promise(setImmediate);
-  assert.equal(h.run('result'),null);
+  assert.equal(h.run('selectedMethod'),null);
 });
 
 
@@ -976,48 +813,6 @@ test("later tree page cannot mix equal numeric revisions from distinct generatio
 });
 
 
-test("same-workspace automatic pair refresh retains list/save/delete payloads for views and notes", async () => {
- const h=harness(), calls=[];
- let viewsData=[], notesData=[];
- h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same',evidenceFormat:'native-v6'}; seed='root'; result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:0,includeCallbacks:false}}`);
- h.context.crypto={randomUUID:(()=>{let n=0;return ()=>`item-${++n}`;})()};
- h.context.fetch=async(url,opts)=>{
-   const parsed=new URL(url,'http://local');
-   calls.push({url,pathname:parsed.pathname,params:parsed.searchParams,method:opts.method,body:opts.body && JSON.parse(opts.body)});
-   if(url==='/api/status') return response({revision:newPair,workspaceRoot:'/same',evidenceFormat:'native-v6',stats:{}});
-   if(url.startsWith('/api/tree?')) return response({...treePage('',[]),revision:newPair});
-   if(url==='/api/dependencies') return response({state:'disabled',workspaceRevision:newPair,packages:[],warnings:[]});
-   if(parsed.pathname==='/api/views' && opts.method==='GET') return response(viewsData);
-   if(parsed.pathname==='/api/annotations' && opts.method==='GET') return response(notesData);
-   if(parsed.pathname==='/api/views/item-1' && opts.method==='PUT') {viewsData=[{view:JSON.parse(opts.body)}];return response({});}
-   if(parsed.pathname==='/api/annotations/item-2' && opts.method==='PUT') {notesData=[{annotation:JSON.parse(opts.body)}];return response({});}
-   if(parsed.pathname==='/api/views/item-1' && opts.method==='DELETE') {viewsData=[];return response(null);}
-   if(parsed.pathname==='/api/annotations/item-2' && opts.method==='DELETE') {notesData=[];return response(null);}
-   return response({revision:newPair,items:[],nextOffset:null});
- };
- await h.run('loadFiles(true)'); await new Promise(setImmediate);
- assert.equal(h.run('status.revision.indexGeneration'),newPair.indexGeneration);
- await h.run('loadSaved()');
- const listCalls=calls.filter(c=>['/api/views','/api/annotations'].includes(c.pathname)&&c.method==='GET');
- assert.equal(listCalls.length,2);
- for(const call of listCalls){assert.equal(call.params.get('indexGeneration'),newPair.indexGeneration);assert.equal(call.params.get('indexRevision'),'1');}
- h.run(`result={revision:status.revision,calls:[],nodes:[],query:{seed:'root',depth:1}}; seed='root'; renderResult()`);
- h.get('view-title').value='Keep';h.get('save-form').listeners.submit({preventDefault(){}}); await new Promise(setImmediate); await new Promise(setImmediate);
- h.get('note').value='Remember';h.get('annotation-form').listeners.submit({preventDefault(){}});await new Promise(setImmediate);await new Promise(setImmediate);
- const viewPut=calls.find(c=>c.pathname==='/api/views/item-1'&&c.method==='PUT');
- const notePut=calls.find(c=>c.pathname==='/api/annotations/item-2'&&c.method==='PUT');
- for(const call of [viewPut,notePut]){assert.equal(call.params.get('indexGeneration'),newPair.indexGeneration);assert.equal(call.params.get('indexRevision'),'1');}
- assert.deepEqual(viewPut.body,{id:'item-1',title:'Keep',query:{seed:'root',depth:1,maxNodes:40,maxCalls:200,includeCallbacks:false,excludePaths:[]},pins:{},hidden:[]});
- assert.deepEqual(notePut.body,{id:'item-2',nodeId:'root',body:'Remember'});
- const viewDelete=descendants(h.get('views')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
- const noteDelete=descendants(h.get('annotations')).find(n=>n.tagName==='button'&&n.textContent==='Delete');
- viewDelete.listeners.click();noteDelete.listeners.click();await new Promise(setImmediate);await new Promise(setImmediate);
- assert.equal(calls.find(c=>c.pathname==='/api/views/item-1'&&c.method==='DELETE').body,undefined);
- assert.equal(calls.find(c=>c.pathname==='/api/annotations/item-2'&&c.method==='DELETE').body,undefined);
- assert.equal(h.run('views.length + annotations.length'),0);
-});
-
-
 test("request handlers reject bare numeric pins without sending a request", async () => {
  const h=harness(), requests=[];h.context.fetch=async url=>{requests.push(url);throw Error('invalid request was sent');};
  await assert.rejects(h.run("showSource({path:'x',range:{startLine:1,endLine:1}},1)"),/snapshot pair|revision/);
@@ -1025,27 +820,10 @@ test("request handlers reject bare numeric pins without sending a request", asyn
 });
 
 
-test("old target IDs never enable follow-up graph queries", async () => {
-  const h = harness(), requests = [];
-  const target = {...symbol("target"), kind:"method"};
-  const root = {...symbol("root"), kind:"method"};
-  const call = {id:"entry",caller:"root",target:"target",candidateSymbols:["target"],calleeText:"target",path:"src/a.js",range:{startLine:2,endLine:2},resolution:"internal"};
-  h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';`);
-  h.context.result = {revision:oldPair,nodes:[root,target],calls:[call]};
-  h.context.fetch = async url => { requests.push(url); throw Error("Unexpected request " + url); };
-  h.run("result = globalThis.result; renderResult()");
-  assert.equal(descendants(h.get("calls")).some(n => n.textContent === "Expand outgoing calls"), false);
-  assert.equal(descendants(h.get("calls")).some(n => n.textContent === "Read call-site source"), true);
-  assert.equal(descendants(h.get("nodes")).some(n => n.textContent === "target · method"), false);
-  assert.equal(requests.length, 0);
-});
-
 test("failed status reconciliation allows the next unexpected pair to retry", async () => {
   for (const failure of ["network","http"]) {
     const h=harness(), requests=[];
-    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};seed='root';
-      result={revision:status.revision,calls:[],nodes:[]};packet={packetId:'old',revision:status.revision};
-      focused={revision:status.revision,calls:[],nodes:[]};selectedMethod={id:'old'};`);
+    h.run(`status={revision:${JSON.stringify(oldPair)},workspaceRoot:'/same'};selectedMethod={id:'old'};`);
     h.context.fetch=async (url, options) => {
       requests.push({url,method:options.method});
       if(url==='/api/status') {
@@ -1066,7 +844,7 @@ test("failed status reconciliation allows the next unexpected pair to retry", as
     await h.run('loadFiles(true)'); await new Promise(setImmediate); await new Promise(setImmediate);
     assert.equal(requests.filter(r=>r.url==='/api/status').length,2,failure);
     assert.equal(h.run('status.revision.indexGeneration'),newPair.indexGeneration,failure);
-    for(const value of ['result','packet','focused','selectedMethod','seed']) assert.equal(h.run(value),null,`${failure}: ${value}`);
+    for(const value of ['selectedMethod']) assert.equal(h.run(value),null,`${failure}: ${value}`);
     assert.ok(requests.length<=6,`${failure}: bounded requests`);
     assert.ok(requests.every(r=>! /questions|answer|provider/.test(r.url)));
     assert.equal(requests.filter(r=>r.url.startsWith('/api/files')).length,2);
@@ -1074,49 +852,152 @@ test("failed status reconciliation allows the next unexpected pair to retry", as
   }
 });
 
-test("new terminal DTO keeps measured call source without candidate traversal", () => {
-  const h=harness(), root={...symbol("root"),kind:"method"};
-  h.context.result={revision:oldPair,nodes:[root],calls:[{id:"terminal",caller:"root",calleeText:"open",path:"src/a.js",range:{startLine:4,endLine:4}}],regions:[]};
-  h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';result=globalThis.result;renderResult()`);
-  const rows=descendants(h.get("calls"));
-  assert.ok(rows.some(item=>item.textContent==="Read call-site source"));
-  assert.ok(rows.some(item=>item.textContent==="Syntax only · target unverified"));
-  assert.equal(rows.some(item=>item.textContent==="Expand outgoing calls"),false);
+test("shared source rejects missing, empty, inverted and noninteger witnessed ranges",async()=>{
+ const h=harness(), requests=[];
+ h.context.fetch=async url=>{requests.push(url);return response({revision:oldPair,file:{path:"src/a.js",text:"measured"}});};
+ for(const item of [
+   {path:"",range:{startLine:1,endLine:2}},
+   {path:"src/a.js",range:{startLine:3,endLine:2}},
+   {path:"src/a.js",range:{startLine:1.5,endLine:2}},
+   {path:"src/a.js",range:{startLine:1,endLine:2,startByte:8,endByte:3}},
+   {path:"src/a.js"}
+ ]) {
+   h.context.item=item;
+   await assert.rejects(h.run("showSource(item,status.revision)"),/Measured source path and range unavailable/);
+ }
+ assert.equal(requests.length,0);
 });
 
-test("saved callback setting never reaches an old query endpoint", async () => {
-  const h=harness(), requests=[];
-  h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';`);
-  h.context.fetch=async(url,opts)=>{requests.push({url,body:opts.body&&JSON.parse(opts.body)});return response({revision:oldPair,nodes:[],calls:[]});};
-  await h.run("runQuery({seed:'root',depth:5,includeCallbacks:true,maxNodes:40,maxCalls:200,excludePaths:[]})");
-  assert.equal(requests[0].url,"/api/query");
-  assert.equal(requests[0].body.depth,1);
-  assert.equal(requests[0].body.includeCallbacks,false);
+const metricPin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+const metricFile = {path:"src/a.js",sourceSetId:"main",language:"javascript",declarationCount:1,roleCounts:{production:1,test:0},metrics:{cognitive:7}};
+const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,metricsVersion:"metrics:v1",scope,aggregate:"max",role:"production",files,directories,topCognitive:[]},catchingUp:false});
+
+test("selecting a sequence step fences an already pending file metrics inspection", async () => {
+  const h = harness({}, true), pending = deferred();
+  const step = {id:"selected-call",kind:"call",label:"Selected call",path:"src/a.js",range:{startLine:2,endLine:2},target:"unknown",children:[],alternate:[]};
+  const data = {...view("root"),steps:[step]};
+  h.context.fetch = async request => {
+    if (request === "/api/sequence") return response(data);
+    if (request.startsWith("/api/metrics?")) return new URL(request,"http://test").searchParams.get("scope") === "revision" ? metricsResponse("revision") : pending.promise;
+    if (request.startsWith("/api/methods?")) return response({...metricPin,revision:metricPin,items:[],truncated:false});
+    throw new Error("Unexpected " + request);
+  };
+  await h.run(`selectMethod(${JSON.stringify(symbol("root"))})`);
+  await h.run("viewerMetrics.refresh()");
+  h.run("files=[{path:'src/a.js',methodCount:1}]; renderFiles()");
+  const file = descendants(h.get("file-tree")).find(node => node.tagName === "button" && node.title === "src/a.js");
+  await file.listeners.click();
+  assert.equal(h.get("metric-inspector").hidden, false);
+  const pick = descendants(h.get("sequence-diagram")).find(node => node.attrs?.class?.split(" ").includes("sequence-source"));
+  pick.listeners.click();
+  assert.equal(h.get("inspector-title").textContent, "Selected call");
+  assert.equal(h.get("metric-inspector").hidden, true);
+  pending.resolve(metricsResponse("file"));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.get("metric-inspector").hidden, true);
+  assert.equal(h.get("metric-inspector-values").children.length, 0);
+  assert.equal(h.get("inspector-title").textContent, "Selected call");
+  assert.equal(h.get("inspector-open-source").disabled, false);
+  assert.equal(h.networkUrls.some(url => /\/source\?/.test(url)), false);
 });
 
-test("missing or malformed call-site range stays non-actionable on an old DTO",()=>{
-  const h=harness(), root={...symbol("root"),kind:"method"};
-  h.context.result={revision:oldPair,nodes:[root],calls:[
-    {id:"missing",caller:"root",target:"guessed",calleeText:"open",path:"src/a.js"},
-    {id:"invalid",caller:"root",target:"guessed",calleeText:"open",path:"src/a.js",range:{startLine:7,endLine:2}}
-  ],regions:[]};
-  h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';result=globalThis.result;renderResult()`);
-  const rows=descendants(h.get("calls"));
-  assert.equal(rows.filter(item=>item.textContent==="Read call-site source").length,0);
-  assert.equal(rows.filter(item=>item.textContent==="Expand outgoing calls").length,0);
-  assert.equal(rows.filter(item=>item.textContent==="Call site · source unavailable").length,2);
+test("cwd compact directory metrics use the terminal indexed-relative path, never an outside prefix", async () => {
+  const h = harness({}, true), inspections = [];
+  const rows = ["", "src"].map(path => ({path,sourceSetId:"main",declarationCount:1,metrics:{cognitive:path ? 8 : 2}}));
+  h.context.fetch = async request => {
+    const query = new URL(request,"http://test").searchParams;
+    if (request.startsWith("/api/metrics?")) {
+      if (query.get("scope") !== "revision") inspections.push(query.get("path"));
+      return metricsResponse(query.get("scope"),{files:[],directories:rows.filter(row => query.get("scope") === "revision" || row.path === query.get("path"))});
+    }
+    throw new Error("Unexpected " + request);
+  };
+  h.run(`treeMode=true; treeRoot='/cwd'; indexedWorkspace='/cwd/sample';
+    directories.set('',{open:true,items:${JSON.stringify([folder('sample'),folder('sample-old')])},nextOffset:null,truncated:false});
+    directories.set('sample',{open:false,items:${JSON.stringify([folder('sample/src')])},nextOffset:null,truncated:false});
+    directories.set('sample/src',{open:false,items:[],nextOffset:null,truncated:false});
+    directories.set('sample-old',{open:false,items:[],nextOffset:null,truncated:false});`);
+  await h.run("viewerMetrics.refresh()");
+  const compact = descendants(h.get("file-tree")).find(node => node.title === "sample/src/");
+  assert.ok(compact);
+  assert.match(text(compact), /8/);
+  await compact.listeners.click(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(inspections, ["src"]);
+  assert.equal(h.get("metric-inspector-title").textContent, "src");
+  const outside = descendants(h.get("file-tree")).find(node => node.title === "sample-old/");
+  await outside.listeners.click(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(inspections, ["src"]);
+  assert.equal(h.get("metric-inspector").hidden, true);
+  assert.equal(h.run("metricDirectorySelection('sample').path"), "");
+  assert.equal(h.run("metricDirectorySelection('')"), null);
+  assert.equal(h.run("metricDirectorySelection('sample-old')"), null);
 });
 
-test("root and call source actions reject missing, empty, inverted and noninteger witnessed ranges",()=>{
- const h=harness(), root={...symbol("root"),kind:"method",path:"src/a.js",range:{startLine:3,endLine:2}};
- h.context.result={revision:oldPair,nodes:[root],calls:[
-   {id:"empty",caller:"root",path:"",range:{startLine:1,endLine:2}},
-   {id:"float",caller:"root",path:"src/a.js",range:{startLine:1.5,endLine:2}},
-   {id:"byte",caller:"root",path:"src/a.js",range:{startLine:1,endLine:2,startByte:8,endByte:3}},
-   {id:"good",caller:"root",path:"src/a.js",range:{startLine:1,endLine:2},calleeText:"measured"}],regions:[]};
- h.run(`status={revision:${JSON.stringify(oldPair)}};seed='root';result=globalThis.result;renderResult()`);
- const rows=descendants(h.get("calls"));
- assert.equal(rows.filter(item=>item.textContent==="Read root source").length,0);
- assert.equal(rows.filter(item=>item.textContent==="Read call-site source").length,1);
- assert.equal(rows.filter(item=>item.textContent==="Expand outgoing calls").length,0);
+for (const transition of ["root", "session", "generation"]) test(`${transition} change clears metrics projection, selection and pending inspection`, async () => {
+  const h = harness({}, true), pending = deferred();
+  const changedPin = {...metricPin,indexGeneration:"87654321-4321-4321-8321-cba987654321"};
+  h.context.fetch = async request => {
+    if (request.startsWith("/api/metrics?")) {
+      const query = new URL(request,"http://test").searchParams;
+      return query.get("scope") !== "revision" ? pending.promise : query.get("indexGeneration") === changedPin.indexGeneration
+        ? metricsResponse("revision",{pin:changedPin,files:[]}) : metricsResponse("revision");
+    }
+    if (request === "/api/status") return response({workspaceRoot:"/synthetic",revision:changedPin,stats:{}});
+    if (request.startsWith("/api/tree?")) return response({...treePage("",[]),root:"/synthetic",indexedWorkspace:"/synthetic",revision:changedPin});
+    if (request === "/api/dependencies") return response({state:"disabled",workspaceRevision:changedPin,catalogId:null,packages:[],warnings:[]});
+    throw new Error("Unexpected " + request);
+  };
+  await h.run("viewerMetrics.refresh()");
+  h.run("files=[{path:'src/a.js',methodCount:1}]; renderFiles()");
+  assert.match(text(h.get("metric-legend")), /Displayed/);
+  const inspection = h.run("viewerMetrics.inspect({scope:'file',path:'src/a.js'})");
+  assert.equal(h.get("metric-inspector").hidden, false);
+  if (transition === "root") h.run("resetCheckout()");
+  if (transition === "session") h.get("logout").listeners.click();
+  if (transition === "generation") await h.run("refreshStatus()");
+  pending.resolve(metricsResponse("file")); await inspection;
+  assert.equal(h.get("metric-inspector").hidden, true);
+  assert.equal(h.get("metric-inspector-values").children.length, 0);
+  assert.equal(h.get("metric-inspector-top").children.length, 0);
+  assert.doesNotMatch(text(h.get("metric-legend")), /Displayed/);
+  assert.equal(h.run("viewerMetrics.decorate(document.createElement('button'),{scope:'file',path:'src/a.js'}).value"), undefined);
+});
+
+test("a listed generation-only snapshot change clears derived UI before awaiting status rebind", async () => {
+  const h = harness({}, true), statusReply = deferred();
+  const nextPin = {...metricPin,indexGeneration:"87654321-4321-4321-8321-cba987654321"};
+  h.context.fetch = async request => {
+    if (request === "/api/checkouts") return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",revision:nextPin,catchingUp:false}]});
+    if (request === "/api/status") return statusReply.promise;
+    if (request.startsWith("/api/metrics?")) {
+      const query = new URL(request,"http://test").searchParams;
+      return metricsResponse(query.get("scope"),query.get("indexGeneration") === nextPin.indexGeneration ? {pin:nextPin,files:[]} : {});
+    }
+    if (request.startsWith("/api/tree?")) return response({...treePage("",[]),root:"/synthetic",indexedWorkspace:"/synthetic",revision:nextPin});
+    if (request === "/api/dependencies") return response({state:"disabled",workspaceRevision:nextPin,catalogId:null,packages:[],warnings:[]});
+    throw new Error("Unexpected " + request);
+  };
+  h.run("selectedWorkspaceRoot='/synthetic'; files=[{path:'src/a.js',methodCount:1}]");
+  await h.run("viewerMetrics.refresh()");
+  await h.run("viewerMetrics.inspect({scope:'file',path:'src/a.js'})");
+  h.run("selectedMethod={id:'old'}; sourceCache.set('old',{text:'old'}); $('source').append(document.createTextNode('old source')); window.TrellisShell.showSource('workspace')");
+  assert.match(text(h.get("metric-legend")),/Displayed/);
+  let settled = false;
+  const listed = h.run("loadCheckouts()").then(value => { settled = true; return value; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.networkUrls.filter(url => url.endsWith("/status")).length,1);
+  assert.equal(settled,false,"list refresh must await the selected checkout's status rebind");
+  assert.equal(h.run("selectedMethod"),null);
+  assert.equal(h.run("sourceCache.size"),0);
+  assert.equal(h.get("source").children.length,0);
+  assert.equal(h.get("source-dock").hidden,true);
+  assert.equal(h.get("file-tree").children.length,0);
+  assert.equal(h.get("metric-inspector").hidden,true);
+  assert.equal(h.get("metric-inspector-values").children.length,0);
+  assert.doesNotMatch(text(h.get("metric-legend")),/Displayed/);
+  statusReply.resolve(response({workspaceRoot:"/synthetic",revision:nextPin,catchingUp:false,stats:{}}));
+  assert.equal(await listed,true);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),nextPin);
+  assert.equal(h.get("error").hidden,true);
 });

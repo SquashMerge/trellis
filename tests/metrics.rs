@@ -166,6 +166,7 @@ fn completed_memo_rebinds_native_identity_and_call_sites() {
     .unwrap();
     first.document.path = "elsewhere.java".into();
     first.syntax_id = "sid:v1:other".into();
+    first.role = DeclarationRole::Test;
     let call = Call {
         id: "occ:v2:test".into(),
         owner_syntax_id: first.syntax_id.clone(),
@@ -197,6 +198,8 @@ fn completed_memo_rebinds_native_identity_and_call_sites() {
     assert_eq!(rebound[0].metrics.cognitive, rows[0].metrics.cognitive);
     assert_eq!(rebound[0].path, "elsewhere.java");
     assert_eq!(rebound[0].sid, "sid:v1:other");
+    assert_eq!(rows[0].role, DeclarationRole::Production);
+    assert_eq!(rebound[0].role, DeclarationRole::Test);
 }
 #[test]
 fn declaration_fold_is_exact_and_empty_leaves_are_null() {
@@ -1402,6 +1405,121 @@ fn native_test_framework_callbacks_lambdas_and_recursion_are_distinct() {
             rows.iter()
                 .any(|row| row.sid != calc.sid && row.metrics.cyclomatic == 2),
             "{lang}: callback lambda"
+        );
+    }
+}
+
+#[test]
+fn every_grammar_binds_the_current_declaration_role() {
+    for language in ["java", "python", "javascript", "rust"] {
+        let source = fixture(language);
+        let mut memo = MetricsMemo::new(1024 * 1024);
+        let mut native = declaration(language, source.trim_end().len());
+        for role in [DeclarationRole::Production, DeclarationRole::Test] {
+            native.role = role;
+            let rows = metrics::compute_memoized(
+                &mut memo,
+                SourceInput {
+                    language,
+                    content_hash: "same",
+                    text: source,
+                },
+                &[native.clone()],
+                &[],
+                &[],
+                &mut || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(rows[0].role, role, "{language}");
+            assert_eq!(memo.len(), 1, "{language}");
+        }
+    }
+}
+
+#[test]
+fn warm_memo_rebinds_reordered_callables_by_source_range_and_current_role() {
+    let plain = "fn plain() {}";
+    let branch = "fn branch(x: bool) { if x { if x {} } }";
+    let source = format!("{plain}\n{branch}\n");
+    let mut declarations = Vec::new();
+    for (name, start, end, role) in [
+        ("plain", 0, plain.len(), DeclarationRole::Production),
+        (
+            "branch",
+            plain.len() + 1,
+            source.len() - 1,
+            DeclarationRole::Test,
+        ),
+    ] {
+        let mut native = declaration("rust", end);
+        native.range.start = start;
+        native.name = Some(name.into());
+        native.syntax_id = format!("sid:v1:original-{name}");
+        native.role = role;
+        declarations.push(native);
+    }
+    let mut memo = MetricsMemo::new(1024 * 1024);
+    let input = || SourceInput {
+        language: "rust",
+        content_hash: "same-two-callables",
+        text: &source,
+    };
+    let original =
+        metrics::compute_memoized(&mut memo, input(), &declarations, &[], &[], &mut || Ok(()))
+            .unwrap();
+    assert_eq!(
+        (
+            original[0].metrics.cyclomatic,
+            original[0].metrics.cognitive
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        (
+            original[1].metrics.cyclomatic,
+            original[1].metrics.cognitive
+        ),
+        (3, 3)
+    );
+    let mut current = declarations.clone();
+    current.reverse();
+    for native in &mut current {
+        native.document.path = "tests/rebound.rs".into();
+        native.syntax_id = format!("sid:v1:rebound-{}", native.name.as_deref().unwrap());
+        native.role = match native.role {
+            DeclarationRole::Production => DeclarationRole::Test,
+            DeclarationRole::Test => DeclarationRole::Production,
+        };
+    }
+    let uncached = metrics::compute("rust", &source, &current, &[], &[], &mut || Ok(())).unwrap();
+    let rebound =
+        metrics::compute_memoized(&mut memo, input(), &current, &[], &[], &mut || Ok(())).unwrap();
+    assert_eq!(memo.len(), 1);
+    for (name, expected_role, cyclomatic, cognitive) in [
+        ("plain", DeclarationRole::Test, 1, 0),
+        ("branch", DeclarationRole::Production, 3, 3),
+    ] {
+        let sid = format!("sid:v1:rebound-{name}");
+        let fresh = uncached.iter().find(|row| row.sid == sid).unwrap();
+        let warm = rebound
+            .iter()
+            .find(|row| row.sid == sid && row.range == fresh.range)
+            .unwrap();
+        assert_eq!(fresh.role, expected_role, "uncached {name}");
+        assert_eq!(warm.role, expected_role, "memo hit {name}");
+        assert_eq!(
+            (fresh.metrics.cyclomatic, fresh.metrics.cognitive),
+            (cyclomatic, cognitive),
+            "uncached {name}"
+        );
+        assert_eq!(
+            (warm.metrics.cyclomatic, warm.metrics.cognitive),
+            (cyclomatic, cognitive),
+            "memo hit {name}"
+        );
+        assert_eq!(
+            warm, fresh,
+            "current identity/range and score association for {name}"
         );
     }
 }

@@ -265,8 +265,12 @@ async function indexThroughApi(server, token, expected, changedPath, changedSour
   return pin;
 }
 async function seedId(server, token, name) {
-  const symbols=await api(server.base,token,"GET",scoped(server.rootKey,`symbols?q=${encodeURIComponent(name)}`));assert.equal(symbols.status,200,JSON.stringify(symbols.data));
-  const item=symbols.data.items.find(value=>value.name===name);assert.ok(item,`missing ${name} symbol`);return item.id;
+  const files=await api(server.base,token,"GET",scoped(server.rootKey,"files?offset=0&limit=200"));assert.equal(files.status,200,JSON.stringify(files.data));
+  for (const file of files.data.items) {
+    const methods=await api(server.base,token,"GET",scoped(server.rootKey,`methods?path=${encodeURIComponent(file.path)}`));assert.equal(methods.status,200,JSON.stringify(methods.data));
+    const item=methods.data.items.find(value=>value.symbol.name===name);if(item)return item.symbol.id;
+  }
+  assert.fail(`missing ${name} method`);
 }
 async function connect(page, server, token) {
   const {base,rootKey} = server;
@@ -274,7 +278,7 @@ async function connect(page, server, token) {
   page.serveLog = () => server.stderr().replaceAll(token,"[redacted]").slice(-4000);
   await page.goto(`${base}/`,{waitUntil:"domcontentloaded"});
   await page.locator("#token").fill(token);
-  await page.locator("#connect-form button").click();
+  await page.locator("#connect-form button[type=submit]").click();
   await page.locator("#checkout-select").waitFor({state:"visible",timeout:15000});
   await page.locator("#checkout-select").selectOption(rootKey);
   await page.locator("#workspace").waitFor({state:"visible",timeout:15000});

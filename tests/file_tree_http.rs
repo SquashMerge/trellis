@@ -48,8 +48,6 @@ fn setup() -> (
         opts,
         TOKEN.into(),
         "127.0.0.1:7331".parse().unwrap(),
-        None,
-        None,
         root,
     )
     .unwrap();

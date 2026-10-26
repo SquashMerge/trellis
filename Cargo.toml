@@ -16,7 +16,9 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 hex = "0.4"
+git2 = { version = "=0.21.0", default-features = false, features = ["vendored-libgit2"] }
 ignore = "0.4"
+globset = "0.4"
 icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 libc = "0.2"
 notify = "8"

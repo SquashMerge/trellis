@@ -411,7 +411,7 @@ fn nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullab
     }
     assert!(
         !artifact.references.is_empty(),
-        "native-v9 measures lexical sites"
+        "native-v10 measures lexical sites"
     );
     for reference in &artifact.references {
         let source = &capture

@@ -176,7 +176,7 @@ if [ "$1" = tools/verify-env.mjs ]; then
 fi
 # verify hands the browser suite the binary it built (#192).
 for arg in "$@"; do
-  if [ "$arg" = tests/browser/saved-items.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
+  if [ "$arg" = tests/browser/sequence-harness.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
 done
 if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
 if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ] && [ "$2" = install-deps ]; then echo $$ > "$FAKE_VERIFY_HANG_DEPS"; exec sleep 600; fi
@@ -220,7 +220,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
         ["cargo", "build", "--locked", "--bin", "trellis"],
-        ["node", "--test", "--test-concurrency=1", "tests/browser/saved-items.test.cjs", "tests/browser/sequence-harness.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs"],
+        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/treemap.test.cjs"],
       ],
       tests: [
         ["cargo", "nextest", "--version"],
@@ -229,12 +229,11 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       semantic: [["node", "tools/semantic-contract/test/run.mjs"]],
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
       checks: [
-        ["node", "--test", "runtime/acp/runner.test.mjs"],
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
         ["node", "--test", "tests/factory-config.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
-        ["node", "--test", "tests/question-ui.test.cjs", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs"],
+        ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs"],
       ],
     };
     function assertRan(commands, expected) {

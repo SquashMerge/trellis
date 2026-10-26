@@ -141,7 +141,7 @@ A runtime closed for root loss does not keep a verified replacement root from at
 `serve` registers its browser options on the checkout without retiring its runtime. The daemon's provisioning mutex serializes serve registrations, which is the reservation: no other registration can start until this one finishes. One registry guard then covers, in order:
 
 1. **Conflict check.** A *different* existing registration conflicts, and nothing changes. A checkout without a registration takes one in place, even while its runtime runs and clients are attached.
-2. **Build.** Validate and build the complete browser configuration (source directory, Rust source roots, dependency catalog options, Jev and ACP providers, explicit index options) as one immutable value, all or nothing. This is bounded local work (directory and ledger opens), done under the guard as activation does. If this is the daemon's first browser registration, bind the listener and load and check the token after the build.
+2. **Build.** Validate and build the complete browser configuration (source directory, Rust source roots, dependency catalog options, explicit index options) as one immutable value, all or nothing. This is bounded local work (directory opens), done under the guard as activation does. If this is the daemon's first browser registration, bind the listener and load and check the token after the build.
 3. **Publish.** In one step under the same guard: record the registration and publish the new configuration version on the live runtime, if there is one. Without a live runtime, the next activation builds from the registration.
 
 **Failure.** A failure at any step publishes nothing and returns the typed error, never success. Failures include a conflicting registration, a build failure, and a listener or token failure. A build failure is detected before any token is minted. The previous configuration stays.
@@ -153,6 +153,8 @@ A runtime closed for root loss does not keep a verified replacement root from at
 - Each browser request pins one configuration version for its whole duration.
 - An accepted request runs with the options recorded with it in `requests.db`.
 - If no runtime is live, the next activation uses the published version.
+
+Jev and ACP providers and their ledger opens are retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Existing provider state remains in place and ignored; the registration, failure and concurrency rules above are unchanged.
 
 ### 7. MCP calls
 

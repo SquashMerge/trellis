@@ -48,7 +48,7 @@ for(const count of [80,180])test(`indexed ${count}-call cohort uses Pele and mea
    assert.ok(requests.some(raw=>{const q=new URL(raw).searchParams;return q.get("path")===unknown.path&&q.get("indexGeneration")===dto.revision.indexGeneration&&q.get("indexRevision")===String(dto.revision.indexRevision);}));
    assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(),Array.from({length:unknown.range.endLine-unknown.range.startLine+1},(_,i)=>String(unknown.range.startLine+i)));
  }
- const vendor=readFileSync(resolve(ROOT,"web/vendor/pele-1.6.0.js"));
+ const vendor=readFileSync(resolve(ROOT,"web/vendor/pele-1.10.0-trellis.2.js"));
  const record={count,coldAppMs,firstSelectionMs,os:`${os.platform()} ${os.release()} ${os.arch()}`,cpu:os.cpus()[0]?.model,chromium:await page.evaluate(()=>navigator.userAgent),rawBytes:vendor.length,gzipBytes:gzipSync(vendor).length,old:stats(result.old),pele:stats(result.pele),svgBytes:result.bytes,svgNodes:result.nodes,cspViolations:errors.filter(e=>/Content Security Policy|CSP/.test(e)).length};
  writeFileSync(`/tmp/trellis-232-cost-${count}.json`,JSON.stringify(record,null,2));console.log(JSON.stringify(record));
  });

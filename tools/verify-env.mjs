@@ -82,7 +82,7 @@ function main() {
   const npmCache = externalDirectory(join(cache, "npm-cache"), "npm cache", true);
   process.env.PLAYWRIGHT_BROWSERS_PATH = browsers;
   const env = { ...process.env, npm_config_cache: npmCache, PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1" };
-  ensureLockedPackage(cache, "runtime/acp", ["@agentclientprotocol/sdk", "@agentclientprotocol/claude-agent-acp"], env);
+  ensureLockedPackage(cache, "tests/mcp", ["@modelcontextprotocol/sdk", "ajv"], env);
   ensureLockedPackage(cache, "tests/browser", ["playwright", "playwright-core"], env);
   const cli = join(root, "tests/browser/node_modules/playwright/cli.js");
   const requireBrowser = createRequire(join(root, "tests/browser/package.json"));

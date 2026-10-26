@@ -57,6 +57,12 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "src/semantic_import.rs",
         "post-native semantic relationships from authenticated source",
     ),
+    (
+        "src/files_view.rs",
+        "read-time Files outline and syntax matches",
+    ),
+    ("src/references.rs", "read-time structural references"),
+    ("src/rules.rs", "read-time architecture rules"),
 ];
 
 fn root() -> &'static Path {

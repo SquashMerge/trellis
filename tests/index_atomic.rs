@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -3008,21 +3008,21 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     );
     assert!(
         store
-            .views()
+            .files_at(None, 0, 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         store
-            .view("missing")
+            .source_at("flow.js", None)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         store
-            .annotations()
+            .symbols_at("go", 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3052,7 +3052,7 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     assert!(store.recovery_pending_for_tests());
     assert!(
         clone
-            .views()
+            .files_at(None, 0, 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3075,7 +3075,7 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     assert!(store.recovery_pending_for_tests());
     assert!(
         clone
-            .annotations()
+            .symbols_at("go", 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3102,21 +3102,21 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
     );
     assert!(
         clone
-            .views()
+            .files_at(None, 0, 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         clone
-            .view("missing")
+            .source_at("flow.js", None)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         clone
-            .annotations()
+            .symbols_at("go", 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3130,7 +3130,7 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
     db.execute("UPDATE index_metadata SET stats='not-json'", [])
         .unwrap();
     drop(db);
-    let error = store.views().unwrap_err();
+    let error = store.status().unwrap_err();
     assert!(
         error.to_string().starts_with("incompatible_index:"),
         "{error:#}"

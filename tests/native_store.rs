@@ -240,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     let count: i64 = db
         .query_row(
@@ -668,7 +668,13 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
 #[test]
 #[cfg(feature = "test-support")]
 fn index_from_another_native_producer_version_is_rebuilt_not_served() {
-    for old_version in ["native-v2", "native-v3"] {
+    for old_version in [
+        "native-v2",
+        "native-v3",
+        "native-v8",
+        "native-v8.1",
+        "native-v9",
+    ] {
         let (state, root, store, cancel) = fixture();
         let leader = store.publication_for_tests().unwrap();
         let first = publish(
@@ -681,7 +687,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         .unwrap();
         drop(leader);
         drop(store);
-        // Both withdrawn v2 and immediate v3 predecessor must be refused; v3 used occ:v2 IDs.
+        // Withdrawn versions and both merge-parent producer versions must be refused.
         let path = published_db(state.path(), root.path());
         let db = Connection::open(&path).unwrap();
         // Rewrite every producer-version FK in one deferred transaction. This
@@ -739,7 +745,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v9");
+        assert_eq!(version, "native-v10");
         let calls: Vec<String> = db
             .prepare("SELECT 'occ:v2:'||lower(hex(id)) FROM native_version_calls")
             .unwrap()
@@ -836,7 +842,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -847,7 +853,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v9");
+    assert_eq!(version, "native-v10");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();
@@ -3057,7 +3063,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            22
+            23
         );
         assert_eq!(
             rebuilt
@@ -3066,7 +3072,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
                     0
                 ))
                 .unwrap(),
-            22
+            23
         );
         for table in [
             "native_version_references",
@@ -3111,7 +3117,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=23").unwrap();
+    db.execute_batch("PRAGMA user_version=24").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3131,13 +3137,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 22);
+    assert_eq!(metadata_version, 23);
     assert_eq!(generation, old.index_generation.to_string());
 }
 

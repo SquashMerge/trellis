@@ -1,0 +1,22 @@
+block
+  columns 1
+  block:upper["Upper band"]
+    a b
+  end
+  block:peers["Peer bands"]
+    columns 2
+    block:left["Left peer"]
+      c d
+    end
+    block:right["Right peer"]
+      e f
+    end
+  end
+  block:lower["Lower band"]
+    g h
+  end
+  upper -- "12 production conforming" --> left
+  left -- "12 production conforming" --> lower
+  lower -- "12 production deviation" --> left
+  right -. "7 test exception" .-> upper
+  right -- "7 production policy" --> lower

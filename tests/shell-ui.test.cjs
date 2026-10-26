@@ -24,7 +24,7 @@ function harness(withApp = false) {
   const run = code => vm.runInContext(code,context);
   if(withApp)run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
-  if(withApp){run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+  if(withApp){run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
     let handler = context.fetch;
     Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});
@@ -43,9 +43,23 @@ const view=(steps=[])=>({revision:{indexGeneration:'12345678-1234-4123-8123-1234
 const response=data=>({ok:true,status:200,json:async()=>data});
 const key=(element,value)=>{let prevented=false;element.listeners.keydown({key:value,preventDefault(){prevented=true;}});return prevented;};
 
-test("tabs have roving keyboard focus and never request source or providers",()=>{
+test("Architecture owns its metric controls across view and Files transitions", () => {
+  const h = harness();
+  h.shell.showView("architecture");
+  assert.equal(h.get("diagram-metrics").hidden, true);
+  h.shell.setSection("files");
+  h.shell.setSection("diagrams");
+  assert.equal(h.get("diagram-metrics").hidden, true);
+  h.shell.showView("sequence");
+  assert.equal(h.get("diagram-metrics").hidden, false);
+  h.shell.showView("classes");
+  assert.equal(h.get("diagram-metrics").hidden, false);
+  assert.deepEqual(h.requests, []);
+});
+
+test("five workspace tabs have roving keyboard focus and never request source",()=>{
   const h=harness();
-  assert.equal(h.get("sequence-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);
+  assert.equal(h.get("sequence-panel").hidden,false);assert.equal(h.get("dependency-library").hidden,true);assert.equal(h.get("architecture-panel").hidden,true);
   assert.equal(key(h.get("view-sequence"),"ArrowRight"),true);
   assert.equal(h.get("view-classes").attrs["aria-selected"],"true");
   assert.equal(h.get("classes-panel").hidden,false);
@@ -53,10 +67,27 @@ test("tabs have roving keyboard focus and never request source or providers",()=
   assert.equal(key(h.get("view-classes"),"ArrowRight"),true);
   assert.equal(h.get("view-libraries").attrs["aria-selected"],"true");assert.equal(h.get("view-libraries").tabIndex,0);assert.equal(h.get("view-sequence").tabIndex,-1);
   assert.equal(h.get("dependency-library").hidden,false);assert.ok(h.get("view-libraries").focused);
-  key(h.get("view-libraries"),"End");assert.equal(h.get("tools-panel").hidden,false);
-  key(h.get("view-tools"),"Home");assert.equal(h.get("sequence-panel").hidden,false);
-  key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("tools-panel").hidden,false);
-  h.shell.showView("terminal");assert.equal(h.get("tools-panel").hidden,false);assert.deepEqual(h.requests,[]);
+  key(h.get("view-classes"),"End");assert.equal(h.get("dependency-library").hidden,false);
+  key(h.get("view-libraries"),"ArrowRight");assert.equal(h.get("architecture-panel").hidden,false);assert.ok(h.get("view-architecture").focused);
+  key(h.get("view-architecture"),"ArrowRight");assert.equal(h.get("treemap-panel").hidden,false);
+  key(h.get("view-treemap"),"ArrowRight");assert.equal(h.get("sequence-panel").hidden,false);
+  key(h.get("view-sequence"),"ArrowLeft");assert.equal(h.get("treemap-panel").hidden,false);
+  key(h.get("view-libraries"),"Home");assert.equal(h.get("architecture-panel").hidden,false);
+  for (const name of ["tools", "terminal"]) h.shell.showView(name);
+  assert.equal(h.get("architecture-panel").hidden,false);
+  for (const name of ["architecture", "treemap", "sequence", "classes", "libraries"]) {
+    assert.equal(h.get(`view-${name}`).attrs["aria-selected"],String(name === "architecture"));
+    assert.equal(h.get(`view-${name}`).tabIndex,name === "architecture" ? 0 : -1);
+  }
+  assert.deepEqual(h.requests,[]);
+});
+test("workspace tabs have exactly five valid ARIA panel relationships",()=>{
+  const html=fs.readFileSync(path.join(__dirname,"../web/index.html"),"utf8");
+  const tabs=[...html.matchAll(/<button id="view-([^"]+)" role="tab"[^>]*aria-controls="([^"]+)"/g)];
+  assert.deepEqual(tabs.map(match=>match[1]),["architecture","treemap","sequence","classes","libraries"]);
+  for(const [,name,panel] of tabs) {
+    assert.match(html,new RegExp(`<section id="${panel}"[^>]*role="tabpanel"[^>]*aria-labelledby="view-${name}"`));
+  }
 });
 test("source dock only changes presentation and can switch/close by keyboard",()=>{
   const h=harness();assert.equal(h.get("source-dock").hidden,true);
@@ -122,7 +153,7 @@ test("app row selection inspects without fetch; explicit Open call site reads gu
 for(const change of ["method","revision","disconnect","index"] ) test(`app invalidates inspector callbacks after ${change}`,async()=>{
   const h=await selectedHarness(),open=h.get("inspector-open-source").listeners.click;
   if(change==="method")await h.run(`selectMethod({id:"new",name:"new",path:"main.rs",range:{startLine:1,endLine:1}})`);
-  if(change==="revision")h.run(`status.revision=2;clearBrowse();`);
+  if(change==="revision")h.run(`status.revision={...status.revision,indexRevision:2};clearBrowse();`);
   if(change==="disconnect")h.get("logout").listeners.click();
   if(change==="index") {h.context.fetch=async()=>response({id:"job",state:"running"});await h.get("index").listeners.click();}
   await open();assert.equal(h.requests.some(p=>p.startsWith("/api/source?")),false);
@@ -223,4 +254,106 @@ test("inspector refuses source callback for malformed ranges or missing paired s
  const good=call("good");h.shell.selectStep(good,{...view([good]),revision:null},()=>opened++);
  assert.equal(h.get("inspector-open-source").disabled,true);
  assert.equal(opened,0);
+});
+
+const branchGit = (upstream = null) => ({state:"available",head:{kind:"branch",name:"feature/<script>",commit:"abcdef123456",shortCommit:"abcdef1"},upstream});
+test("Git header shows measured branch, last-fetch counts, detached HEAD and unavailable without inventing a branch",()=>{
+  const h=harness();
+  for (const [git,expected] of [
+    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · origin/main ↑2 ↓3 · As of last fetch"],
+    [branchGit(),"feature/<script> · No upstream"],
+    [{state:"available",head:{kind:"detached",name:null,commit:"abcdef123456",shortCommit:"abcdef1"},upstream:null},"Detached HEAD abcdef1 · No upstream"],
+    [{state:"unavailable",reason:"not_repository"},"Git unavailable"],
+    [undefined,"Git unavailable"]
+  ]) {
+    h.shell.updateCheckout("/a/repo",git);
+    assert.equal(h.get("workspace-git").textContent,expected);
+    assert.equal(h.get("workspace-git").title,expected);
+    assert.equal(h.get("workspace-git").hidden,false);
+    assert.equal(all(h.get("workspace-git")).some(n=>n.tagName==="script"),false);
+    h.shell.updateWorkspace(null);
+    assert.equal(h.get("workspace-git").textContent,expected,"cold index must not erase independent Git");
+    assert.equal(h.get("workspace-name").textContent,"repo");
+  }
+  h.shell.setConnected(false);
+  assert.equal(h.get("workspace-git").textContent,"");
+  assert.equal(h.get("workspace-git").hidden,true);
+  assert.deepEqual(h.requests,[]);
+});
+
+test("Files is a primary source section without automatic reads or drawers and preserves the diagram view", () => {
+  const h = harness();
+  h.context.window.matchMedia = () => ({matches:true});
+  h.shell.showView("libraries");
+  h.shell.showMetricInspector();
+  h.get("section-files").listeners.click();
+  assert.equal(h.get("file-filter").focused,true);
+  assert.equal(h.document.body.classList.contains("files-section"),true);
+  assert.equal(h.document.body.classList.contains("explorer-open"),false);
+  assert.equal(h.document.body.classList.contains("inspector-open"),false);
+  assert.equal(h.get("section-files").attrs["aria-current"],"page");
+  for (const id of ["diagram-tabs", "diagram-metrics", "sequence-panel", "classes-panel", "dependency-library", "metric-inspector"]) {
+    assert.equal(h.get(id).hidden,true,`${id} is not shown over Files`);
+  }
+  assert.equal(h.get("source-dock").hidden,false);
+  assert.equal(h.get("workspace-source-panel").hidden,false);
+  assert.equal(h.get("library-source-panel").hidden,true);
+  assert.equal(h.get("files-inspector").hidden,false);
+  h.document.listeners.keydown({key:"Escape"});
+  assert.equal(h.get("source-dock").hidden,false,"Escape does not close primary Files source");
+  h.get("section-diagrams").listeners.click();
+  assert.equal(h.document.body.classList.contains("files-section"),false);
+  assert.equal(h.get("section-diagrams").attrs["aria-current"],"page");
+  assert.equal(h.get("dependency-library").hidden,false);
+  assert.equal(h.get("view-libraries").focused,true);
+  assert.equal(h.get("files-inspector").hidden,true);
+  assert.deepEqual(h.requests,[]);
+});
+
+test("Clear removes metric exception and drawers, notifies the controller, and erases call source callbacks", () => {
+  const h = harness(); let cleared = 0, opened = 0;
+  h.shell.setInspectorClearCallback(() => cleared++);
+  h.shell.selectStep(call(),view(),() => opened++);
+  h.shell.showMetricInspector();
+  h.get("metric-inspector-title").textContent="main.rs";
+  h.get("metric-inspector-values").append(h.get("synthetic-value"));
+  assert.equal(h.document.body.classList.contains("metric-inspector-active"),true);
+  h.get("inspector-clear").listeners.click();
+  assert.equal(cleared,1);
+  assert.equal(h.document.body.classList.contains("metric-inspector-active"),false);
+  assert.equal(h.document.body.classList.contains("inspector-open"),false);
+  assert.equal(h.get("metric-inspector").hidden,true);
+  assert.equal(h.get("metric-inspector-title").textContent,"");
+  assert.equal(h.get("metric-inspector-values").children.length,0);
+  assert.equal(h.get("inspector-clear").disabled,true);
+  h.get("inspector-open-source").listeners.click();
+  assert.equal(opened,0);
+  h.shell.selectStep(call(),view(),() => opened++);
+  h.get("inspector-clear").listeners.click();
+  h.get("inspector-open-source").listeners.click();
+  assert.equal(cleared,2);
+  assert.equal(opened,0);
+  assert.equal(h.get("inspector-open-source").disabled,true);
+  assert.deepEqual(h.requests,[]);
+});
+
+test("Treemap owns its controls and inspector across view and Files transitions", () => {
+  const h = harness();
+  h.shell.showView("treemap");
+  assert.equal(h.get("treemap-panel").hidden, false);
+  assert.equal(h.get("diagram-metrics").hidden, true);
+  h.shell.showTreemapInspector();
+  assert.equal(h.get("treemap-inspector").hidden, false);
+  h.shell.showArchitectureInspector();
+  assert.equal(h.get("treemap-inspector").hidden, true);
+  h.shell.showTreemapInspector();
+  assert.equal(h.get("architecture-inspector").hidden, true);
+  h.shell.setSection("files");
+  assert.equal(h.get("treemap-panel").hidden, true);
+  assert.equal(h.get("treemap-inspector").hidden, true);
+  h.shell.setSection("diagrams");
+  assert.equal(h.get("treemap-panel").hidden, false);
+  assert.equal(h.get("diagram-metrics").hidden, true);
+  h.shell.showView("sequence");
+  assert.equal(h.get("diagram-metrics").hidden, false);
 });

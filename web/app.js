@@ -1,14 +1,11 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, checkoutBusy = false, checkouts = [], querySerial = 0, sourceSerial = 0, searchSerial = 0;
+let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, selectedGit = null, gitSerial = 0, checkoutBusy = false, checkouts = [], sourceSerial = 0;
 const pendingRequests = new Set();
-let status = null, result = null, seed = null, views = [], annotations = [], editingView = null, editingNote = null;
-let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
+let status = null;
+let statusSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null, waitingForJob = false;
-let packet = null, focused = null, questionSerial = 0;
-let jevStatus = null, jevStatusSerial = 0, jevRunning = false;
-let acpStatus = null, acpStatusSerial = 0, acpRunning = false, answerSerial = 0;
 const IndexPin = Object.freeze({
   copy(value) {
     if (!value || typeof value !== "object" || Array.isArray(value) ||
@@ -27,88 +24,13 @@ const IndexPin = Object.freeze({
   isConflict(error) { return error?.status === 409 && error.code === "revision_conflict"; },
 });
 window.TrellisIndexPin = IndexPin;
-const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
-const savedReasonText = Object.freeze({
-  missing: "The original declaration is missing from this index.",
-  headerMismatch: "The declaration header changed, so the original anchor no longer attaches.",
-  groupChanged: "The declaration's sibling group changed, so the original anchor no longer attaches.",
-  unprovenContinuity: "Continuity after this edit cannot be proved.",
-});
-function normalizeAnchorResult(value) {
-  if (!objectValue(value) || !["attached", "orphaned"].includes(value.status)) return null;
-  if (value.status === "attached") {
-    if (typeof value.targetId !== "string" || !value.targetId || value.reason !== "none") return null;
-    return {status:"attached", targetId:value.targetId, reason:"none"};
-  }
-  if (value.targetId !== null || !own(savedReasonText, value.reason)) return null;
-  return {status:"orphaned", targetId:null, reason:value.reason};
-}
-function savedInner(value, kind) {
-  const key = kind === "view" ? "view" : "annotation";
-  const wrapped = objectValue(value) && objectValue(value[key]);
-  const item = wrapped ? value[key] : value;
-  if (!objectValue(item) || typeof item.id !== "string") return null;
-  if (kind === "view" && (typeof item.title !== "string" || !objectValue(item.query) || typeof item.query.seed !== "string")) return null;
-  if (kind === "note" && (typeof item.nodeId !== "string" || typeof item.body !== "string")) return null;
-  return {key, wrapped, item};
-}
-function normalizeSavedState(value, kind) {
-  const inner = savedInner(value, kind);
-  if (!inner) throw new Error(`Invalid saved ${kind} response.`);
-  let pair = null, attachment = {availability:"anchorless", result:null}, invalidMetadata = false;
-  const hasMetadata = inner.wrapped && own(value, "indexGeneration") && own(value, "indexRevision") && own(value, "attachment");
-  if (hasMetadata) {
-    if (value.indexGeneration !== null || value.indexRevision !== null) {
-      try { pair = IndexPin.copy(value); } catch (_) { invalidMetadata = true; }
-    }
-    const candidate = value.attachment;
-    if (objectValue(candidate) && candidate.availability === "ready" && pair) {
-      const normalized = normalizeAnchorResult(candidate.result);
-      if (normalized) attachment = {availability:"ready", result:normalized};
-      else invalidMetadata = true;
-    } else if (objectValue(candidate) && candidate.availability === "anchorless" && candidate.result === null) {
-      attachment = {availability:"anchorless", result:null};
-    } else if (objectValue(candidate) && candidate.availability === "indexUnavailable" && candidate.result === null &&
-               value.indexGeneration === null && value.indexRevision === null) {
-      attachment = {availability:"indexUnavailable", result:null};
-    } else invalidMetadata = true;
-  }
-  if (invalidMetadata) { pair = null; attachment = {availability:"anchorless", result:null}; }
-  return {
-    [inner.key]:inner.item,
-    ...(kind === "view" ? {orphanedIds:inner.wrapped && Array.isArray(value.orphanedIds) ? value.orphanedIds.filter(id => typeof id === "string") : []}
-      : {orphaned:inner.wrapped && value.orphaned === true}),
-    indexGeneration:pair?.indexGeneration ?? null,
-    indexRevision:pair?.indexRevision ?? null,
-    attachment,
-    savedPair:pair,
-    originalId:inner.item.id,
-    originalTarget:kind === "view" ? inner.item.query.seed : inner.item.nodeId,
-    metadataInvalid:invalidMetadata,
-  };
-}
-function normalizeSavedList(value, kind) {
-  if (!Array.isArray(value)) throw new Error(`Invalid saved ${kind} list response.`);
-  return value.map(item => normalizeSavedState(item, kind));
-}
-function currentNativePin() {
-  if (!status || typeof status.evidenceFormat !== "string" || !status.evidenceFormat) return null;
-  try { return IndexPin.copy(status.revision); } catch (_) { return null; }
-}
-function savedTarget(state) { return state.originalTarget; }
-function savedLoadDecision(state, kind) {
-  const target = savedTarget(state), attachment = state.attachment;
-  if (state.metadataInvalid) return {enabled:false, reason:"Saved attachment metadata is invalid. Refresh before loading."};
-  if (attachment.availability === "indexUnavailable") return {enabled:false, reason:"Indexed anchor evidence is unavailable."};
-  if (attachment.availability === "anchorless") return {enabled:false, reason:"This legacy item has no durable anchor."};
-  const anchored = attachment.result;
-  if (anchored.status === "orphaned") return {enabled:false, reason:savedReasonText[anchored.reason]};
-  if (anchored.targetId !== target) return {enabled:false, reason:"The saved attachment does not match its original target."};
-  if (!state.savedPair || !IndexPin.equal(state.savedPair, status?.revision)) return {enabled:false, reason:"Saved evidence is stale. Refresh saved items at the current index."};
-  return {enabled:true, reason:"Attached to the original declaration.", pin:IndexPin.copy(state.savedPair), target};
-}
 const sourceCache = new Map();
+let section = "diagrams", sectionSerial = 0, filesSerial = 0, filesDiffSerial = 0, filesMatchesSerial = 0;
+let filesFile = null, filesSymbol = null, filesBasis = "indexed", filesMini = null, filesMatches = null;
+let filesGitStatus = null, filesDiff = null, filesCatalogLoaded = false;
+let diagramSequence = null;
+
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -122,9 +44,9 @@ function button(text, action) {
 function describe(value) { return typeof value === "string" ? value : JSON.stringify(value, null, 2); }
 function aborted() { return new DOMException("Superseded request", "AbortError"); }
 function operationGuard() {
-  const session = epoch, root = selectedRootKey, queryAtStart = querySerial, questionAtStart = questionSerial;
-  const selectedSeed = seed, revision = status?.revision && IndexPin.copy(status.revision);
-  return () => session === epoch && root === selectedRootKey && queryAtStart === querySerial && questionAtStart === questionSerial && selectedSeed === seed && IndexPin.equal(revision, status?.revision);
+  const session = epoch, root = selectedRootKey, method = selectedMethod;
+  const revision = status?.revision && IndexPin.copy(status.revision);
+  return () => session === epoch && root === selectedRootKey && method === selectedMethod && IndexPin.equal(revision, status?.revision);
 }
 function selectedUrl(path, method, root) {
   if (path === "/api/checkouts" || path === "/api/daemon/status") {
@@ -133,23 +55,25 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "symbols", "symbol", "source", "query", "views", "annotations", "jobs/current", "jev/status", "acp/status", "questions/preview", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
-  const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route) || /^(?:views|annotations)\/[^/?]+$/.test(route) || /^questions\/[^/?]+\/(?:jev-request|jev-response|jev-run|acp-answer|selection)$/.test(route);
+  const simple = new Set(["status", "git", "git/diff", "metrics", "architecture", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  if (route === "syntax-matches" && method !== "POST") throw new Error("Syntax match requests must be POST.");
+  if (["git", "git/diff", "metrics", "architecture", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
+  const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route);
   if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
   return `/api/checkouts/${encodeURIComponent(root)}/${suffix}`;
 }
-async function api(path, method = "GET", body) {
+async function api(path, method = "GET", body, callerCurrent = () => true) {
   const session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
   const url = selectedUrl(path, method, root);
-  const guarded = path === "/api/query" || path.startsWith("/api/query?") || path.startsWith("/api/questions/") || path.startsWith("/api/source?");
+  const guarded = path.startsWith("/api/source?");
   const operationCurrent = operationGuard();
-  const current = () => session === epoch && root === selectedRootKey && (!guarded || (operationCurrent() && (!path.startsWith("/api/source?") || sourceAtStart === sourceSerial)));
+  const current = () => callerCurrent() && session === epoch && root === selectedRootKey && (!guarded || (operationCurrent() && sourceAtStart === sourceSerial));
   let response, data, timer;
   const controller = new AbortController(); pendingRequests.add(controller);
   const timeoutError = new Error("Request timed out. No automatic retry was made. Refresh status before trying again.");
   timeoutError.name = "TimeoutError";
-  const deadline = path.endsWith("/acp-answer") ? 150000 : 15000;
+  const deadline = 15000;
   try {
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => { reject(timeoutError); controller.abort(); }, deadline);
@@ -170,8 +94,9 @@ async function api(path, method = "GET", body) {
     error.status = response.status;
     error.code = data?.error?.code;
     error.reason = data?.error?.reason;
+    if (error.code === "invalid_rules") error.diagnostic = data.error;
     error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
-    if (error.status === 401 || error.status === 403) disconnect("Authentication failed. Connect with a daemon token again.");
+    if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
     throw error;
   }
@@ -189,19 +114,35 @@ async function perform(action, control) {
     current = operationGuard();
     await pending;
   }
-  catch (error) { if (error.name !== "AbortError" && current()) { if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); window.TrellisShell?.resetInspector(); diagramSerial++; invalidateFocus("Index changed. Preview again after refreshing."); clearSource(); renderResult(); stale("The index revision changed. Refresh this view before reading source."); } $("error").textContent = error.message; $("error").hidden = false; if ($("focus-state").textContent.startsWith("Preparing")) $("focus-state").textContent = "Preview failed. Check the error and try again."; } }
-  finally { if (control) control.disabled = false; syncFocusControls(); syncSavedControls(); }
+  catch (error) { if (error.name !== "AbortError" && current()) { if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); window.TrellisShell?.resetInspector(); diagramSerial++; clearSource(); stale("The index revision changed. Refresh this view before reading source."); } $("error").textContent = error.message; $("error").hidden = false; } }
+  finally { if (control) control.disabled = false; }
 }
 function form(id, action) {
-  $(id).addEventListener("submit", event => { event.preventDefault(); perform(action, $(id).querySelector("button")); });
+  $(id).addEventListener("submit", event => { event.preventDefault(); perform(action, $(id).querySelector("button[type=submit]")); });
 }
 function stale(message) { $("stale").textContent = message; $("stale").hidden = false; }
 function clearSource() {
-  sourceSerial++; window.TrellisNavigation?.reset(); $("source").replaceChildren();
+  sourceSerial++; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
   $("source-path").textContent = "Choose a call to read its cached source snapshot.";
   if (!$("source-dock")?.hidden) window.TrellisShell?.closeSource?.();
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
+function showSelectedGit(git) {
+  selectedGit = git || null;
+  updateFilesBasis();
+  window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
+  if (!status) window.TrellisShell?.updateWorkspace(null);
+}
+async function refreshGit() {
+  const serial = ++gitSerial, session = epoch, root = selectedRootKey;
+  filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
+  try {
+    const data = await api("/api/git");
+    if (serial === gitSerial && session === epoch && root === selectedRootKey) { filesGitStatus = data; showSelectedGit(data?.git); updateFilesBasis(); if (section === "files") renderFiles(); }
+  } catch (error) {
+    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") { filesGitStatus = null; showSelectedGit(null); updateFilesBasis(); }
+  }
+}
 async function refreshStatus(followup = false) {
   statusRefreshDepth++;
   try {
@@ -211,13 +152,15 @@ async function refreshStatus(followup = false) {
   catch (error) {
     if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
       const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
-      const listedRoot = selectedWorkspaceRoot;
+      const listedRoot = selectedWorkspaceRoot, git = selectedGit;
       resetCheckout();
       selectedRootKey = root; selectedWorkspaceRoot = listedRoot;
+      showSelectedGit(git);
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
       $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
       window.TrellisShell?.setConnected(true);
+      showCheckoutIndexState(checkouts.find(row => row.rootKey === root));
       $("status").textContent = "No validated index head is available yet.";
       $("checkout-state").textContent = "Index not ready. Retry status after indexing starts.";
       stale("Index not ready. Retry status after indexing starts.");
@@ -230,34 +173,29 @@ async function refreshStatus(followup = false) {
   const workspaceChanged = status && status.workspaceRoot !== data.workspaceRoot;
   const nextPin = data.revision == null ? null : IndexPin.copy(data.revision);
   const browseChanged = !status || workspaceChanged || !IndexPin.equal(status.revision, nextPin);
-  const hadStatus = !!status;
-  if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); querySerial++; invalidateFocus("Index workspace or revision changed. Preview again."); clearSource(); }
-  if (status && browseChanged) {
-    result = null; seed = null; searchSerial++;
-    $("symbols").replaceChildren();
-    if (workspaceChanged) {
-      savedSerial++; views = []; annotations = []; resetView(); resetNote();
-      $("views").replaceChildren(); $("annotations").replaceChildren();
-    }
-    $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
-    renderResult();
-  }
+  if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); clearSource(); }
   if (browseChanged) clearDependencyCatalog();
   status = {...data, revision:nextPin};
   data = status;
-  if (hadStatus && browseChanged && !workspaceChanged) { renderViews(); renderNotes(); }
+  updateFilesBasis();
+  const listed = checkouts.find(row => row.rootKey === selectedRootKey);
+  if (listed) Object.assign(listed, {revision:nextPin, catchingUp:data.catchingUp, indexError:nextPin ? null : "index_not_ready"});
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
-  if (browseChanged && nextPin) await loadTreeRoot();
+  renderCheckoutList();
+  if (browseChanged && nextPin) {
+    void viewerMetrics?.refresh();
+    if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
+    if (section === "diagrams" && !$("treemap-panel").hidden) void treemap?.refresh();
+    await loadTreeRoot();
+  }
   if (serial !== statusSerial || session !== epoch || status !== data) return;
-  if (result && !IndexPin.equal(result.revision, status.revision)) renderResult();
   const stats = status.stats || {};
   $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   $("stale").hidden = true;
   if (!nextPin) stale("Index not ready. Retry status after this checkout finishes indexing.");
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
-  if (result && !IndexPin.equal(result.revision, status.revision)) stale("This view is from an older revision. Refresh status & view to update it.");
   // A rejected optional catalog must not recursively request status when status is unchanged.
   if (nextPin && (browseChanged || !pairRefreshPending)) void refreshDependencies();
   } finally {
@@ -274,11 +212,7 @@ async function refreshStatus(followup = false) {
   }
 }
 function unexpectedPair(message = "Index snapshot changed. Refresh status.", receivedPair) {
-  clearBrowse(message); clearSource(); sourceCache.clear(); querySerial++; searchSerial++;
-  result = null; seed = null; $("symbols").replaceChildren();
-  $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
-  invalidateFocus(message); renderResult(); clearDependencyCatalog();
-  $("search-state").textContent = message;
+  clearBrowse(message); clearSource(); sourceCache.clear(); clearDependencyCatalog();
   $("files-state").textContent = message;
   $("dependency-state").textContent = message;
   $("dependency-symbol-state").textContent = message;
@@ -294,28 +228,8 @@ function unexpectedPair(message = "Index snapshot changed. Refresh status.", rec
     void refreshStatus().catch(() => {}).finally(() => { pairRefreshPending = false; });
   }
 }
-function requireCurrentPair(value) {
-  if (!IndexPin.equal(value?.revision, status?.revision)) { unexpectedPair(undefined, value?.revision); throw new Error("Index snapshot changed. Refresh status."); }
-  return value;
-}
-async function loadSaved() {
-  const serial = ++savedSerial, session = epoch, workspace = status?.workspaceRoot;
-  const expected = currentNativePin();
-  const suffix = expected ? `?${IndexPin.query(expected)}` : "";
-  const data = await Promise.all([api(`/api/views${suffix}`), api(`/api/annotations${suffix}`)]);
-  if (serial !== savedSerial || session !== epoch || workspace !== status?.workspaceRoot ||
-      (expected && !IndexPin.equal(expected, status?.revision))) return;
-  views = normalizeSavedList(data[0], "view");
-  annotations = normalizeSavedList(data[1], "note");
-  if (!expected) {
-    const unpinned = state => ({...state, indexGeneration:null, indexRevision:null, savedPair:null,
-      attachment:state.attachment.availability === "anchorless" ? state.attachment : {availability:"indexUnavailable", result:null}});
-    views = views.map(unpinned); annotations = annotations.map(unpinned);
-  }
-  renderViews(); renderNotes();
-}
 const tokenStorageKey = "trellis.daemonToken.v1";
-let tokenFileSerial = 0;
+let tokenFileSerial = 0, tokenSaveFailed = false;
 const safeTokenText = value => value.length <= 512 && /^[A-Za-z0-9_-]+$/.test(value);
 function forgetStoredToken() {
   try { localStorage.removeItem(tokenStorageKey); return true; } catch (_) { return false; }
@@ -327,8 +241,9 @@ try {
     $("notice").textContent = "Saved token loaded. Select Connect to browse.";
   }
 } catch (_) { /* Normal in-memory authentication still works. */ }
+$("load-token-file").addEventListener("click", () => $("token-file").click());
 $("remember-token").addEventListener("change", () => {
-  if (!$("remember-token").checked) forgetStoredToken();
+  if (!$("remember-token").checked) { tokenSaveFailed = false; forgetStoredToken(); }
 });
 $("token-file").addEventListener("change", async () => {
   const input = $("token-file"), file = input.files?.[0], session = epoch, serial = ++tokenFileSerial;
@@ -349,30 +264,27 @@ const validRootKey = key => typeof key === "string" && /^[0-9a-f]{64}$/.test(key
 function checkoutOption(label, value) { const option = element("option", label); option.value = value; return option; }
 function resetCheckout() {
   // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
-  epoch++; selectedRootKey = null; selectedWorkspaceRoot = null; checkoutBusy = false;
+  epoch++; gitSerial++; section = "diagrams"; sectionSerial++; filesGitStatus = null; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
   for (const controller of pendingRequests) controller.abort();
-  clearTimeout(pollTimer); pollTimer = null; statusSerial++; savedSerial++; querySerial++; searchSerial++;
+  clearTimeout(pollTimer); pollTimer = null; statusSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
-  status = null; result = null; seed = null; job = null; waitingForJob = false;
-  acpStatusSerial++; acpStatus = null; acpRunning = false; $("acp-status").textContent = "ACP status unavailable.";
-  jevStatusSerial++; jevStatus = null; jevRunning = false; $("jev-status").textContent = "Live Jev status unavailable.";
-  invalidateFocus(); views = []; annotations = []; resetView(); resetNote();
-  ["symbols", "calls", "nodes", "views", "annotations"].forEach(id => $(id).replaceChildren());
-  ["status", "diagnostics", "job", "result-meta"].forEach(id => $(id).textContent = "");
-  $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
-  $("file-filter").value = ""; $("search").value = "";
+  status = null; job = null; waitingForJob = false;
+  ["status", "diagnostics", "job"].forEach(id => $(id).textContent = "");
+  $("file-filter").value = "";
   $("stale").hidden = true; $("catching-up").hidden = true;
   $("checkout-root").textContent = "No checkout selected";
   $("workspace").hidden = true; $("index").disabled = true; $("cancel").hidden = true;
   window.TrellisShell?.setConnected(false);
+  renderCheckoutList();
 }
 function disconnect(message) {
-  tokenFileSerial++; const forgotten = forgetStoredToken();
-  resetCheckout(); checkouts = []; token = "";
+  tokenFileSerial++; tokenSaveFailed = false; const forgotten = forgetStoredToken();
+  resetCheckout(); checkouts = []; renderCheckoutList(); token = "";
   $("remember-token").checked = false; $("token-file").value = ""; $("token").value = "";
   $("checkout-picker").hidden = true; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
   $("logout").hidden = true; $("connect-form").hidden = false;
+  document.body.classList.toggle("daemon-connected", false);
   $("error").hidden = !message; $("error").textContent = message || "";
   $("notice").textContent = message || (forgotten ? "Disconnected. Saved token and cached source cleared." : "Disconnected. Browser storage could not be cleared; clear this address’s site data to forget any saved token.");
   $("token").focus();
@@ -391,8 +303,43 @@ function uniqueSelectableRoot(key) {
   const matches = checkouts.filter(row => row.rootKey === key);
   return matches.length === 1 && selectable(matches[0]);
 }
+function checkoutIndexLabel(row) {
+  if (!row || row.state !== "available") return {text: row?.state === "storage_busy" ? "Busy" : "Failed", state:"failed", shape:"□"};
+  const pin = row.revision, catchingUp = row.catchingUp;
+  if (row.indexError && row.indexError !== "index_not_ready") return {text:`Index unavailable · ${row.indexError}`, state:"failed", shape:"□"};
+  if (!pin) return catchingUp === true ? {text:"Catching up", state:"catching-up", shape:"◐"}
+    : {text:"Not indexed", state:"unknown", shape:"◇"};
+  let label;
+  try { label = IndexPin.label(pin); } catch (_) { return {text:"Index status unavailable", state:"unknown", shape:"◇"}; }
+  return catchingUp === true ? {text:`Catching up · rev ${label}`, state:"catching-up", shape:"◐"}
+    : catchingUp === false ? {text:`Fresh · rev ${label}`, state:"fresh", shape:"○"}
+    : {text:`Indexed · idle · rev ${label}`, state:"unknown", shape:"◇"};
+}
+function showCheckoutIndexState(row) {
+  const state = checkoutIndexLabel(row);
+  $("workspace-index-state")?.setAttribute("data-state", state.state);
+  if ($("workspace-index-label")) $("workspace-index-label").textContent = state.text;
+}
+function renderCheckoutList() {
+  const list = $("indexed-checkouts");
+  if (!list) return;
+  list.replaceChildren();
+  for (const row of checkouts) {
+    const li = element("li"), state = checkoutIndexLabel(row);
+    const name = row.workspaceRoot?.split("/").filter(Boolean).at(-1) || row.rootKey;
+    const pick = button(name, () => selectCheckout(row.rootKey));
+    pick.className = "checkout-pick"; pick.disabled = !selectable(row);
+    pick.title = row.workspaceRoot || row.rootKey;
+    pick.setAttribute("aria-pressed", String(row.rootKey === selectedRootKey));
+    pick.append(element("span", window.TrellisShell?.formatGit(row.git) || "Git unavailable", "checkout-git"));
+    const freshness = element("span", `${state.shape} ${state.text}`, "checkout-freshness");
+    freshness.setAttribute("data-state", state.state); pick.append(freshness);
+    li.append(pick); list.append(li);
+  }
+  if (!checkouts.length) list.append(element("li", "No indexed checkouts listed.", "detail"));
+}
 async function loadCheckouts() {
-  const session = epoch;
+  const session = epoch, gitAtStart = gitSerial;
   $("checkout-state").textContent = "Loading checkouts…";
   $("checkout-select").disabled = true; $("checkout-retry").hidden = true;
   try {
@@ -410,35 +357,43 @@ async function loadCheckouts() {
     const busy = sameRoot && selected.state === "storage_busy";
     const recovering = checkoutBusy && sameRoot && selectable(selected);
     if (busy && !checkoutBusy) {
-      const key = selectedRootKey;
+      const key = selectedRootKey, git = selectedGit;
       resetCheckout();
       selectedRootKey = key; selectedWorkspaceRoot = verifiedRoot;
+      showSelectedGit(git);
       checkoutBusy = true;
       $("checkout-root").textContent = verifiedRoot;
     }
     checkouts = next;
+    renderCheckoutList();
     if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
       invalidateSelection("Selected checkout is no longer available. Choose again."); return;
     }
     const select = $("checkout-select"), choice = selectedRootKey || "";
     select.replaceChildren(checkoutOption("Choose a checkout", ""));
     for (const row of checkouts) {
-      const option = checkoutOption(`${row.workspaceRoot || row.rootKey} · ${row.state}`, row.rootKey);
+      const option = checkoutOption(`${row.workspaceRoot || row.rootKey} · ${row.state} · ${window.TrellisShell.formatGit(row.git)}`, row.rootKey);
       option.disabled = !selectable(row); select.append(option);
     }
     select.value = choice;
+    if (choice && !busy && gitAtStart === gitSerial) { gitSerial++; showSelectedGit(selected.git); }
     select.disabled = !checkouts.some(selectable);
     $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
       : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
       : choice ? "Checkout selected." : "Choose a checkout to inspect. No checkout is selected automatically.";
     $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
+    if (choice && !busy) showCheckoutIndexState(selected);
     if (recovering) await selectCheckout(choice);
+    else if (choice && !busy && status?.revision && Object.hasOwn(selected, "revision") && !IndexPin.equal(selected.revision, status.revision)) {
+      clearBrowse("Index changed. Rebinding the selected checkout."); clearSource(); sourceCache.clear(); clearDependencyCatalog();
+      await refreshStatus();
+    }
     return true;
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     if (selectedRootKey) resetCheckout();
-    checkouts = []; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
+    checkouts = []; renderCheckoutList(); $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
     $("checkout-select").disabled = true; $("checkout-retry").hidden = false;
     $("checkout-state").textContent = `Checkout list unavailable: ${error.message} Retry the list.`;
     return false;
@@ -458,7 +413,11 @@ async function selectCheckout(key) {
     $("checkout-select").value = ""; $("checkout-state").textContent = "Choose an available checkout."; return;
   }
   selectedRootKey = key;
-  selectedWorkspaceRoot = checkouts.find(row => row.rootKey === key).workspaceRoot;
+  const selected = checkouts.find(row => row.rootKey === key);
+  selectedWorkspaceRoot = selected.workspaceRoot;
+  renderCheckoutList();
+  showSelectedGit(selected.git);
+  showCheckoutIndexState(selected);
   $("error").hidden = true; $("error").textContent = "";
   $("checkout-root").textContent = "Verifying selected checkout…";
   $("checkout-state").textContent = "Loading selected checkout…";
@@ -468,16 +427,17 @@ async function selectCheckout(key) {
   try {
     await refreshStatus();
     if (session !== epoch) return;
-    await loadSaved(); await refreshJevStatus(); await refreshAcpStatus();
     job = await api("/api/jobs/current").catch(error => { if (error.name !== "AbortError") throw error; return null; });
     if (session !== epoch) return;
     waitingForJob = !!job && activeJob(job);
     if (job) { showJob(); schedulePoll(); }
     $("checkout-state").textContent = "Checkout ready.";
-    $("notice").textContent = "Browse folders below. Indexed files expand to methods.";
+    $("notice").textContent = "Browse folders below. Indexed files expand to methods."
+      + (tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "");
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     const cold = error.code === "index_not_ready";
+    showCheckoutIndexState(cold ? checkouts.find(row => row.rootKey === key) : {state:"unavailable"});
     $("checkout-root").textContent = error.workspaceRoot || status?.workspaceRoot || "Selected checkout · verified root unavailable until status responds";
     $("checkout-state").textContent = cold ? "Index not ready. Retry status after indexing starts." : `Checkout unavailable: ${error.message} Retry status; your selection is unchanged.`;
     $("status").textContent = cold ? "No validated index head is available yet." : "Selected checkout status unavailable.";
@@ -489,109 +449,31 @@ $("checkout-select").addEventListener("change", event => { void selectCheckout(e
 $("checkout-retry").addEventListener("click", async () => {
   const [listed] = await Promise.all([loadCheckouts(), loadDaemonStatus()]);
   if (listed && token && $("remember-token").checked) {
-    try { localStorage.setItem(tokenStorageKey, token); }
-    catch (_) { $("checkout-state").textContent += " Browser storage is unavailable; token was not saved."; }
+    try { localStorage.setItem(tokenStorageKey, token); tokenSaveFailed = false; }
+    catch (_) { tokenSaveFailed = true; $("checkout-state").textContent += " Browser storage is unavailable; token was not saved."; }
   }
 });
 form("connect-form", async () => {
   const supplied = $("token").value.trim();
   if (!safeTokenText(supplied)) throw new Error("Paste a daemon token or load daemon.token first.");
-  tokenFileSerial++; token = supplied; $("token").value = "";
+  tokenFileSerial++; tokenSaveFailed = false; token = supplied; $("token").value = ""; $("token-file").value = "";
   $("error").hidden = true; $("error").textContent = "";
   $("checkout-picker").hidden = false; $("connect-form").hidden = true; $("logout").hidden = false;
+  document.body.classList.toggle("daemon-connected", true);
   const [listed] = await Promise.all([loadCheckouts(), loadDaemonStatus()]);
   if (!token) return;
-  let remembered = false, storageFailed = false;
+  let remembered = false;
   if (listed && $("remember-token").checked) {
     try { localStorage.setItem(tokenStorageKey, token); remembered = true; }
-    catch (_) { storageFailed = true; }
+    catch (_) { tokenSaveFailed = true; }
   } else if (listed) forgetStoredToken();
-  $("notice").textContent = listed ? "Connected. Choose a checkout before browsing."
-    + (remembered ? " Token saved on this browser." : storageFailed ? " Browser storage is unavailable; token was not saved." : "")
+  $("notice").textContent = listed ? `Connected to the daemon on ${window.location?.host || "this address"}. Choose a checkout before browsing.`
+    + (remembered ? " Token saved on this browser." : tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "")
     : "Checkout list unavailable. Retry the list; no checkout has been selected.";
   $("checkout-select").focus();
 });
 $("logout").addEventListener("click", () => disconnect());
 
-form("search-form", async () => {
-  const serial = ++searchSerial;
-  $("search-state").textContent = "Searching…";
-  const data = await api(`/api/symbols?q=${encodeURIComponent($("search").value)}&limit=80`);
-  if (serial !== searchSerial) return;
-  requireCurrentPair(data);
-  $("symbols").replaceChildren(); $("search-state").textContent = `${data.items.length} symbols · revision ${IndexPin.label(data.revision)}`;
-  for (const symbol of data.items) {
-    const li = element("li"); const pick = button(symbol.name, () => selectSymbol(symbol)); pick.className = "symbol";
-    pick.append(element("span", `${symbol.kind} · ${symbol.path}:${symbol.range.startLine}`, "detail"));
-    li.append(pick); $("symbols").append(li);
-  }
-  if (!data.items.length) $("search-state").textContent = "No symbols found. Try another name or index the workspace.";
-});
-async function selectSymbol(symbol) {
-  diagramSerial++; window.TrellisShell?.resetInspector();
-  seed = symbol.id; $("seed").textContent = `${symbol.name} · ${symbol.path}`;
-  $("depth").value = "1"; $("callbacks").checked = false; renderNotes(); await runQuery();
-}
-function query() { return {seed, depth: Number($("depth").value), maxNodes: 40, maxCalls: 200, includeCallbacks: false, excludePaths: []}; }
-function savedQueryDto(value) {
-  return {
-    seed:value.seed,
-    depth:Number.isSafeInteger(value.depth) ? value.depth : 1,
-    maxNodes:Number.isSafeInteger(value.maxNodes) ? value.maxNodes : 40,
-    maxCalls:Number.isSafeInteger(value.maxCalls) ? value.maxCalls : 200,
-    includeCallbacks:value.includeCallbacks === true,
-    excludePaths:Array.isArray(value.excludePaths) ? value.excludePaths.filter(path => typeof path === "string") : [],
-  };
-}
-function savedViewDto(view, title = view.title) {
-  const pins = {};
-  if (objectValue(view.pins)) for (const [id, position] of Object.entries(view.pins)) {
-    if (objectValue(position)) pins[id] = {x:position.x, y:position.y};
-  }
-  return {id:view.id, title, query:savedQueryDto(view.query), pins,
-    hidden:Array.isArray(view.hidden) ? view.hidden.filter(id => typeof id === "string") : []};
-}
-function annotationDto(note, titleValue, titleSupplied) {
-  return {id:note.id, nodeId:note.nodeId, body:note.body, ...(titleSupplied ? {title:titleValue} : {})};
-}
-async function runQuery(savedQuery, savedReplayPin = null) {
-  if (!seed && !savedQuery?.seed) throw new Error("Select a symbol first.");
-  const replayPin = savedReplayPin && IndexPin.copy(savedReplayPin);
-  const path = replayPin ? `/api/query?${IndexPin.query(replayPin)}` : "/api/query";
-  invalidateFocus(); const serial = ++querySerial; clearSource();
-  result = null; $("calls").replaceChildren(); $("nodes").replaceChildren();
-  $("result-meta").textContent = "Loading interactions…";
-  const data = await api(path, "POST", {...(savedQuery || query()), depth: 1, includeCallbacks: false});
-  if (serial !== querySerial) return;
-  if (replayPin && !IndexPin.equal(data?.revision, replayPin)) {
-    unexpectedPair("Saved replay returned a different index snapshot.", data?.revision);
-    throw new Error("Saved replay returned a different index snapshot.");
-  }
-  result = requireCurrentPair(data); renderResult();
-}
-form("query-form", () => runQuery());
-function renderResult() {
-  $("calls").replaceChildren(); $("nodes").replaceChildren();
-  const view = focused || result;
-  syncFocusControls(); syncSavedControls();
-  if (!view) { $("result-meta").textContent = "Select a symbol to inspect outgoing calls."; return; }
-  $("result-meta").textContent = `${view.calls.length} measured call sites · ${view.nodes.length} symbols · revision ${IndexPin.label(view.revision)}${view.truncated ? ` · Truncated: ${view.omittedNodes} nodes omitted` : ""}${view.warnings?.length ? ` · ${view.warnings.map(describe).join(" · ")}` : ""}`;
-  if (focused) $("focus-counts").textContent = `Supporting: ${view.supportingCount} · Uncertain: ${view.uncertainCount} · Policy-hidden: ${view.policyHiddenCount} · Omitted: ${view.omittedCount}. Only essential calls that pass display limits are shown. Counts may overlap.`;
-  const rootNode = (view.nodes || []).find(n => n.id === seed);
-  if (rootNode) {
-    const rootRow = element("li", undefined, "hierarchy-root");
-    rootRow.append(element("strong", rootNode.name || rootNode.id), element("span", `${rootNode.kind} · ${rootNode.path || ""}`, "detail"));
-    if (sourceWitness(rootNode)) rootRow.append(button("Read root source", () => showSource(rootNode, view.revision)));
-    $("calls").append(rootRow);
-  }
-  for (const call of view.calls.filter(call => call.caller === seed)) $("calls").append(callRow(call, view));
-  if (!view.calls.length) $("calls").append(element("li", focused ? "No essential calls pass the current display policy. Inspect the raw hierarchy or change your focus terms." : "No outgoing call sites in this view. Depth 0 shows only the seed symbol."));
-  for (const node of (rootNode ? [rootNode] : [])) {
-    const li = element("li", `${node.name || node.id} · ${node.kind || "symbol"}`);
-    if (sourceWitness(node)) li.append(button("Read source", () => showSource(node, view.revision)));
-    $("nodes").append(li);
-  }
-}
 function sourceWitness(item) {
   const r = item?.range;
   return typeof item?.path === "string" && !!item.path.trim() && !!r &&
@@ -603,213 +485,73 @@ function sourceWitness(item) {
     (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
     (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
 }
-function terminalView(view, selectedSeed, revision) {
-  const root = (view.nodes || []).find(node => node.id === selectedSeed);
-  const nodes = root ? [{id:root.id, name:root.name, kind:root.kind,
-    ...(sourceWitness(root) ? {path:root.path, range:root.range} : {})}] : [];
-  const calls = (view.calls || []).filter(call => call.caller === selectedSeed && sourceWitness(call))
-    .map(call => ({id:call.id, caller:selectedSeed, path:call.path, range:call.range,
-      calleeText:call.calleeText || call.spelling || null,
-      regions:(call.regions || []).filter(id => (view.regions || []).some(r => r.id === id && r.path === call.path && sourceWitness(r)))}));
-  const regions = (view.regions || []).filter(region => sourceWitness(region) && calls.some(call => call.path === region.path && call.regions.includes(region.id)))
-    .map(region => ({id:region.id, kind:region.kind, label:region.label, path:region.path, range:region.range}));
-  return {revision:IndexPin.copy(revision), query:{seed:selectedSeed,depth:1,includeCallbacks:false},
-    nodes,calls,regions,warnings:[],truncated:false,supportingCount:0,uncertainCount:0,policyHiddenCount:0,omittedCount:0};
-}
-function callRow(call, view) {
-  const nodes = new Map((view.nodes || []).map(node => [node.id, node]));
-  const regions = new Map((view.regions || []).map(region => [region.id, region]));
-  const li = element("li", undefined, "call-row");
-  const witness = sourceWitness(call);
-  const heading = element("div", undefined, "call-heading");
-  if (witness) {
-    const name = button(call.calleeText || call.spelling || "Call site", () => showSource(call, view.revision));
-    name.className = "call-name"; name.setAttribute("data-terminal-source", "call"); heading.append(name);
-  } else heading.append(element("span", "Call site · source unavailable", "call-name"));
-  heading.append(element("span", "Syntax only · target unverified", "badge"));
-  li.append(heading);
-  if (witness) li.append(element("span", `${call.path}:${call.range.startLine} · from ${nodes.get(call.caller)?.name || call.caller || "unknown"}`, "detail"));
-  const evidence = element("details", undefined, "call-evidence");
-  evidence.append(element("summary", witness ? `Measured call site · ${call.path}:${call.range.startLine}` : "No measured call-site source"));
-  if (call.regions?.length) evidence.append(element("div", `Control context: ${call.regions.map(id => { const r = regions.get(id); return r ? `${r.kind}: ${r.label}` : id; }).join(" · ")}`, "detail"));
-  if (witness) evidence.append(button("Read call-site source", () => showSource(call, view.revision)));
-  li.append(evidence);
-  return li;
-}
 async function showSource(item, revision) {
-  IndexPin.copy(revision);
   if (!sourceWitness(item)) throw new Error("Measured source path and range unavailable.");
-  if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
-  const serial = ++sourceSerial; const key = `${IndexPin.key(revision)}:${item.path}`;
-  window.TrellisNavigation?.reset();
-  $("source-path").textContent = `Loading ${item.path}…`; $("source").replaceChildren();
-  const data = sourceCache.get(key) || await api(`/api/source?path=${encodeURIComponent(item.path)}&${IndexPin.query(revision)}`);
-  if (serial !== sourceSerial || !IndexPin.equal(status?.revision, revision)) return;
-  if (!IndexPin.equal(data.revision, revision) || !IndexPin.equal(status?.revision, revision)) { unexpectedPair("Source snapshot changed. Refresh status.", data.revision); throw new Error("Source snapshot changed. Refresh status."); }
-  sourceCache.set(key, data);
-  $("source-path").textContent = `${data.file.path} · revision ${IndexPin.label(data.revision)} · cached snapshot`;
+  return showCachedSource(item.path, item.range, revision);
+}
+let workspaceSource = null;
+function paintCachedSource(data, range, current) {
+  workspaceSource = {data, range};
+  $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot`;
   const fragment = document.createDocumentFragment();
+  const lastLine = range && range.endLine > range.startLine && range.endColumn === 1 ? range.endLine - 1 : range?.endLine;
   data.file.text.split("\n").forEach((text, index) => {
-    const number = index + 1; const line = element("span", undefined, "source-line");
-    if (number >= item.range.startLine && number <= item.range.endLine) line.classList.add("highlight");
+    const number = index + 1, line = element("span", undefined, "source-line");
+    if (range && number >= range.startLine && number <= lastLine) line.classList.add("highlight");
     line.append(element("span", String(number), "line-number"), document.createTextNode(text)); fragment.append(line);
   });
-  $("source").replaceChildren(fragment);
+  $("source").replaceChildren(fragment); $("source").hidden = false;
   window.TrellisShell?.showSource("workspace");
   window.TrellisNavigation?.attachSource($("source"), {
-    path:data.file.path, revision:data.revision, startLine:item.range.startLine,
-    isCurrent: () => serial === sourceSerial && !!token && IndexPin.equal(status?.revision, revision) &&
-      !$("source-dock")?.hidden && !$("workspace-source-panel")?.hidden,
+    path:data.file.path, revision:data.revision, startLine:range?.startLine || 1,
+    isCurrent: () => current() && !!token && IndexPin.equal(status?.revision, data.revision) &&
+      !(section === "files" && filesBasis !== "indexed") && !$("source-dock")?.hidden && !$("workspace-source-panel")?.hidden,
   });
+}
+async function showCachedSource(path, range, revision, callerCurrent = () => true) {
+  IndexPin.copy(revision);
+  if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
+  const serial = ++sourceSerial, session = epoch, root = selectedRootKey;
+  const current = () => callerCurrent() && serial === sourceSerial && session === epoch && root === selectedRootKey && IndexPin.equal(status?.revision, revision);
+  const key = `${IndexPin.key(revision)}:${path}`;
+  window.TrellisNavigation?.reset(); workspaceSource = null;
+  $("source-path").textContent = `Loading ${path}…`; $("source").replaceChildren();
+  const data = sourceCache.get(key) || await api(`/api/source?path=${encodeURIComponent(path)}&${IndexPin.query(revision)}`, "GET", undefined, current);
+  if (!current()) return;
+  if (!IndexPin.equal(data.revision, revision)) { unexpectedPair("Source snapshot changed. Refresh status.", data.revision); return; }
+  if (data.file.path !== path) throw new Error("Source path mismatch. Nothing displayed.");
+  sourceCache.set(key, data);
+  if (section === "diagrams") {
+    // An explicit diagram source read replaces the shared source selection.
+    filesSerial++; filesDiffSerial++; clearFilesInspector();
+    filesFile = files.find(file => file.path === path) || {path}; filesBasis = "indexed"; filesDiff = null;
+  }
+  paintCachedSource(data, range, current);
   $("source").focus({preventScroll:true});
-  $("source").scrollIntoView?.({block:"nearest"});
   const highlight = $("source").querySelector(".highlight");
   if (highlight) {
     $("source").scrollTop = highlight.offsetTop - $("source").offsetTop - 80;
-    // The workbench's source panel can own vertical scrolling, not the pre.
     highlight.scrollIntoView?.({block:"start", inline:"nearest"});
   }
 }
-$("refresh").addEventListener("click", () => perform(async () => { clearSource(); const revision = status?.revision; await refreshStatus(); if (IndexPin.equal(revision, status?.revision)) await refreshTree(); if (selectedMethod) await loadSequence(); else if (seed) await runQuery(); await loadSaved(); await refreshJevStatus(); await refreshAcpStatus(); schedulePoll(); }, $("refresh")));
-function savedButton(text, action, kind, id, actionName) {
-  const control = button(text, action);
-  control.setAttribute("data-saved-kind", kind);
-  control.setAttribute("data-saved-id", id);
-  control.setAttribute("data-action", actionName);
-  return control;
-}
-function syncSavedControls() {
-  const pin = currentNativePin();
-  const currentResult = !!result && IndexPin.equal(result.revision, status?.revision);
-  $("save-view").disabled = !pin || (!editingView && (!currentResult || !!focused));
-  $("save-note").disabled = !pin || (!editingNote && (!currentResult || !seed || result?.query?.seed !== seed));
-}
-function resetView() {
-  editingView = null; $("view-title").value = ""; $("save-view").textContent = "Save raw query"; $("reset-view").hidden = true; syncSavedControls();
-}
-function beginViewEdit(state) {
-  const pin = currentNativePin();
-  if (!pin) throw new Error("Index a native snapshot before editing this saved view.");
-  const view = state.view, snapshot = savedViewDto(view);
-  snapshot.id = state.originalId; snapshot.query.seed = state.originalTarget;
-  editingView = {id:state.originalId, target:state.originalTarget, pin, view:snapshot};
-  $("view-title").value = view.title; $("save-view").textContent = "Save view title"; $("reset-view").hidden = false;
-  $("view-title").focus(); syncSavedControls();
-}
-async function loadSavedView(state) {
-  const decision = savedLoadDecision(state, "view");
-  if (!decision.enabled) throw new Error(decision.reason);
-  const view = state.view;
-  seed = decision.target; $("seed").textContent = `Saved view: ${view.title}`;
-  $("depth").value = String(Math.max(0, Math.min(5, Number(view.query.depth ?? 1)))); $("callbacks").checked = false;
-  const replay = savedQueryDto(view.query); replay.seed = decision.target;
-  renderNotes(); await runQuery(replay, decision.pin);
-}
-function renderViews() {
-  $("views").replaceChildren();
-  for (const state of views) {
-    const view = state.view, decision = savedLoadDecision(state, "view"), li = element("li");
-    li.setAttribute("data-saved-kind", "view"); li.setAttribute("data-saved-id", view.id);
-    li.append(element("strong", view.title, "saved-title"));
-    const actions = element("div", undefined, "bar saved-actions");
-    const load = savedButton("Load", () => loadSavedView(state), "view", view.id, "load");
-    load.disabled = !decision.enabled; load.title = decision.reason;
-    const editView = savedButton("Edit title", () => beginViewEdit(state), "view", view.id, "edit");
-    editView.disabled = !currentNativePin();
-    editView.title = editView.disabled ? "Index a native snapshot before editing." : "Edit without loading this view.";
-    actions.append(load, editView, savedButton("Delete", async () => {
-      await api(`/api/views/${encodeURIComponent(view.id)}`, "DELETE");
-      if (editingView?.id === view.id) resetView(); await loadSaved();
-    }, "view", view.id, "delete"));
-    li.append(actions);
-    const reason = element("span", decision.reason, "detail saved-reason");
-    reason.id = `saved-view-${view.id}-reason`; load.setAttribute("aria-describedby", reason.id); li.append(reason);
-    if (state.orphanedIds.length) li.append(element("span", `${state.orphanedIds.length} saved layout reference${state.orphanedIds.length === 1 ? " is" : "s are"} unavailable.`, "detail"));
-    $("views").append(li);
+$("refresh").addEventListener("click", () => perform(async () => {
+  const revision = status?.revision, session = epoch, root = selectedRootKey;
+  const file = filesFile, basis = filesBasis;
+  clearSource(); filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
+  await refreshGit(); if (session !== epoch || root !== selectedRootKey) return;
+  await refreshStatus();
+  if (IndexPin.equal(revision, status?.revision)) {
+    void viewerMetrics?.refresh(); await refreshTree();
+    if (section === "files" && file) {
+      if (file.changeOnly) { filesFile = file; await setFilesBasis("working"); }
+      else { await selectFilesFile(file); if (basis === "working") await setFilesBasis("working"); }
+    }
   }
-  if (!views.length) $("views").append(element("li", "No saved views yet. Run a raw query, then save it here."));
-  syncSavedControls();
-}
-$("reset-view").addEventListener("click", resetView);
-form("save-form", async () => {
-  const title = $("view-title").value.trim();
-  if (editingView) {
-    const edit = editingView, dto = savedViewDto(edit.view, title);
-    if (dto.id !== edit.id || dto.query.seed !== edit.target) throw new Error("Saved view identity changed. Cancel and reopen the editor.");
-    await api(`/api/views/${encodeURIComponent(edit.id)}?${IndexPin.query(edit.pin)}`, "PUT", dto);
-    resetView(); await loadSaved(); return;
-  }
-  if (focused) throw new Error("Focused selections cannot be saved as raw queries. Return to the raw hierarchy first.");
-  const pin = currentNativePin();
-  if (!pin || !result || !IndexPin.equal(result.revision, pin)) throw new Error("Run a current pinned query before saving a view.");
-  const id = crypto.randomUUID(), dto = savedViewDto({id, title, query:{...result.query, depth:1, includeCallbacks:false}, pins:{}, hidden:[]});
-  await api(`/api/views/${encodeURIComponent(id)}?${IndexPin.query(pin)}`, "PUT", dto);
-  resetView(); await loadSaved();
-});
-function resetNote() {
-  editingNote = null; $("note-title").value = ""; $("note").value = ""; $("save-note").textContent = "Add note"; $("reset-note").hidden = true; syncSavedControls();
-}
-$("reset-note").addEventListener("click", resetNote);
-function beginNoteEdit(state) {
-  const pin = currentNativePin();
-  if (!pin) throw new Error("Index a native snapshot before editing this note.");
-  const note = state.annotation;
-  editingNote = {id:state.originalId, target:state.originalTarget, pin,
-    note:annotationDto({...note, id:state.originalId, nodeId:state.originalTarget}, note.title, typeof note.title === "string")};
-  $("note-title").value = note.title || ""; $("note").value = note.body;
-  $("save-note").textContent = "Save note"; $("reset-note").hidden = false; $("note").focus(); syncSavedControls();
-}
-async function loadSavedNote(state) {
-  const decision = savedLoadDecision(state, "note");
-  if (!decision.enabled) throw new Error(decision.reason);
-  seed = decision.target; $("seed").textContent = `Saved note target: ${state.annotation.title || state.annotation.id}`;
-  $("depth").value = "1"; $("callbacks").checked = false; renderNotes();
-  await runQuery({seed:decision.target, depth:1, maxNodes:40, maxCalls:200, includeCallbacks:false, excludePaths:[]}, decision.pin);
-}
-function renderNotes() {
-  $("annotation-target").textContent = editingNote ? `Editing note anchored to ${editingNote.target}. Selection changes will not retarget it.`
-    : seed ? `Notes for symbol ${seed}` : "Select a symbol to attach a note. Unavailable notes remain visible.";
-  $("annotations").replaceChildren();
-  const displayed = annotations.filter(state => state.annotation.nodeId === seed || editingNote?.id === state.annotation.id ||
-    state.attachment.availability !== "ready" || state.attachment.result?.status === "orphaned" || !IndexPin.equal(state.savedPair, status?.revision));
-  for (const state of displayed) {
-    const note = state.annotation, decision = savedLoadDecision(state, "note"), li = element("li");
-    li.setAttribute("data-saved-kind", "note"); li.setAttribute("data-saved-id", note.id);
-    if (note.title) li.append(element("strong", note.title, "saved-title"));
-    li.append(element("p", note.body));
-    const actions = element("div", undefined, "bar saved-actions");
-    const load = savedButton("Load", () => loadSavedNote(state), "note", note.id, "load");
-    load.disabled = !decision.enabled; load.title = decision.reason;
-    const editNote = savedButton("Edit", () => beginNoteEdit(state), "note", note.id, "edit");
-    editNote.disabled = !currentNativePin();
-    editNote.title = editNote.disabled ? "Index a native snapshot before editing." : "Edit without changing the saved target.";
-    actions.append(load, editNote, savedButton("Delete", async () => {
-      await api(`/api/annotations/${encodeURIComponent(note.id)}`, "DELETE");
-      if (editingNote?.id === note.id) resetNote(); await loadSaved();
-    }, "note", note.id, "delete"));
-    li.append(actions);
-    const reason = element("span", decision.reason, "detail saved-reason");
-    reason.id = `saved-note-${note.id}-reason`; load.setAttribute("aria-describedby", reason.id); li.append(reason);
-    $("annotations").append(li);
-  }
-  if (!displayed.length) $("annotations").append(element("li", seed ? "No notes for this symbol." : "No saved notes yet."));
-  syncSavedControls();
-}
-form("annotation-form", async () => {
-  const title = $("note-title").value.trim(), body = $("note").value;
-  if (editingNote) {
-    const edit = editingNote;
-    const titleSupplied = !!title || own(edit.note, "title");
-    const dto = annotationDto({id:edit.id, nodeId:edit.target, body}, title, titleSupplied);
-    await api(`/api/annotations/${encodeURIComponent(edit.id)}?${IndexPin.query(edit.pin)}`, "PUT", dto);
-    resetNote(); await loadSaved(); return;
-  }
-  const pin = currentNativePin();
-  if (!pin || !seed || !result || result.query?.seed !== seed || !IndexPin.equal(result.revision, pin)) throw new Error("Run a current pinned query for the selected symbol before adding a note.");
-  const id = crypto.randomUUID(), dto = annotationDto({id, nodeId:seed, body}, title, !!title);
-  await api(`/api/annotations/${encodeURIComponent(id)}?${IndexPin.query(pin)}`, "PUT", dto);
-  resetNote(); await loadSaved();
-});
+  if (section !== "files" && !$("treemap-panel").hidden) await treemap?.refresh();
+  else if (section !== "files" && !$("architecture-panel").hidden) await architecture?.refresh();
+  else if (section !== "files" && selectedMethod) await loadSequence();
+  schedulePoll();
+}, $("refresh")));
 function activeJob(value) { return ["queued", "running"].includes(value.state); }
 function showJob() {
   if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }
@@ -823,12 +565,12 @@ function schedulePoll() {
   pollTimer = setTimeout(() => perform(async () => {
     job = await api(`/api/jobs/${encodeURIComponent(job.id)}`); showJob();
     if (activeJob(job)) schedulePoll();
-    else { waitingForJob = false; showJob(); await refreshStatus(); await loadSaved(); }
+    else { waitingForJob = false; showJob(); await refreshStatus(); }
   }), 700);
 }
 $("index").addEventListener("click", () => perform(async () => {
   window.TrellisClasses?.reset();
-  diagramSerial++; window.TrellisShell?.resetInspector(); clearSource();
+  diagramSerial++; viewerMetrics?.clearInspection(); window.TrellisShell?.resetInspector(); clearSource();
   job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
 }, $("index")).then(() => { if (job) showJob(); }));
 $("cancel").addEventListener("click", () => {
@@ -836,247 +578,271 @@ $("cancel").addEventListener("click", () => {
   clearTimeout(pollTimer); waitingForJob = false; showJob();
 });
 
-async function refreshJevStatus() {
-  const serial = ++jevStatusSerial;
-  try {
-    const data = await api("/api/jev/status");
-    if (serial !== jevStatusSerial) return;
-    jevStatus = data;
-    const b = data.budget;
-    $("jev-status").textContent = data.enabled && b
-      ? `Live Jev enabled · $${(b.remainingCents / 100).toFixed(2)} available of $${(b.capCents / 100).toFixed(2)} · $${(b.reservedCents / 100).toFixed(2)} reserved · ${b.attempts} attempts. Conservative reservation accounting, not invoiced cost. Each attempt reserves $0.10, including failures.`
-      : "Live Jev disabled. Offline preview and JSON export/import remain available.";
-  } catch (error) {
-    if (serial !== jevStatusSerial || error.name === "AbortError") return;
-    jevStatus = null;
-    $("jev-status").textContent = "Live Jev status unavailable. Refresh status before running.";
-  }
-  syncFocusControls();
-}
-function syncFocusControls() {
-  $("explain-acp").disabled = acpRunning || !safePacket() || !acpStatus?.enabled || !(acpStatus.status?.remainingAttempts > 0);
-  $("run-jev").disabled = jevRunning || !safePacket() || !jevStatus?.enabled || !(jevStatus.budget?.remainingCents >= 10);
 
-  $("save-view").disabled = !!focused;
-  $("save-view").title = focused ? "Return to the raw hierarchy to save its query" : "Saves raw query settings, not a focused selection";
-  $("return-raw").hidden = !focused;
-  $("query-form").hidden = !!focused;
-  $("focus-counts").hidden = !focused;
-  $("packet-actions").hidden = !safePacket();
-  $("result-title").textContent = focused ? "Focused outgoing calls" : "Outgoing call hierarchy";
+// Files uses the existing checkout/session owner, source cache and tree DOM.
+function filesGuard({symbol = false, basis = false} = {}) {
+  const session = epoch, root = selectedRootKey, pin = status?.revision, generation = filesSerial;
+  const surface = sectionSerial, file = filesFile, selected = filesSymbol, sourceBasis = filesBasis;
+  return () => session === epoch && root === selectedRootKey && IndexPin.equal(pin, status?.revision) &&
+    section === "files" && surface === sectionSerial && file === filesFile &&
+    (!symbol || (generation === filesSerial && selected === filesSymbol)) && (!basis || sourceBasis === filesBasis);
 }
-function invalidateFocus(message = "Prepare preview offline first, then explicitly Run Jev with that packet. No automatic provider calls.") {
-  clearAnswer(); questionSerial++; packet = null; focused = null;
-  $("import-jev").value = ""; $("focus-state").textContent = message;
-  syncFocusControls();
+function clearFilesInspector() {
+  filesMatchesSerial++; filesSymbol = null; filesMini = null; filesMatches = null;
+  for (const id of ["files-symbol-location", "files-symbol-header", "files-symbol-return", "files-mini-sequence", "files-matches", "files-matches-state"]) $(id)?.replaceChildren();
+  if ($("files-symbol-title")) $("files-symbol-title").textContent = "Choose a symbol";
+  if ($("files-symbol-kind")) $("files-symbol-kind").textContent = "Indexed symbol";
+  if ($("files-mini-state")) $("files-mini-state").textContent = "Select a callable to preview its measured sequence.";
+  if ($("files-open-full")) $("files-open-full").disabled = true;
+  for (const id of ["files-matches-more", "files-matches-retry"]) if ($(id)) $(id).hidden = true;
 }
-function questionChanged() {
-  const hadFocus = !!focused;
-  invalidateFocus("Question settings changed. Preview again to prepare a new evidence packet.");
-  if (hadFocus) { clearSource(); renderResult(); }
+function clearFilesEvidence() {
+  filesSerial++; filesDiffSerial++; filesFile = null; filesBasis = "indexed"; filesDiff = null; filesCatalogLoaded = false;
+  clearFilesInspector(); $("files-diff")?.replaceChildren();
+  if ($("files-empty")) $("files-empty").hidden = false;
+  updateFilesBasis();
 }
-$("question-form").addEventListener("input", questionChanged);
-$("query-form").addEventListener("change", () => {
-  querySerial++; invalidateFocus("Raw query settings changed. Apply the query or preview again."); clearSource(); renderResult();
-});
-form("question-form", async () => {
-  if (!seed || !status) throw new Error("Select an indexed symbol first.");
-  invalidateFocus(); clearSource(); renderResult();
-  const serial = questionSerial, queryAtStart = querySerial, selectedSeed = seed, revision = IndexPin.copy(status.revision);
-  const terms = $("focus-terms").value.split(",").map(s => s.trim()).filter(Boolean);
-  if (terms.length > 12) throw new Error("Use no more than 12 focus terms.");
-  if (!safeEvidenceFormat()) {
-    packet = null; focused = null;
-    $("focus-state").textContent = "Source-only preview. Packet actions are unavailable without verified terminal status.";
+function filesFailure(error, target, current) {
+  if (!current() || error.name === "AbortError") return;
+  if (["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) { unexpectedPair("Indexed evidence is stale. Refresh status before selecting again."); return; }
+  if ($(target)) $(target).textContent = error.message;
+}
+async function setSection(name) {
+  if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
+  if (section === name) {
+    const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $("view-sequence");
+    target?.focus(); return;
   }
-  $("focus-state").textContent = "Preparing local evidence and offline preview…";
-  const data = await api("/api/questions/preview", "POST", {seed, question: $("question").value.trim(), expectedRevision: revision,
-    evidenceDepth: Number($("evidence-depth").value), maxVisible: Number($("max-visible").value),
-    allowDeeperDisplay: $("allow-deeper").checked, focusTerms: terms});
-  if (serial !== questionSerial || queryAtStart !== querySerial || seed !== selectedSeed || !IndexPin.equal(status?.revision, revision)) return;
-  if (!IndexPin.equal(data.packet.revision, revision) || !IndexPin.equal(data.view.revision, revision)) { unexpectedPair("Preview revision changed. Refresh and try again.", data.packet.revision); throw new Error("Preview revision changed. Refresh and try again."); }
-  if (!safeEvidenceFormat() || hasLexicalProof(data.packet) || hasLexicalProof(data.view)) {
-    packet = null; focused = terminalView(data.view, selectedSeed, revision);
-    $("focus-state").textContent = `Source-only terminal preview · revision ${IndexPin.label(revision)}. Packet and provider actions unavailable.`;
-    renderResult(); return;
+  architecture?.reset();
+  treemap?.reset();
+  section = name; sectionSerial++; sourceSerial++; filesDiffSerial++;
+  for (const state of fileStates.values()) if (state.outlineLoading) {
+    state.serial++; state.outlineLoading = false; state.outlineError = "Symbol read interrupted. Retry to read this indexed outline.";
   }
-  packet = data.packet; focused = terminalView(data.view, selectedSeed, revision);
-  $("focus-state").textContent = `Local preview—not Jev/ACP · deterministic term matching · revision ${IndexPin.label(revision)}. ${packet.warnings?.map(describe).join(" · ") || ""}`;
-  renderResult();
-});
-$("return-raw").addEventListener("click", () => { focused = null; questionSerial++; clearAnswer(); clearSource(); renderResult(); });
-function safeEvidenceFormat() {
-  // This status marker is an explicit frontend cutover contract. Old indexes omit it.
-  return status?.evidenceFormat === "terminal-native-graph-v1" &&
-    !!status.revision;
+  window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
+  window.TrellisShell?.setSection(name);
+  if (name !== "files") {
+    $("source").hidden = false; $("files-diff").hidden = true;
+    if (!workspaceSource) window.TrellisShell?.closeSource();
+    renderFiles();
+    const cached = workspaceSource, surface = sectionSerial, session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
+    const current = () => section === "diagrams" && surface === sectionSerial && session === epoch && root === selectedRootKey && sourceAtStart === sourceSerial && IndexPin.equal(cached?.data.revision, status?.revision);
+    if (!$("treemap-panel").hidden) await treemap?.refresh();
+    else if (!$("architecture-panel").hidden) await architecture?.refresh();
+    else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
+    if (cached && current()) paintCachedSource(cached.data, cached.range, current);
+    return;
+  }
+  viewerMetrics?.clearInspection();
+  // Section changes keep validated evidence but never choose or read a file.
+  updateFilesBasis(); renderFiles();
+  if (!workspaceSource && filesFile && !filesFile.changeOnly && status?.revision) {
+    const cached = sourceCache.get(`${IndexPin.key(status.revision)}:${filesFile.path}`);
+    if (cached) workspaceSource = {data:cached, range:filesSymbol?.symbol.range || null};
+  }
+  if (workspaceSource && filesBasis === "indexed") {
+    const source = workspaceSource;
+    paintCachedSource(source.data, source.range, filesGuard({basis:true}));
+  }
+  if (filesSymbol) {
+    const current = filesGuard({symbol:true});
+    if (filesMatches) renderFilesMatches(); else void loadFilesMatches();
+    if (filesMini) await renderFilesMini(current);
+    else if (["function", "method"].includes(filesSymbol.symbol.kind)) void loadFilesMini(current);
+  }
+  if (!workspaceSource && filesFile && filesBasis === "indexed") $("source-path").textContent = "Source read interrupted. Select the file again to read its cached snapshot.";
+  if (filesBasis === "working") {
+    if (filesDiff) window.TrellisFiles?.diff($("files-diff"), filesDiff);
+    else $("files-diff").textContent = "Diff read interrupted. Select Working tree again to measure it.";
+  }
+  if (!filesCatalogLoaded && status?.revision) await loadFiles(true);
+  if (!filesGitStatus) await refreshGit();
 }
-function safePacket() {
-  return !!packet && safeEvidenceFormat() && IndexPin.equal(packet.revision, status.revision) &&
-    !hasLexicalProof(packet) && (!focused || (IndexPin.equal(focused.revision, status.revision) && !hasLexicalProof(focused)));
+window.TrellisShell?.setSectionCallback?.(name => { void setSection(name); });
+function appendFilesOutline(li, file) {
+  const state = fileStates.get(file.path);
+  if (!state?.outlineOpen) return;
+  const list = element("ul"); li.append(list);
+  const guard = filesGuard(), serial = state.serial;
+  const current = () => guard() && fileStates.get(file.path) === state && serial === state.serial;
+  if (state.outlineLoading) list.append(element("li", "Loading symbols…", "detail"));
+  else if (state.outlineError) list.append(button(`Retry symbols · ${state.outlineError}`, () => { if (current()) return loadFilesOutline(file, 0); }));
+  else {
+    window.TrellisFiles?.outline(list, state.outlineItems || [], filesSymbol, selectFilesSymbol, current);
+    if (!state.outlineItems?.length) list.append(element("li", "No measured symbols. Cached source remains readable.", "detail"));
+    if (state.outlineNext != null) { const next = state.outlineNext; list.append(button("More symbols", () => { if (current()) return loadFilesOutline(file, next); })); }
+    for (const warning of state.outlineWarnings || []) list.append(element("li", warning, "warning"));
+    if (state.outlineTruncated) list.append(element("li", "Outline continues on the next page.", "detail"));
+  }
 }
-function hasLexicalProof(value, seen = new Set()) {
-  if (!value || typeof value !== "object") return false;
-  if (seen.has(value)) return true;
-  seen.add(value);
-  if (Object.keys(value).some(key => ["target", "candidateSymbols", "resolution", "callbackArguments", "includeCallbacks", "candidateIds", "derivedFrom"].includes(key))) return true;
-  return Object.values(value).some(child => hasLexicalProof(child, seen));
-}
-function currentPacket() {
-  if (!safePacket() || !IndexPin.equal(packet.revision, status?.revision) || packet.request.seed !== seed) throw new Error("Packet actions require a verified terminal snapshot. Reindex before using a provider or export.");
-  return packet;
-}
-$("export-jev").addEventListener("click", () => perform(async () => {
-  const current = currentPacket(), serial = questionSerial;
-  if (!window.confirm("This JSON includes indexed source code. Export it only if you are allowed to share that code. No provider request will be sent. Download now?")) return;
-  const data = await api(`/api/questions/${encodeURIComponent(current.packetId)}/jev-request`);
-  if (packet !== current || serial !== questionSerial) return;
-  const json = JSON.stringify(data);
-  const bytes = new TextEncoder().encode(json);
-  if (bytes.byteLength > 176000) throw new Error(`Provider request is ${bytes.byteLength} bytes; the limit is 176000 bytes. Nothing was downloaded. Reduce evidence depth or select a smaller root and preview again.`);
-  const blob = new Blob([bytes], {type: "application/json"});
-  const url = URL.createObjectURL(blob), link = element("a");
-  link.href = url; link.download = "trellis-jev-request.json"; document.body.append(link); link.click(); link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-  $("focus-state").textContent = "Provider request downloaded with source code. No provider call was made.";
-}, $("export-jev")));
-$("import-jev").addEventListener("change", () => {
-  const file = $("import-jev").files[0]; $("import-jev").value = "";
-  if (!file) return;
-  perform(async () => {
-    const current = currentPacket(), serial = ++questionSerial, session = epoch;
-    clearAnswer();
-    if (file.size > 2 * 1024 * 1024) throw new Error("Response file is too large (maximum 2 MiB).");
-    let data;
-    try { data = JSON.parse(await file.text()); } catch { throw new Error("Choose a valid Jev response JSON file."); }
-    if (epoch !== session || packet !== current || serial !== questionSerial) return;
-    const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/jev-response`, "POST", data);
-    if (packet !== current || serial !== questionSerial) return;
-    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(undefined, response.view.revision); throw new Error("Imported Jev revision changed. Refresh status."); }
-    clearSource(); focused = response.view;
-    $("focus-state").textContent = "Imported Jev · user-supplied, unverified response. No live Jev/ACP call was made.";
-    renderResult();
-  });
-});
-syncFocusControls();
-
-$("run-jev").addEventListener("click", () => perform(async () => {
-  const current = currentPacket();
-  if (!jevStatus?.enabled || jevRunning) return;
-  if (!window.confirm("Send the entire prepared evidence packet to Jev? This includes your question and complete indexed source files, not just visible calls. Continue only if you are allowed to share all of this source. This attempt reserves $0.10 even if it fails; reservation accounting is not invoiced cost. Run Jev now?")) return;
-  const serial = ++questionSerial, session = epoch;
-  clearAnswer();
-  jevRunning = true;
-  $("focus-state").textContent = "Running Jev with the prepared packet… No automatic retries.";
-  syncFocusControls();
+async function loadFilesOutline(file, offset = 0) {
+  if (!status?.revision || filesFile?.path !== file.path) return;
+  let state = fileStates.get(file.path);
+  if (!state) { state = {open:false, serial:0}; fileStates.set(file.path, state); }
+  const current = filesGuard(), serial = ++state.serial, pin = IndexPin.copy(status.revision);
+  const active = () => current() && fileStates.get(file.path) === state && serial === state.serial;
+  state.outlineOpen = true; state.outlineLoading = true; state.outlineError = null; renderFiles();
   try {
-    const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/jev-run`, "POST", {});
-    if (packet !== current || serial !== questionSerial) return;
-    if (!IndexPin.equal(response.view.revision, status?.revision)) { unexpectedPair(undefined, response.view.revision); throw new Error("Jev revision changed. Refresh status."); }
-    clearSource(); focused = response.view;
-    $("focus-state").textContent = `Live Jev · provider selection, not proof of correctness or execution order · revision ${IndexPin.label(response.view.revision)} · ${response.latencyMs} ms.`;
-    renderResult();
-  } catch (error) {
-    if (session === epoch && packet === current && serial === questionSerial && error.name !== "AbortError")
-      $("focus-state").textContent = "Jev attempt failed. Any reservation is retained. No automatic retry was made.";
-    throw error;
-  } finally {
-    if (session === epoch) {
-      jevRunning = false;
-      await refreshJevStatus();
-      syncFocusControls();
-    }
+    const data = await api(`/api/symbols?path=${encodeURIComponent(file.path)}&${IndexPin.query(pin)}&offset=${offset}&limit=200`, "GET", undefined, active);
+    if (!active()) return;
+    if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
+    if (data.path !== file.path || data.items.some(item => item.symbol.path !== file.path)) throw new Error("Outline path mismatch. Nothing displayed.");
+    state.outlineItems = offset ? [...(state.outlineItems || []), ...data.items] : data.items;
+    state.outlineNext = data.nextOffset; state.outlineWarnings = data.warnings; state.outlineTruncated = data.truncated;
+  } catch (error) { if (active()) state.outlineError = error.message; filesFailure(error, "files-state", active); }
+  finally { if (active()) { state.outlineLoading = false; renderFiles(); } }
+}
+async function selectFilesFile(file) {
+  if (section !== "files" || !status?.revision) return;
+  for (const [path, state] of fileStates) if (path !== file.path) state.outlineOpen = false;
+  filesSerial++; filesDiffSerial++; filesFile = {...file}; filesBasis = "indexed"; filesDiff = null; clearFilesInspector();
+  $("files-diff").replaceChildren(); $("files-empty").hidden = true; updateFilesBasis();
+  const current = filesGuard({symbol:true, basis:true}), pin = IndexPin.copy(status.revision);
+  await Promise.all([
+    showCachedSource(file.path, null, pin, current).catch(error => filesFailure(error, "source-path", current)),
+    loadFilesOutline(file),
+  ]);
+}
+async function selectFilesSymbol(item) {
+  if (section !== "files") return;
+  if (item.symbol.path !== filesFile?.path) {
+    filesFile = files.find(file => file.path === item.symbol.path) || {path:item.symbol.path};
+    for (const [path, state] of fileStates) if (path !== item.symbol.path) state.outlineOpen = false;
   }
-}, $("run-jev")));
-
-// Status reads do not start inference. Unknown status must fail closed.
-async function refreshAcpStatus() {
-  const serial = ++acpStatusSerial;
-  acpStatus = null;
-  $("acp-status").textContent = "Checking ACP allowance…";
-  syncFocusControls();
+  filesSerial++; filesDiffSerial++; clearFilesInspector(); filesSymbol = item; filesBasis = "indexed"; filesDiff = null;
+  const symbol = item.symbol, pin = IndexPin.copy(status.revision), current = filesGuard({symbol:true});
+  $("files-symbol-title").textContent = symbol.qualifiedName || symbol.name;
+  $("files-symbol-kind").textContent = item.nativeKind;
+  $("files-symbol-location").textContent = `${symbol.path}:${symbol.range.startLine}–${symbol.range.endLine} · indexed revision ${IndexPin.label(pin)}`;
+  $("files-symbol-header").textContent = window.TrellisFiles?.headerText(item.header) || "Measured header unavailable";
+  $("files-symbol-return").textContent = item.header?.resultType ? `Return type · ${item.header.resultType}` : "Return type not recorded";
+  updateFilesBasis(); renderFiles();
+  const callable = ["function", "method"].includes(symbol.kind);
+  $("files-mini-state").textContent = callable ? "Loading measured sequence…" : "Sequence not applicable to this noncallable symbol.";
+  await Promise.all([
+    showCachedSource(symbol.path, symbol.range, pin, filesGuard({symbol:true, basis:true})).catch(error => filesFailure(error, "source-path", current)),
+    loadFilesMatches(),
+    callable ? loadFilesMini(current) : Promise.resolve(),
+  ]);
+}
+async function loadFilesMatches(continuation = null) {
+  if (!filesSymbol) return;
+  const item = filesSymbol, pin = IndexPin.copy(status.revision), guard = filesGuard({symbol:true}), serial = ++filesMatchesSerial;
+  const current = () => guard() && serial === filesMatchesSerial;
+  $("files-matches-state").textContent = "Loading syntax matches…"; $("files-matches-more").hidden = true; $("files-matches-retry").hidden = true;
   try {
-    const data = await api("/api/acp/status");
-    if (serial !== acpStatusSerial) return;
-    acpStatus = data;
-    const allowance = data.status;
-    $("acp-status").textContent = data.enabled && allowance
-      ? `ACP · ${allowance.model} · ${allowance.remainingAttempts} of ${allowance.maxAttempts} attempts remaining (${allowance.attempts} used). Claude subscription allowance, separate from Jev. Up to $${allowance.maxEstimatedUsdPerAttempt} estimated per attempt; not a bill or hard spending guarantee.`
-      : "ACP disabled. Offline preview and Jev selection remain available.";
-  } catch (error) {
-    if (serial !== acpStatusSerial || error.name === "AbortError") return;
-    acpStatus = null;
-    $("acp-status").textContent = "ACP status unavailable. Refresh status before explaining.";
-  }
-  syncFocusControls();
+    const data = await api("/api/syntax-matches", "POST", {expectedRevision:pin, symbolId:item.symbol.id, ...(continuation ? {continuation} : {})}, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
+    if (data.symbolId !== item.symbol.id || data.evidenceKind !== "syntaxMatches") throw new Error("Syntax match provenance mismatch. Nothing displayed.");
+    filesMatches = {...data, items:continuation ? [...(filesMatches?.items || []), ...data.items] : data.items}; renderFilesMatches();
+  } catch (error) { filesFailure(error, "files-matches-state", current); if (current()) $("files-matches-retry").hidden = false; }
 }
-function clearAnswer() {
-  answerSerial++;
-  $("answer").hidden = true;
-  $("answer-content").replaceChildren();
-  $("answer-meta").textContent = "";
-  $("answer-state").textContent = "";
+function renderFilesMatches() {
+  $("files-matches").replaceChildren();
+  if (!filesMatches || !filesSymbol) return;
+  const data = filesMatches, pin = IndexPin.copy(data.revision), current = filesGuard({symbol:true});
+  window.TrellisFiles?.matches($("files-matches"), data.items, item => openFilesLocation(item, pin), current);
+  $("files-matches-state").textContent = `${data.items.length} shown · ${data.scope?.language || "language unavailable"} · source set ${data.scope?.sourceSetId || "unavailable"}${data.scope?.spelling ? " · " + data.scope.spelling : " · spelling unavailable"}${data.partial ? " · Incomplete coverage (skipped files or work budget)" : ""}${data.truncated ? " · more available" : ""}${!data.items.length ? " · No matches returned in the scanned scope; not proof of no references." : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}`;
+  $("files-matches-more").hidden = data.continuation == null;
 }
-function renderAnswer(response) {
-  const content = $("answer-content"); content.replaceChildren();
-  function claims(items) {
-    for (const claim of items) {
-      const row = element("div", undefined, "answer-claim");
-      row.append(element("p", claim.text));
-      const citations = element("div", undefined, "answer-citations");
-      for (const citation of claim.citations) {
-        const link = button(`${citation.path}:${citation.startLine}–${citation.endLine}`, () => showSource({path: citation.path, range: {startLine: citation.startLine, endLine: citation.endLine}}, response.revision));
-        link.title = citation.quote;
-        citations.append(link);
-      }
-      row.append(citations); content.append(row);
-    }
-  }
-  claims(response.answer.summary);
-  if (response.answer.branches.length) { content.append(element("h3", "Branch cases")); claims(response.answer.branches); }
-  if (response.answer.limitations.length) {
-    content.append(element("h3", "Model caveats · unverified"));
-    const list = element("ul");
-    for (const caveat of response.answer.limitations) list.append(element("li", caveat));
-    content.append(list);
-  }
-  $("answer-meta").textContent = `Live ACP · Claude · revision ${IndexPin.label(response.revision)} · ${response.latencyMs} ms · ${response.estimatedUsd == null ? "cost estimate unavailable" : `$${response.estimatedUsd} estimated (not billed cost)`}`;
-  $("answer").hidden = false;
+async function openFilesLocation(item, pin) {
+  if (!IndexPin.equal(pin, status?.revision) || section !== "files") return;
+  filesSerial++; filesDiffSerial++; clearFilesInspector(); filesFile = files.find(file => file.path === item.path) || {path:item.path}; filesBasis = "indexed"; filesDiff = null;
+  $("files-empty").hidden = true; $("files-symbol-title").textContent = "Pinned source location";
+  $("files-symbol-location").textContent = `${item.path}:${item.range.startLine} · indexed revision ${IndexPin.label(pin)}`;
+  updateFilesBasis(); renderFiles();
+  const current = filesGuard({symbol:true, basis:true});
+  await showCachedSource(item.path, item.range, pin, current).catch(error => filesFailure(error, "source-path", current));
 }
-$("explain-acp").addEventListener("click", () => perform(async () => {
-  const current = currentPacket();
-  if (!acpStatus?.enabled || !(acpStatus.status?.remainingAttempts > 0) || acpRunning) return;
-  if (!window.confirm("Send the FULL prepared source evidence to Claude via ACP? This includes your question and complete indexed source files, not just the five displayed calls. Continue only if you are allowed to share all of this source. This uses your Claude subscription and a separate ACP attempt allowance, NOT Jev’s budget. Failed or incomplete attempts still count. Cost estimates are not bills or hard spending guarantees. Explain with ACP now?")) return;
-  clearAnswer();
-  const serial = answerSerial, session = epoch, operationCurrent = operationGuard();
-  const currentRequest = () => session === epoch && serial === answerSerial && packet === current && operationCurrent();
-  acpRunning = true; syncFocusControls();
-  $("answer-state").textContent = "Explaining with ACP… Full packet sent; no automatic retry.";
+async function loadFilesMini(current) {
+  const symbol = filesSymbol.symbol, pin = IndexPin.copy(status.revision);
   try {
-    const response = await api(`/api/questions/${encodeURIComponent(current.packetId)}/acp-answer`, "POST", {});
-    if (!currentRequest()) return;
-    if (!IndexPin.equal(response.revision, status?.revision)) {
-      unexpectedPair("ACP answer provenance does not match this packet. Refresh status.", response.revision);
-      $("answer-state").textContent = "ACP answer provenance does not match this packet. Refresh status.";
-      $("error").textContent = $("answer-state").textContent; $("error").hidden = false;
-      throw new Error("ACP answer provenance does not match this packet. Refresh status.");
-    }
-    if (response.packetId !== current.packetId || response.answer?.packetId !== current.packetId || response.source !== "liveAcp")
-      throw new Error("ACP answer provenance does not match this packet. Nothing displayed.");
-    renderAnswer(response);
-    $("answer-state").textContent = "";
-  } catch (error) {
-    if (!currentRequest()) throw aborted();
-    if (error.name !== "AbortError") $("answer-state").textContent = error.message || "ACP attempt failed. The attempt allowance is retained. No automatic retry was made.";
-    throw error;
-  } finally {
-    if (session === epoch) {
-      acpRunning = false;
-      acpStatus = null;
-      syncFocusControls();
-      await refreshAcpStatus();
-    }
+    const data = await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:pin, showAll:false}, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
+    if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+    filesMini = data; await renderFilesMini(current);
+  } catch (error) { filesFailure(error, "files-mini-state", current); }
+}
+async function renderFilesMini(current) {
+  if (!filesMini || !filesSymbol) return;
+  const data = filesMini, revision = data.revision, expanded = new Set(), container = $("files-mini-sequence");
+  const readSource = step => { if (current()) return openFilesLocation(step, revision); };
+  const options = {showDetails:false, isCurrent:current};
+  options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
+  const outcome = window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
+  if (!current() || outcome.status === "stale") return;
+  if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
+  $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}${outcome.status !== "rendered" ? " · Pele fell back: " + outcome.reason : ""}`;
+  $("files-open-full").disabled = false;
+}
+async function openFilesFull() {
+  if (section !== "files" || !filesMini || !filesSymbol || !IndexPin.equal(filesMini.revision, status?.revision)) return;
+  const data = filesMini, symbol = filesSymbol.symbol;
+  await setSection("diagrams"); selectedMethod = symbol; $("all-steps").checked = false;
+  $("method-source").disabled = false; if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
+  window.TrellisShell?.showView("sequence"); renderFiles(); await loadSequence(data);
+}
+function updateFilesBasis() {
+  if (!$("files-working")) return;
+  const available = selectedGit?.state === "available", working = filesBasis === "working";
+  $("files-working").hidden = !available; $("files-working").disabled = !filesFile;
+  $("files-indexed").disabled = !filesFile || filesFile.changeOnly === true;
+  $("files-indexed").setAttribute("aria-pressed", String(!working)); $("files-working").setAttribute("aria-pressed", String(working));
+  $("files-git-state").textContent = available ? "" : `Working tree unavailable · ${selectedGit?.reason || "Git status unavailable"}`;
+  $("files-basis-note").textContent = status?.revision ? working ? `Uncommitted vs HEAD · Not indexed. Navigation and diagrams use indexed revision ${IndexPin.label(status.revision)}.` : `Cached source · indexed revision ${IndexPin.label(status.revision)}. Navigation and diagrams use this basis.` : "Select an indexed checkout to read cached source.";
+  $("files-diff").hidden = !working; $("source").hidden = working;
+  if ($("files-empty")) $("files-empty").hidden = !!filesFile || !!workspaceSource;
+}
+async function setFilesBasis(basis) {
+  if (section !== "files" || !filesFile || !["indexed", "working"].includes(basis) || (basis === "indexed" && filesFile.changeOnly)) return;
+  if (basis === "working" && selectedGit?.state !== "available") return;
+  filesBasis = basis; const serial = ++filesDiffSerial;
+  window.TrellisNavigation?.reset(); filesDiff = null; $("files-diff").replaceChildren(); updateFilesBasis();
+  if (basis === "indexed") {
+    const current = filesGuard({basis:true});
+    if (workspaceSource?.data.file.path === filesFile.path) paintCachedSource(workspaceSource.data, workspaceSource.range, current);
+    else await showCachedSource(filesFile.path, filesSymbol?.symbol.range || null, status.revision, current).catch(error => filesFailure(error, "source-path", current));
+    return;
   }
-}, $("explain-acp")));
+  const path = filesFile.path, guard = filesGuard({basis:true}), observation = ++gitSerial;
+  const current = () => guard() && serial === filesDiffSerial && observation === gitSerial;
+  $("files-diff").append(element("p", "Measuring uncommitted changes against HEAD…"));
+  try {
+    const statusData = await api("/api/git", "GET", undefined, current);
+    if (!current()) return;
+    filesGitStatus = statusData; showSelectedGit(statusData.git);
+    if (statusData.git.state !== "available") { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
+    if (!statusData.changes?.some(change => change.path === path)) { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
+    const data = await api(`/api/git/diff?path=${encodeURIComponent(path)}`, "GET", undefined, current);
+    if (!current()) return;
+    if (data.file && data.file.path !== path) throw new Error("Git diff path changed. Refresh to measure again.");
+    filesDiff = data; showSelectedGit(data.git); window.TrellisFiles?.diff($("files-diff"), data); renderFiles();
+  } catch (error) { if (current()) $("files-diff").replaceChildren(); filesFailure(error, "files-diff", current); }
+}
+function appendChangedOnlyPaths(tree, filter) {
+  const indexed = new Set(files.map(file => file.path));
+  const changes = filesGitStatus?.changes?.filter(change => !indexed.has(change.path) && change.path.toLowerCase().includes(filter)) || [];
+  if (!changes.length) return;
+  const group = element("li", "Uncommitted paths · not indexed"), list = element("ul"); group.append(list); tree.append(group);
+  const session = epoch, root = selectedRootKey, surface = sectionSerial, pin = status?.revision && IndexPin.copy(status.revision);
+  const current = () => session === epoch && root === selectedRootKey && surface === sectionSerial && section === "files" && IndexPin.equal(pin, status?.revision);
+  for (const change of changes) {
+    const row = element("li"), pick = button(`${change.status} · ${change.path}`, async () => {
+      if (!current()) return;
+      filesSerial++; filesDiffSerial++; clearFilesInspector(); clearSource(); filesFile = {path:change.path, changeOnly:true};
+      $("source-path").textContent = `${change.path} · not in the loaded indexed catalog; no indexed outline or navigation`;
+      await setFilesBasis("working");
+    });
+    pick.className = "files-change-pick"; pick.setAttribute("data-path", change.path); row.append(pick); list.append(row);
+  }
+}
+$("files-indexed")?.addEventListener("click", () => setFilesBasis("indexed"));
+$("files-working")?.addEventListener("click", () => setFilesBasis("working"));
+$("files-open-full")?.addEventListener("click", openFilesFull);
+$("files-matches-more")?.addEventListener("click", () => { if (filesMatches?.continuation) return loadFilesMatches(filesMatches.continuation); });
+$("files-matches-retry")?.addEventListener("click", () => loadFilesMatches());
 
 // File browser has independent request generations, including failures.
 let browseSerial = 0, diagramSerial = 0, files = [], nextFileOffset = null;
@@ -1085,10 +851,15 @@ const fileStates = new Map(), closedDirectories = new Set();
 let treeMode = false, treeRoot = null, indexedWorkspace = "";
 const directories = new Map();
 function clearBrowse(message = "Expand a file and select a method.") {
+  clearFilesEvidence();
   window.TrellisClasses?.reset();
+  architecture?.reset();
+  treemap?.reset();
   if ($("method-class")) $("method-class").disabled = true;
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
+  viewerMetrics?.reset();
+  diagramSequence = null;
   browseSerial++; diagramSerial++; catalogSerial++; directoryRefreshSerial++; files = []; nextFileOffset = null; selectedMethod = null;
   directories.clear(); treeMode = false; treeRoot = null; indexedWorkspace = "";
   $("index").textContent = "Index workspace";
@@ -1111,30 +882,32 @@ async function browseRequest(action, current, state) {
 }
 async function loadFiles(reset = false) {
   if (!status) return;
-  const serial = ++catalogSerial, guard = browseGuard();
-  const current = () => guard() && serial === catalogSerial;
+  const serial = ++catalogSerial, guard = browseGuard(), surface = sectionSerial;
+  const current = () => guard() && serial === catalogSerial && surface === sectionSerial;
   const revision = IndexPin.copy(status.revision), offset = reset ? 0 : nextFileOffset;
   if (offset == null) return;
   $("files-state").textContent = "Loading indexed files…"; $("retry-files").hidden = true;
   let loaded = false; retryCatalogReset = reset;
   await browseRequest(async () => {
-    const data = await api(`/api/files?${IndexPin.query(revision)}&offset=${offset}&limit=200`);
+    const data = await api(`/api/files?${IndexPin.query(revision)}&offset=${offset}&limit=200`, "GET", undefined, current);
     if (!current()) return;
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("File catalog revision does not match. Refresh status."); }
+    if (reset && section === "files") files = [];
     const hadFiles = files.length > 0;
     const known = new Set(files.map(f => f.path));
     files.push(...data.items.filter(f => !known.has(f.path)));
     if (!reset || !hadFiles) nextFileOffset = data.nextOffset;
-    renderFiles(); loaded = true;
+    filesCatalogLoaded = true; renderFiles(); loaded = true;
   }, current, "files-state");
   if (current()) $("retry-files").hidden = loaded;
 }
 function renderFiles() {
-  if (treeMode) { renderDirectoryTree(); return; }
+  if (section !== "files" && treeMode) { renderDirectoryTree(); return; }
   const generation = ++treeSerial;
   const tree = $("file-tree"); tree.replaceChildren();
   const filter = $("file-filter").value.toLowerCase();
   const visible = files.filter(f => f.path.toLowerCase().includes(filter));
+  const metricRows = [];
   const dirs = new Map([["", tree]]);
   for (const file of visible) {
     const parts = file.path.split("/"); let parent = tree, key = "";
@@ -1156,18 +929,23 @@ function renderFiles() {
       parent = dirs.get(key);
     }
     const state = fileStates.get(file.path), li = element("li");
-    const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)} · ${file.methodCount}`, () => toggleFile(file));
+    const fileCurrent = browseGuard(), fileSurface = sectionSerial;
+    const selection = {scope:"file", path:file.path};
+    const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)}${section === "files" ? "" : " · " + file.methodCount}`, () => { if (!fileCurrent() || fileSurface !== sectionSerial) return; if (section === "files") return selectFilesFile(file); inspectTreeSelection(selection); return toggleFile(file); });
     pick.className = "file-pick"; pick.title = file.path;
-    attachClassMenu(pick, {path:file.path});
-    pick.setAttribute("aria-expanded", String(!!state?.open)); li.append(pick);
-    appendMethods(li, file);
+    if (section !== "files") attachClassMenu(pick, {path:file.path});
+    pick.setAttribute("aria-expanded", String(section === "files" ? !!state?.outlineOpen : !!state?.open));
+    if (section !== "files") metricRows.push(viewerMetrics?.decorate(pick, selection)); li.append(pick);
+    if (section === "files") appendFilesOutline(li, file); else appendMethods(li, file);
     parent.append(li);
   }
+  viewerMetrics?.renderLegend(metricRows.filter(Boolean));
   $("browse-root").textContent = status?.workspaceRoot || "Indexed workspace";
   $("reveal-method").hidden = !selectedMethod;
   if (!visible.length) tree.append(element("li", files.length ? "No loaded paths match. Clear the filter or load more files." : "No indexed files yet. Use Index workspace above, then browse the tree.", "detail"));
   $("files-state").textContent = `${visible.length} of ${files.length} loaded files${nextFileOffset != null ? " · more available" : ""}`;
   $("more-files").hidden = nextFileOffset == null;
+  if (section === "files") appendChangedOnlyPaths(tree, filter);
 }
 async function toggleFile(file) {
   let state = fileStates.get(file.path);
@@ -1189,27 +967,31 @@ async function toggleFile(file) {
   } finally { if (current()) { state.loading = false; renderFiles(); } }
 }
 async function selectMethod(symbol) {
+  viewerMetrics?.clearInspection();
   window.TrellisShell?.showView("sequence");
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
-  selectedMethod = symbol; $("method-source").disabled = false; seed = symbol.id; querySerial++; invalidateFocus(); result = null;
-  $("seed").textContent = `${symbol.name} · ${symbol.path}`;
-  clearSource(); renderNotes(); renderResult(); renderFiles();
+  selectedMethod = symbol; $("method-source").disabled = false;
+  clearSource(); renderFiles();
   await loadSequence();
-  if (selectedMethod === symbol && window.matchMedia?.("(max-width: 850px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
+  if (selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
-async function loadSequence() {
+async function loadSequence(admitted = null, preserveSource = false) {
+  viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   if (!selectedMethod || !status) return;
   const serial = ++diagramSerial, guard = browseGuard(), symbol = selectedMethod, revision = IndexPin.copy(status.revision);
-  const current = () => guard() && serial === diagramSerial && selectedMethod === symbol;
-  clearSource(); $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+  const surface = sectionSerial;
+  const current = () => guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
+  if (!preserveSource) clearSource();
+  $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
   await browseRequest(async () => {
-    const data = await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
+    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
     if (!current()) return;
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+    diagramSequence = data;
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
     // A later group redraw can fail after the initial load succeeded. Preserve
@@ -1220,7 +1002,7 @@ async function loadSequence() {
       $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
-      if (current()) window.TrellisShell?.selectStep(step, data, () => readSource(step));
+      if (current()) { viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step)); }
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
@@ -1297,6 +1079,7 @@ function appendMethods(li, file) {
 
 // Filesystem metadata is separate from the immutable indexed source catalog.
 async function loadTreeRoot() {
+  if (section === "files") return loadFiles(true);
   treeMode = true;
   await loadDirectory("", true);
 }
@@ -1314,6 +1097,7 @@ function openDirectoryAnchors(path = "", found = [], visited = new Set()) {
   return found;
 }
 async function refreshTree() {
+  if (section === "files") return loadFiles(true);
   if (!treeMode) return loadTreeRoot();
   const serial = ++directoryRefreshSerial, guard = browseGuard();
   const anchors = openDirectoryAnchors();
@@ -1326,6 +1110,52 @@ async function refreshTree() {
   }
 }
 const compactDirectoryDepth = 32;
+const viewerMetrics = window.TrellisMetrics?.create({
+  request: path => api(path),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
+  onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
+  onChange: () => renderFiles(),
+});
+const treemap = window.TrellisTreemap?.create({
+  request: (path, current) => api(path, "GET", undefined, current),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
+  readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
+  onConflict: () => unexpectedPair("Treemap snapshot changed. Refresh status before reopening Treemap."),
+  onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
+});
+const architecture = window.TrellisArchitecture?.create({
+  request: (path, current) => api(path, "GET", undefined, current),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
+  readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
+  onConflict: () => unexpectedPair("Architecture snapshot changed. Refresh status before reopening Architecture."),
+  openTreemap: (identity, pin) => {
+    if (!IndexPin.equal(pin, status?.revision)) return;
+    window.TrellisShell?.showView("treemap");
+    void treemap?.openFile(identity, pin);
+  },
+  onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
+});
+window.TrellisShell?.setViewCallback?.(name => {
+  architecture?.clearInspection(); treemap?.clearInspection();
+  if (name === "architecture" && section === "diagrams") void architecture?.refresh();
+  else architecture?.reset();
+  if (name === "treemap" && section === "diagrams") void treemap?.refresh();
+  else treemap?.reset();
+});
+window.TrellisShell?.setInspectorClearCallback?.(() => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); treemap?.clearInspection(); });
+function metricDirectorySelection(path) {
+  if (!treeRoot || !indexedWorkspace) return null;
+  const absolute = `${treeRoot.replace(/\/$/, "")}${path ? "/" + path : ""}`;
+  const base = indexedWorkspace.replace(/\/$/, "");
+  const relative = absolute === base ? "" : absolute.startsWith(base + "/") ? absolute.slice(base.length + 1) : null;
+  return relative == null ? null : {scope:"directory", path:relative};
+}
+function inspectTreeSelection(selection) {
+  architecture?.clearInspection();
+  treemap?.clearInspection();
+  if (selection) void viewerMetrics?.inspect(selection);
+  else viewerMetrics?.clearInspection();
+}
 function directoryState(path, open = false) {
   let state = directories.get(path);
   if (!state) { state = {open, items:null, serial:0, expansionSerial:0}; directories.set(path, state); }
@@ -1442,6 +1272,7 @@ function renderDirectoryTree() {
       (item.kind === "directory" && directories.get(item.path)?.items?.some(matches));
   }
   let count = 0;
+  const metricRows = [];
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
     if (!state) return;
@@ -1454,19 +1285,24 @@ function renderDirectoryTree() {
         const open = !!child?.open || (!!filter && !!terminal?.items);
         const label = compact.items.map(entry => entry.name).join("/") + "/";
         const fullPath = compact.last.path + "/";
-        const pick = button(`${open ? "▾" : "▸"} ${label}`, () => toggleDirectory(item.path));
+        const selection = metricDirectorySelection(compact.last.path);
+        const pick = button(`${open ? "▾" : "▸"} ${label}`, () => { inspectTreeSelection(selection); return toggleDirectory(item.path); });
         pick.className = "file-pick directory-pick"; pick.title = fullPath;
         pick.setAttribute("aria-label", `${open ? "Collapse" : "Expand"} folder ${fullPath}`);
         pick.setAttribute("aria-expanded", String(open));
+        metricRows.push(viewerMetrics?.decorate(pick, selection));
         row.append(pick);
         if (open) { const children = element("ul"); rows(compact.last.path, children, item.path); row.append(children); }
       } else if (item.kind === "file" && item.indexedPath != null) {
         const file = {path:item.indexedPath, methodCount:item.methodCount};
         const open = !!fileStates.get(file.path)?.open;
-        const pick = button(`${open ? "▾" : "▸"} ${item.name} · ${item.methodCount ?? 0}`, () => toggleFile(file));
+        const selection = {scope:"file", path:item.indexedPath};
+        const pick = button(`${open ? "▾" : "▸"} ${item.name} · ${item.methodCount ?? 0}`, () => { inspectTreeSelection(selection); return toggleFile(file); });
         pick.className = "file-pick"; pick.title = item.path;
         attachClassMenu(pick, {path:file.path});
-        pick.setAttribute("aria-expanded", String(open)); row.append(pick); appendMethods(row, file);
+        pick.setAttribute("aria-expanded", String(open));
+        metricRows.push(viewerMetrics?.decorate(pick, selection));
+        row.append(pick); appendMethods(row, file);
       } else {
         row.append(element("span", item.name, "unindexed-file"), element("span",
           item.kind === "symlink" ? "Symbolic link · not followed" : item.kind === "file" ? (item.unindexedReason || "Not indexed in current workspace") : "Special entry · metadata only", "detail"));
@@ -1486,6 +1322,7 @@ function renderDirectoryTree() {
     if (state.truncated) list.append(element("li", "Directory scan limit reached. Some entries are omitted.", "warning"));
   }
   rows("", tree);
+  viewerMetrics?.renderLegend(metricRows.filter(Boolean));
   $("files-state").textContent = filter ? `${count} matching loaded entries · unopened folders are not searched` : "Expand folders to browse. Choose an indexed file to see methods.";
   if (filter && !count) tree.append(element("li", "No loaded entries match. Clear the filter to browse folders.", "detail"));
 }
@@ -1804,7 +1641,10 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 // a sequence participant's type or call a provider.
 function classLanguage(path) { return /\.(?:java|py)$/i.test(path || ""); }
 async function openClasses(options = {}) {
+  architecture?.clearInspection();
+  treemap?.clearInspection();
   if (!token || !status || !window.TrellisClasses) return;
+  viewerMetrics?.clearInspection();
   clearSource(); window.TrellisShell?.resetInspector();
   window.TrellisShell?.showView("classes");
   return window.TrellisClasses.open(options.seed ? {seed:options.seed} : options);
@@ -1832,7 +1672,7 @@ window.TrellisNavigation?.init({
   currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
   openClass: symbol => perform(() => openClasses({seed:symbol.id})),
   selectMethod: symbol => perform(() => selectMethod(symbol)),
-  openSource: (symbol, revision) => perform(() => showSource(symbol, revision)),
+  openSource: (symbol, revision) => perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision)),
   showMenu: (event, actions, options) => window.TrellisClasses?.showContextMenu(event, actions, options),
 });
 function initClassView() {
@@ -1841,7 +1681,7 @@ function initClassView() {
     onStale: unexpectedPair,
     currentRevision: () => status?.revision,
     currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
-    onChange: () => { clearSource(); window.TrellisShell?.resetInspector(); },
+    onChange: () => { viewerMetrics?.clearInspection(); clearSource(); window.TrellisShell?.resetInspector(); },
     readSource: (item, revision) => perform(() => showSource(item, revision)),
     selectMethod: symbol => perform(() => selectMethod(symbol)),
     navigateMember: (event, selector, options) => window.TrellisNavigation?.open(event, selector, options),

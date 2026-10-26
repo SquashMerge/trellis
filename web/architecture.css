@@ -1,0 +1,30 @@
+/* Natural-size block diagram: readable text wins over fitting a poster to a pane. */
+#architecture-panel { display: flex; flex-direction: column; overflow: hidden; }
+.architecture-controls { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 18px 8px; font-size: 12px; }
+.architecture-controls select { max-width: 100%; }
+.architecture-basis, #architecture-state, .architecture-edge-legend { flex: none; margin: 4px 18px 8px; font-size: 12px; color: var(--secondary); }
+#architecture-state[data-state="error"], #architecture-state[data-state="stale"] { color: var(--error); }
+#architecture-legend { flex: none; padding: 0 18px 8px; font-size: 12px; }
+#architecture-diagram { flex: 1; min-height: 120px; min-width: 0; overflow: auto; overscroll-behavior: contain; padding: 12px; }
+#architecture-diagram svg { display: block; max-width: none; font-family: var(--sans); }
+#architecture-notices { max-height: 25vh; }
+#architecture-notice-content { overflow-wrap: anywhere; white-space: pre-wrap; }
+#architecture-inspector { padding-top: 14px; font-size: 12px; overflow-wrap: anywhere; }
+#architecture-inspector-title { margin-top: 0; font: 13px/1.6 var(--mono); }
+#architecture-inspector-content details { margin: 12px 0; }
+#architecture-inspector-content pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+#architecture-inspector-content button { font-size: 12px; min-height: 34px; }
+#architecture-inspector-content ul { padding-left: 18px; }
+.architecture-inspector-active .inspector-footnote { display: none; }
+@media (max-width: 600px) {
+  .view-tabs { overflow-x: auto; }
+  .view-tabs button { flex: none; }
+  .architecture-controls { padding: 4px 12px 8px; }
+  .architecture-basis, #architecture-state, .architecture-edge-legend { margin-left: 12px; margin-right: 12px; }
+  #architecture-legend { padding-left: 12px; padding-right: 12px; }
+}
+
+#architecture-diagram .trellis-architecture-svg { width: auto; height: auto; max-width: none; font-size: 14px; }
+#architecture-diagram [role="button"] { cursor: pointer; }
+#architecture-diagram [role="button"]:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+#architecture-diagram [role="button"]:hover > rect, #architecture-diagram [role="button"]:focus-visible > rect { stroke: var(--focus); stroke-width: 2; }

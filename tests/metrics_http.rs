@@ -52,9 +52,26 @@ async fn fixture_with_startup_hook(
     ProvisionedBrowser,
     String,
 ) {
+    fixture_with_identity(startup_hook, wait_ready, parser_fixture, false, false).await
+}
+async fn fixture_with_identity(
+    startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    wait_ready: bool,
+    parser_fixture: bool,
+    git: bool,
+    role_fixture: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<trellis::daemon::registry::CheckoutRuntime>,
+    ProvisionedBrowser,
+    String,
+) {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().join("checkout");
     fs::create_dir(&root).unwrap();
+    if git {
+        fs::create_dir(root.join(".git")).unwrap();
+    }
     fs::write(root.join("sample.js"), "function sample(x) { return x; }\n").unwrap();
     fs::create_dir(root.join("deep")).unwrap();
     fs::write(
@@ -65,6 +82,30 @@ async fn fixture_with_startup_hook(
     fs::write(root.join("empty.js"), "// no callable\n").unwrap();
     fs::create_dir(root.join("zero")).unwrap();
     fs::write(root.join("zero/empty.js"), "// zero-callable directory\n").unwrap();
+    if role_fixture {
+        fs::create_dir(root.join("mixed")).unwrap();
+        fs::write(
+            root.join("mixed/roles.rs"),
+            "fn production(x: bool) -> bool { x }\n#[cfg(feature = \"test-support\")]\nfn support() -> usize { 1 }\n#[cfg(test)]\nmod tests { fn check(x: bool) -> bool { if x { true } else { false } } }\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("tests")).unwrap();
+        for (path, text) in [
+            ("tests/empty.rs", ""),
+            ("no_final.rs", "// comment"),
+            ("final.rs", "// comment\n"),
+            ("crlf.rs", "// comment\r\n\r\n"),
+            ("no_callables.rs", "const VALUE: usize = 1;\n"),
+            ("empty.rs", ""),
+        ] {
+            fs::write(root.join(path), text).unwrap();
+        }
+        fs::write(
+            root.join("tests/check.js"),
+            "function check() { return 1; }\n",
+        )
+        .unwrap();
+    }
     if parser_fixture {
         let mut source = String::from("function parseMany() {\n");
         for i in 0..4000 {
@@ -131,6 +172,291 @@ async fn fixture_with_startup_hook(
     let key = identity.root_key;
     (base, runtime, browser, key)
 }
+#[tokio::test]
+async fn selected_metrics_roles_share_one_pin_and_filter_every_projection() {
+    let (_base, _runtime, browser, key) =
+        fixture_with_identity(None, true, false, false, true).await;
+    let app = browser.router();
+    let (status, omitted) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{omitted}");
+    assert_eq!(omitted["payload"]["role"], "all");
+    let payload = &omitted["payload"];
+    let generation = payload["indexGeneration"].as_str().unwrap();
+    let revision = payload["indexRevision"].as_u64().unwrap();
+    let pin = format!("indexGeneration={generation}&indexRevision={revision}");
+    let source = payload["files"][0]["sourceSetId"].as_str().unwrap();
+    let (status, explicit_all) = request(app.clone(), &key, &format!("?role=all&{pin}")).await;
+    assert_eq!(status, StatusCode::OK, "{explicit_all}");
+    assert_eq!(explicit_all["payload"], *payload);
+    let mut test_sid = String::new();
+    for (role, count, sum, max, mean) in [
+        ("all", 3, 4, 2, 1.333333),
+        ("production", 2, 2, 1, 1.0),
+        ("test", 1, 2, 2, 2.0),
+    ] {
+        for (aggregate, expected) in [("sum", sum as f64), ("max", max as f64), ("mean", mean)] {
+            let query = format!(
+                "?scope=file&sourceSetId={source}&language=rust&path=mixed/roles.rs&role={role}&aggregate={aggregate}&topCognitive=10&{pin}"
+            );
+            let (status, file) = request(app.clone(), &key, &query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {file}");
+            let selected = &file["payload"];
+            assert_eq!(selected["role"], role);
+            assert_eq!(selected["indexGeneration"], generation);
+            assert_eq!(selected["indexRevision"], revision);
+            assert_eq!(selected["files"][0]["declarationCount"], count);
+            assert_eq!(selected["files"][0]["physicalLines"], 5);
+            assert_eq!(selected["files"][0]["fileRole"], "production");
+            assert_eq!(
+                selected["files"][0]["roleCounts"],
+                serde_json::json!({"production":2,"test":1})
+            );
+            assert_eq!(
+                selected["files"][0]["metrics"]["cyclomatic"].as_f64(),
+                Some(expected)
+            );
+            assert_eq!(
+                selected["declarations"].as_array().unwrap().len(),
+                count as usize
+            );
+            assert_eq!(
+                selected["topCognitive"].as_array().unwrap().len(),
+                count as usize
+            );
+            for rows in ["declarations", "topCognitive"] {
+                for row in selected[rows].as_array().unwrap() {
+                    assert!(matches!(row["role"].as_str(), Some("production" | "test")));
+                    if role != "all" {
+                        assert_eq!(row["role"], role);
+                    }
+                }
+            }
+            if role == "all" {
+                test_sid = selected["declarations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["role"] == "test")
+                    .unwrap()["sid"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            }
+            let (status, directory) = request(app.clone(), &key, &format!(
+                "?scope=directory&sourceSetId={source}&path=mixed&role={role}&aggregate={aggregate}&{pin}"
+            )).await;
+            assert_eq!(status, StatusCode::OK, "{directory}");
+            assert_eq!(directory["payload"]["files"], selected["files"]);
+            assert_eq!(
+                directory["payload"]["directories"][0]["declarationCount"],
+                count
+            );
+            assert_eq!(
+                directory["payload"]["directories"][0]["metrics"],
+                selected["files"][0]["metrics"]
+            );
+            let (status, revision_view) = request(
+                app.clone(),
+                &key,
+                &format!("?role={role}&aggregate={aggregate}&{pin}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{revision_view}");
+            let mixed = revision_view["payload"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["path"] == "mixed/roles.rs")
+                .unwrap();
+            assert_eq!(*mixed, selected["files"][0]);
+        }
+    }
+    let (status, excluded) = request(app.clone(), &key, &format!(
+        "?scope=declaration&sourceSetId={source}&path=mixed/roles.rs&sid={test_sid}&role=production&{pin}"
+    )).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{excluded}");
+    assert_eq!(excluded["error"]["code"], "not_found");
+    let (status, empty) = request(app.clone(), &key, &format!(
+        "?scope=file&sourceSetId={source}&language=javascript&path=tests/check.js&role=production&topCognitive=10&{pin}"
+    )).await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert_eq!(empty["payload"]["files"][0]["declarationCount"], 0);
+    assert_eq!(empty["payload"]["files"][0]["physicalLines"], 1);
+    assert_eq!(empty["payload"]["files"][0]["fileRole"], "test");
+    assert_eq!(
+        empty["payload"]["files"][0]["roleCounts"],
+        serde_json::json!({"production":0,"test":1})
+    );
+    assert!(empty["payload"]["files"][0]["metrics"]["loc"].is_null());
+    assert_eq!(empty["payload"]["topCognitive"], serde_json::json!([]));
+    for query in [
+        "?role=",
+        "?role=unknown",
+        "?role=Production",
+        "?role=all&role=test",
+        "?role=all&%72ole=production",
+    ] {
+        let (status, error) = request(app.clone(), &key, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {error}");
+        assert_eq!(error["error"]["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn selected_metrics_file_metadata_preserves_zero_area_and_no_callable_roles() {
+    let (_base, _runtime, browser, key) =
+        fixture_with_identity(None, true, false, false, true).await;
+    let app = browser.router();
+    let (status, response) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let payload = &response["payload"];
+    assert_eq!(payload["role"], "all");
+    let generation = payload["indexGeneration"].as_str().unwrap();
+    let revision = payload["indexRevision"].as_u64().unwrap();
+    let source = payload["files"][0]["sourceSetId"].as_str().unwrap();
+    for (path, physical_lines, file_role) in [
+        ("empty.rs", 0, "production"),
+        ("tests/empty.rs", 0, "test"),
+        ("no_final.rs", 1, "production"),
+        ("final.rs", 1, "production"),
+        ("crlf.rs", 2, "production"),
+        ("no_callables.rs", 1, "production"),
+    ] {
+        let expected = payload["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == path)
+            .unwrap();
+        assert_eq!(expected["physicalLines"], physical_lines, "{path}");
+        assert_eq!(expected["fileRole"], file_role, "{path}");
+        assert_eq!(
+            expected["roleCounts"],
+            serde_json::json!({"production": 0, "test": 0})
+        );
+        assert_eq!(expected["declarationCount"], 0);
+        assert!(expected["metrics"]["cognitive"].is_null());
+        for role in ["all", "production", "test"] {
+            let query = format!(
+                "?scope=file&sourceSetId={source}&language=rust&path={path}&role={role}&indexGeneration={generation}&indexRevision={revision}"
+            );
+            let (status, selected) = request(app.clone(), &key, &query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {selected}");
+            assert_eq!(selected["payload"]["indexGeneration"], generation);
+            assert_eq!(selected["payload"]["indexRevision"], revision);
+            assert_eq!(selected["payload"]["files"][0], *expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_metrics_top_cognitive_validation_and_git_identity() {
+    for git in [false, true] {
+        let (_base, _runtime, browser, key) =
+            fixture_with_identity(None, true, false, git, false).await;
+        let app = browser.clone().router();
+        let (status, ordinary) = request(app.clone(), &key, "").await;
+        assert_eq!(status, StatusCode::OK, "{ordinary}");
+        assert!(ordinary["payload"].get("topCognitive").is_none());
+        let payload = &ordinary["payload"];
+        let source = payload["files"][0]["sourceSetId"].as_str().unwrap();
+        if git {
+            let identity = source.strip_prefix("source-set:v1:").unwrap();
+            assert_eq!(
+                uuid::Uuid::parse_str(identity).unwrap().to_string(),
+                identity
+            );
+        } else {
+            assert!(source.starts_with("source-set:v1:path-"));
+        }
+        let generation = payload["indexGeneration"].as_str().unwrap();
+        let revision = payload["indexRevision"].as_u64().unwrap();
+        let pin = format!("indexGeneration={generation}&indexRevision={revision}");
+        let query = format!(
+            "?scope=directory&sourceSetId={source}&path=&aggregate=mean&metrics=loc&topCognitive=1&{pin}"
+        );
+        let (status, directory) = request(app.clone(), &key, &query).await;
+        assert_eq!(status, StatusCode::OK, "{directory}");
+        assert_eq!(directory["payload"]["declarations"], serde_json::json!([]));
+        let top = &directory["payload"]["topCognitive"];
+        assert_eq!(top.as_array().unwrap().len(), 1);
+        assert_eq!(top[0]["name"], "extra");
+        assert_eq!(top[0]["kind"], "function");
+        assert_eq!(top[0]["path"], "deep/extra.js");
+        assert_eq!(top[0]["sourceSetId"], source);
+        assert_eq!(
+            top[0]["metrics"],
+            serde_json::json!({"cognitive":0,"cyclomatic":1,"maxNesting":0})
+        );
+        browser.set_metrics_controls_for_tests(
+            serde_json::to_vec(&directory).unwrap().len() - 1,
+            None,
+            false,
+        );
+        let (status, oversized) = request(app.clone(), &key, &query).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{oversized}");
+        assert_eq!(oversized["error"]["code"], "response_too_large");
+        browser.set_metrics_controls_for_tests(64 * 1024 * 1024, None, true);
+        let (status, cancelled) = request(app.clone(), &key, &query).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{cancelled}");
+        assert_eq!(cancelled["error"]["code"], "cancelled");
+        browser.set_metrics_controls_for_tests(64 * 1024 * 1024, None, false);
+        let (status, file) = request(app.clone(), &key, &format!("?scope=file&sourceSetId={source}&language=javascript&path=sample.js&topCognitive=10&{pin}")).await;
+        assert_eq!(status, StatusCode::OK, "{file}");
+        assert_eq!(file["payload"]["topCognitive"][0]["name"], "sample");
+        assert_eq!(
+            file["payload"]["topCognitive"][0]["sid"],
+            file["payload"]["declarations"][0]["sid"]
+        );
+        assert_eq!(
+            file["payload"]["topCognitive"][0]["range"],
+            file["payload"]["declarations"][0]["range"]
+        );
+        assert!(file["payload"]["declarations"][0].get("name").is_none());
+        let (status, wrong_pin) = request(
+            app.clone(),
+            &key,
+            &format!(
+                "?topCognitive=3&indexGeneration={generation}&indexRevision={}",
+                revision + 1
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{wrong_pin}");
+        assert_eq!(wrong_pin["error"]["code"], "revision_conflict");
+        for count in [
+            "",
+            "0",
+            "11",
+            "-1",
+            "1.0",
+            "%2B1",
+            "99999999999999999999999999",
+        ] {
+            let (status, error) =
+                request(app.clone(), &key, &format!("?topCognitive={count}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert_eq!(error["error"]["code"], "invalid_request");
+        }
+        let (status, _) = request(app.clone(), &key, "?topCognitive=1&topCognitive=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for identity in [
+            "SOURCE-SET:v1:path-0000000000000000000000000000000000000000000000000000000000000000",
+            "source-set:v1:550E8400-E29B-41D4-A716-446655440000",
+            "source-set:v1:550e8400e29b41d4a716446655440000",
+            "source-set:v1:not-a-uuid",
+        ] {
+            let (status, _) = request(
+                app.clone(),
+                &key,
+                &format!("?scope=directory&sourceSetId={identity}&path="),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{identity}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn selected_metrics_projection_and_validation() {
     let (_base, _runtime, browser, key) = fixture().await;

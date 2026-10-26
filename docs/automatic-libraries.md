@@ -8,7 +8,7 @@ This is not support for every language or Windows yet.
 
 ## Current interface (revision 7)
 
-The charcoal/orange workbench has Sequence, Libraries and Tools tabs. Select a call to inspect
+The charcoal/orange workbench has Sequence, Classes and Libraries tabs. Select a call to inspect
 its target and evidence, then choose **Open call site** to read the cached workspace source.
 Library definitions open a separate source-dock tab. Selecting either source does not expand
 third-party behavior. Compact diagram labels retain full evidence in the inspector and Show all.

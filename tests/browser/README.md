@@ -1,11 +1,11 @@
-# Browser acceptance: saved items and sequence
+# Browser acceptance: diagrams and shell
 
 This test drives the real Trellis web shell in Playwright Chromium. It starts the compiled daemon with an isolated workspace, token, home, and XDG directories. It does not mock or intercept application requests.
 
 ## Verify from a clean checkout
 
 From the repository root, run `./tools/verify`. Its sequential setup step installs the
-locked `runtime/acp` and `tests/browser` Node packages when missing or stale, then checks
+locked `tests/mcp` and `tests/browser` Node packages when missing or stale, then checks
 and repairs the pinned Playwright Chromium bundles. Setup completes before the parallel verification
 lanes start. The package lock pins `playwright` to exactly `1.64.1`; setup never uses `npx`,
 a system browser, or `--with-deps`. A first run needs npm registry and browser-download access.
@@ -37,10 +37,23 @@ npm_config_cache="$TRELLIS_RUN_CACHE/npm-cache" \
 PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
   node tests/browser/node_modules/playwright/cli.js install chromium
 PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
-  node tests/browser/saved-items.test.cjs
+  node --test tests/browser/sequence.test.cjs
 ```
 
 The harness fails if the environment variable, locked package, managed Chromium executable, Cargo build, daemon, or any browser assertion is unavailable. It has no synthetic-DOM fallback and never skips acceptance.
+
+## Pele block-label vendor regression
+
+`pele-block-labels.test.cjs` serves the exact vendored Pele bundle to Chromium and
+installs its unchanged raw SVG. It checks label bounding boxes and ordinary mouse
+clicks on original node and edge text for vertical, horizontal and repeated
+same-pair block edges. A passive listener observes the browser's native target and
+stable Pele `data-id`; no wrapper routes clicks or rewrites SVG.
+This upstream-only host has no CSP because raw Pele owns inline SVG styles. It is
+not evidence about Trellis's CSP; the product adapter tests below retain the strict
+no-inline policy. After normal browser provisioning, run it alone with
+`node --test tests/browser/pele-block-labels.test.cjs` and the same external
+`PLAYWRIGHT_BROWSERS_PATH`. It also runs in `./tools/verify`.
 
 ## Pele sequence acceptance
 
@@ -80,3 +93,54 @@ IPC readiness hook after real daemon election and serve attachment, interrupts
 that child suite, and checks both owned PIDs are gone. A daemon using another
 suite binary must survive. SIGKILL cannot run JavaScript cleanup. Production
 15-minute checkout/browser and 30-minute daemon idle policy is unchanged.
+
+## Files acceptance
+
+`files.test.cjs` uses the real daemon and published cached index to exercise Files on desktop
+and mobile. It checks the all-symbol outline, indexed source and syntax-match evidence labels,
+callable mini-sequence/Open full, and the existing per-file net HEAD-to-working-tree Git diff.
+Working-tree fixtures are staged and edited before indexing and startup so assertions do not
+race the watcher. Deterministic cached-vs-live divergence belongs to the offline Store/HTTP
+regressions, not timing-based browser edits. Git diff coordinates never become indexed
+navigation targets. No-Git and repository text remain explicit and safe.
+
+The suite runs in the canonical `./tools/verify` browser lane. For a focused run after normal
+setup and build, set `TRELLIS_SUITE_BINARY` to the absolute built binary and run
+`node --test --test-concurrency=1 tests/browser/files.test.cjs` with the same external
+`PLAYWRIGHT_BROWSERS_PATH`.
+
+## Architecture acceptance
+
+`architecture.test.cjs` uses an isolated real daemon, authenticated checkout selection and
+40 indexed Rust file modules. Authored rules exercise ordered and peer bands, shared and
+empty layers, and explicit unassigned evidence. Hand-counted `crate::` references include
+forward/skipped, reverse, same-layer, cross-peer, shared-outbound and unresolved sites.
+Mixed production/test declarations retain stored roles: `test-support` remains production.
+The suite compares the browser Architecture DTO to the existing references CLI at the same
+complete pin, then checks exact summary counts and UI evidence. No API request is intercepted.
+Separate pre-start fixtures cover missing, empty and malformed configuration without watcher races.
+
+The UI checks cover hostile layer text under the real CSP, mouse/Enter/Space selection,
+production/test visibility, pinned cached-source actions and narrow-screen containment.
+Module Flow (#324) and the treemap action (#121) remain deferred; no placeholder claims
+that navigation works. `architecture-pele.test.cjs` checks pinned-renderer mapping, DOM-order independence,
+negative SVG admission and atomic render failure in real Chromium; timing-sensitive pin/rules races use deterministic unit/HTTP
+hooks rather than editing a running browser fixture.
+
+After the normal setup and build above, set `TRELLIS_SUITE_BINARY` to the absolute built
+binary and use the same external `PLAYWRIGHT_BROWSERS_PATH`, then run:
+
+```sh
+node --test --test-concurrency=1 tests/browser/architecture.test.cjs
+```
+
+## Treemap acceptance
+
+`treemap.test.cjs` drives the real daemon, indexed per-file line/role/metric response
+and exact vendored Pele under the product CSP. It covers independent heat and
+test-file controls, native tile/file-list selection, directory navigation, empty
+files, pinned source, Architecture entry and stale async actions. Run after normal
+provisioning/build with `TRELLIS_SUITE_BINARY` and `PLAYWRIGHT_BROWSERS_PATH`. It is
+also part of `./tools/verify`. Area is physical file lines, including inline test
+lines, not callable-range LOC. Native adapter admission/mutation tests run in
+`tests/treemap-pele.test.cjs`.

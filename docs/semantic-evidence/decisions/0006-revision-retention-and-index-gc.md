@@ -18,7 +18,7 @@ A derived index is a disposable cache: deleting it only costs a rebuild. An **ol
 - **Release:** once a non-head revision is past the 15-minute grace, the leader releases it and collects unreferenced document versions and projections. GC always runs **outside** the publication transaction, and never removes anything a retained revision references.
 - **Expired pin:** a pinned read or write at a released revision fails with a typed conflict (pin expired or released). It **never** silently moves to a newer revision. The client re-reads at head.
 - **Readers write nothing.** Retention needs no lease renewal or other reader-side writes, so the T06 rule that followers never write index or request state to read still holds.
-- **Saved views and notes.** Loading one at an expired pin **conflicts**, like any other pinned read. It never falls forward silently. The caller may then explicitly request head and reattach the item there through its durable anchors (#65). #97 shows when a result comes from an older revision than head.
+- **Saved views and notes retired** by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Their files remain in place and ignored; no loading or reattachment path remains.
 - **The grace is a policy constant.** Changing it later is an owner decision, not a format change.
 
 Durable per-reader pin leases were considered and rejected for now. Renewing a lease on every read would make readers write shared state, against T06. If longer-lived pins are needed later, a separate decision must define where leases are stored and why readers may write them.

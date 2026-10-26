@@ -260,24 +260,6 @@ fn tree_metadata_applies_no_overlay_before_post_fence() {
 }
 
 #[test]
-fn durable_fallback_classifier_excludes_operational_and_current_corruption_errors() {
-    let operational: anyhow::Error =
-        std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
-    assert!(!native_index_unavailable(&operational));
-    let sqlite: anyhow::Error = rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-        None,
-    )
-    .into();
-    assert!(!native_index_unavailable(&sqlite));
-    let corruption: anyhow::Error =
-        ControlIntegrity("incompatible_index: current marker".into()).into();
-    assert!(!native_index_unavailable(&corruption));
-    let safe: anyhow::Error = topology::IndexNotReady::new("reconciliation required").into();
-    assert!(native_index_unavailable(&safe));
-}
-
-#[test]
 fn recovery_classifier_separates_corruption_from_operational_storage_errors() {
     let classify = |extended_code| {
         let error: anyhow::Error =

@@ -10,6 +10,7 @@ enum ReaderFamily {
     Navigation,
     Metrics,
     Files,
+    Architecture,
 }
 
 impl ReaderFamily {
@@ -50,6 +51,17 @@ impl ReaderFamily {
                 assert_eq!(page["items"].as_array().unwrap().len(), 1);
                 assert_eq!(page["items"][0]["path"], "f0.js");
             }
+            Self::Architecture => {
+                let response = store.evidence_response()?;
+                let result = response.architecture_response(
+                    "references",
+                    &serde_json::json!({"expectedBasis":pin}),
+                    &mut || Ok(()),
+                )?;
+                let result = response.finish(result)?;
+                assert_eq!(result["indexRevision"], pin.index_revision);
+                assert_eq!(result["modules"].as_array().unwrap().len(), 1);
+            }
         }
         Ok(())
     }
@@ -69,6 +81,9 @@ impl ReaderFamily {
             // The metrics manifest enumeration reads this before fetching a document.
             Self::Metrics => "UPDATE revision_documents SET language=x'ff'",
             Self::Files => "UPDATE revision_documents SET gid=-1",
+            Self::Architecture => {
+                "UPDATE native_version_declarations SET role='invalid' WHERE name='f0'"
+            }
         };
         assert_eq!(db.execute(sql, []).unwrap(), 1, "{self:?}");
     }
@@ -99,6 +114,7 @@ fn row_corruption_in_each_reader_family_reindexes_and_restores_reads() {
         ReaderFamily::Navigation,
         ReaderFamily::Metrics,
         ReaderFamily::Files,
+        ReaderFamily::Architecture,
     ] {
         let (_state, root, store) = published_store(1);
         let pin = store.status().unwrap().revision;
@@ -329,16 +345,9 @@ fn optional_operational_failures_do_not_schedule_recovery() {
 }
 
 #[test]
-fn selected_anchor_index_decode_failure_schedules_rebuild() {
+fn native_declaration_index_decode_failure_schedules_rebuild() {
     let (_state, root, store) = published_store(1);
-    let response = store.evidence_response().unwrap();
     let pin = store.status().unwrap().revision;
-    let id = response.mcp_find("f0", 10, Some(pin)).unwrap().symbols[0]
-        .declaration
-        .syntax_id
-        .clone();
-    response.finish(()).unwrap();
-    drop(response);
     {
         let db = store.cache_write().unwrap();
         db.execute_batch(
@@ -347,18 +356,21 @@ fn selected_anchor_index_decode_failure_schedules_rebuild() {
         .unwrap();
     }
     let response = store.evidence_response().unwrap();
-    let error = Store::selected_anchor_in(&response.db, &store, &id, true)
+    let error = response
+        .mcp_find("f0", 10, Some(pin))
         .map_err(|error| response.report_index_failure(error))
-        .unwrap_err();
+        .err()
+        .expect("corrupt native manifest must reject find");
     drop(response);
     assert_rebuild(&store, &error);
     let repaired = reindex(&store, root.path());
     let response = store.evidence_response().unwrap();
-    let id = response.mcp_find("f0", 10, Some(repaired)).unwrap().symbols[0]
-        .declaration
-        .syntax_id
-        .clone();
-    Store::selected_anchor_in(&response.db, &store, &id, true).unwrap();
+    let found = response.mcp_find("f0", 10, Some(repaired)).unwrap();
+    // Find also matches syntax-ID substrings, including unnamed modules.
+    assert!(found.symbols.iter().any(|symbol| {
+        symbol.declaration.name.as_deref() == Some("f0")
+            && symbol.declaration.document.path == "f0.js"
+    }));
     response.finish(()).unwrap();
 }
 

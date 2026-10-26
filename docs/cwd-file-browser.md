@@ -1,5 +1,7 @@
 # Current-directory file browser
 
+> Historical validation/analysis. Saved views, notes and Jev/ACP providers described below were retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Their old files remain in place and ignored. Historical observations are not current feature or startup instructions.
+
 The file tree and index share the selected workspace by default. The workspace defaults to
 cwd; `--workspace PATH` changes both. `serve --browse-root PATH` explicitly selects a different
 read-only browsing root and the UI then warns which workspace Index actually targets. Search is optional:
