@@ -6,8 +6,8 @@ This is the narrow serializer, source-head and stopword proposal requested for r
 Decision [0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) remains
 binding. The evidence input is `issue-211/next-slice-card-lexical-closure-draft.md`
 in the external evidence directory; that input is itself a recommendation, not authority.
-This draft assumes the supplied integration state: runtime #337 merged, #339 not yet
-merged. It does not assume #339's changes are available or reopen the accepted runtime.
+Runtime #337 and Decision 0018 (#339) are merged on main. This draft follows that
+ratified direction without reopening the accepted runtime or authorizing index wiring.
 
 ## 1. Boundary between requirements and choices
 
