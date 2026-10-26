@@ -2,6 +2,14 @@ name: Release candidates
 # Candidate builds only until #338's full-model/Metal qualification gate is provisioned.
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release-candidates.yml'
+      - 'tools/release/**'
+      - 'tools/release-smoke.py'
+      - 'tools/release-linux.Dockerfile'
+      - 'src/build_info.rs'
+      - 'tests/build_identity.rs'
 permissions:
   contents: read
 jobs:
