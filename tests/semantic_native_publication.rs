@@ -11,8 +11,24 @@ use trellis::{native_ids, store::topology::TopologyRoots};
 fn cli(home: &Path) -> Command {
     let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     cmd.env("HOME", home)
-        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
-        .env_remove("XDG_CACHE_HOME")
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"));
+    if home.join("full-oracle").exists() {
+        cmd.env("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1");
+        cmd.env(
+            "TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE",
+            home.join("work-counts.json"),
+        );
+    }
+    if home.join("force-full").exists() {
+        cmd.env("TRELLIS_TEST_FORCE_FULL_REJOIN", "1");
+    }
+    if home.join("work-counts").exists() {
+        cmd.env(
+            "TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE",
+            home.join("work-counts.json"),
+        );
+    }
+    cmd.env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::null());
     cmd
@@ -38,6 +54,20 @@ fn run(home: &Path, args: &[&str]) -> Value {
     stdout.read_to_end(&mut bytes).unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
+fn copy_seed(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_seed(&entry.path(), &target);
+        } else if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 fn selected_case(change_b: &str) {
     use protobuf::{EnumOrUnknown, Message};
     let temp = Builder::new()
@@ -46,6 +76,9 @@ fn selected_case(change_b: &str) {
         .unwrap();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
+    if change_b.starts_with("oracle_") {
+        fs::write(home.join("full-oracle"), b"1").unwrap();
+    }
     let root = temp.path().join("checkout");
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join("src")).unwrap();
@@ -54,11 +87,36 @@ fn selected_case(change_b: &str) {
     let b = "function target(){ return 1; }\n";
     fs::write(root.join("src/A.js"), a).unwrap();
     fs::write(root.join("src/B.js"), b).unwrap();
-    if change_b == "two_producers" {
+    if matches!(
+        change_b,
+        "two_producers"
+            | "oracle_two_producers"
+            | "oracle_fork_two_producers"
+            | "oracle_fork_healthy_two_producers"
+    ) {
         fs::write(root.join("src/C.py"), "def helper(): return 1\n").unwrap();
     }
     let root = fs::canonicalize(root).unwrap();
     let root_string = root.to_str().unwrap();
+    let mut private_stage_daemon = if change_b == "selected_private_stage" {
+        let mut child = cli(&home)
+            .arg("daemon")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        trellis::testing::wait_until("private-stage daemon election", || {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "fixture daemon exited before election"
+            );
+            fs::read_to_string(home.join("daemon.pid"))
+                .is_ok_and(|marker| marker == child.id().to_string())
+        });
+        Some(child)
+    } else {
+        None
+    };
     let indexed = run(&home, &["index", "--workspace", root_string]);
     let r1: trellis::model::IndexPin =
         serde_json::from_value(indexed["publishedRevision"].clone()).unwrap();
@@ -114,21 +172,37 @@ fn selected_case(change_b: &str) {
         doc.occurrences.push(occurrence);
         binary.documents.push(doc);
     }
-    if change_b == "unmatched_both" {
+    if matches!(
+        change_b,
+        "unmatched_both" | "oracle_unmatched_both" | "oracle_fork_unmatched_both"
+    ) {
         let mut claim = scip::types::Occurrence::new();
         claim.range = vec![0, 0, 8];
         claim.symbol = "unmatched0#".into();
         claim.symbol_roles = 0;
         binary.documents[0].occurrences.push(claim);
     }
-    if matches!(change_b, "duplicate_call_claims" | "contradictory_calls") {
+    if matches!(
+        change_b,
+        "duplicate_call_claims"
+            | "contradictory_calls"
+            | "oracle_duplicate_call_claims"
+            | "oracle_contradictory_calls"
+            | "oracle_fork_duplicate_call_claims"
+            | "oracle_fork_contradictory_calls"
+    ) {
         let mut repeated = binary.documents[0]
             .occurrences
             .iter()
             .find(|occurrence| occurrence.symbol == "pkg target.")
             .unwrap()
             .clone();
-        if change_b == "contradictory_calls" {
+        if matches!(
+            change_b,
+            "contradictory_calls"
+                | "oracle_contradictory_calls"
+                | "oracle_fork_contradictory_calls"
+        ) {
             repeated.symbol = "external pkg other.".into();
         } else {
             repeated.syntax_kind = EnumOrUnknown::from_i32(1);
@@ -168,7 +242,9 @@ fn selected_case(change_b: &str) {
     let exclusion_reason = match change_b {
         "partial_empty_covered" => Some("notRequested"),
         "partial_not_requested" => Some("notRequested"),
-        "partial_unsupported" => Some("unsupported"),
+        "partial_unsupported"
+        | "oracle_partial_unsupported"
+        | "oracle_fork_partial_unsupported" => Some("unsupported"),
         "partial_failed" | "caller_failed" => Some("failed"),
         _ => None,
     };
@@ -244,7 +320,13 @@ fn selected_case(change_b: &str) {
         &digest,
     ];
     let imported = run(&home, &args);
-    let imported = if change_b == "two_producers" {
+    let imported = if matches!(
+        change_b,
+        "two_producers"
+            | "oracle_two_producers"
+            | "oracle_fork_two_producers"
+            | "oracle_fork_healthy_two_producers"
+    ) {
         let python = profile["semanticProducers"]
             .as_array()
             .unwrap()
@@ -301,9 +383,12 @@ fn selected_case(change_b: &str) {
     } else {
         imported
     };
-    let prior: trellis::model::IndexPin =
+    let mut prior: trellis::model::IndexPin =
         serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
-    let prior_semantic = store.semantic_at(prior).unwrap();
+    let mut prior_semantic = store.semantic_at(prior).unwrap();
+    let accepted_artifact_hash = store.selected_raw_inputs_at(prior).unwrap()[0]
+        .artifact_hash
+        .clone();
     if !matches!(change_b, "zero_claims" | "partial_empty_covered") {
         assert!(
             !prior_semantic.provenance.is_empty(),
@@ -319,26 +404,279 @@ fn selected_case(change_b: &str) {
         store.semantic_at(prior).unwrap().provenance,
         prior_semantic.provenance
     );
-    if matches!(change_b, "corrupt_capture" | "two_producers") {
-        if change_b == "two_producers" {
+    if change_b == "oracle_fork_successive_local" {
+        fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
+        prior = serde_json::from_value(
+            run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
+        )
+        .unwrap();
+        prior_semantic = store.semantic_at(prior).unwrap();
+        assert!(
+            prior_semantic
+                .provenance
+                .iter()
+                .any(|proof| proof.document.path == "src/A.js" && proof.derived_from.is_some()),
+            "first LOCAL did not preserve selected r1 evidence: {prior_semantic:?}"
+        );
+    }
+    let (fork_home, store) = if change_b.starts_with("oracle_fork_") {
+        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        trellis::testing::wait_until("seed daemon exit", || {
+            !trellis::testing::process_running(pid)
+        });
+        if matches!(
+            change_b,
+            "oracle_fork_restored_b" | "oracle_fork_retained_target"
+        ) {
+            fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
+        }
+        if change_b == "oracle_fork_successive_local" {
+            fs::write(root.join("src/B.js"), "function target(){ return 3; }\n").unwrap();
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let options = trellis::indexer::IndexOptions::new(root.clone());
+        let (graph, native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        let seeded = store
+            .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
+            .unwrap();
+        assert!(seeded.index_revision > prior.index_revision);
+        let store = if change_b == "oracle_fork_raw_replacement" {
+            let mut extra = scip::types::Occurrence::new();
+            extra.range = vec![0, 0, 8];
+            extra.symbol = "unmatched0#".into();
+            extra.symbol_roles = 0;
+            binary.documents[0].occurrences.push(extra);
+            let bytes = binary.write_to_bytes().unwrap();
+            fs::write(root.join("artifact.scip"), &bytes).unwrap();
+            drop(store);
+            let stable = run(&home, &["index", "--workspace", root_string]);
+            let roots = TopologyRoots::isolated_for_tests(
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Caches/dev.squashmerge.trellis")
+                } else {
+                    home.join(".cache/trellis")
+                },
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Application Support/dev.squashmerge.trellis")
+                } else {
+                    home.join(".local/share/trellis")
+                },
+            );
+            let identity =
+                trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+            let stabilized = trellis::store::Store::open(roots, identity).unwrap();
+            let stable_pin: trellis::model::IndexPin =
+                serde_json::from_value(stable["publishedRevision"].clone()).unwrap();
+            let (actual, _) = stabilized.retained_native_snapshot_at(stable_pin).unwrap();
+            let mut replacement = manifest.clone();
+            replacement["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
+            replacement["sourceRevision"] = json!(actual.revision.id);
+            replacement["sourceManifestHash"] = json!(native_ids::digest(
+                b"",
+                &native_ids::canonical(&json!(
+                    actual
+                        .revision
+                        .documents
+                        .iter()
+                        .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
+                        .collect::<Vec<_>>()
+                ))
+            ));
+            replacement["components"] = json!({
+                "toolchainHash":actual.revision.toolchain_hash,
+                "configHash":actual.revision.config_hash,
+                "dependencyHash":actual.revision.dependency_hash,
+            });
+            let bytes = serde_json::to_vec(&replacement).unwrap();
+            fs::write(root.join("manifest.json"), &bytes).unwrap();
+            let digest = native_ids::digest(b"", &bytes);
+            drop(stabilized);
+            let imported = run(
+                &home,
+                &[
+                    "semantic",
+                    "import",
+                    "--workspace",
+                    root_string,
+                    "--scip",
+                    root.join("artifact.scip").to_str().unwrap(),
+                    "--manifest",
+                    root.join("manifest.json").to_str().unwrap(),
+                    "--profile",
+                    "mac-mini-m5-pro-v1",
+                    "--producer",
+                    "scip-typescript",
+                    "--manifest-sha256",
+                    &digest,
+                ],
+            );
+            prior = serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
+            let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+            trellis::testing::wait_until("replacement daemon exit", || {
+                !trellis::testing::process_running(pid)
+            });
+            let roots = TopologyRoots::isolated_for_tests(
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Caches/dev.squashmerge.trellis")
+                } else {
+                    home.join(".cache/trellis")
+                },
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Application Support/dev.squashmerge.trellis")
+                } else {
+                    home.join(".local/share/trellis")
+                },
+            );
+            let identity =
+                trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+            trellis::store::Store::open(roots, identity).unwrap()
+        } else {
+            prior = seeded;
+            store
+        };
+        prior_semantic = store.semantic_at(prior).unwrap();
+        if change_b == "oracle_fork_raw_replacement" {
+            assert_ne!(
+                store.selected_raw_inputs_at(prior).unwrap()[0].artifact_hash,
+                accepted_artifact_hash,
+                "the replacement must select a distinct authenticated raw artifact",
+            );
+        }
+        assert!(
+            prior_semantic
+                .provenance
+                .iter()
+                .any(|proof| proof.derived_from.is_some())
+        );
+        let fork = temp.path().join("fork-home");
+        copy_seed(&home, &fork);
+        fs::remove_file(fork.join("full-oracle")).unwrap();
+        fs::write(fork.join("force-full"), b"1").unwrap();
+        if matches!(
+            change_b,
+            "oracle_fork_context" | "oracle_fork_missing_raw_key"
+        ) {
+            fs::remove_file(home.join("full-oracle")).unwrap();
+        }
+        if matches!(
+            change_b,
+            "oracle_fork_context"
+                | "oracle_fork_missing_raw_key"
+                | "oracle_fork_healthy_two_producers"
+                | "oracle_fork_successive_local"
+        ) {
+            fs::write(home.join("work-counts"), b"1").unwrap();
+        }
+        drop(store);
+        let roots = TopologyRoots::isolated_for_tests(
+            if cfg!(target_os = "macos") {
+                home.join("Library/Caches/dev.squashmerge.trellis")
+            } else {
+                home.join(".cache/trellis")
+            },
+            if cfg!(target_os = "macos") {
+                home.join("Library/Application Support/dev.squashmerge.trellis")
+            } else {
+                home.join(".local/share/trellis")
+            },
+        );
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        (
+            Some(fork),
+            trellis::store::Store::open(roots, identity).unwrap(),
+        )
+    } else {
+        (None, store)
+    };
+    if change_b == "oracle_fork_missing_raw_key" {
+        let capture_id = store.selected_raw_inputs_at(prior).unwrap()[0].capture_id;
+        store
+            .with_index_sql_for_tests(|db| {
+                assert_eq!(db.execute(
+                "DELETE FROM semantic_raw_documents WHERE capture_id=?1 AND path='src/A.js'",
+                [capture_id],
+            )?,1);
+                Ok(())
+            })
+            .unwrap();
+        if let Some(fork) = &fork_home {
+            copy_seed(&home, fork);
+            let _ = fs::remove_file(fork.join("full-oracle"));
+        }
+    }
+    if change_b == "oracle_fork_healthy_two_producers" {
+        let selected = store.selected_raw_inputs_at(prior).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|input| !input.proofs.is_empty()));
+    }
+    if matches!(
+        change_b,
+        "corrupt_capture" | "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
+    ) {
+        if change_b != "corrupt_capture" {
             assert_eq!(store.selected_raw_inputs_at(prior).unwrap().len(), 2);
         }
         store.with_index_sql_for_tests(|db| {
             db.execute("UPDATE semantic_raw_captures SET binary_bytes=x'00' WHERE producer_id='scip-typescript'", [])?;
             Ok(())
         }).unwrap();
+        if let Some(fork) = &fork_home {
+            copy_seed(&home, fork);
+            fs::remove_file(fork.join("full-oracle")).unwrap();
+        }
     }
-    match change_b {
+    if matches!(change_b, "oracle_retained_target" | "oracle_restored_b") {
+        fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
+        prior = serde_json::from_value(
+            run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
+        )
+        .unwrap();
+        prior_semantic = store.semantic_at(prior).unwrap();
+    }
+    let fork_scenario = change_b
+        .strip_prefix("oracle_fork_")
+        .map(|name| format!("oracle_{name}"));
+    match fork_scenario.as_deref().unwrap_or(change_b) {
         "selected_private_stage" => (),
+        "oracle_retained_target" => {
+            fs::write(root.join("src/C.js"), "function extra(){ return 2; }\n").unwrap()
+        }
+        "oracle_restored_b" => fs::write(root.join("src/B.js"), b).unwrap(),
+        "oracle_successive_local" => {
+            fs::write(root.join("src/B.js"), "function target(){ return 4; }\n").unwrap()
+        }
+        "oracle_deleted_a" => fs::remove_file(root.join("src/A.js")).unwrap(),
+        "oracle_deleted_b" => fs::remove_file(root.join("src/B.js")).unwrap(),
+        "oracle_moved_a" => fs::rename(root.join("src/A.js"), root.join("src/D.js")).unwrap(),
+        "oracle_moved_b" => fs::rename(root.join("src/B.js"), root.join("src/D.js")).unwrap(),
+        "oracle_ambiguous_b" => fs::write(
+            root.join("src/B.js"),
+            "function target(){ return 1; }\nfunction target(){ return 2; }\n",
+        )
+        .unwrap(),
         "caller_failed" => {
             fs::write(root.join("src/C.js"), "function extra(){ return 1; }\n").unwrap()
         }
-        "changed_a" => fs::write(
+        "changed_a" | "oracle_changed_a" => fs::write(
             root.join("src/A.js"),
             "function run(){ target(); return 3; }\n",
         )
         .unwrap(),
-        "missing_b" => fs::write(root.join("src/B.js"), "function other(){ return 2; }\n").unwrap(),
+        "missing_b" | "oracle_missing_b" => {
+            fs::write(root.join("src/B.js"), "function other(){ return 2; }\n").unwrap()
+        }
         "new_document" => {
             fs::write(root.join("src/C.js"), "function extra(){ return 2; }\n").unwrap()
         }
@@ -552,14 +890,18 @@ fn selected_case(change_b: &str) {
         return;
     }
     if change_b == "selected_private_stage" {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+        let mut child = private_stage_daemon.take().unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join("daemon.pid")).unwrap(),
+            child.id().to_string(),
+            "CLI commands must have used the elected fixture daemon",
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "fixture daemon exited early"
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        child.wait().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = trellis::indexer::IndexOptions::new(root.clone());
         let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
@@ -603,7 +945,7 @@ fn selected_case(change_b: &str) {
         assert_eq!(store.semantic_at(prior).unwrap(), prior_semantic);
         return;
     }
-    let index_args = if change_b == "full" {
+    let index_args = if matches!(change_b, "full" | "oracle_fork_context") {
         vec![
             "index",
             "--workspace",
@@ -618,6 +960,280 @@ fn selected_case(change_b: &str) {
         serde_json::from_value(run(&home, &index_args)["publishedRevision"].clone()).unwrap();
     assert!(next.index_revision > prior.index_revision);
     let snapshot = store.semantic_at(next).unwrap();
+    if change_b.starts_with("oracle_") {
+        assert!(
+            snapshot.coverage.iter().all(|row| row
+                .diagnostic
+                .as_deref()
+                .is_none_or(|diagnostic| !diagnostic
+                    .contains("differs from independent FULL rejoin oracle"))),
+            "{change_b}: {snapshot:?}"
+        );
+    }
+    if change_b == "oracle_fork_context" {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        eprintln!("context invalidation publication work: {work}");
+        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+        assert_eq!(
+            work["destinationDocumentRows"], 2,
+            "native FULL must index both documents: {work}"
+        );
+        assert_eq!(
+            work["destinationRoleParses"], 2,
+            "native FULL must rejoin both source claims: {work}"
+        );
+        assert_eq!(
+            work["fullFallbacks"], 0,
+            "native FULL does not enter the LOCAL fallback: {work}"
+        );
+    }
+    if change_b == "oracle_fork_successive_local" {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        assert_eq!(
+            work["fullFallbacks"], 0,
+            "second LOCAL must witness the earliest original association: {work}"
+        );
+        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+        assert_eq!(work["destinationDocumentRows"], 1, "{work}");
+        assert_eq!(work["destinationRoleParses"], 0, "{work}");
+        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
+        assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        assert!(
+            work["parsedRoleSiteDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["parsedTypeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalNativeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalSourceDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
+        assert!(
+            work["originalSourceHashDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert_eq!(
+            work["indexPin"],
+            serde_json::to_value(next).unwrap(),
+            "{work}"
+        );
+        let (current_native, _) = store.retained_native_snapshot_at(next).unwrap();
+        assert_eq!(
+            work["destinationRevision"], current_native.revision.id,
+            "{work}"
+        );
+        assert!(
+            snapshot
+                .call_bindings
+                .iter()
+                .any(|call| matches!(&call.declared_target,
+            Some(trellis::semantic_evidence::Target::Internal {revision_id,..})
+                if revision_id==&current_native.revision.id)),
+            "second LOCAL must decide the latest target revision: {snapshot:?}"
+        );
+    }
+    if change_b == "oracle_fork_missing_raw_key" {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        assert_eq!(work["fullFallbacks"], 1, "{work}");
+        assert!(
+            work["originalRawProofBytes"].as_u64().unwrap() > 0,
+            "{work}"
+        );
+        assert!(work["originalRawDecodes"].as_u64().unwrap() > 0, "{work}");
+        assert_eq!(
+            work["indexPin"],
+            serde_json::to_value(next).unwrap(),
+            "{work}"
+        );
+        assert!(
+            snapshot
+                .coverage
+                .iter()
+                .any(|row| row.document_path == "src/A.js"
+                    && row.selected
+                    && row.state == trellis::semantic_evidence::CoverageState::Complete),
+            "missing-key fallback published incomplete evidence: {snapshot:?}"
+        );
+    }
+    if change_b == "oracle_fork_healthy_two_producers" {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+        assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
+        // Only A and C contain captured source claims; B is a changed native
+        // target and must be indexed, not parsed as a destination source claim.
+        assert_eq!(work["destinationRoleParses"], 0, "{work}");
+        assert_eq!(work["destinationDocumentRows"], 1, "{work}");
+        assert_eq!(work["originalRoleParses"], 0, "{work}");
+        assert!(work["originalNativeRows"].as_u64().unwrap() <= 2, "{work}");
+        assert!(
+            work["originalNativeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalSourceBytes"].as_u64().unwrap() <= (b.len() * 2) as u64,
+            "{work}"
+        );
+        assert!(
+            work["originalSourceDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
+        assert_eq!(work["originalRawEnvelopeParses"], 0, "{work}");
+        assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        assert!(
+            work["parsedRoleSiteDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["parsedTypeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalSourceHashDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["currentTargetLookups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["currentTargetLookups"].as_array().unwrap().len() <= 4,
+            "{work}"
+        );
+        assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
+        assert!(work["currentTargetRows"].as_u64().unwrap() <= 4, "{work}");
+        let (next_native, _) = store.retained_native_snapshot_at(next).unwrap();
+        assert_eq!(
+            work["destinationRevision"], next_native.revision.id,
+            "{work}"
+        );
+        assert_eq!(
+            work["indexPin"],
+            serde_json::to_value(next).unwrap(),
+            "{work}"
+        );
+        assert_eq!(
+            work["producerIds"],
+            json!(["scip-python", "scip-typescript"]),
+            "{work}"
+        );
+        assert_eq!(
+            work["reusedDocuments"].as_array().unwrap().len(),
+            2,
+            "{work}"
+        );
+        let changed_target = next_native
+            .declarations
+            .iter()
+            .find(|row| row.document.path == "src/B.js" && row.name.as_deref() == Some("target"))
+            .unwrap();
+        assert_ne!(
+            next_native
+                .revision
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "src/B.js")
+                .unwrap()
+                .content_hash,
+            native
+                .revision
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "src/B.js")
+                .unwrap()
+                .content_hash,
+            "the changed B target must be measured from new bytes",
+        );
+        assert!(
+            snapshot.call_bindings.iter().any(|call| {
+                matches!(
+                    &call.declared_target,
+                    Some(trellis::semantic_evidence::Target::Internal {
+                        syntax_id,
+                        revision_id,
+                        ..
+                    }) if syntax_id == &changed_target.syntax_id
+                        && revision_id == &next_native.revision.id
+                )
+            }),
+            "changed B declaration must resolve the unchanged A source: {snapshot:?}"
+        );
+    }
+    if matches!(change_b, "oracle_body" | "oracle_two_producers") {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        eprintln!("publication work counts {change_b}: {work}");
+        if change_b == "oracle_body" {
+            assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+            assert_eq!(work["destinationRoleParses"], 0, "{work}");
+            assert_eq!(work["fullFallbacks"], 0, "{work}");
+            assert_eq!(work["originalRoleParses"], 0, "{work}");
+            assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        } else {
+            assert_eq!(work["fullFallbacks"], 1, "{work}");
+            assert_eq!(
+                work["destinationIndexBuilds"], 2,
+                "attempted LOCAL work plus FULL fallback: {work}"
+            );
+            assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
+        }
+        assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
+    }
     assert!(
         snapshot
             .coverage
@@ -656,7 +1272,10 @@ fn selected_case(change_b: &str) {
             assert!(snapshot.provenance.is_empty());
         }
     }
-    if matches!(change_b, "corrupt_capture" | "two_producers") {
+    if matches!(
+        change_b,
+        "corrupt_capture" | "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
+    ) {
         let failed: Vec<_> = snapshot
             .coverage
             .iter()
@@ -672,7 +1291,10 @@ fn selected_case(change_b: &str) {
                 .iter()
                 .all(|proof| proof.producer_id != "scip-typescript")
         );
-        if change_b == "two_producers" {
+        if matches!(
+            change_b,
+            "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
+        ) {
             let good: Vec<_> = snapshot
                 .coverage
                 .iter()
@@ -690,18 +1312,119 @@ fn selected_case(change_b: &str) {
         }
     } else if !matches!(
         change_b,
-        "zero_claims" | "changed_a" | "partial_empty_covered"
+        "zero_claims"
+            | "changed_a"
+            | "partial_empty_covered"
+            | "oracle_changed_a"
+            | "oracle_fork_changed_a"
+            | "oracle_fork_deleted_a"
+            | "oracle_fork_deleted_b"
+            | "oracle_fork_moved_a"
+            | "oracle_fork_moved_b"
+            | "oracle_fork_ambiguous_b"
+            | "oracle_deleted_a"
+            | "oracle_deleted_b"
+            | "oracle_moved_a"
+            | "oracle_moved_b"
+            | "oracle_ambiguous_b"
     ) {
         assert!(
             !snapshot.provenance.is_empty(),
             "native rejoin should preserve valid A evidence: {snapshot:?}"
         );
     }
+    if let Some(fork) = &fork_home {
+        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        trellis::testing::wait_until("local branch daemon exit", || {
+            !trellis::testing::process_running(pid)
+        });
+        let full: trellis::model::IndexPin =
+            serde_json::from_value(run(fork, &index_args)["publishedRevision"].clone()).unwrap();
+        assert_eq!(
+            full, next,
+            "forked FULL and LOCAL pins must share the same seeded identity"
+        );
+        let roots = TopologyRoots::isolated_for_tests(
+            if cfg!(target_os = "macos") {
+                fork.join("Library/Caches/dev.squashmerge.trellis")
+            } else {
+                fork.join(".cache/trellis")
+            },
+            if cfg!(target_os = "macos") {
+                fork.join("Library/Application Support/dev.squashmerge.trellis")
+            } else {
+                fork.join(".local/share/trellis")
+            },
+        );
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let oracle = trellis::store::Store::open(roots, identity).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&snapshot).unwrap(),
+            serde_json::to_vec(&oracle.semantic_at(full).unwrap()).unwrap(),
+            "forked selected FULL/LOCAL semantic output differs",
+        );
+        assert_eq!(
+            store
+                .semantic_import_report_at(next, "scip-typescript")
+                .unwrap(),
+            oracle
+                .semantic_import_report_at(full, "scip-typescript")
+                .unwrap(),
+            "forked selected FULL/LOCAL report differs",
+        );
+        if change_b == "oracle_fork_healthy_two_producers" {
+            for producer in ["scip-typescript", "scip-python"] {
+                assert!(
+                    snapshot.coverage.iter().any(|row| {
+                        row.producer_id == producer
+                            && row.selected
+                            && row.requested
+                            && row.state == trellis::semantic_evidence::CoverageState::Complete
+                    }),
+                    "missing healthy selected coverage for {producer}: {snapshot:?}"
+                );
+                assert!(
+                    snapshot.provenance.iter().any(|proof| {
+                        proof.producer_id == producer && proof.derived_from.is_some()
+                    }),
+                    "missing selected proof for {producer}: {snapshot:?}"
+                );
+                assert_eq!(
+                    store.semantic_import_report_at(next, producer).unwrap(),
+                    oracle.semantic_import_report_at(full, producer).unwrap(),
+                    "forked selected FULL/LOCAL report differs for {producer}",
+                );
+            }
+        }
+    }
     assert_eq!(
         store.selected_raw_inputs_at(next).unwrap().len(),
-        if change_b == "two_producers" { 2 } else { 1 }
+        if matches!(
+            change_b,
+            "two_producers"
+                | "oracle_two_producers"
+                | "oracle_fork_two_producers"
+                | "oracle_fork_healthy_two_producers"
+        ) {
+            2
+        } else {
+            1
+        }
     );
-    if matches!(change_b, "duplicate_call_claims" | "contradictory_calls") {
+    if matches!(
+        change_b,
+        "duplicate_call_claims"
+            | "contradictory_calls"
+            | "oracle_duplicate_call_claims"
+            | "oracle_contradictory_calls"
+            | "oracle_fork_duplicate_call_claims"
+            | "oracle_fork_contradictory_calls"
+    ) {
         let calls: Vec<_> = snapshot
             .call_bindings
             .iter()
@@ -721,13 +1444,21 @@ fn selected_case(change_b: &str) {
             .collect();
         assert_eq!(distinct.len(), 2);
         assert_eq!(calls[0].join.anchor, calls[1].join.anchor);
-        if change_b == "contradictory_calls" {
+        if matches!(
+            change_b,
+            "contradictory_calls"
+                | "oracle_contradictory_calls"
+                | "oracle_fork_contradictory_calls"
+        ) {
             assert!(calls.iter().all(|call| call.resolution
                 == trellis::semantic_evidence::Resolution::Ambiguous
                 && call.candidates.len() == 2));
         }
     }
-    if change_b == "unmatched_both" {
+    if matches!(
+        change_b,
+        "unmatched_both" | "oracle_unmatched_both" | "oracle_fork_unmatched_both"
+    ) {
         let selected = store.selected_raw_inputs_at(prior).unwrap();
         let unmatched: Vec<_> = selected[0]
             .proofs
@@ -1061,4 +1792,76 @@ fn bad_selected_artifact_does_not_block_other_selected_producer() {
 fn changed_caller_and_missing_target_are_rejoined_from_captured_r1() {
     selected_case("changed_a");
     selected_case("missing_b");
+}
+
+#[test]
+fn forked_seeded_local_matches_forced_full_oracle() {
+    for scenario in [
+        "oracle_fork_body",
+        "oracle_fork_changed_a",
+        "oracle_fork_missing_b",
+        "oracle_fork_deleted_a",
+        "oracle_fork_deleted_b",
+        "oracle_fork_moved_a",
+        "oracle_fork_moved_b",
+        "oracle_fork_ambiguous_b",
+        "oracle_fork_restored_b",
+        "oracle_fork_retained_target",
+        "oracle_fork_unmatched_both",
+        "oracle_fork_duplicate_call_claims",
+        "oracle_fork_contradictory_calls",
+        "oracle_fork_partial_unsupported",
+        "oracle_fork_two_producers",
+    ] {
+        eprintln!("forked oracle scenario: {scenario}");
+        selected_case(scenario);
+    }
+}
+
+#[test]
+fn two_healthy_producers_share_one_incremental_destination() {
+    selected_case("oracle_fork_healthy_two_producers");
+}
+
+#[test]
+fn successive_local_publications_reuse_original_capture_without_unchanged_work() {
+    selected_case("oracle_fork_successive_local");
+}
+
+#[test]
+fn missing_admitted_document_key_uses_same_transaction_full_fallback() {
+    selected_case("oracle_fork_missing_raw_key");
+}
+
+#[test]
+fn raw_replacement_uses_new_captured_associations() {
+    selected_case("oracle_fork_raw_replacement");
+}
+
+#[test]
+fn context_invalidation_uses_full_oracle() {
+    selected_case("oracle_fork_context");
+}
+
+#[test]
+fn incremental_local_matches_independent_full_oracle() {
+    for scenario in [
+        "oracle_body",
+        "oracle_changed_a",
+        "oracle_missing_b",
+        "oracle_retained_target",
+        "oracle_restored_b",
+        "oracle_deleted_a",
+        "oracle_deleted_b",
+        "oracle_moved_a",
+        "oracle_moved_b",
+        "oracle_ambiguous_b",
+        "oracle_unmatched_both",
+        "oracle_duplicate_call_claims",
+        "oracle_contradictory_calls",
+        "oracle_partial_unsupported",
+        "oracle_two_producers",
+    ] {
+        selected_case(scenario);
+    }
 }

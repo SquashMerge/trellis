@@ -185,6 +185,7 @@ fn target(
     t: &Target,
     native: &native::Artifact,
     declarations: &BTreeMap<String, &native::Declaration>,
+    selected: Option<&BTreeMap<String, &TargetDeclaration>>,
 ) -> Result<()> {
     match t {
         Target::Internal {
@@ -198,9 +199,18 @@ fn target(
                 "foreign internal target revision"
             );
             ensure!(
-                declarations
-                    .get(syntax_id)
-                    .is_some_and(|d| &d.document == document),
+                selected.map_or_else(
+                    || declarations
+                        .get(syntax_id)
+                        .is_some_and(|d| &d.document == document),
+                    |items| items
+                        .get(syntax_id)
+                        .is_some_and(|d| &d.document == document)
+                        || (items.get(syntax_id).is_none()
+                            && declarations
+                                .get(syntax_id)
+                                .is_some_and(|d| &d.document == document)),
+                ),
                 "unmeasured internal target"
             );
         }
@@ -213,10 +223,11 @@ fn targets(
     native: &native::Artifact,
     decls: &BTreeMap<String, &native::Declaration>,
     sorted: bool,
+    selected: Option<&BTreeMap<String, &TargetDeclaration>>,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     for item in items {
-        target(item, native, decls)?;
+        target(item, native, decls, selected)?;
         let bytes = native_ids::canonical(&serde_json::to_value(item)?);
         ensure!(seen.insert(bytes), "duplicate semantic target");
     }
@@ -272,14 +283,196 @@ fn validate_join(
     family: JoinKind,
     native: &native::Artifact,
     sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    original: Option<&Join>,
 ) -> Result<()> {
     let a = &join.anchor;
     ensure!(
         a.kind == family || (family == JoinKind::Callee && a.kind == JoinKind::Invocation),
         "wrong join family"
     );
-    let source = sources.get(&a.document).context("missing join source")?;
-    let slice = span(source, &a.range)?;
+    if let Some(previous) = original {
+        ensure!(
+            previous.anchor.document == a.document
+                && previous.anchor.kind == a.kind
+                && previous.anchor.range == a.range
+                && previous.status == join.status
+                && previous.candidate_ids == join.candidate_ids
+                && previous.diagnostic == join.diagnostic,
+            "join differs from admitted source association"
+        );
+        ensure!(
+            join.status == JoinStatus::Exact,
+            "unwitnessed negative join"
+        );
+        for id in &join.candidate_ids {
+            if family == JoinKind::DeclarationName {
+                sid(id)?
+            } else {
+                occ(id)?
+            }
+        }
+    } else {
+        let source = sources.get(&a.document).context("missing join source")?;
+        let slice = span(source, &a.range)?;
+        let doc = native
+            .revision
+            .documents
+            .iter()
+            .find(|d| d.key == a.document)
+            .context("missing join document")?;
+        ensure!(
+            a.revision_id == native.revision.id && a.content_hash == doc.content_hash,
+            "foreign join anchor"
+        );
+        let mut candidates = BTreeSet::new();
+        match family {
+            JoinKind::DeclarationName => {
+                for d in &native.declarations {
+                    if d.document == a.document
+                        && d.name_range.as_ref() == Some(&a.range)
+                        && d.name.as_deref() == Some(slice)
+                    {
+                        candidates.insert(d.syntax_id.clone());
+                    }
+                }
+            }
+            JoinKind::Callee => {
+                for call in &native.calls {
+                    let r = if a.kind == JoinKind::Invocation {
+                        Some(&call.range)
+                    } else {
+                        call.callee_range.as_ref()
+                    };
+                    if call.document == a.document
+                        && r == Some(&a.range)
+                        && (a.kind == JoinKind::Invocation
+                            || call.spelling.as_deref() == Some(slice))
+                    {
+                        candidates.insert(call.id.clone());
+                    }
+                }
+            }
+            JoinKind::Reference => {
+                for reference in &native.references {
+                    if reference.document == a.document
+                        && reference.range == a.range
+                        && reference.spelling == slice
+                        && native::lookup(&a.document.language, slice)? == reference.lookup_key
+                    {
+                        candidates.insert(reference.id.clone());
+                    }
+                }
+            }
+            JoinKind::Invocation => anyhow::bail!("invocation is a call anchor, not a fact family"),
+        }
+        let kind = match a.kind {
+            JoinKind::DeclarationName => native::MeasurementKind::DeclarationName,
+            JoinKind::Callee => native::MeasurementKind::Callee,
+            JoinKind::Invocation => native::MeasurementKind::Invocation,
+            JoinKind::Reference => native::MeasurementKind::Reference,
+        };
+        let support = native
+            .capability_reports
+            .iter()
+            .find(|report| report.document == a.document && report.revision_id == a.revision_id)
+            .context("missing native capability report")?
+            .families
+            .iter()
+            .find(|support| support.kind == kind)
+            .context("missing native measurement family")?;
+        let contained = |range: &native::Range, within: &native::Range| {
+            within.start <= range.start && range.end <= within.end
+        };
+        let measured_ranges: Vec<_> = match a.kind {
+            JoinKind::DeclarationName => native
+                .declarations
+                .iter()
+                .filter(|d| d.document == a.document)
+                .filter_map(|d| d.name_range.as_ref())
+                .collect(),
+            JoinKind::Callee => native
+                .calls
+                .iter()
+                .filter(|c| c.document == a.document)
+                .filter_map(|c| c.callee_range.as_ref())
+                .collect(),
+            JoinKind::Invocation => native
+                .calls
+                .iter()
+                .filter(|c| c.document == a.document)
+                .map(|c| &c.range)
+                .collect(),
+            JoinKind::Reference => native
+                .references
+                .iter()
+                .filter(|r| r.document == a.document)
+                .map(|r| &r.range)
+                .collect(),
+        };
+        ensure!(
+            support.available || measured_ranges.is_empty(),
+            "unavailable family has measured candidates"
+        );
+        for gap in &support.gaps {
+            span(source, &gap.range)?;
+            text(&gap.diagnostic)?;
+            ensure!(
+                !measured_ranges
+                    .iter()
+                    .any(|range| contained(range, &gap.range)),
+                "measured candidate contradicts native capability gap"
+            );
+        }
+        let unsupported = if !support.available {
+            Some(
+                support
+                    .diagnostic
+                    .as_deref()
+                    .context("unavailable family without diagnostic")?,
+            )
+        } else {
+            ensure!(support.diagnostic.is_none(), "enabled family diagnostic");
+            support
+                .gaps
+                .iter()
+                .find(|gap| contained(&a.range, &gap.range))
+                .map(|gap| gap.diagnostic.as_str())
+        };
+        let expected: Vec<_> = candidates.into_iter().collect();
+        let status = if unsupported.is_some() && expected.is_empty() {
+            JoinStatus::Unsupported
+        } else if expected.len() == 1 {
+            JoinStatus::Exact
+        } else if expected.len() >= 2 {
+            JoinStatus::Ambiguous
+        } else {
+            JoinStatus::Unmatched
+        };
+        ensure!(
+            join.status == status && join.candidate_ids == expected,
+            "join differs from measured candidates"
+        );
+        if let Some(diagnostic) = &join.diagnostic {
+            text(diagnostic)?;
+        }
+        ensure!(
+            join.diagnostic.is_some() == (status != JoinStatus::Exact),
+            "join diagnostic mismatch"
+        );
+        if status == JoinStatus::Unsupported {
+            ensure!(
+                join.diagnostic.as_deref() == unsupported,
+                "unsupported join diagnostic differs from native capability"
+            );
+        }
+        for id in &join.candidate_ids {
+            if family == JoinKind::DeclarationName {
+                sid(id)?
+            } else {
+                occ(id)?
+            }
+        }
+    }
     let doc = native
         .revision
         .documents
@@ -290,154 +483,76 @@ fn validate_join(
         a.revision_id == native.revision.id && a.content_hash == doc.content_hash,
         "foreign join anchor"
     );
-    let mut candidates = BTreeSet::new();
-    match family {
-        JoinKind::DeclarationName => {
-            for d in &native.declarations {
-                if d.document == a.document
-                    && d.name_range.as_ref() == Some(&a.range)
-                    && d.name.as_deref() == Some(slice)
-                {
-                    candidates.insert(d.syntax_id.clone());
-                }
-            }
-        }
-        JoinKind::Callee => {
-            for call in &native.calls {
-                let r = if a.kind == JoinKind::Invocation {
-                    Some(&call.range)
-                } else {
-                    call.callee_range.as_ref()
-                };
-                if call.document == a.document
-                    && r == Some(&a.range)
-                    && (a.kind == JoinKind::Invocation || call.spelling.as_deref() == Some(slice))
-                {
-                    candidates.insert(call.id.clone());
-                }
-            }
-        }
-        JoinKind::Reference => {
-            for reference in &native.references {
-                if reference.document == a.document
-                    && reference.range == a.range
-                    && reference.spelling == slice
-                    && native::lookup(&a.document.language, slice)? == reference.lookup_key
-                {
-                    candidates.insert(reference.id.clone());
-                }
-            }
-        }
-        JoinKind::Invocation => anyhow::bail!("invocation is a call anchor, not a fact family"),
-    }
-    let kind = match a.kind {
-        JoinKind::DeclarationName => native::MeasurementKind::DeclarationName,
-        JoinKind::Callee => native::MeasurementKind::Callee,
-        JoinKind::Invocation => native::MeasurementKind::Invocation,
-        JoinKind::Reference => native::MeasurementKind::Reference,
-    };
-    let support = native
-        .capability_reports
-        .iter()
-        .find(|report| report.document == a.document && report.revision_id == a.revision_id)
-        .context("missing native capability report")?
-        .families
-        .iter()
-        .find(|support| support.kind == kind)
-        .context("missing native measurement family")?;
-    let contained = |range: &native::Range, within: &native::Range| {
-        within.start <= range.start && range.end <= within.end
-    };
-    let measured_ranges: Vec<_> = match a.kind {
-        JoinKind::DeclarationName => native
-            .declarations
-            .iter()
-            .filter(|d| d.document == a.document)
-            .filter_map(|d| d.name_range.as_ref())
-            .collect(),
-        JoinKind::Callee => native
-            .calls
-            .iter()
-            .filter(|c| c.document == a.document)
-            .filter_map(|c| c.callee_range.as_ref())
-            .collect(),
-        JoinKind::Invocation => native
-            .calls
-            .iter()
-            .filter(|c| c.document == a.document)
-            .map(|c| &c.range)
-            .collect(),
-        JoinKind::Reference => native
-            .references
-            .iter()
-            .filter(|r| r.document == a.document)
-            .map(|r| &r.range)
-            .collect(),
-    };
-    ensure!(
-        support.available || measured_ranges.is_empty(),
-        "unavailable family has measured candidates"
-    );
-    for gap in &support.gaps {
-        span(source, &gap.range)?;
-        text(&gap.diagnostic)?;
-        ensure!(
-            !measured_ranges
-                .iter()
-                .any(|range| contained(range, &gap.range)),
-            "measured candidate contradicts native capability gap"
-        );
-    }
-    let unsupported = if !support.available {
-        Some(
-            support
-                .diagnostic
-                .as_deref()
-                .context("unavailable family without diagnostic")?,
-        )
-    } else {
-        ensure!(support.diagnostic.is_none(), "enabled family diagnostic");
-        support
-            .gaps
-            .iter()
-            .find(|gap| contained(&a.range, &gap.range))
-            .map(|gap| gap.diagnostic.as_str())
-    };
-    let expected: Vec<_> = candidates.into_iter().collect();
-    let status = if unsupported.is_some() && expected.is_empty() {
-        JoinStatus::Unsupported
-    } else if expected.len() == 1 {
-        JoinStatus::Exact
-    } else if expected.len() >= 2 {
-        JoinStatus::Ambiguous
-    } else {
-        JoinStatus::Unmatched
-    };
-    ensure!(
-        join.status == status && join.candidate_ids == expected,
-        "join differs from measured candidates"
-    );
-    if let Some(diagnostic) = &join.diagnostic {
-        text(diagnostic)?;
-    }
-    ensure!(
-        join.diagnostic.is_some() == (status != JoinStatus::Exact),
-        "join diagnostic mismatch"
-    );
-    if status == JoinStatus::Unsupported {
-        ensure!(
-            join.diagnostic.as_deref() == unsupported,
-            "unsupported join diagnostic differs from native capability"
-        );
-    }
-    for id in &join.candidate_ids {
-        if family == JoinKind::DeclarationName {
-            sid(id)?
-        } else {
-            occ(id)?
-        }
-    }
     Ok(())
+}
+
+fn admitted_proof<'a>(witness: &'a WitnessedDocument, proof: &Provenance) -> Result<&'a str> {
+    let derived = proof
+        .derived_from
+        .as_ref()
+        .context("unwitnessed derived proof")?;
+    let mut matches = witness.original.provenance.iter().filter(|p| {
+        p.document == proof.document
+            && p.producer_id == proof.producer_id
+            && p.derived_from.as_ref() == Some(derived)
+            && p.evidence_kind == proof.evidence_kind
+            && p.content_hash == proof.content_hash
+    });
+    let previous = matches
+        .next()
+        .context("missing admitted proof association")?;
+    ensure!(
+        matches.next().is_none(),
+        "ambiguous admitted proof association"
+    );
+    Ok(&previous.id)
+}
+
+fn original_join<'a>(
+    witness: &'a WitnessedDocument,
+    proof: &Provenance,
+    family: JoinKind,
+) -> Result<&'a Join> {
+    let id = admitted_proof(witness, proof)?;
+    let matches: Vec<_> = match family {
+        JoinKind::DeclarationName => witness
+            .original
+            .declaration_bindings
+            .iter()
+            .filter(|b| b.provenance_id == id)
+            .map(|b| &b.join)
+            .collect(),
+        JoinKind::Callee => witness
+            .original
+            .call_bindings
+            .iter()
+            .filter(|b| b.provenance_id == id)
+            .map(|b| &b.join)
+            .collect(),
+        _ => anyhow::bail!("invalid witnessed join family"),
+    };
+    ensure!(matches.len() == 1, "incomplete admitted join association");
+    Ok(matches[0])
+}
+
+fn original_reference<'a>(
+    witness: &'a WitnessedDocument,
+    proof: &Provenance,
+) -> Result<&'a Reference> {
+    let id = admitted_proof(witness, proof)?;
+    let mut matches = witness
+        .original
+        .references
+        .iter()
+        .filter(|r| r.provenance_id == id);
+    let original = matches
+        .next()
+        .context("missing admitted reference association")?;
+    ensure!(
+        matches.next().is_none(),
+        "fused or ambiguous admitted reference association"
+    );
+    Ok(original)
 }
 
 fn language_rank(language: &str) -> usize {
@@ -486,13 +601,48 @@ pub fn validate_evidence(
     validate_evidence_with_raw(semantic, native, captured, None)
 }
 
+struct ValidatedRaw<'a> {
+    producer_id: &'a str,
+    source_set_id: &'a str,
+    captured_revision: &'a str,
+    binary_bytes: &'a [u8],
+    inventory: crate::scip_raw::ProofInventory,
+}
+impl<'a> ValidatedRaw<'a> {
+    fn from_decoded(raw: &'a crate::store::SemanticRawCapture) -> Self {
+        Self {
+            producer_id: &raw.producer_id,
+            source_set_id: &raw.source_set_id,
+            captured_revision: &raw.captured_revision,
+            binary_bytes: &raw.binary_bytes,
+            inventory: raw.inventory.proof_identities(),
+        }
+    }
+    fn from_witnessed(raw: &'a crate::store::WitnessedRawCapture) -> Self {
+        Self {
+            producer_id: &raw.producer_id,
+            source_set_id: &raw.source_set_id,
+            captured_revision: &raw.captured_revision,
+            binary_bytes: &raw.binary_bytes,
+            inventory: raw.inventory.clone(),
+        }
+    }
+}
+
 pub fn validate_evidence_with_raw(
     semantic: &SemanticPublication,
     native: &native::Artifact,
     captured: &CapturedComponents,
     raw: Option<&crate::store::SemanticRawCapture>,
 ) -> Result<()> {
-    validate_evidence_inner(semantic, native, captured, raw, None)
+    validate_evidence_inner(
+        semantic,
+        native,
+        captured,
+        raw.map(ValidatedRaw::from_decoded),
+        None,
+        None,
+    )
 }
 
 pub(crate) fn validate_evidence_with_attested_raw(
@@ -502,16 +652,64 @@ pub(crate) fn validate_evidence_with_attested_raw(
     raw: &crate::store::SemanticRawCapture,
     attested: &crate::store::AttestedProfileProducer,
 ) -> Result<()> {
-    validate_evidence_inner(semantic, native, captured, Some(raw), Some(attested))
+    validate_evidence_inner(
+        semantic,
+        native,
+        captured,
+        Some(ValidatedRaw::from_decoded(raw)),
+        Some(attested),
+        None,
+    )
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WitnessedDocument {
+    pub source_hash: String,
+    pub wire_digest: Option<String>,
+    pub captured_version: String,
+    pub current_version: String,
+    pub original: SemanticSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TargetDeclaration {
+    pub syntax_id: String,
+    pub document: native::DocumentKey,
+    pub name: String,
+    pub name_range: native::Range,
+}
+
+pub(crate) fn validate_evidence_with_witnessed_raw(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    raw: &crate::store::WitnessedRawCapture,
+    attested: &crate::store::AttestedProfileProducer,
+    witnesses: &BTreeMap<native::DocumentKey, WitnessedDocument>,
+    current_declarations: &[TargetDeclaration],
+) -> Result<()> {
+    validate_evidence_inner(
+        semantic,
+        native,
+        captured,
+        Some(ValidatedRaw::from_witnessed(raw)),
+        Some(attested),
+        Some((witnesses, current_declarations)),
+    )
 }
 
 fn validate_evidence_inner(
     semantic: &SemanticPublication,
     native: &native::Artifact,
     captured: &CapturedComponents,
-    raw: Option<&crate::store::SemanticRawCapture>,
+    raw: Option<ValidatedRaw<'_>>,
     attested: Option<&crate::store::AttestedProfileProducer>,
+    witnessed: Option<(
+        &BTreeMap<native::DocumentKey, WitnessedDocument>,
+        &[TargetDeclaration],
+    )>,
 ) -> Result<()> {
+    let witnesses = witnessed.map(|(documents, _)| documents);
     ensure!(
         captured.native_extraction_components.is_empty(),
         "undeclared native extraction components"
@@ -533,23 +731,81 @@ fn validate_evidence_inner(
             doc.revision_id == captured.captured_revision.id,
             "foreign native document revision"
         );
-        let bytes = captured
-            .sources
-            .get(&doc.key)
-            .context("absent captured source")?;
         ensure!(
-            doc.content_hash == native_ids::digest(b"", bytes) && doc.byte_length == bytes.len(),
-            "source digest/length mismatch"
-        );
-        manifest.push(json!({"document":doc.key,"contentHash":doc.content_hash}));
-        ensure!(
-            sources.insert(doc.key.clone(), bytes.clone()).is_none(),
+            !sources.contains_key(&doc.key),
             "duplicate native manifest document"
         );
+        if let Some(witness) = witnesses.and_then(|items| items.get(&doc.key)) {
+            if let Some(wire_digest) = &witness.wire_digest {
+                hash(wire_digest)?;
+            } else {
+                ensure!(
+                    !semantic
+                        .producers
+                        .iter()
+                        .any(|p| p
+                            .languages
+                            .iter()
+                            .any(|language| serde_json::to_value(language)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                                .as_deref()
+                                == Some(&doc.key.language)))
+                        && witness.original.producers.is_empty()
+                        && witness.original.coverage.is_empty()
+                        && witness.original.provenance.is_empty()
+                        && witness.original.symbols.is_empty()
+                        && witness.original.declaration_bindings.is_empty()
+                        && witness.original.references.is_empty()
+                        && witness.original.call_bindings.is_empty()
+                        && witness.original.type_relationships.is_empty()
+                        && raw.as_ref().is_some_and(|raw| raw
+                            .inventory
+                            .claims
+                            .iter()
+                            .all(|claim| claim.language != doc.key.language
+                                || claim.path != doc.key.path)),
+                    "missing producer-covered document witness"
+                );
+            }
+            ensure!(
+                !captured.sources.contains_key(&doc.key)
+                    && witness.source_hash == doc.content_hash
+                    && witness.captured_version == witness.current_version
+                    && revision
+                        .documents
+                        .iter()
+                        .any(|current| current.key == doc.key
+                            && current.content_hash == doc.content_hash
+                            && current.byte_length == doc.byte_length),
+                "invalid unchanged source witness"
+            );
+        } else {
+            let bytes = captured
+                .sources
+                .get(&doc.key)
+                .context("absent captured source")?;
+            #[cfg(feature = "test-support")]
+            if witnessed.is_some() {
+                crate::semantic_import::note_original_source_hash(&doc.key);
+            }
+            ensure!(
+                doc.content_hash == native_ids::digest(b"", bytes)
+                    && doc.byte_length == bytes.len(),
+                "source digest/length mismatch"
+            );
+            sources.insert(doc.key.clone(), bytes.clone());
+        }
+        manifest.push(json!({"document":doc.key,"contentHash":doc.content_hash}));
     }
     ensure!(
-        captured.sources.len() == sources.len(),
-        "extra captured source"
+        captured.sources.len() == sources.len()
+            && witnesses.is_none_or(|items| items.keys().all(|key| captured
+                .captured_revision
+                .documents
+                .iter()
+                .any(|doc| &doc.key == key))),
+        "extra captured source or witness"
     );
     let mut ordered_docs = captured
         .captured_revision
@@ -749,22 +1005,106 @@ fn validate_evidence_inner(
             }
         }
     }
+    if let Some(documents) = witnesses {
+        ensure!(
+            native
+                .declarations
+                .iter()
+                .all(|d| !documents.contains_key(&d.document))
+                && native
+                    .references
+                    .iter()
+                    .all(|r| !documents.contains_key(&r.document))
+                && native
+                    .calls
+                    .iter()
+                    .all(|c| !documents.contains_key(&c.document))
+                && native
+                    .capability_reports
+                    .iter()
+                    .all(|r| !documents.contains_key(&r.document)),
+            "witness overlaps measured native document"
+        );
+    }
     let decls: BTreeMap<_, _> = native
         .declarations
         .iter()
         .map(|d| (d.syntax_id.clone(), d))
         .collect();
+    ensure!(
+        decls.len() == native.declarations.len(),
+        "duplicate measured declaration ID"
+    );
+    let selected: Option<BTreeMap<String, &TargetDeclaration>> =
+        witnessed.map(|(_, rows)| rows.iter().map(|d| (d.syntax_id.clone(), d)).collect());
+    if let Some((_, rows)) = witnessed {
+        let selected = selected.as_ref().expect("selected declarations");
+        ensure!(
+            selected.len() == rows.len(),
+            "duplicate current target declaration"
+        );
+        for d in rows {
+            sid(&d.syntax_id)?;
+            key(&d.document, revision)?;
+            text(&d.name)?;
+            ensure!(
+                d.name_range.start < d.name_range.end,
+                "invalid target name range"
+            );
+            let document = revision
+                .documents
+                .iter()
+                .find(|doc| doc.key == d.document)
+                .context("target declaration without current document")?;
+            ensure!(
+                d.name_range.end <= document.byte_length,
+                "target name exceeds current document"
+            );
+            if let Some(measured) = decls.get(&d.syntax_id) {
+                ensure!(
+                    measured.document == d.document
+                        && measured.name.as_deref() == Some(&d.name)
+                        && measured.name_range.as_ref() == Some(&d.name_range),
+                    "current target contradicts measurement"
+                );
+            }
+        }
+    }
+    let mut artifact_hashes = BTreeMap::new();
+    for (producer_id, bytes) in &captured.artifacts {
+        let artifact_hash = if let Some(raw) = &raw {
+            ensure!(
+                raw.producer_id == producer_id && raw.binary_bytes == bytes.as_slice(),
+                "captured artifact differs from admitted raw binary"
+            );
+            let digest = native_ids::digest(b"", raw.binary_bytes);
+            ensure!(
+                raw.inventory.artifact_hash == digest,
+                "raw binary identity mismatch"
+            );
+            digest
+        } else {
+            native_ids::digest(b"", bytes)
+        };
+        artifact_hashes.insert(producer_id, artifact_hash);
+    }
     let mut proof = BTreeMap::new();
     for p in &semantic.provenance {
         text(&p.id)?;
         key(&p.document, revision)?;
         hash(&p.content_hash)?;
+        if let Some(witness) = witnesses.and_then(|items| items.get(&p.document)) {
+            ensure!(p.derived_from.is_some(), "unwitnessed captured proof");
+            admitted_proof(witness, p)?;
+        }
         if let Some(derived) = &p.derived_from {
             ensure!(
                 p.revision_id == revision.id,
                 "derived proof revision mismatch"
             );
-            let raw = raw.context("derived provenance requires authenticated raw inventory")?;
+            let raw = raw
+                .as_ref()
+                .context("derived provenance requires authenticated raw inventory")?;
             let kind = serde_json::to_value(derived.record_kind)?;
             let claim = raw.inventory.lookup(
                 &derived.provenance_id,
@@ -775,9 +1115,8 @@ fn validate_evidence_inner(
                 p.producer_id == raw.producer_id
                     && p.document.source_set_id == raw.source_set_id
                     && p.document.language == claim.language
-                    && p.document.path == claim.envelope.relative_path
-                    && raw.captured_revision == captured.captured_revision.id
-                    && raw.inventory.artifact_hash == native_ids::digest(b"", &raw.binary_bytes),
+                    && p.document.path == claim.path
+                    && raw.captured_revision == captured.captured_revision.id,
                 "derived provenance raw capture identity mismatch"
             );
         } else {
@@ -826,13 +1165,12 @@ fn validate_evidence_inner(
         );
         ensure!(
             basis.artifact_hash
-                == native_ids::digest(
-                    b"",
-                    captured
-                        .artifacts
-                        .get(&p.producer_id)
-                        .context("missing captured semantic artifact")?
-                )
+                == *artifact_hashes
+                    .get(&p.producer_id)
+                    .context("missing captured semantic artifact")?
+                && raw.as_ref().is_none_or(|raw| witnessed.is_none()
+                    || (basis.artifact_hash == raw.inventory.artifact_hash
+                        && raw.inventory.source_manifest_hash == manifest_hash))
                 && basis.source_manifest_hash == manifest_hash
                 && basis.toolchain_hash == captured.captured_revision.toolchain_hash
                 && basis.config_hash == captured.captured_revision.config_hash
@@ -906,6 +1244,87 @@ fn validate_evidence_inner(
             );
             Ok(p)
         };
+    for (doc, witness) in witnesses.into_iter().flat_map(|items| items.iter()) {
+        let producer_id = &raw.as_ref().context("missing raw witness")?.producer_id;
+        ensure!(
+            witness
+                .original
+                .provenance
+                .iter()
+                .all(|p| p.document == *doc),
+            "witness contains foreign proof document"
+        );
+        let admitted_ids: BTreeSet<_> = witness
+            .original
+            .provenance
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        let admitted: BTreeSet<_> = witness
+            .original
+            .provenance
+            .iter()
+            .filter(|p| p.document == *doc && p.producer_id == *producer_id)
+            .filter_map(|p| {
+                p.derived_from.as_ref().map(|d| {
+                    (
+                        &d.provenance_id,
+                        d.record_kind,
+                        &d.fact_digest,
+                        p.evidence_kind,
+                    )
+                })
+            })
+            .collect();
+        ensure!(
+            admitted_ids.len() == witness.original.provenance.len()
+                && admitted.len() == witness.original.provenance.len(),
+            "duplicate or non-derived admitted proof"
+        );
+        ensure!(
+            witness.original.references.iter().all(|r| witness
+                .original
+                .provenance
+                .iter()
+                .any(|p| p.id == r.provenance_id))
+                && witness.original.declaration_bindings.iter().all(|b| witness
+                    .original
+                    .provenance
+                    .iter()
+                    .any(|p| p.id == b.provenance_id))
+                && witness.original.call_bindings.iter().all(|b| witness
+                    .original
+                    .provenance
+                    .iter()
+                    .any(|p| p.id == b.provenance_id)),
+            "foreign admitted association proof"
+        );
+        let output: BTreeSet<_> = semantic
+            .provenance
+            .iter()
+            .filter(|p| p.document == *doc && p.producer_id == *producer_id)
+            .filter_map(|p| {
+                p.derived_from.as_ref().map(|d| {
+                    (
+                        &d.provenance_id,
+                        d.record_kind,
+                        &d.fact_digest,
+                        p.evidence_kind,
+                    )
+                })
+            })
+            .collect();
+        ensure!(
+            admitted == output
+                && output.len()
+                    == semantic
+                        .provenance
+                        .iter()
+                        .filter(|p| p.document == *doc && p.producer_id == *producer_id)
+                        .count(),
+            "incomplete witnessed document proof inventory"
+        );
+    }
     let mut symbols = BTreeSet::new();
     for s in &semantic.symbols {
         let p = fact(&s.provenance_id, None, EvidenceKind::DeclarationBinding)?;
@@ -916,7 +1335,34 @@ fn validate_evidence_inner(
         if let Some(doc) = &s.key.document {
             ensure!(doc == &p.document, "symbol evidence document mismatch");
         }
-        targets(&s.declarations, native, &decls, false)?;
+        targets(&s.declarations, native, &decls, false, selected.as_ref())?;
+        if let Some(witness) = witnesses.and_then(|items| items.get(&p.document)) {
+            let id = admitted_proof(witness, p)?;
+            ensure!(
+                witness
+                    .original
+                    .symbols
+                    .iter()
+                    .any(|old| old.provenance_id == id
+                        && old.key == s.key
+                        && old.display_name == s.display_name
+                        && old.declarations.len() == s.declarations.len()
+                        && old.declarations.iter().zip(&s.declarations).all(
+                            |(before, after)| match (before, after) {
+                                (
+                                    Target::Internal { document: a, .. },
+                                    Target::Internal { document: b, .. },
+                                ) => a == b,
+                                (
+                                    Target::External { symbol: a },
+                                    Target::External { symbol: b },
+                                ) => a == b,
+                                _ => false,
+                            }
+                        )),
+                "symbol differs from admitted association"
+            );
+        }
         ensure!(
             symbols.insert((
                 p.producer_id.clone(),
@@ -941,7 +1387,40 @@ fn validate_evidence_inner(
             )),
             "duplicate declaration binding fact"
         );
-        validate_join(&b.join, JoinKind::DeclarationName, native, &sources)?;
+        let admitted = witnesses
+            .and_then(|items| items.get(&p.document))
+            .map(|w| original_join(w, p, JoinKind::DeclarationName))
+            .transpose()?;
+        validate_join(
+            &b.join,
+            JoinKind::DeclarationName,
+            native,
+            &sources,
+            admitted,
+        )?;
+        if let Some(old) = admitted {
+            ensure!(
+                old.anchor.revision_id == captured.captured_revision.id
+                    && old.anchor.content_hash == p.content_hash,
+                "foreign admitted declaration anchor"
+            );
+            ensure!(
+                witnesses
+                    .and_then(|items| items.get(&p.document))
+                    .is_some_and(|w| {
+                        let Ok(id) = admitted_proof(w, p) else {
+                            return false;
+                        };
+                        w.original.declaration_bindings.iter().any(|previous| {
+                            previous.provenance_id == id
+                                && previous.join == *old
+                                && previous.syntax_id == b.syntax_id
+                                && previous.symbols == b.symbols
+                        })
+                    }),
+                "binding differs from admitted association"
+            );
+        }
         ensure!(
             p.document == b.join.anchor.document,
             "foreign declaration binding"
@@ -981,38 +1460,65 @@ fn validate_evidence_inner(
             EvidenceKind::SemanticReference,
         )?;
         ensure!(r.revision_id == revision.id, "foreign reference revision");
+        let admitted = witnesses
+            .and_then(|items| items.get(&r.document))
+            .map(|w| original_reference(w, p))
+            .transpose()?;
+        if let Some(original) = admitted {
+            ensure!(
+                original.revision_id == captured.captured_revision.id,
+                "foreign admitted reference revision"
+            );
+            ensure!(
+                original.id == r.id
+                    && original.owner_syntax_id == r.owner_syntax_id
+                    && original.ordinal == r.ordinal
+                    && original.document == r.document
+                    && original.range == r.range
+                    && original.spelling == r.spelling
+                    && original.lookup_key == r.lookup_key
+                    && original.site == r.site
+                    && original.roles == r.roles,
+                "reference differs from admitted source association"
+            );
+        }
         sid(&r.owner_syntax_id)?;
         occ(&r.id)?;
         uint(r.ordinal)?;
         ensure!(
-            native_references
-                .get(r.id.as_str())
-                .is_some_and(|candidate| {
-                    candidate.owner_syntax_id == r.owner_syntax_id
-                        && candidate.ordinal == r.ordinal
-                        && candidate.document == r.document
-                        && candidate.revision_id == r.revision_id
-                        && candidate.range == r.range
-                        && candidate.spelling == r.spelling
-                        && candidate.lookup_key == r.lookup_key
-                }),
+            admitted.is_some()
+                || native_references
+                    .get(r.id.as_str())
+                    .is_some_and(|candidate| {
+                        candidate.owner_syntax_id == r.owner_syntax_id
+                            && candidate.ordinal == r.ordinal
+                            && candidate.document == r.document
+                            && candidate.revision_id == r.revision_id
+                            && candidate.range == r.range
+                            && candidate.spelling == r.spelling
+                            && candidate.lookup_key == r.lookup_key
+                    }),
             "reference differs from native reference candidate"
         );
         ensure!(
-            decls
-                .get(&r.owner_syntax_id)
-                .is_some_and(|d| d.document == r.document
-                    && d.range.start <= r.range.start
-                    && r.range.end <= d.range.end),
+            admitted.is_some()
+                || decls
+                    .get(&r.owner_syntax_id)
+                    .is_some_and(|d| d.document == r.document
+                        && d.range.start <= r.range.start
+                        && r.range.end <= d.range.end),
             "unmeasured reference owner"
         );
-        let bytes = sources
-            .get(&r.document)
-            .context("missing reference source")?;
-        ensure!(
-            span(bytes, &r.range)? == r.spelling && !r.spelling.is_empty(),
-            "reference spelling mismatch"
-        );
+        if admitted.is_none() {
+            let bytes = sources
+                .get(&r.document)
+                .context("missing reference source")?;
+            ensure!(
+                span(bytes, &r.range)? == r.spelling,
+                "reference spelling mismatch"
+            );
+        }
+        ensure!(!r.spelling.is_empty(), "empty reference spelling");
         ensure!(
             native::lookup(&r.document.language, &r.spelling)? == r.lookup_key,
             "reference lookup mismatch"
@@ -1027,7 +1533,7 @@ fn validate_evidence_inner(
             !r.roles.contains(&Role::Alias) || r.roles.contains(&Role::Definition),
             "alias without definition"
         );
-        if r.roles.contains(&Role::Call) {
+        if r.roles.contains(&Role::Call) && admitted.is_none() {
             ensure!(
                 native.calls.iter().any(|call| call.document == r.document
                     && call.owner_syntax_id == r.owner_syntax_id
@@ -1045,7 +1551,7 @@ fn validate_evidence_inner(
             (r.site == ReferenceSite::Declaration) == r.roles.contains(&Role::Definition),
             "reference site/role mismatch"
         );
-        if r.site == ReferenceSite::Declaration {
+        if r.site == ReferenceSite::Declaration && admitted.is_none() {
             ensure!(
                 native.declarations.iter().any(|d| {
                     d.document == r.document
@@ -1058,9 +1564,9 @@ fn validate_evidence_inner(
         }
         resolution(r.resolution, &r.declared_target, &r.candidates)?;
         if let Some(t) = &r.declared_target {
-            target(t, native, &decls)?;
+            target(t, native, &decls, selected.as_ref())?;
         }
-        targets(&r.candidates, native, &decls, true)?;
+        targets(&r.candidates, native, &decls, true, selected.as_ref())?;
         ensure!(
             references.insert((p.producer_id.as_str(), r.id.as_str())),
             "duplicate reference ID"
@@ -1084,7 +1590,55 @@ fn validate_evidence_inner(
             )),
             "duplicate call binding fact"
         );
-        validate_join(&b.join, JoinKind::Callee, native, &sources)?;
+        let admitted = witnesses
+            .and_then(|items| items.get(&proof.document))
+            .map(|w| original_join(w, proof, JoinKind::Callee))
+            .transpose()?;
+        validate_join(&b.join, JoinKind::Callee, native, &sources, admitted)?;
+        if let Some(old) = admitted {
+            ensure!(
+                old.anchor.revision_id == captured.captured_revision.id
+                    && old.anchor.content_hash == proof.content_hash,
+                "foreign admitted call anchor"
+            );
+            let witness = witnesses
+                .and_then(|items| items.get(&proof.document))
+                .context("missing call witness")?;
+            let id = admitted_proof(witness, proof)?;
+            ensure!(
+                witness
+                    .original
+                    .call_bindings
+                    .iter()
+                    .any(|previous| previous.provenance_id == id
+                        && previous.join == *old
+                        && previous.call_id == b.call_id),
+                "call differs from admitted source association"
+            );
+            let call = b.call_id.as_ref().context("unwitnessed call ID")?;
+            let owner = &witness
+                .original
+                .references
+                .iter()
+                .find(|old| old.provenance_id == id)
+                .context("missing admitted call reference")?
+                .owner_syntax_id;
+            ensure!(
+                semantic
+                    .references
+                    .iter()
+                    .any(|r| r.document == proof.document
+                        && r.provenance_id == b.provenance_id
+                        && r.roles.contains(&Role::Call)
+                        && (r.range == b.join.anchor.range
+                            || (b.join.anchor.kind == JoinKind::Invocation
+                                && b.join.anchor.range.start <= r.range.start
+                                && r.range.end <= b.join.anchor.range.end))
+                        && &r.owner_syntax_id == owner),
+                "call/reference witness mismatch"
+            );
+            occ(call)?;
+        }
         ensure!(
             b.call_id.as_ref()
                 == (b.join.status == JoinStatus::Exact).then(|| &b.join.candidate_ids[0]),
@@ -1109,10 +1663,16 @@ fn validate_evidence_inner(
                 .push((b.resolution, target, candidates));
         }
         if let Some(t) = &b.declared_target {
-            target(t, native, &decls)?;
+            target(t, native, &decls, selected.as_ref())?;
         }
-        targets(&b.candidates, native, &decls, true)?;
-        targets(&b.possible_dispatch, native, &decls, true)?;
+        targets(&b.candidates, native, &decls, true, selected.as_ref())?;
+        targets(
+            &b.possible_dispatch,
+            native,
+            &decls,
+            true,
+            selected.as_ref(),
+        )?;
         ensure!(
             !b.possible_dispatch_complete && b.stale_target != Some(true),
             "unsupported dispatch completeness/stale target"
@@ -1152,6 +1712,20 @@ fn validate_evidence_inner(
     let mut relationships = BTreeSet::new();
     for r in &semantic.type_relationships {
         let proof = fact(&r.provenance_id, None, EvidenceKind::TypeRelationship)?;
+        if let Some(witness) = witnesses.and_then(|items| items.get(&proof.document)) {
+            let id = admitted_proof(witness, proof)?;
+            ensure!(
+                witness.original.type_relationships.iter().any(|old| {
+                    old.provenance_id == id
+                        && old.kind == r.kind
+                        && matches!((&old.source, &r.source),
+                        (Target::Internal { syntax_id: old_id, document: old_doc, .. },
+                         Target::Internal { syntax_id: new_id, document: new_doc, .. })
+                        if old_id == new_id && old_doc == new_doc)
+                }),
+                "relationship differs from admitted source association"
+            );
+        }
         ensure!(
             matches!(&r.source, Target::Internal { document, .. } if document == &proof.document),
             "relationship source/evidence document mismatch"
@@ -1165,8 +1739,8 @@ fn validate_evidence_inner(
             )),
             "duplicate relationship fact"
         );
-        target(&r.source, native, &decls)?;
-        target(&r.target, native, &decls)?;
+        target(&r.source, native, &decls, selected.as_ref())?;
+        target(&r.target, native, &decls, selected.as_ref())?;
     }
     for ((producer, lang, path), row) in &coverage {
         let observed = |id: &str| {
@@ -1212,4 +1786,90 @@ fn validate_evidence_inner(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_reference_requires_exact_proof_and_one_original_association() {
+        let document = native::DocumentKey {
+            source_set_id: "set".into(),
+            language: "python".into(),
+            path: "a.py".into(),
+        };
+        let derived = DerivedFrom {
+            provenance_id: "proof".into(),
+            record_kind: RecordKind::Occurrence,
+            fact_digest: "f".repeat(64),
+        };
+        let proof = Provenance {
+            id: "new".into(),
+            producer_id: "producer".into(),
+            document: document.clone(),
+            revision_id: "revision:new".into(),
+            content_hash: "a".repeat(64),
+            evidence_kind: EvidenceKind::SemanticReference,
+            basis: None,
+            freshness: Freshness::PossiblyStale,
+            derived_from: Some(derived.clone()),
+        };
+        let previous = Provenance {
+            id: "old".into(),
+            revision_id: "revision:old".into(),
+            ..proof.clone()
+        };
+        let reference = Reference {
+            id: "occ:v2:test".into(),
+            owner_syntax_id: "sid:v2:test".into(),
+            ordinal: 0,
+            document,
+            revision_id: "revision:old".into(),
+            range: native::Range { start: 0, end: 1 },
+            spelling: "a".into(),
+            lookup_key: "a".into(),
+            site: ReferenceSite::Use,
+            roles: vec![Role::Read],
+            resolution: Resolution::Unresolved,
+            declared_target: None,
+            candidates: vec![],
+            provenance_id: "old".into(),
+        };
+        let mut original = SemanticSnapshot {
+            producers: vec![],
+            coverage: vec![],
+            provenance: vec![previous],
+            symbols: vec![],
+            declaration_bindings: vec![],
+            references: vec![reference],
+            call_bindings: vec![],
+            type_relationships: vec![],
+        };
+        let mut witness = WitnessedDocument {
+            source_hash: "a".repeat(64),
+            wire_digest: Some("b".repeat(64)),
+            captured_version: "v".into(),
+            current_version: "v".into(),
+            original: original.clone(),
+        };
+        assert_eq!(original_reference(&witness, &proof).unwrap().spelling, "a");
+        original.references.push(original.references[0].clone());
+        witness.original = original;
+        assert!(
+            original_reference(&witness, &proof)
+                .unwrap_err()
+                .to_string()
+                .contains("fused or ambiguous")
+        );
+        witness.original.references.pop();
+        let mut wrong = proof;
+        wrong.derived_from.as_mut().unwrap().fact_digest = "0".repeat(64);
+        assert!(
+            original_reference(&witness, &wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("missing admitted proof")
+        );
+    }
 }

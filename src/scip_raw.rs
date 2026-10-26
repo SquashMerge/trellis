@@ -62,6 +62,49 @@ fn cancelled(flag: &CancelFlag) -> Result<(), ScipCaptureError> {
 pub(crate) fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+/// Digest the exact payload bytes of each already-admitted Index.documents field.
+/// The caller must first complete `decode_authenticated`; this does not admit bytes.
+pub(crate) fn admitted_document_wire_digests(
+    artifact: &[u8],
+    flag: &CancelFlag,
+) -> Result<BTreeMap<(String, String), String>, ScipCaptureError> {
+    wire(artifact, Node::Index, 0, &mut WireBudget::default(), flag)?;
+    let index = types::Index::parse_from_bytes(artifact).map_err(|_| invalid("protobuf parse"))?;
+    let mut payloads = Vec::new();
+    let mut i = 0;
+    while i < artifact.len() {
+        let tag = varint(artifact, &mut i)?;
+        if tag & 7 == 0 {
+            varint(artifact, &mut i)?;
+            continue;
+        }
+        let len = usize::try_from(varint(artifact, &mut i)?).map_err(|_| limit("field length"))?;
+        let end = i
+            .checked_add(len)
+            .filter(|end| *end <= artifact.len())
+            .ok_or_else(|| invalid("truncated field"))?;
+        if tag >> 3 == 2 {
+            payloads.push(sha(&artifact[i..end]));
+        }
+        i = end;
+    }
+    if payloads.len() != index.documents.len() {
+        return Err(invalid("document wire identity mismatch"));
+    }
+    let mut digests = BTreeMap::new();
+    for (document, digest) in index.documents.iter().zip(payloads) {
+        if digests
+            .insert(
+                (document.language.clone(), document.relative_path.clone()),
+                digest,
+            )
+            .is_some()
+        {
+            return Err(invalid("duplicate document wire identity"));
+        }
+    }
+    Ok(digests)
+}
 #[derive(Debug)]
 pub(crate) struct AuthenticatedScipDocument<'a> {
     pub language: String,
@@ -103,6 +146,60 @@ pub struct CapturedClaim {
     pub captured_proof_id: String,
     pub language: String,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawProofIdentity {
+    pub(crate) proof_id: String,
+    pub(crate) record_kind: String,
+    pub(crate) fact_digest: String,
+    pub(crate) language: String,
+    pub(crate) path: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProofInventory {
+    pub(crate) artifact_hash: String,
+    pub(crate) source_manifest_hash: String,
+    pub(crate) exclusions: Vec<Exclusion>,
+    pub(crate) claims: Vec<RawProofIdentity>,
+}
+
+fn unique_proof<'a, T>(
+    rows: &'a [T],
+    id: &str,
+    kind: &str,
+    digest: &str,
+    fields: impl Fn(&T) -> (&str, &str, &str),
+) -> Result<&'a T, ScipCaptureError> {
+    let mut found = None;
+    for row in rows {
+        let (proof_id, record_kind, fact_digest) = fields(row);
+        if proof_id == id {
+            if found.is_some() {
+                return Err(ScipCaptureError::NonUniqueProof);
+            }
+            found = Some((row, record_kind, fact_digest));
+        }
+    }
+    let (row, record_kind, fact_digest) = found.ok_or(ScipCaptureError::MissingProof)?;
+    if record_kind != kind || fact_digest != digest {
+        return Err(ScipCaptureError::MissingProof);
+    }
+    Ok(row)
+}
+
+impl ProofInventory {
+    pub(crate) fn lookup(
+        &self,
+        id: &str,
+        kind: &str,
+        digest: &str,
+    ) -> Result<&RawProofIdentity, ScipCaptureError> {
+        unique_proof(&self.claims, id, kind, digest, |claim| {
+            (&claim.proof_id, &claim.record_kind, &claim.fact_digest)
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CapturedScipInventory {
     pub artifact_hash: String,
@@ -113,25 +210,37 @@ pub struct CapturedScipInventory {
     pub claims: Vec<CapturedClaim>,
 }
 impl CapturedScipInventory {
+    pub(crate) fn proof_identities(&self) -> ProofInventory {
+        ProofInventory {
+            artifact_hash: self.artifact_hash.clone(),
+            source_manifest_hash: self.source_manifest_hash.clone(),
+            exclusions: self.exclusions.clone(),
+            claims: self
+                .claims
+                .iter()
+                .map(|claim| RawProofIdentity {
+                    proof_id: claim.captured_proof_id.clone(),
+                    record_kind: claim.envelope.record_kind.clone(),
+                    fact_digest: claim.fact_digest.clone(),
+                    language: claim.language.clone(),
+                    path: claim.envelope.relative_path.clone(),
+                })
+                .collect(),
+        }
+    }
     pub fn lookup(
         &self,
         proof_id: &str,
         record_kind: &str,
         fact_digest: &str,
     ) -> Result<&CapturedClaim, ScipCaptureError> {
-        let mut found = None;
-        for claim in &self.claims {
-            if claim.captured_proof_id == proof_id {
-                if claim.envelope.record_kind != record_kind || claim.fact_digest != fact_digest {
-                    continue;
-                }
-                if found.is_some() {
-                    return Err(ScipCaptureError::NonUniqueProof);
-                }
-                found = Some(claim);
-            }
-        }
-        found.ok_or(ScipCaptureError::MissingProof)
+        unique_proof(&self.claims, proof_id, record_kind, fact_digest, |claim| {
+            (
+                &claim.captured_proof_id,
+                &claim.envelope.record_kind,
+                &claim.fact_digest,
+            )
+        })
     }
 }
 
@@ -987,6 +1096,30 @@ mod tests {
         };
         decode_authenticated(&input, &Arc::new(AtomicBool::new(false)))
     }
+    #[test]
+    fn document_identity_uses_original_wire_payload_not_reserialization() {
+        let original = hex::decode(FULL).unwrap();
+        let mut alternate = original.clone();
+        assert_eq!(&alternate[88..90], &[0x30, 0x01]);
+        alternate[1] += 1;
+        alternate.splice(88..90, [0x30, 0x81, 0x00]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = admitted_document_wire_digests(&original, &flag).unwrap();
+        let second = admitted_document_wire_digests(&alternate, &flag).unwrap();
+        assert_ne!(
+            first[&("javascript".into(), "src/A.js".into())],
+            second[&("javascript".into(), "src/A.js".into())]
+        );
+        assert_eq!(
+            first[&("javascript".into(), "src/B.js".into())],
+            second[&("javascript".into(), "src/B.js".into())]
+        );
+        assert_eq!(
+            types::Index::parse_from_bytes(&original).unwrap(),
+            types::Index::parse_from_bytes(&alternate).unwrap()
+        );
+    }
+
     #[test]
     fn scip_exact_pinned_full_inventory() {
         let inventory = decoded(FULL).unwrap();
