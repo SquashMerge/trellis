@@ -180,29 +180,25 @@ pub(super) fn read_cards(
 }
 
 /// Called in every head-changing transaction, before its metadata update.
-/// History retention never writes this corpus. Equal document versions keep
-/// the existing rows and BM25 statistics on semantic/metadata-only publication.
+/// History retention never writes this corpus. Immutable document versions keep
+/// their existing rows; only removed and added versions change BM25 statistics.
 pub(super) fn publish_head(db: &Connection, revision: &str) -> Result<()> {
-    let changed: bool = db.query_row(
-        "SELECT EXISTS(SELECT vid,syntax_id FROM head_search_fts
-          EXCEPT SELECT c.vid,c.syntax_id FROM native_version_search_cards c
-          JOIN revision_documents m ON m.vid=c.vid WHERE m.revision_id=?1)
-         OR EXISTS(SELECT c.vid,c.syntax_id FROM native_version_search_cards c
-          JOIN revision_documents m ON m.vid=c.vid WHERE m.revision_id=?1
-          EXCEPT SELECT vid,syntax_id FROM head_search_fts)",
+    #[cfg(feature = "test-support")]
+    let _audit = fts_write_audit::Guard::install(db);
+    db.execute(
+        "DELETE FROM head_search_fts WHERE vid NOT IN
+         (SELECT vid FROM revision_documents WHERE revision_id=?1)",
         [revision],
-        |row| row.get(0),
     )?;
-    if changed {
-        db.execute("DELETE FROM head_search_fts", [])?;
-        db.execute(
-            "INSERT INTO head_search_fts(terms,vid,syntax_id)
-             SELECT c.terms,c.vid,c.syntax_id FROM native_version_search_cards c
-             JOIN revision_documents m ON m.vid=c.vid
-             WHERE m.revision_id=?1 ORDER BY c.syntax_id",
-            [revision],
-        )?;
-    }
+    db.execute(
+        "WITH added(vid) AS MATERIALIZED
+         (SELECT vid FROM revision_documents WHERE revision_id=?1
+          EXCEPT SELECT vid FROM head_search_fts)
+         INSERT INTO head_search_fts(terms,vid,syntax_id)
+         SELECT terms,vid,syntax_id FROM native_version_search_cards
+         WHERE vid IN (SELECT vid FROM added)",
+        [revision],
+    )?;
     Ok(())
 }
 
@@ -395,7 +391,62 @@ impl EvidenceResponse {
 }
 
 #[cfg(feature = "test-support")]
+mod fts_write_audit {
+    use super::*;
+
+    thread_local! {
+        static WRITES: std::cell::RefCell<Vec<(i32, i64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn record(
+        _context: *mut std::ffi::c_void,
+        operation: i32,
+        _database: *const std::ffi::c_char,
+        table: *const std::ffi::c_char,
+        rowid: i64,
+    ) {
+        let _ = std::panic::catch_unwind(|| {
+            // SAFETY: SQLite supplies a valid, nul-terminated table name.
+            if unsafe { std::ffi::CStr::from_ptr(table) }.to_bytes() == b"head_search_fts_content" {
+                WRITES.with_borrow_mut(|writes| writes.push((operation, rowid)));
+            }
+        });
+    }
+
+    pub(super) struct Guard(*mut rusqlite::ffi::sqlite3);
+    impl Guard {
+        pub(super) fn install(db: &Connection) -> Self {
+            WRITES.with_borrow_mut(Vec::clear);
+            // SAFETY: the connection remains live until this guard is dropped;
+            // the callback uses only same-thread state, with no borrowed context.
+            let handle = unsafe { db.handle() };
+            unsafe {
+                rusqlite::ffi::sqlite3_update_hook(handle, Some(record), std::ptr::null_mut());
+            }
+            Self(handle)
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: publish_head drops the guard before releasing its connection.
+            unsafe {
+                rusqlite::ffi::sqlite3_update_hook(self.0, None, std::ptr::null_mut());
+            }
+        }
+    }
+    pub(super) fn take() -> Vec<(i32, i64)> {
+        WRITES.with_borrow_mut(std::mem::take)
+    }
+}
+
+#[cfg(feature = "test-support")]
 impl Store {
+    /// Drain logical FTS content writes attempted by the last head publication
+    /// on this thread, including writes later rolled back by its transaction.
+    pub fn take_search_fts_writes_for_tests(&self) -> Vec<(i32, i64)> {
+        fts_write_audit::take()
+    }
+
     /// Fault the required head ranking table through the retained writer handle.
     pub fn corrupt_search_fts_for_tests(&self, writer: &topology::WriterGuard) -> Result<()> {
         writer.belongs_to(&self.identity)?;

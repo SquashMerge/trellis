@@ -59,6 +59,101 @@ fn all_cards(store: &Store, pin: IndexPin) -> Vec<trellis::store::HeadSearchCard
     store.head_search_cards(Some(pin), None, 16).unwrap().cards
 }
 
+fn fts_rows(db: &Connection) -> BTreeMap<(i64, Vec<u8>), i64> {
+    db.prepare("SELECT vid,syntax_id,rowid FROM head_search_fts ORDER BY vid,syntax_id")
+        .unwrap()
+        .query_map([], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn edited_document_changes_only_its_fts_rows_and_keeps_head_bm25() {
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("cards.rs"),
+        "fn orchard() { apple(); } fn orchard_helper() { basket(); }\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("steady.rs"), "fn orchard_steady() {}\n").unwrap();
+    fs::write(root.path().join("other.rs"), "fn orchard_other() {}\n").unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let first = publish(&store, root.path(), &leader, &cancel);
+    let db = Connection::open(db_path(state.path(), root.path())).unwrap();
+    let before = fts_rows(&db);
+    assert_eq!(before.len(), 4);
+    fs::write(
+        root.path().join("cards.rs"),
+        "fn orchard() { pear(); } fn orchard_replacement() { gather(); }\n",
+    )
+    .unwrap();
+    let second = publish(&store, root.path(), &leader, &cancel);
+    assert_ne!(first, second);
+    let after = fts_rows(&db);
+    let removed: Vec<_> = before
+        .keys()
+        .filter(|key| !after.contains_key(*key))
+        .collect();
+    let added: Vec<_> = after
+        .keys()
+        .filter(|key| !before.contains_key(*key))
+        .collect();
+    let retained: Vec<_> = before
+        .keys()
+        .filter(|key| after.contains_key(*key))
+        .collect();
+    assert_eq!(
+        removed.len(),
+        2,
+        "both cards of the changed vid leave the head"
+    );
+    assert_eq!(added.len(), 2, "all cards of the new vid enter the head");
+    assert_eq!(
+        retained.len(),
+        2,
+        "the other document versions stay in place"
+    );
+    for key in retained {
+        assert_eq!(
+            before[key], after[key],
+            "unchanged card keeps its FTS rowid"
+        );
+    }
+    let mut expected: Vec<_> = removed
+        .iter()
+        .map(|key| (rusqlite::ffi::SQLITE_DELETE, before[*key]))
+        .chain(
+            added
+                .iter()
+                .map(|key| (rusqlite::ffi::SQLITE_INSERT, after[*key])),
+        )
+        .collect();
+    let mut writes = store.take_search_fts_writes_for_tests();
+    expected.sort();
+    writes.sort();
+    assert_eq!(
+        writes, expected,
+        "writes are bounded by the actual card delta"
+    );
+    // A fresh head-only corpus inserted in reverse order has the same scores.
+    // Retained old card versions must not influence BM25 statistics.
+    db.execute_batch(
+        "CREATE VIRTUAL TABLE temp.expected_fts USING fts5(terms,vid UNINDEXED,syntax_id UNINDEXED,tokenize='porter unicode61 remove_diacritics 2');
+         INSERT INTO expected_fts SELECT terms,vid,syntax_id FROM head_search_fts ORDER BY syntax_id DESC;",
+    )
+    .unwrap();
+    let expected_scores: Vec<(i64, Vec<u8>, String, f64)> = db
+        .prepare(r#"SELECT vid,syntax_id,terms,bm25(expected_fts) FROM expected_fts WHERE expected_fts MATCH '"orchard"' ORDER BY syntax_id"#)
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(corpus(&db), expected_scores);
+    assert_eq!(all_cards(&store, second).len(), 4);
+}
+
 #[test]
 fn mutation_deletion_and_retention_keep_exact_cards_and_head_only_statistics() {
     let (state, root, store, cancel) = fixture();
@@ -152,11 +247,14 @@ fn mutation_deletion_and_retention_keep_exact_cards_and_head_only_statistics() {
 #[test]
 fn publication_rollback_keeps_card_rows_and_fts_together() {
     let (state, root, store, cancel) = fixture();
+    fs::write(root.path().join("steady.rs"), "fn unchanged() {}\n").unwrap();
+    fs::write(root.path().join("other.rs"), "fn untouched() {}\n").unwrap();
     let leader = store.publication_for_tests().unwrap();
     let first = publish(&store, root.path(), &leader, &cancel);
     let before = all_cards(&store, first);
     let db = Connection::open(db_path(state.path(), root.path())).unwrap();
     let before_fts = corpus(&db);
+    let before_rows = fts_rows(&db);
     fs::write(
         root.path().join("cards.rs"),
         "fn orchard() { different(); }\n",
@@ -182,6 +280,26 @@ fn publication_rollback_keeps_card_rows_and_fts_together() {
     assert_eq!(store.index_baseline().unwrap(), first);
     assert_eq!(all_cards(&store, first), before);
     assert_eq!(corpus(&db), before_fts);
+    assert_eq!(fts_rows(&db), before_rows);
+    let writes = store.take_search_fts_writes_for_tests();
+    let deleted: Vec<_> = writes
+        .iter()
+        .filter(|(operation, _)| *operation == rusqlite::ffi::SQLITE_DELETE)
+        .map(|(_, rowid)| *rowid)
+        .collect();
+    let expected_deleted: Vec<_> = before_fts
+        .iter()
+        .map(|(vid, sid, _, _)| before_rows[&(*vid, sid.clone())])
+        .collect();
+    assert_eq!(
+        deleted, expected_deleted,
+        "the changed card delta was attempted"
+    );
+    assert_eq!(
+        writes.len(),
+        before_fts.len() * 2,
+        "only the replacement card was inserted before rollback"
+    );
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM native_version_search_cards",
@@ -189,7 +307,7 @@ fn publication_rollback_keeps_card_rows_and_fts_together() {
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        1
+        i64::try_from(before.len()).unwrap()
     );
 }
 
@@ -368,6 +486,7 @@ fn semantic_only_same_version_preserves_exact_corpus_without_rewriting_fts() {
     );
     assert_eq!(all_cards(&store, second), before);
     assert_eq!(corpus(&db), before_fts);
+    assert!(store.take_search_fts_writes_for_tests().is_empty());
     assert_eq!(
         db.query_row("SELECT count(*) FROM document_versions", [], |r| r
             .get::<_, i64>(0))
