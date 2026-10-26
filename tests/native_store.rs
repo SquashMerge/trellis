@@ -240,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        23
+        24
     );
     let count: i64 = db
         .query_row(
@@ -745,7 +745,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v10");
+        assert_eq!(version, "native-v11");
         let calls: Vec<String> = db
             .prepare("SELECT 'occ:v2:'||lower(hex(id)) FROM native_version_calls")
             .unwrap()
@@ -842,7 +842,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        23
+        24
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -853,7 +853,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v10");
+    assert_eq!(version, "native-v11");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();
@@ -3048,9 +3048,9 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
 
 #[test]
 #[cfg(feature = "test-support")]
-fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
+fn schemas16_19_and23_recreate_exclusively_without_migration_and_preserve_queue() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for old_version in [16, 19] {
+    for old_version in [16, 19, 23] {
         let (state, root, prior, cancel) = fixture();
         let queued = prior
             .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
@@ -3072,11 +3072,11 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
             db.execute("INSERT INTO index_metadata VALUES(1,16,'native-v6-delta-v1',?1,?2,?3,?4,0,0,'','{}','[]',NULL)",
                 rusqlite::params![identity.root.to_str().unwrap(),identity.device.to_string(),identity.inode.to_string(),old_generation.to_string()]).unwrap();
         } else {
-            // Exercise paired obsolete markers, not a historical schema19 layout.
+            // Exercise paired obsolete markers, not historical schema layouts.
             let db = Connection::open(&path).unwrap();
-            db.execute_batch(
-                "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=19; PRAGMA user_version=19;",
-            )
+            db.execute_batch(&format!(
+                "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version={old_version}; PRAGMA user_version={old_version};",
+            ))
             .unwrap();
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -3121,7 +3121,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            23
+            24
         );
         assert_eq!(
             rebuilt
@@ -3130,7 +3130,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
                     0
                 ))
                 .unwrap(),
-            23
+            24
         );
         for table in [
             "native_version_references",
@@ -3175,7 +3175,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=24").unwrap();
+    db.execute_batch("PRAGMA user_version=25").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3195,13 +3195,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 23);
+    assert_eq!(metadata_version, 24);
     assert_eq!(generation, old.index_generation.to_string());
 }
 

@@ -2025,11 +2025,64 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     // Generation-specific binding control is checked separately; compare the
     // actual native/graph/class evidence across independent CLI/daemon roots.
     // Decision 0013's trigram prefilter tables are derived search state.
-    let mut names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%trigrams%' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_display_labels','class_projections','classes','class_relations')) ORDER BY name").unwrap();
-    for name in names.query_map([], |r| r.get::<_, String>(0)).unwrap() {
-        let name = name.unwrap();
+    let names: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%trigrams%' AND name!='native_binding_epoch' AND name!='native_revision_supersessions' AND (name LIKE 'native_%' OR name LIKE 'head_search_fts%' OR name IN ('document_versions','revision_documents','revision_capture_inputs','graph_projections','graph_nodes','graph_display_labels','class_projections','classes','class_relations')) ORDER BY name").unwrap()
+        .query_map([], |r| r.get::<_, String>(0)).unwrap()
+        .collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        names.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "class_projections",
+            "class_relations",
+            "classes",
+            "document_versions",
+            "graph_display_labels",
+            "graph_nodes",
+            "graph_projections",
+            "head_search_fts",
+            "head_search_fts_config",
+            "head_search_fts_content",
+            "head_search_fts_data",
+            "head_search_fts_docsize",
+            "head_search_fts_idx",
+            "native_producer_inputs",
+            "native_producer_languages",
+            "native_producers",
+            "native_release_candidate_classes",
+            "native_release_candidate_graphs",
+            "native_release_candidate_versions",
+            "native_revision_release_debt",
+            "native_revisions",
+            "native_source_set_dependencies",
+            "native_source_set_languages",
+            "native_source_sets",
+            "native_version_ancestor_signature_types",
+            "native_version_call_regions",
+            "native_version_calls",
+            "native_version_capability_families",
+            "native_version_capability_gaps",
+            "native_version_control_regions",
+            "native_version_coverage_roles",
+            "native_version_declaration_ancestors",
+            "native_version_declarations",
+            "native_version_header_items",
+            "native_version_headers",
+            "native_version_own_signature_types",
+            "native_version_parameters",
+            "native_version_references",
+            "native_version_search_cards",
+            "revision_capture_inputs",
+            "revision_documents",
+        ],
+        "exact schema-24 native evidence and search table inventory"
+    );
+    // Compare all corpus cells, not history-dependent FTS shadow segment bytes.
+    for name in names
+        .into_iter()
+        .filter(|name| !name.starts_with("head_search_fts_"))
+    {
         let (predicate, alias) = match name.as_str() {
             "native_revisions" => ("id=?1", ""),
+            "head_search_fts" => ("?1 IS NOT NULL", ""),
             "native_revision_release_debt"
             | "native_release_candidate_versions"
             | "native_release_candidate_graphs"
@@ -2075,10 +2128,12 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
                 "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
-            _ => panic!("unexpected v9 evidence table: {name}"),
+            _ => panic!("unexpected schema-24 evidence table: {name}"),
         };
         let order = if name == "native_version_references" {
             "vid,owner_syntax_id,ordinal"
+        } else if name == "head_search_fts" {
+            "vid,syntax_id"
         } else {
             "rowid"
         };
@@ -2120,10 +2175,23 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
         }
         all_rows.insert(name, serde_json::json!(records));
     }
+    let mut expected_corpus: Vec<Value> = all_rows["native_version_search_cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| serde_json::json!([card[5], card[0], card[1]]))
+        .collect();
+    let mut actual_corpus = all_rows["head_search_fts"].as_array().unwrap().clone();
+    expected_corpus.sort_by_key(Value::to_string);
+    actual_corpus.sort_by_key(Value::to_string);
+    assert_eq!(
+        actual_corpus, expected_corpus,
+        "logical head search corpus must contain exactly the selected version cards"
+    );
     assert_eq!(
         all_rows.len(),
-        34,
-        "retain every native evidence table in schema-20 raw snapshot"
+        36,
+        "retain every native evidence table and logical search corpus in schema-24 snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3027,7 +3095,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 34 native schema-20 evidence tables and documents must match after only publication identity normalization"
+            "{name}: all 35 native schema-24 evidence tables, logical head search corpus and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,

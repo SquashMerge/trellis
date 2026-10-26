@@ -72,7 +72,7 @@ pub fn describe(
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":1,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":2,"schemaVersion":1,
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
         "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":4}},
@@ -174,13 +174,58 @@ pub fn declaration(
     (serde_json::to_vec(&frame).ok()?.len() < super::wire::RESPONSE_BYTES).then_some(envelope)
 }
 
-/// Budget the actual structured-plus-summary JSON-RPC frame, not the structured envelope alone.
+/// Budget the actual structured-plus-summary JSON-RPC frame, including LF.
 pub fn find(
     id: &Value,
     result: crate::store::mcp_read::McpFindWithLines,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
+) -> Result<Option<Value>, &'static str> {
+    symbols(id, result, root, catching_up, modern, None)
+}
+
+/// Search relevance decorates syntax evidence; it never changes native completeness.
+pub fn search(
+    id: &Value,
+    result: super::search::SearchResult,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Result<Option<Value>, &'static str> {
+    if result.matched_by.len() != result.symbols.symbols.len()
+        || result.matched_by.iter().any(|arms| {
+            !matches!(
+                arms.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["lexical"] | ["vector"] | ["lexical", "vector"]
+            )
+        })
+    {
+        return Err("store_unavailable: invalid search arm membership");
+    }
+    let status = serde_json::to_value(result.search_index)
+        .map_err(|_| "store_unavailable: search status serialization")?;
+    symbols(
+        id,
+        result.symbols,
+        root,
+        catching_up,
+        modern,
+        Some((&result.matched_by, &status)),
+    )
+}
+
+/// Budget the actual structured-plus-summary JSON-RPC frame, not the structured envelope alone.
+fn symbols(
+    id: &Value,
+    result: crate::store::mcp_read::McpFindWithLines,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+    search: Option<(&[Vec<String>], &Value)>,
 ) -> Result<Option<Value>, &'static str> {
     // #156: completeness is a property of the whole searched scope, carried by
     // `scopeCoverage`; per-document coverage covers only the emitted symbols.
@@ -213,7 +258,7 @@ pub fn find(
                 .iter()
                 .map(|symbol| &symbol.source.document),
         )?;
-        let symbols: Vec<Value> = result.symbols[..n].iter().map(|symbol| {
+        let mut symbols: Vec<Value> = result.symbols[..n].iter().map(|symbol| {
             let d = &symbol.symbol.declaration;
             Ok(json!({"symbolId":d.syntax_id,"name":d.name,"displayKey":display_key(d),
                 "kind":d.kind,"role":d.role,"doc":document_ref(&refs, &symbol.source.document).ok_or("store_unavailable: missing document ref")?,
@@ -221,6 +266,12 @@ pub fn find(
                 "lines":symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
                 "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}))
         }).collect::<Result<Vec<_>, &'static str>>()?;
+        if let Some((matched_by, _)) = search {
+            for (index, symbol) in symbols.iter_mut().enumerate() {
+                symbol["rank"] = json!(index + 1);
+                symbol["matchedBy"] = json!(matched_by[index]);
+            }
+        }
         let emitted = &result.symbols[..n];
         let mut closure: Vec<&crate::native_evidence::Provenance> = Vec::new();
         for symbol in emitted {
@@ -274,13 +325,22 @@ pub fn find(
                 ))
         });
         let truncated = n < result.symbols.len() || result.has_more;
-        let envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,
+        let mut envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,
             "catchingUp":catching_up,"evidenceBasis":basis,
             "data":{"symbols":symbols,"documents":documents,"coverage":coverage,"scopeCoverage":scope,"provenance":closure},
             "warnings":warnings,"partial":incomplete || truncated,"truncated":truncated,
             "truncationReason": if n < result.symbols.len() {Some("response_bytes")}
                 else if result.has_more {Some("limit")} else {None}});
-        let response = super::tools::result("trellis_find_symbols", envelope.clone(), modern);
+        let name = if let Some((_, status)) = search {
+            let data = envelope["data"].as_object_mut().expect("symbol data");
+            let hits = data.remove("symbols").expect("symbol list");
+            data.insert("hits".into(), hits);
+            data.insert("searchIndex".into(), status.clone());
+            "trellis_search_symbols"
+        } else {
+            "trellis_find_symbols"
+        };
+        let response = super::tools::result(name, envelope.clone(), modern);
         let frame = json!({"jsonrpc":"2.0","id":id,"result":response});
         if serde_json::to_vec(&frame)
             .map_err(|_| "store_unavailable: serialization")?
@@ -329,7 +389,7 @@ mod find_tests {
     }
 
     /// Hits `(name, source set, path)`, each in its own proof unless a path repeats.
-    fn fixture(
+    pub(super) fn fixture(
         hits: &[(String, &str, String)],
         scope: [[u64; 5]; 4],
         has_more: bool,
@@ -731,6 +791,211 @@ mod find_tests {
             assert_eq!(envelope["truncationReason"], "limit");
             assert_eq!(envelope["truncated"], true);
             assert_wire(envelope, &id, modern);
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use crate::mcp::search::SearchResult;
+    use crate::search_embed::Backend;
+    use crate::search_model::{LexicalState, SearchIndexState, SearchIndexStatus};
+
+    const COMPLETE: [[u64; 5]; 4] = [[0; 5], [0; 5], [0; 5], [3, 3, 0, 0, 0]];
+
+    fn fixture(names: &[(&str, &str)], scope: [[u64; 5]; 4], has_more: bool) -> SearchResult {
+        let hits: Vec<_> = names
+            .iter()
+            .map(|(name, path)| ((*name).to_owned(), "source-set:v1:test", (*path).to_owned()))
+            .collect();
+        SearchResult {
+            symbols: super::find_tests::fixture(&hits, scope, has_more),
+            matched_by: names
+                .iter()
+                .map(|_| vec!["lexical".into(), "vector".into()])
+                .collect(),
+            search_index: SearchIndexStatus {
+                state: SearchIndexState::Partial,
+                model_id: Some("a".repeat(64)),
+                model_name: Some("voyage-4-nano".into()),
+                backend: Some(Backend::Cpu),
+                declarations: 3,
+                embedded: 1,
+                lexical: LexicalState::Complete,
+            },
+        }
+    }
+
+    fn project(result: SearchResult, modern: bool) -> Result<Option<Value>, &'static str> {
+        search(
+            &json!("search"),
+            result,
+            std::path::Path::new("/workspace"),
+            true,
+            modern,
+        )
+    }
+
+    fn assert_wire(envelope: &Value, modern: bool) {
+        let frame = json!({"jsonrpc":"2.0","id":"search","result":
+            crate::mcp::tools::result("trellis_search_symbols", envelope.clone(), modern)});
+        let mut line = Vec::new();
+        crate::mcp::wire::write_response(&mut line, &frame).unwrap();
+        assert!(line.len() <= crate::mcp::wire::RESPONSE_BYTES);
+        assert_eq!(line.last(), Some(&b'\n'));
+        assert_eq!(frame["result"].get("resultType").is_some(), modern);
+    }
+
+    #[test]
+    fn search_relevance_is_not_native_completeness() {
+        for modern in [false, true] {
+            let envelope = project(
+                fixture(&[("one", "a.js"), ("two", "a.js")], COMPLETE, false),
+                modern,
+            )
+            .unwrap()
+            .unwrap();
+            let data = &envelope["data"];
+            assert_eq!(data.as_object().unwrap().len(), 6);
+            assert_eq!(data["searchIndex"]["state"], "partial");
+            assert_eq!(data["searchIndex"]["embedded"], 1);
+            assert_eq!(envelope["partial"], false);
+            assert_eq!(envelope["truncated"], false);
+            assert_eq!(
+                envelope["warnings"],
+                json!([{"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}])
+            );
+            assert_eq!(data["hits"][0]["rank"], 1);
+            assert_eq!(data["hits"][1]["rank"], 2);
+            assert_eq!(data["hits"][0]["matchedBy"], json!(["lexical", "vector"]));
+            assert_eq!(data["hits"][0]["lines"], json!({"start":1,"end":1}));
+            assert_eq!(data["documents"].as_array().unwrap().len(), 1);
+            assert_eq!(data["coverage"].as_array().unwrap().len(), 1);
+            assert_eq!(data["provenance"].as_array().unwrap().len(), 1);
+            assert_wire(&envelope, modern);
+
+            let mut unavailable = fixture(&[], COMPLETE, false);
+            unavailable.search_index.state = SearchIndexState::Unavailable;
+            unavailable.search_index.model_id = None;
+            unavailable.search_index.model_name = None;
+            unavailable.search_index.backend = None;
+            unavailable.search_index.embedded = 0;
+            let empty = project(unavailable, modern).unwrap().unwrap();
+            assert_eq!(empty["partial"], false);
+            assert_eq!(empty["data"]["searchIndex"]["backend"], Value::Null);
+            for field in ["hits", "documents", "coverage", "provenance"] {
+                assert_eq!(empty["data"][field], json!([]));
+            }
+            let incomplete = [[0; 5], [2, 1, 1, 0, 0], [0; 5], [3, 3, 0, 0, 0]];
+            let empty = project(fixture(&[], incomplete, false), modern)
+                .unwrap()
+                .unwrap();
+            assert_eq!(empty["partial"], true);
+            assert_eq!(empty["warnings"][0]["code"], "coverageIncomplete");
+            assert_eq!(empty["warnings"][1]["code"], "syntaxOnly");
+            assert_eq!(empty["data"]["scopeCoverage"][1]["coverage"]["partial"], 1);
+            assert_wire(&empty, modern);
+        }
+    }
+
+    #[test]
+    fn search_byte_prefix_keeps_only_emitted_closure_and_precedes_limit() {
+        let first = "a".repeat(12_000);
+        let second = "b".repeat(12_000);
+        let third = "c".repeat(12_000);
+        for modern in [false, true] {
+            let envelope = project(
+                fixture(
+                    &[(&first, "a.js"), (&second, "b.js"), (&third, "c.js")],
+                    COMPLETE,
+                    true,
+                ),
+                modern,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), 2);
+            assert_eq!(envelope["truncationReason"], "response_bytes");
+            assert_eq!(envelope["partial"], true);
+            for field in ["documents", "coverage", "provenance"] {
+                assert_eq!(envelope["data"][field].as_array().unwrap().len(), 2);
+            }
+            assert_eq!(envelope["data"]["documents"][1]["document"]["path"], "b.js");
+            assert_wire(&envelope, modern);
+            let limited = project(fixture(&[("one", "a.js")], COMPLETE, true), modern)
+                .unwrap()
+                .unwrap();
+            assert_eq!(limited["truncationReason"], "limit");
+            let oversized = "x".repeat(40_000);
+            let empty = project(fixture(&[(&oversized, "big.js")], COMPLETE, false), modern)
+                .unwrap()
+                .unwrap();
+            assert_eq!(empty["truncationReason"], "response_bytes");
+            for field in ["hits", "documents", "coverage", "provenance"] {
+                assert_eq!(empty["data"][field], json!([]));
+            }
+            assert_wire(&empty, modern);
+        }
+    }
+
+    #[test]
+    fn invalid_arm_membership_and_missing_required_proof_are_typed_failures() {
+        for arms in [
+            vec![],
+            vec!["vector", "lexical"],
+            vec!["lexical", "lexical"],
+            vec!["unknown"],
+        ] {
+            let mut result = fixture(&[("one", "a.js")], COMPLETE, false);
+            result.matched_by = vec![arms.into_iter().map(str::to_owned).collect()];
+            assert!(
+                project(result, true)
+                    .unwrap_err()
+                    .starts_with("store_unavailable")
+            );
+        }
+        let mut wrong_length = fixture(&[("one", "a.js")], COMPLETE, false);
+        wrong_length.matched_by.clear();
+        assert!(
+            project(wrong_length, true)
+                .unwrap_err()
+                .starts_with("store_unavailable")
+        );
+        let mut missing = fixture(&[("one", "a.js")], COMPLETE, false);
+        missing.symbols.provenance.clear();
+        assert!(
+            project(missing, true)
+                .unwrap_err()
+                .starts_with("store_unavailable")
+        );
+    }
+
+    #[test]
+    fn search_budgets_status_summary_and_final_lf_at_exact_boundary() {
+        for modern in [false, true] {
+            let make = |size| {
+                let mut result = fixture(&[], COMPLETE, false);
+                result.search_index.model_name = Some("x".repeat(size));
+                result
+            };
+            let (mut low, mut high) = (0, crate::mcp::wire::RESPONSE_BYTES);
+            while low + 1 < high {
+                let mid = low + (high - low) / 2;
+                if project(make(mid), modern).unwrap().is_some() {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            assert!(project(make(high), modern).unwrap().is_none());
+            let envelope = project(make(low), modern).unwrap().unwrap();
+            let frame = json!({"jsonrpc":"2.0","id":"search","result":
+                crate::mcp::tools::result("trellis_search_symbols", envelope, modern)});
+            assert_eq!(
+                serde_json::to_vec(&frame).unwrap().len() + 1,
+                crate::mcp::wire::RESPONSE_BYTES
+            );
         }
     }
 }

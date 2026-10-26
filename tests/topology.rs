@@ -766,7 +766,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        23
+        24
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1068,7 +1068,7 @@ fn gc_report_sorts_multiple_derived_indexes() {
 }
 
 #[test]
-fn gc_classifies_current_schema23_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema24_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1114,15 +1114,15 @@ fn gc_classifies_current_schema23_but_refuses_spoofed_shapes() {
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     // Any earlier schema is collectable whatever its layout, root or age (#253).
-    for version in [1, 7, 9, 13, 14, 15, 17, 18, 19, 20, 21, 22] {
+    for version in [1, 7, 9, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23] {
         db.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(inspect(), ("eligible", "old_schema"), "v{version}");
     }
     db.pragma_update(None, "user_version", 0).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 24).unwrap();
+    db.pragma_update(None, "user_version", 25).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 23).unwrap();
+    db.pragma_update(None, "user_version", 24).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -1130,7 +1130,7 @@ fn gc_classifies_current_schema23_but_refuses_spoofed_shapes() {
 }
 
 #[test]
-fn complete_schema23_index_remains_gc_eligible() {
+fn complete_schema24_index_remains_gc_eligible() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1139,7 +1139,7 @@ fn complete_schema23_index_remains_gc_eligible() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        23
+        24
     );
     let now = 1_800_000_000_i64;
     db.execute(
@@ -1154,7 +1154,7 @@ fn complete_schema23_index_remains_gc_eligible() {
 
 #[cfg(feature = "test-support")]
 #[test]
-fn gc_report_accepts_current_schema23_but_rejects_bad_inventory() {
+fn gc_report_accepts_current_schema24_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();

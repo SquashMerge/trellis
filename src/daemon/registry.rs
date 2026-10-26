@@ -458,6 +458,8 @@ struct Entry {
 pub struct CheckoutRegistry {
     entries: HashMap<String, Entry>,
     roots: Option<TopologyRoots>,
+    search_fill: Option<Arc<super::search_fill::SearchFill>>,
+    search: Option<Arc<super::search::SearchService>>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
     idle_exit_at: Option<Instant>,
     clock_override: Option<Instant>,
@@ -485,6 +487,8 @@ impl CheckoutRegistry {
         Self {
             entries: HashMap::new(),
             roots: None,
+            search_fill: None,
+            search: None,
             runtimes: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
             clock_override: None,
@@ -494,6 +498,15 @@ impl CheckoutRegistry {
             #[cfg(feature = "test-support")]
             test_next_startup_hook: None,
         }
+    }
+
+    /// Supply the daemon-wide fill owner before checkout activation.
+    pub fn set_search_fill(&mut self, search_fill: Arc<super::search_fill::SearchFill>) {
+        self.search_fill = Some(search_fill);
+    }
+
+    pub fn set_search_service(&mut self, search: Arc<super::search::SearchService>) {
+        self.search = Some(search);
     }
 
     /// Pause the next activation's startup reconciliation, installed before
@@ -613,6 +626,7 @@ impl CheckoutRegistry {
             }))),
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing,
+            search: self.search.clone(),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
@@ -640,6 +654,9 @@ impl CheckoutRegistry {
         #[cfg(feature = "test-support")]
         if let Some(hook) = self.test_next_startup_hook.take() {
             scheduler.set_startup_hook_for_tests(hook);
+        }
+        if let Some(search_fill) = &self.search_fill {
+            scheduler.set_search_fill(search_fill.register(&scheduler));
         }
         scheduler.begin_startup_reconciliation();
         Ok(runtime)
@@ -1657,6 +1674,7 @@ pub struct CheckoutRuntime {
     #[cfg(feature = "test-support")]
     mcp_admitted_gate: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
+    search: Option<Arc<super::search::SearchService>>,
     /// Released because its root was lost: a stale handle answers root_changed.
     root_lost: std::sync::atomic::AtomicBool,
     initial_indexing: bool,
@@ -1722,6 +1740,10 @@ impl CheckoutRuntime {
 
     pub fn browser_scheduler(&self) -> anyhow::Result<Arc<http::DaemonState>> {
         Ok(self.resources()?.scheduler.clone())
+    }
+
+    pub(crate) fn search_service(&self) -> Option<&Arc<super::search::SearchService>> {
+        self.search.as_ref()
     }
 
     /// Invoked through a weak edge AFTER a queue tick releases all stream and

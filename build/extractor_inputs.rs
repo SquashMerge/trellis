@@ -26,6 +26,8 @@ pub const EXTRACTION_MODULES: &[&str] = &[
     "src/native_evidence.rs",
     "src/native_ids.rs",
     "src/parallel.rs",
+    "src/search_card.rs",
+    "src/search_capture.rs",
 ];
 
 /// Fixture conversion is compiled only for test-support captures. It must not

@@ -105,7 +105,7 @@ pub struct SearchIndexStatus {
     pub state: SearchIndexState,
     pub model_id: Option<String>,
     pub model_name: Option<String>,
-    pub backend: Backend,
+    pub backend: Option<Backend>,
     pub declarations: u64,
     pub embedded: u64,
     pub lexical: LexicalState,
@@ -130,7 +130,27 @@ impl SearchModelStatus {
         lexical: LexicalState,
         building: bool,
     ) -> SearchIndexStatus {
-        let ready = self.ready.load(Ordering::Acquire);
+        self.snapshot_with_readiness(
+            self.ready.load(Ordering::Acquire),
+            card_format,
+            declarations,
+            embedded,
+            lexical,
+            building,
+        )
+    }
+
+    /// A query owns its readiness decision, even after its job drops weights.
+    /// Do not resample another job's live flag when projecting that query.
+    pub(crate) fn snapshot_with_readiness(
+        &self,
+        ready: bool,
+        card_format: &str,
+        declarations: u64,
+        embedded: u64,
+        lexical: LexicalState,
+        building: bool,
+    ) -> SearchIndexStatus {
         SearchIndexStatus {
             state: if !ready {
                 SearchIndexState::Unavailable
@@ -143,7 +163,7 @@ impl SearchModelStatus {
             },
             model_id: ready.then(|| model_id_for_card_format(card_format)),
             model_name: ready.then(|| supported_model_name().to_owned()),
-            backend: self.backend,
+            backend: Some(self.backend),
             declarations,
             embedded: if ready { embedded } else { 0 },
             lexical,
@@ -312,7 +332,7 @@ mod tests {
                     Some(model_id_for_card_format("test-card-format.v1"))
                 );
                 assert_eq!(building.model_name.as_deref(), Some(supported_model_name()));
-                assert_eq!(building.backend, Backend::Cpu);
+                assert_eq!(building.backend, Some(Backend::Cpu));
                 assert_eq!(
                     status
                         .snapshot("test-card-format.v1", 3, 3, LexicalState::Complete, true)

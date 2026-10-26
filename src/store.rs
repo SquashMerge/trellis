@@ -3,6 +3,9 @@ pub mod anchors;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 pub mod requests;
+mod search;
+pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
+pub use search::{HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchHeadChanged};
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
@@ -652,11 +655,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 23;
+const DATABASE_SCHEMA_VERSION: u32 = 24;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V23: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=23), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V24: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=24), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -696,6 +699,9 @@ CREATE TABLE native_version_coverage_roles(vid INTEGER NOT NULL REFERENCES docum
 CREATE TABLE native_version_declarations(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,syntax_id BLOB NOT NULL,owner_syntax_id BLOB,kind TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('test','production')),name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX native_version_declarations_lookup ON native_version_declarations(lookup_key,vid,syntax_id);
 CREATE INDEX native_version_declarations_owner ON native_version_declarations(vid,owner_syntax_id);
+CREATE TABLE native_version_search_cards(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,card_text TEXT NOT NULL,card_hash TEXT NOT NULL CHECK(length(card_hash)=64),facts_json TEXT NOT NULL CHECK(json_valid(facts_json)),terms TEXT NOT NULL,PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
+CREATE INDEX native_version_search_cards_cursor ON native_version_search_cards(syntax_id,vid);
+CREATE VIRTUAL TABLE head_search_fts USING fts5(terms,vid UNINDEXED,syntax_id UNINDEXED,tokenize='porter unicode61 remove_diacritics 2');
 CREATE VIRTUAL TABLE native_declaration_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
 CREATE TRIGGER native_declaration_trigrams_insert AFTER INSERT ON native_version_declarations BEGIN INSERT INTO native_declaration_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
 CREATE TRIGGER native_declaration_trigrams_delete AFTER DELETE ON native_version_declarations BEGIN INSERT INTO native_declaration_trigrams(native_declaration_trigrams,rowid,name) VALUES('delete',old.rowid,lower(old.name)); END;
@@ -3091,7 +3097,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V23)?;
+    expected.execute_batch(CACHE_SCHEMA_V24)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -3215,6 +3221,7 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
                 "native_version_ancestor_signature_types",
                 "native_version_own_signature_types",
                 "native_version_declaration_ancestors",
+                "native_version_search_cards",
                 "native_version_declarations",
                 "native_version_coverage_roles",
             ][..],
@@ -4585,6 +4592,7 @@ impl ImmutableAppend {
                     | "classes"
                     | "class_relations"
                     | "native_version_coverage_roles"
+                    | "native_version_search_cards"
                     | "native_version_declarations"
                     | "native_version_declaration_ancestors"
                     | "native_version_own_signature_types"
@@ -4626,6 +4634,7 @@ impl ImmutableAppend {
             | "classes"
             | "class_relations"
             | "native_version_coverage_roles"
+            | "native_version_search_cards"
             | "native_version_declarations"
             | "native_version_declaration_ancestors"
             | "native_version_own_signature_types"
@@ -4803,6 +4812,7 @@ impl ImmutableAppend {
                 "document_versions",
                 &[
                     ("native_version_coverage_roles", "vid"),
+                    ("native_version_search_cards", "vid"),
                     ("native_version_declarations", "vid"),
                     ("native_version_declaration_ancestors", "vid"),
                     ("native_version_own_signature_types", "vid"),
@@ -7639,6 +7649,7 @@ fn write_native(
             )?;
         }
     }
+    search::write_cards(db, a, &storage_ids, reuse, immutable, cancel)?;
     for report in &a.capability_reports {
         check_cancel(cancel)?;
         if reuse.for_path(&report.document.path).native {
@@ -7815,7 +7826,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V23 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V24 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -7842,6 +7853,8 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         "native_version_coverage_roles",
         "native_version_declaration_ancestors",
         "native_version_declarations",
+        "native_version_search_cards",
+        "head_search_fts",
         "native_version_header_items",
         "native_version_headers",
         "native_version_own_signature_types",
@@ -10124,7 +10137,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V23)?;
+                db.execute_batch(CACHE_SCHEMA_V24)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -11895,6 +11908,7 @@ impl Store {
         tx.execute("INSERT INTO semantic_import_reports(revision_id,producer_id,report_json) VALUES(?1,?2,?3)",params![next_key,raw.producer_id,serde_json::to_string(report)?])?;
         tx.execute("INSERT INTO semantic_import_reports SELECT ?1,producer_id,report_json FROM semantic_import_reports WHERE revision_id=?2 AND producer_id<>?3",params![next_key,old_key,raw.producer_id])?;
         hook(&tx)?;
+        search::publish_head(&tx, &next_key)?;
         let published_at = self.retention_time()?;
         stamp_predecessor(&tx, &old_key, published_at.as_secs() as i64)?;
         tx.execute("UPDATE index_metadata SET index_revision=?1,indexed_at=?2 WHERE singleton=1 AND index_generation=?3 AND index_revision=?4", params![next.index_revision as i64,published_at.as_millis().to_string(),expected.index_generation.to_string(),expected.index_revision as i64])?;
@@ -12597,6 +12611,11 @@ impl Store {
                     let mut report = read_native_capability_report(db, &scope)?;
                     report.revision_id.clone_from(&native.revision.id);
                     native.capability_reports.push(report);
+                    native.search_cards.extend(search::read_cards(
+                        db,
+                        scope.vid,
+                        &document.key.path,
+                    )?);
                 }
                 Ok(())
             })?;
@@ -13139,6 +13158,7 @@ impl Store {
             control_regions,
             references,
             capability_report,
+            search_cards: search::read_cards(db, scope.vid, &file.path)?,
         })
     }
 
@@ -13469,6 +13489,7 @@ impl Store {
             "invalid_supersession_time"
         );
         let timestamp = publication_time.as_millis().to_string();
+        search::publish_head(&tx, &revision_key)?;
         stamp_predecessor(&tx, &selected.key, publication_time.as_secs() as i64)?;
         selected_ensure!(
             tx.execute(
@@ -14821,6 +14842,7 @@ impl Store {
                 DELETE FROM native_version_control_regions; DELETE FROM native_version_own_signature_types;
                 DELETE FROM native_version_ancestor_signature_types; DELETE FROM native_version_parameters;
                 DELETE FROM native_version_header_items; DELETE FROM native_version_headers;
+                DELETE FROM head_search_fts; DELETE FROM native_version_search_cards;
                 DELETE FROM native_version_declaration_ancestors; DELETE FROM native_version_declarations;
                 DELETE FROM native_version_coverage_roles; DELETE FROM class_relations; DELETE FROM classes;
                 DELETE FROM class_projections; DELETE FROM graph_display_labels;
@@ -15104,6 +15126,7 @@ impl Store {
                 revision,
                 semantic,
             )?;
+            search::publish_head(&tx, &revision_key)?;
             let publication_time = self.retention_time()?;
             ensure!(
                 publication_time.as_secs() <= 9_007_199_254_740_991,
@@ -16012,6 +16035,7 @@ impl Store {
             "native_version_ancestor_signature_types",
             "native_version_own_signature_types",
             "native_version_declaration_ancestors",
+            "native_version_search_cards",
             "native_version_declarations",
             "native_version_coverage_roles",
         ] {
@@ -16466,7 +16490,7 @@ impl Store {
             let source_set = n::SourceSet { id: source_set_id.clone(),root_id,languages: languages.clone(),dependencies };
             let revision = n::Revision { id:native_id,source_set_id,documents,toolchain_hash,config_hash,dependency_hash };
             let mut sources = BTreeMap::new();
-            let (mut coverage,mut provenance,mut declarations,mut calls,mut control_regions,mut references,mut capability_reports) = (vec![],vec![],vec![],vec![],vec![],vec![],vec![]);
+            let (mut coverage,mut provenance,mut declarations,mut calls,mut control_regions,mut references,mut capability_reports,mut search_cards) = (vec![],vec![],vec![],vec![],vec![],vec![],vec![],vec![]);
             for document in &revision.documents {
                 let scope = v8_native_scope_for(db,&document.key,selected)?.context(SelectedIntegrity("incompatible_index: retained native document absent".into()))?;
                 let source = self.selected_source_row_for(db,&document.key.path,selected)?.context(SelectedIntegrity("incompatible_index: retained source missing".into()))?;
@@ -16479,8 +16503,9 @@ impl Store {
                 control_regions.extend(read_native_control_regions_v8(db,&scope,None)?);
                 references.extend(read_native_references(db,&scope,None)?);
                 capability_reports.push(read_native_capability_report(db,&scope)?);
+                search_cards.extend(search::read_cards(db,scope.vid,&document.key.path)?);
             }
-            Ok((n::Artifact { producer:n::Producer { id:producer_id,version:producer_version,executable_hash,kind,languages,position_encoding },source_set,revision,coverage,provenance,declarations,calls,control_regions,references,capability_reports },sources))
+            Ok((n::Artifact { producer:n::Producer { id:producer_id,version:producer_version,executable_hash,kind,languages,position_encoding },source_set,revision,coverage,provenance,declarations,calls,control_regions,references,capability_reports,search_cards },sources))
         })
     }
 
@@ -17843,7 +17868,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V23).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V24).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -17979,7 +18004,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V23).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V24).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

@@ -81,7 +81,7 @@ Tests define local finite control rows `{id,baseline,mutate,expectedAssertion,ex
 
 ## Capture with the production native extractor (#95)
 
-The registry admits the current `trellis.native.syntax@native-v10` with the
+The registry admits the current `trellis.native.syntax@native-v11` with the
 production `EXTRACTION_INPUTS` inventory (`[]` for Java, Rust, Python and
 JavaScript). Historical v3/v4 descriptors are not admitted. The Rust inventory
 guard queries the complete production entry set in this JS registry through Node

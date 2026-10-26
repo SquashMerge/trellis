@@ -44,7 +44,7 @@ fn missing_or_unverified_model_is_lexical_only_with_selected_backend() {
         let status = owner.status_handle();
         let initial = status.snapshot("test-card-format.v1", 4, 3, LexicalState::Complete, false);
         assert_eq!(initial.state, SearchIndexState::Unavailable);
-        assert_eq!(initial.backend, Backend::Cpu);
+        assert_eq!(initial.backend, Some(Backend::Cpu));
         assert_eq!(initial.lexical, LexicalState::Complete);
         assert_eq!(initial.declarations, 4);
         assert_eq!(initial.embedded, 0);

@@ -515,6 +515,12 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
                 symbols.as_array().unwrap().len(),
                 "symbols",
             )
+        } else if let Some(hits) = data.get("hits") {
+            (
+                "trellis_search_symbols",
+                hits.as_array().unwrap().len(),
+                "hits",
+            )
         } else if data.get("referencesVersion").is_some() {
             (
                 "trellis_references",
@@ -911,7 +917,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 9);
+        assert_eq!(catalog.as_array().unwrap().len(), 10);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -1092,7 +1098,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 10);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -1709,6 +1715,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             .iter()
             .map(|name| name.as_str().unwrap().to_owned())
             .collect();
+        expected_names.insert(2, "trellis_search_symbols".to_owned());
         expected_names.extend([
             "trellis_references".to_owned(),
             "trellis_rules_check".to_owned(),
@@ -2816,7 +2823,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
 #[test]
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 9);
+    assert_eq!(catalog.as_array().unwrap().len(), 10);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         assert_eq!(
@@ -10944,4 +10951,483 @@ async fn architecture_prompt_cancellation_deadline_and_final_root_are_not_tool_r
             }
         }
     }
+}
+
+// Search integration uses a real native publication, with startup paused so
+// coverage overrides and retained-head guards cannot race reconciliation.
+struct SearchMcpFixture {
+    _temp: tempfile::TempDir,
+    identity: trellis::store::topology::WorkspaceIdentity,
+    registry: std::sync::Arc<tokio::sync::Mutex<trellis::daemon::registry::CheckoutRegistry>>,
+    startup: ReadGate,
+    previous: trellis::model::IndexPin,
+    current: trellis::model::IndexPin,
+    vectors: PathBuf,
+}
+
+impl SearchMcpFixture {
+    async fn new(files: &[(&str, &str)], incomplete_python: bool) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let (identity, topology) = published_inactive_checkout(temp.path(), files);
+        let vectors = topology.vectors_db();
+        let store = trellis::store::Store::open_for_tests(temp.path(), &identity.root).unwrap();
+        let previous = store.index_baseline().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+            &trellis::indexer::IndexOptions::new(identity.root.clone()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let writer = store.publication_for_tests().unwrap();
+        let current = store
+            .publish_native(&graph, &capture, &native, &writer, previous, &cancel)
+            .unwrap();
+        assert!(current.index_revision > previous.index_revision);
+        if incomplete_python {
+            store
+                .mcp_set_coverage_for_tests(&writer, "b.py", true, "partial")
+                .unwrap();
+        }
+        drop(writer);
+        drop(store);
+        let mut registry = trellis::daemon::registry::CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(211, &identity).unwrap();
+        let startup = ReadGate::default();
+        let hold = startup.hook();
+        registry.set_next_startup_hook_for_tests(hold);
+        registry.activate(&identity.root_key).unwrap();
+        let waiter = startup.clone();
+        tokio::task::spawn_blocking(move || waiter.await_held(1))
+            .await
+            .unwrap();
+        Self {
+            _temp: temp,
+            identity,
+            registry: std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
+            startup,
+            previous,
+            current,
+            vectors,
+        }
+    }
+
+    fn basis(pin: trellis::model::IndexPin) -> Value {
+        json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision})
+    }
+}
+
+impl Drop for SearchMcpFixture {
+    fn drop(&mut self) {
+        self.startup.open();
+    }
+}
+
+fn search_socket_ask(
+    client: &mut std::os::unix::net::UnixStream,
+    reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    legacy: bool,
+    id: u64,
+    arguments: Value,
+) -> Value {
+    writeln!(
+        client,
+        "{}",
+        call(legacy, json!(id), "trellis_search_symbols", arguments)
+    )
+    .unwrap();
+    let reply = next_reply(reader);
+    assert_eq!(reply["id"], id);
+    let mut frame = serde_json::to_vec(&reply).unwrap();
+    frame.push(b'\n');
+    assert_reply_cap(&frame);
+    reply
+}
+
+fn search_socket_initialize(
+    client: &mut std::os::unix::net::UnixStream,
+    reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    legacy: bool,
+) {
+    if legacy {
+        writeln!(
+            client,
+            "{}",
+            request(
+                json!(0),
+                "initialize",
+                fixture()["legacyInitialize"].clone()
+            )
+        )
+        .unwrap();
+        assert_eq!(
+            next_reply(reader)["result"]["protocolVersion"],
+            "2025-11-25"
+        );
+        writeln!(
+            client,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+    }
+}
+
+fn search_schema_pair(reply: &Value) -> Value {
+    json!({"name":"trellis_search_symbols","structuredContent":reply["result"]["structuredContent"]})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
+    let source: String = (0..51)
+        .map(|index| format!("function orchard{index:03}() {{}}\n"))
+        .collect();
+    let fixture = SearchMcpFixture::new(&[("a.js", &source)], false).await;
+    let mut schema_pairs = Vec::new();
+    for legacy in [false, true] {
+        let (mut client, mut reader, session) =
+            socket_session(&fixture.identity, &fixture.registry, 211, None);
+        search_socket_initialize(&mut client, &mut reader, legacy);
+        for (id, limit, count) in [(1, None, 10), (2, Some(50), 50), (3, Some(1), 1)] {
+            let mut args = json!({"schemaVersion":1,"query":"orchard"});
+            if let Some(limit) = limit {
+                args["limit"] = json!(limit);
+            }
+            let reply = search_socket_ask(&mut client, &mut reader, legacy, id, args);
+            tool(&reply, None, !legacy);
+            let envelope = &reply["result"]["structuredContent"];
+            assert_eq!(
+                envelope["evidenceBasis"],
+                SearchMcpFixture::basis(fixture.current)
+            );
+            let hits = envelope["data"]["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), count, "{reply}");
+            for (index, hit) in hits.iter().enumerate() {
+                assert_eq!(hit["rank"], index + 1);
+                assert_eq!(hit["matchedBy"], json!(["lexical"]));
+                assert_eq!(hit["evidenceTier"], "syntax");
+                assert_eq!(
+                    emitted_document(&envelope["data"], hit)["document"]["path"],
+                    "a.js"
+                );
+            }
+            assert_eq!(envelope["truncated"], true);
+            assert_eq!(envelope["truncationReason"], "limit");
+            assert_eq!(
+                envelope["data"]["searchIndex"],
+                json!({
+                    "state":"unavailable","modelId":null,"modelName":null,"backend":null,
+                    "declarations":51,"embedded":0,"lexical":"complete"
+                })
+            );
+            assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
+            assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
+            schema_pairs.push(search_schema_pair(&reply));
+        }
+        for (id, query) in [(4, "__ * : ( )"), (5, "the and for")] {
+            let reply = search_socket_ask(
+                &mut client,
+                &mut reader,
+                legacy,
+                id,
+                json!({"schemaVersion":1,"query":query}),
+            );
+            tool(&reply, None, !legacy);
+            let envelope = &reply["result"]["structuredContent"];
+            for field in ["hits", "documents", "coverage", "provenance"] {
+                assert_eq!(envelope["data"][field], json!([]));
+            }
+            assert_eq!(envelope["partial"], false);
+            assert_eq!(envelope["truncated"], false);
+            assert_eq!(envelope["data"]["searchIndex"]["lexical"], "complete");
+            schema_pairs.push(search_schema_pair(&reply));
+        }
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+    assert!(
+        !fixture.vectors.exists(),
+        "search created an optional cache"
+    );
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!PathBuf::from(format!("{}{suffix}", fixture.vectors.display())).exists());
+    }
+    validate_structured_content(&schema_pairs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_closed_inputs_and_utf8_query_byte_boundaries() {
+    let fixture = SearchMcpFixture::new(&[("a.js", "function café() {}\n")], false).await;
+    let mut schema_pairs = Vec::new();
+    for legacy in [false, true] {
+        let (mut client, mut reader, session) =
+            socket_session(&fixture.identity, &fixture.registry, 211, None);
+        search_socket_initialize(&mut client, &mut reader, legacy);
+        let boundary = "é".repeat(512);
+        assert_eq!(boundary.len(), 1024);
+        for (id, query) in [(1, boundary.as_str()), (2, "CAFÉ"), (3, " café ")] {
+            let reply = search_socket_ask(
+                &mut client,
+                &mut reader,
+                legacy,
+                id,
+                json!({"schemaVersion":1,"query":query,"limit":50}),
+            );
+            tool(&reply, None, !legacy);
+            if id != 1 {
+                assert_eq!(
+                    reply["result"]["structuredContent"]["data"]["hits"][0]["name"],
+                    "café"
+                );
+            }
+            schema_pairs.push(search_schema_pair(&reply));
+        }
+        let invalid = [
+            (json!({"schemaVersion":1,"query":""}), "invalid_request"),
+            (json!({"schemaVersion":1,"query":null}), "invalid_request"),
+            (
+                json!({"schemaVersion":1,"query":format!("{boundary}a")}),
+                "invalid_request",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","limit":0}),
+                "range_too_large",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","limit":51}),
+                "range_too_large",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","limit":null}),
+                "invalid_request",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","expectedBasis":null}),
+                "invalid_request",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","expectedBasis":{"indexRevision":1}}),
+                "invalid_request",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","backend":"cpu"}),
+                "invalid_request",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","score":true}),
+                "invalid_request",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","filters":{}}),
+                "invalid_request",
+            ),
+            (
+                json!({"schemaVersion":1,"query":"café","view":"search"}),
+                "invalid_request",
+            ),
+        ];
+        for (index, (arguments, code)) in invalid.into_iter().enumerate() {
+            let reply = search_socket_ask(
+                &mut client,
+                &mut reader,
+                legacy,
+                10 + index as u64,
+                arguments,
+            );
+            tool(&reply, Some(code), !legacy);
+            schema_pairs.push(search_schema_pair(&reply));
+        }
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+    assert!(!fixture.vectors.exists());
+    validate_structured_content(&schema_pairs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_accepts_current_basis_but_refuses_retained_and_other_generations() {
+    let fixture = SearchMcpFixture::new(&[("a.js", "function orchard() {}\n")], false).await;
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let current = SearchMcpFixture::basis(fixture.current);
+    let accepted = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        1,
+        json!({"schemaVersion":1,"query":"orchard","expectedBasis":current}),
+    );
+    tool(&accepted, None, true);
+    assert_eq!(
+        accepted["result"]["structuredContent"]["evidenceBasis"],
+        current
+    );
+    let mut wrong_generation = current.clone();
+    wrong_generation["indexGeneration"] = json!("123e4567-e89b-42d3-a456-426614174000");
+    assert_ne!(wrong_generation, current);
+    let mut stale = current.clone();
+    stale["indexRevision"] = json!(0);
+    let mut schema_pairs = vec![search_schema_pair(&accepted)];
+    for (index, pin) in [
+        SearchMcpFixture::basis(fixture.previous),
+        wrong_generation,
+        stale,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reply = search_socket_ask(
+            &mut client,
+            &mut reader,
+            false,
+            index as u64 + 2,
+            json!({"schemaVersion":1,"query":"zzzzNoMatch","expectedBasis":pin}),
+        );
+        tool(&reply, Some("revision_conflict"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(envelope["error"]["currentBasis"], current);
+        assert!(envelope.get("data").is_none());
+        schema_pairs.push(search_schema_pair(&reply));
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&schema_pairs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_zero_hits_keep_incomplete_native_scope_separate_from_vectors() {
+    let fixture = SearchMcpFixture::new(
+        &[
+            ("a.js", "function orchard() {}\n"),
+            ("b.py", "def unrelated(): pass\n"),
+        ],
+        true,
+    )
+    .await;
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let mut schema_pairs = Vec::new();
+    for (id, query, count) in [(1, "zzzzNoMatch", 0), (2, "orchard", 1)] {
+        let reply = search_socket_ask(
+            &mut client,
+            &mut reader,
+            false,
+            id,
+            json!({"schemaVersion":1,"query":query}),
+        );
+        tool(&reply, None, true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), count);
+        assert_eq!(envelope["partial"], true);
+        assert_eq!(envelope["truncated"], false);
+        assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
+        assert_eq!(envelope["warnings"][1]["code"], "syntaxOnly");
+        assert_eq!(envelope["warnings"].as_array().unwrap().len(), 2);
+        let scope = envelope["data"]["scopeCoverage"].as_array().unwrap();
+        assert_eq!(scope.len(), 4);
+        assert_eq!(scope[2]["language"], "python");
+        assert_eq!(scope[2]["coverage"]["partial"], 1);
+        assert_eq!(envelope["data"]["searchIndex"]["state"], "unavailable");
+        assert_eq!(envelope["data"]["searchIndex"]["embedded"], 0);
+        if count == 0 {
+            for field in ["documents", "coverage", "provenance"] {
+                assert_eq!(envelope["data"][field], json!([]));
+            }
+        } else {
+            let coverage = envelope["data"]["coverage"].as_array().unwrap();
+            assert_eq!(coverage.len(), 1);
+            assert_eq!(coverage[0]["documentPath"], "a.js");
+        }
+        schema_pairs.push(search_schema_pair(&reply));
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&schema_pairs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, registry, runtime) = ready_registry(temp.path(), 211).await;
+    let admitted = {
+        let (response, _) = runtime.evidence_response().unwrap();
+        let pin = response.status().unwrap().revision;
+        response.finish(()).unwrap();
+        pin
+    };
+    let gate = ReadGate::default();
+    runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 211, None);
+    writeln!(client, "{}", call(false, json!(1), "trellis_search_symbols",
+        json!({"schemaVersion":1,"query":"held","expectedBasis":SearchMcpFixture::basis(admitted)}))).unwrap();
+    let waiter = gate.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    fs::write(identity.root.join("a.js"), "function moved() {}\n").unwrap();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        while !runtime.catching_up() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher did not queue the edit");
+    gate.open();
+    let reply = next_reply(&mut reader);
+    tool(&reply, None, true);
+    let envelope = &reply["result"]["structuredContent"];
+    assert_eq!(envelope["evidenceBasis"], SearchMcpFixture::basis(admitted));
+    assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["data"]["hits"][0]["name"], "held");
+    let symbol_id = envelope["data"]["hits"][0]["symbolId"].clone();
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let (response, _) = runtime.evidence_response().unwrap();
+            let pin = response.status().unwrap().revision;
+            response.finish(()).unwrap();
+            if pin != admitted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("edit was not published");
+    let conflict = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        2,
+        json!({"schemaVersion":1,"query":"held","expectedBasis":SearchMcpFixture::basis(admitted)}),
+    );
+    tool(&conflict, Some("revision_conflict"), true);
+    writeln!(client, "{}", call(false, json!(3), "trellis_declaration", json!({
+        "schemaVersion":1,"symbolId":symbol_id,"expectedBasis":SearchMcpFixture::basis(admitted)
+    }))).unwrap();
+    tool(&next_reply(&mut reader), Some("revision_conflict"), true);
+    let newer = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        4,
+        json!({"schemaVersion":1,"query":"moved"}),
+    );
+    tool(&newer, None, true);
+    assert_eq!(
+        newer["result"]["structuredContent"]["data"]["hits"][0]["name"],
+        "moved"
+    );
+    validate_structured_content(&[
+        search_schema_pair(&reply),
+        search_schema_pair(&conflict),
+        search_schema_pair(&newer),
+    ]);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
 }

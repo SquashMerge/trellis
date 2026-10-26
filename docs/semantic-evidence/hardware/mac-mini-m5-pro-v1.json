@@ -57,6 +57,17 @@
       "runtime": "trellis.native.syntax@native-v10 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
     },
     {
+      "name": "trellis-native-v11-javascript-test-support",
+      "status": "recorded",
+      "version": "native-v11",
+      "installedAtCapture": true,
+      "capturedOn": "2026-10-26",
+      "installMethod": "cargo build --locked --features test-support --bin trellis; feat/211-card-capture from feature-scip 44320bc plus main prerequisites 3fd3cfd; frozen-fourth-source-hashes.json and javascript-v11-descriptor.json retained in issue-211-capture evidence; pinned Rust 1.99.1 aarch64-apple-darwin",
+      "artifactDigest": "sha256:7bc7509763073366908a8a85758817984f7115a97f5a06f9e7f4b088923ee37b",
+      "executableHash": "7bc7509763073366908a8a85758817984f7115a97f5a06f9e7f4b088923ee37b",
+      "runtime": "trellis.native.syntax@native-v11 test-support capture build; nativeExtractor hash includes capture adapter and test-support feature flag; tree-sitter 0.27.1; UTF-8; source-only extractionInputs []."
+    },
+    {
       "name": "scip-java",
       "status": "recorded",
       "version": "0.12.3",

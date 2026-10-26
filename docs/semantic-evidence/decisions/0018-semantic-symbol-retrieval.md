@@ -1,15 +1,17 @@
 # Decision 0018: semantic symbol retrieval
 
 - Status: owner-ratified direction on #211 (2026-10-21), amended by the 2026-10-25 parity and
-  backend rulings. Ranking constants remain pending the owner-required tuning and contract
-  review; this record does not authorize shipping arbitrary constants.
+  backend rulings and the 2026-10-26 item-8 approval. The initial reviewed constants are
+  (k, D, wL, wV) = (20, 200, 1, 4), with no additional lexical-arm restriction.
 - Amends: #24’s catalog/wire projection and #23’s optional-vector-cache topology as stated in
   their amended sections. No #22 evidence record, identity, provenance or warning shape changes.
 - Scope: one card/vector per eligible named declaration; no AST chunks, summary vectors,
   hosted provider, score field or debug-score flag.
 - Compatibility: none for disposable indexes. Native search-fact output changes the native
-  producer version; storage changes follow the current disposable-index contract. Allocate
-  neither schema nor native-producer version until the feature-scip/main integration is synced.
+  producer version; storage changes follow the current disposable-index contract. The owner's
+  2026-10-26 capture-slice direction permits preparation on a separate feature-scip-based branch
+  before the merge. Reconcile branch-local schema/producer identifiers onto merged main before
+  opening its PR; never change the #90 factory branch or reserve a competing main format.
 
 ## Authority and activation boundary
 
@@ -18,10 +20,13 @@
 - [Automatic backend and status ruling](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6405742145).
 
 These amendments record that direction; they do not ratify the old plan/proposal wholesale.
-Search is specified, not enabled by this records-only change. Representation details listed
-below, the backend refusal mapping and evaluated fusion constants need reviewed closure
-before their respective implementation is wired or activated. Synchronize main after
-`feature-scip` merges before index-facing changes; this record allocates no schema or producer.
+The [2026-10-26 item-8 ruling](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6416445655)
+accepts the exact draft text below, keeps local voyage-4-nano, and permits enabling
+`trellis_search_symbols` in the capture PR after `feature-scip` merges to main. The earlier
+[pre-code plan](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6411250597)
+authorized capture/FTS/background-fill preparation on its own feature-scip-based branch.
+Rebase onto merged main and run full verification before opening the capture PR; never
+change the #90 factory branch.
 
 ## Cards and measured inputs
 
@@ -36,10 +41,13 @@ Capture previously missing doc comments, literals, body type names and impl self
 during the existing native parse. No second parse, file reread or read-time extraction is
 introduced. Store these in search-only version-owned tables, not #22 Declaration/Header or
 another evidence record. Retain the proposed bounds: at most 20 literals of at most 100 bytes,
-a 600-byte doc comment, 30 type names and 40 callees per declaration. The exact card serializer,
-source-head cap, candidate-kind set and versioned stopword list must be written and reviewed
-before card/FTS wiring; this record invents none of their missing bytes or membership rules.
-Use the chosen (c) reference/evaluation artifacts when closing that format.
+a 600-byte doc comment, 30 type names and 40 callees per declaration. The owner's 2026-10-26
+capture-slice direction selects the written
+[card serializer, 1,200-source-byte head cap and fixed stopwords](../../semantic-search-card-format-draft.md)
+for implementation. The capture plan explicitly records the remaining eligibility, attachment
+and splitter choices rather than inferring them from historical model parity. Use the chosen
+(c) reference/evaluation artifacts when evaluating the resulting representation. Fusion and
+tool activation remain subject to item 8.
 
 cardHash = SHA-256(UTF8("trellis.search-card.v1\0") || exactCardBytes).
 Cards include the measured root-relative path. Equal exact card bytes can reuse vectors
@@ -77,7 +85,14 @@ Configured files are verified before loading against the reviewed immutable mode
 The model loads lazily for a job and drops afterward; its pin is not a promise of daemon-lifetime
 residency. The single embedding owner also owns query-model availability and avoids blocking
 checkout worker locks while loading. Its precise query/job lifecycle must preserve the owner’s
-lazy-load/drop constraints and lexical-only state while loading. The model
+lazy-load/drop constraints and lexical-only state while loading. A search call attempts to
+own one query job before admitting its index snapshot. A busy embedding owner makes that
+call lexical-only; it does not prove that a fill is running. An admitted query job verifies,
+loads, embeds and drops its weights under the original call deadline and cancellation flag,
+without an index, cache or registry lock. That call retains its verified model identity and
+query vector as a per-call readiness receipt after the weights drop. Other calls while it
+loads remain lexical-only. Cache counts and ranking then use one read transaction, and
+building state comes from the fill owner for the admitted head. The model
 is not a #22 Producer: vectors are retrieval metadata, not evidence. Other modelId cache
 entries are ignored safely after switching models. The first model is voyageai/voyage-4-nano,
 ported to Rust/Candle; no Python runtime or executed upstream custom code is used. The current
@@ -118,12 +133,9 @@ wL/(k+l) + wV/(k+v); an absent arm contributes zero. Sort score descending, then
 available arm rank, then l (absent last), then symbolId bytes. matchedBy records the arms
 that returned the candidate, not an inferred relevance explanation.
 
-k, D, wL and wV are NOT fixed by this record. Tune them on #214’s saved evaluation set during
-implementation and land exact values through contract review before enabling the tool.
-The old 60/100/1/1 proposal is not a default or ratified implementation choice. An
-exact-match-limited lexical arm is permitted only if evaluation supports it and its precise
-matching rule is reviewed and recorded along with the constants. Changes to the fixed rule
-or constants after that review are contract changes, not silent tuning.
+The initial weighted-RRF constants are **k=20, D=200, wL=1 and wV=4**. Each arm applies its existing deterministic ordering and retains at most 200 candidates before fusion. For a candidate with 1-based lexical rank l and vector rank v, its score is `1/(20+l) + 4/(20+v)`; an absent arm contributes exactly zero. Sort by score descending, then smaller available arm rank, then l with absent last, then symbolId UTF-8 bytes, as specified above. Fusion contributions are evaluated in binary64, lexical first and vector second. D is an internal candidate depth, not a change to the public response limit.
+
+The lexical arm has **no additional exact-phrase, literal, identifier, substring, language or query-category gate**. It uses the shared card/query 32-term transform, bound quoted OR expression, BM25 ascending and symbolId-byte tie-break already specified in this record. No terms means an empty lexical arm. A store or FTS failure is still a typed failure, never vector-only best-effort success. `matchedBy` records arm membership after each depth cutoff, not relevance. These constants and any future lexical restriction are reviewed contract choices, not silent runtime tuning. This adds no score field or cross-call/backend ranking-equality promise.
 
 Within a call, one index snapshot and one vector-cache read transaction give coherent
 candidates, counts and matchedBy/order. evidenceBasis pins only the index head, not the
@@ -163,5 +175,30 @@ scope rule; vector completeness and selected backend are separate searchIndex me
    is a typed refusal. Status reports the actual backend and separate completeness. Existing
    accepted CPU/Metal (c) parity evidence is referenced, not replaced by weaker tolerances.
 8. The #214 tuning report, chosen constants and any lexical-arm restriction receive review
-   and become exact record text before the new tool is enabled. Measure the built FTS table
-   against #199’s size results. No hosted code/model use or invented shipping gate is added.
+   and become exact record text before the new tool is enabled. The reviewed tuning and built
+   FTS size observations below satisfy item 8 under the 2026-10-26 owner ruling. No hosted
+   production path or invented shipping gate is added.
+
+## Item 8: reviewed tuning evidence (2026-10-26)
+
+The 2026-10-26 item 8 report replays #214's corrected development set: 50 queries (30 concept, 6 named, 8 error-message, 6 JavaScript), 82 answer slots/73 distinct declarations, over 6,722 saved card-c candidates from Trellis `693c32cb2d47a16cf69c8265ae7a1291b71fbd93`. R@5/R@10 are any-answer query success rates; MRR uses the first correct hit through 100. This small, correlated, repeatedly inspected set is not a holdout or a generalization claim.
+
+The frozen grid is k={20,60,100}, D={50,100,200}, wL=1 and wV={1,2,4}: 27 cells per backend. The actual capture-branch lexical implementation and matching bundled SQLite 3.53.2 supply transformed terms and BM25/ID ordering. Accepted saved CPU and Metal outputs from pinned voyage-4-nano revision `5fb34e870f49f19e79c94d5e118f5ee730133279` are joined by IDs, truncated to 1024 and quantized on both query and document sides with the accepted int8 representation. The same cells replay on Metal without backend-specific retuning. No model inference, hosted service or timing campaign was run.
+
+The proposed 20/200/1/4 cell raises overall success@10 from 30/50 to 31/50 and concept success@10 from 12/30 to 13/30. It rescues q12 at 10 and loses no vector-only success at 10. Named 6/6, error 6/8 and JavaScript 6/6 success@10 are unchanged. It lowers overall success@5 from 24/50 to 20/50 (q22,q27,q35,q45 leave the top 5) and overall MRR from 0.2960059650230314 to 0.28429474173010805. Concept MRR rises from 0.1399098726919398 to 0.16323069981837932 and named MRR from 0.638888888888889 to 0.6444444444444445; error MRR falls from 0.40870859213250516 to 0.3188936781609195 and JavaScript MRR from 0.5833333333333334 to 0.48333333333333334. CPU and Metal aggregate metrics agree for every cell, but rankings are not promised equal.
+
+Actual-transform BM25-only scores R@5=.16,R@10=.20,MRR=.10475726328435135; ordinary 60/100/1/1 scores .26/.34/.22488896033500286. The historical ASCII/no-cap BM25 control reproduces revision 3's .30/.46/.277 and missed-query IDs. Therefore historical unrestricted-BM25 or equal-weight results are not substituted for this actual 32-term representation. No ordinary cell rescues an error-message query at 10. The frozen optional exact-gate trigger was false, so no exact-limited cell was run; the report neither supports nor rejects an untested exact gate.
+
+Saved vectors bind historical c card bytes, **not the newly serialized native capture cards**. This replay supports an explicit owner decision about the proposed fusion tradeoff on #214's saved representation using the current lexical transform; it does not claim new native-card embedding quality, native-card parity, or a new hardware-independent ranking guarantee. All cells, per-query arm/fusion ranks, wins/losses, input hashes and CPU/Metal receipts remain available in the report packet. No new recall, MRR, parity, timing or size acceptance threshold is introduced.
+
+## Item 8: built FTS size observation
+
+An untimed capture-branch build of the normal frozen MEDIUM cohort (1,000 files, 250 per language, 16,777,216 source bytes) published one head with 75,614 eligible cards and 75,614 ranking-FTS rows. All source hashes match the cohort manifest. Across the five physical FTS objects, `dbstat` reports **21,934,080 B (20.918 MiB)**: content 14,757,888; data 6,258,688; docsize 901,120; idx 12,288; config 4,096. The virtual table owns no additional pages outside those shadows. Version-owned cards/facts/terms and their two indexes are separate: **92,221,440 B**. Combined measured search objects are 114,155,520 B. The stopped whole `index.db` is **535,904,256 B**; FTS is 4.0929102% of that file and about 290.08 allocated bytes/card. No VACUUM/optimize or embedding run was applied. The private daemon was stopped and its object allocation/file size remained unchanged.
+
+#199's linked original report §1.5 records **2,108,219,392 B** for the same MEDIUM source content. Independent manifest comparison confirms all 1,000 paths, lengths and SHA-256 values agree despite manifest versions 1/2. The current whole index is 25.419757% of that historical size, but **this is historical context, not a causal size delta for adding FTS**: extractor, schema, retained state and intervening compaction changes differ. #199's original 10k total 16,780,910,592 B and later stopped S-2 total 2,566,254,592 B are separate LARGE observations; no MEDIUM-to-LARGE extrapolation is made. Q8's names-only trigram tables are different indexes, unchanged by this measurement. Their reported 52,838,400 B whole-file increment and later 52,850,688 B two-group page sum are distinct statistics, not a comparable regression percentage. No new size budget or shipping gate follows from these measurements.
+
+The [separate owner-approved hosted evaluation](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6416200314)
+compared voyage-4-lite at the same fixed hybrid settings: R@5 .42, R@10 .52 and
+MRR@100 .29090339284698713, versus local nano .40/.62/.28429474173010805.
+The owner kept local nano. That evaluation-only exception adds no hosted production path
+and does not change the historical tuning report above.

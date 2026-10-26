@@ -232,6 +232,7 @@ pub struct DaemonState {
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     worker_started: AtomicBool,
+    search_fill: Mutex<Option<crate::daemon::search_fill::FillRegistration>>,
     /// Watcher inventories run on the worker and are never cancelled from
     /// outside it (Decision 0009 §1).
     watcher_cancel: CancelFlag,
@@ -442,6 +443,7 @@ pub fn new_with_config(
         config: std::sync::RwLock::new(Arc::new(config)),
         explicit_pending: Mutex::new(None),
         worker_started: AtomicBool::new(false),
+        search_fill: Mutex::new(None),
         watcher_cancel: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "test-support")]
         startup_hook: Mutex::new(None),
@@ -1166,11 +1168,46 @@ impl DaemonState {
         Ok(!pending)
     }
 
+    pub(crate) fn set_search_fill(
+        &self,
+        registration: crate::daemon::search_fill::FillRegistration,
+    ) {
+        *self.search_fill.lock().unwrap() = Some(registration);
+    }
+
+    pub(crate) fn search_fill_building(&self, pin: IndexPin) -> bool {
+        self.search_fill
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fill| fill.building_for(pin))
+    }
+
+    pub(crate) fn search_fill_page(
+        &self,
+        expected: Option<IndexPin>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<crate::store::HeadSearchCards> {
+        // A fill is not a read admission lease: disposable work must never
+        // cancel retirement or retain a writer session while loading weights.
+        anyhow::ensure!(
+            matches!(*self.runtime.lock().unwrap(), RuntimeState::Ready(_)),
+            "index_not_ready: checkout is not ready for search fill"
+        );
+        self.store.head_search_cards(expected, after, limit)
+    }
+
     fn worker_step(self: &Arc<Self>) -> anyhow::Result<()> {
         #[cfg(feature = "test-support")]
         let _held = self.worker_hold.read().unwrap();
         let result = self.worker_step_inner();
         self.publish_fifo_pending();
+        // The authoritative worker has released its step/watcher/publication
+        // guards. The fill owner only receives a coalescing in-memory hint.
+        if let Some(fill) = self.search_fill.lock().unwrap().as_ref() {
+            fill.notify();
+        }
         #[cfg(feature = "test-support")]
         if result.is_ok() {
             self.report_causal_startup_ready();

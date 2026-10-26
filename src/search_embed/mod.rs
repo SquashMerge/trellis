@@ -22,7 +22,7 @@ const MAX_TOKENS: usize = 512;
 // Bounds text tokenization work before adding the fixed retrieval prompt.
 const MAX_INPUT_BYTES: usize = 16_384;
 const FULL_DIMENSIONS: usize = 2048;
-const DIMENSIONS: usize = 1024;
+pub(crate) const DIMENSIONS: usize = 1024;
 const QUERY_PROMPT: &str = "Represent the query for retrieving supporting documents: ";
 const DOCUMENT_PROMPT: &str = "Represent the document for retrieval: ";
 

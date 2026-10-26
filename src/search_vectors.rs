@@ -125,6 +125,17 @@ impl std::fmt::Display for CacheFormat {
 }
 impl std::error::Error for CacheFormat {}
 
+/// Only disposable format/corruption failures warrant dropping and recreating
+/// the cache. Contention, I/O and capacity failures must preserve it.
+pub(crate) fn is_corrupt_cache(error: &anyhow::Error) -> bool {
+    error.is::<CacheFormat>()
+        || error.chain().any(|cause| {
+            matches!(cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(info, _))
+                if matches!(info.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
+        })
+}
+
 fn validate(db: &rusqlite::Connection) -> Result<()> {
     let version: i64 = storage(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
     let journal: String = storage(db.pragma_query_value(None, "journal_mode", |row| row.get(0)))?;
@@ -162,11 +173,7 @@ impl VectorCacheWriter {
     }
     pub fn open_with_budget(path: &Path, byte_budget: u64) -> Result<Self> {
         match Self::open_once(path, byte_budget) {
-            Err(error) if error.is::<CacheFormat>() || error.chain().any(|cause| {
-                matches!(cause.downcast_ref::<rusqlite::Error>(),
-                    Some(rusqlite::Error::SqliteFailure(info, _))
-                    if matches!(info.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
-            }) => {
+            Err(error) if is_corrupt_cache(&error) => {
                 unavailable(crate::store::discard_sqlite_cache(path))?;
                 Self::open_once(path, byte_budget)
             }
@@ -203,25 +210,42 @@ impl VectorCacheWriter {
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate),
         )?;
-        evict(&tx, byte_budget, None)?;
+        evict(&tx, byte_budget, &[])?;
         storage(tx.commit())?;
         Ok(cache)
     }
     /// Invalid input is rejected before any transaction. If this entry cannot
     /// fit even alone, the whole operation rolls back with typed Capacity.
     pub fn put(&mut self, model_id: &str, card_hash: &str, vector: &[i8]) -> Result<()> {
-        keys(model_id, card_hash)?;
-        if !valid_vector(vector) {
-            return Err(InvalidVector.into());
+        self.put_many(&[(model_id, card_hash, vector)])
+    }
+    /// Atomically store a batch in input LRU order, with one transaction and one
+    /// eviction pass. All inserted/replaced keys are retained on success; if
+    /// they cannot fit together, typed Capacity rolls back the entire batch.
+    /// Duplicate keys and invalid keys/vectors reject the whole batch before
+    /// opening a transaction. An empty batch is a no-op.
+    pub fn put_many(&mut self, entries: &[(&str, &str, &[i8])]) -> Result<()> {
+        let mut retained = Vec::with_capacity(entries.len());
+        for &(model_id, card_hash, vector) in entries {
+            keys(model_id, card_hash)?;
+            if !valid_vector(vector) || retained.contains(&(model_id, card_hash)) {
+                return Err(InvalidVector.into());
+            }
+            retained.push((model_id, card_hash));
         }
-        let bytes: Vec<u8> = vector.iter().map(|v| *v as u8).collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
         let tx = storage(
             self.db
                 .transaction_with_behavior(TransactionBehavior::Immediate),
         )?;
-        let age = next_age(&tx)?;
-        storage(tx.execute("INSERT INTO vectors VALUES (?1, ?2, ?3, ?4) ON CONFLICT(model_id,card_hash) DO UPDATE SET vector=excluded.vector,touched=excluded.touched", params![model_id, card_hash, bytes, age]))?;
-        evict(&tx, self.byte_budget, Some((model_id, card_hash)))?;
+        for &(model_id, card_hash, vector) in entries {
+            let bytes: Vec<u8> = vector.iter().map(|v| *v as u8).collect();
+            let age = next_age(&tx)?;
+            storage(tx.execute("INSERT INTO vectors VALUES (?1, ?2, ?3, ?4) ON CONFLICT(model_id,card_hash) DO UPDATE SET vector=excluded.vector,touched=excluded.touched", params![model_id, card_hash, bytes, age]))?;
+        }
+        evict(&tx, self.byte_budget, &retained)?;
         storage(tx.commit())
     }
     /// Explicit owner operation. Reads never call this and never change age.
@@ -236,7 +260,7 @@ impl VectorCacheWriter {
             "UPDATE vectors SET touched=?3 WHERE model_id=?1 AND card_hash=?2",
             params![model_id, card_hash, age],
         ))?;
-        evict(&tx, self.byte_budget, None)?;
+        evict(&tx, self.byte_budget, &[])?;
         storage(tx.commit())
     }
     pub fn snapshot(&mut self) -> Result<VectorSnapshot<'_>> {
@@ -265,15 +289,28 @@ fn compact_bytes(db: &rusqlite::Connection) -> Result<u64> {
         .and_then(|pages| pages.checked_mul(size))
         .ok_or_else(|| StoreUnavailable.into())
 }
-fn evict(tx: &Transaction<'_>, budget: u64, inserted: Option<(&str, &str)>) -> Result<()> {
+fn evict(tx: &Transaction<'_>, budget: u64, retained: &[(&str, &str)]) -> Result<()> {
     while compact_bytes(tx)? > budget {
-        let oldest: Option<(String, String)> = storage(tx.query_row("SELECT model_id,card_hash FROM vectors ORDER BY touched,model_id,card_hash LIMIT 1", [], |row| Ok((row.get(0)?,row.get(1)?))).optional())?;
+        let oldest = {
+            let mut statement = storage(tx.prepare(
+                "SELECT model_id,card_hash FROM vectors ORDER BY touched,model_id,card_hash",
+            ))?;
+            let mut rows = storage(statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }))?;
+            let mut oldest = None;
+            for row in &mut rows {
+                let (model, card) = storage(row)?;
+                if !retained.contains(&(model.as_str(), card.as_str())) {
+                    oldest = Some((model, card));
+                    break;
+                }
+            }
+            oldest
+        };
         let Some((model, card)) = oldest else {
             return Err(Capacity.into());
         };
-        if inserted.is_some_and(|key| key == (model.as_str(), card.as_str())) {
-            return Err(Capacity.into());
-        }
         storage(tx.execute(
             "DELETE FROM vectors WHERE model_id=?1 AND card_hash=?2",
             params![model, card],
@@ -437,6 +474,134 @@ mod tests {
             assert_eq!(snapshot.entry_count(), 1);
             assert_eq!(snapshot.get(&model, &card).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn batch_validation_precedes_transaction_and_duplicate_keys_are_rejected() {
+        let (directory, mut writer) = cache(32 * 1024);
+        let model = key(1);
+        let card = key(2);
+        writer.put(&model, &card, &[1]).unwrap();
+        let mut reader = VectorCacheReader::open_existing(&directory.path().join("vectors.db"))
+            .unwrap()
+            .unwrap();
+        let snapshot = reader.snapshot().unwrap();
+        // A write would fail busy while this snapshot is live. Validation and
+        // an empty batch must not open a write transaction at all.
+        writer.put_many(&[]).unwrap();
+        for entries in [
+            vec![
+                (model.as_str(), card.as_str(), &[2][..]),
+                ("bad", card.as_str(), &[1][..]),
+            ],
+            vec![
+                (model.as_str(), card.as_str(), &[2][..]),
+                (model.as_str(), card.as_str(), &[3][..]),
+            ],
+            vec![(model.as_str(), card.as_str(), &[0][..])],
+        ] {
+            assert!(writer.put_many(&entries).unwrap_err().is::<InvalidVector>());
+        }
+        assert_eq!(snapshot.get(&model, &card).unwrap(), Some(vec![1]));
+    }
+
+    #[test]
+    fn batch_success_assigns_input_order_ages_and_busy_commit_rolls_back() {
+        let (directory, mut writer) = cache(128 * 1024);
+        let model = key(1);
+        let cards: Vec<_> = (2..18).map(key).collect();
+        let vector = [3; 1024];
+        let entries: Vec<_> = cards
+            .iter()
+            .map(|card| (model.as_str(), card.as_str(), vector.as_slice()))
+            .collect();
+        writer.put_many(&entries).unwrap();
+        let ages: Vec<i64> = writer
+            .db
+            .prepare("SELECT touched FROM vectors ORDER BY card_hash")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ages, (1..=16).collect::<Vec<_>>());
+        let mut reader = VectorCacheReader::open_existing(&directory.path().join("vectors.db"))
+            .unwrap()
+            .unwrap();
+        let snapshot = reader.snapshot().unwrap();
+        assert!(
+            writer
+                .put_many(&[(&model, &cards[0], &[-1]), (&model, &key(18), &[2]),])
+                .unwrap_err()
+                .is::<StorageBusy>()
+        );
+        drop(snapshot);
+        let snapshot = writer.snapshot().unwrap();
+        assert_eq!(snapshot.entry_count(), 16);
+        assert_eq!(
+            snapshot.get(&model, &cards[0]).unwrap(),
+            Some(vector.to_vec())
+        );
+        assert_eq!(snapshot.get(&model, &key(18)).unwrap(), None);
+    }
+
+    #[test]
+    fn batch_capacity_rolls_back_replacement_new_rows_and_lru_ages() {
+        let (_directory, mut writer) = cache(32 * 1024);
+        let model = key(1);
+        let original = key(2);
+        writer.put(&model, &original, &[-1]).unwrap();
+        let before: i64 = writer
+            .db
+            .query_row("SELECT touched FROM vectors", [], |row| row.get(0))
+            .unwrap();
+        let cards: Vec<_> = (2..18).map(key).collect();
+        let vector = [3; 1024];
+        let entries: Vec<_> = cards
+            .iter()
+            .map(|card| (model.as_str(), card.as_str(), vector.as_slice()))
+            .collect();
+        assert!(writer.put_many(&entries).unwrap_err().is::<Capacity>());
+        let after: i64 = writer
+            .db
+            .query_row("SELECT touched FROM vectors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        let snapshot = writer.snapshot().unwrap();
+        assert_eq!(snapshot.entry_count(), 1);
+        assert_eq!(snapshot.get(&model, &original).unwrap(), Some(vec![-1]));
+        assert_eq!(snapshot.get(&model, &cards[1]).unwrap(), None);
+    }
+
+    #[test]
+    fn corruption_predicate_excludes_busy_io_and_capacity() {
+        assert!(is_corrupt_cache(
+            &anyhow::Error::new(CacheFormat).context(StoreUnavailable)
+        ));
+        for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
+            let error = storage::<()>(Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            )))
+            .unwrap_err();
+            assert!(is_corrupt_cache(&error));
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_FULL,
+        ] {
+            let error = storage::<()>(Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            )))
+            .unwrap_err();
+            assert!(!is_corrupt_cache(&error));
+        }
+        assert!(!is_corrupt_cache(&Capacity.into()));
+        assert!(!is_corrupt_cache(&anyhow::Error::new(
+            std::io::Error::from(std::io::ErrorKind::Other)
+        )));
     }
 
     #[test]
