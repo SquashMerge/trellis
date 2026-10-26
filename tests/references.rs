@@ -2657,3 +2657,191 @@ fn references_java_unknown_static_on_demand_type_bindings_block_qualified_packag
     );
     assert_eq!(module_paths(&data), ["app/Use.java"]);
 }
+
+fn java_review_maven_snapshot() -> &'static Snapshot {
+    static INPUT: std::sync::OnceLock<Snapshot> = std::sync::OnceLock::new();
+    INPUT.get_or_init(|| {
+        let sources: Vec<_> = (0..500)
+            .map(|index| {
+                let next: Vec<_> = (1..=3).map(|offset| (index + offset) % 500).collect();
+                let mut text = format!("package com.example.p{index:03};\n");
+                for target in &next {
+                    text.push_str(&format!("import com.example.p{target:03}.*;\n"));
+                }
+                text.push_str(&format!("\npublic class Service{index:03} {{\n"));
+                for (field, target) in next.iter().enumerate() {
+                    text.push_str(&format!(
+                        "    private Service{target:03} dependency{field};\n"
+                    ));
+                }
+                text.push_str("    private int value;\n\n");
+                for method in 0..20 {
+                    text.push_str(&format!(
+                        r#"    public int calculate{method}(int amount, int multiplier) {{
+        int base = (value + amount) * (multiplier + 1);
+        int weight = (amount + value) * (multiplier + 2) + (amount & 255);
+        int result = (base + weight) * (multiplier + 3) - (value & 15);
+        for (int step = 0; step < 4; step++) {{
+            result = (result * 31 + amount * step) ^ (multiplier + step + weight);
+        }}
+        return (result + base) * (multiplier + value) + (weight & 1023);
+    }}
+"#
+                    ));
+                }
+                text.push_str("}\n");
+                assert_eq!(text.lines().count(), 192);
+                (
+                    format!("src/main/java/com/example/p{index:03}/Service{index:03}.java"),
+                    text,
+                )
+            })
+            .collect();
+        let files: Vec<_> = sources
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let input = snapshot(&files);
+        assert_eq!(input.documents.len(), 500);
+        input
+    })
+}
+
+fn assert_java_review_maven_projection(paths: &[String], all: bool) {
+    let input = java_review_maven_snapshot();
+    let result = references::project(input, paths, 1, &mut || Ok(()));
+    assert!(
+        result.is_ok(),
+        "500-file Maven Java projection {paths:?} must fit the unchanged work budget: {result:?}"
+    );
+    let data = result.unwrap().data;
+    let scanned = if all { 500 } else { 1 };
+    assert_eq!(data["counts"]["scannedDocuments"], scanned);
+    assert_eq!(data["counts"]["mappedSites"], scanned * 3);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
+    assert!(data["tests"].as_array().unwrap().is_empty());
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["production"].as_array().unwrap().len(), scanned * 3);
+    assert_eq!(module_paths(&data).len(), if all { 500 } else { 4 });
+    for index in 0..scanned {
+        let source = format!("src/main/java/com/example/p{index:03}/Service{index:03}.java");
+        let doc = input
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == source)
+            .unwrap();
+        let owner = doc
+            .declarations
+            .iter()
+            .find(|row| row.kind == "module" && row.ancestors.is_empty())
+            .unwrap();
+        for offset in 1..=3 {
+            let target = (index + offset) % 500;
+            let target_path =
+                format!("src/main/java/com/example/p{target:03}/Service{target:03}.java");
+            let pair = edge(&data, "production", &source, &target_path);
+            assert_eq!(pair["count"], 1);
+            assert_eq!(pair["mapping"], "structural");
+            assert_eq!(pair["omittedSites"], 0);
+            assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+            let site = &pair["sites"][0];
+            let spelling = format!("import com.example.p{target:03}.*;");
+            assert_eq!(site["spelling"], spelling);
+            assert_eq!(site["relationKind"], "import");
+            assert_eq!(site["role"], "production");
+            assert_eq!(site["ownerSyntaxId"], owner.syntax_id);
+            let start = site["range"]["start"].as_u64().unwrap() as usize;
+            let end = site["range"]["end"].as_u64().unwrap() as usize;
+            assert_eq!(&doc.file.text[start..end], spelling);
+        }
+    }
+    for module in data["modules"].as_array().unwrap() {
+        let path = module["identity"]["path"].as_str().unwrap();
+        let doc = input
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == path)
+            .unwrap();
+        let native = doc
+            .declarations
+            .iter()
+            .find(|row| row.kind == "module" && row.ancestors.is_empty())
+            .unwrap();
+        assert_eq!(module["identity"]["sid"], native.syntax_id);
+        assert_eq!(module["revisionId"], native.revision_id);
+        assert_eq!(module["provenanceId"], native.provenance_id);
+        assert_eq!(module["contentHash"], doc.file.hash);
+    }
+}
+
+#[test]
+fn references_java_review_maven_one_file_fits_unchanged_work_budget() {
+    assert_java_review_maven_projection(
+        &["src/main/java/com/example/p000/Service000.java".into()],
+        false,
+    );
+}
+
+#[test]
+fn references_java_review_maven_all_files_fit_unchanged_work_budget() {
+    assert_java_review_maven_projection(&["**".into()], true);
+}
+
+#[test]
+fn references_java_review_nested_on_demand_collision_keeps_explicit_proof() {
+    for explicit_t in [false, true] {
+        let source = format!(
+            "package app; import pkg.*; import other.Outer.*; import known.Keep; {} class Use {{ T value; }}",
+            if explicit_t { "import pkg.T;" } else { "" }
+        );
+        let input = snapshot(&[
+            ("app/Use.java", &source),
+            ("pkg/T.java", "package pkg; public class T {}"),
+            (
+                "other/Outer.java",
+                "package other; public class Outer { public static class T {} }",
+            ),
+            ("known/Keep.java", "package known; public class Keep {}"),
+        ]);
+        let data = project_java_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "app/Use.java", "pkg/T.java"),
+            explicit_t,
+            "nested and package on-demand imports must not select wildcard-only T: {data}"
+        );
+        assert!(!has_edge(&data, "app/Use.java", "other/Outer.java"));
+        let keep = edge(&data, "production", "app/Use.java", "known/Keep.java");
+        assert_eq!(keep["count"], 1);
+        assert_eq!(keep["sites"][0]["spelling"], "import known.Keep;");
+        if explicit_t {
+            let pair = edge(&data, "production", "app/Use.java", "pkg/T.java");
+            assert_eq!(pair["count"], 1);
+            assert_eq!(pair["sites"][0]["spelling"], "import pkg.T;");
+        }
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            1 + usize::from(explicit_t)
+        );
+        assert_eq!(data["counts"]["scannedDocuments"], 1);
+        assert_eq!(data["counts"]["mappedSites"], 1 + usize::from(explicit_t));
+        assert_eq!(data["counts"]["unresolvedSites"], 2);
+        let unknowns: Vec<_> = data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["site"]["spelling"].as_str().unwrap())
+            .collect();
+        assert_eq!(unknowns, ["import pkg.*;", "import other.Outer.*;"]);
+        assert!(data["tests"].as_array().unwrap().is_empty());
+        assert!(data["externalPackages"].as_array().unwrap().is_empty());
+        assert_eq!(
+            module_paths(&data),
+            if explicit_t {
+                vec!["app/Use.java", "known/Keep.java", "pkg/T.java"]
+            } else {
+                vec!["app/Use.java", "known/Keep.java"]
+            }
+        );
+    }
+}

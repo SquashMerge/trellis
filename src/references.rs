@@ -182,10 +182,15 @@ pub fn project(
         let tree = parse(doc, check)?;
         trees.push(tree);
     }
+    let selected: Vec<_> = docs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, doc)| (paths.is_empty() || globs.is_match(&doc.key.path)).then_some(i))
+        .collect();
     let mut external_work = 0;
     let packages = external::RustPackages::new(&snapshot.manifests, &mut external_work, check)?;
     let mut rust = rust::Catalog::new(&docs, &trees, &document_map, external_work, check)?;
-    let java = java::Catalog::new(&docs, &trees, &mut rust.work, check)?;
+    let java = java::Catalog::new(&docs, &trees, &selected, &mut rust.work, check)?;
     let mut external_packages = BTreeMap::new();
     let mut edges: BTreeMap<(usize, Target, bool), (usize, Vec<Site>)> = BTreeMap::new();
     let mut emitted_modules = BTreeSet::new();
@@ -193,10 +198,9 @@ pub fn project(
     let mut site_count = 0usize;
     let mut scanned = 0usize;
     let mut mapped = 0usize;
-    for (source, (doc, tree)) in docs.iter().zip(&trees).enumerate() {
-        if !paths.is_empty() && !globs.is_match(&doc.key.path) {
-            continue;
-        }
+    for source in selected {
+        let doc = docs[source];
+        let tree = &trees[source];
         check()?;
         emitted_modules.insert(source);
         scanned += 1;

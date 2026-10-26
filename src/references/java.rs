@@ -105,6 +105,7 @@ impl Catalog {
     pub(super) fn new(
         docs: &[&DocumentInput],
         trees: &[Tree],
+        selected: &[usize],
         work: &mut usize,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
@@ -129,19 +130,71 @@ impl Catalog {
                 }
             }
             let root = trees[document].root_node();
-            let mut unit = Unit::default();
-            let mut cursor = root.walk();
-            for child in root.named_children(&mut cursor) {
-                owner_step(work, check)?;
-                if child.kind() == "package_declaration" {
-                    unit.package = declaration_path(doc, child, work, check)?.unwrap_or_default();
-                }
-            }
+            let package_path = package_path(doc, root, work, check)?;
             owner_step(work, check)?;
             let package = result
                 .packages
-                .entry((doc.key.source_set_id.clone(), unit.package.clone()))
+                .entry((doc.key.source_set_id.clone(), package_path))
                 .or_default();
+            let mut cursor = root.walk();
+            for child in root.named_children(&mut cursor) {
+                owner_step(work, check)?;
+                if !type_declaration(child) {
+                    continue;
+                }
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                owner_step(work, check)?;
+                let name = text(doc, name).to_owned();
+                owner_step(work, check)?;
+                package.declared.insert(name.clone());
+                owner_step(work, check)?;
+                *package.declarations.entry(name.clone()).or_default() += 1;
+                if !public(child, work, check)? {
+                    continue;
+                }
+                owner_step(work, check)?;
+                let bucket = package.exports.entry(name).or_default();
+                let rows = native.get(&(child.start_byte(), child.end_byte()));
+                if child.kind() == "annotation_type_declaration" {
+                    bucket.unknown = true;
+                } else if let Some(rows) = rows.filter(|rows| rows.len() == 1) {
+                    let row = rows[0];
+                    if row.role == DeclarationRole::Test {
+                        bucket.unknown = true;
+                    } else {
+                        owner_step(work, check)?;
+                        bucket.declarations.insert(DeclarationId {
+                            document,
+                            start: row.range.start,
+                            end: row.range.end,
+                            sid: row.syntax_id.clone(),
+                        });
+                    }
+                } else {
+                    bucket.unknown = true;
+                }
+            }
+        }
+        for package in result.packages.values_mut() {
+            owner_step(work, check)?;
+            for (name, bucket) in &mut package.exports {
+                owner_step(work, check)?;
+                bucket.unknown |= package.declarations[name] > 1;
+            }
+        }
+        for &document in selected {
+            let doc = docs[document];
+            if doc.key.language != "java" {
+                continue;
+            }
+            owner_step(work, check)?;
+            let root = trees[document].root_node();
+            let mut unit = Unit {
+                package: package_path(doc, root, work, check)?,
+                ..Unit::default()
+            };
             let mut cursor = root.walk();
             for child in root.named_children(&mut cursor) {
                 owner_step(work, check)?;
@@ -167,65 +220,19 @@ impl Catalog {
                         unit.imports
                             .insert((child.start_byte(), child.end_byte()), import);
                     }
-                } else if type_declaration(child) {
-                    let Some(name) = child.child_by_field_name("name") else {
-                        continue;
-                    };
+                } else if type_declaration(child)
+                    && let Some(name) = child.child_by_field_name("name")
+                {
                     owner_step(work, check)?;
-                    let name = text(doc, name).to_owned();
-                    owner_step(work, check)?;
-                    unit.top_level.insert(name.clone());
-                    owner_step(work, check)?;
-                    package.declared.insert(name.clone());
-                    owner_step(work, check)?;
-                    *package.declarations.entry(name.clone()).or_default() += 1;
-                    if !public(child, work, check)? {
-                        continue;
-                    }
-                    owner_step(work, check)?;
-                    let bucket = package.exports.entry(name).or_default();
-                    let rows = native.get(&(child.start_byte(), child.end_byte()));
-                    if child.kind() == "annotation_type_declaration" {
-                        bucket.unknown = true;
-                    } else if let Some(rows) = rows.filter(|rows| rows.len() == 1) {
-                        let row = rows[0];
-                        if row.role == DeclarationRole::Test {
-                            bucket.unknown = true;
-                        } else {
-                            owner_step(work, check)?;
-                            bucket.declarations.insert(DeclarationId {
-                                document,
-                                start: row.range.start,
-                                end: row.range.end,
-                                sid: row.syntax_id.clone(),
-                            });
-                        }
-                    } else {
-                        bucket.unknown = true;
-                    }
+                    unit.top_level.insert(text(doc, name).to_owned());
                 }
             }
             scan_blockers(doc, root, &mut unit, work, check)?;
             for blockers in unit.blockers.values_mut() {
                 blockers.finish(work, check)?;
             }
-            owner_step(work, check)?;
-            result.units.insert(document, unit);
-            owner_step(work, check)?;
-            result
-                .source_sets
-                .insert(document, doc.key.source_set_id.clone());
-        }
-        for package in result.packages.values_mut() {
-            owner_step(work, check)?;
-            for (name, bucket) in &mut package.exports {
-                owner_step(work, check)?;
-                bucket.unknown |= package.declarations[name] > 1;
-            }
-        }
-        // Merge each compilation unit's contributors once, never the full catalog per site/name.
-        for (&document, unit) in &mut result.units {
-            let source_set = &result.source_sets[&document];
+            // Merge contributors only for units whose sites will be scanned.
+            let source_set = &doc.key.source_set_id;
             let mut seen = BTreeSet::new();
             for import in unit.imports.values() {
                 owner_step(work, check)?;
@@ -235,6 +242,9 @@ impl Catalog {
                 charge(import.path.len(), work, check)?;
                 if !seen.insert(import.path.clone()) {
                     continue;
+                }
+                if result.type_prefix(source_set, &import.path, work, check)? {
+                    unit.static_unknown = true;
                 }
                 if let Some(package) = result
                     .packages
@@ -251,6 +261,10 @@ impl Catalog {
                     }
                 }
             }
+            owner_step(work, check)?;
+            result.units.insert(document, unit);
+            owner_step(work, check)?;
+            result.source_sets.insert(document, source_set.clone());
         }
         Ok(result)
     }
@@ -518,6 +532,21 @@ fn public(
     }
     Ok(false)
 }
+fn package_path(
+    doc: &DocumentInput,
+    root: Node<'_>,
+    work: &mut usize,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<String>> {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        owner_step(work, check)?;
+        if child.kind() == "package_declaration" {
+            return Ok(declaration_path(doc, child, work, check)?.unwrap_or_default());
+        }
+    }
+    Ok(Vec::new())
+}
 fn declaration_path(
     doc: &DocumentInput,
     node: Node<'_>,
@@ -617,37 +646,6 @@ fn add_blocker(
         .push((start, end));
     Ok(())
 }
-fn walk<'a, C: FnMut() -> Result<()>>(
-    root: Node<'a>,
-    check: &mut C,
-    visit: &mut impl FnMut(Node<'a>, &mut usize, &mut C) -> Result<bool>,
-    work: &mut usize,
-) -> Result<()> {
-    owner_step(work, check)?;
-    let mut pending = vec![(root, 0)];
-    let mut visits = 0;
-    while let Some((node, depth)) = pending.pop() {
-        owner_step(work, check)?;
-        visits += 1;
-        ensure!(
-            visits <= VISITS && depth <= DEPTH,
-            "bounded_work: reference AST"
-        );
-        if !visit(node, work, check)? {
-            let mut children = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                owner_step(work, check)?;
-                children.push((child, depth + 1));
-            }
-            for child in children.into_iter().rev() {
-                owner_step(work, check)?;
-                pending.push(child);
-            }
-        }
-    }
-    Ok(())
-}
 fn scan_blockers(
     doc: &DocumentInput,
     root: Node<'_>,
@@ -655,64 +653,56 @@ fn scan_blockers(
     work: &mut usize,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    walk(
-        root,
-        check,
-        &mut |node, work, check| {
+    super::walk(root, check, &mut |node, check| {
+        if type_declaration(node)
+            && let (Some(parent), Some(name)) = (node.parent(), node.child_by_field_name("name"))
+            && parent.kind() != "program"
+        {
+            let mut scope = parent;
+            if scope.kind() == "enum_body_declarations" {
+                scope = scope.parent().expect("enum body");
+            }
+            if scope.kind() == "switch_block_statement_group" {
+                scope = scope.parent().expect("switch block");
+            }
+            let start = if matches!(scope.kind(), "block" | "constructor_body" | "switch_block") {
+                node.start_byte()
+            } else {
+                scope.start_byte()
+            };
             owner_step(work, check)?;
-            if type_declaration(node)
-                && let (Some(parent), Some(name)) =
-                    (node.parent(), node.child_by_field_name("name"))
-                && parent.kind() != "program"
-            {
-                let mut scope = parent;
-                if scope.kind() == "enum_body_declarations" {
-                    scope = scope.parent().expect("enum body");
-                }
-                if scope.kind() == "switch_block_statement_group" {
-                    scope = scope.parent().expect("switch block");
-                }
-                let start = if matches!(scope.kind(), "block" | "constructor_body" | "switch_block")
-                {
-                    node.start_byte()
-                } else {
-                    scope.start_byte()
-                };
+            add_blocker(
+                unit,
+                text(doc, name).to_owned(),
+                start,
+                scope.end_byte(),
+                work,
+                check,
+            )?;
+        }
+        if node.kind() == "type_parameter" {
+            let Some(owner) = node.parent().and_then(|parameters| parameters.parent()) else {
+                return Ok(false);
+            };
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
                 owner_step(work, check)?;
-                add_blocker(
-                    unit,
-                    text(doc, name).to_owned(),
-                    start,
-                    scope.end_byte(),
-                    work,
-                    check,
-                )?;
-            }
-            if node.kind() == "type_parameter" {
-                let Some(owner) = node.parent().and_then(|parameters| parameters.parent()) else {
-                    return Ok(false);
-                };
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
+                if child.kind() == "type_identifier" {
                     owner_step(work, check)?;
-                    if child.kind() == "type_identifier" {
-                        owner_step(work, check)?;
-                        add_blocker(
-                            unit,
-                            text(doc, child).to_owned(),
-                            owner.start_byte(),
-                            owner.end_byte(),
-                            work,
-                            check,
-                        )?;
-                        break;
-                    }
+                    add_blocker(
+                        unit,
+                        text(doc, child).to_owned(),
+                        owner.start_byte(),
+                        owner.end_byte(),
+                        work,
+                        check,
+                    )?;
+                    break;
                 }
             }
-            Ok(false)
-        },
-        work,
-    )
+        }
+        Ok(false)
+    })
 }
 pub(super) fn extract(
     doc: &DocumentInput,
@@ -721,30 +711,24 @@ pub(super) fn extract(
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<RawSite>> {
     let mut result = Vec::new();
-    walk(
-        tree.root_node(),
-        check,
-        &mut |node, work, check| {
-            owner_step(work, check)?;
-            let kind = match node.kind() {
-                "import_declaration" => "import",
-                "scoped_type_identifier" => "reference",
-                _ => return Ok(false),
-            };
-            ensure!(result.len() < SITES, "bounded_work: reference site count");
-            let destination = if kind == "import" {
-                declaration_path(doc, node, work, check)?
-            } else {
-                path(doc, node, work, check)?
-            }
-            .ok_or("java_type_path_unsupported");
-            owner_step(work, check)?;
-            result.push(raw(doc, node, kind, destination));
-            // Keep a maximal scoped type site without duplicate inner-prefix sites.
-            Ok(true)
-        },
-        work,
-    )?;
+    super::walk(tree.root_node(), check, &mut |node, check| {
+        let kind = match node.kind() {
+            "import_declaration" => "import",
+            "scoped_type_identifier" => "reference",
+            _ => return Ok(false),
+        };
+        ensure!(result.len() < SITES, "bounded_work: reference site count");
+        let destination = if kind == "import" {
+            declaration_path(doc, node, work, check)?
+        } else {
+            path(doc, node, work, check)?
+        }
+        .ok_or("java_type_path_unsupported");
+        owner_step(work, check)?;
+        result.push(raw(doc, node, kind, destination));
+        // Keep a maximal scoped type site without duplicate inner-prefix sites.
+        Ok(true)
+    })?;
     result.sort_by(|a, b| {
         (a.start, a.end, a.kind, &a.spelling).cmp(&(b.start, b.end, b.kind, &b.spelling))
     });
@@ -814,7 +798,8 @@ mod tests {
             .map(|doc| parse(doc, &mut || Ok(())).unwrap())
             .collect();
         let mut work = 0;
-        let catalog = Catalog::new(&docs, &trees, &mut work, &mut || Ok(())).unwrap();
+        let selected: Vec<_> = (0..docs.len()).collect();
+        let catalog = Catalog::new(&docs, &trees, &selected, &mut work, &mut || Ok(())).unwrap();
         let document = docs
             .iter()
             .position(|doc| doc.key.path == "Use.java")
