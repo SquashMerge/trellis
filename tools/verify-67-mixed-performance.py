@@ -633,8 +633,8 @@ def typed_cells(value):
     return value
 
 
-def parity_digest(db, revision):
-    view = SelectedView(db, revision)
+def parity_digest(db, revision, physical_root):
+    view = SelectedView(db, revision, physical_root)
     require(db.execute("PRAGMA user_version").fetchone()[0] == 23, "selected parity requires schema23")
     generation, number = revision.removeprefix("pin:v1:").rsplit(":", 1)
     require(db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
@@ -694,7 +694,11 @@ def parity_digest(db, revision):
         elif table == "semantic_raw_proofs":
             where = "capture_id IN (SELECT capture_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
         elif table == "semantic_import_reports":
-            where = "revision_id=(SELECT captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?)"
+            where = ("EXISTS(SELECT 1 FROM semantic_revision_raw_selections r "
+                     "JOIN semantic_revision_raw_selections current ON current.capture_id=r.capture_id "
+                     "AND current.producer_id=r.producer_id "
+                     "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
+                     "AND r.producer_id=selected.producer_id)")
         else:
             raise RuntimeError(f"unclassified schema23 selected table: {table}")
         columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
@@ -715,6 +719,31 @@ def parity_digest(db, revision):
     require(output["native_revisions"]["rows"] == 1
             and output["revision_documents"]["rows"] in (1000, 10000),
             "selected native corpus incomplete")
+    # Root-derived opaque hashes cannot be compared byte-for-byte across roots.
+    # Bind each normalized role to a complete, independently hashed input closure;
+    # every input table above retains every selected row and column.
+    closures = {
+        "document_version_id": ("document_versions", "native_version_coverage_roles",
+            "native_version_capability_families", "native_version_capability_gaps"),
+        "extraction_context": ("native_producers", "native_producer_languages",
+            "native_producer_inputs", "native_revisions", "revision_capture_inputs"),
+        "native_witness": tuple(sorted(name for name in output if name.startswith("native_version_")))
+            + ("document_versions",),
+        "graph_hash": ("graph_projections", "graph_nodes", "graph_display_labels",
+            "native_version_declarations", "native_version_calls", "native_version_references",
+            "native_version_control_regions", "native_version_call_regions"),
+        "class_content_hash": ("class_projections", "classes", "class_relations",
+            "graph_projections", "graph_nodes", "native_version_declarations"),
+    }
+    output["opaque_input_closures"] = {
+        role: {name: output[name] for name in tables} for role, tables in closures.items()}
+    require(all(output[name]["rows"] > 0 for name in
+                ("document_versions", "native_version_declarations", "native_version_calls",
+                 "native_version_references", "native_version_control_regions", "graph_nodes",
+                 "graph_projections", "class_projections", "classes")),
+            "opaque hash input closure missing selected evidence")
+    require(output["semantic_import_reports"]["rows"] == 1,
+            "selected capture import report missing or ambiguous")
     require(output["semantic_raw_proofs"]["rows"] > 0
             and output["semantic_provenance"]["rows"] > 0
             and output["semantic_coverage"]["rows"] > 0, "no selected semantic/raw-linked evidence")
@@ -888,9 +917,11 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-23 selected-output view; every cell is kept after explicit identity mapping."""
-    def __init__(self, db, revision):
+    """Closed schema-23 view retaining all selected columns plus input-closure digests."""
+    def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
+        self.physical_root = physical_root.resolve(strict=True)
+        self.root_id = "path-" + hashlib.sha256(str(self.physical_root).encode()).hexdigest()
         header = db.execute("SELECT source_set_id,native_revision_id,source_inventory FROM native_revisions WHERE id=?",
                             (revision,)).fetchone()
         require(header is not None, "missing selected native header")
@@ -929,10 +960,23 @@ class SelectedView:
                 previous = self.ids[family].get(raw)
                 require(previous is None or previous == key, f"conflicting native {family} mapping")
                 self.ids[family][raw] = key
-        for gid, raw, name, kind in db.execute(
-                "SELECT gid,id,name,kind FROM graph_nodes WHERE gid IN "
-                "(SELECT gid FROM revision_documents WHERE revision_id=?)", (revision,)):
-            self.ids["graph-node"][raw] = (self.ids["gid"][gid], name, kind)
+        graph_count = 0
+        for gid, raw, name, kind, syntax in db.execute(
+                "SELECT n.gid,n.id,n.name,n.kind,d.syntax_id FROM graph_nodes n "
+                "JOIN graph_projections g ON g.gid=n.gid "
+                "JOIN native_version_declarations d ON d.vid=g.vid AND d.syntax_id=n.id "
+                "WHERE n.gid IN (SELECT gid FROM revision_documents WHERE revision_id=?)", (revision,)):
+            require(syntax in self.ids["syntax"], "graph node lacks selected native declaration")
+            key = (self.ids["gid"][gid], self.ids["syntax"][syntax], name, kind)
+            require(raw not in self.ids["graph-node"], "duplicate graph node identity")
+            self.ids["graph-node"][raw] = key
+            graph_count += 1
+        require(graph_count == db.execute(
+            "SELECT count(*) FROM graph_nodes WHERE gid IN "
+            "(SELECT gid FROM revision_documents WHERE revision_id=?)", (revision,)).fetchone()[0],
+            "unmapped selected graph node")
+        require(len(set(map(repr, self.ids["graph-node"].values()))) == graph_count,
+                "colliding normalized graph node identity")
         for cid, raw, name, qualified, path in db.execute(
                 "SELECT cid,id,name,qualified_name,path FROM classes WHERE cid IN "
                 "(SELECT cid FROM revision_documents WHERE revision_id=?)", (revision,)):
@@ -953,10 +997,28 @@ class SelectedView:
         require(len(selections) == 1, f"expected exactly one selected capture: {selections}")
         for capture, producer, artifact, source_set, captured_revision, captured_pin, manifest_bytes in selections:
             manifest = json.loads(manifest_bytes)
+            original = db.execute("SELECT source_inventory FROM native_revisions WHERE id=? "
+                                  "AND native_revision_id=? AND source_set_id=?",
+                                  (captured_pin, captured_revision, source_set)).fetchall()
+            require(len(original) == 1, "captured r1 native source inventory missing")
+            retained = json.loads(original[0][0])
+            expected_rows = [{"document": {"sourceSetId": source_set,
+                              "language": item["key"]["language"], "path": item["key"]["path"]},
+                              "contentHash": item["contentHash"]} for item in retained]
+            binary = db.execute("SELECT binary_bytes FROM semantic_raw_captures WHERE capture_id=?",
+                                (capture,)).fetchone()[0]
             require(source_set == self.source_set and manifest["sourceSet"]["id"] == source_set
+                    and manifest["sourceSet"]["rootId"] == self.root_id
+                    and source_set == "source-set:v1:" + self.root_id
+                    and manifest["metadata"]["projectRoot"] == self.physical_root.as_uri()
                     and manifest["sourceRevision"] == captured_revision
+                    and manifest["sourceDocuments"] == [
+                        {"language": item["key"]["language"], "relativePath": item["key"]["path"],
+                         "contentHash": item["contentHash"]} for item in retained]
+                    and manifest["sourceManifestHash"] == hashlib.sha256(canonical(expected_rows)).hexdigest()
+                    and hashlib.sha256(binary).hexdigest() == artifact
                     and manifest["artifacts"][0]["hash"] == artifact,
-                    "selected raw manifest disagrees with admitted capture")
+                    "selected raw manifest/source root/r1 inventory/binary digest mismatch")
             r1_doc = [(d["language"], d["relativePath"], d["contentHash"])
                       for d in manifest["sourceDocuments"]]
             require(len(r1_doc) == 4 and len(set(r1_doc)) == 4, "r1 document closure missing")
@@ -966,6 +1028,12 @@ class SelectedView:
             self.ids["capture"][capture] = (producer, artifact, tuple(r1_doc))
             self.capture_manifest = manifest
             self.capture_pin = captured_pin
+            imported = db.execute("""SELECT r.revision_id FROM semantic_revision_raw_selections r
+                JOIN semantic_import_reports i ON i.revision_id=r.revision_id AND i.producer_id=r.producer_id
+                WHERE r.capture_id=? AND r.producer_id=?""", (capture, producer)).fetchall()
+            require(len(imported) == 1 and imported[0][0] != revision,
+                    "selected capture has no unique imported report pin")
+            self.ids["pin"][imported[0][0]] = "<import-pin>"
             self.capture_bytes = manifest_bytes
             self.r1_docs = r1_doc
             for raw, kind, language, path, fact, canonical_bytes in db.execute(
@@ -1043,13 +1111,14 @@ class SelectedView:
         for field_name in ("device", "inode", "mtimeSeconds", "mtimeNanoseconds",
                            "ctimeSeconds", "ctimeNanoseconds"):
             require(isinstance(stat[field_name], int), f"non-integer capture {field_name}")
-            stat[field_name] = "<root-local-stat>"
+            stat[field_name] = 0
         return stat
 
     def row(self, table, cells):
         # A per-table selected scope is established by parity_digest before this point.
         if table == "native_source_sets":
-            require(cells["id"] == self.source_set and self.source_set.endswith(cells["root_id"]),
+            require(cells["id"] == self.source_set and cells["root_id"] == self.root_id
+                    and self.source_set == "source-set:v1:" + self.root_id,
                     "native source set is not tied to root identity")
             cells["root_id"] = "<physical-root>"
             cells["id"] = self.map("source-set", cells["id"])
@@ -1098,8 +1167,8 @@ class SelectedView:
                 if column in cells and cells[column] is not None:
                     cells[column] = self.embedded(json.loads(cells[column]))
         if table == "class_projections":
-            # The projection hash is a content digest of native root-derived IDs.
-            # It is replaced by the exact normalized class rows through cid linkage.
+            # Root-derived digest role is checked against the complete class/native
+            # input closure published by parity_digest, not on its own.
             cells["content_hash"] = ("normalized-class-projection", self.map("cid", cells["cid"]))
         if table == "graph_projections":
             cells["graph_hash"] = ("normalized-graph-projection", self.map("gid", cells["gid"]))
@@ -1251,9 +1320,9 @@ def main():
             finally:
                 oracle.stop()
             with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
-                selected_digest = parity_digest(db, local["revision"])
+                selected_digest = parity_digest(db, local["revision"], workspace)
             with closing(sqlite3.connect(f"file:{db_for(oracle_home)}?mode=ro", uri=True)) as db:
-                oracle_digest = parity_digest(db, oracle_revision)
+                oracle_digest = parity_digest(db, oracle_revision, oracle_root)
             (EVIDENCE / "smoke-selected-digest.json").write_text(json.dumps(selected_digest, indent=2) + "\n")
             (EVIDENCE / "smoke-oracle-digest.json").write_text(json.dumps(oracle_digest, indent=2) + "\n")
             require(selected_digest == oracle_digest, "smoke selected/native/raw-linked FULL oracle mismatch: " +
@@ -1320,7 +1389,7 @@ def main():
             # substitute for an edit publication.
             daemon.stop()
             with closing(sqlite3.connect(f"file:{db_for(home)}?mode=ro", uri=True)) as db:
-                warm_digest = parity_digest(db, prior)
+                warm_digest = parity_digest(db, prior, workspace)
             oracle_home = scratch / f"{size}-{shape}-independent-home"
             oracle_home.mkdir(mode=0o700)
             oracle_root = scratch / f"{size}-{shape}-independent-root"
@@ -1340,7 +1409,7 @@ def main():
             finally:
                 oracle.stop()
             with closing(sqlite3.connect(f"file:{db_for(oracle_home)}?mode=ro", uri=True)) as db:
-                cold_digest = parity_digest(db, oracle_revision)
+                cold_digest = parity_digest(db, oracle_revision, oracle_root)
             (EVIDENCE / f"{shape}-warm-digest.json").write_text(json.dumps(warm_digest, indent=2, sort_keys=True) + "\n")
             (EVIDENCE / f"{shape}-full-digest.json").write_text(json.dumps(cold_digest, indent=2, sort_keys=True) + "\n")
             require(warm_digest == cold_digest, f"{size} {shape}: complete selected output differs from FULL: " +
