@@ -344,6 +344,141 @@ fn selected_case(change_b: &str) {
         }
         _ => fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap(),
     }
+    if change_b == "corrupt_rebaseline" {
+        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        trellis::testing::wait_until("fixture daemon exit", || {
+            !trellis::testing::process_running(pid)
+        });
+        store
+            .with_index_sql_for_tests(|db| {
+                db.execute("UPDATE index_metadata SET stats='not-json'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let roots = TopologyRoots::isolated_for_tests(
+            if cfg!(target_os = "macos") {
+                home.join("Library/Caches/dev.squashmerge.trellis")
+            } else {
+                home.join(".cache/trellis")
+            },
+            if cfg!(target_os = "macos") {
+                home.join("Library/Application Support/dev.squashmerge.trellis")
+            } else {
+                home.join(".local/share/trellis")
+            },
+        );
+        let identity =
+            trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let rebaselined = trellis::store::Store::open(roots, identity).unwrap();
+        let options = trellis::indexer::IndexOptions::new(root.clone());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (next, session) = trellis::index_coordinator::reconcile_workspace(
+            &rebaselined,
+            &options,
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        session.verify().unwrap();
+        assert_ne!(next.index_generation, prior.index_generation);
+        assert!(
+            rebaselined
+                .retained_native_snapshot_at(next)
+                .unwrap()
+                .0
+                .revision
+                .documents
+                .len()
+                >= 2
+        );
+        assert!(rebaselined.semantic_at(next).unwrap().coverage.is_empty());
+        assert!(rebaselined.selected_raw_inputs_at(next).unwrap().is_empty());
+        rebaselined
+            .with_index_sql_for_tests(|db| {
+                let selections: i64 = db.query_row(
+                    "SELECT count(*) FROM semantic_revision_raw_selections",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(selections, 0);
+                Ok(())
+            })
+            .unwrap();
+        return;
+    }
+    if change_b == "bad_candidate" {
+        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        trellis::testing::wait_until("fixture daemon exit", || {
+            !trellis::testing::process_running(pid)
+        });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let options = trellis::indexer::IndexOptions::new(root.clone());
+        let (graph, mut native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        native.revision.documents[0].content_hash = "bad-candidate-hash".into();
+        let leader = store.publication_for_tests().unwrap();
+        assert!(
+            store
+                .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
+                .is_err()
+        );
+        assert_eq!(store.index_baseline().unwrap(), prior);
+        assert_eq!(store.semantic_at(prior).unwrap(), prior_semantic);
+        store.with_index_sql_for_tests(|db| {
+            let next: i64 = db.query_row("SELECT count(*) FROM native_revisions WHERE published_index_revision>?1", [prior.index_revision as i64], |row| row.get(0))?;
+            let failed: i64 = db.query_row("SELECT count(*) FROM semantic_coverage WHERE revision_id=?1 AND state='failed'", [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision+1)], |row| row.get(0))?;
+            assert_eq!((next, failed), (0, 0));
+            Ok(())
+        }).unwrap();
+        return;
+    }
+    if change_b == "structural_corruption" {
+        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        trellis::testing::wait_until("fixture daemon exit", || {
+            !trellis::testing::process_running(pid)
+        });
+        store.with_index_sql_for_tests(|db| {
+            db.pragma_update(None, "foreign_keys", "OFF")?;
+            db.execute("DELETE FROM semantic_requested_producers WHERE revision_id=?1 AND id='scip-typescript'", [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision)])?;
+            db.pragma_update(None, "foreign_keys", "ON")?;
+            Ok(())
+        }).unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let options = trellis::indexer::IndexOptions::new(root.clone());
+        let (graph, native, capture) =
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+                .unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        let error = store
+            .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("incompatible_index"),
+            "{error:#}"
+        );
+        store.with_index_sql_for_tests(|db| {
+            let revision: i64 = db.query_row("SELECT index_revision FROM index_metadata", [], |row| row.get(0))?;
+            assert_eq!(revision, prior.index_revision as i64);
+            let failed: i64 = db.query_row("SELECT count(*) FROM semantic_coverage WHERE revision_id=?1 AND state='failed'", [format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision + 1)], |row| row.get(0))?;
+            assert_eq!(failed, 0);
+            Ok(())
+        }).unwrap();
+        return;
+    }
     if matches!(change_b, "cancel_before" | "cancel_after") {
         let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
             .unwrap()
@@ -659,10 +794,24 @@ fn selected_case(change_b: &str) {
     }
     if change_b == "changed_a" {
         assert!(
+            prior_semantic
+                .provenance
+                .iter()
+                .any(|proof| proof.document.path == "src/A.js")
+        );
+        assert!(!prior_semantic.call_bindings.is_empty());
+        assert_eq!(store.semantic_at(prior).unwrap(), prior_semantic);
+        assert!(
             snapshot
                 .provenance
                 .iter()
                 .all(|proof| proof.document.path != "src/A.js")
+        );
+        assert!(
+            snapshot
+                .call_bindings
+                .iter()
+                .all(|binding| binding.join.anchor.document.path != "src/A.js")
         );
         assert!(
             snapshot
@@ -672,11 +821,33 @@ fn selected_case(change_b: &str) {
         );
     }
     if change_b == "missing_b" {
+        let a = snapshot
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/A.js")
+            .unwrap();
+        assert_eq!(
+            a.state,
+            trellis::semantic_evidence::CoverageState::Partial,
+            "{snapshot:?}"
+        );
+        assert!(a.selected && a.requested);
+        assert!(a.diagnostic.is_some());
+        assert!(
+            a.observed_roles
+                .contains(&trellis::semantic_evidence::Role::Definition)
+        );
         assert!(
             snapshot
                 .provenance
                 .iter()
                 .any(|proof| proof.document.path == "src/A.js" && proof.derived_from.is_some())
+        );
+        assert!(
+            snapshot
+                .call_bindings
+                .iter()
+                .all(|binding| binding.join.anchor.document.path != "src/A.js")
         );
         assert!(
             snapshot
@@ -704,6 +875,50 @@ fn selected_case(change_b: &str) {
             })
             .unwrap();
         assert_eq!(captured_target.syntax_id, current_target.syntax_id);
+        let retargeted: Vec<_> = snapshot
+            .call_bindings
+            .iter()
+            .filter(|binding| binding.join.anchor.document.path == "src/A.js")
+            .collect();
+        assert_eq!(
+            retargeted.len(),
+            1,
+            "expected unique rejoined A call: {snapshot:?}"
+        );
+        let call = retargeted[0];
+        assert_eq!(
+            call.resolution,
+            trellis::semantic_evidence::Resolution::Resolved
+        );
+        assert_eq!(call.stale_target, Some(false));
+        match call.declared_target.as_ref().expect("verified target") {
+            trellis::semantic_evidence::Target::Internal {
+                syntax_id,
+                revision_id,
+                ..
+            } => {
+                assert_eq!(syntax_id, &current_target.syntax_id);
+                assert_eq!(revision_id, &r2_native.revision.id);
+            }
+            other => panic!("expected a verified internal target, found {other:?}"),
+        }
+        let call_proof = snapshot
+            .provenance
+            .iter()
+            .find(|proof| proof.id == call.provenance_id)
+            .unwrap();
+        let raw = call_proof
+            .derived_from
+            .as_ref()
+            .expect("retargeted call requires one raw link");
+        let inputs = store.selected_raw_inputs_at(next).unwrap();
+        let captured_raw = inputs[0]
+            .proofs
+            .iter()
+            .find(|(id, _)| id == &raw.provenance_id)
+            .unwrap();
+        assert_eq!(captured_raw.1.fact_digest, raw.fact_digest);
+        assert_eq!(captured_raw.1.record_kind, "occurrence");
         let captured_proofs: std::collections::BTreeSet<_> = prior_semantic
             .provenance
             .iter()
@@ -777,6 +992,21 @@ fn selected_capture_survives_zero_claims_and_new_document() {
 #[test]
 fn full_native_publication_rejoins_accepted_capture() {
     selected_case("full");
+}
+
+#[test]
+fn corrupt_index_rebaseline_discards_prior_selected_capture() {
+    selected_case("corrupt_rebaseline");
+}
+
+#[test]
+fn bad_shared_native_candidate_rolls_back_without_producer_failure() {
+    selected_case("bad_candidate");
+}
+
+#[test]
+fn structural_selection_corruption_rolls_back_without_failed_producer_rows() {
+    selected_case("structural_corruption");
 }
 
 #[test]

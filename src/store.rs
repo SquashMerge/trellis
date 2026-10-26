@@ -6304,6 +6304,9 @@ fn selected_native_rejoin(
 ) -> Result<()> {
     use crate::{native_ids, semantic_evidence as sem};
     let key = semantic_pin_key(pin);
+    // The destination is shared by every selected producer. A corrupt measured
+    // candidate must abort this publication, never become one producer's failure.
+    crate::semantic_import::MeasuredFacts::new(native, sources)?;
     for input in selected {
         check_cancel(cancel)?;
         let attempt = (|| -> Result<(sem::SemanticPublication, sem::CapturedComponents)> {
@@ -12461,14 +12464,12 @@ impl Store {
         if semantic.is_some()
             || (expected.compatible
                 && expected.pin().is_some_and(|pin| pin.index_revision > 0)
-                && !self
-                    .selected_raw_input_results_at(prepared.prior_pin)?
-                    .is_empty())
+                && self.selected_links_for_reconciliation(prepared.prior_pin)?)
         {
             // Reused versions belong to the selected, previously validated pin.
             // Read their measured rows through that pin, not from the changed-only
             // artifact or from a newly fabricated measurement.
-            self.native_at(prepared.prior_pin, |db, selected| {
+            self.native_at_reconcile(prepared.prior_pin, |db, selected| {
                 for document in &native.revision.documents {
                     if prepared.changed_paths.contains(&document.key.path) {
                         continue;
@@ -14360,7 +14361,11 @@ impl Store {
             && let Some(pin) = baseline.pin().filter(|pin| pin.index_revision > 0)
             && self.disposition() != RecoveryDisposition::Rebuild
         {
-            self.selected_native_inputs_at(pin)?
+            if self.selected_links_for_reconciliation(pin)? {
+                self.selected_native_inputs_at(pin)?
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -15253,6 +15258,38 @@ impl Store {
         })
     }
 
+    fn native_at_reconcile<T>(
+        &self,
+        pin: IndexPin,
+        read: impl FnOnce(&Connection, &ReadRevision) -> Result<T>,
+    ) -> Result<T> {
+        (|| {
+            let mut db = self.cache()?;
+            let tx = storage_result(db.transaction())?;
+            begin_read_snapshot(
+                &tx,
+                &self.roots.index_db(&self.identity),
+                Duration::from_secs(5),
+            )?;
+            let selected = self.read_revision_for(&tx, Some(pin), true)?;
+            read(&tx, &selected)
+        })()
+        .map_err(|error| self.report_index_failure(error))
+    }
+
+    fn selected_links_for_reconciliation(&self, pin: IndexPin) -> Result<bool> {
+        (|| {
+            let db = self.cache()?;
+            let key = semantic_pin_key(pin);
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM semantic_revision_raw_selections WHERE revision_id=?1)",
+                [&key],
+                |row| row.get(0),
+            )?)
+        })()
+        .map_err(|error| self.report_index_failure(error))
+    }
+
     /// Resolve one deduplicated captured proof by its authenticated capture tuple.
     pub fn semantic_raw_proof_at(
         &self,
@@ -15296,7 +15333,15 @@ impl Store {
         &self,
         pin: IndexPin,
     ) -> Result<Vec<SelectedRawInputResult>> {
-        self.native_at(pin, |db, selected| {
+        self.selected_raw_input_results_at_with(pin, false)
+    }
+
+    fn selected_raw_input_results_at_with(
+        &self,
+        pin: IndexPin,
+        reconciling: bool,
+    ) -> Result<Vec<SelectedRawInputResult>> {
+        let read = |db: &Connection, selected: &ReadRevision| {
             let mut inputs = Vec::new();
             let links: Vec<(String, i64, String)> = db.prepare(
                 "SELECT producer_id,capture_id,captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?1 ORDER BY producer_id"
@@ -15307,55 +15352,101 @@ impl Store {
                     "SELECT h.version,h.executable_hash,p.kind,p.position_encoding FROM semantic_requested_producers h JOIN semantic_producers p ON p.id=h.id AND p.version=h.version WHERE h.revision_id=?1 AND h.id=?2",
                     params![selected.key,producer_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
                 ).optional()?;
-                let (version, executable_hash, kind, encoding) = descriptor.context(SelectedIntegrity("incompatible_index: selected producer descriptor missing".into()))?;
-                let languages = semantic_ordered(db,
-                    "SELECT ordinal,language FROM semantic_requested_producer_languages WHERE revision_id=?1 AND id=?2 ORDER BY ordinal", &[&selected.key,&producer_id])?;
+                let (version, executable_hash, kind, encoding) =
+                    descriptor.context(SelectedIntegrity(
+                        "incompatible_index: selected producer descriptor missing".into(),
+                    ))?;
+                let languages = semantic_ordered(
+                    db,
+                    "SELECT ordinal,language FROM semantic_requested_producer_languages WHERE revision_id=?1 AND id=?2 ORDER BY ordinal",
+                    &[&selected.key, &producer_id],
+                )?;
                 let producer = crate::semantic_evidence::Producer {
-                    id: producer_id.clone(), version, executable_hash,
-                    kind: semantic_enum(kind)?, position_encoding: semantic_enum(encoding)?, languages,
+                    id: producer_id.clone(),
+                    version,
+                    executable_hash,
+                    kind: semantic_enum(kind)?,
+                    position_encoding: semantic_enum(encoding)?,
+                    languages,
                 };
-                let selected_source_set: String = db.query_row("SELECT source_set_id FROM native_revisions WHERE id=?1", [&selected.key], |r| r.get(0))?;
+                let selected_source_set: String = db.query_row(
+                    "SELECT source_set_id FROM native_revisions WHERE id=?1",
+                    [&selected.key],
+                    |r| r.get(0),
+                )?;
                 let requested_documents = db.prepare(
                     "SELECT language,path FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND requested=1 ORDER BY language,path"
                 )?.query_map(params![selected.key,producer_id], |r| Ok(crate::native_evidence::DocumentKey { source_set_id:selected_source_set.clone(), language:r.get(0)?, path:r.get(1)? }))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let input = (|| -> Result<SelectedRawInput> {
-                let raw = db.query_row(
+                    let raw = db.query_row(
                     "SELECT producer_id,source_set_id,captured_revision,artifact_hash,decoder_version,binary_bytes,manifest_bytes FROM semantic_raw_captures WHERE capture_id=?1",
                     [capture_id], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, String>(3)?,r.get::<_, String>(4)?,r.get::<_, Vec<u8>>(5)?,r.get::<_, Vec<u8>>(6)?))
                 ).optional()?;
-                let (raw_producer,source_set_id,captured_revision,artifact_hash,decoder_version,binary_bytes,manifest_bytes) = raw.context(SelectedIntegrity("incompatible_index: selected capture missing".into()))?;
-                selected_ensure!(raw_producer == producer_id, "incompatible_index: selected capture producer mismatch");
-                let captured_revision_number: Option<i64> = db.query_row(
+                    let (
+                        raw_producer,
+                        source_set_id,
+                        captured_revision,
+                        artifact_hash,
+                        decoder_version,
+                        binary_bytes,
+                        manifest_bytes,
+                    ) = raw.context(SelectedIntegrity(
+                        "incompatible_index: selected capture missing".into(),
+                    ))?;
+                    selected_ensure!(
+                        raw_producer == producer_id,
+                        "incompatible_index: selected capture producer mismatch"
+                    );
+                    let captured_revision_number: Option<i64> = db.query_row(
                     "SELECT published_index_revision FROM native_revisions WHERE id=?1 AND native_revision_id=?2 AND source_set_id=?3",
                     params![captured_key,captured_revision,source_set_id], |r| r.get(0)
                 ).optional()?;
-                let captured_revision_number = captured_revision_number.context(SelectedIntegrity("incompatible_index: selected captured pin missing".into()))?;
-                let proofs = db.prepare(
+                    let captured_revision_number =
+                        captured_revision_number.context(SelectedIntegrity(
+                            "incompatible_index: selected captured pin missing".into(),
+                        ))?;
+                    let proofs = db.prepare(
                     "SELECT proof_id,record_kind,fact_digest,language,path,canonical_bytes FROM semantic_raw_proofs WHERE capture_id=?1 ORDER BY proof_id"
                 )?.query_map([capture_id], |r| Ok((r.get(0)?, StoredRawProof {record_kind:r.get(1)?,fact_digest:r.get(2)?,language:r.get(3)?,path:r.get(4)?,canonical_bytes:r.get(5)?})))?
                     .collect::<rusqlite::Result<_>>()?;
-                Ok(SelectedRawInput {
-                    producer: producer.clone(), requested_documents: requested_documents.clone(), producer_id, source_set_id, captured_revision,
-                    artifact_hash, decoder_version, binary_bytes, manifest_bytes, proofs,
-                    captured_pin:IndexPin {index_generation:pin.index_generation,index_revision:u64::try_from(captured_revision_number)?},
-                })
+                    Ok(SelectedRawInput {
+                        producer: producer.clone(),
+                        requested_documents: requested_documents.clone(),
+                        producer_id,
+                        source_set_id,
+                        captured_revision,
+                        artifact_hash,
+                        decoder_version,
+                        binary_bytes,
+                        manifest_bytes,
+                        proofs,
+                        captured_pin: IndexPin {
+                            index_generation: pin.index_generation,
+                            index_revision: u64::try_from(captured_revision_number)?,
+                        },
+                    })
                 })();
                 inputs.push((producer, requested_documents, input));
             }
             Ok(inputs)
-        })
+        };
+        if reconciling {
+            self.native_at_reconcile(pin, read)
+        } else {
+            self.native_at(pin, read)
+        }
     }
 
     fn selected_native_inputs_at(&self, pin: IndexPin) -> Result<Vec<SelectedNativeInput>> {
-        self.selected_raw_input_results_at(pin)?
+        self.selected_raw_input_results_at_with(pin, true)?
             .into_iter()
             .map(|(producer, requested_documents, raw)| {
                 let captured = match &raw {
                     Ok(input) => self
-                        .retained_native_snapshot_at(input.captured_pin)
+                        .retained_native_snapshot_at_with(input.captured_pin, true)
                         .and_then(|(native, sources)| {
-                            self.retained_native_components_at(input.captured_pin)
+                            self.retained_native_components_at_with(input.captured_pin, true)
                                 .map(|components| (native, sources, components))
                         }),
                     Err(error) => Err(SelectedIntegrity(format!(
@@ -16492,19 +16583,39 @@ impl Store {
         Vec<serde_json::Value>,
         Vec<serde_json::Value>,
     )> {
-        self.native_at(pin, |db, selected| {
+        self.retained_native_components_at_with(pin, false)
+    }
+
+    fn retained_native_components_at_with(
+        &self,
+        pin: IndexPin,
+        reconciling: bool,
+    ) -> Result<(
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    )> {
+        let read = |db: &Connection, selected: &ReadRevision| {
             let (toolchain, config, dependencies): (String, String, String) = db.query_row(
                 "SELECT retained_toolchain,retained_config,retained_dependencies FROM native_revisions WHERE id=?1",
                 [&selected.key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
             )?;
-            let toolchain = serde_json::from_str(&toolchain)
-                .context(SelectedIntegrity("incompatible_index: corrupt retained toolchain".into()))?;
-            let config = serde_json::from_str(&config)
-                .context(SelectedIntegrity("incompatible_index: corrupt retained config".into()))?;
-            let dependencies = serde_json::from_str(&dependencies)
-                .context(SelectedIntegrity("incompatible_index: corrupt retained dependencies".into()))?;
+            let toolchain = serde_json::from_str(&toolchain).context(SelectedIntegrity(
+                "incompatible_index: corrupt retained toolchain".into(),
+            ))?;
+            let config = serde_json::from_str(&config).context(SelectedIntegrity(
+                "incompatible_index: corrupt retained config".into(),
+            ))?;
+            let dependencies = serde_json::from_str(&dependencies).context(SelectedIntegrity(
+                "incompatible_index: corrupt retained dependencies".into(),
+            ))?;
             Ok((toolchain, config, dependencies))
-        })
+        };
+        if reconciling {
+            self.native_at_reconcile(pin, read)
+        } else {
+            self.native_at(pin, read)
+        }
     }
 
     /// Captured source bytes and measured native facts from one retained pin, without disk reads.
@@ -16515,34 +16626,126 @@ impl Store {
         crate::native_evidence::Artifact,
         BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
     )> {
+        self.retained_native_snapshot_at_with(pin, false)
+    }
+
+    fn retained_native_snapshot_at_with(
+        &self,
+        pin: IndexPin,
+        reconciling: bool,
+    ) -> Result<(
+        crate::native_evidence::Artifact,
+        BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
+    )> {
         use crate::native_evidence as n;
-        self.native_at(pin, |db, selected| {
+        let read = |db: &Connection, selected: &ReadRevision| {
             let (source_set_id, native_id, toolchain_hash, config_hash, dependency_hash, inventory): (String,String,String,String,String,String) = db.query_row("SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash,source_inventory FROM native_revisions WHERE id=?1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
-            let documents: Vec<n::Document> = serde_json::from_str(&inventory).context(SelectedIntegrity("incompatible_index: corrupt retained native manifest".into()))?;
+            let documents: Vec<n::Document> = serde_json::from_str(&inventory).context(
+                SelectedIntegrity("incompatible_index: corrupt retained native manifest".into()),
+            )?;
             let (producer_id, producer_version): (String,String) = db.query_row("SELECT producer_id,producer_version FROM document_versions d JOIN revision_documents m ON m.vid=d.vid WHERE m.revision_id=?1 LIMIT 1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let (executable_hash,kind,position_encoding): (String,String,String) = db.query_row("SELECT executable_hash,kind,position_encoding FROM native_producers WHERE id=?1 AND version=?2",params![producer_id,producer_version],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-            let languages = semantic_ordered(db,"SELECT ordinal,language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal",&[&producer_id,&producer_version])?;
-            let root_id: String = db.query_row("SELECT root_id FROM native_source_sets WHERE id=?1",[&source_set_id],|r|r.get(0))?;
-            let dependencies = semantic_ordered(db,"SELECT ordinal,dependency_id FROM native_source_set_dependencies WHERE source_set_id=?1 ORDER BY ordinal",&[&source_set_id])?;
-            let source_set = n::SourceSet { id: source_set_id.clone(),root_id,languages: languages.clone(),dependencies };
-            let revision = n::Revision { id:native_id,source_set_id,documents,toolchain_hash,config_hash,dependency_hash };
+            let languages = semantic_ordered(
+                db,
+                "SELECT ordinal,language FROM native_producer_languages WHERE producer_id=?1 AND producer_version=?2 ORDER BY ordinal",
+                &[&producer_id, &producer_version],
+            )?;
+            let root_id: String = db.query_row(
+                "SELECT root_id FROM native_source_sets WHERE id=?1",
+                [&source_set_id],
+                |r| r.get(0),
+            )?;
+            let dependencies = semantic_ordered(
+                db,
+                "SELECT ordinal,dependency_id FROM native_source_set_dependencies WHERE source_set_id=?1 ORDER BY ordinal",
+                &[&source_set_id],
+            )?;
+            let source_set = n::SourceSet {
+                id: source_set_id.clone(),
+                root_id,
+                languages: languages.clone(),
+                dependencies,
+            };
+            let revision = n::Revision {
+                id: native_id,
+                source_set_id,
+                documents,
+                toolchain_hash,
+                config_hash,
+                dependency_hash,
+            };
             let mut sources = BTreeMap::new();
-            let (mut coverage,mut provenance,mut declarations,mut calls,mut control_regions,mut references,mut capability_reports) = (vec![],vec![],vec![],vec![],vec![],vec![],vec![]);
+            let (
+                mut coverage,
+                mut provenance,
+                mut declarations,
+                mut calls,
+                mut control_regions,
+                mut references,
+                mut capability_reports,
+            ) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
             for document in &revision.documents {
-                let scope = v8_native_scope_for(db,&document.key,selected)?.context(SelectedIntegrity("incompatible_index: retained native document absent".into()))?;
-                let source = self.selected_source_row_for(db,&document.key.path,selected)?.context(SelectedIntegrity("incompatible_index: retained source missing".into()))?;
-                selected_ensure!(source.language == document.key.language && source.hash == document.content_hash && source.text.len() == document.byte_length,"incompatible_index: retained source identity mismatch");
-                sources.insert(document.key.clone(),source.text.into_bytes());
-                coverage.push(read_native_coverage_v8(db,&scope)?);
-                provenance.push(n::Provenance { id:scope.proof_id(), producer_id:scope.producer_id.clone(), document:document.key.clone(), revision_id:revision.id.clone(), content_hash:document.content_hash.clone(), evidence_kind:"measuredSyntax".into(), basis: None, freshness:"fresh".into(), derived_from:None });
-                declarations.extend(read_native_declarations_v8(db,&scope,None,true)?);
-                calls.extend(read_native_calls_v8(db,&scope,None)?);
-                control_regions.extend(read_native_control_regions_v8(db,&scope,None)?);
-                references.extend(read_native_references(db,&scope,None)?);
-                capability_reports.push(read_native_capability_report(db,&scope)?);
+                let scope = v8_native_scope_for(db, &document.key, selected)?.context(
+                    SelectedIntegrity("incompatible_index: retained native document absent".into()),
+                )?;
+                let source = self
+                    .selected_source_row_for(db, &document.key.path, selected)?
+                    .context(SelectedIntegrity(
+                        "incompatible_index: retained source missing".into(),
+                    ))?;
+                selected_ensure!(
+                    source.language == document.key.language
+                        && source.hash == document.content_hash
+                        && source.text.len() == document.byte_length,
+                    "incompatible_index: retained source identity mismatch"
+                );
+                sources.insert(document.key.clone(), source.text.into_bytes());
+                coverage.push(read_native_coverage_v8(db, &scope)?);
+                provenance.push(n::Provenance {
+                    id: scope.proof_id(),
+                    producer_id: scope.producer_id.clone(),
+                    document: document.key.clone(),
+                    revision_id: revision.id.clone(),
+                    content_hash: document.content_hash.clone(),
+                    evidence_kind: "measuredSyntax".into(),
+                    basis: None,
+                    freshness: "fresh".into(),
+                    derived_from: None,
+                });
+                declarations.extend(read_native_declarations_v8(db, &scope, None, true)?);
+                calls.extend(read_native_calls_v8(db, &scope, None)?);
+                control_regions.extend(read_native_control_regions_v8(db, &scope, None)?);
+                references.extend(read_native_references(db, &scope, None)?);
+                capability_reports.push(read_native_capability_report(db, &scope)?);
             }
-            Ok((n::Artifact { producer:n::Producer { id:producer_id,version:producer_version,executable_hash,kind,languages,position_encoding },source_set,revision,coverage,provenance,declarations,calls,control_regions,references,capability_reports },sources))
-        })
+            Ok((
+                n::Artifact {
+                    producer: n::Producer {
+                        id: producer_id,
+                        version: producer_version,
+                        executable_hash,
+                        kind,
+                        languages,
+                        position_encoding,
+                    },
+                    source_set,
+                    revision,
+                    coverage,
+                    provenance,
+                    declarations,
+                    calls,
+                    control_regions,
+                    references,
+                    capability_reports,
+                },
+                sources,
+            ))
+        };
+        if reconciling {
+            self.native_at_reconcile(pin, read)
+        } else {
+            self.native_at(pin, read)
+        }
     }
 
     pub fn native_source_at(
