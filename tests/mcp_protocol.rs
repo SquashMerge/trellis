@@ -11151,7 +11151,7 @@ async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
                 envelope["data"]["searchIndex"],
                 json!({
                     "state":"unavailable","modelId":null,"modelName":null,"backend":null,
-                    "declarations":51,"embedded":0,"lexical":"complete"
+                    "declarations":51,"embedded":0,"lexical":"complete","unavailableReason":null
                 })
             );
             assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
@@ -11551,7 +11551,8 @@ async fn mcp_search_without_model_ignores_stale_and_corrupt_optional_cache() {
                 envelope["data"]["searchIndex"],
                 json!({
                     "state":"unavailable", "modelId":null, "modelName":null,
-                    "backend":backend, "declarations":1, "embedded":0, "lexical":"complete"
+                    "backend":backend, "declarations":1, "embedded":0, "lexical":"complete",
+                    "unavailableReason":null
                 })
             );
             assert_eq!(envelope["partial"], false);
@@ -11572,12 +11573,10 @@ struct McpSearchEmbedderFactory {
 impl trellis::search_embed::SearchEmbedderFactory for McpSearchEmbedderFactory {
     fn load(
         &self,
-        cancel: &std::sync::atomic::AtomicBool,
+        control: &trellis::search_embed::EmbeddingControl<'_>,
     ) -> Result<Box<dyn trellis::search_embed::SearchEmbedder>, trellis::search_embed::EmbedError>
     {
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(trellis::search_embed::EmbedError::Cancelled);
-        }
+        control.check()?;
         self.loads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(Box::new(McpSearchEmbedder))
     }
@@ -11589,12 +11588,10 @@ impl trellis::search_embed::SearchEmbedder for McpSearchEmbedder {
         &self,
         texts: &[String],
         _kind: trellis::search_embed::InputKind,
-        cancel: &std::sync::atomic::AtomicBool,
+        control: &trellis::search_embed::EmbeddingControl<'_>,
     ) -> Result<Vec<trellis::search_embed::QuantizedVector>, trellis::search_embed::EmbedError>
     {
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(trellis::search_embed::EmbedError::Cancelled);
-        }
+        control.check()?;
         Ok(texts
             .iter()
             .map(|_| trellis::search_embed::QuantizedVector {
@@ -11602,6 +11599,197 @@ impl trellis::search_embed::SearchEmbedder for McpSearchEmbedder {
             })
             .collect())
     }
+}
+
+#[derive(Clone)]
+struct McpBudgetEmbedderFactory {
+    inference: ReadGate,
+}
+
+impl trellis::search_embed::SearchEmbedderFactory for McpBudgetEmbedderFactory {
+    fn load(
+        &self,
+        control: &trellis::search_embed::EmbeddingControl<'_>,
+    ) -> Result<Box<dyn trellis::search_embed::SearchEmbedder>, trellis::search_embed::EmbedError>
+    {
+        control.check()?;
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl trellis::search_embed::SearchEmbedder for McpBudgetEmbedderFactory {
+    fn embed(
+        &self,
+        texts: &[String],
+        kind: trellis::search_embed::InputKind,
+        control: &trellis::search_embed::EmbeddingControl<'_>,
+    ) -> Result<Vec<trellis::search_embed::QuantizedVector>, trellis::search_embed::EmbedError>
+    {
+        control.check()?;
+        assert_eq!(kind, trellis::search_embed::InputKind::Query);
+        // Model work has begun within budget. The next cooperative boundary
+        // observes the request's advanced clock, not wall-clock elapsed time.
+        (self.inference.hook())();
+        control.check()?;
+        McpSearchEmbedder.embed(texts, kind, control)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_inference_budget_returns_complete_lexical_and_keeps_required_failures() {
+    let source: String = (0..17)
+        .map(|index| format!("function orchard{index:02}() {{}}\n"))
+        .collect();
+    let mut schema_pairs = Vec::new();
+    for scenario in ["budget", "native_fts", "cancel", "root"] {
+        let inference = ReadGate::default();
+        let _release_on_failure = McpFillRelease([inference.clone(), ReadGate::default()]);
+        let (fixture, _service, _) = SearchMcpFixture::with_search(
+            &[("a.js", &source)],
+            |roots| {
+                std::sync::Arc::new(
+                    trellis::daemon::search::SearchService::with_embedder_for_tests(
+                        roots.clone(),
+                        std::sync::Arc::new(McpBudgetEmbedderFactory {
+                            inference: inference.clone(),
+                        }),
+                    )
+                    .unwrap(),
+                )
+            },
+            false,
+        )
+        .await;
+        let runtime = fixture
+            .registry
+            .lock()
+            .await
+            .runtime(&fixture.identity.root_key)
+            .unwrap();
+        let origin = std::time::Instant::now() - trellis::mcp::CALL_DEADLINE;
+        runtime.freeze_mcp_call_clock_for_tests(origin);
+        let clock = runtime.clone();
+        let hooks = trellis::mcp::TransportHooksForTests {
+            paused_clock_for_tests: Some(std::sync::Arc::new(move || {
+                clock.mcp_call_clock_now_for_tests()
+            })),
+            ..Default::default()
+        };
+        if scenario == "native_fts" {
+            let store =
+                trellis::store::Store::open_for_tests(fixture._temp.path(), &fixture.identity.root)
+                    .unwrap();
+            let writer = store.publication_for_tests().unwrap();
+            store.corrupt_search_fts_for_tests(&writer).unwrap();
+        }
+        let (mut client, mut reader, session) =
+            hooked_session(&fixture.identity, &fixture.registry, 211, None, hooks);
+        writeln!(
+            client,
+            "{}",
+            call(
+                false,
+                json!(1),
+                "trellis_search_symbols",
+                json!({
+                    "schemaVersion":1,"query":"orchard","limit":50,
+                    "expectedBasis":SearchMcpFixture::basis(fixture.current)
+                })
+            )
+        )
+        .unwrap();
+        let waiter = inference.clone();
+        tokio::task::spawn_blocking(move || waiter.await_held(1))
+            .await
+            .unwrap();
+        runtime.advance_mcp_clock_for_tests(Duration::from_secs(3));
+        assert_eq!(
+            runtime.mcp_call_clock_now_for_tests(),
+            origin + Duration::from_secs(3)
+        );
+        assert!(runtime.mcp_call_clock_now_for_tests() < origin + trellis::mcp::CALL_DEADLINE);
+        match scenario {
+            "cancel" => {
+                writeln!(
+                    client,
+                    "{}",
+                    json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+                    "params":{"requestId":1}})
+                )
+                .unwrap();
+                // The following response proves the transport processed the
+                // cancellation before inference is allowed to finish.
+                writeln!(client, "{}", modern(json!(2), "tools/list", json!({}))).unwrap();
+                assert_eq!(next_reply(&mut reader)["id"], 2);
+            }
+            "root" => {
+                fs::rename(
+                    &fixture.identity.root,
+                    fixture._temp.path().join("moved-checkout"),
+                )
+                .unwrap();
+                fs::create_dir(&fixture.identity.root).unwrap();
+            }
+            _ => {}
+        }
+        inference.open();
+        if scenario == "cancel" {
+            writeln!(client, "{}", modern(json!(3), "tools/list", json!({}))).unwrap();
+            assert_eq!(
+                next_reply(&mut reader)["id"],
+                3,
+                "cancelled search emitted evidence"
+            );
+        } else {
+            let reply = next_reply(&mut reader);
+            assert_eq!(reply["id"], 1);
+            if scenario == "root" {
+                tool(&reply, Some("root_changed"), true);
+                assert!(reply["result"]["structuredContent"].get("data").is_none());
+                schema_pairs.push(search_schema_pair(&reply));
+            } else if scenario == "native_fts" {
+                tool(&reply, Some("store_unavailable"), true);
+                assert!(reply["result"]["structuredContent"].get("data").is_none());
+                schema_pairs.push(search_schema_pair(&reply));
+            } else {
+                tool(&reply, None, true);
+                let envelope = &reply["result"]["structuredContent"];
+                assert_eq!(
+                    envelope["evidenceBasis"],
+                    SearchMcpFixture::basis(fixture.current)
+                );
+                assert_eq!(
+                    envelope["data"]["searchIndex"],
+                    json!({
+                        "state":"unavailable","modelId":null,"modelName":null,"backend":"cpu",
+                        "declarations":17,"embedded":0,"lexical":"complete",
+                        "unavailableReason":"vector_budget_exceeded"
+                    })
+                );
+                let hits = envelope["data"]["hits"].as_array().unwrap();
+                assert_eq!(hits.len(), 17);
+                let names: std::collections::BTreeSet<_> = hits
+                    .iter()
+                    .map(|hit| hit["name"].as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(
+                    names,
+                    (0..17).map(|index| format!("orchard{index:02}")).collect()
+                );
+                for (index, hit) in hits.iter().enumerate() {
+                    assert_eq!(hit["rank"], index + 1);
+                    assert_eq!(hit["matchedBy"], json!(["lexical"]));
+                }
+                assert_eq!(envelope["partial"], false);
+                assert_eq!(envelope["truncated"], false);
+                schema_pairs.push(search_schema_pair(&reply));
+            }
+        }
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+    validate_structured_content(&schema_pairs);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11627,6 +11815,7 @@ async fn mcp_search_hybrid_ranks_both_arms_and_vector_only_with_partial_then_com
             "orchard",
             &cancel,
             std::time::Instant::now() + trellis::testing::HANG_BACKSTOP,
+            None,
         )
         .unwrap()
         .model_id()
@@ -11708,6 +11897,13 @@ async fn mcp_search_hybrid_ranks_both_arms_and_vector_only_with_partial_then_com
         assert_eq!(status["declarations"], 2);
         assert_eq!(status["embedded"], if complete { 2 } else { 1 });
         assert_eq!(status["lexical"], "complete");
+        assert_eq!(status["unavailableReason"], Value::Null);
+        assert!(
+            status
+                .as_object()
+                .unwrap()
+                .contains_key("unavailableReason")
+        );
         assert_eq!(
             envelope["partial"], false,
             "vector misses are not native incompleteness"
@@ -11783,9 +11979,10 @@ struct McpFillEmbedderFactory {
 impl trellis::search_embed::SearchEmbedderFactory for McpFillEmbedderFactory {
     fn load(
         &self,
-        _cancel: &std::sync::atomic::AtomicBool,
+        control: &trellis::search_embed::EmbeddingControl<'_>,
     ) -> Result<Box<dyn trellis::search_embed::SearchEmbedder>, trellis::search_embed::EmbedError>
     {
+        control.check()?;
         self.loads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(Box::new(self.clone()))
     }
@@ -11795,7 +11992,7 @@ impl trellis::search_embed::SearchEmbedder for McpFillEmbedderFactory {
         &self,
         texts: &[String],
         kind: trellis::search_embed::InputKind,
-        cancel: &std::sync::atomic::AtomicBool,
+        control: &trellis::search_embed::EmbeddingControl<'_>,
     ) -> Result<Vec<trellis::search_embed::QuantizedVector>, trellis::search_embed::EmbedError>
     {
         if kind == trellis::search_embed::InputKind::Document {
@@ -11810,7 +12007,7 @@ impl trellis::search_embed::SearchEmbedder for McpFillEmbedderFactory {
                 _ => panic!("unexpected third document batch"),
             }
         }
-        McpSearchEmbedder.embed(texts, kind, cancel)
+        McpSearchEmbedder.embed(texts, kind, control)
     }
 }
 

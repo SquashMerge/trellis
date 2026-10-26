@@ -286,7 +286,9 @@ pub fn write_response(writer: &mut impl Write, response: &Value) -> io::Result<(
     write_capped(writer, response, RESPONSE_BYTES)
 }
 fn write_capped(writer: &mut impl Write, response: &Value, cap: usize) -> io::Result<()> {
+    let phase = crate::search_model::SearchPhaseTimer::start("wire_serialization");
     let mut encoded = serde_json::to_vec(response).map_err(io::Error::other)?;
+    drop(phase);
     if encoded.len() + 1 > cap {
         return Err(io::Error::other("response too large"));
     }

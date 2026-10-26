@@ -634,12 +634,11 @@ fn admitted_search_snapshot_is_head_guarded_and_hydrates_ranked_prefix_only() {
             .windows(2)
             .all(|pair| pair[0].key.syntax_id.as_bytes() < pair[1].key.syntax_id.as_bytes())
     );
-    assert_eq!(candidates.scope[1], [2, 2, 0, 0, 0]);
     let selected = read
         .mcp_search_hydrate(&candidates.lexical[..1], first, &mut || Ok(()))
         .unwrap();
     assert_eq!(selected.pin, first);
-    assert_eq!(selected.scope, candidates.scope);
+    assert_eq!(selected.scope[1], [2, 2, 0, 0, 0]);
     assert_eq!(selected.symbols.len(), 1);
     assert_eq!(selected.provenance.len(), 1);
     assert_eq!(
@@ -650,7 +649,7 @@ fn admitted_search_snapshot_is_head_guarded_and_hydrates_ranked_prefix_only() {
     let empty = read.mcp_search_hydrate(&[], first, &mut || Ok(())).unwrap();
     assert!(empty.symbols.is_empty());
     assert!(empty.provenance.is_empty());
-    assert_eq!(empty.scope, candidates.scope);
+    assert_eq!(empty.scope, selected.scope);
     read.finish(()).unwrap();
     drop(read);
     fs::write(root.path().join("cards.rs"), "fn changed() {}\n").unwrap();
@@ -682,7 +681,8 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
         .mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
         .unwrap();
     assert!(candidates.lexical.is_empty());
-    assert_eq!(candidates.scope[1], [1, 0, 1, 0, 0]);
+    let empty = read.mcp_search_hydrate(&[], pin, &mut || Ok(())).unwrap();
+    assert_eq!(empty.scope[1], [1, 0, 1, 0, 0]);
     let error = read
         .mcp_search_candidates("orchard", Some(pin), &mut || {
             anyhow::bail!("deadline_exceeded")
@@ -717,6 +717,31 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
             "missing required search table must fail admission: {error:#}"
         ),
     }
+}
+
+#[test]
+fn empty_search_hydration_rejects_unrelated_corrupt_scope() {
+    let (_state, root, store, cancel) = fixture();
+    fs::write(root.path().join("other.rs"), "fn other() {}\n").unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    store
+        .mcp_set_coverage_for_tests(&leader, "other.rs", false, "failed")
+        .unwrap();
+    let read = store.evidence_response().unwrap();
+    let candidates = read
+        .mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
+        .unwrap();
+    assert!(candidates.lexical.is_empty());
+    let error = read
+        .mcp_search_hydrate(&[], pin, &mut || Ok(()))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("store_unavailable: inconsistent native coverage tuple")
+    );
 }
 
 #[test]

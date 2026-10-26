@@ -202,13 +202,12 @@ pub(super) fn publish_head(db: &Connection, revision: &str) -> Result<()> {
     Ok(())
 }
 
-/// Candidate identities, lexical order and native scope from one admitted head.
+/// Candidate identities and lexical order from one admitted head.
 #[derive(Debug)]
 pub struct McpSearchCandidates {
     pub pin: IndexPin,
     pub cards: Vec<crate::search_rank::SearchCandidate>,
     pub lexical: Vec<crate::search_rank::SearchCandidateKey>,
-    pub scope: [[u64; 5]; 4],
 }
 
 // The callback and guard are scoped to a synchronous admitted read. Preserve the
@@ -294,7 +293,7 @@ impl EvidenceResponse {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
             ensure!(expected.is_none_or(|pin| pin == selected.pin),
                 "revision conflict: expected basis differs from admitted head");
-            let scope = self.mcp_find_scope(&selected, check)?;
+            let candidates_phase = crate::search_model::SearchPhaseTimer::start("head_candidates");
             let mut statement = self.db.prepare(
                 "SELECT c.vid,c.syntax_id,c.card_hash
                  FROM native_version_search_cards c
@@ -320,6 +319,8 @@ impl EvidenceResponse {
             let corpus: i64 = self.db.query_row("SELECT count(*) FROM head_search_fts", [], |row| row.get(0))?;
             ensure!(usize::try_from(corpus).ok() == Some(cards.len()),
                 SelectedIntegrity("store_unavailable: head search corpus mismatch".into()));
+            drop(candidates_phase);
+            let _phase = crate::search_model::SearchPhaseTimer::start("lexical_search");
             let mut lexical = Vec::new();
             if let Some(expression) = crate::search_lexical::query_expression(&self.db, query)? {
                 let mut statement = self.db.prepare(
@@ -338,7 +339,7 @@ impl EvidenceResponse {
                     lexical.push(SearchCandidateKey { version_id: row.get(0)?, syntax_id: stored_id_row(row,1,false)? });
                 }
             }
-            Ok(McpSearchCandidates { pin: selected.pin, cards, lexical, scope: scope.counts })
+            Ok(McpSearchCandidates { pin: selected.pin, cards, lexical })
         })
     }
 
@@ -350,6 +351,7 @@ impl EvidenceResponse {
         expected: IndexPin,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<super::mcp_read::McpFindWithLines> {
+        let _phase = crate::search_model::SearchPhaseTimer::start("search_hydration");
         ensure!(keys.len() <= 50, "invalid_request: search hydration limit");
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;

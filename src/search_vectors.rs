@@ -94,6 +94,13 @@ fn present(path: &Path) -> Result<bool> {
     }
 }
 fn open(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
+    open_with_wait(path, writable, BUSY_WAIT)
+}
+fn open_with_wait(
+    path: &Path,
+    writable: bool,
+    busy_wait: Duration,
+) -> Result<ProtectedSqliteConnection> {
     unavailable((|| {
         ensure!(path.is_absolute(), "vector cache path must be absolute");
         let path = fs::canonicalize(path.parent().ok_or(StoreUnavailable)?)?
@@ -109,7 +116,7 @@ fn open(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
         };
         let db =
             crate::store::protected_sqlite_open(path, access | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        storage(db.busy_timeout(BUSY_WAIT))?;
+        storage(db.busy_timeout(busy_wait))?;
         if !writable {
             storage(db.pragma_update(None, "query_only", "ON"))?;
         }
@@ -352,6 +359,39 @@ impl VectorCacheReader {
         }
         Ok(Some(Self { db }))
     }
+    /// Query-only reader with contention waits bounded by the vector budget.
+    /// Actual storage failures take precedence over a subsequent budget check.
+    pub fn open_existing_with_budget(
+        path: &Path,
+        budget: &crate::search_embed::QueryBudget,
+    ) -> Result<Option<Self>> {
+        budget.check()?;
+        if !unavailable(present(path))? {
+            budget.check()?;
+            return Ok(None);
+        }
+        let mut db = open_with_wait(path, false, BUSY_WAIT.min(budget.remaining()))?;
+        budget.check()?;
+        storage(db.busy_timeout(BUSY_WAIT.min(budget.remaining())))?;
+        {
+            let tx = storage(db.transaction())?;
+            validate(&tx)?;
+        }
+        budget.check()?;
+        Ok(Some(Self { db }))
+    }
+
+    pub fn snapshot_with_budget(
+        &mut self,
+        budget: &crate::search_embed::QueryBudget,
+    ) -> Result<VectorSnapshot<'_>> {
+        budget.check()?;
+        storage(self.db.busy_timeout(BUSY_WAIT.min(budget.remaining())))?;
+        let snapshot = snapshot(&mut self.db)?;
+        budget.check()?;
+        Ok(snapshot)
+    }
+
     pub fn snapshot(&mut self) -> Result<VectorSnapshot<'_>> {
         snapshot(&mut self.db)
     }
@@ -373,6 +413,37 @@ impl VectorSnapshot<'_> {
     pub fn entry_count(&self) -> u64 {
         self.entries
     }
+    /// Visit the active model in primary-key order without copying vector rows.
+    /// Non-TEXT keys cannot match a valid card hash. Non-BLOB vectors are misses.
+    /// Borrowed values live only for the callback; callback failures retain their
+    /// original type, including caller cancellation and vector sub-budget errors.
+    pub(crate) fn scan_model(
+        &self,
+        model_id: &str,
+        visit: &mut impl FnMut(Option<&[u8]>, Option<&[u8]>) -> Result<()>,
+    ) -> Result<()> {
+        if !valid_key(model_id) {
+            return Err(InvalidVector.into());
+        }
+        let mut statement =
+            storage(self.tx.prepare(
+                "SELECT card_hash,vector FROM vectors WHERE model_id=?1 ORDER BY card_hash",
+            ))?;
+        let mut rows = storage(statement.query([model_id]))?;
+        while let Some(row) = storage(rows.next())? {
+            let hash = match storage(row.get_ref(0))? {
+                ValueRef::Text(bytes) => Some(bytes),
+                _ => None,
+            };
+            let vector = match storage(row.get_ref(1))? {
+                ValueRef::Blob(bytes) => Some(bytes),
+                _ => None,
+            };
+            visit(hash, vector)?;
+        }
+        Ok(())
+    }
+
     /// Invalid stored vector bytes are a miss. SQLite stepping/I/O failures are
     /// store_unavailable, never a fabricated hit or a partial vector.
     pub fn get(&self, model_id: &str, card_hash: &str) -> Result<Option<Vec<i8>>> {
@@ -448,6 +519,265 @@ mod tests {
             VectorCacheWriter::open_with_budget(&directory.path().join("vectors.db"), budget)
                 .unwrap();
         (directory, writer)
+    }
+
+    #[test]
+    fn query_reader_budget_bounds_wait_without_changing_storage_errors() {
+        use crate::search_embed::{EmbedError, QueryBudget};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (directory, writer) = cache(32 * 1024);
+        let path = directory.path().join("vectors.db");
+        drop(writer);
+        let now = Instant::now();
+        let expired = QueryBudget::new(now, Arc::new(move || now));
+        let error = match VectorCacheReader::open_existing_with_budget(&path, &expired) {
+            Err(error) => error,
+            Ok(_) => panic!("expired budget opened the vector cache"),
+        };
+        assert!(matches!(
+            error.downcast_ref::<EmbedError>(),
+            Some(EmbedError::BudgetExceeded)
+        ));
+        let allowance = Duration::from_millis(250);
+        let budget = QueryBudget::new(now + allowance, Arc::new(move || now));
+        let mut reader = VectorCacheReader::open_existing_with_budget(&path, &budget)
+            .unwrap()
+            .unwrap();
+        let wait: i64 = reader
+            .db
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(wait, allowance.as_millis() as i64);
+        assert_eq!(
+            reader.snapshot_with_budget(&budget).unwrap().entry_count(),
+            0
+        );
+        assert!(reader.snapshot_with_budget(&expired).is_err());
+        drop(reader);
+        let db = open(&path, true).unwrap();
+        db.pragma_update(None, "user_version", 2).unwrap();
+        drop(db);
+        let error = match VectorCacheReader::open_existing_with_budget(&path, &budget) {
+            Err(error) => error,
+            Ok(_) => panic!("incompatible format became a budget fallback"),
+        };
+        assert!(error.is::<StoreUnavailable>());
+    }
+
+    #[test]
+    fn ordered_scan_borrows_current_model_rows_and_keeps_malformed_misses() {
+        let (_directory, mut writer) = cache(128 * 1024);
+        let model = key(1);
+        let other = key(2);
+        for card in [6, 3, 5, 4] {
+            writer.put(&model, &key(card), &[-128, 127]).unwrap();
+        }
+        writer.put(&other, &key(3), &[1, 2]).unwrap();
+        writer
+            .db
+            .execute(
+                "UPDATE vectors SET vector=CAST(X'80' AS TEXT) WHERE model_id=?1 AND card_hash=?2",
+                params![model, key(4)],
+            )
+            .unwrap();
+        writer
+            .db
+            .execute(
+                "UPDATE vectors SET vector=zeroblob(2) WHERE model_id=?1 AND card_hash=?2",
+                params![model, key(5)],
+            )
+            .unwrap();
+        writer
+            .db
+            .execute(
+                "UPDATE vectors SET vector=X'' WHERE model_id=?1 AND card_hash=?2",
+                params![model, key(6)],
+            )
+            .unwrap();
+        let ages = |db: &rusqlite::Connection| -> Vec<i64> {
+            db.prepare("SELECT touched FROM vectors ORDER BY model_id,card_hash")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let before = ages(&writer.db);
+        {
+            let snapshot = writer.snapshot().unwrap();
+            let mut seen = Vec::new();
+            snapshot
+                .scan_model(&model, &mut |hash, bytes| {
+                    seen.push((hash.unwrap().to_vec(), bytes.map(<[u8]>::to_vec)));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                seen.iter()
+                    .map(|(hash, _)| hash.as_slice())
+                    .collect::<Vec<_>>(),
+                [3, 4, 5, 6]
+                    .iter()
+                    .map(|card| key(*card).into_bytes())
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(seen[0].1.as_deref(), Some(&[128, 127][..]));
+            assert_eq!(seen[1].1, None);
+            assert_eq!(snapshot.get(&model, &key(5)).unwrap(), None);
+            assert_eq!(snapshot.get(&model, &key(6)).unwrap(), None);
+        }
+        assert_eq!(ages(&writer.db), before);
+    }
+
+    #[test]
+    fn scan_failure_after_rows_is_typed_and_snapshot_stays_pinned() {
+        let (directory, mut writer) = cache(128 * 1024);
+        let model = key(1);
+        for card in 2..5 {
+            writer.put(&model, &key(card), &[1, -2]).unwrap();
+        }
+        let mut reader = VectorCacheReader::open_existing(&directory.path().join("vectors.db"))
+            .unwrap()
+            .unwrap();
+        let snapshot = reader.snapshot().unwrap();
+        let mut seen = 0;
+        let error = snapshot
+            .scan_model(&model, &mut |_, _| {
+                seen += 1;
+                if seen == 2 {
+                    return Err(StorageBusy.into());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(seen, 2);
+        assert!(error.is::<StorageBusy>());
+        // A callback failure never commits or releases the caller's snapshot.
+        assert!(
+            writer
+                .put(&model, &key(2), &[3])
+                .unwrap_err()
+                .is::<StorageBusy>()
+        );
+        let mut old = Vec::new();
+        snapshot
+            .scan_model(&model, &mut |_, vector| {
+                old.push(vector.unwrap().to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(old, vec![vec![1, 254]; 3]);
+        drop(snapshot);
+        writer.put(&model, &key(2), &[3]).unwrap();
+        let next = reader.snapshot().unwrap();
+        let mut first = None;
+        next.scan_model(&model, &mut |_, vector| {
+            if first.is_none() {
+                first = Some(vector.unwrap().to_vec());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(first, Some(vec![3]));
+    }
+
+    #[test]
+    fn bulk_real_cache_misses_and_late_cancellation_never_return_partial_ranking() {
+        use std::cell::Cell;
+
+        let (_directory, mut writer) = cache(128 * 1024);
+        let model = key(1);
+        let candidates: Vec<_> = (2..8)
+            .map(|card| crate::search_rank::SearchCandidate {
+                key: crate::search_rank::SearchCandidateKey {
+                    version_id: i64::from(card),
+                    syntax_id: format!("sid:v1:{card:032x}"),
+                },
+                card_hash: key(card),
+            })
+            .collect();
+        let mut vector = vec![0; crate::search_embed::DIMENSIONS];
+        vector[0] = -128;
+        vector[1] = 127;
+        for card in 2..7 {
+            writer.put(&model, &key(card), &vector).unwrap();
+        }
+        for (card, value) in [
+            (3, Value::Text("bad".into())),
+            (4, Value::Blob(vec![0; crate::search_embed::DIMENSIONS])),
+            (5, Value::Blob(vec![1; crate::search_embed::DIMENSIONS - 1])),
+            (6, Value::Blob(vec![])),
+        ] {
+            writer
+                .db
+                .execute(
+                    "UPDATE vectors SET vector=?1 WHERE model_id=?2 AND card_hash=?3",
+                    params![value, model, key(card)],
+                )
+                .unwrap();
+        }
+        // This unmatched row is still stepped and checked, never admitted.
+        writer.put(&model, &key(8), &vector).unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        let checks = Cell::new(0);
+        let ranking = crate::search_rank::rank_snapshot(
+            &candidates,
+            &[],
+            Some(&snapshot),
+            Some(&model),
+            Some(&vector),
+            &mut || {
+                checks.set(checks.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ranking.embedded, 1);
+        assert_eq!(ranking.hits.len(), 1);
+        assert_eq!(ranking.hits[0].key, candidates[0].key);
+        let final_check = checks.get();
+        checks.set(0);
+        #[derive(Debug)]
+        struct VectorBudget;
+        impl std::fmt::Display for VectorBudget {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("vector budget exhausted")
+            }
+        }
+        impl std::error::Error for VectorBudget {}
+        let error = crate::search_rank::rank_snapshot(
+            &candidates,
+            &[],
+            Some(&snapshot),
+            Some(&model),
+            Some(&vector),
+            &mut || {
+                checks.set(checks.get() + 1);
+                if checks.get() == final_check {
+                    return Err(VectorBudget.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.is::<VectorBudget>());
+    }
+
+    #[test]
+    fn scan_storage_fault_is_not_an_empty_success() {
+        let (_directory, mut writer) = cache(32 * 1024);
+        writer.db.execute("DROP TABLE vectors", []).unwrap();
+        let tx = writer.db.transaction().unwrap();
+        let snapshot = VectorSnapshot { tx, entries: 0 };
+        let error = snapshot
+            .scan_model(&key(1), &mut |_, _| Ok(()))
+            .unwrap_err();
+        assert!(error.is::<StoreUnavailable>());
     }
 
     #[test]

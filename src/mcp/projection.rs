@@ -193,6 +193,7 @@ pub fn search(
     catching_up: bool,
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
+    let _phase = crate::search_model::SearchPhaseTimer::start("search_projection");
     if result.matched_by.len() != result.symbols.symbols.len()
         || result.matched_by.iter().any(|arms| {
             !matches!(
@@ -823,6 +824,7 @@ mod search_tests {
                 declarations: 3,
                 embedded: 1,
                 lexical: LexicalState::Complete,
+                unavailable_reason: None,
             },
         }
     }

@@ -94,10 +94,12 @@ test("search status and rank membership definitions are closed", () => {
     $defs: defs, $ref: `#/$defs/${name}` });
   const validateStatus = definition("SearchIndexStatus");
   const status = { state: "unavailable", modelId: null, modelName: null, backend: null,
-    declarations: 3, embedded: 0, lexical: "complete" };
+    declarations: 3, embedded: 0, lexical: "complete", unavailableReason: null };
   for (const backend of [null, "cpu", "metal"]) {
     assert.ok(validateStatus({ ...status, backend }), JSON.stringify(validateStatus.errors));
   }
+  assert.ok(validateStatus({ ...status, unavailableReason: "vector_budget_exceeded" }));
+  assert.equal(validateStatus({ ...status, unavailableReason: "other" }), false);
   assert.equal(validateStatus({ ...status, backend: "auto" }), false);
   assert.equal(validateStatus({ ...status, score: 1 }), false);
   for (const field of Object.keys(status)) {

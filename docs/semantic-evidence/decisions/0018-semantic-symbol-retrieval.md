@@ -82,10 +82,14 @@ inputs, and this adds no cross-call numerical equality requirement.
 
 One supported model is active at a time, selected from Trellis’s closed reviewed pins.
 Configured files are verified before loading against the reviewed immutable model descriptor.
-The model loads lazily for a job and drops afterward; its pin is not a promise of daemon-lifetime
-residency. The single embedding owner also owns query-model availability and avoids blocking
-checkout worker locks while loading. Its precise query/job lifecycle must preserve the owner’s
-lazy-load/drop constraints and lexical-only state while loading. The model
+The model loads lazily. After a query or fill loads the verified model, the single embedding
+owner keeps its weights resident and reuses them for later queries and fill batches. It drops
+them after ten minutes with no query and no fill work; each use resets the idle timer. File
+verification is reused per file identity and is repeated when files change, before reusing
+changed model inputs. Loading remains lexical-only for concurrent callers and the explicit
+Metal-unavailable error is unchanged. The owner avoids blocking checkout worker locks while
+loading. This amends the earlier per-job drop rule (owner ruling
+[#211, 2026-10-26](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6427400386)). The model
 is not a #22 Producer: vectors are retrieval metadata, not evidence. Other modelId cache
 entries are ignored safely after switching models. The first model is voyageai/voyage-4-nano,
 ported to Rust/Candle; no Python runtime or executed upstream custom code is used. The current
@@ -137,6 +141,25 @@ identical bytes. Cache filling, eviction or changed numerical output may change 
 between calls at one basis. No cross-call equality, backend equality or runtime-independent
 ranking guarantee is added. Existing within-call ordering and typed numerical validity must
 still hold; non-finite/malformed vectors cannot enter cosine ordering as valid rows.
+
+## Optional vector budget (owner follow-up, 2026-10-26)
+
+The call deadline stays 5,000ms. Optional vector work uses one absolute 3,000ms budget from
+protocol acceptance, including admission, verification/read, load, embedding, cache access
+and scoring. It never restarts on retries. Expiry stops the operation cooperatively and
+discards its entire vector arm before completing lexical retrieval at the admitted head.
+No model work is detached. Resident weights follow the ten-minute idle rule above. The remaining 2,000ms is reserved
+for cleanup and mandatory lexical/projection/final checks, not a guarantee against an
+uninterruptible filesystem/device operation or mandatory-work overrun.
+
+`SearchIndexStatus` adds required nullable `unavailableReason`. It is null normally and
+`vector_budget_exceeded` only for this fallback. State is then `unavailable`, model identity
+is null and `embedded:0` is the unavailable sentinel, not a measured cache count. Declarations
+remain the exact eligible head count, backend remains the selected backend, lexical is
+complete, and every hit has lexical-only membership. This adds no warning, evidence meaning,
+partial flag or truncation reason. Only optional-cache contention may consume this budget
+and fall back on its expiry; BUSY itself does not authorize fallback. Observed database
+faults, mandatory index/FTS contention, cancellation and root checks retain their typed rules.
 
 ## Retrieval is not evidence
 

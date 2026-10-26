@@ -13,7 +13,10 @@ use crate::{
     http::DaemonState,
     model::IndexPin,
     search_card::CardFormat,
-    search_embed::{DIMENSIONS, EmbedError, InputKind, SearchEmbedder, model_id_for_card_format},
+    search_embed::{
+        DIMENSIONS, EmbedError, EmbeddingControl, InputKind, SearchEmbedder,
+        model_id_for_card_format,
+    },
     search_vectors::VectorCacheReader,
     store::{HeadSearchCards, SEARCH_CARD_BATCH_SIZE, SearchHeadChanged, topology::StorageBusy},
 };
@@ -45,6 +48,14 @@ struct Outcome {
     result: Result<()>,
 }
 trait FillBackend: Send + Sync {
+    fn idle_remaining(&self) -> Option<Duration> {
+        None
+    }
+    fn begin_idle_expiry(&self) -> bool {
+        false
+    }
+    fn finish_idle_expiry(&self) {}
+
     fn run(
         &self,
         source: &dyn FillSource,
@@ -55,6 +66,16 @@ trait FillBackend: Send + Sync {
 }
 struct LocalBackend(Arc<SearchService>);
 impl FillBackend for LocalBackend {
+    fn idle_remaining(&self) -> Option<Duration> {
+        self.0.idle_remaining()
+    }
+    fn begin_idle_expiry(&self) -> bool {
+        self.0.begin_idle_expiry()
+    }
+    fn finish_idle_expiry(&self) {
+        self.0.finish_idle_expiry();
+    }
+
     fn run(
         &self,
         source: &dyn FillSource,
@@ -163,7 +184,8 @@ impl LocalBackend {
                     .iter()
                     .map(|card| card.card_text.clone())
                     .collect::<Vec<_>>();
-                let vectors = model.embed(&texts, InputKind::Document, cancel)?;
+                let vectors =
+                    model.embed(&texts, InputKind::Document, &EmbeddingControl::new(cancel))?;
                 if vectors.len() != cards.len() {
                     return Err(EmbedError::Runtime(
                         "document embedding returned the wrong batch size".into(),
@@ -222,10 +244,25 @@ struct Inbox {
     ready: VecDeque<u64>,
     shutdown: bool,
 }
+impl Inbox {
+    fn has_pending_work(&self) -> bool {
+        self.slots
+            .values()
+            .any(|slot| slot.running || slot.queued || slot.dirty || slot.retry_at.is_some())
+    }
+}
+
 #[derive(Default)]
-struct Core {
+pub(super) struct Core {
     inbox: Mutex<Inbox>,
     changed: Condvar,
+}
+
+impl Core {
+    pub(super) fn wake(&self) {
+        let _inbox = self.inbox.lock().unwrap();
+        self.changed.notify_all();
+    }
 }
 
 /// Owns one blocking driver. Its inbox contains only weak checkout sources.
@@ -236,7 +273,10 @@ pub struct SearchFill {
 }
 impl SearchFill {
     pub fn start(search: Arc<SearchService>) -> Result<Arc<Self>> {
-        Self::start_with(Arc::new(LocalBackend(search)))
+        let owner = Self::start_with(Arc::new(LocalBackend(search.clone())))?;
+        search.set_maintenance(Arc::downgrade(&owner.core));
+        owner.core.wake();
+        Ok(owner)
     }
 
     fn start_with(backend: Arc<dyn FillBackend>) -> Result<Arc<Self>> {
@@ -400,14 +440,34 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
                     slot.running_pin = None;
                     break (id, slot.source.clone(), slot.cancel.clone(), slot.completed);
                 }
-                let deadline = inbox.slots.values().filter_map(|slot| slot.retry_at).min();
-                inbox = match deadline {
-                    Some(at) => {
-                        core.changed
-                            .wait_timeout(inbox, at.saturating_duration_since(now))
-                            .unwrap()
-                            .0
-                    }
+                let pending_fill = inbox.has_pending_work();
+                // Inbox -> admission only claims the transition. Never wait for
+                // the model with this inbox held; notifications use this mutex.
+                if !pending_fill && backend.begin_idle_expiry() {
+                    drop(inbox);
+                    backend.finish_idle_expiry();
+                    inbox = core.inbox.lock().unwrap();
+                    continue;
+                }
+                let retry = inbox
+                    .slots
+                    .values()
+                    .filter_map(|slot| slot.retry_at)
+                    .min()
+                    .map(|at| at.saturating_duration_since(now));
+                // An expired idle cutoff must not spin while a future retry is
+                // pending. Pending fill work takes priority over idle eviction.
+                let idle = if pending_fill {
+                    None
+                } else {
+                    backend.idle_remaining()
+                };
+                let remaining = match (retry, idle) {
+                    (Some(retry), Some(idle)) => Some(retry.min(idle)),
+                    (retry, idle) => retry.or(idle),
+                };
+                inbox = match remaining {
+                    Some(remaining) => core.changed.wait_timeout(inbox, remaining).unwrap().0,
                     None => core.changed.wait(inbox).unwrap(),
                 };
             }
@@ -808,6 +868,42 @@ mod tests {
     }
 
     #[test]
+    fn future_fill_retry_is_pending_work_for_idle_eviction() {
+        let source: Arc<dyn FillSource> = Arc::new(TestSource(pin(1)));
+        let now = Instant::now();
+        let retry = now + FAULT_RETRY;
+        let mut inbox = Inbox::default();
+        inbox.slots.insert(
+            1,
+            Slot {
+                source: Arc::downgrade(&source),
+                cancel: Arc::new(AtomicBool::new(false)),
+                queued: false,
+                dirty: false,
+                running: false,
+                running_pin: None,
+                completed: None,
+                retries: 1,
+                retry_at: Some(retry),
+                fault_cooldown: None,
+            },
+        );
+        assert!(
+            inbox.has_pending_work(),
+            "a future retry defers idle eviction"
+        );
+        assert!(inbox.ready.is_empty());
+        assert_eq!(
+            inbox.slots.values().filter_map(|slot| slot.retry_at).min(),
+            Some(retry)
+        );
+        // The driver ignores idle remaining while this predicate is true and
+        // waits for the retry deadline instead of spinning at expired idle.
+        inbox.slots.get_mut(&1).unwrap().retry_at = None;
+        assert!(!inbox.has_pending_work());
+    }
+
+    #[test]
     fn completed_pin_skips_pages_until_cache_invalidation() {
         use crate::store::topology::TopologyRoots;
         let directory = tempfile::tempdir().unwrap();
@@ -907,7 +1003,7 @@ mod tests {
             "invalidated cache causes a whole job recheck"
         );
         assert_eq!(loads.load(Ordering::Relaxed), 1);
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), BATCH);
@@ -941,7 +1037,7 @@ mod tests {
         }
     }
     impl crate::search_embed::SearchEmbedderFactory for RecordingFactory {
-        fn load(&self, _: &AtomicBool) -> Result<Box<dyn SearchEmbedder>, EmbedError> {
+        fn load(&self, _: &EmbeddingControl<'_>) -> Result<Box<dyn SearchEmbedder>, EmbedError> {
             self.loads.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(RecordingEmbedder {
                 drops: self.drops.clone(),
@@ -955,7 +1051,7 @@ mod tests {
             &self,
             texts: &[String],
             kind: InputKind,
-            cancel: &AtomicBool,
+            control: &EmbeddingControl<'_>,
         ) -> Result<Vec<crate::search_embed::QuantizedVector>, EmbedError> {
             if kind == InputKind::Document {
                 let first = {
@@ -973,9 +1069,7 @@ mod tests {
                         .unwrap();
                 }
             }
-            if cancel.load(Ordering::Acquire) {
-                return Err(EmbedError::Cancelled);
-            }
+            control.check()?;
             Ok(texts
                 .iter()
                 .map(|_| crate::search_embed::QuantizedVector {
@@ -1079,7 +1173,7 @@ mod tests {
         );
         assert_eq!(service.vector_report().unwrap().entries, BATCH as u64);
         assert_eq!(loads.load(Ordering::Relaxed), 1);
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
         backend
             .run(
                 &source,
@@ -1097,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn head_change_mid_loaded_fill_keeps_committed_progress_and_drops_model() {
+    fn head_change_mid_loaded_fill_keeps_committed_progress_and_resident_model() {
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (entered, events) = mpsc::channel();
         let (resume, proceed) = mpsc::channel();
@@ -1129,12 +1223,12 @@ mod tests {
                 .is::<SearchHeadChanged>()
         );
         assert_eq!(service.vector_report().unwrap().entries, (BATCH - 1) as u64);
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
         LocalBackend(service.clone())
             .run(source.as_ref(), &AtomicBool::new(false), None, &|_| {})
             .result
             .unwrap();
-        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
         assert_eq!(
             service.vector_report().unwrap().entries,
             BATCH as u64,
@@ -1184,15 +1278,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             loads.load(Ordering::Relaxed),
-            2,
-            "reconcile loads only for the remaining page-two miss"
+            1,
+            "reconcile reuses the model for the remaining page-two miss"
         );
-        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
         assert_eq!(service.vector_report().unwrap().entries, BATCH as u64);
     }
 
     #[test]
-    fn cancelled_loaded_fill_drops_weights_without_publishing_unfinished_batch() {
+    fn cancelled_loaded_fill_retains_weights_without_publishing_unfinished_batch() {
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (entered, events) = mpsc::channel();
         let (resume, proceed) = mpsc::channel();
@@ -1220,19 +1314,20 @@ mod tests {
             Some(EmbedError::Cancelled)
         ));
         assert_eq!(service.vector_report().unwrap().entries, 0);
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
         assert!(
             service
                 .query_embedding(
                     "after cancellation",
                     &Arc::new(AtomicBool::new(false)),
-                    Instant::now() + crate::testing::HANG_BACKSTOP
+                    Instant::now() + crate::testing::HANG_BACKSTOP,
+                    None
                 )
                 .unwrap()
                 .vector
                 .is_some()
         );
-        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1259,6 +1354,7 @@ mod tests {
                 "queued",
                 &Arc::new(AtomicBool::new(false)),
                 Instant::now() + crate::testing::HANG_BACKSTOP,
+                None,
             )
         });
         service.wait_for_queued_query_for_tests();
@@ -1266,7 +1362,7 @@ mod tests {
         assert!(query.join().unwrap().unwrap().vector.is_some());
         job.join().unwrap().result.unwrap();
         assert_eq!(loads.load(Ordering::Relaxed), 1);
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
 
     #[test]

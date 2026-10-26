@@ -3121,6 +3121,12 @@
                 "complete",
                 "unavailable"
               ]
+            },
+            "unavailableReason": {
+              "enum": [
+                null,
+                "vector_budget_exceeded"
+              ]
             }
           },
           "required": [
@@ -3130,7 +3136,8 @@
             "backend",
             "declarations",
             "embedded",
-            "lexical"
+            "lexical",
+            "unavailableReason"
           ]
         }
       },

@@ -9,6 +9,8 @@
 use candle_core::{D, DType, Module, Result, Tensor};
 use candle_nn::{Activation, Embedding, Linear, VarBuilder};
 
+use super::{EmbedError, EmbeddingControl};
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(super) struct Config {
     pub(super) vocab_size: usize,
@@ -262,7 +264,12 @@ pub(super) struct Model {
 }
 
 impl Model {
-    pub(super) fn new(cfg: &Config, vb: VarBuilder<'_>) -> Result<Self> {
+    pub(super) fn new(
+        cfg: &Config,
+        vb: VarBuilder<'_>,
+        control: &EmbeddingControl<'_>,
+    ) -> std::result::Result<Self, EmbedError> {
+        control.check()?;
         cfg.validate()?;
         let inv_freq: Vec<f32> = (0..cfg.head_dim)
             .step_by(2)
@@ -270,31 +277,48 @@ impl Model {
             .collect();
         let inv_freq = Tensor::from_vec(inv_freq, (1, cfg.head_dim / 2), vb.device())?;
         let layers = (0..cfg.num_hidden_layers)
-            .map(|i| Layer::new(cfg, vb.pp("model.layers").pp(i)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|i| {
+                control.check()?;
+                let layer = Layer::new(cfg, vb.pp("model.layers").pp(i))?;
+                control.check()?;
+                Ok(layer)
+            })
+            .collect::<std::result::Result<Vec<_>, EmbedError>>()?;
+        control.check()?;
+        let embed_tokens =
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        control.check()?;
+        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        control.check()?;
+        let linear = candle_nn::linear_no_bias(cfg.hidden_size, cfg.num_labels, vb.pp("linear"))?;
+        control.check()?;
         Ok(Self {
-            embed_tokens: candle_nn::embedding(
-                cfg.vocab_size,
-                cfg.hidden_size,
-                vb.pp("model.embed_tokens"),
-            )?,
+            embed_tokens,
             layers,
-            norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
-            linear: candle_nn::linear_no_bias(cfg.hidden_size, cfg.num_labels, vb.pp("linear"))?,
+            norm,
+            linear,
             inv_freq,
             max_positions: cfg.max_position_embeddings,
         })
     }
 
     /// Returns tokenwise projected embeddings, not pooled sentence embeddings.
-    pub(super) fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        control: &EmbeddingControl<'_>,
+    ) -> std::result::Result<Tensor, EmbedError> {
+        control.check()?;
         let (batch, tokens) = input_ids.dims2()?;
         if attention_mask.dims2()? != (batch, tokens)
             || batch == 0
             || tokens == 0
             || tokens > self.max_positions
         {
-            candle_core::bail!("invalid Qwen3 input and attention-mask dimensions")
+            return Err(EmbedError::Runtime(
+                "invalid Qwen3 input and attention-mask dimensions".into(),
+            ));
         }
         let device = input_ids.device();
         let padding = attention_mask.eq(0u32)?;
@@ -312,9 +336,13 @@ impl Model {
         let cos = freqs.cos()?.to_dtype(x.dtype())?;
         let sin = freqs.sin()?.to_dtype(x.dtype())?;
         for layer in &self.layers {
+            control.check()?;
             x = layer.forward(&x, &mask, &cos, &sin)?;
+            control.check()?;
         }
-        self.norm.forward(&x)?.apply(&self.linear)
+        let output = self.norm.forward(&x)?.apply(&self.linear)?;
+        control.check()?;
+        Ok(output)
     }
 }
 
@@ -324,7 +352,7 @@ mod tests {
     use candle_core::Device;
     use std::collections::HashMap;
 
-    fn toy_model() -> Result<Model> {
+    fn toy_model() -> std::result::Result<Model, EmbedError> {
         let device = &Device::Cpu;
         let cfg = Config {
             vocab_size: 3,
@@ -382,22 +410,29 @@ mod tests {
             "linear.weight".into(),
             Tensor::new(&[[1f32, 0.], [0., 1.], [1., 1.]], device)?,
         );
-        Model::new(&cfg, VarBuilder::from_tensors(weights, DType::F32, device))
+        Model::new(
+            &cfg,
+            VarBuilder::from_tensors(weights, DType::F32, device),
+            &EmbeddingControl::new(&std::sync::atomic::AtomicBool::new(false)),
+        )
     }
 
     #[test]
-    fn future_tokens_contribute_but_padded_keys_do_not() -> Result<()> {
+    fn future_tokens_contribute_but_padded_keys_do_not() -> std::result::Result<(), EmbedError> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let control = EmbeddingControl::new(&cancel);
         let model = toy_model()?;
         let device = &Device::Cpu;
         let ids = Tensor::new(&[[0u32, 1], [0, 2]], device)?;
         let mask = Tensor::new(&[[1u32, 1], [1, 0]], device)?;
-        let output = model.forward(&ids, &mask)?;
+        let output = model.forward(&ids, &mask, &control)?;
         assert_eq!(output.dims(), &[2, 2, 3]);
         let rows = output.to_vec3::<f32>()?;
         let solo = model
             .forward(
                 &Tensor::new(&[[0u32]], device)?,
                 &Tensor::new(&[[1u32]], device)?,
+                &control,
             )?
             .to_vec3::<f32>()?;
         assert!((rows[0][0][1] - solo[0][0][1]).abs() > 0.1);
@@ -405,7 +440,43 @@ mod tests {
             assert!((actual - expected).abs() < 1e-6);
         }
         assert!((rows[0][0][2] - rows[0][0][0] - rows[0][0][1]).abs() < 1e-6);
-        assert_eq!(rows, model.forward(&ids, &mask)?.to_vec3::<f32>()?);
+        assert_eq!(
+            rows,
+            model.forward(&ids, &mask, &control)?.to_vec3::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_preserves_budget_exhaustion_at_layer_boundary() -> std::result::Result<(), EmbedError>
+    {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let model = toy_model()?;
+        let start = Instant::now();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let clock_checks = checks.clone();
+        let budget = super::super::QueryBudget::new(
+            start + Duration::from_secs(1),
+            Arc::new(move || {
+                if clock_checks.fetch_add(1, Ordering::Relaxed) >= 2 {
+                    start + Duration::from_secs(1)
+                } else {
+                    start
+                }
+            }),
+        );
+        let cancel = AtomicBool::new(false);
+        let result = model.forward(
+            &Tensor::new(&[[0u32]], &Device::Cpu)?,
+            &Tensor::new(&[[1u32]], &Device::Cpu)?,
+            &EmbeddingControl::with_budget(&cancel, &budget),
+        );
+        assert!(matches!(result, Err(EmbedError::BudgetExceeded)));
+        assert_eq!(checks.load(Ordering::Relaxed), 3);
+        assert!(!cancel.load(Ordering::Acquire));
         Ok(())
     }
 

@@ -100,7 +100,7 @@ it never enters card hashes, lookup, ranking, ordering or joins.
 `SearchIndexStatus` is exactly:
 `{state:"complete"|"building"|"partial"|"unavailable",modelId:Hash|null,
 modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
-lexical:"complete"|"unavailable"}`.
+lexical:"complete"|"unavailable",unavailableReason:null|"vector_budget_exceeded"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
 `embedded<=declarations`. No configured/verified/ready model gives `unavailable`, null
@@ -110,7 +110,13 @@ is unavailable; `backend:null` means only that no backend has been selected. Wit
 all candidates have vectors, `building` means vectors are missing and a background job is
 running, and `partial` means vectors are missing and no job is running. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
-can still be returned by the lexical arm.
+can still be returned by the lexical arm. `unavailableReason` is null except when this call
+exhausts its optional vector budget. Then the complete vector arm is discarded, state is
+`unavailable`, model identity is null and `embedded:0` is an unavailable sentinel, not an
+observed cache count. `declarations` remains the exact eligible head count and backend remains
+the selected backend. The reason is `vector_budget_exceeded`, all returned hits are lexical,
+and lexical remains complete. This reason changes no native coverage, warning, truncation or
+partial-result meaning.
 
 Successful search has `lexical:"complete"`. A required head search table that cannot be read
 is a store failure, not a lexical-unavailable success. A query that produces no lexical terms
@@ -148,8 +154,17 @@ but adds no warning. There is no pagination. No hits is a successful empty list,
 and not proof of absence.
 
 The existing five-second acceptance-to-decision deadline and cancellation/root checks apply,
-including query inference and cold-load handling. Contention is typed storage_busy, retried
-within that deadline, then deadline_exceeded; it is never corruption or lexical-only success.
+including query inference and cold-load handling. Optional vector work has one absolute
+3,000ms sub-budget from acceptance, leaving 2,000ms for cleanup and mandatory lexical work.
+It covers model admission, verification/read, loading, embedding, cache access and scoring;
+it never resets on retry. Verified model weights are reused by the single owner with the
+[ten-minute idle timeout](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#model-identity-and-runtime),
+reset by query/fill use; loading remains lexical-only. On that budget alone, cooperatively stop vector work, discard the
+whole vector arm and return the complete lexical result with the reason above. Client
+cancellation and mandatory deadline/root checks still apply. Mandatory index/FTS contention
+remains typed storage_busy, retried within the call deadline, then deadline_exceeded. Optional
+cache contention is also typed/retried, but expiry of its vector budget permits this reasoned
+fallback; BUSY itself is not permission for lexical-only success or evidence of corruption.
 Database-level vector-cache failures, including corruption, schema mismatch and unreadable or
 unsafe storage, fail store_unavailable. Only a vector-cache row that fails typed decoding is
 a specified miss under T00/T02; it lowers embedded and is re-embedded outside the read.
@@ -305,7 +320,7 @@ Request cap 16384 bytes counts UTF-8 JSON-RPC line excluding delimiter. Response
 - **Deadline:** a `tools/call`'s five-second deadline starts at **protocol acceptance**, when the relay (or the daemon session, for a direct socket client) reads the complete valid call. It covers application validation, capacity, selection, read admission, the read and the send decision.
 - **Capacity:** after application validation, a connection may have at most four outstanding calls, and a fifth receives `too_many_requests` without queueing. The daemon also runs at most 16 live call-worker threads; a worker keeps its permit until its thread exits, even after its call timed out or was cancelled. Exhausting that budget, or failing to start a thread, also gives `too_many_requests`.
 - **The send decision:** the daemon rechecks cancellation, then the deadline, then selected-root identity. The relay decides each call's client-facing outcome by its own acceptance plus five seconds. The bound covers that decision, not a client that stops reading stdout.
-- **After the deadline:** if mandatory call/read work exceeds it, return `deadline_exceeded` with no partial evidence unless cancellation suppresses output. Optional hint work stops at its separate budget instead of failing the call.
+- **After the deadline:** if mandatory call/read work exceeds it, return `deadline_exceeded` with no partial evidence unless cancellation suppresses output. Optional hint work and the optional search vector arm stop at their separate budgets instead of failing the mandatory answer; search reports `unavailableReason:"vector_budget_exceeded"`.
 
 Before read admission has sampled `catchingUp`, a `too_many_requests` or `deadline_exceeded` uses the pre-resolution failure shape:
 

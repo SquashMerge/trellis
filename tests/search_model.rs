@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicBool;
 
-use trellis::search_embed::{Backend, EmbedError};
+use trellis::search_embed::{Backend, EmbedError, EmbeddingControl};
 use trellis::search_model::{
     BackendPreference, LexicalState, SearchConfig, SearchIndexState, SearchModel,
 };
@@ -50,9 +50,10 @@ fn missing_or_unverified_model_is_lexical_only_with_selected_backend() {
         assert_eq!(initial.embedded, 0);
         assert!(initial.model_id.is_none());
         assert!(initial.model_name.is_none());
-        let result: Result<(), EmbedError> = owner.with_job(&AtomicBool::new(false), |_| {
-            panic!("unverified model cannot run")
-        });
+        let result: Result<(), EmbedError> = owner
+            .with_job(&EmbeddingControl::new(&AtomicBool::new(false)), |_| {
+                panic!("unverified model cannot run")
+            });
         assert!(matches!(result, Err(EmbedError::ModelUnavailable(_))));
         assert_eq!(
             status.snapshot("test-card-format.v1", 4, 3, LexicalState::Complete, false),
@@ -65,9 +66,10 @@ fn missing_or_unverified_model_is_lexical_only_with_selected_backend() {
 fn pre_cancelled_job_does_not_load_missing_model() {
     let mut owner =
         SearchModel::new(SearchConfig::from_values(None, Some("cpu")).unwrap()).unwrap();
-    let result: Result<(), EmbedError> = owner.with_job(&AtomicBool::new(true), |_| {
-        panic!("cancelled job cannot run")
-    });
+    let result: Result<(), EmbedError> = owner
+        .with_job(&EmbeddingControl::new(&AtomicBool::new(true)), |_| {
+            panic!("cancelled job cannot run")
+        });
     assert!(matches!(result, Err(EmbedError::Cancelled)));
     let json = serde_json::to_value(owner.status_handle().snapshot(
         "test-card-format.v1",

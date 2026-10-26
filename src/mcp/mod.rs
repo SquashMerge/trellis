@@ -370,6 +370,7 @@ fn evidence_read(
     query: Option<&str>,
     read: &EvidenceToolReadFn<'_>,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
+    let _profile = query.map(|_| crate::search_model::SearchPhaseTimer::start("search_total"));
     let cancelled = || cancel.load(std::sync::atomic::Ordering::Acquire);
     let runtime = loop {
         if let Some(runtime) = registry.blocking_lock().runtime(key) {
@@ -401,16 +402,29 @@ fn evidence_read(
             if cancelled() || runtime.mcp_clock_now() >= deadline {
                 anyhow::bail!("deadline_exceeded: MCP search query deadline");
             }
+            let budget_clock = runtime.clone();
+            let budget = crate::search_embed::QueryBudget::new(
+                deadline
+                    .checked_sub(SEARCH_LEXICAL_RESERVE)
+                    .unwrap_or(deadline),
+                std::sync::Arc::new(move || budget_clock.mcp_clock_now()),
+            );
             match runtime.search_service() {
-                Some(search) => search
-                    .query_embedding(query, cancel, deadline)
-                    .map_err(|error| {
-                        if matches!(error, crate::search_embed::EmbedError::Cancelled) {
-                            anyhow::anyhow!("deadline_exceeded: MCP search query cancelled")
-                        } else {
-                            anyhow::Error::new(error)
+                Some(search) => {
+                    match search.query_embedding(query, cancel, deadline, Some(budget.clone())) {
+                        Ok(prepared) => Ok(prepared),
+                        Err(crate::search_embed::EmbedError::BudgetExceeded) => {
+                            Ok(crate::daemon::search::SearchQuery::budget_exceeded(
+                                Some(search.status_handle().backend()),
+                                budget,
+                            ))
                         }
-                    }),
+                        Err(crate::search_embed::EmbedError::Cancelled) => Err(anyhow::anyhow!(
+                            "deadline_exceeded: MCP search query cancelled"
+                        )),
+                        Err(error) => Err(anyhow::Error::new(error)),
+                    }
+                }
                 None => Ok(crate::daemon::search::SearchQuery::unavailable(None)),
             }
         })
@@ -485,6 +499,9 @@ struct DescribedSnapshot {
 /// Every tool call is answered within this deadline; describe reports it as
 /// `limits.deadlineMs` (contract W1).
 pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
+
+/// Keep mandatory lexical/projection work inside the original call deadline.
+const SEARCH_LEXICAL_RESERVE: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// Retry only direct Store contention. Every failed attempt drops its selected
 /// response; the one successful answer is materialized and finished in one snapshot.
@@ -1008,49 +1025,93 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         };
                         let candidates =
                             response.mcp_search_candidates(query, expected, &mut check)?;
-                        let mut rank = |snapshot: Option<
-                            &crate::search_vectors::VectorSnapshot<'_>,
-                        >| {
-                            let mut lookup = |hash: &str| match (snapshot, prepared.model_id()) {
-                                (Some(snapshot), Some(model_id)) => snapshot.get(model_id, hash),
-                                _ => Ok(None),
+                        let ranked = {
+                            let mut vector_check = || {
+                                check()?;
+                                if let Some(budget) = prepared.budget() {
+                                    budget.check()?;
+                                }
+                                Ok(())
                             };
-                            crate::search_rank::rank(
-                                &candidates.cards,
-                                &candidates.lexical,
-                                &mut lookup,
-                                prepared.vector.as_deref(),
-                                &mut check,
-                            )
+                            let rank =
+                                |snapshot: Option<&crate::search_vectors::VectorSnapshot<'_>>| {
+                                    crate::search_rank::rank_snapshot(
+                                        &candidates.cards,
+                                        &candidates.lexical,
+                                        snapshot,
+                                        prepared.model_id(),
+                                        prepared.vector.as_deref(),
+                                        &mut vector_check,
+                                    )
+                                };
+                            match runtime.search_service() {
+                                Some(service) if prepared.model_id().is_some() => {
+                                    service.with_vector_snapshot_budget(prepared.budget(), rank)
+                                }
+                                _ => crate::search_rank::rank_lexical(
+                                    &candidates.cards,
+                                    &candidates.lexical,
+                                    &mut check,
+                                ),
+                            }
                         };
-                        let ranked = match runtime.search_service() {
-                            Some(service) if prepared.model_id().is_some() => match service
-                                .with_vector_snapshot(rank)
+                        let (ranked, budget_exceeded) = match ranked {
+                            Ok(ranked) => (ranked, false),
+                            Err(error)
+                                if matches!(
+                                    error.downcast_ref::<crate::search_embed::EmbedError>(),
+                                    Some(crate::search_embed::EmbedError::BudgetExceeded)
+                                ) =>
                             {
-                                Ok(ranked) => ranked,
-                                Err(error)
-                                    if crate::store::cli_read_retryable_contention(&error) =>
+                                (
+                                    crate::search_rank::rank_lexical(
+                                        &candidates.cards,
+                                        &candidates.lexical,
+                                        &mut check,
+                                    )?,
+                                    true,
+                                )
+                            }
+                            Err(error) if crate::store::cli_read_retryable_contention(&error) => {
+                                if prepared
+                                    .budget()
+                                    .is_some_and(|budget| budget.check().is_err())
                                 {
+                                    check()?;
+                                    (
+                                        crate::search_rank::rank_lexical(
+                                            &candidates.cards,
+                                            &candidates.lexical,
+                                            &mut check,
+                                        )?,
+                                        true,
+                                    )
+                                } else {
                                     return Err(error);
                                 }
-                                Err(error)
-                                    if error.is::<crate::search_vectors::StoreUnavailable>() =>
-                                {
-                                    // Disposable cache failure does not invalidate the native index.
-                                    return Ok(tools::failure(id, "store_unavailable"));
-                                }
-                                Err(error) => return Err(error),
-                            },
-                            _ => rank(None)?,
+                            }
+                            Err(error) if error.is::<crate::search_vectors::StoreUnavailable>() => {
+                                return Ok(tools::failure(id, "store_unavailable"));
+                            }
+                            Err(error) => return Err(error),
                         };
                         let building = runtime
                             .browser_scheduler()?
                             .search_fill_building(candidates.pin);
-                        let search_index = prepared.status(
+                        let mut search_index = prepared.status(
                             candidates.cards.len() as u64,
                             ranked.embedded,
                             building,
                         );
+                        if budget_exceeded {
+                            search_index.state = crate::search_model::SearchIndexState::Unavailable;
+                            search_index.model_id = None;
+                            search_index.model_name = None;
+                            search_index.embedded = 0;
+                            search_index.unavailable_reason = Some(
+                                crate::search_model::SearchUnavailableReason::VectorBudgetExceeded,
+                            );
+                        }
                         let has_more = ranked.hits.len() > limit;
                         let prefix = &ranked.hits[..ranked.hits.len().min(limit)];
                         let keys: Vec<_> = prefix.iter().map(|hit| hit.key.clone()).collect();

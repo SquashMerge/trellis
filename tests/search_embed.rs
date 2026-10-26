@@ -76,7 +76,7 @@ fn metal_without_feature_does_not_fall_back_to_cpu() {
 #[test]
 #[ignore = "requires explicitly provisioned pinned local model; set TRELLIS_PARITY_MODEL_DIR and TRELLIS_PARITY_BACKEND"]
 fn pinned_real_model_matches_saved_fixture() {
-    use trellis::search_embed::InputKind;
+    use trellis::search_embed::{EmbeddingControl, InputKind};
     let path = std::env::var_os("TRELLIS_PARITY_MODEL_DIR").expect("set TRELLIS_PARITY_MODEL_DIR");
     let backend = match std::env::var("TRELLIS_PARITY_BACKEND").as_deref() {
         Ok("cpu") => Backend::Cpu,
@@ -95,7 +95,7 @@ fn pinned_real_model_matches_saved_fixture() {
             InputKind::Document
         };
         let actual = embedder
-            .embed_reference(&texts, input_kind, &cancel)
+            .embed_reference(&texts, input_kind, &EmbeddingControl::new(&cancel))
             .unwrap();
         assert_eq!(actual.len(), selected.len());
         for (vector, row) in actual.iter().zip(&selected) {
@@ -109,13 +109,15 @@ fn pinned_real_model_matches_saved_fixture() {
             let cosine = dot / (a * b).sqrt();
             assert!(cosine >= 0.999, "{} {backend:?} cosine {cosine}", row.id);
         }
-        let production = embedder.embed(&texts, input_kind, &cancel).unwrap();
+        let production = embedder
+            .embed(&texts, input_kind, &EmbeddingControl::new(&cancel))
+            .unwrap();
         for (reference, product) in actual.iter().zip(production) {
             assert_eq!(quantize(reference).unwrap(), product);
         }
         cancel.store(true, std::sync::atomic::Ordering::Release);
         assert!(matches!(
-            embedder.embed(&texts, input_kind, &cancel),
+            embedder.embed(&texts, input_kind, &EmbeddingControl::new(&cancel)),
             Err(EmbedError::Cancelled)
         ));
         cancel.store(false, std::sync::atomic::Ordering::Release);

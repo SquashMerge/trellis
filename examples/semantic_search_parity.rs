@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use trellis::search_embed::{Backend, Embedder, InputKind};
+use trellis::search_embed::{Backend, Embedder, EmbeddingControl, InputKind};
 
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const BATCH_SIZE: usize = 16;
@@ -67,7 +67,7 @@ fn write_batch(
     };
     let texts: Vec<String> = batch.iter().map(|row| row.text.clone()).collect();
     let vectors = embedder
-        .embed_reference(&texts, kind, cancel)
+        .embed_reference(&texts, kind, &EmbeddingControl::new(cancel))
         .with_context(|| format!("embedding batch {batch_number}"))?;
     ensure!(
         vectors.len() == batch.len(),
