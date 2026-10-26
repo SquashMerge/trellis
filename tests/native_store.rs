@@ -3107,12 +3107,27 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
     let capture_id = store.with_index_sql_for_tests(|db| {
         db.execute("INSERT INTO semantic_raw_captures(producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,manifest_bytes,decoder_version) SELECT 'fixture','artifact',source_set_id,native_revision_id,x'01',x'02','fixture' FROM native_revisions WHERE published_index_revision=?1", [r1.index_revision as i64])?;
         let capture_id = db.last_insert_rowid();
-        db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,language,path,canonical_bytes) VALUES(?1,'unselected','occurrence',?2,'javascript','flow.js',x'03')",rusqlite::params![capture_id,"a".repeat(64)])?;
+        for i in 0..70_u32 {
+            db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,language,path,canonical_bytes) VALUES(?1,?2,'occurrence',?3,'javascript','flow.js',x'03')",rusqlite::params![capture_id,format!("unselected-{i}"),format!("{i:064x}")])?;
+        }
         db.execute("INSERT INTO semantic_revision_raw_selections(revision_id,producer_id,capture_id,captured_pin) VALUES(?1,'fixture',?2,?3)",rusqlite::params![format!("pin:v1:{}:{}",r2.index_generation,r2.index_revision),capture_id,format!("pin:v1:{}:{}",r1.index_generation,r1.index_revision)])?;
         Ok(capture_id)
     }).unwrap();
+    // Keep r1 younger than the release horizon while r2 becomes due, so an
+    // unrelated r1 release cannot drain leftover proof batches.
+    store
+        .with_index_sql_for_tests(|db| {
+            db.execute(
+                "UPDATE native_revision_supersessions SET superseded_at=1901 WHERE revision_id=?1",
+                [format!(
+                    "pin:v1:{}:{}",
+                    r1.index_generation, r1.index_revision
+                )],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     store.set_retention_clock_for_tests(1_901, 901);
-    assert!(store.release_revision(r1, &leader).is_err());
     let (retained_native, retained_sources) = store.retained_native_snapshot_at(r1).unwrap();
     assert!(!retained_native.revision.documents.is_empty());
     assert!(!retained_native.declarations.is_empty());
@@ -3127,13 +3142,12 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
                 [capture_id],
                 |r| r.get(0),
             )?;
-            assert_eq!(retained, 1);
+            assert_eq!(retained, 70);
             Ok(())
         })
         .unwrap();
     store.set_retention_clock_for_tests(1_902, 902);
     store.release_revision(r2, &leader).unwrap();
-    store.release_revision(r1, &leader).unwrap();
     store
         .with_index_sql_for_tests(|db| {
             let selections: i64 = db.query_row(
@@ -3155,6 +3169,8 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
             Ok(())
         })
         .unwrap();
+    store.set_retention_clock_for_tests(2_802, 1_803);
+    store.release_revision(r1, &leader).unwrap();
     assert_eq!(store.status().unwrap().revision, r3);
 }
 

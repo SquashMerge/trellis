@@ -6702,9 +6702,9 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
                 return Ok(true);
             }
         }
-        db.execute("DELETE FROM semantic_raw_proofs WHERE rowid IN (SELECT p.rowid FROM semantic_raw_proofs p WHERE NOT EXISTS(SELECT 1 FROM semantic_provenance v WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.capture_id=p.capture_id) LIMIT 64)",[])?;
-        db.execute("DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.capture_id=c.capture_id) LIMIT 64)",[])?;
-        return Ok(false);
+        let proofs = db.execute("DELETE FROM semantic_raw_proofs WHERE rowid IN (SELECT p.rowid FROM semantic_raw_proofs p WHERE NOT EXISTS(SELECT 1 FROM semantic_provenance v WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.capture_id=p.capture_id) LIMIT 64)",[])?;
+        let captures = db.execute("DELETE FROM semantic_raw_captures WHERE capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c WHERE NOT EXISTS(SELECT 1 FROM semantic_raw_proofs p WHERE p.capture_id=c.capture_id) AND NOT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s WHERE s.capture_id=c.capture_id) LIMIT 64)",[])?;
+        return Ok(proofs > 0 || captures > 0);
     };
     for (table, scope) in [
         ("semantic_reference_roles", "tuple_id=?1"),
