@@ -214,9 +214,18 @@ at most 256 UTF-8 bytes. `destination` is only valid for `$layers`; it selects a
 mapped destination pair, while unresolved-source layer instances have no
 destination. Explicit null optional fields and unknown fields fail
 `invalid_request`. `paths` are anchored positive source path globs, each 1–4096
-UTF-8 bytes; omitted/empty selects all sources. Filters do not shrink the snapshot's
-destination map or target roles. References `limit` defaults to 5 and accepts 1–50 **sample sites per
-edge**, not a cap on edges/counts; out-of-range integer fails `range_too_large`.
+UTF-8 bytes; omitted/empty selects all sources. Filters do not shrink the internal
+full-snapshot destination map or target roles. References emit only the
+module/proof closure of selected sources (even those without sites) and emitted
+production/test destinations, in full document-key order (#347 owner amendment).
+A no-match source scope returns complete empty structural arrays and zero counts,
+while `semanticComplete:false` remains invariant. Module revision/hash/provenance
+links and all selected unresolved sites remain intact. Rules' informational
+`unassigned` catalog still uses the full snapshot map. References `limit` defaults
+to 5 and accepts 1–50 **sample sites per edge**, not a cap on edges/counts;
+out-of-range integer fails `range_too_large`. Unrelated modules cannot force
+reference response overflow; genuinely oversized selected evidence still fails
+atomically with `response_too_large`, without raising the cap or clipping proof.
 
 The exact closed payloads, ordering, module/site identity, counts, supported
 structural mapping, grammar and exception semantics are in

@@ -87,6 +87,28 @@ fn diagnostic(text: &str) -> Value {
     };
     rules::diagnostic(&error).unwrap()
 }
+
+#[test]
+fn rules_source_filter_keeps_full_snapshot_assignments_and_unassigned_catalog() {
+    let input = snapshot(&[
+        ("web/a.js", "import './b.js';"),
+        ("web/b.js", "export const value = 1;"),
+        ("web/unrelated.js", ""),
+    ]);
+    let config = rules::parse("version=1\n[layers.entry]\norder=1\npaths=[\"web/a.js\"]\n[layers.core]\norder=2\npaths=[\"web/b.js\"]\n").unwrap();
+    for paths in [vec!["web/a.js".into()], vec!["absent.js".into()]] {
+        let refs = references::project(&input, &paths, 1, &mut || Ok(())).unwrap();
+        let data = rules::evaluate(&config, &input, &refs, &paths, &mut || Ok(())).unwrap();
+        assert_eq!(data["unassigned"].as_array().unwrap().len(), 1);
+        assert_eq!(data["unassigned"][0]["path"], "web/unrelated.js");
+        if paths[0] == "web/a.js" {
+            assert_eq!(pair(&data, "web/a.js", "web/b.js")["status"], "conforms");
+        } else {
+            assert!(data["instances"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
 #[test]
 fn rules_closed_parser_rejects_malformed_unknown_and_invalid_references_with_locations() {
     for text in [
