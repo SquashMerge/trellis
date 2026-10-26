@@ -52,7 +52,7 @@ enum Command {
     References(ReferencesArgs),
     /// Query a bounded static call view. This is not a runtime sequence.
     Query(QueryArgs),
-    /// Inspect existing derived indexes without changing them.
+    /// Inspect existing derived indexes and the vector cache without changing them.
     Gc(GcArgs),
 }
 #[cfg(feature = "test-support")]
@@ -1027,6 +1027,9 @@ async fn run_daemon() -> Result<()> {
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_PID_FILE") {
         std::fs::write(path, std::process::id().to_string())?;
     }
+    let search = Arc::new(daemon::search::SearchService::from_environment(
+        TopologyRoots::production()?,
+    )?);
     owner.listener().set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(owner.listener().try_clone()?)?;
     let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
@@ -1118,10 +1121,11 @@ async fn run_daemon() -> Result<()> {
                 stream.set_nonblocking(false)?;
                 let registry = registry.clone();
                 let browser = browser.clone();
+                let search = search.clone();
                 let id = next_session.fetch_add(1, Ordering::Relaxed);
                 let browser_shutdown = browser_shutdown.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = dispatch_connection(stream, id, registry, browser, browser_shutdown, accepted_at);
+                    let _ = dispatch_connection(stream, id, registry, browser, search, browser_shutdown, accepted_at);
                 });
             }
         }
@@ -1165,6 +1169,7 @@ fn dispatch_connection(
     session: u64,
     registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
     browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
+    search: Arc<daemon::search::SearchService>,
     browser_shutdown: tokio::sync::watch::Sender<bool>,
     accepted_at: Instant,
 ) -> Result<()> {
@@ -1336,7 +1341,7 @@ fn dispatch_connection(
         return served;
     }
     if request.operation == "gc_report" {
-        let result = TopologyRoots::production().and_then(|roots| roots.gc_report());
+        let result = search.gc_report();
         let reply = protocol::Reply {
             id: request.id,
             payload: match result {

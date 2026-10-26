@@ -2471,7 +2471,7 @@ impl Drop for ProtectedSqliteConnection {
         clean_retired_sqlite_witness(&mut registry, &self.key.0);
     }
 }
-fn protected_sqlite_open(
+pub(crate) fn protected_sqlite_open(
     path: &Path,
     flags: rusqlite::OpenFlags,
 ) -> Result<ProtectedSqliteConnection> {
@@ -2753,7 +2753,7 @@ fn release_deleted_sqlite_witness_kind(
     Ok(())
 }
 
-fn retained_sqlite_file(
+pub(crate) fn retained_sqlite_file(
     path: &Path,
     writable: bool,
     create: bool,

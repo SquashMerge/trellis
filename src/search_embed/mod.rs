@@ -67,7 +67,83 @@ const MODEL_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SupportedModel {
+    name: &'static str,
+    revision: &'static str,
+    files: &'static [(&'static str, &'static str)],
+}
+
+const SUPPORTED_MODEL: SupportedModel = SupportedModel {
+    name: "voyageai/voyage-4-nano",
+    revision: "5fb34e870f49f19e79c94d5e118f5ee730133279",
+    files: MODEL_FILES,
+};
+
+impl SupportedModel {
+    fn descriptor(&self, card_format: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "revision": self.revision,
+            "modelFiles": self.files.iter().map(|(path, sha256)| {
+                serde_json::json!({"path": path, "sha256": sha256})
+            }).collect::<Vec<_>>(),
+            "dimensions": DIMENSIONS,
+            "quantization": "int8-prefix-maxabs-f64-ties-even.v1",
+            "maxTokens": MAX_TOKENS,
+            "queryPrompt": QUERY_PROMPT,
+            "documentPrompt": DOCUMENT_PROMPT,
+            "pooling": "masked-mean-including-prompt-then-l2-f32.v1",
+            "inputPolicy": "utf8-prefix-16384-python-strip-tokenizer-nfc-no-special-tokens-right-truncate-right-pad-151643.v1",
+            "cardFormat": card_format,
+        })
+    }
+}
+
+pub(crate) fn supported_model_name() -> &'static str {
+    SUPPORTED_MODEL.name
+}
+
+pub(crate) fn model_id_for_card_format(card_format: &str) -> String {
+    crate::native_ids::digest(
+        b"trellis.search-model.v1\0",
+        &crate::native_ids::canonical(&SUPPORTED_MODEL.descriptor(card_format)),
+    )
+}
+
+/// Only this module can construct verified model inputs. Loading consumes the same
+/// owned bytes that were hashed, without reopening the source files.
+pub(crate) struct VerifiedModel {
+    config: Vec<u8>,
+    tokenizer: Vec<u8>,
+    weights: Vec<u8>,
+}
+
+impl VerifiedModel {
+    pub fn from_path(path: &Path) -> Result<Self, EmbedError> {
+        verify_files(path, SUPPORTED_MODEL.files)
+    }
+}
+
+fn verify_files(path: &Path, files: &[(&str, &str)]) -> Result<VerifiedModel, EmbedError> {
+    let mut verified = VerifiedModel {
+        config: Vec::new(),
+        tokenizer: Vec::new(),
+        weights: Vec::new(),
+    };
+    for &(name, expected_hash) in files {
+        let bytes = read_verified(path, name, expected_hash)?;
+        match name {
+            "config.json" => verified.config = bytes,
+            "tokenizer.json" => verified.tokenizer = bytes,
+            "model.safetensors" => verified.weights = bytes,
+            _ => {}
+        }
+    }
+    Ok(verified)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Backend {
     Cpu,
     Metal,
@@ -115,22 +191,26 @@ impl Embedder {
     /// Loads only the supported, hash-pinned snapshot from a local directory.
     /// Metal is explicit: unavailable Metal never falls back to CPU.
     pub fn load(path: &Path, backend: Backend) -> Result<Self, EmbedError> {
-        let device = match backend {
-            Backend::Cpu => Device::Cpu,
-            Backend::Metal => metal_device()?,
-        };
-        let mut config = Vec::new();
-        let mut tokenizer = Vec::new();
-        let mut weights = Vec::new();
-        for &(name, expected_hash) in MODEL_FILES {
-            let bytes = read_verified(path, name, expected_hash)?;
-            match name {
-                "config.json" => config = bytes,
-                "tokenizer.json" => tokenizer = bytes,
-                "model.safetensors" => weights = bytes,
-                _ => {}
-            }
-        }
+        let device = backend_device(backend)?;
+        Self::from_verified_on_device(VerifiedModel::from_path(path)?, device)
+    }
+
+    pub(crate) fn from_verified(
+        verified: VerifiedModel,
+        backend: Backend,
+    ) -> Result<Self, EmbedError> {
+        Self::from_verified_on_device(verified, backend_device(backend)?)
+    }
+
+    fn from_verified_on_device(
+        verified: VerifiedModel,
+        device: Device,
+    ) -> Result<Self, EmbedError> {
+        let VerifiedModel {
+            config,
+            tokenizer,
+            weights,
+        } = verified;
         let config: qwen3::Config = serde_json::from_slice(&config)
             .map_err(|error| EmbedError::ModelUnavailable(format!("config.json: {error}")))?;
         let mut tokenizer = Tokenizer::from_bytes(&tokenizer)
@@ -279,12 +359,23 @@ fn read_verified(path: &Path, name: &str, expected_hash: &str) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-#[cfg(feature = "metal")]
+pub(crate) fn backend_available(backend: Backend) -> Result<(), EmbedError> {
+    backend_device(backend).map(|_| ())
+}
+
+fn backend_device(backend: Backend) -> Result<Device, EmbedError> {
+    match backend {
+        Backend::Cpu => Ok(Device::Cpu),
+        Backend::Metal => metal_device(),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn metal_device() -> Result<Device, EmbedError> {
     Device::new_metal(0).map_err(|error| EmbedError::ModelUnavailable(format!("Metal: {error}")))
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
 fn metal_device() -> Result<Device, EmbedError> {
     Err(EmbedError::ModelUnavailable(
         "Metal support is not enabled".into(),
@@ -419,5 +510,101 @@ mod tests {
         ));
         let result: Result<(), EmbedError> = batch_boundary(|| panic!("runtime failure"));
         assert!(matches!(result, Err(EmbedError::Runtime(_))));
+    }
+
+    #[test]
+    fn descriptor_is_closed_canonical_and_covers_every_verified_file() {
+        let descriptor = SUPPORTED_MODEL.descriptor("test-card-format.v1");
+        let object = descriptor.as_object().unwrap();
+        assert_eq!(object.len(), 11);
+        let files = descriptor["modelFiles"].as_array().unwrap();
+        assert_eq!(files.len(), 9);
+        let paths: Vec<_> = files.iter().map(|v| v["path"].as_str().unwrap()).collect();
+        assert!(
+            paths
+                .windows(2)
+                .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+        );
+        for file in files {
+            assert_eq!(file.as_object().unwrap().len(), 2);
+            let hash = file["sha256"].as_str().unwrap();
+            assert_eq!(hash.len(), 64);
+            assert!(
+                hash.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+        }
+        let original = model_id_for_card_format("test-card-format.v1");
+        assert_eq!(
+            original,
+            "165233b0aa2514c3b565cb92173ce56c9c2dc2a7067cf8edaf2df31df60b55d3"
+        );
+        for key in object.keys() {
+            let mut changed = descriptor.clone();
+            changed[key] = serde_json::Value::Null;
+            assert_ne!(
+                original,
+                crate::native_ids::digest(
+                    b"trellis.search-model.v1\0",
+                    &crate::native_ids::canonical(&changed)
+                ),
+                "descriptor field {key} must bind the cache identity"
+            );
+        }
+        for index in 0..files.len() {
+            let mut changed = descriptor.clone();
+            changed["modelFiles"][index]["sha256"] = serde_json::json!("0".repeat(64));
+            assert_ne!(
+                original,
+                crate::native_ids::digest(
+                    b"trellis.search-model.v1\0",
+                    &crate::native_ids::canonical(&changed)
+                )
+            );
+        }
+        assert_eq!(original, model_id_for_card_format("test-card-format.v1"));
+    }
+
+    #[test]
+    fn verification_refuses_missing_or_modified_inputs_and_retains_owned_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let names = [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors",
+            "provenance.py",
+        ];
+        let hashes: Vec<_> = names
+            .iter()
+            .map(|name| {
+                std::fs::write(temp.path().join(name), name.as_bytes()).unwrap();
+                hex::encode(Sha256::digest(name.as_bytes()))
+            })
+            .collect();
+        let pins: Vec<_> = names
+            .iter()
+            .zip(&hashes)
+            .map(|(name, hash)| (*name, hash.as_str()))
+            .collect();
+        let verified = verify_files(temp.path(), &pins).unwrap();
+        std::fs::write(temp.path().join("config.json"), b"changed").unwrap();
+        assert_eq!(verified.config, b"config.json");
+        assert_eq!(verified.tokenizer, b"tokenizer.json");
+        assert_eq!(verified.weights, b"model.safetensors");
+        assert!(matches!(
+            verify_files(temp.path(), &pins),
+            Err(EmbedError::ModelUnavailable(_))
+        ));
+        std::fs::write(temp.path().join("config.json"), b"config.json").unwrap();
+        std::fs::write(temp.path().join("provenance.py"), b"changed").unwrap();
+        assert!(matches!(
+            verify_files(temp.path(), &pins),
+            Err(EmbedError::ModelUnavailable(_))
+        ));
+        std::fs::remove_file(temp.path().join("provenance.py")).unwrap();
+        assert!(matches!(
+            verify_files(temp.path(), &pins),
+            Err(EmbedError::ModelUnavailable(_))
+        ));
     }
 }

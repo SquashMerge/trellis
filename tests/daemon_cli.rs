@@ -3398,3 +3398,127 @@ fn metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end() {
         "transfer stall was unbounded"
     );
 }
+
+#[test]
+fn gc_report_counts_vectors_without_checkout_state_or_cache_mutation() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let roots = fixture_roots(&home);
+    roots.prepare_vectors().unwrap();
+    let path = roots.vectors_db();
+    {
+        let mut writer = trellis::search_vectors::VectorCacheWriter::open(&path).unwrap();
+        writer
+            .put(&"a".repeat(64), &"b".repeat(64), &[1, -2])
+            .unwrap();
+        writer.put(&"c".repeat(64), &"b".repeat(64), &[3]).unwrap();
+    }
+    // Close the fixture writer before raw reads; bytes include persisted LRU ages.
+    let before = fs::read(&path).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let cache_modified = fs::metadata(&roots.cache).unwrap().modified().unwrap();
+    assert!(!roots.data.exists());
+    let output = cli(&home)
+        .arg("gc")
+        .arg("--report")
+        .env("TRELLIS_SEARCH_BACKEND", "cpu")
+        .env_remove("TRELLIS_SEARCH_MODEL")
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["derived"].as_array().unwrap().is_empty());
+    assert_eq!(report["vectors"]["entries"], 2);
+    assert_eq!(report["vectors"]["bytes"], before.len() as u64);
+    assert_eq!(before, fs::read(&path).unwrap());
+    assert_eq!(modified, fs::metadata(&path).unwrap().modified().unwrap());
+    assert_eq!(
+        cache_modified,
+        fs::metadata(&roots.cache).unwrap().modified().unwrap()
+    );
+    let cache_entries: Vec<_> = fs::read_dir(&roots.cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(cache_entries, vec![path]);
+    assert!(!roots.cache.join("indexes").exists());
+    // Cold CLI startup may create only daemon control state outside the cache.
+    let data_entries: Vec<_> = fs::read_dir(&roots.data)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(data_entries, vec![roots.data.join("run")]);
+}
+
+#[test]
+fn gc_report_refuses_corrupt_vector_cache_without_partial_inventory() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let roots = fixture_roots(&home);
+    roots.prepare_vectors().unwrap();
+    let path = roots.vectors_db();
+    drop(trellis::search_vectors::VectorCacheWriter::open(&path).unwrap());
+    let corrupt = b"not a SQLite database";
+    fs::write(&path, corrupt).unwrap();
+    let output = cli(&home)
+        .arg("gc")
+        .arg("--report")
+        .env("TRELLIS_SEARCH_BACKEND", "cpu")
+        .env_remove("TRELLIS_SEARCH_MODEL")
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "GC emitted partial inventory");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("store_unavailable: vector cache"),
+        "untyped vector-cache failure: {stderr}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
+    assert!(!roots.cache.join("indexes").exists());
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[test]
+fn explicit_metal_refuses_direct_daemon_without_metal_support() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let output = cli(&home)
+        .arg("daemon")
+        .env("TRELLIS_SEARCH_BACKEND", "metal")
+        .env_remove("TRELLIS_SEARCH_MODEL")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("model unavailable"), "{stderr}");
+    assert!(stderr.contains("Metal support is not enabled"), "{stderr}");
+    assert!(!fixture_roots(&home).cache.exists());
+}
+
+#[test]
+fn invalid_search_backend_refuses_direct_daemon_without_checkout_state() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let output = cli(&home)
+        .arg("daemon")
+        .env("TRELLIS_SEARCH_BACKEND", "not-a-backend")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid embedding input"));
+    assert!(!fixture_roots(&home).cache.exists());
+}

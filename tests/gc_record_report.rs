@@ -427,7 +427,18 @@ async fn ordinary_binary_lifecycle_never_accesses_retired_records_or_ledgers() {
     // production activation/reconciliation path, not an in-test Store.
     fixture.json("restarted-index", &mut fixture.command("index"));
     let report = fixture.json("gc", fixture.command("gc").arg("--report"));
-    assert_eq!(report.as_object().unwrap().len(), 1, "{report}");
+    let mut report_keys: Vec<_> = report
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    report_keys.sort_unstable();
+    assert_eq!(report_keys, ["derived", "vectors"], "{report}");
+    assert_eq!(
+        report["vectors"],
+        serde_json::json!({"bytes": 0, "entries": 0})
+    );
     let derived = report["derived"].as_array().unwrap();
     assert_eq!(derived.len(), 1, "{report}");
     assert_eq!(derived[0]["rootKey"], fixture.key);
