@@ -888,9 +888,7 @@ pub fn evaluate(
         .map(|p| pattern(&config.text, p, true, &mut budget))
         .collect::<Result<Vec<_>>>()
         .map_err(|_| anyhow::anyhow!("invalid_request: invalid rules source path glob"))?;
-    let modules = refs.data["modules"]
-        .as_array()
-        .context("store_unavailable: references modules absent")?;
+    let modules = &refs.modules;
     let layer_patterns: usize = config
         .layers
         .values()

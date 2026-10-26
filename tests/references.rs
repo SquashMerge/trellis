@@ -132,6 +132,83 @@ fn references_sample_limit_does_not_change_exact_counts_and_source_filter_keeps_
 }
 
 #[test]
+fn references_filtered_closure_keeps_selected_sources_and_both_role_destinations() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "fn f() { crate::store::run(); } #[cfg(test)] mod tests { fn t() { crate::helper::run(); } }",
+        ),
+        ("src/store.rs", "pub fn run() {}"),
+        ("src/helper.rs", "pub fn run() {}"),
+        ("src/unrelated.rs", "pub fn unused() {}"),
+    ]);
+    let data = references::project(&input, &["src/lib.rs".into()], 1, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let paths: Vec<_> = data["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["identity"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["src/helper.rs", "src/lib.rs", "src/store.rs"]);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/store.rs")["count"],
+        1
+    );
+    assert_eq!(
+        edge(&data, "tests", "src/lib.rs", "src/helper.rs")["count"],
+        1
+    );
+    for module in data["modules"].as_array().unwrap() {
+        let path = module["identity"]["path"].as_str().unwrap();
+        let doc = input.documents.iter().find(|d| d.key.path == path).unwrap();
+        let root = doc
+            .declarations
+            .iter()
+            .find(|d| d.kind == "module" && d.ancestors.is_empty())
+            .unwrap();
+        assert_eq!(module["revisionId"], root.revision_id);
+        assert_eq!(module["contentHash"], doc.file.hash);
+        assert_eq!(module["provenanceId"], root.provenance_id);
+        assert_eq!(module["identity"]["sid"], root.syntax_id);
+    }
+}
+
+#[test]
+fn references_filtered_resolution_keeps_unselected_ambiguity_and_rust_layout() {
+    let input = snapshot(&[
+        ("web/a.js", "import './b';"),
+        ("web/b.js", ""),
+        ("web/b.mjs", ""),
+        ("src/lib.rs", "fn f() { crate::store::run(); }"),
+        ("src/store.rs", "pub fn run() {}"),
+        ("src/layout.rs", r#"#[path = "other.rs"] mod store;"#),
+    ]);
+    let data = references::project(
+        &input,
+        &["web/a.js".into(), "src/lib.rs".into()],
+        1,
+        &mut || Ok(()),
+    )
+    .unwrap()
+    .data;
+    assert!(data["production"].as_array().unwrap().is_empty());
+    let mut reasons: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["reason"].as_str().unwrap())
+        .collect();
+    reasons.sort_unstable();
+    assert_eq!(
+        reasons,
+        ["module_path_ambiguous", "rust_custom_path_unsupported"]
+    );
+    assert_eq!(data["modules"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn references_relative_imports_and_java_unresolved_are_honest() {
     let input = snapshot(&[
         (

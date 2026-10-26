@@ -27,6 +27,8 @@ pub struct Snapshot {
 #[derive(Debug)]
 pub struct Projection {
     pub data: Value,
+    // Rules assign layers and report unassigned modules across the full snapshot.
+    pub(crate) modules: Vec<Value>,
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +162,7 @@ pub fn project(
         trees.push(tree);
     }
     let mut edges: BTreeMap<(usize, usize, bool), (usize, Vec<Site>)> = BTreeMap::new();
+    let mut emitted_modules = BTreeSet::new();
     let mut unresolved = Vec::new();
     let mut site_count = 0usize;
     let mut scanned = 0usize;
@@ -170,6 +173,7 @@ pub fn project(
             continue;
         }
         check()?;
+        emitted_modules.insert(source);
         scanned += 1;
         let raw = extract(doc, tree, check)?;
         let declarations = RangeIndex::new(
@@ -250,6 +254,7 @@ pub fn project(
     let mut tests = Vec::new();
     for ((source, target, test), (count, sites)) in edges {
         check()?;
+        emitted_modules.insert(target);
         let omitted = count - sites.len();
         let edge = json!({"source":identities[source],"target":identities[target],"count":count,
             "sites":sites,"omittedSites":omitted,"mapping":"structural"});
@@ -259,12 +264,13 @@ pub fn project(
             production.push(edge);
         }
     }
+    let emitted_modules: Vec<_> = emitted_modules.into_iter().map(|i| &modules[i]).collect();
     check()?;
     Ok(Projection {
         data: json!({
             "referencesVersion":"references:v1","indexGeneration":snapshot.pin.index_generation.to_string(),
             "indexRevision":snapshot.pin.index_revision,"evidenceTier":"syntax","semanticComplete":false,
-            "modules":modules,"production":production,"tests":tests,"unresolved":unresolved,
+            "modules":emitted_modules,"production":production,"tests":tests,"unresolved":unresolved,
             "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":site_count-mapped},
             "limitations":[
                 "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
@@ -274,6 +280,7 @@ pub fn project(
                 "Java import and qualified type sites remain unresolved; package grouping is not produced."
             ]
         }),
+        modules,
     })
 }
 

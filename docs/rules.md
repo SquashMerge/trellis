@@ -281,9 +281,18 @@ Site = {ownerSyntaxId:string|null,role:"production"|"test"|null,
         spelling:string,callId:string|null}
 ```
 
-`Lines` is the existing inclusive 1-based line shape or null. `modules` retains
-the full snapshot target map, even with source path filters. It is ordered by
-full document key. Edges sort by source and target identities within each role
+`Lines` is the existing inclusive 1-based line shape or null. Target mapping
+always uses the full admitted snapshot module map internally. By the
+[owner's #347 ruling](https://github.com/SquashMerge/trellis/issues/347#issuecomment-6415629907),
+`modules` emits only the module/proof closure of selected sources (including
+sources with no sites) and destinations of emitted production or test edges.
+Every emitted module retains its native revision, content hash and provenance.
+A source filter matching no documents returns empty `modules`, `production`,
+`tests` and `unresolved` arrays with zero counts; this is a complete empty
+structural scope, not semantic completeness. Unrelated modules do not consume
+response bytes. No cap is raised and no verdict or proof is clipped; genuinely
+oversized selected evidence still fails atomically with `response_too_large`.
+Modules are ordered by full document key. Edges sort by source and target identities within each role
 array; samples sort by range, kind and spelling. Unresolved sites sort by source,
 range, kind and reason and are not clipped. `count` is exact and
 `omittedSites = count - sites.length`. `limit` bounds samples **per edge**, not

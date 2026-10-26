@@ -10618,6 +10618,116 @@ async fn incoming_escaped_javascript_declarations_keep_wire_labels_and_later_cal
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_is_atomic() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, String)> = (0..400)
+        .map(|i| {
+            (
+                format!("module_{i:03}.js"),
+                "export const value = 1;\n".into(),
+            )
+        })
+        .collect();
+    files[0].1 = "import './module_399.js'; import './module_399.js'; import 'external';\n".into();
+    files[1].1 = "import('external');\n".repeat(300);
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(347, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 347, None);
+    let mut ask = |id, arguments| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({
+                    "name":"trellis_references", "arguments":arguments
+                })
+            )
+        )
+        .unwrap();
+        next_reply(&mut reader)
+    };
+    let selected = ask(
+        1,
+        json!({"schemaVersion":1,"paths":["module_000.js"],"limit":1}),
+    );
+    tool(&selected, None, true);
+    let envelope = &selected["result"]["structuredContent"];
+    let basis = &envelope["evidenceBasis"];
+    let data = &envelope["data"];
+    let modules = data["modules"].as_array().unwrap();
+    assert_eq!(modules.len(), 2);
+    assert_eq!(modules[0]["identity"]["path"], "module_000.js");
+    assert_eq!(modules[1]["identity"]["path"], "module_399.js");
+    let edge = &data["production"][0];
+    assert_eq!(edge["source"], modules[0]["identity"]);
+    assert_eq!(edge["target"], modules[1]["identity"]);
+    assert_eq!(edge["count"], 2);
+    assert_eq!(edge["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(edge["omittedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+    assert_eq!(data["unresolved"][0]["source"], modules[0]["identity"]);
+    assert_eq!(
+        data["counts"],
+        json!({"scannedDocuments":1,"mappedSites":2,"unresolvedSites":1})
+    );
+    assert_eq!(envelope["truncated"], false);
+    let empty = ask(
+        2,
+        json!({"schemaVersion":1,"expectedBasis":basis,"paths":["absent.js"],"limit":1}),
+    );
+    tool(&empty, None, true);
+    let empty_data = &empty["result"]["structuredContent"]["data"];
+    for field in ["modules", "production", "tests", "unresolved"] {
+        assert_eq!(empty_data[field], json!([]));
+    }
+    assert_eq!(
+        empty_data["counts"],
+        json!({"scannedDocuments":0,"mappedSites":0,"unresolvedSites":0})
+    );
+    assert_eq!(empty_data["semanticComplete"], false);
+    let isolated = ask(
+        3,
+        json!({"schemaVersion":1,"expectedBasis":basis,"paths":["module_002.js"]}),
+    );
+    tool(&isolated, None, true);
+    let isolated_data = &isolated["result"]["structuredContent"]["data"];
+    assert_eq!(isolated_data["modules"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        isolated_data["modules"][0]["identity"]["path"],
+        "module_002.js"
+    );
+    assert_eq!(isolated_data["counts"]["scannedDocuments"], 1);
+    let oversized = ask(
+        4,
+        json!({"schemaVersion":1,"expectedBasis":basis,"paths":["module_001.js"],"limit":1}),
+    );
+    tool(&oversized, Some("response_too_large"), true);
+    let failed = &oversized["result"]["structuredContent"];
+    assert_eq!(failed["error"]["currentBasis"], *basis);
+    assert_eq!(failed["error"]["retryable"], false);
+    assert!(failed.get("data").is_none());
+    validate_structured_content(&[
+        json!({"name":"trellis_references","structuredContent":envelope}),
+        json!({"name":"trellis_references","structuredContent":empty["result"]["structuredContent"]}),
+        json!({"name":"trellis_references","structuredContent":isolated["result"]["structuredContent"]}),
+        json!({"name":"trellis_references","structuredContent":failed}),
+    ]);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
 #[test]
 fn architecture_catalog_prompt_and_closed_inputs_use_both_protocol_modes() {
     for legacy in [false, true] {
