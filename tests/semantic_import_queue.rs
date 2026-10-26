@@ -9,6 +9,51 @@ use tempfile::Builder;
 use trellis::{native_ids, store::topology::TopologyRoots};
 
 const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
+
+struct CrashDaemon(std::process::Child);
+impl CrashDaemon {
+    fn start(mut command: Command, home: &Path) -> Self {
+        let mut daemon = Self(
+            command
+                .arg("daemon")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let data = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/dev.squashmerge.trellis")
+        } else {
+            home.join(".local/share/trellis")
+        };
+        let socket = trellis::daemon::SocketPaths::new(&data).socket;
+        trellis::testing::wait_until("crash fixture daemon listening", || {
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            std::os::unix::net::UnixStream::connect(&socket).is_ok()
+        });
+        daemon
+    }
+
+    fn kill_and_wait(&mut self, home: &Path) {
+        use std::os::unix::process::ExitStatusExt;
+        let elected: u32 = fs::read_to_string(home.join("daemon.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(self.0.id(), elected);
+        self.0.kill().unwrap();
+        // CLI EOF does not prove the daemon has exited.
+        // Reap the daemon itself before attempting the recovery mutation.
+        assert_eq!(self.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+}
+impl Drop for CrashDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn cli(home: &Path) -> Command {
     let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
     cmd.env("HOME", home)
@@ -44,6 +89,7 @@ fn two_document_case(change_b: &str) {
     fs::write(root.join("src/B.js"), b).unwrap();
     let root = fs::canonicalize(root).unwrap();
     let root_string = root.to_str().unwrap();
+    let mut crash_daemon = None;
     let indexed = if matches!(
         change_b,
         "ambiguous"
@@ -115,10 +161,17 @@ fn two_document_case(change_b: &str) {
                 home.join("semantic-commit.marker"),
             );
         }
-        let output = cmd
-            .args(["index", "--workspace", root_string])
-            .output()
-            .unwrap();
+        let output = if matches!(change_b, "crash_claim" | "crash_published") {
+            crash_daemon = Some(CrashDaemon::start(cmd, &home));
+            cli(&home)
+                .args(["index", "--workspace", root_string])
+                .output()
+                .unwrap()
+        } else {
+            cmd.args(["index", "--workspace", root_string])
+                .output()
+                .unwrap()
+        };
         assert!(
             output.status.success(),
             "{}",
@@ -297,11 +350,7 @@ fn two_document_case(change_b: &str) {
                 .unwrap()
                 .is_some()
         );
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        crash_daemon.as_mut().unwrap().kill_and_wait(&home);
         let _ = child.wait();
         fs::write(socket.with_extension("done"), b"crash injected").unwrap();
         fs::remove_file(socket).unwrap();
@@ -499,11 +548,7 @@ fn two_document_case(change_b: &str) {
         }
         let claimed = store.earliest_unfinished_request().unwrap().unwrap();
         assert_eq!(claimed.state, "running");
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        crash_daemon.as_mut().unwrap().kill_and_wait(&home);
         let _ = child.wait();
         let marker = home.join("semantic-claimed.sock");
         assert!(marker.exists());
