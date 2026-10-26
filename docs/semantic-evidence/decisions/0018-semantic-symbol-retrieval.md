@@ -85,14 +85,7 @@ Configured files are verified before loading against the reviewed immutable mode
 The model loads lazily for a job and drops afterward; its pin is not a promise of daemon-lifetime
 residency. The single embedding owner also owns query-model availability and avoids blocking
 checkout worker locks while loading. Its precise query/job lifecycle must preserve the owner’s
-lazy-load/drop constraints and lexical-only state while loading. A search call attempts to
-own one query job before admitting its index snapshot. A busy embedding owner makes that
-call lexical-only; it does not prove that a fill is running. An admitted query job verifies,
-loads, embeds and drops its weights under the original call deadline and cancellation flag,
-without an index, cache or registry lock. That call retains its verified model identity and
-query vector as a per-call readiness receipt after the weights drop. Other calls while it
-loads remain lexical-only. Cache counts and ranking then use one read transaction, and
-building state comes from the fill owner for the admitted head. The model
+lazy-load/drop constraints and lexical-only state while loading. The model
 is not a #22 Producer: vectors are retrieval metadata, not evidence. Other modelId cache
 entries are ignored safely after switching models. The first model is voyageai/voyage-4-nano,
 ported to Rust/Candle; no Python runtime or executed upstream custom code is used. The current

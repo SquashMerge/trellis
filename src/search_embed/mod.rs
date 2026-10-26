@@ -124,6 +124,88 @@ impl VerifiedModel {
     }
 }
 
+/// Only file identities survive a job. Neither weights nor a loaded runtime do.
+#[derive(Default)]
+pub(crate) struct ModelVerification {
+    files: Option<Vec<FileIdentity>>,
+    #[cfg(test)]
+    verifications: usize,
+}
+
+#[derive(PartialEq)]
+struct FileIdentity {
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+fn file_identities(path: &Path, files: &[(&str, &str)]) -> Result<Vec<FileIdentity>, EmbedError> {
+    files
+        .iter()
+        .map(|(name, _)| {
+            let metadata = std::fs::metadata(path.join(name))
+                .map_err(|error| EmbedError::ModelUnavailable(format!("{name}: {error}")))?;
+            Ok(FileIdentity {
+                length: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .map_err(|error| EmbedError::ModelUnavailable(error.to_string()))?,
+                #[cfg(unix)]
+                inode: {
+                    use std::os::unix::fs::MetadataExt;
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    )
+                },
+            })
+        })
+        .collect()
+}
+
+impl ModelVerification {
+    pub(crate) fn read(&mut self, path: &Path) -> Result<VerifiedModel, EmbedError> {
+        self.read_files(path, SUPPORTED_MODEL.files)
+    }
+
+    fn read_files(
+        &mut self,
+        path: &Path,
+        files: &[(&str, &str)],
+    ) -> Result<VerifiedModel, EmbedError> {
+        let before = file_identities(path, files)?;
+        let verified = if self.files.as_ref() == Some(&before) {
+            let read = |name| {
+                std::fs::read(path.join(name))
+                    .map_err(|error| EmbedError::ModelUnavailable(format!("{name}: {error}")))
+            };
+            VerifiedModel {
+                config: read("config.json")?,
+                tokenizer: read("tokenizer.json")?,
+                weights: read("model.safetensors")?,
+            }
+        } else {
+            self.files = None;
+            #[cfg(test)]
+            {
+                self.verifications += 1;
+            }
+            verify_files(path, files)?
+        };
+        if before != file_identities(path, files)? {
+            self.files = None;
+            return Err(EmbedError::ModelUnavailable(
+                "model files changed while loading".into(),
+            ));
+        }
+        self.files = Some(before);
+        Ok(verified)
+    }
+}
+
 fn verify_files(path: &Path, files: &[(&str, &str)]) -> Result<VerifiedModel, EmbedError> {
     let mut verified = VerifiedModel {
         config: Vec::new(),
@@ -179,6 +261,31 @@ impl std::error::Error for EmbedError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuantizedVector {
     pub values: Vec<i8>,
+}
+
+/// The production model and deterministic test models use the same job path.
+pub trait SearchEmbedder: Send {
+    fn embed(
+        &self,
+        texts: &[String],
+        kind: InputKind,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<QuantizedVector>, EmbedError>;
+}
+
+pub trait SearchEmbedderFactory: Send + Sync {
+    fn load(&self, cancel: &AtomicBool) -> Result<Box<dyn SearchEmbedder>, EmbedError>;
+}
+
+impl SearchEmbedder for Embedder {
+    fn embed(
+        &self,
+        texts: &[String],
+        kind: InputKind,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<QuantizedVector>, EmbedError> {
+        Embedder::embed(self, texts, kind, cancel)
+    }
 }
 
 pub struct Embedder {
@@ -563,6 +670,43 @@ mod tests {
             );
         }
         assert_eq!(original, model_id_for_card_format("test-card-format.v1"));
+    }
+
+    #[test]
+    fn model_jobs_rehash_only_when_a_file_identity_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors",
+            "provenance.py",
+        ];
+        let hashes = names
+            .iter()
+            .map(|name| {
+                std::fs::write(directory.path().join(name), name).unwrap();
+                hex::encode(Sha256::digest(name.as_bytes()))
+            })
+            .collect::<Vec<_>>();
+        let pins = names
+            .iter()
+            .zip(&hashes)
+            .map(|(name, hash)| (*name, hash.as_str()))
+            .collect::<Vec<_>>();
+        let mut verification = ModelVerification::default();
+        let first = verification.read_files(directory.path(), &pins).unwrap();
+        assert_eq!(first.weights, b"model.safetensors");
+        drop(first);
+        let second = verification.read_files(directory.path(), &pins).unwrap();
+        assert_eq!(second.weights, b"model.safetensors");
+        assert_eq!(verification.verifications, 1);
+        std::fs::write(directory.path().join("provenance.py"), b"changed-file").unwrap();
+        assert!(matches!(
+            verification.read_files(directory.path(), &pins),
+            Err(EmbedError::ModelUnavailable(_))
+        ));
+        assert_eq!(verification.verifications, 2);
+        assert!(verification.files.is_none());
     }
 
     #[test]

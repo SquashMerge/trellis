@@ -363,7 +363,7 @@ fn evidence_read(
     selected: Option<&crate::daemon::registry::SelectedCheckout>,
     deadline: std::time::Instant,
     clock_now: &dyn Fn() -> std::time::Instant,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     publish: &dyn Fn(bool),
     id: &serde_json::Value,
     #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
@@ -402,13 +402,15 @@ fn evidence_read(
                 anyhow::bail!("deadline_exceeded: MCP search query deadline");
             }
             match runtime.search_service() {
-                Some(search) => search.query_embedding(query, cancel).map_err(|error| {
-                    if matches!(error, crate::search_embed::EmbedError::Cancelled) {
-                        anyhow::anyhow!("deadline_exceeded: MCP search query cancelled")
-                    } else {
-                        anyhow::Error::new(error)
-                    }
-                }),
+                Some(search) => search
+                    .query_embedding(query, cancel, deadline)
+                    .map_err(|error| {
+                        if matches!(error, crate::search_embed::EmbedError::Cancelled) {
+                            anyhow::anyhow!("deadline_exceeded: MCP search query cancelled")
+                        } else {
+                            anyhow::Error::new(error)
+                        }
+                    }),
                 None => Ok(crate::daemon::search::SearchQuery::unavailable(None)),
             }
         })
@@ -1006,32 +1008,25 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         };
                         let candidates =
                             response.mcp_search_candidates(query, expected, &mut check)?;
-                        let mut rank =
-                            |snapshot: Option<&crate::search_vectors::VectorSnapshot<'_>>| {
-                                let mut vectors = std::collections::BTreeMap::new();
-                                if let (Some(snapshot), Some(model_id)) =
-                                    (snapshot, prepared.model_id())
-                                {
-                                    for card in &candidates.cards {
-                                        check()?;
-                                        if !vectors.contains_key(&card.card_hash)
-                                            && let Some(vector) =
-                                                snapshot.get(model_id, &card.card_hash)?
-                                        {
-                                            vectors.insert(card.card_hash.clone(), vector);
-                                        }
-                                    }
-                                }
-                                crate::search_rank::rank(
-                                    &candidates.cards,
-                                    &candidates.lexical,
-                                    &vectors,
-                                    prepared.vector.as_deref(),
-                                    &mut check,
-                                )
+                        let mut rank = |snapshot: Option<
+                            &crate::search_vectors::VectorSnapshot<'_>,
+                        >| {
+                            let mut lookup = |hash: &str| match (snapshot, prepared.model_id()) {
+                                (Some(snapshot), Some(model_id)) => snapshot.get(model_id, hash),
+                                _ => Ok(None),
                             };
+                            crate::search_rank::rank(
+                                &candidates.cards,
+                                &candidates.lexical,
+                                &mut lookup,
+                                prepared.vector.as_deref(),
+                                &mut check,
+                            )
+                        };
                         let ranked = match runtime.search_service() {
-                            Some(service) => match service.with_vector_snapshot(rank) {
+                            Some(service) if prepared.model_id().is_some() => match service
+                                .with_vector_snapshot(rank)
+                            {
                                 Ok(ranked) => ranked,
                                 Err(error)
                                     if crate::store::cli_read_retryable_contention(&error) =>
@@ -1046,7 +1041,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 }
                                 Err(error) => return Err(error),
                             },
-                            None => rank(None)?,
+                            _ => rank(None)?,
                         };
                         let building = runtime
                             .browser_scheduler()?

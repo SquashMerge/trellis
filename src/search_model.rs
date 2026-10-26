@@ -1,7 +1,7 @@
 //! Local search-model configuration and single-owner, job-scoped inference.
 //!
-//! Construction selects a backend but never reads model files. Jobs verify and
-//! load the configured snapshot and release all model weights on every exit.
+//! Construction selects a backend but never reads model files. Jobs verify each
+//! model file identity once, load the snapshot, and release all weights on exit.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::search_embed::{
-    Backend, EmbedError, Embedder, VerifiedModel, backend_available, model_id_for_card_format,
-    supported_model_name,
+    Backend, EmbedError, Embedder, ModelVerification, SearchEmbedder, SearchEmbedderFactory,
+    backend_available, model_id_for_card_format, supported_model_name,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -118,6 +118,10 @@ pub struct SearchModelStatus {
 }
 
 impl SearchModelStatus {
+    pub(crate) fn backend(&self) -> Backend {
+        self.backend
+    }
+
     /// Counts and `building` come from the caller's coherent owner-published
     /// index/cache snapshot. A loaded query model alone is not a background job.
     /// The caller explicitly names its reviewed card serializer. There is no
@@ -176,6 +180,8 @@ impl SearchModelStatus {
 pub struct SearchModel {
     config: SearchConfig,
     status: SearchModelStatus,
+    verification: ModelVerification,
+    factory: Option<Arc<dyn SearchEmbedderFactory>>,
 }
 
 impl SearchModel {
@@ -184,11 +190,22 @@ impl SearchModel {
         let backend = select_backend(config.backend, backend_available)?;
         Ok(Self {
             config,
+            verification: ModelVerification::default(),
+            factory: None,
             status: SearchModelStatus {
                 backend,
                 ready: Arc::new(AtomicBool::new(false)),
             },
         })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_embedder_for_tests(
+        factory: Arc<dyn SearchEmbedderFactory>,
+    ) -> Result<Self, EmbedError> {
+        let mut model = Self::new(SearchConfig::from_values(None, Some("cpu"))?)?;
+        model.factory = Some(factory);
+        Ok(model)
     }
 
     pub fn backend(&self) -> Backend {
@@ -204,22 +221,28 @@ impl SearchModel {
     pub fn with_job<T>(
         &mut self,
         cancel: &AtomicBool,
-        operation: impl FnOnce(&Embedder) -> Result<T, EmbedError>,
+        operation: impl FnOnce(&dyn SearchEmbedder) -> Result<T, EmbedError>,
     ) -> Result<T, EmbedError> {
         let path = self.config.model_path.as_deref();
         let backend = self.status.backend;
+        let verification = &mut self.verification;
+        let factory = self.factory.as_ref();
         run_job(
             &self.status.ready,
             cancel,
             || {
+                if let Some(factory) = factory {
+                    return factory.load(cancel);
+                }
                 let path = path.ok_or_else(|| {
                     EmbedError::ModelUnavailable("no local search model is configured".into())
                 })?;
-                let verified = VerifiedModel::from_path(path)?;
+                let verified = verification.read(path)?;
                 check_cancel(cancel)?;
-                Embedder::from_verified(verified, backend)
+                Ok(Box::new(Embedder::from_verified(verified, backend)?)
+                    as Box<dyn SearchEmbedder>)
             },
-            operation,
+            |model| operation(model.as_ref()),
         )
     }
 }

@@ -10967,6 +10967,24 @@ struct SearchMcpFixture {
 
 impl SearchMcpFixture {
     async fn new(files: &[(&str, &str)], incomplete_python: bool) -> Self {
+        Self::with_optional_search(files, incomplete_python, |_| None, false)
+            .await
+            .0
+    }
+
+    async fn with_optional_search(
+        files: &[(&str, &str)],
+        incomplete_python: bool,
+        make_service: impl FnOnce(
+            &trellis::store::topology::TopologyRoots,
+        )
+            -> Option<std::sync::Arc<trellis::daemon::search::SearchService>>,
+        start_fill: bool,
+    ) -> (
+        Self,
+        Option<std::sync::Arc<trellis::daemon::search::SearchService>>,
+        Option<std::sync::Arc<trellis::daemon::search_fill::SearchFill>>,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let (identity, topology) = published_inactive_checkout(temp.path(), files);
         let vectors = topology.vectors_db();
@@ -10992,7 +11010,18 @@ impl SearchMcpFixture {
         }
         drop(writer);
         drop(store);
+        let service = make_service(&topology);
+        let fill = start_fill.then(|| {
+            trellis::daemon::search_fill::SearchFill::start(service.as_ref().unwrap().clone())
+                .unwrap()
+        });
         let mut registry = trellis::daemon::registry::CheckoutRegistry::with_roots(topology);
+        if let Some(service) = &service {
+            registry.set_search_service(service.clone());
+        }
+        if let Some(fill) = &fill {
+            registry.set_search_fill(fill.clone());
+        }
         registry.attach_launch(211, &identity).unwrap();
         let startup = ReadGate::default();
         let hold = startup.hook();
@@ -11002,15 +11031,19 @@ impl SearchMcpFixture {
         tokio::task::spawn_blocking(move || waiter.await_held(1))
             .await
             .unwrap();
-        Self {
-            _temp: temp,
-            identity,
-            registry: std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
-            startup,
-            previous,
-            current,
-            vectors,
-        }
+        (
+            Self {
+                _temp: temp,
+                identity,
+                registry: std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
+                startup,
+                previous,
+                current,
+                vectors,
+            },
+            service,
+            fill,
+        )
     }
 
     fn basis(pin: trellis::model::IndexPin) -> Value {
@@ -11430,4 +11463,482 @@ async fn mcp_search_keeps_admitted_head_and_followup_pin_conflicts_after_publica
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
+}
+
+impl SearchMcpFixture {
+    /// Install the daemon search service before activation; the startup gate
+    /// keeps publication and optional fill work out of test setup.
+    async fn with_search(
+        files: &[(&str, &str)],
+        make_service: impl FnOnce(
+            &trellis::store::topology::TopologyRoots,
+        ) -> std::sync::Arc<trellis::daemon::search::SearchService>,
+        start_fill: bool,
+    ) -> (
+        Self,
+        std::sync::Arc<trellis::daemon::search::SearchService>,
+        Option<std::sync::Arc<trellis::daemon::search_fill::SearchFill>>,
+    ) {
+        let (fixture, service, fill) =
+            Self::with_optional_search(files, false, |roots| Some(make_service(roots)), start_fill)
+                .await;
+        (fixture, service.unwrap(), fill)
+    }
+}
+
+fn install_unusable_search_cache(path: &Path, stale_format: bool) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // No vector reader or writer has opened this path. In particular, never
+    // close a raw file descriptor beneath a live SQLite connection.
+    if stale_format {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.pragma_update(None, "user_version", 2).unwrap();
+    } else {
+        fs::write(path, b"not a SQLite database").unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_without_model_ignores_stale_and_corrupt_optional_cache() {
+    let mut schema_pairs = Vec::new();
+    for configured_service in [false, true] {
+        for stale_format in [true, false] {
+            let fixture = if configured_service {
+                SearchMcpFixture::with_search(
+                    &[("a.js", "function orchard() {}\n")],
+                    |roots| {
+                        std::sync::Arc::new(
+                            trellis::daemon::search::SearchService::new(
+                                roots.clone(),
+                                trellis::search_model::SearchConfig::from_values(None, Some("cpu"))
+                                    .unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                    },
+                    false,
+                )
+                .await
+                .0
+            } else {
+                SearchMcpFixture::new(&[("a.js", "function orchard() {}\n")], false).await
+            };
+            install_unusable_search_cache(&fixture.vectors, stale_format);
+            let (mut client, mut reader, session) =
+                socket_session(&fixture.identity, &fixture.registry, 211, None);
+            let reply = search_socket_ask(
+                &mut client,
+                &mut reader,
+                false,
+                1,
+                json!({"schemaVersion":1,"query":"orchard"}),
+            );
+            tool(&reply, None, true);
+            let envelope = &reply["result"]["structuredContent"];
+            assert_eq!(
+                envelope["evidenceBasis"],
+                SearchMcpFixture::basis(fixture.current)
+            );
+            assert_eq!(envelope["data"]["hits"].as_array().unwrap().len(), 1);
+            assert_eq!(envelope["data"]["hits"][0]["name"], "orchard");
+            assert_eq!(envelope["data"]["hits"][0]["matchedBy"], json!(["lexical"]));
+            let backend = if configured_service {
+                json!("cpu")
+            } else {
+                Value::Null
+            };
+            assert_eq!(
+                envelope["data"]["searchIndex"],
+                json!({
+                    "state":"unavailable", "modelId":null, "modelName":null,
+                    "backend":backend, "declarations":1, "embedded":0, "lexical":"complete"
+                })
+            );
+            assert_eq!(envelope["partial"], false);
+            schema_pairs.push(search_schema_pair(&reply));
+            drop(reader);
+            drop(client);
+            session.join().unwrap().unwrap();
+        }
+    }
+    validate_structured_content(&schema_pairs);
+}
+
+#[derive(Clone, Default)]
+struct McpSearchEmbedderFactory {
+    loads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl trellis::search_embed::SearchEmbedderFactory for McpSearchEmbedderFactory {
+    fn load(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Box<dyn trellis::search_embed::SearchEmbedder>, trellis::search_embed::EmbedError>
+    {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(trellis::search_embed::EmbedError::Cancelled);
+        }
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(Box::new(McpSearchEmbedder))
+    }
+}
+
+struct McpSearchEmbedder;
+impl trellis::search_embed::SearchEmbedder for McpSearchEmbedder {
+    fn embed(
+        &self,
+        texts: &[String],
+        _kind: trellis::search_embed::InputKind,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<trellis::search_embed::QuantizedVector>, trellis::search_embed::EmbedError>
+    {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(trellis::search_embed::EmbedError::Cancelled);
+        }
+        Ok(texts
+            .iter()
+            .map(|_| trellis::search_embed::QuantizedVector {
+                values: vec![1; 1024],
+            })
+            .collect())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_hybrid_ranks_both_arms_and_vector_only_with_partial_then_complete_cache() {
+    let factory = std::sync::Arc::new(McpSearchEmbedderFactory::default());
+    let (fixture, service, _) = SearchMcpFixture::with_search(
+        &[("a.js", "function orchard() {}\nfunction unrelated() {}\n")],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory,
+                )
+                .unwrap(),
+            )
+        },
+        false,
+    )
+    .await;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let model_id = service
+        .query_embedding(
+            "orchard",
+            &cancel,
+            std::time::Instant::now() + trellis::testing::HANG_BACKSTOP,
+        )
+        .unwrap()
+        .model_id()
+        .unwrap()
+        .to_owned();
+    let store = trellis::store::Store::open_for_tests(fixture._temp.path(), &fixture.identity.root)
+        .unwrap();
+    let cards = store
+        .head_search_cards(Some(fixture.current), None, 16)
+        .unwrap()
+        .cards;
+    assert_eq!(cards.len(), 2);
+    drop(store);
+    let unrelated = cards
+        .iter()
+        .find(|card| card.card_text.contains("unrelated"))
+        .unwrap();
+    let orchard = cards
+        .iter()
+        .find(|card| card.card_text.contains("orchard"))
+        .unwrap();
+    service
+        .with_vector_writer(|writer| writer.put(&model_id, &unrelated.card_hash, &[1; 1024]))
+        .unwrap();
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    let mut schema_pairs = Vec::new();
+    for (id, complete) in [(1, false), (2, true)] {
+        if complete {
+            service
+                .with_vector_writer(|writer| writer.put(&model_id, &orchard.card_hash, &[1; 1024]))
+                .unwrap();
+        }
+        let reply = search_socket_ask(
+            &mut client,
+            &mut reader,
+            false,
+            id,
+            json!({"schemaVersion":1,"query":"orchard","limit":10}),
+        );
+        tool(&reply, None, true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert_eq!(
+            envelope["evidenceBasis"],
+            SearchMcpFixture::basis(fixture.current)
+        );
+        let hits = envelope["data"]["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2);
+        let expected_names = if complete {
+            ["orchard", "unrelated"]
+        } else {
+            ["unrelated", "orchard"]
+        };
+        for (index, (hit, name)) in hits.iter().zip(expected_names).enumerate() {
+            assert_eq!(hit["name"], name);
+            assert_eq!(hit["rank"], index + 1);
+            assert_eq!(hit["evidenceTier"], "syntax");
+            assert_eq!(
+                emitted_document(&envelope["data"], hit)["document"]["path"],
+                "a.js"
+            );
+            assert!(hit.get("score").is_none());
+            let matched = if name == "unrelated" {
+                json!(["vector"])
+            } else if complete {
+                json!(["lexical", "vector"])
+            } else {
+                json!(["lexical"])
+            };
+            assert_eq!(hit["matchedBy"], matched);
+        }
+        let status = &envelope["data"]["searchIndex"];
+        assert_eq!(
+            status["state"],
+            if complete { "complete" } else { "partial" }
+        );
+        assert_eq!(status["modelId"], model_id);
+        assert_eq!(status["backend"], "cpu");
+        assert_eq!(status["declarations"], 2);
+        assert_eq!(status["embedded"], if complete { 2 } else { 1 });
+        assert_eq!(status["lexical"], "complete");
+        assert_eq!(
+            envelope["partial"], false,
+            "vector misses are not native incompleteness"
+        );
+        assert_eq!(envelope["truncated"], false);
+        assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
+        schema_pairs.push(search_schema_pair(&reply));
+    }
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&schema_pairs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_available_model_keeps_stale_and_corrupt_cache_faults_typed() {
+    let mut schema_pairs = Vec::new();
+    for stale_format in [true, false] {
+        let (fixture, _service, _) = SearchMcpFixture::with_search(
+            &[("a.js", "function orchard() {}\n")],
+            |roots| {
+                std::sync::Arc::new(
+                    trellis::daemon::search::SearchService::with_embedder_for_tests(
+                        roots.clone(),
+                        std::sync::Arc::new(McpSearchEmbedderFactory::default()),
+                    )
+                    .unwrap(),
+                )
+            },
+            false,
+        )
+        .await;
+        install_unusable_search_cache(&fixture.vectors, stale_format);
+        let (mut client, mut reader, session) =
+            socket_session(&fixture.identity, &fixture.registry, 211, None);
+        let reply = search_socket_ask(
+            &mut client,
+            &mut reader,
+            false,
+            1,
+            json!({"schemaVersion":1,"query":"orchard"}),
+        );
+        tool(&reply, Some("store_unavailable"), true);
+        let envelope = &reply["result"]["structuredContent"];
+        assert!(
+            envelope.get("data").is_none(),
+            "no partial lexical results on database fault"
+        );
+        schema_pairs.push(search_schema_pair(&reply));
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+    validate_structured_content(&schema_pairs);
+}
+
+struct McpFillRelease([ReadGate; 2]);
+impl Drop for McpFillRelease {
+    fn drop(&mut self) {
+        for gate in &self.0 {
+            gate.open();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct McpFillEmbedderFactory {
+    first_batch: ReadGate,
+    second_batch: ReadGate,
+    loads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    batches: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+impl trellis::search_embed::SearchEmbedderFactory for McpFillEmbedderFactory {
+    fn load(
+        &self,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Box<dyn trellis::search_embed::SearchEmbedder>, trellis::search_embed::EmbedError>
+    {
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(Box::new(self.clone()))
+    }
+}
+impl trellis::search_embed::SearchEmbedder for McpFillEmbedderFactory {
+    fn embed(
+        &self,
+        texts: &[String],
+        kind: trellis::search_embed::InputKind,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<trellis::search_embed::QuantizedVector>, trellis::search_embed::EmbedError>
+    {
+        if kind == trellis::search_embed::InputKind::Document {
+            let batch = {
+                let mut batches = self.batches.lock().unwrap();
+                batches.push(texts.len());
+                batches.len()
+            };
+            match batch {
+                1 => (self.first_batch.hook())(),
+                2 => (self.second_batch.hook())(),
+                _ => panic!("unexpected third document batch"),
+            }
+        }
+        McpSearchEmbedder.embed(texts, kind, cancel)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_fill_serves_queued_query_between_real_batches_and_reports_building() {
+    let source: String = (0..17)
+        .map(|index| format!("function orchard{index:02}() {{}}\n"))
+        .collect();
+    let first_batch = ReadGate::default();
+    let second_batch = ReadGate::default();
+    let _release_on_failure = McpFillRelease([first_batch.clone(), second_batch.clone()]);
+    let factory = std::sync::Arc::new(McpFillEmbedderFactory {
+        first_batch: first_batch.clone(),
+        second_batch: second_batch.clone(),
+        loads: Default::default(),
+        batches: Default::default(),
+    });
+    let (fixture, service, fill) = SearchMcpFixture::with_search(
+        &[("a.js", &source)],
+        |roots| {
+            std::sync::Arc::new(
+                trellis::daemon::search::SearchService::with_embedder_for_tests(
+                    roots.clone(),
+                    factory.clone(),
+                )
+                .unwrap(),
+            )
+        },
+        true,
+    )
+    .await;
+    fixture.startup.open();
+    let waiter = first_batch.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let (mut client, mut reader, session) =
+        socket_session(&fixture.identity, &fixture.registry, 211, None);
+    writeln!(
+        client,
+        "{}",
+        call(
+            false,
+            json!(1),
+            "trellis_search_symbols",
+            json!({"schemaVersion":1,"query":"orchard","limit":50,
+            "expectedBasis":SearchMcpFixture::basis(fixture.current)})
+        )
+    )
+    .unwrap();
+    let waiter = service.clone();
+    tokio::task::spawn_blocking(move || waiter.wait_for_queued_query_for_tests())
+        .await
+        .unwrap();
+    first_batch.open();
+    let waiter = second_batch.clone();
+    tokio::task::spawn_blocking(move || waiter.await_held(1))
+        .await
+        .unwrap();
+    let building = next_reply(&mut reader);
+    assert_eq!(building["id"], 1);
+    tool(&building, None, true);
+    let envelope = &building["result"]["structuredContent"];
+    assert_eq!(
+        envelope["evidenceBasis"],
+        SearchMcpFixture::basis(fixture.current)
+    );
+    let status = &envelope["data"]["searchIndex"];
+    assert_eq!(status["state"], "building");
+    assert!(status["modelId"].is_string());
+    assert_eq!(status["backend"], "cpu");
+    assert_eq!(status["declarations"], 17);
+    assert_eq!(status["embedded"], 16);
+    let hits = envelope["data"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 17);
+    assert_eq!(
+        hits.iter()
+            .filter(|hit| hit["matchedBy"] == json!(["lexical", "vector"]))
+            .count(),
+        16
+    );
+    assert_eq!(
+        hits.iter()
+            .filter(|hit| hit["matchedBy"] == json!(["lexical"]))
+            .count(),
+        1
+    );
+    assert_eq!(envelope["partial"], false);
+    assert_eq!(
+        factory.loads.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "query must reuse the loaded fill model rather than loading another job"
+    );
+    assert_eq!(*factory.batches.lock().unwrap(), [16, 1]);
+    second_batch.open();
+    let waiter = fill.unwrap();
+    tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+        .await
+        .unwrap();
+    let complete = search_socket_ask(
+        &mut client,
+        &mut reader,
+        false,
+        2,
+        json!({"schemaVersion":1,"query":"orchard","limit":50,
+            "expectedBasis":SearchMcpFixture::basis(fixture.current)}),
+    );
+    tool(&complete, None, true);
+    let complete_envelope = &complete["result"]["structuredContent"];
+    assert_eq!(
+        complete_envelope["evidenceBasis"],
+        envelope["evidenceBasis"]
+    );
+    let complete_status = &complete_envelope["data"]["searchIndex"];
+    assert_eq!(complete_status["state"], "complete");
+    assert_eq!(complete_status["embedded"], 17);
+    assert_eq!(complete_status["declarations"], 17);
+    assert_eq!(complete_status["modelId"], status["modelId"]);
+    assert!(
+        complete_envelope["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["matchedBy"] == json!(["lexical", "vector"]))
+    );
+    assert_eq!(complete_envelope["partial"], false);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+    validate_structured_content(&[search_schema_pair(&building), search_schema_pair(&complete)]);
 }

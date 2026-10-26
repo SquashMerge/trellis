@@ -13,7 +13,8 @@ use crate::{
     http::DaemonState,
     model::IndexPin,
     search_card::CardFormat,
-    search_embed::{EmbedError, Embedder, InputKind, model_id_for_card_format},
+    search_embed::{DIMENSIONS, EmbedError, InputKind, SearchEmbedder, model_id_for_card_format},
+    search_vectors::VectorCacheReader,
     store::{HeadSearchCards, SEARCH_CARD_BATCH_SIZE, SearchHeadChanged, topology::StorageBusy},
 };
 use anyhow::Result;
@@ -32,8 +33,15 @@ impl FillSource for DaemonState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Completed {
+    pin: IndexPin,
+    cache_epoch: u64,
+}
+
 struct Outcome {
     pin: Option<IndexPin>,
+    cache_epoch: u64,
     result: Result<()>,
 }
 trait FillBackend: Send + Sync {
@@ -41,7 +49,7 @@ trait FillBackend: Send + Sync {
         &self,
         source: &dyn FillSource,
         cancel: &AtomicBool,
-        completed: Option<IndexPin>,
+        completed: Option<Completed>,
         publish: &dyn Fn(IndexPin),
     ) -> Outcome;
 }
@@ -51,17 +59,24 @@ impl FillBackend for LocalBackend {
         &self,
         source: &dyn FillSource,
         cancel: &AtomicBool,
-        _completed: Option<IndexPin>,
+        completed: Option<Completed>,
         publish: &dyn Fn(IndexPin),
     ) -> Outcome {
         let mut pin = None;
+        let mut cache_epoch = self.0.cache_epoch();
+        // One reader/connection per head job, with a fresh transaction per page.
+        // Transactions end before inference/writes, so own inserts are visible.
+        let mut reader = None;
         let result = (|| {
             check_cancel(cancel)?;
             let mut page = source.page(None, None)?;
             pin = Some(page.pin);
+            if completed.is_some_and(|done| {
+                done.pin == page.pin && done.cache_epoch == self.0.cache_epoch()
+            }) {
+                return Ok(());
+            }
             publish(page.pin);
-            // A completed head can lose evictable vectors without changing its
-            // index pin. Every owner hint rechecks misses before skipping work.
             if !self.0.model_configured() {
                 return Err(EmbedError::ModelUnavailable(
                     "no local search model is configured".into(),
@@ -70,15 +85,21 @@ impl FillBackend for LocalBackend {
             }
             let model_id = model_id_for_card_format(CardFormat::V1.as_str());
             self.0.with_vector_writer(|_| Ok(()))?;
-            // No model is loaded when all pages are already cached.
+            cache_epoch = self.0.cache_epoch();
+            reader = self.0.fill_reader()?;
             loop {
                 check_cancel(cancel)?;
-                let missing = self.missing(&model_id, &page)?;
+                let missing = Self::missing(reader.as_mut(), &model_id, &page)?;
                 if missing.iter().any(|value| *value) {
-                    // One head-scoped job, with bounded pages and no index/cache
-                    // snapshot held while loading or running the model.
                     return self.0.with_model_job(cancel, |model| {
-                        Ok(self.fill_loaded(source, cancel, model, &model_id, page, missing))
+                        Ok(self.fill_loaded(
+                            source,
+                            cancel,
+                            model,
+                            &model_id,
+                            (page, missing),
+                            reader.as_mut(),
+                        ))
                     })?;
                 }
                 let Some(after) = next_cursor(&page) else {
@@ -87,29 +108,47 @@ impl FillBackend for LocalBackend {
                 page = source.page(pin, Some(&after))?;
             }
         })();
-        Outcome { pin, result }
+        drop(reader);
+        self.0.invalidate_corrupt_cache(&result);
+        Outcome {
+            pin,
+            cache_epoch,
+            result,
+        }
     }
 }
 impl LocalBackend {
-    fn missing(&self, model_id: &str, page: &HeadSearchCards) -> Result<Vec<bool>> {
-        let hashes = page
-            .cards
+    fn missing(
+        reader: Option<&mut VectorCacheReader>,
+        model_id: &str,
+        page: &HeadSearchCards,
+    ) -> Result<Vec<bool>> {
+        let Some(reader) = reader else {
+            return Ok(vec![true; page.cards.len()]);
+        };
+        let snapshot = reader.snapshot()?;
+        page.cards
             .iter()
-            .map(|card| card.card_hash.as_str())
-            .collect::<Vec<_>>();
-        self.0.missing_vectors(model_id, &hashes)
+            .map(|card| {
+                snapshot
+                    .get(model_id, &card.card_hash)
+                    .map(|vector| vector.is_none_or(|vector| vector.len() != DIMENSIONS))
+            })
+            .collect()
     }
 
     fn fill_loaded(
         &self,
         source: &dyn FillSource,
         cancel: &AtomicBool,
-        model: &Embedder,
+        model: &dyn SearchEmbedder,
         model_id: &str,
-        mut page: HeadSearchCards,
-        mut missing: Vec<bool>,
+        first_page: (HeadSearchCards, Vec<bool>),
+        mut reader: Option<&mut VectorCacheReader>,
     ) -> Result<()> {
+        let (mut page, mut missing) = first_page;
         loop {
+            self.0.serve_queries(model);
             check_cancel(cancel)?;
             let mut hashes = std::collections::BTreeSet::new();
             let cards: Vec<_> = page
@@ -125,6 +164,12 @@ impl LocalBackend {
                     .map(|card| card.card_text.clone())
                     .collect::<Vec<_>>();
                 let vectors = model.embed(&texts, InputKind::Document, cancel)?;
+                if vectors.len() != cards.len() {
+                    return Err(EmbedError::Runtime(
+                        "document embedding returned the wrong batch size".into(),
+                    )
+                    .into());
+                }
                 check_cancel(cancel)?;
                 self.0.with_vector_writer(|writer| {
                     let entries = cards
@@ -137,12 +182,13 @@ impl LocalBackend {
                     writer.put_many(&entries)
                 })?;
             }
+            self.0.serve_queries(model);
             let Some(after) = next_cursor(&page) else {
                 return Ok(());
             };
             check_cancel(cancel)?;
             page = source.page(Some(page.pin), Some(&after))?;
-            missing = self.missing(model_id, &page)?;
+            missing = Self::missing(reader.as_deref_mut(), model_id, &page)?;
         }
     }
 }
@@ -164,7 +210,7 @@ struct Slot {
     dirty: bool,
     running: bool,
     running_pin: Option<IndexPin>,
-    completed: Option<IndexPin>,
+    completed: Option<Completed>,
     retries: usize,
     retry_at: Option<Instant>,
     fault_cooldown: Option<Instant>,
@@ -200,6 +246,21 @@ impl SearchFill {
             .name("trellis-search-fill".into())
             .spawn(move || drive(driver, backend))?;
         Ok(Arc::new(Self { core }))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_until_idle_for_tests(&self) {
+        let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
+        let mut inbox = self.core.inbox.lock().unwrap();
+        while inbox
+            .slots
+            .values()
+            .any(|slot| slot.running || slot.queued || slot.retry_at.is_some())
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "fill did not settle");
+            inbox = self.core.changed.wait_timeout(inbox, remaining).unwrap().0;
+        }
     }
 
     pub(crate) fn register(&self, scheduler: &Arc<DaemonState>) -> FillRegistration {
@@ -365,7 +426,8 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
             })
         }))
         .unwrap_or_else(|_| Outcome {
-            pin: completed,
+            pin: completed.map(|done| done.pin),
+            cache_epoch: completed.map_or(0, |done| done.cache_epoch),
             result: Err(EmbedError::Runtime("fill job panicked".into()).into()),
         });
         // Release the source before publishing completion. It does not keep a
@@ -399,7 +461,14 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
             slot.dirty = false;
             slot.fault_cooldown = Some(Instant::now() + FAULT_RETRY);
         } else {
-            slot.completed = outcome.pin;
+            slot.completed = if outcome.result.is_ok() {
+                outcome.pin.map(|pin| Completed {
+                    pin,
+                    cache_epoch: outcome.cache_epoch,
+                })
+            } else {
+                None
+            };
             slot.retries = 0;
         }
         if changed || slot.dirty {
@@ -438,7 +507,7 @@ mod tests {
             &self,
             source: &dyn FillSource,
             cancel: &AtomicBool,
-            _: Option<IndexPin>,
+            _: Option<Completed>,
             publish: &dyn Fn(IndexPin),
         ) -> Outcome {
             let pin = source.page(None, None).unwrap().pin;
@@ -450,6 +519,7 @@ mod tests {
             observed.store(cancel.load(Ordering::Acquire), Ordering::Release);
             Outcome {
                 pin: Some(pin),
+                cache_epoch: 0,
                 result: if self.busy {
                     Err(StorageBusy.into())
                 } else {
@@ -738,53 +808,74 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_head_rechecks_cache_and_retries_misses_without_a_new_pin() {
-        use crate::{search_model::SearchConfig, store::topology::TopologyRoots};
+    fn completed_pin_skips_pages_until_cache_invalidation() {
+        use crate::store::topology::TopologyRoots;
         let directory = tempfile::tempdir().unwrap();
         let roots = TopologyRoots::isolated_for_tests(
             directory.path().join("cache"),
             directory.path().join("data"),
         );
-        // Deliberately missing files: a fully cached rescan must not load them.
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
         let service = Arc::new(
-            SearchService::new(
+            SearchService::with_embedder_for_tests(
                 roots.clone(),
-                SearchConfig::from_values(
-                    Some(directory.path().join("missing-model")),
-                    Some("cpu"),
-                )
-                .unwrap(),
+                Arc::new(RecordingFactory {
+                    loads: loads.clone(),
+                    drops: drops.clone(),
+                    calls: calls.clone(),
+                    pause: None,
+                }),
             )
             .unwrap(),
         );
         let model_id = model_id_for_card_format(CardFormat::V1.as_str());
         let cards = (0..BATCH)
-            .map(|index| crate::store::HeadSearchCard {
+            .map(|index| HeadSearchCard {
                 syntax_id: format!("card-{index:03}"),
-                card_text: "measured card".into(),
+                card_text: "cached".into(),
                 card_hash: format!("{index:064x}"),
             })
             .collect::<Vec<_>>();
         service
             .with_vector_writer(|writer| {
-                for card in &cards {
-                    writer.put(&model_id, &card.card_hash, &vec![1; 1024])?;
-                }
-                Ok(())
+                let entries = cards
+                    .iter()
+                    .map(|card| {
+                        (
+                            model_id.as_str(),
+                            card.card_hash.as_str(),
+                            &[1; DIMENSIONS][..],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                writer.put_many(&entries)
             })
             .unwrap();
         let source = CachedSource {
             cards,
             pages: std::sync::atomic::AtomicUsize::new(0),
         };
-        let backend = LocalBackend(service);
-        let outcome = backend.run(&source, &AtomicBool::new(false), Some(pin(1)), &|_| {});
-        outcome.result.unwrap();
+        let backend = LocalBackend(service.clone());
+        let first = backend.run(&source, &AtomicBool::new(false), None, &|_| {});
+        first.result.unwrap();
+        assert_eq!(source.pages.load(Ordering::Relaxed), 2);
+        let completed = Some(Completed {
+            pin: pin(1),
+            cache_epoch: first.cache_epoch,
+        });
+        backend
+            .run(&source, &AtomicBool::new(false), completed, &|_| {})
+            .result
+            .unwrap();
         assert_eq!(
             source.pages.load(Ordering::Relaxed),
-            2,
-            "completed pin does not bypass cache recheck"
+            3,
+            "only the pin probe is read"
         );
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
+        assert!(calls.lock().unwrap().is_empty());
         {
             let path = std::fs::canonicalize(roots.vectors_db()).unwrap();
             let _witness = crate::store::retained_sqlite_file(&path, true, false, true).unwrap();
@@ -793,19 +884,389 @@ mod tests {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
             )
             .unwrap();
-            // A miss at this same index head must cause a fresh model job.
-            db.execute(
-                "DELETE FROM vectors WHERE card_hash=?1",
-                [&source.cards[0].card_hash],
-            )
-            .unwrap();
+            db.pragma_update(None, "user_version", 2).unwrap();
         }
-        let outcome = backend.run(&source, &AtomicBool::new(false), Some(pin(1)), &|_| {});
-        assert!(matches!(
-            outcome.result.unwrap_err().downcast_ref::<EmbedError>(),
-            Some(EmbedError::ModelUnavailable(_))
-        ));
+        let error = service
+            .with_vector_snapshot::<()>(|_| panic!("corrupt cache is not absence"))
+            .unwrap_err();
+        assert!(error.is::<crate::search_vectors::StoreUnavailable>());
+        assert!(service.cache_epoch() > first.cache_epoch);
         assert_eq!(source.pages.load(Ordering::Relaxed), 3);
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
+        assert!(calls.lock().unwrap().is_empty());
+
+        // The read only invalidates. A later ordinary hint for the same pin
+        // must recheck and fill, rather than fast-skip its completed job.
+        backend
+            .run(&source, &AtomicBool::new(false), completed, &|_| {})
+            .result
+            .unwrap();
+        assert_eq!(
+            source.pages.load(Ordering::Relaxed),
+            5,
+            "invalidated cache causes a whole job recheck"
+        );
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), BATCH);
+        drop(calls);
+        let present = service
+            .with_vector_snapshot(|snapshot| {
+                let snapshot = snapshot.unwrap();
+                assert_eq!(snapshot.entry_count(), BATCH as u64);
+                snapshot.get(&model_id, &source.cards[0].card_hash)
+            })
+            .unwrap();
+        assert_eq!(present, Some(vec![1; DIMENSIONS]));
+    }
+
+    type BatchPause = (Sender<()>, Arc<Mutex<Receiver<()>>>);
+
+    struct RecordingFactory {
+        loads: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        pause: Option<BatchPause>,
+    }
+    struct RecordingEmbedder {
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        pause: Option<BatchPause>,
+    }
+    impl Drop for RecordingEmbedder {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl crate::search_embed::SearchEmbedderFactory for RecordingFactory {
+        fn load(&self, _: &AtomicBool) -> Result<Box<dyn SearchEmbedder>, EmbedError> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(RecordingEmbedder {
+                drops: self.drops.clone(),
+                calls: self.calls.clone(),
+                pause: self.pause.clone(),
+            }))
+        }
+    }
+    impl SearchEmbedder for RecordingEmbedder {
+        fn embed(
+            &self,
+            texts: &[String],
+            kind: InputKind,
+            cancel: &AtomicBool,
+        ) -> Result<Vec<crate::search_embed::QuantizedVector>, EmbedError> {
+            if kind == InputKind::Document {
+                let first = {
+                    let mut calls = self.calls.lock().unwrap();
+                    let first = calls.is_empty();
+                    calls.push(texts.to_vec());
+                    first
+                };
+                if first && let Some((entered, resume)) = &self.pause {
+                    entered.send(()).unwrap();
+                    resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
+                }
+            }
+            if cancel.load(Ordering::Acquire) {
+                return Err(EmbedError::Cancelled);
+            }
+            Ok(texts
+                .iter()
+                .map(|_| crate::search_embed::QuantizedVector {
+                    values: vec![1; DIMENSIONS],
+                })
+                .collect())
+        }
+    }
+    struct PagedSource {
+        cards: Vec<HeadSearchCard>,
+        changed: AtomicBool,
+        pages: std::sync::atomic::AtomicUsize,
+    }
+    impl FillSource for PagedSource {
+        fn page(&self, expected: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
+            self.pages.fetch_add(1, Ordering::Relaxed);
+            let current = pin(if self.changed.load(Ordering::Acquire) {
+                2
+            } else {
+                1
+            });
+            if expected.is_some_and(|value| value != current) {
+                return Err(SearchHeadChanged.into());
+            }
+            Ok(HeadSearchCards {
+                pin: current,
+                cards: self
+                    .cards
+                    .iter()
+                    .filter(|card| after.is_none_or(|cursor| card.syntax_id.as_str() > cursor))
+                    .take(BATCH)
+                    .cloned()
+                    .collect(),
+            })
+        }
+    }
+    fn paged_source() -> PagedSource {
+        // Duplicate within batch and across pages. Fresh reader transactions
+        // must observe the first batch's writes before deciding page two misses.
+        PagedSource {
+            cards: (0..BATCH + 3)
+                .map(|index| HeadSearchCard {
+                    syntax_id: format!("{index:04}"),
+                    card_text: format!(
+                        "text-{}",
+                        if index == BATCH + 2 {
+                            BATCH
+                        } else {
+                            index % (BATCH - 1)
+                        }
+                    ),
+                    card_hash: format!(
+                        "{:064x}",
+                        if index == BATCH + 2 {
+                            BATCH
+                        } else {
+                            index % (BATCH - 1)
+                        }
+                    ),
+                })
+                .collect(),
+            changed: AtomicBool::new(false),
+            pages: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn recording_service(factory: RecordingFactory) -> (tempfile::TempDir, Arc<SearchService>) {
+        let directory = tempfile::tempdir().unwrap();
+        let roots = crate::store::topology::TopologyRoots::isolated_for_tests(
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        );
+        let service =
+            Arc::new(SearchService::with_embedder_for_tests(roots, Arc::new(factory)).unwrap());
+        (directory, service)
+    }
+
+    #[test]
+    fn production_fill_pages_deduplicates_and_reuses_reader_after_put_many() {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (_directory, service) = recording_service(RecordingFactory {
+            loads: loads.clone(),
+            drops: drops.clone(),
+            calls: calls.clone(),
+            pause: None,
+        });
+        let source = paged_source();
+        let backend = LocalBackend(service.clone());
+        let outcome = backend.run(&source, &AtomicBool::new(false), None, &|_| {});
+        outcome.result.unwrap();
+        assert_eq!(source.pages.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [BATCH - 1, 1]
+        );
+        assert_eq!(service.vector_report().unwrap().entries, BATCH as u64);
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        backend
+            .run(
+                &source,
+                &AtomicBool::new(false),
+                Some(Completed {
+                    pin: pin(1),
+                    cache_epoch: outcome.cache_epoch,
+                }),
+                &|_| {},
+            )
+            .result
+            .unwrap();
+        assert_eq!(source.pages.load(Ordering::Relaxed), 3);
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn head_change_mid_loaded_fill_keeps_committed_progress_and_drops_model() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered, events) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        let (_directory, service) = recording_service(RecordingFactory {
+            loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drops: drops.clone(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            pause: Some((entered, Arc::new(Mutex::new(proceed)))),
+        });
+        let source = Arc::new(paged_source());
+        let job_source = source.clone();
+        let job_service = service.clone();
+        let job = std::thread::spawn(move || {
+            LocalBackend(job_service).run(
+                job_source.as_ref(),
+                &AtomicBool::new(false),
+                None,
+                &|_| {},
+            )
+        });
+        events.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        source.changed.store(true, Ordering::Release);
+        resume.send(()).unwrap();
+        assert!(
+            job.join()
+                .unwrap()
+                .result
+                .unwrap_err()
+                .is::<SearchHeadChanged>()
+        );
+        assert_eq!(service.vector_report().unwrap().entries, (BATCH - 1) as u64);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        LocalBackend(service.clone())
+            .run(source.as_ref(), &AtomicBool::new(false), None, &|_| {})
+            .result
+            .unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            service.vector_report().unwrap().entries,
+            BATCH as u64,
+            "reconciliation fills only the remaining misses"
+        );
+    }
+
+    struct FaultOnceSource {
+        source: PagedSource,
+        fault: AtomicBool,
+    }
+    impl FillSource for FaultOnceSource {
+        fn page(&self, pin: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
+            if pin.is_some() && self.fault.swap(false, Ordering::AcqRel) {
+                return Err(StorageBusy.into());
+            }
+            self.source.page(pin, after)
+        }
+    }
+
+    #[test]
+    fn ordinary_read_fault_preserves_committed_batches_for_reconciliation() {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_directory, service) = recording_service(RecordingFactory {
+            loads: loads.clone(),
+            drops: drops.clone(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            pause: None,
+        });
+        let source = FaultOnceSource {
+            source: paged_source(),
+            fault: AtomicBool::new(true),
+        };
+        let backend = LocalBackend(service.clone());
+        assert!(
+            backend
+                .run(&source, &AtomicBool::new(false), None, &|_| {})
+                .result
+                .unwrap_err()
+                .is::<StorageBusy>()
+        );
+        assert_eq!(service.vector_report().unwrap().entries, (BATCH - 1) as u64);
+        backend
+            .run(&source, &AtomicBool::new(false), None, &|_| {})
+            .result
+            .unwrap();
+        assert_eq!(
+            loads.load(Ordering::Relaxed),
+            2,
+            "reconcile loads only for the remaining page-two miss"
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(service.vector_report().unwrap().entries, BATCH as u64);
+    }
+
+    #[test]
+    fn cancelled_loaded_fill_drops_weights_without_publishing_unfinished_batch() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered, events) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        let (_directory, service) = recording_service(RecordingFactory {
+            loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drops: drops.clone(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            pause: Some((entered, Arc::new(Mutex::new(proceed)))),
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job_cancel = cancel.clone();
+        let job_service = service.clone();
+        let job = std::thread::spawn(move || {
+            LocalBackend(job_service).run(&paged_source(), &job_cancel, None, &|_| {})
+        });
+        events.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        cancel.store(true, Ordering::Release);
+        resume.send(()).unwrap();
+        assert!(matches!(
+            job.join()
+                .unwrap()
+                .result
+                .unwrap_err()
+                .downcast_ref::<EmbedError>(),
+            Some(EmbedError::Cancelled)
+        ));
+        assert_eq!(service.vector_report().unwrap().entries, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(
+            service
+                .query_embedding(
+                    "after cancellation",
+                    &Arc::new(AtomicBool::new(false)),
+                    Instant::now() + crate::testing::HANG_BACKSTOP
+                )
+                .unwrap()
+                .vector
+                .is_some()
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn queued_query_is_served_by_fill_without_a_second_model_load() {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered, events) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        let (_directory, service) = recording_service(RecordingFactory {
+            loads: loads.clone(),
+            drops: drops.clone(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            pause: Some((entered, Arc::new(Mutex::new(proceed)))),
+        });
+        let source = paged_source();
+        let job_service = service.clone();
+        let job = std::thread::spawn(move || {
+            LocalBackend(job_service).run(&source, &AtomicBool::new(false), None, &|_| {})
+        });
+        events.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let query_service = service.clone();
+        let query = std::thread::spawn(move || {
+            query_service.query_embedding(
+                "queued",
+                &Arc::new(AtomicBool::new(false)),
+                Instant::now() + crate::testing::HANG_BACKSTOP,
+            )
+        });
+        service.wait_for_queued_query_for_tests();
+        resume.send(()).unwrap();
+        assert!(query.join().unwrap().unwrap().vector.is_some());
+        job.join().unwrap().result.unwrap();
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
