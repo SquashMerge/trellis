@@ -388,3 +388,82 @@ fn references_grouped_self_import_does_not_map_a_decoy_file() {
                 && site["reason"] == "rust_inline_or_alias_ambiguous")
     );
 }
+
+#[test]
+fn references_modest_file_with_many_calls_keeps_exact_counts() {
+    let source = (0..600)
+        .map(|i| format!("fn f{i}() {{ {} }}\n", "crate::target::run(); ".repeat(4)))
+        .collect::<String>();
+    let input = snapshot(&[
+        ("src/lib.rs", &source),
+        ("src/target.rs", "pub fn run() {}"),
+    ]);
+    let data = references::project(&input, &[], 1, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let pair = edge(&data, "production", "src/lib.rs", "src/target.rs");
+    assert_eq!(pair["count"], 2400);
+    assert_eq!(pair["omittedSites"], 2399);
+    assert_eq!(data["counts"]["mappedSites"], 2400);
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn references_indexed_owners_preserve_linear_selection_and_call_order() {
+    let mut input = snapshot(&[
+        ("src/lib.rs", "fn f() { crate::target::run(); }"),
+        ("src/target.rs", "pub fn run() {}"),
+    ]);
+    let source_index = input
+        .documents
+        .iter()
+        .position(|d| d.key.path == "src/lib.rs")
+        .unwrap();
+    let original = input.documents[source_index].declarations.clone();
+    let f = original
+        .iter()
+        .find(|d| d.name.as_deref() == Some("f"))
+        .unwrap()
+        .clone();
+    for (kind, depth, ambiguous) in [
+        ("function", 0, true),
+        ("method", 0, false),
+        ("module", 0, false),
+        ("function", 1, false),
+    ] {
+        let source = &mut input.documents[source_index];
+        source.declarations = original.clone();
+        let mut duplicate = f.clone();
+        duplicate.syntax_id = "sid:v1:duplicate".into();
+        duplicate.kind = kind.into();
+        if depth != 0 || kind == "module" {
+            duplicate.ancestors.push(f.key.clone());
+        }
+        source.declarations.push(duplicate);
+        let expected = if depth != 0 {
+            "sid:v1:duplicate"
+        } else {
+            &f.syntax_id
+        };
+        let data = project(&input);
+        if ambiguous {
+            assert_eq!(data["unresolved"][0]["reason"], "reference_owner_ambiguous");
+        } else {
+            assert_eq!(
+                edge(&data, "production", "src/lib.rs", "src/target.rs")["sites"][0]["ownerSyntaxId"],
+                expected
+            );
+        }
+    }
+    let source = &mut input.documents[source_index];
+    source.declarations = original;
+    let mut outer = source.calls[0].clone();
+    outer.id = "occ:v2:first-stored".into();
+    outer.range = f.range;
+    source.calls.insert(0, outer);
+    let data = project(&input);
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/target.rs")["sites"][0]["callId"],
+        "occ:v2:first-stored"
+    );
+}
