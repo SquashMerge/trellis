@@ -154,8 +154,9 @@ summary does not.
 
 Versions published before the switch remain available under the MIT License. Third-party material
 is not part of the Licensed Work: bundled fonts keep their own SIL OFL licenses under `web/fonts/`,
-and the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-factory/` and
-`tests/fixtures/extraction/feature-factory.*`) carry their original project's terms.
+the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-factory/` and
+`tests/fixtures/extraction/feature-factory.*`) carry their original project's terms, and the
+Candle/Voyage embedding adaptation retains its [upstream terms](src/search_embed/licenses/README.md).
 
 ## Read more
 
