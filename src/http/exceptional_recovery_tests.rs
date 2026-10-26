@@ -2061,6 +2061,159 @@ fn deferred_full_gate_clears_only_matching_explicit_registration() {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn causal_watch_ack_follows_published_fifo_and_watch_status() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let (reporter, mut events) =
+        crate::daemon::causal_witness::CausalWitness::in_memory_for_tests();
+    *state.causal_witness.lock().unwrap() = Some(reporter.clone());
+    let owner = state.retained_serving_session().unwrap();
+    {
+        let mut guard = state.watcher_work.lock().unwrap();
+        guard.as_mut().unwrap().1.attach_causal_witness(
+            reporter,
+            owner.incarnation(),
+            state.causal_lineage_ordinal.clone(),
+        );
+    }
+    state.worker_step().unwrap();
+    let lineage = state.causal_lineage_for(&owner).unwrap();
+    state.emit_causal_startup_ready_once(lineage, store.status().unwrap().revision);
+    assert!(!state.checkout_watch_pending());
+    assert!(!state.fifo_pending());
+    while events.try_recv().is_ok() {}
+
+    let queued = state.enqueue_index(&options, None).unwrap();
+    assert!(state.fifo_pending());
+    // A same-pin request can cover a new accepted watch generation. Its ACK
+    // must not race the worker's still-pending public FIFO snapshot.
+    state.submit_watch_event_for_tests(Ok(notify::Event::new(notify::EventKind::Modify(
+        notify::event::ModifyKind::Any,
+    ))
+    .add_path(options.workspace_root.join("a.js"))));
+    let events = Arc::new(std::sync::Mutex::new(events));
+    let paused_events = events.clone();
+    let inspected = Arc::new(AtomicBool::new(false));
+    let inspected_hook = inspected.clone();
+    let paused_state = state.clone();
+    let paused_store = store.clone();
+    let id = queued.id.clone();
+    state.test_queue_after_watcher_reconcile.set(move || {
+        assert_eq!(
+            paused_store.request_by_id(&id).unwrap().unwrap().state,
+            "done"
+        );
+        assert!(
+            paused_store
+                .earliest_unfinished_request()
+                .unwrap()
+                .is_none()
+        );
+        assert!(!paused_state.checkout_watch_pending());
+        assert!(
+            paused_state.fifo_pending(),
+            "FIFO snapshot is not published yet"
+        );
+        let mut pending = false;
+        while let Ok(event) = paused_events.lock().unwrap().try_recv() {
+            pending |= event.kind == "WATCH_PENDING";
+            assert_ne!(
+                event.kind, "WATCH_ACK",
+                "ACK preceded public FIFO settlement"
+            );
+        }
+        assert!(pending);
+        inspected_hook.store(true, Ordering::Release);
+    });
+    state.worker_step().unwrap();
+    assert!(inspected.load(Ordering::Acquire));
+    assert!(!state.fifo_pending());
+    assert!(!state.checkout_watch_pending());
+    let ack = events
+        .lock()
+        .unwrap()
+        .try_recv()
+        .expect("settled worker ACK");
+    assert_eq!(ack.kind, "WATCH_ACK");
+    assert_eq!(ack.queue_empty, Some(true));
+    assert_eq!(ack.request_seq, Some(queued.seq));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn completed_noop_request_emits_watch_ack_deferred_by_queued_row() {
+    let (_tmp, store, state, options) = serving_queue_watch_fixture();
+    let (reporter, mut events) =
+        crate::daemon::causal_witness::CausalWitness::in_memory_for_tests();
+    *state.causal_witness.lock().unwrap() = Some(reporter.clone());
+    let owner = state.retained_serving_session().unwrap();
+    let pin = store.status().unwrap().revision;
+    let queued = {
+        let mut guard = state.watcher_work.lock().unwrap();
+        let work = &mut guard.as_mut().unwrap().1;
+        work.attach_causal_witness(
+            reporter,
+            owner.incarnation(),
+            state.causal_lineage_ordinal.clone(),
+        );
+        assert!(
+            work.reconcile_due(
+                &store,
+                &owner,
+                &options,
+                &Arc::new(AtomicBool::new(false)),
+                true,
+            )
+            .unwrap()
+        );
+        assert_eq!(work.accounted_watch_pin(), Some(pin));
+        assert!(!work.accepted_watch_intent(&options));
+        // Place the enqueue after inventory acknowledgment but before the
+        // empty-FIFO witness check, without timing a real worker thread.
+        let queued = store.enqueue_request(&options, None).unwrap();
+        state.finalize_watcher_gate(None);
+        queued
+    };
+    let pending = events.try_recv().expect("initial watcher pending witness");
+    assert_eq!(pending.kind, "WATCH_PENDING");
+    assert!(events.try_recv().is_err(), "queued row prevents WATCH_ACK");
+    assert_eq!(
+        store.request_by_id(&queued.id).unwrap().unwrap().state,
+        "queued"
+    );
+
+    state.worker_step().unwrap();
+    let terminal = store.request_by_id(&queued.id).unwrap().unwrap();
+    assert_eq!(terminal.state, "done");
+    assert_eq!(
+        terminal.revision,
+        Some(pin),
+        "unchanged request reuses the head"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let guard = state.watcher_work.lock().unwrap();
+    let work = &guard.as_ref().unwrap().1;
+    assert_eq!(work.accounted_watch_pin(), Some(pin));
+    assert_eq!(work.accounted_watch_generation(), pending.watch_generation);
+    assert!(!work.accepted_watch_intent(&options));
+    let ack = events
+        .try_recv()
+        .expect("completed no-op must emit the watcher ACK deferred by its queued row");
+    assert_eq!(ack.kind, "WATCH_ACK");
+    assert_eq!(ack.pin, Some(pin));
+    assert_eq!(ack.watch_generation, pending.watch_generation);
+    assert_eq!(ack.queue_empty, Some(true));
+    assert_eq!(ack.request_seq, Some(queued.seq));
+    drop(guard);
+    state.worker_step().unwrap();
+    assert!(
+        events.try_recv().is_err(),
+        "idle step must not duplicate ACK"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn empty_fifo_deferred_retry_emits_exact_causal_ack() {
     let (_tmp, store, state, options) = serving_queue_watch_fixture();
     let (reporter, mut events) =
