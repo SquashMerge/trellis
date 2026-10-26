@@ -468,8 +468,11 @@ fn chain_control_and_opaque_arguments_are_not_hidden() {
     }
 }
 #[test]
-fn actual_acp_open_options_chain_is_presentational() {
-    let (graph, view) = fixture(include_str!("../src/acp.rs"), "check_file_with_unlinked");
+fn open_options_chain_is_presentational() {
+    let (graph, view) = fixture(
+        include_str!("fixtures/rust/open_options.rs"),
+        "check_file_with_unlinked",
+    );
     assert!(!view.warnings.iter().any(|w| w.contains("use_declaration")));
     assert!(
         flatten(&view.steps)
@@ -574,8 +577,11 @@ fn target_for<'a>(view: &'a SequenceView, label: &str) -> &'a trellis::behavior:
 }
 
 #[test]
-fn real_acp_calls_have_source_hints_not_inferred_types() {
-    let (graph, view) = fixture(include_str!("../src/acp.rs"), "check_file_with_unlinked");
+fn open_options_calls_have_source_hints_not_inferred_types() {
+    let (graph, view) = fixture(
+        include_str!("fixtures/rust/open_options.rs"),
+        "check_file_with_unlinked",
+    );
     let file = target_for(&view, "metadata");
     assert_eq!((&*file.kind, &*file.label), ("unresolvedReceiver", "file"));
     let helper = target_for(&view, "check_file_metadata");

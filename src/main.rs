@@ -27,6 +27,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    GitRead(GitReadArgs),
     /// Export fixture snapshots through the real native extractor (test-support build only).
     #[cfg(feature = "test-support")]
     NativeCapture(NativeCaptureArgs),
@@ -46,12 +48,14 @@ enum Command {
     Symbols(SymbolsArgs),
     /// Compute pinned source complexity metrics without writing the index.
     Metrics(MetricsArgs),
+    /// Check reviewed architecture rules against captured source.
+    Rules(RulesArgs),
+    /// Show captured structural file-module references, not resolved call edges.
+    References(ReferencesArgs),
     /// Query a bounded static call view. This is not a runtime sequence.
     Query(QueryArgs),
-    /// Inspect existing derived indexes and saved records without changing them.
+    /// Inspect existing derived indexes without changing them.
     Gc(GcArgs),
-    /// Permanently remove one saved workspace record by its exact ID.
-    Forget(ForgetArgs),
 }
 #[cfg(feature = "test-support")]
 #[derive(Args)]
@@ -71,11 +75,46 @@ struct NativeCaptureArgs {
     revision: Option<String>,
 }
 #[derive(Args)]
-struct ForgetArgs {
-    record_id: String,
-    /// Confirm without an interactive terminal.
+struct RulesArgs {
+    #[command(subcommand)]
+    command: RulesCommand,
+}
+#[derive(Subcommand)]
+enum RulesCommand {
+    Check(RulesCheckArgs),
+}
+#[derive(Args)]
+struct RulesCheckArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long, default_value = "json", value_parser = ["json"])]
+    format: String,
+    /// Full index generation:revision pair; omitted means the admitted head.
     #[arg(long)]
-    yes: bool,
+    pin: Option<String>,
+    /// Source path glob; target evidence is not restricted.
+    #[arg(long = "path")]
+    paths: Vec<String>,
+}
+#[derive(Args)]
+struct ReferencesArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long)]
+    pin: Option<String>,
+    #[arg(long = "path")]
+    paths: Vec<String>,
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+}
+#[derive(Args)]
+struct GitReadArgs {
+    #[arg(long)]
+    root: PathBuf,
+    #[arg(long, value_parser = ["summary", "status", "diff"])]
+    mode: String,
+    #[arg(long)]
+    path: Option<String>,
 }
 #[derive(Args)]
 struct GcArgs {
@@ -146,21 +185,6 @@ struct ServeArgs {
     /// Existing private token file or a path at which to securely create one.
     #[arg(long)]
     token_file: Option<PathBuf>,
-    /// Explicit opt-in to source-bearing Jev requests; durable shared budget directory.
-    #[arg(long, requires = "jev_budget_cents")]
-    jev_budget_dir: Option<PathBuf>,
-    /// Authorized reservation cap in cents. Existing ledger caps cannot be changed.
-    #[arg(long, requires = "jev_budget_dir", value_parser = clap::value_parser!(u64).range(10..=500))]
-    jev_budget_cents: Option<u64>,
-    /// Explicit opt-in: trusted executable ACP runner (not a command from the inspected repository).
-    #[arg(long, requires_all = ["acp_state_dir", "acp_max_attempts"])]
-    acp_runner: Option<PathBuf>,
-    /// Separate private ACP allowance/audit directory. Never use a Jev budget directory.
-    #[arg(long, requires_all = ["acp_runner", "acp_max_attempts"])]
-    acp_state_dir: Option<PathBuf>,
-    /// Authorized ACP attempt allowance; immutable across restarts. Not a monetary cap.
-    #[arg(long, requires_all = ["acp_runner", "acp_state_dir"], value_parser = clap::value_parser!(u64).range(1..=20))]
-    acp_max_attempts: Option<u64>,
 }
 #[derive(Args)]
 struct SymbolsArgs {
@@ -209,6 +233,8 @@ struct MetricsArgs {
     sid: Option<String>,
     #[arg(long, default_value = "sum")]
     aggregate: String,
+    #[arg(long, default_value = "all")]
+    role: String,
     #[arg(long)]
     metrics: Option<String>,
 }
@@ -235,6 +261,10 @@ const CLI_READ_WAIT: Duration = Duration::from_secs(5);
 #[tokio::main]
 async fn main() -> Result<()> {
     let command = Cli::parse().command;
+    if let Command::GitRead(args) = &command {
+        trellis::git_status::write_child_response(&args.root, &args.mode, args.path.as_deref())?;
+        return Ok(());
+    }
     if matches!(&command, Command::Index(_) | Command::Serve(_)) {
         trellis::capture::pin_running_executable()?;
     }
@@ -265,7 +295,7 @@ async fn main() -> Result<()> {
                 )?;
             }
         }
-        Command::Daemon | Command::Serve(_) => unreachable!(),
+        Command::Daemon | Command::Serve(_) | Command::GitRead(_) => unreachable!(),
         Command::Mcp(args) => {
             let (_, identity) = args.resolve_unattached()?;
             let socket = socket_path()?;
@@ -279,46 +309,14 @@ async fn main() -> Result<()> {
             let request = daemon_request("gc_report", serde_json::json!({}));
             print_json(&send_daemon(&request, true)?)?;
         }
-        Command::Forget(args) => {
-            use std::io::{self, Write};
-            let deleted = TopologyRoots::production()?.forget_with_confirmation(
-                &args.record_id,
-                |record, paths| {
-                    eprintln!("Record ID: {}", record.id);
-                    eprintln!(
-                        "Saved views: {}; annotations: {}",
-                        record.views, record.annotations
-                    );
-                    for path in paths {
-                        eprintln!("Saved path: {path}");
-                    }
-                    eprintln!("WARNING: every checkout sharing this UUID loses these saved items.");
-                    if args.yes {
-                        return Ok(true);
-                    }
-                    ensure!(
-                        unsafe { libc::isatty(libc::STDIN_FILENO) } == 1,
-                        "confirmation requires a terminal or --yes"
-                    );
-                    eprint!("Type the exact record ID to forget: ");
-                    io::stderr().flush()?;
-                    let mut answer = String::new();
-                    io::stdin().read_line(&mut answer)?;
-                    Ok(answer.trim_end_matches(['\r', '\n']) == record.id)
-                },
-            )?;
-            ensure!(
-                deleted,
-                "record ID confirmation did not match; no files removed"
-            );
-            eprintln!("Forgot record {}", args.record_id);
-        }
         command @ (Command::Index(_)
         | Command::Semantic(_)
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
-        | Command::Metrics(_)) => dispatch_cli(&command)?,
+        | Command::Metrics(_)
+        | Command::Rules(_)
+        | Command::References(_)) => dispatch_cli(&command)?,
     }
     Ok(())
 }
@@ -652,6 +650,20 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
 fn dispatch_cli(command: &Command) -> Result<()> {
     let (operation, workspace, mut payload, read_only) = match command {
         Command::Status(args) => ("status", args, serde_json::json!({}), true),
+        Command::Rules(RulesArgs {
+            command: RulesCommand::Check(args),
+        }) => (
+            "rules_check",
+            &args.workspace,
+            architecture_cli_arguments(args.pin.as_deref(), &args.paths, None)?,
+            true,
+        ),
+        Command::References(args) => (
+            "references",
+            &args.workspace,
+            architecture_cli_arguments(args.pin.as_deref(), &args.paths, Some(args.limit))?,
+            true,
+        ),
         Command::Symbols(args) => {
             ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
             (
@@ -690,6 +702,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 path: args.path.clone(),
                 sid: args.sid.clone(),
                 aggregate: args.aggregate.clone(),
+                role: args.role.clone(),
                 ..Default::default()
             };
             if let Some(names) = &args.metrics {
@@ -760,7 +773,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 serde_json::json!({
                     "scope": options.scope, "sourceSetId": options.source_set_id,
                     "language": options.language, "path": options.path,
-                    "sid": options.sid, "aggregate": options.aggregate,
+                    "sid": options.sid, "aggregate": options.aggregate, "role": options.role,
                     "metrics": options.metrics, "pin": options.pin
                 }),
                 true,
@@ -842,11 +855,12 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         } else {
             let payload = &value["payload"];
             println!(
-                "metrics {}:{} ({}, {}, catchingUp={})",
+                "metrics {}:{} ({}, {}, role={}, catchingUp={})",
                 payload["indexGeneration"].as_str().unwrap_or("?"),
                 payload["indexRevision"],
                 payload["scope"].as_str().unwrap_or("?"),
                 payload["aggregate"].as_str().unwrap_or("?"),
+                payload["role"].as_str().unwrap_or("?"),
                 value["catchingUp"]
             );
             for kind in ["declarations", "files", "directories"] {
@@ -867,7 +881,47 @@ fn dispatch_cli(command: &Command) -> Result<()> {
     } else {
         print_json(&value)?;
     }
+    if matches!(command, Command::Rules(_) | Command::References(_)) && value.get("error").is_some()
+    {
+        anyhow::bail!("architecture evaluation failed");
+    }
+    if matches!(command, Command::Rules(_))
+        && value["payload"]["counts"]["deviates"].as_u64().unwrap_or(0) > 0
+    {
+        anyhow::bail!("architecture deviations");
+    }
     Ok(())
+}
+
+fn architecture_cli_arguments(
+    pin: Option<&str>,
+    paths: &[String],
+    limit: Option<usize>,
+) -> Result<serde_json::Value> {
+    let mut arguments = serde_json::json!({"paths":paths});
+    if let Some(limit) = limit {
+        ensure!(
+            (1..=50).contains(&limit),
+            "invalid_argument: limit must be 1..50"
+        );
+        arguments["limit"] = serde_json::json!(limit);
+    }
+    if let Some(pin) = pin {
+        let (generation, revision) = pin
+            .rsplit_once(':')
+            .context("invalid_argument: pin requires generation:revision")?;
+        ensure!(
+            !revision.is_empty() && revision.bytes().all(|b| b.is_ascii_digit()),
+            "invalid_argument: revision"
+        );
+        let pin: trellis::model::IndexPin = serde_json::from_value(serde_json::json!({
+            "indexGeneration":generation,
+            "indexRevision":revision.parse::<u64>().context("invalid_argument: revision")?,
+        }))
+        .context("invalid_argument: pin")?;
+        arguments["expectedBasis"] = serde_json::to_value(pin)?;
+    }
+    Ok(arguments)
 }
 
 async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
@@ -885,19 +939,7 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         .as_ref()
         .context("serve requires explicit --token-file")?;
     let (roots, identity) = args.index.workspace.resolve_unattached()?;
-    let mut destinations = vec![token_file.clone()];
-    destinations.extend(args.jev_budget_dir.iter().cloned());
-    destinations.extend(args.acp_state_dir.iter().cloned());
-    roots.validate_external(&identity, &destinations)?;
-    if args.jev_budget_dir.is_some() {
-        let key = std::env::var("JEV_KEY")
-            .map_err(|_| anyhow::anyhow!("JEV_KEY must be configured to enable live Jev"))?;
-        ensure!(
-            !key.trim().is_empty()
-                && reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_ok(),
-            "JEV_KEY must be configured to enable live Jev"
-        );
-    }
+    roots.validate_external(&identity, std::slice::from_ref(token_file))?;
     let token_parent = token_file
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -938,16 +980,6 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             .clone()
             .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
             .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo"))),
-        jev_budget_dir: args.jev_budget_dir.clone(),
-        jev_budget_cents: args.jev_budget_cents,
-        jev_key: if args.jev_budget_dir.is_some() {
-            Some(std::env::var("JEV_KEY")?)
-        } else {
-            None
-        },
-        acp_runner: args.acp_runner.clone(),
-        acp_state_dir: args.acp_state_dir.clone(),
-        acp_max_attempts: args.acp_max_attempts,
     };
     let mut options_json = serde_json::to_value(options)?;
     let fields = options_json
@@ -1374,7 +1406,7 @@ fn dispatch_connection(
     let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
     let read_scope = matches!(
         request.operation.as_str(),
-        "status" | "symbols" | "query" | "metrics"
+        "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
     );
     let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
@@ -1425,7 +1457,14 @@ fn dispatch_connection(
         ensure!(
             matches!(
                 request.operation.as_str(),
-                "status" | "symbols" | "query" | "index" | "semantic_import" | "metrics"
+                "status"
+                    | "symbols"
+                    | "query"
+                    | "index"
+                    | "semantic_import"
+                    | "metrics"
+                    | "rules_check"
+                    | "references"
             ),
             "unknown daemon operation"
         );
@@ -1489,6 +1528,39 @@ fn dispatch_connection(
                         .context("missing includeCallbacks")?,
                     exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
                 }),
+                "rules_check" | "references" => (|| {
+                    let (response, catching_up) = checkout.evidence_response()?;
+                    let kind = if request.operation == "references" {
+                        "references"
+                    } else {
+                        "check"
+                    };
+                    let mut check = || {
+                        ensure!(Instant::now() < request_deadline, "deadline_exceeded");
+                        Ok(())
+                    };
+                    let result = response.architecture_response(kind, args, &mut check);
+                    match result {
+                        Ok(payload) => {
+                            check()?;
+                            let value =
+                                serde_json::json!({"catchingUp":catching_up,"payload":payload});
+                            ensure!(
+                                serde_json::to_vec(&value)?.len() <= 64 * 1024 * 1024,
+                                "response_too_large"
+                            );
+                            check()?;
+                            response.finish(value)
+                        }
+                        Err(error) => {
+                            if let Some(diagnostic) = trellis::rules::diagnostic(&error) {
+                                response.finish(serde_json::json!({"catchingUp":catching_up,"error":diagnostic}))
+                            } else {
+                                Err(error)
+                            }
+                        }
+                    }
+                })(),
                 "metrics" => {
                     let options = metrics_options.as_ref().expect("metrics options validated");
                     let mut before_work = || {
@@ -1642,6 +1714,15 @@ fn dispatch_connection(
                     .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
+                #[cfg(all(feature = "test-support", unix))]
+                if let Ok(path) = std::env::var("TRELLIS_TEST_CLI_READ_WAIT_SOCKET") {
+                    use std::io::Write;
+                    let mut signal = std::os::unix::net::UnixStream::connect(path)
+                        .expect("connect CLI startup read fixture");
+                    signal
+                        .write_all(b"W")
+                        .expect("report CLI startup read wait");
+                }
                 // Wait for startup reconciliation to progress, not a poll (#138
                 // item 16).
                 checkout.wait_state_change(
@@ -1795,7 +1876,15 @@ fn metrics_options_from_request(
     ensure!(
         fields.keys().all(|key| matches!(
             key.as_str(),
-            "scope" | "aggregate" | "sourceSetId" | "language" | "path" | "sid" | "metrics" | "pin"
+            "scope"
+                | "aggregate"
+                | "role"
+                | "sourceSetId"
+                | "language"
+                | "path"
+                | "sid"
+                | "metrics"
+                | "pin"
         )),
         "invalid_argument: unknown metrics option"
     );
@@ -1814,6 +1903,11 @@ fn metrics_options_from_request(
             .as_str()
             .context("invalid_argument: aggregate")?
             .to_owned(),
+        role: if fields.contains_key("role") {
+            field(args, "role")?
+        } else {
+            "all".into()
+        },
         source_set_id: field(args, "sourceSetId")?,
         language: field(args, "language")?,
         path: field(args, "path")?,
@@ -1824,6 +1918,7 @@ fn metrics_options_from_request(
             vec![]
         },
         pin: field(args, "pin")?,
+        top_cognitive: None,
     };
     options
         .validate()
@@ -1959,4 +2054,42 @@ fn write_daemon_reply_until(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod metrics_request_tests {
+    use super::metrics_options_from_request;
+    use serde_json::json;
+
+    #[test]
+    fn role_selection_defaults_and_strict_daemon_option_validation() {
+        let args = json!({"scope": "revision", "aggregate": "sum"});
+        assert_eq!(metrics_options_from_request(&args).unwrap().role, "all");
+        for role in ["production", "all", "test"] {
+            let mut selected = args.clone();
+            selected["role"] = json!(role);
+            assert_eq!(metrics_options_from_request(&selected).unwrap().role, role);
+        }
+        for role in [
+            json!(""),
+            json!("unknown"),
+            json!("Production"),
+            json!(null),
+            json!(true),
+            json!(["all"]),
+        ] {
+            let mut invalid = args.clone();
+            invalid["role"] = role;
+            let error = metrics_options_from_request(&invalid).unwrap_err();
+            assert!(error.to_string().contains("invalid_argument"), "{error}");
+        }
+        let mut unknown = args;
+        unknown["roles"] = json!("production");
+        assert!(
+            metrics_options_from_request(&unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown metrics option")
+        );
+    }
 }

@@ -86,7 +86,7 @@ approval. No network listener or model/provider call is needed for tests.
 | Permission to disclose local information to an agent | Configuring `trellis mcp` for that agent (whole checkout); remote bridges add runtime/destination policy |
 
 Do not duplicate credentials, permission caches, run retries, or pane ownership across systems.
-An external-agent integration must not reset or bypass existing Trellis Jev/ACP accounting.
+An external-agent integration must not inspect or alter retired Trellis Jev/ACP state.
 
 Architecture: [context](architecture/agent-integration-context.md) and
 [containers](architecture/agent-integration-containers.md).
@@ -102,11 +102,10 @@ are **not** compiler bindings. Unresolved graph edges remain unresolved.
 
 Also shipped: the per-user daemon, per-checkout indexes, native watcher/delta publication,
 revision guards and the five-tool stdio MCP client. Still missing: bounded snapshot grep,
-versioned diagram artifacts, artifact notifications and deep links. Existing saved views are raw
-graph queries, not a general sequence/class/authored-diagram artifact system. Their writes have
-no artifact CAS/ownership.
+versioned diagram artifacts, artifact notifications and deep links. Saved views and notes are retired;
+they are not a general sequence/class/authored-diagram artifact system.
 Incoming **call** hierarchy is not implemented; class relations/hierarchy are a different capability.
-Current Trellis ACP is a tools-disabled evidence-answer adapter, not the agent manager to extend.
+The former tools-disabled ACP evidence-answer adapter is retired, not an agent manager to extend.
 
 ### Mimir: important integration constraint
 
@@ -191,9 +190,8 @@ Separate worktrees are separate workspaces with separate indexes; they share onl
 extraction results. No global registry, stable project catalog or workspace picker is needed for agents.
 
 A future browser project picker can list known checkouts without merging databases. See
-[multi-project viability](multi-project-viability.md). A moved checkout keeps its UUID, so its saved
-views and notes stay connected, and its index is rebuilt cheaply from the fact cache. A copy shares
-the original's views and notes.
+[historical multi-project viability](multi-project-viability.md). A moved checkout keeps its shared
+evidence UUID, and its index can reuse the fact cache. Saved views and notes remain retired.
 
 Keep runtime session/run IDs, optional Herdr connection/pane associations, and future artifact IDs
 and artifact revisions separate from source revision. Client-supplied labels do not authenticate
@@ -234,8 +232,8 @@ Later tools may add `trellis_search_text`, `trellis_navigate`, `trellis_diagram_
 Artifact reads and conceptual drafts will need their own version/authorization contract.
 
 Return original IDs/ranges, evidence basis, certainty, warnings and explicit truncation. A capped
-result is not “no results.” MCP basis and source-hash guards are implemented; the separate browser
-`/api/symbols` and `/api/query` routes do not require an expected revision. Agents never use the
+result is not “no results.” MCP basis and source-hash guards are implemented; the former browser
+`/api/symbols` and `/api/query` routes are removed. Agents never use the
 browser's owner HTTP routes.
 
 ### Structured tools complement grep
@@ -436,7 +434,7 @@ The following additional gates apply as the later capabilities are delivered, no
 - Trellis: `src/auth.rs` token file handling, `src/main.rs` CLI/workspace resolution;
   `src/http.rs` owner-bearer guard, route table and handlers; `src/store.rs` guarded reads/publication/views;
   `src/model.rs` graph/view identities; `src/navigation.rs`; `src/class_diagram.rs`;
-  `docs/member-navigation.md`, `docs/acp-answer-contract.md`, `docs/multi-project-viability.md`.
+  `docs/member-navigation.md`, `docs/multi-project-viability.md` (historical).
 - Mimir checkout: `mimir/server.py:1509-1526`; `mimir/acp/agent.py:522-555,595-643,682-733,1230-1346`;
   `mimir/acp/proxy.py:136-153,798-846,1640-1678`; `mimir/acp/daemon.py:273-314`;
   `mimir/acp/journal.py:141-193`; `mimir/tools/client_provider.py`; `mimir/mcp_client.py:896-918`.

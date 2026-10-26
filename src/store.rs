@@ -1,4 +1,4 @@
-//! SQLite snapshots and durable user data. Connections are never shared between threads.
+//! SQLite index snapshots and request queues. Connections are never shared between threads.
 pub mod anchors;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
@@ -6,6 +6,7 @@ pub mod requests;
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
+use crate::native_evidence::DeclarationRole;
 use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -651,11 +652,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 22;
+const DATABASE_SCHEMA_VERSION: u32 = 23;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V22: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=22), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V23: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=23), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -949,6 +950,7 @@ impl ReadRevision {
 #[derive(Debug, Clone)]
 pub struct MetricsOptions {
     pub pin: Option<IndexPin>,
+    pub role: String,
     pub scope: String,
     pub source_set_id: Option<String>,
     pub language: Option<String>,
@@ -957,23 +959,30 @@ pub struct MetricsOptions {
     pub aggregate: String,
     /// Empty means all metrics; transport rejects an explicitly empty list.
     pub metrics: Vec<String>,
+    pub top_cognitive: Option<usize>,
 }
 impl Default for MetricsOptions {
     fn default() -> Self {
         Self {
             pin: None,
             scope: "revision".into(),
+            role: "all".into(),
             source_set_id: None,
             language: None,
             path: None,
             sid: None,
             aggregate: "sum".into(),
             metrics: vec![],
+            top_cognitive: None,
         }
     }
 }
 impl MetricsOptions {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(self.role.as_str(), "production" | "all" | "test"),
+            "invalid role"
+        );
         ensure!(
             matches!(
                 self.scope.as_str(),
@@ -991,6 +1000,11 @@ impl MetricsOptions {
                 .all(|m| crate::metrics::METRIC_ORDER.contains(&m.as_str()))
                 && self.metrics.iter().collect::<BTreeSet<_>>().len() == self.metrics.len(),
             "invalid metrics"
+        );
+        ensure!(
+            self.top_cognitive
+                .is_none_or(|count| (1..=10).contains(&count)),
+            "invalid top cognitive count"
         );
         let located = self.scope != "revision";
         ensure!(
@@ -1024,8 +1038,17 @@ pub struct MetricsFileRow {
     pub source_set_id: String,
     pub language: String,
     pub path: String,
+    pub physical_lines: usize,
+    pub file_role: DeclarationRole,
+    pub role_counts: MetricsRoleCounts,
     pub declaration_count: usize,
     pub metrics: serde_json::Value,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsRoleCounts {
+    pub production: usize,
+    pub test: usize,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1038,6 +1061,7 @@ pub struct MetricsDirectoryRow {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsDeclarationRow {
+    pub role: DeclarationRole,
     pub source_set_id: String,
     pub language: String,
     pub path: String,
@@ -1047,8 +1071,29 @@ pub struct MetricsDeclarationRow {
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MetricsTopCognitiveRow {
+    pub role: DeclarationRole,
+    pub source_set_id: String,
+    pub language: String,
+    pub path: String,
+    pub sid: String,
+    pub range: crate::native_evidence::Range,
+    pub name: Option<String>,
+    pub kind: String,
+    pub metrics: MetricsTopCognitiveScore,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsTopCognitiveScore {
+    pub cognitive: usize,
+    pub cyclomatic: usize,
+    pub max_nesting: usize,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MetricsPayload {
     pub metrics_version: &'static str,
+    pub role: String,
     pub index_generation: String,
     pub index_revision: u64,
     pub scope: String,
@@ -1057,6 +1102,8 @@ pub struct MetricsPayload {
     pub declarations: Vec<MetricsDeclarationRow>,
     pub files: Vec<MetricsFileRow>,
     pub directories: Vec<MetricsDirectoryRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_cognitive: Option<Vec<MetricsTopCognitiveRow>>,
 }
 
 /// One coherent native read snapshot retained until its owned result passes T03.
@@ -1187,6 +1234,13 @@ impl MetricsReadCheck<'_> {
     }
 }
 
+/// Metrics and file metadata from one fetched indexed document.
+struct MetricsComputedDocument {
+    computed: crate::metrics::Computed,
+    physical_lines: usize,
+    file_role: DeclarationRole,
+}
+
 /// Why one revision document did not produce metrics.
 enum MetricsDocumentFailure {
     /// Reading the selected document failed; reported as a selected-read failure.
@@ -1249,6 +1303,361 @@ fn trace_metrics_resident(documents: usize, bytes: u64) {
 }
 
 impl EvidenceResponse {
+    /// Materialize one captured-source architecture view in this admitted snapshot.
+    pub fn architecture_response(
+        &self,
+        kind: &str,
+        arguments: &serde_json::Value,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        ensure!(
+            matches!(kind, "references" | "check" | "explain" | "prompt"),
+            "invalid_request"
+        );
+        let pin = arguments
+            .get("expectedBasis")
+            .map(|value| {
+                serde_json::from_value::<IndexPin>(value.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid_request: expectedBasis"))
+            })
+            .transpose()?;
+        let paths: Vec<String> = arguments
+            .get("paths")
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid_request: paths"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            paths
+                .iter()
+                .all(|path| crate::references::valid_path_glob(path)),
+            "invalid_request: paths"
+        );
+        let sample_limit = arguments
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|limit| (1..=50).contains(limit))
+                    .map(|limit| limit as usize)
+                    .ok_or_else(|| anyhow::anyhow!("invalid_request: limit"))
+            })
+            .transpose()?
+            .unwrap_or(5);
+        check()?;
+        let config = if kind == "references" {
+            None
+        } else {
+            crate::rules::load(Path::new(self.store.workspace_root()))?
+        };
+        if matches!(kind, "check" | "explain") && config.is_none() {
+            anyhow::bail!("rules_not_found");
+        }
+        let snapshot = self
+            .architecture_snapshot(pin, check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let references = crate::references::project(&snapshot, &paths, sample_limit, check)?;
+        let mut payload = match kind {
+            "references" => references.data,
+            "prompt" => serde_json::json!({
+                "rulesText": config.as_ref().map(|config| &config.text),
+                "rulesFile": config.as_ref().map(crate::rules::descriptor),
+                "references": references.data,
+            }),
+            "check" | "explain" => {
+                let config = config.as_ref().expect("checked rules presence");
+                let result = crate::rules::evaluate(config, &snapshot, &references, &paths, check)?;
+                if kind == "explain" {
+                    crate::rules::explain(
+                        result,
+                        arguments["rule"]
+                            .as_str()
+                            .context("invalid_request: rule")?,
+                        arguments.get("target").context("invalid_request: target")?,
+                        arguments.get("destination"),
+                    )?
+                } else {
+                    result
+                }
+            }
+            _ => unreachable!(),
+        };
+        payload["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
+        payload["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
+        check()?;
+        Ok(payload)
+    }
+
+    /// Browser-only layer summary, references and metrics from this admitted read.
+    pub fn architecture_view(
+        &self,
+        options: &MetricsOptions,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        options.validate()?;
+        check()?;
+        let config = crate::rules::load(Path::new(self.store.workspace_root()))?;
+        let selected = self.store.read_revision_for(&self.db, options.pin, true)?;
+        let layers = config
+            .as_ref()
+            .map(crate::rules::view_layers)
+            .unwrap_or_default();
+        let mut payload = serde_json::json!({
+            "indexGeneration": selected.pin.index_generation.to_string(),
+            "indexRevision": selected.pin.index_revision,
+            "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
+            "rulesFile": config.as_ref().map(crate::rules::descriptor),
+            "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
+            "role": options.role, "evidenceTier": "syntax", "semanticComplete": false,
+            "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
+        });
+        if payload["state"] != "ready" {
+            check()?;
+            return Ok(payload);
+        }
+        let config = config.as_ref().expect("ready config");
+        let snapshot = self
+            .architecture_snapshot(Some(selected.pin), check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let mut references = crate::references::project(&snapshot, &[], 5, check)?;
+        let mut rules = crate::rules::evaluate(config, &snapshot, &references, &[], check)?;
+        let metrics = self.metrics_at(
+            &MetricsOptions {
+                pin: Some(snapshot.pin),
+                role: options.role.clone(),
+                aggregate: options.aggregate.clone(),
+                ..MetricsOptions::default()
+            },
+            check,
+        )?;
+        let files: BTreeMap<_, _> = metrics
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    (
+                        file.source_set_id.as_str(),
+                        file.language.as_str(),
+                        file.path.as_str(),
+                    ),
+                    file,
+                )
+            })
+            .collect();
+        let documents: BTreeMap<_, _> = snapshot
+            .documents
+            .iter()
+            .map(|doc| {
+                (
+                    (
+                        doc.key.source_set_id.as_str(),
+                        doc.key.language.as_str(),
+                        doc.key.path.as_str(),
+                    ),
+                    doc,
+                )
+            })
+            .collect();
+        let mut modules = Vec::new();
+        for module in references.data["modules"]
+            .as_array()
+            .context("store_unavailable: references modules")?
+        {
+            check()?;
+            let target = &module["identity"];
+            let key = (
+                target["sourceSetId"]
+                    .as_str()
+                    .context("store_unavailable: module source set")?,
+                target["language"]
+                    .as_str()
+                    .context("store_unavailable: module language")?,
+                target["path"]
+                    .as_str()
+                    .context("store_unavailable: module path")?,
+            );
+            let file = files
+                .get(&key)
+                .context("store_unavailable: architecture metrics join")?;
+            let doc = documents
+                .get(&key)
+                .context("store_unavailable: architecture source join")?;
+            let mut row = module.clone();
+            row["layer"] = serde_json::json!(crate::rules::layer_for(config, key.2)?);
+            row["physicalLines"] = serde_json::json!(doc.file.text.lines().count());
+            row["declarationCount"] = serde_json::json!(file.declaration_count);
+            row["roleCounts"] = serde_json::json!(file.role_counts);
+            row["metrics"] = file.metrics.clone();
+            modules.push(row);
+        }
+        // Keep policy and exception contributions separate even on the same pair.
+        type SummaryKey = (String, String, String, String, bool, Option<String>);
+        let mut summaries: BTreeMap<SummaryKey, serde_json::Value> = BTreeMap::new();
+        for (field, evaluated, role) in [
+            ("production", "instances", "production"),
+            ("tests", "testOnly", "test"),
+        ] {
+            let verdicts: BTreeMap<_, _> = rules[evaluated]
+                .as_array()
+                .context("store_unavailable: layer verdicts")?
+                .iter()
+                .filter(|row| row["rule"] == "$layers" && !row["destination"].is_null())
+                .map(|row| {
+                    (
+                        (row["target"].to_string(), row["destination"].to_string()),
+                        row,
+                    )
+                })
+                .collect();
+            for pair in references.data[field]
+                .as_array()
+                .context("store_unavailable: reference pairs")?
+            {
+                check()?;
+                let verdict = verdicts
+                    .get(&(pair["source"].to_string(), pair["target"].to_string()))
+                    .context("store_unavailable: architecture verdict join")?;
+                let (Some(source), Some(destination)) = (
+                    verdict["sourceLayer"].as_str(),
+                    verdict["destinationLayer"].as_str(),
+                ) else {
+                    continue;
+                };
+                if source == destination {
+                    continue;
+                }
+                let status = verdict["status"]
+                    .as_str()
+                    .context("store_unavailable: layer status")?;
+                let excepted = verdict["excepted"]
+                    .as_bool()
+                    .context("store_unavailable: layer exception")?;
+                let reason = verdict["exceptionReason"].as_str().map(str::to_owned);
+                let summary = summaries
+                    .entry((
+                        source.into(),
+                        destination.into(),
+                        role.into(),
+                        status.into(),
+                        excepted,
+                        reason.clone(),
+                    ))
+                    .or_insert_with(|| {
+                        serde_json::json!({
+                            "sourceLayer": source, "destinationLayer": destination, "role": role,
+                            "status": status, "excepted": excepted, "exceptionReason": reason,
+                            "count": 0, "pairs": []
+                        })
+                    });
+                summary["count"] = serde_json::json!(
+                    summary["count"].as_u64().unwrap_or(0)
+                        + pair["count"]
+                            .as_u64()
+                            .context("store_unavailable: reference count")?
+                );
+                summary["pairs"]
+                    .as_array_mut()
+                    .expect("constructed pairs")
+                    .push(pair.clone());
+            }
+        }
+        for value in [&mut references.data, &mut rules] {
+            value["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
+            value["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
+        }
+        payload["modules"] = serde_json::json!(modules);
+        payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
+        payload["references"] = references.data;
+        payload["rules"] = rules;
+        check()?;
+        Ok(payload)
+    }
+
+    /// Read each selected native document once; never reopen source from the checkout.
+    fn architecture_snapshot(
+        &self,
+        pin: Option<IndexPin>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<crate::references::Snapshot> {
+        use crate::native_evidence::DocumentKey;
+        check()?;
+        let selected = self.store.read_revision_for(&self.db, pin, true)?;
+        let mut statement = self.db.prepare(
+            "SELECT r.source_set_id,m.language,m.path FROM revision_documents m
+             JOIN native_revisions r ON r.id=m.revision_id
+             WHERE m.revision_id=?1 ORDER BY r.source_set_id,m.language,m.path",
+        )?;
+        let mut cursor = statement.query([&selected.key])?;
+        let mut documents = Vec::new();
+        let mut source_bytes = 0u64;
+        let mut stored_bytes = 0u64;
+        while let Some(row) = cursor.next()? {
+            check()?;
+            ensure!(
+                documents.len() < 100_000,
+                "bounded_work: architecture documents"
+            );
+            let key = DocumentKey {
+                source_set_id: row.get(0)?,
+                language: row.get(1)?,
+                path: row.get(2)?,
+            };
+            let fetched = {
+                let progress_failure = Mutex::new(None);
+                let check = Mutex::new(&mut *check);
+                let expired = || match (*check.lock().unwrap())() {
+                    Ok(()) => false,
+                    Err(error) => {
+                        *progress_failure.lock().unwrap() = Some(error);
+                        true
+                    }
+                };
+                let header = self.store.fetch_selected_header(
+                    &self.db,
+                    &key.path,
+                    &selected,
+                    Some(&expired),
+                );
+                if let Some(error) = progress_failure.lock().unwrap().take() {
+                    return Err(error);
+                }
+                let header = header?;
+                source_bytes = source_bytes.saturating_add(header.bytes.max(0) as u64);
+                stored_bytes = stored_bytes.saturating_add(header.stored_bytes);
+                ensure!(
+                    header.bytes <= 2 * 1024 * 1024
+                        && source_bytes <= 256 * 1024 * 1024
+                        && stored_bytes <= 512 * 1024 * 1024,
+                    "bounded_work: architecture source"
+                );
+                let fetched =
+                    self.store
+                        .fetch_selected_rows(&self.db, header, &selected, Some(&expired));
+                if let Some(error) = progress_failure.lock().unwrap().take() {
+                    return Err(error);
+                }
+                fetched?
+            };
+            selected_ensure!(
+                fetched.file.language == key.language,
+                "incompatible_index: architecture language mismatch"
+            );
+            documents.push(crate::references::DocumentInput {
+                key,
+                file: fetched.file,
+                declarations: fetched.declarations,
+                calls: fetched.calls,
+            });
+        }
+        check()?;
+        Ok(crate::references::Snapshot {
+            pin: selected.pin,
+            documents,
+        })
+    }
+
     /// Compute metrics from one selected revision in this response's read transaction.
     pub fn metrics_at(
         &self,
@@ -1316,6 +1725,9 @@ impl EvidenceResponse {
         }
         let mut declarations = Vec::new();
         let mut files = Vec::new();
+        let mut top_cognitive = options
+            .top_cognitive
+            .map(|_| Vec::<MetricsTopCognitiveRow>::new());
         let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
             BTreeMap::new();
         // Read only the selected version; no checkout filesystem access.
@@ -1347,7 +1759,7 @@ impl EvidenceResponse {
         let compute_document =
             |fetched: FetchedDocument,
              key: &DocumentKey|
-             -> std::result::Result<crate::metrics::Computed, MetricsDocumentFailure> {
+             -> std::result::Result<MetricsComputedDocument, MetricsDocumentFailure> {
                 let calls = std::cell::Cell::new(0);
                 let expired = || progress.expired_every(&calls, check_every);
                 // Metrics use the stored source and native rows as fetched.
@@ -1360,6 +1772,17 @@ impl EvidenceResponse {
                 if expired() {
                     return Err(MetricsDocumentFailure::Stopped);
                 }
+                let mut roots = fetched
+                    .declarations
+                    .iter()
+                    .filter(|row| row.kind == "module" && row.ancestors.is_empty());
+                let file_role = roots.next().map(|row| row.role);
+                let Some(file_role) = file_role.filter(|_| roots.next().is_none()) else {
+                    return Err(MetricsDocumentFailure::Read(
+                        SelectedIntegrity("incompatible_index: metrics file module".into()).into(),
+                    ));
+                };
+                let physical_lines = fetched.file.text.lines().count();
                 let source = crate::metrics::SourceInput {
                     language: &key.language,
                     content_hash: &fetched.file.hash,
@@ -1383,6 +1806,11 @@ impl EvidenceResponse {
                         Ok(())
                     },
                 )
+                .map(|computed| MetricsComputedDocument {
+                    computed,
+                    physical_lines,
+                    file_role,
+                })
                 .map_err(MetricsDocumentFailure::Other)
             };
         let compute = |fetched: FetchedDocument, key: &DocumentKey| {
@@ -1395,10 +1823,14 @@ impl EvidenceResponse {
         };
         let mut accept = |key: &DocumentKey,
                           outcome: Option<
-            std::result::Result<crate::metrics::Computed, MetricsDocumentFailure>,
+            std::result::Result<MetricsComputedDocument, MetricsDocumentFailure>,
         >|
          -> Result<()> {
-            let computed = match outcome {
+            let MetricsComputedDocument {
+                computed,
+                physical_lines,
+                file_role,
+            } = match outcome {
                 Some(Ok(computed)) => computed,
                 Some(Err(MetricsDocumentFailure::Read(error))) => {
                     return progress.result(Err(self.store.report_index_failure(error)));
@@ -1411,13 +1843,25 @@ impl EvidenceResponse {
                     return progress.result(Err(anyhow::anyhow!("cancelled")));
                 }
             };
-            let rows = computed.commit(
+            let mut rows = computed.commit(
                 &mut self
                     .store
                     .metrics_memo
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )?;
+            let mut role_counts = MetricsRoleCounts {
+                production: 0,
+                test: 0,
+            };
+            for row in &rows {
+                progress.check()?;
+                match row.role {
+                    DeclarationRole::Production => role_counts.production += 1,
+                    DeclarationRole::Test => role_counts.test += 1,
+                }
+            }
+            rows.retain(|row| options.role == "all" || options.role == row.role.as_str());
             let mut file_fold = crate::metrics::Accumulator::default();
             let mut parents = vec![String::new()];
             let mut directory = String::new();
@@ -1459,8 +1903,49 @@ impl EvidenceResponse {
                 }
             }
             for row in rows {
-                if options.scope == "file"
-                    || (options.scope == "declaration" && options.sid.as_ref() == Some(&row.sid))
+                let selected_callable =
+                    options.scope != "declaration" || options.sid.as_ref() == Some(&row.sid);
+                if selected_callable
+                    && let (Some(count), Some(top)) = (options.top_cognitive, &mut top_cognitive)
+                {
+                    top.push(MetricsTopCognitiveRow {
+                        role: row.role,
+                        source_set_id: row.source_set_id.clone(),
+                        language: row.language.clone(),
+                        path: row.path.clone(),
+                        sid: row.sid.clone(),
+                        range: row.range.clone(),
+                        name: row.name.clone(),
+                        kind: row.kind.clone(),
+                        metrics: MetricsTopCognitiveScore {
+                            cognitive: row.metrics.cognitive,
+                            cyclomatic: row.metrics.cyclomatic,
+                            max_nesting: row.metrics.max_nesting,
+                        },
+                    });
+                    top.sort_by(|a, b| {
+                        b.metrics.cognitive.cmp(&a.metrics.cognitive).then_with(|| {
+                            (
+                                &a.source_set_id,
+                                &a.language,
+                                &a.path,
+                                a.range.start,
+                                a.range.end,
+                                &a.sid,
+                            )
+                                .cmp(&(
+                                    &b.source_set_id,
+                                    &b.language,
+                                    &b.path,
+                                    b.range.start,
+                                    b.range.end,
+                                    &b.sid,
+                                ))
+                        })
+                    });
+                    top.truncate(count);
+                }
+                if options.scope == "file" || (options.scope == "declaration" && selected_callable)
                 {
                     let mut projected = serde_json::to_value(&row.metrics)?;
                     projected
@@ -1468,6 +1953,7 @@ impl EvidenceResponse {
                         .expect("metric score object")
                         .retain(|name, _| selected_metrics.iter().any(|selected| selected == name));
                     declarations.push(MetricsDeclarationRow {
+                        role: row.role,
                         source_set_id: row.source_set_id,
                         language: row.language,
                         path: row.path,
@@ -1482,6 +1968,9 @@ impl EvidenceResponse {
                     source_set_id: key.source_set_id.clone(),
                     language: key.language.clone(),
                     path: key.path.clone(),
+                    physical_lines,
+                    file_role,
+                    role_counts,
                     declaration_count: file_fold.count(),
                     metrics: file_fold.project(&options.aggregate, &names)?,
                 });
@@ -1689,6 +2178,7 @@ impl EvidenceResponse {
         progress.check()?;
         Ok(MetricsPayload {
             metrics_version: crate::metrics::VERSION,
+            role: options.role.clone(),
             index_generation: selected.pin.index_generation.to_string(),
             index_revision: selected.pin.index_revision,
             scope: options.scope.clone(),
@@ -1697,6 +2187,7 @@ impl EvidenceResponse {
             declarations,
             files,
             directories: directory_rows,
+            top_cognitive,
         })
     }
     pub(crate) fn report_index_failure(&self, error: anyhow::Error) -> anyhow::Error {
@@ -1728,10 +2219,6 @@ impl EvidenceResponse {
             .store
             .selected_source_row_for(&self.db, path, &selected)?;
         Ok(source.map(|source| (selected.pin, source)))
-    }
-    pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
-        self.store
-            .validate_selected_view_in(&self.db, view, sources)
     }
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
         self.query_view_at(query, None)
@@ -1772,6 +2259,22 @@ impl EvidenceResponse {
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
         self.store.methods_in(&self.db, path, expected, true)
+    }
+    pub fn file_symbols_at(
+        &self,
+        path: &str,
+        expected: IndexPin,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<crate::files_view::Outline>> {
+        self.store
+            .file_symbols_in(&self.db, path, expected, offset, limit, true)
+    }
+    pub fn syntax_matches_at(
+        &self,
+        request: &crate::files_view::SyntaxMatchesRequest,
+    ) -> Result<Option<crate::files_view::SyntaxMatches>> {
+        self.store.syntax_matches_in(&self.db, request, true)
     }
     pub fn sequence_at(
         &self,
@@ -1819,107 +2322,11 @@ impl EvidenceResponse {
     ) -> Result<Option<(IndexPin, Symbol)>> {
         self.store.symbol_in(&self.db, id, expected_revision, true)
     }
-    fn saved_pin(&self, expected: Option<IndexPin>) -> Result<IndexPin> {
-        Ok(self.store.read_revision_for(&self.db, expected, true)?.pin)
-    }
-    pub fn saved_views_at(&self, expected: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
-        let pin = self.saved_pin(expected)?;
-        self.store
-            .records()
-            .view_records()?
-            .into_iter()
-            .map(|v| Store::resolve_view(&self.db, &self.store, v, Some(pin), true))
-            .collect()
-    }
-    pub fn saved_view_at(
-        &self,
-        id: &str,
-        expected: Option<IndexPin>,
-    ) -> Result<Option<SavedViewState>> {
-        let pin = self.saved_pin(expected)?;
-        self.store
-            .records()
-            .view_record(id)?
-            .map(|v| Store::resolve_view(&self.db, &self.store, v, Some(pin), true))
-            .transpose()
-    }
-    pub fn saved_annotations_at(&self, expected: Option<IndexPin>) -> Result<Vec<AnnotationState>> {
-        let pin = self.saved_pin(expected)?;
-        self.store
-            .records()
-            .annotation_records()?
-            .into_iter()
-            .map(|a| Store::resolve_annotation(&self.db, &self.store, a, Some(pin), true))
-            .collect()
-    }
     /// A predecessor permit is read-only. Mutations require a current strict
     /// read, with the root and publication fence checked before sidecar work.
     pub fn require_mutation_ready(&self) -> Result<()> {
         self.store.ensure_public_read_ready()?;
         self.finish(())
-    }
-    pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
-        view.validate()?;
-        self.require_mutation_ready()?;
-        self.saved_pin(Some(pin))?;
-        ensure!(
-            self.status()?.revision == pin,
-            "revision conflict: mutation requires head"
-        );
-        let record = self.store.records().update_view_record(
-            &SavedViewRecord::from_base(view.clone(), None),
-            || {
-                serde_json::value::to_raw_value(&Store::selected_anchor_in(
-                    &self.db,
-                    &self.store,
-                    &view.query.seed,
-                    true,
-                )?)
-                .map_err(Into::into)
-            },
-        )?;
-        Store::resolve_view(&self.db, &self.store, record, Some(pin), true)
-    }
-    pub fn save_annotation_at(
-        &self,
-        pin: IndexPin,
-        request: &AnnotationRequest,
-    ) -> Result<AnnotationState> {
-        request.validate()?;
-        self.require_mutation_ready()?;
-        self.saved_pin(Some(pin))?;
-        ensure!(
-            self.status()?.revision == pin,
-            "revision conflict: mutation requires head"
-        );
-        let title = request
-            .title
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let record = self.store.records().update_annotation_record(
-            &AnnotationRecord::from_base(request.base(), title, None),
-            request.title.is_none(),
-            || {
-                serde_json::value::to_raw_value(&Store::selected_anchor_in(
-                    &self.db,
-                    &self.store,
-                    &request.node_id,
-                    true,
-                )?)
-                .map_err(Into::into)
-            },
-        )?;
-        Store::resolve_annotation(&self.db, &self.store, record, Some(pin), true)
-    }
-    pub fn delete_view(&self, id: &str) -> Result<bool> {
-        self.require_mutation_ready()?;
-        self.store.delete_view(id)
-    }
-    pub fn delete_annotation(&self, id: &str) -> Result<bool> {
-        self.require_mutation_ready()?;
-        self.store.delete_annotation(id)
     }
     /// Ordinary reads release the snapshot before slow response assembly.
     /// A transitional exact-pin fence retains its predecessor snapshot; T03
@@ -1948,7 +2355,7 @@ impl EvidenceResponse {
         }
     }
 }
-/// Unpinned responses need T03 only; cached packets also require their exact pin.
+/// Unpinned responses need T03 only; pinned responses also require their exact pin.
 #[derive(Clone, Copy)]
 pub enum EvidenceFencePolicy {
     T03,
@@ -2650,7 +3057,7 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V22)?;
+    expected.execute_batch(CACHE_SCHEMA_V23)?;
     control_ensure!(
         objects(db)? == objects(&expected)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -7374,7 +7781,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V22 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V23 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -9026,9 +9433,6 @@ fn read_native_capability_report(
     })
 }
 
-fn native_index_unavailable(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<topology::IndexNotReady>().is_some()
-}
 impl Store {
     /// Wake `waker` after every enqueue COMMIT on this checkout's queue, by any
     /// Store instance in this process. Held weakly: dropping it unregisters.
@@ -9480,55 +9884,68 @@ impl Store {
         );
         let store = Self::unopened(roots, identity)?;
         let guard = store.roots.index_use_existing_readonly(&store.identity)?;
-        // Even a read-only SQLite open can try to recover a hot journal or
-        // create WAL shared-memory sidecars. Status explicitly reports busy
-        // instead of recovering, creating sidecars or ignoring live WAL.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = index.with_file_name(format!(
-                "{}{}",
-                index
-                    .file_name()
-                    .context("index filename missing")?
-                    .to_string_lossy(),
-                suffix
-            ));
-            match std::fs::symlink_metadata(sidecar) {
-                Ok(_) => anyhow::bail!("storage_busy: index journal sidecar present"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        let observed = (|| {
+            // Even a read-only SQLite open can try to recover a hot journal or
+            // create WAL shared-memory sidecars. Status explicitly reports busy
+            // instead of recovering, creating sidecars or ignoring live WAL.
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = index.with_file_name(format!(
+                    "{}{}",
+                    index
+                        .file_name()
+                        .context("index filename missing")?
+                        .to_string_lossy(),
+                    suffix
+                ));
+                match std::fs::symlink_metadata(sidecar) {
+                    Ok(_) => anyhow::bail!("storage_busy: index journal sidecar present"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
+            let db = open_index(&index, false).map_err(|error| {
+                if recovery_class(&error) == RecoveryClass::RecreatePending {
+                    anyhow::anyhow!(
+                        "recovery_required: exceptional index format; run explicit trellis index"
+                    )
+                } else {
+                    error
+                }
+            })?;
+            // Status does not replay saved options, but malformed/relative saved
+            // inputs must still refuse rather than look like a healthy publication.
+            let (revision, raw_options): (i64, Option<String>) = db.query_row(
+                "SELECT index_revision,reconcile_options FROM index_metadata WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            ensure!(revision > 0, "index_not_ready: no published revision");
+            let raw_options =
+                raw_options.context("incompatible_index: missing reconcile options")?;
+            let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
+                .context(SelectedIntegrity(
+                    "incompatible_index: stored JSON decode failed".into(),
+                ))
+                .context("incompatible_index: invalid reconcile options")?;
+            ensure!(
+                json(&options)? == raw_options && options.version == 2,
+                "incompatible_index: unsupported reconcile options"
+            );
+            let status = store.read_status(&db)?;
+            store.identity.verify_readonly()?;
+            guard.verify()?;
+            Ok(status)
+        })();
+        drop(guard);
+        let lock = store
+            .roots
+            .cache
+            .join("indexes")
+            .join(format!("{}.lock", store.identity.root_key));
+        if let Ok(_exclusive) = topology::UseGuard::acquire_existing_readonly_exclusive(&lock) {
+            drop(SqliteWitnessRetirement(vec![index]));
         }
-        let db = open_index(&index, false).map_err(|error| {
-            if recovery_class(&error) == RecoveryClass::RecreatePending {
-                anyhow::anyhow!(
-                    "recovery_required: exceptional index format; run explicit trellis index"
-                )
-            } else {
-                error
-            }
-        })?;
-        // Status does not replay saved options, but malformed/relative saved
-        // inputs must still refuse rather than look like a healthy publication.
-        let (revision, raw_options): (i64, Option<String>) = db.query_row(
-            "SELECT index_revision,reconcile_options FROM index_metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        ensure!(revision > 0, "index_not_ready: no published revision");
-        let raw_options = raw_options.context("incompatible_index: missing reconcile options")?;
-        let options: crate::indexer::ReconcileOptions = serde_json::from_str(&raw_options)
-            .context(SelectedIntegrity(
-                "incompatible_index: stored JSON decode failed".into(),
-            ))
-            .context("incompatible_index: invalid reconcile options")?;
-        ensure!(
-            json(&options)? == raw_options && options.version == 2,
-            "incompatible_index: unsupported reconcile options"
-        );
-        let status = store.read_status(&db)?;
-        store.identity.verify_readonly()?;
-        guard.verify()?;
-        Ok(status)
+        observed
     }
     /// Isolated roots for integration fixtures; production startup calls `open` with ProjectDirs.
     #[cfg(test)]
@@ -9673,7 +10090,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V22)?;
+                db.execute_batch(CACHE_SCHEMA_V23)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -10278,9 +10695,6 @@ impl Store {
         .inspect_err(|error| {
             self.note_index_failure(error);
         })
-    }
-    fn records(&self) -> topology::DurableRecords<'_> {
-        topology::DurableRecords::new(&self.roots, &self.identity)
     }
     fn disposition(&self) -> RecoveryDisposition {
         match self.recovery_disposition.load(Ordering::Acquire) {
@@ -16925,6 +17339,231 @@ impl Store {
         ))
     }
 
+    /// All measured declarations in one cached file, retaining their exact native IDs.
+    pub fn file_symbols_at(
+        &self,
+        path: &str,
+        expected: IndexPin,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<crate::files_view::Outline>> {
+        self.with_evidence(|tx| self.file_symbols_in(tx, path, expected, offset, limit, false))
+    }
+    fn file_symbols_in(
+        &self,
+        tx: &Connection,
+        path: &str,
+        expected: IndexPin,
+        offset: usize,
+        limit: usize,
+        pre_startup: bool,
+    ) -> Result<Option<crate::files_view::Outline>> {
+        use crate::files_view::{InvalidRequest, Outline, OutlineItem, RESPONSE_LIMIT};
+        ensure!(
+            crate::files_view::valid_path(path)
+                && (1..=200).contains(&limit)
+                && offset <= i64::MAX as usize,
+            InvalidRequest
+        );
+        let selected = self.read_revision_for(tx, Some(expected), pre_startup)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 AND path=?2)",
+            params![selected.key, path],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let header = self.fetch_selected_header(tx, path, &selected, None)?;
+        let fetched = self.fetch_selected_rows(tx, header, &selected, None)?;
+        let mut metadata: BTreeMap<_, _> = fetched
+            .declarations
+            .iter()
+            .map(|d| (d.syntax_id.clone(), (d.kind.clone(), d.header.clone())))
+            .collect();
+        let mut nodes = Self::project_fetched(fetched)?.nodes;
+        nodes.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
+        let count = nodes.len();
+        let mut result = Outline {
+            revision: selected.pin,
+            path: path.into(),
+            items: vec![],
+            next_offset: None,
+            truncated: false,
+            warnings: vec![],
+        };
+        for symbol in nodes.into_iter().skip(offset).take(limit) {
+            let (native_kind, header) = metadata.remove(&symbol.id).context(SelectedIntegrity(
+                "incompatible_index: outline native declaration missing".into(),
+            ))?;
+            result.items.push(OutlineItem {
+                symbol,
+                native_kind,
+                header,
+            });
+            let next = offset + result.items.len();
+            result.next_offset = (next < count).then_some(next);
+            result.truncated = result.next_offset.is_some();
+            if serde_json::to_vec(&result)?.len() > RESPONSE_LIMIT {
+                result.items.pop();
+                ensure!(
+                    !result.items.is_empty(),
+                    "response_too_large: Files outline item"
+                );
+                result.next_offset = Some(offset + result.items.len());
+                result.truncated = true;
+                break;
+            }
+        }
+        ensure!(
+            serde_json::to_vec(&result)?.len() <= RESPONSE_LIMIT,
+            "response_too_large: Files outline"
+        );
+        Ok(Some(result))
+    }
+    pub fn syntax_matches_at(
+        &self,
+        request: &crate::files_view::SyntaxMatchesRequest,
+    ) -> Result<Option<crate::files_view::SyntaxMatches>> {
+        request.validate()?;
+        self.with_evidence(|tx| self.syntax_matches_in(tx, request, false))
+    }
+    fn syntax_matches_in(
+        &self,
+        tx: &Connection,
+        request: &crate::files_view::SyntaxMatchesRequest,
+        pre_startup: bool,
+    ) -> Result<Option<crate::files_view::SyntaxMatches>> {
+        use crate::files_view::{self, MatchScope, SyntaxMatches};
+        request.validate()?;
+        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_startup)?;
+        let Some(scope) = v8_owner_scope_for(tx, &request.symbol_id, &selected)? else {
+            return Ok(None);
+        };
+        // Decode the selected document's native rows strictly, including noncallables.
+        let declaration = read_native_declarations_v8(tx, &scope, None, true)?
+            .into_iter()
+            .find(|d| d.syntax_id == request.symbol_id)
+            .context(SelectedIntegrity(
+                "incompatible_index: match declaration missing".into(),
+            ))?;
+        let mut result = SyntaxMatches::new(
+            request,
+            MatchScope {
+                source_set_id: scope.key.source_set_id.clone(),
+                language: scope.key.language.clone(),
+                spelling: declaration.name.clone(),
+            },
+        );
+        if declaration.name_range.is_none()
+            || declaration.name.as_ref().is_none_or(|n| n.is_empty())
+        {
+            result.scope.spelling = None;
+            result.warn("Selected declaration has no captured identifier name; syntax matching unavailable.");
+            result.bounded()?;
+            return Ok(Some(result));
+        }
+        if let Some(cursor) = &request.continuation {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM revision_documents m
+                 JOIN native_revisions r ON r.id=m.revision_id WHERE m.revision_id=?1
+                 AND m.path=?2 AND m.language=?3 AND r.source_set_id=?4)",
+                params![
+                    selected.key,
+                    cursor.path,
+                    scope.key.language,
+                    scope.key.source_set_id
+                ],
+                |row| row.get(0),
+            )?;
+            ensure!(present, files_view::InvalidRequest);
+        }
+        let started = Instant::now();
+        let mut bytes = 0usize;
+        let mut after: Option<String> = None;
+        // Read manifest entries one at a time. Never materialize a checkout graph/catalog.
+        let mut entries = tx.prepare(
+            "SELECT m.path,length(d.source_bytes),d.byte_length FROM revision_documents m
+             JOIN native_revisions r ON r.id=m.revision_id
+             LEFT JOIN document_versions d ON d.vid=m.vid AND d.language=m.language AND d.path=m.path
+             WHERE m.revision_id=?1 AND m.language=?2 AND (?3 IS NULL OR m.path>=?3)
+             AND (?4 IS NULL OR m.path>?4) AND r.source_set_id=?5 ORDER BY m.path LIMIT 1")?;
+        loop {
+            let entry: Option<(String, Option<i64>, Option<i64>)> = entries
+                .query_row(
+                    params![
+                        selected.key,
+                        scope.key.language,
+                        request.continuation.as_ref().map(|c| c.path.as_str()),
+                        after,
+                        scope.key.source_set_id
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((path, size, recorded)) = entry else {
+                break;
+            };
+            let (Some(size), Some(recorded)) = (size, recorded) else {
+                return Err(
+                    SelectedIntegrity("incompatible_index: match source absent".into()).into(),
+                );
+            };
+            selected_ensure!(
+                size >= 0 && size == recorded,
+                "incompatible_index: match source length invalid"
+            );
+            let start = request
+                .continuation
+                .as_ref()
+                .filter(|c| c.path == path)
+                .map_or(0, |c| c.offset);
+            ensure!(start <= size as usize, files_view::InvalidRequest);
+            if started.elapsed() >= files_view::TOTAL_TIME_LIMIT {
+                result.warnings.push(
+                    "Request syntax scan budget reached; continue for remaining cached files."
+                        .into(),
+                );
+                result.resume(&path, start);
+                break;
+            }
+            if size as usize > files_view::FILE_INPUT_LIMIT {
+                ensure!(start == 0, files_view::InvalidRequest);
+                result.warn("Cached file exceeds 2 MiB syntax scan input; file skipped and coverage incomplete.");
+                after = Some(path);
+                continue;
+            }
+            if bytes.saturating_add(size as usize) > files_view::TOTAL_INPUT_LIMIT {
+                result.warnings.push(
+                    "Request syntax scan budget reached; continue for remaining cached files."
+                        .into(),
+                );
+                result.resume(&path, start);
+                break;
+            }
+            bytes += size as usize;
+            let file = self
+                .selected_source_row_for(tx, &path, &selected)?
+                .context(SelectedIntegrity(
+                    "incompatible_index: match source missing".into(),
+                ))?;
+            ensure!(
+                file.text.is_char_boundary(start),
+                files_view::InvalidRequest
+            );
+            let excluded = (path == scope.key.path)
+                .then_some(declaration.name_range.as_ref())
+                .flatten()
+                .map(|r| (r.start, r.end));
+            if files_view::scan_file(&mut result, request, &file, start, excluded, started)? {
+                break;
+            }
+            after = Some(path);
+        }
+        result.bounded()?;
+        Ok(Some(result))
+    }
+
     /// Only cached source and measured calls from the same snapshot are used.
     pub fn sequence_at(
         &self,
@@ -17062,94 +17701,6 @@ impl Store {
         })
     }
 
-    /// Simulate accidental same-pin damage while a test provider is paused. Use
-    /// the protected Store connection, not a second raw SQLite file handle.
-    #[cfg(all(test, feature = "test-support"))]
-    pub(crate) fn corrupt_selected_source_for_tests(
-        &self,
-        pin: IndexPin,
-        path: &str,
-    ) -> Result<()> {
-        let mut db = self.cache_write()?;
-        let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let selected = self.read_revision_for(&tx, Some(pin), true)?;
-        let changed = storage_result(tx.execute(
-            "UPDATE document_versions SET source_bytes=zeroblob(length(source_bytes))              WHERE vid=(SELECT m.vid FROM revision_documents m              WHERE m.revision_id=?1 AND m.path=?2) AND length(source_bytes)>0",
-            params![selected.key, path],
-        ))?;
-        ensure!(changed == 1, "test fixture: selected source row missing");
-        self.identity.verify()?;
-        storage_result(tx.commit())
-    }
-
-    /// Reauthenticate only a cached packet's selected evidence under one pin.
-    /// Unrelated documents are not read; status still validates persisted capture inventory.
-    pub fn validate_selected_view(&self, view: &ViewResult, sources: &[SourceFile]) -> Result<()> {
-        self.with_evidence(|tx| self.validate_selected_view_in(tx, view, sources))
-    }
-    fn validate_selected_view_in(
-        &self,
-        tx: &Connection,
-        view: &ViewResult,
-        sources: &[SourceFile],
-    ) -> Result<()> {
-        let selected = self.read_revision(tx, Some(view.revision))?;
-        let paths: BTreeSet<_> = view
-            .nodes
-            .iter()
-            .map(|n| n.path.as_str())
-            .chain(view.calls.iter().map(|c| c.path.as_str()))
-            .chain(view.regions.iter().map(|r| r.path.as_str()))
-            .chain(sources.iter().map(|f| f.path.as_str()))
-            .collect();
-        let mut documents = BTreeMap::new();
-        for path in paths {
-            documents.insert(path, self.selected_graph_document_for(tx, path, &selected)?);
-        }
-        for node in &view.nodes {
-            selected_ensure!(
-                documents
-                    .get(node.path.as_str())
-                    .and_then(|document| document.nodes.iter().find(|actual| actual.id == node.id))
-                    == Some(node),
-                "incompatible_index: cached packet selected graph declaration changed"
-            );
-        }
-        for call in &view.calls {
-            selected_ensure!(
-                documents
-                    .get(call.path.as_str())
-                    .and_then(|document| document
-                        .graph_calls
-                        .iter()
-                        .find(|actual| actual.id == call.id))
-                    == Some(call),
-                "incompatible_index: cached packet selected graph call changed"
-            );
-        }
-        for region in &view.regions {
-            selected_ensure!(
-                documents
-                    .get(region.path.as_str())
-                    .and_then(|document| document
-                        .graph_regions
-                        .iter()
-                        .find(|actual| actual.id == region.id))
-                    == Some(region),
-                "incompatible_index: cached packet selected graph region changed"
-            );
-        }
-        for source in sources {
-            selected_ensure!(
-                self.selected_source_row_for(tx, &source.path, &selected)?
-                    .as_ref()
-                    == Some(source),
-                "incompatible_index: cached packet selected source changed"
-            );
-        }
-        Ok(())
-    }
-
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
         self.query_view_at(query, None)
     }
@@ -17250,359 +17801,6 @@ impl Store {
             },
         }))
     }
-
-    pub fn put_view(&self, view: &SavedView) -> Result<()> {
-        view.validate()?;
-        self.records().put_view(view)?;
-        Ok(())
-    }
-
-    fn selected_anchor_in(
-        db: &Connection,
-        store: &Self,
-        target: &str,
-        pre_startup: bool,
-    ) -> Result<DurableAnchor> {
-        let revision = store.read_revision_for(db, None, pre_startup)?;
-        let selected: Option<(String, String)> = db
-            .query_row(
-                "SELECT m.language,m.path FROM native_version_declarations d
-                 JOIN revision_documents m ON m.revision_id=?2 AND m.vid=d.vid
-                 WHERE d.syntax_id=?1",
-                params![id_codec::encode_sid(target), revision.key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| store.report_index_failure(error.into()))?;
-        let (language, path) = selected.context("native declaration target missing")?;
-        let declarations =
-            Self::read_native_declarations_for(db, &language, None, Some(&path), true, &revision)
-                .map_err(|error| store.report_index_failure(error))?;
-        let focused = anchors::find_selected(target, &declarations)?;
-        anchors::capture_anchor(focused, &declarations)
-    }
-
-    fn declarations_for_anchor(
-        db: &Connection,
-        store: &Self,
-        anchor: &DurableAnchor,
-        selected: &ReadRevision,
-    ) -> Result<Option<(String, Vec<crate::native_evidence::Declaration>)>> {
-        let revision: Option<String> = db
-            .query_row(
-                "SELECT r.native_revision_id FROM revision_documents m
-             JOIN native_revisions r ON r.id=m.revision_id
-             WHERE m.revision_id=?4 AND r.source_set_id=?1 AND m.language=?2 AND m.path=?3",
-                params![
-                    anchor.document.source_set_id,
-                    anchor.document.language,
-                    anchor.document.path,
-                    selected.key
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| store.report_index_failure(error.into()))?;
-        let Some(revision) = revision else {
-            return Ok(None);
-        };
-        // A manifest row without its native version is corruption, not an
-        // orphaned anchor: report it so the index is rebuilt.
-        v8_native_scope_for(db, &anchor.document, selected)
-            .and_then(|scope| {
-                scope.map(drop).context(SelectedIntegrity(
-                    "incompatible_index: selected native version missing".into(),
-                ))
-            })
-            .map_err(|error| store.report_index_failure(error))?;
-        let declarations = Self::read_native_declarations_for(
-            db,
-            &anchor.document.language,
-            None,
-            Some(&anchor.document.path),
-            true,
-            selected,
-        )
-        .map_err(|error| store.report_index_failure(error))?;
-        ensure!(
-            anchors::document_matches(&anchor.document, &declarations),
-            "invalid anchor document association"
-        );
-        Ok(Some((revision, declarations)))
-    }
-
-    fn anchor_attachment(
-        db: &Connection,
-        store: &Self,
-        raw: Option<&serde_json::value::RawValue>,
-        selected: &ReadRevision,
-    ) -> Result<AnchorAttachment> {
-        let Some(raw) = raw else {
-            return Ok(AnchorAttachment {
-                availability: AttachmentAvailability::Anchorless,
-                result: None,
-            });
-        };
-        let anchor: DurableAnchor = serde_json::from_str(raw.get())?;
-        anchor.validate()?;
-        let result = match Self::declarations_for_anchor(db, store, &anchor, selected)? {
-            Some((revision, declarations)) => {
-                let current = declarations
-                    .iter()
-                    .find(|row| row.syntax_id == anchor.syntax_id);
-                anchors::audit_anchor(&anchor, &revision, current, &declarations, None)?
-            }
-            None => AnchorResult::orphaned(AnchorReason::Missing),
-        };
-        Ok(AnchorAttachment {
-            availability: AttachmentAvailability::Ready,
-            result: Some(result),
-        })
-    }
-
-    fn resolve_view(
-        db: &Connection,
-        store: &Self,
-        view: SavedViewRecord,
-        pin: Option<IndexPin>,
-        pre_startup: bool,
-    ) -> Result<SavedViewState> {
-        let selected = store.read_revision_for(db, pin, pre_startup)?;
-        let ids: BTreeSet<&String> = std::iter::once(&view.query.seed)
-            .chain(view.pins.keys())
-            .chain(view.hidden.iter())
-            .collect();
-        let mut orphaned_ids = vec![];
-        for id in ids {
-            let exists: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1)",
-                params![id_codec::encode_sid(id), selected.key],
-                |r| r.get(0),
-            ).map_err(|error| store.report_index_failure(error.into()))?;
-            if !exists {
-                orphaned_ids.push(id.clone());
-            }
-        }
-        let attachment = Self::anchor_attachment(db, store, view.anchor.as_deref(), &selected)?;
-        if attachment
-            .result
-            .as_ref()
-            .is_none_or(|result| result.status != AnchorStatus::Attached)
-            && !orphaned_ids.contains(&view.query.seed)
-        {
-            orphaned_ids.push(view.query.seed.clone());
-        }
-        Ok(SavedViewState {
-            view,
-            orphaned_ids,
-            index_generation: pin.map(|p| p.index_generation.to_string()),
-            index_revision: pin.map(|p| p.index_revision),
-            attachment,
-        })
-    }
-    // Durable records are not index evidence. Admit even an empty result before returning it.
-    fn saved_pin(response: &EvidenceResponse, expected_pin: Option<IndexPin>) -> Result<IndexPin> {
-        Ok(response
-            .store
-            .read_revision(&response.db, expected_pin)?
-            .pin)
-    }
-
-    fn finish_saved<T>(&self, response: &EvidenceResponse, value: T) -> Result<T> {
-        // A publication in flight must not turn an old attachment into a Ready response.
-        self.ensure_public_read_ready()?;
-        response.finish(value)
-    }
-
-    fn unavailable_view(view: SavedViewRecord) -> SavedViewState {
-        let orphaned_ids = std::iter::once(view.query.seed.clone())
-            .chain(view.pins.keys().cloned())
-            .chain(view.hidden.iter().cloned())
-            .collect();
-        SavedViewState {
-            view,
-            orphaned_ids,
-            index_generation: None,
-            index_revision: None,
-            attachment: AnchorAttachment {
-                availability: AttachmentAvailability::IndexUnavailable,
-                result: None,
-            },
-        }
-    }
-
-    pub fn saved_views_at(&self, expected_pin: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
-        let views = self.records().view_records()?;
-        let response = match self.evidence_response() {
-            Ok(response) => response,
-            Err(error) if expected_pin.is_none() && native_index_unavailable(&error) => {
-                return Ok(views.into_iter().map(Self::unavailable_view).collect());
-            }
-            Err(error) => return Err(error),
-        };
-        let pin = Self::saved_pin(&response, expected_pin)?;
-        let states = views
-            .into_iter()
-            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin), false))
-            .collect::<Result<Vec<_>>>()?;
-        self.finish_saved(&response, states)
-    }
-    pub fn views(&self) -> Result<Vec<SavedViewState>> {
-        self.saved_views_at(None)
-    }
-
-    pub fn saved_view_at(
-        &self,
-        id: &str,
-        expected_pin: Option<IndexPin>,
-    ) -> Result<Option<SavedViewState>> {
-        let view = self.records().view_record(id)?;
-        let response = match self.evidence_response() {
-            Ok(response) => response,
-            Err(error) if expected_pin.is_none() && native_index_unavailable(&error) => {
-                return Ok(view.map(Self::unavailable_view));
-            }
-            Err(error) => return Err(error),
-        };
-        let pin = Self::saved_pin(&response, expected_pin)?;
-        let state = view
-            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin), false))
-            .transpose()?;
-        self.finish_saved(&response, state)
-    }
-    pub fn view(&self, id: &str) -> Result<Option<SavedViewState>> {
-        self.saved_view_at(id, None)
-    }
-
-    pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
-        view.validate()?;
-        let response = self.evidence_response()?;
-        Self::saved_pin(&response, Some(pin))?;
-        ensure!(
-            response.status()?.revision == pin,
-            "revision conflict: mutation requires head"
-        );
-        let record = self.records().update_view_record(
-            &SavedViewRecord::from_base(view.clone(), None),
-            || {
-                serde_json::value::to_raw_value(&Self::selected_anchor_in(
-                    &response.db,
-                    self,
-                    &view.query.seed,
-                    false,
-                )?)
-                .map_err(Into::into)
-            },
-        )?;
-        let state = Self::resolve_view(&response.db, self, record, Some(pin), false)?;
-        self.finish_saved(&response, state)
-    }
-    pub fn delete_view(&self, id: &str) -> Result<bool> {
-        self.records().delete_view(id)
-    }
-
-    pub fn put_annotation(&self, annotation: &Annotation) -> Result<()> {
-        annotation.validate()?;
-        self.records().put_annotation(annotation)?;
-        Ok(())
-    }
-    fn resolve_annotation(
-        db: &Connection,
-        store: &Self,
-        annotation: AnnotationRecord,
-        pin: Option<IndexPin>,
-        pre_startup: bool,
-    ) -> Result<AnnotationState> {
-        let selected = store.read_revision_for(db, pin, pre_startup)?;
-        let attachment =
-            Self::anchor_attachment(db, store, annotation.anchor.as_deref(), &selected)?;
-        let orphaned = attachment
-            .result
-            .as_ref()
-            .is_none_or(|result| result.status != AnchorStatus::Attached);
-        Ok(AnnotationState {
-            annotation,
-            orphaned,
-            index_generation: pin.map(|p| p.index_generation.to_string()),
-            index_revision: pin.map(|p| p.index_revision),
-            attachment,
-        })
-    }
-    fn unavailable_annotation(annotation: AnnotationRecord) -> AnnotationState {
-        AnnotationState {
-            annotation,
-            orphaned: true,
-            index_generation: None,
-            index_revision: None,
-            attachment: AnchorAttachment {
-                availability: AttachmentAvailability::IndexUnavailable,
-                result: None,
-            },
-        }
-    }
-    pub fn saved_annotations_at(
-        &self,
-        expected_pin: Option<IndexPin>,
-    ) -> Result<Vec<AnnotationState>> {
-        let annotations = self.records().annotation_records()?;
-        let response = match self.evidence_response() {
-            Ok(response) => response,
-            Err(error) if expected_pin.is_none() && native_index_unavailable(&error) => {
-                return Ok(annotations
-                    .into_iter()
-                    .map(Self::unavailable_annotation)
-                    .collect());
-            }
-            Err(error) => return Err(error),
-        };
-        let pin = Self::saved_pin(&response, expected_pin)?;
-        let states = annotations
-            .into_iter()
-            .map(|item| Self::resolve_annotation(&response.db, self, item, Some(pin), false))
-            .collect::<Result<Vec<_>>>()?;
-        self.finish_saved(&response, states)
-    }
-    pub fn annotations(&self) -> Result<Vec<AnnotationState>> {
-        self.saved_annotations_at(None)
-    }
-
-    pub fn save_annotation_at(
-        &self,
-        pin: IndexPin,
-        request: &AnnotationRequest,
-    ) -> Result<AnnotationState> {
-        request.validate()?;
-        let response = self.evidence_response()?;
-        Self::saved_pin(&response, Some(pin))?;
-        ensure!(
-            response.status()?.revision == pin,
-            "revision conflict: mutation requires head"
-        );
-        let title = request
-            .title
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let record = self.records().update_annotation_record(
-            &AnnotationRecord::from_base(request.base(), title, None),
-            request.title.is_none(),
-            || {
-                serde_json::value::to_raw_value(&Self::selected_anchor_in(
-                    &response.db,
-                    self,
-                    &request.node_id,
-                    false,
-                )?)
-                .map_err(Into::into)
-            },
-        )?;
-        let state = Self::resolve_annotation(&response.db, self, record, Some(pin), false)?;
-        self.finish_saved(&response, state)
-    }
-    pub fn delete_annotation(&self, id: &str) -> Result<bool> {
-        self.records().delete_annotation(id)
-    }
 }
 
 // The SQL runs against encoded BLOB keys. Its budget must still match the old
@@ -17611,7 +17809,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V22).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V23).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -17747,7 +17945,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V22).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V23).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

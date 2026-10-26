@@ -8,7 +8,7 @@ and an existing token at `.trellis/native-smoke/daemon.token`. Those commands an
 paths are historical, not current startup instructions. Today `--state-dir` is removed.
 Run `serve --workspace . --token-file /absolute/private/path/outside/checkout/daemon.token`
 with an existing private parent directory: the token path must be an external absolute file,
-not inside the selected checkout. Fixed per-user locations hold indexes and saved records;
+not inside the selected checkout. Fixed per-user locations hold indexes; retired saved records remain in place and ignored;
 this command does not migrate or reset old data. Browsing defaults to the indexed workspace,
 and the workspace defaults to cwd. Explicit different browse roots remain possible, but
 their indexing scope is displayed prominently and the Index button names its target.

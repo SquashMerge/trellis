@@ -1,5 +1,7 @@
 # Rust indexing and static sequences
 
+> Historical validation/analysis. Saved views, notes and Jev/ACP providers described below were retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Their old files remain in place and ignored. Historical observations are not current feature or startup instructions.
+
 Rust `.rs` files now share the same file → inline methods → sequence workflow as JavaScript.
 Native tree-sitter parsing extracts functions, impl methods, containers, closures, calls and
 lexical control regions. Function signatures without bodies do not acquire invented behavior.

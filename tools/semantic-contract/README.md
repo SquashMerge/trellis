@@ -47,7 +47,7 @@ The literal `example/` is the **sole** `profile=example` exemption from corpus c
 
 ### Corpus count floors
 
-#299 does **not certify** the 40-reference, 20-callable-value-negative or four imports/aliases scenario floors. Certification is deferred to corpus issues #27–#30 after #88/#89 joins real SCIP facts to native-v9 candidates; the required totals are unchanged.
+#299 does **not certify** the 40-reference, 20-callable-value-negative or four imports/aliases scenario floors. Certification is deferred to corpus issues #27–#30 after #88/#89 joins real SCIP facts to native-v10 candidates; the required totals are unchanged.
 
 The floors are per-language data in `counts.mjs`, as amended by Decision 0017 [Amendment 1](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-1-2026-10-23-outcome-floors) and [Amendment 3](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-3-2026-10-23-production-native-captures). The owner-ratified [Amendment 4](../../docs/semantic-evidence/decisions/0017-conformance-corpus-storage-and-producers.md#amendment-4-2026-10-24-production-capability-reports) defers the JavaScript unsupported floor to 0. Every full corpus needs 32 independently anchored scenarios (four per category), 120 measured calls, 40 references, 20 callable-value negatives, 20 each of resolved, proven-external and unresolved outcomes, and every applicable role. The rest differ by language:
 
@@ -81,7 +81,7 @@ Tests define local finite control rows `{id,baseline,mutate,expectedAssertion,ex
 
 ## Capture with the production native extractor (#95)
 
-The registry admits the current `trellis.native.syntax@native-v9` with the
+The registry admits the current `trellis.native.syntax@native-v10` with the
 production `EXTRACTION_INPUTS` inventory (`[]` for Java, Rust, Python and
 JavaScript). Historical v3/v4 descriptors are not admitted. The Rust inventory
 guard queries the complete production entry set in this JS registry through Node
@@ -142,7 +142,7 @@ leaves against the captured UTF-8 source, and native IDs are diagnostic labels,
 never generated stable IDs. A field that cannot be witnessed, or a production signature inconsistent with
 its measured header (currently possible for Java varargs), fails capture rather
 than being silently rewritten. Fixing those production measurements requires its
-own producer-version decision; the adapter must not invent missing types. Keep annotations/coverage honest about the families present. Native-v9 enables all
+own producer-version decision; the adapter must not invent missing types. Keep annotations/coverage honest about the families present. Native-v10 enables all
 four conventions, including in empty documents. Actual opaque constructs are
 reported as narrow per-family gaps, never as fabricated disabled working families.
 

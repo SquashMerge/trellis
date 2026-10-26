@@ -1,6 +1,6 @@
 # Trellis — Architecture Spec
 
-**Status:** the Rust per-user daemon and embedded browser, per-checkout indexes with native watcher refresh, and the five-tool stdio MCP daemon client are implemented. JavaScript/Rust/Java/Python syntax extraction, static sequences, Java/Python class diagrams and JavaScript SCIP import are implemented. Multi-language semantic import, coding-agent ACP sessions and diagram artifacts below remain future work; the historical Stage 1–4 plan does not override the implemented [local topology](docs/local-topology.md) or the [MCP contract](docs/mcp-readonly-pilot-contract.md). The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
+**Status:** the Rust per-user daemon and embedded browser, per-checkout indexes with native watcher refresh, and the five-tool stdio MCP daemon client are implemented. JavaScript/Rust/Java/Python syntax extraction, static sequences, Java/Python class diagrams, authored Architecture layer summaries and JavaScript SCIP import are implemented. The [Architecture view](docs/architecture-view.md) counts pinned structural references as syntax evidence; module-level Flow (#324) and treemap navigation (#121) remain deferred. Multi-language semantic import, coding-agent ACP sessions and diagram artifacts below remain future work; the historical Stage 1–4 plan does not override the implemented [local topology](docs/local-topology.md) or the [MCP contract](docs/mcp-readonly-pilot-contract.md). The Tools tab, saved views/notes and one-shot Jev/ACP answer adapters were retired by the owner ruling (2026-10-24, [#305](https://github.com/SquashMerge/trellis/issues/305)); existing state is left in place and ignored. **Direction reviewed:** 2026-09-23.
 
 **Validation:** The first extraction/storage spike is recorded in
 [docs/research/EXTRACTION-RESULTS.md](docs/research/EXTRACTION-RESULTS.md). It validates a bounded JavaScript
@@ -81,22 +81,13 @@ execution. Views produced by the current source-order model must be called **sta
 call views**, not sequence diagrams. True sequence rendering remains gated on evaluation
 semantics, branches, ownership and dynamic boundaries.
 
-### Offline question-to-view slice
+### Retired question-to-view slice
 
-Implemented after the first daemon: revision-bound question evidence packets, conservative
-literal-name previews, strict relevance/display validation, Jev request export and
-unverified response import. Evidence depth defaults to 2; visible direct calls remain
-capped at 5 unless explicitly changed. Question-bound candidate aliases reject responses
-for another question even when measured call sites are identical.
-
-The local preview is not semantic question understanding and is explicitly labeled.
-A subsequent [live Jev slice](docs/live-jev.md) adds opt-in provider transport and durable
-reservations, independently validated in [the live report](docs/live-jev-validation.md).
-ACP intent planning and selective review remain deferred. Full sources are never silently truncated to fit
-provider limits. The browser separates focused results from raw outgoing navigation;
-individual branch expansion keeps depth 1 as the starting point. Incoming callers and
-pinned exploration tabs remain deferred. See [the workflow](docs/question-workflow.md)
-and [navigation reference](docs/navigation-reference.md).
+The Tools-only question preview, Jev/ACP answers, saved views and annotations were
+retired by the owner ruling (2026-10-24, [#305](https://github.com/SquashMerge/trellis/issues/305)).
+Existing record and provider-ledger files are ignored, not read or deleted. The
+selection experiments above remain historical evidence, not a supported runtime.
+CLI query/search, MCP tools and shared source navigation remain available.
 
 ### First Rust implementation
 
@@ -109,12 +100,9 @@ Build one vertical slice before the Tauri shell or provider integrations:
    sites, control regions, diagnostics and revision metadata. A full rebuild publishes
    in one transaction. Readers see either the old revision or the new one; cancellation,
    validation failure and revision conflicts leave the old revision intact.
-3. A separate `workspace.db` stores view queries, pins, hidden IDs and annotations.
-   Missing symbol IDs become explicit orphans; cache deletion must not delete user data.
-   Parser-only IDs remain provisional and offset-sensitive. Automatic identity migration
-   is not claimed. The durable database binds its state directory to one canonical root.
-4. A loopback-only HTTP API serves status, bounded graph queries, cached source, saved
-   views and annotations. Explicit refresh runs as one cancellable background job.
+3. The first slice included saved views and annotations in `workspace.db`; these
+   were retired by the owner ruling (2026-10-24, #305). Existing files stay ignored.
+4. A loopback-only HTTP API serves status, bounded graph queries and cached source. Explicit refresh runs as one cancellable background job.
    CPU and SQLite work must not block the async request executor. Source lookups may pin
    an expected revision; mismatches return conflicts rather than wrong source spans.
 5. A small browser inspection client exercises this API. It is an integration harness,
@@ -179,17 +167,16 @@ The store is split in two, physically:
   implemented. Today this is `cache.db` in an out-of-tree state directory. The accepted direction
   keeps it out of tree in the per-user cache directory, keyed by the checkout's canonical path
   (see [local topology](docs/local-topology.md#t02--locations-and-store-responsibilities)).
-- **`workspace.db`** — durable views and annotations today; versioned artifacts and other proposed
-  records later. References to missing symbol IDs become orphans; a cache rebuild does not guarantee
-  automatic reattachment. The accepted direction keys it by a workspace UUID kept in the checkout's
-  Git directory, so views and notes follow a moved checkout. Tokens and ledgers stay at explicitly
-  configured paths outside every checkout. There is no `--state-dir` flag and there are no state
-  migrations; existing views and notes are not carried over.
+- **Retired `workspace.db` and provider ledgers** — the owner ruling (2026-10-24,
+  [#305](https://github.com/SquashMerge/trellis/issues/305)) removed saved views and
+  annotations. Existing files stay untouched and ignored. Workspace UUIDs still
+  supply semantic root identity; token files remain explicitly configured outside
+  every checkout.
 
 With identical source bytes, pinned extraction tools, semantic-index artifacts and
 database snapshots, deleting the index must reproduce the same normalized semantic
-graph. Preserve accepted agent output, saved views, notes and non-positional user
-choices under their durable-state contracts. Re-indexing may change renderer
+graph. Preserve durable accepted state under its remaining contracts; retired
+saved views, notes and provider ledgers stay untouched and ignored (#305). Re-indexing may change renderer
 coordinates; this decision does not migrate or delete stored records. SQLite
 file bytes and renderer pixels are not the determinism contract.
 
@@ -387,8 +374,8 @@ sequence schema.
 ### Live views and published artifacts are different
 
 A live view is a query plus overrides: seed, bounded traversal, pins, hidden IDs and notes.
-On reindex, reevaluate only against an explicit new basis and expose orphaned IDs. Current
-saved views implement a subset of that model. The IDs in the example are stable declaration IDs;
+On reindex, reevaluate only against an explicit new basis and expose orphaned IDs.
+Saved views were retired by the owner ruling (2026-10-24, #305); this model is future work. The IDs in the example are stable declaration IDs;
 readable display keys appear only in presentation results, not saved-view selectors. Anchors survive
 body edits under the contract's continuity rules and orphan on removal, rename, changed header, or
 unsafe sibling-group change.
@@ -576,8 +563,8 @@ revision publication and sequence-region tables are not yet a production schema.
 The one alternative worth benchmarking is **KuzuDB** — embedded property graph, Cypher,
 single file. If traversals become variable-length filtered paths, Cypher beats
 hand-written CTEs by a wide margin. The cost is a second storage engine, since
-`workspace.db` stays SQLite. Decision: SQLite first, move only when a specific query
-measurably hurts.
+Saved `workspace.db` persistence was retired by the owner ruling (2026-10-24, #305).
+The remaining stores use SQLite; move only when a specific query measurably hurts.
 
 Do not use a server-based graph database. Do not keep the graph in memory only.
 
@@ -694,6 +681,15 @@ Artifacts use idempotent creation, version/CAS checks and explicit local publica
 receives an inbox event/deep link; publication must not steal focus, run a provider, or fetch source.
 
 ## 9. Rendering
+
+The browser frame follows the [Viewer shell contract](docs/viewer-shell.md). Diagrams keeps
+Sequence, Classes and Libraries, with observed per-checkout freshness and pinned metric
+file/directory inspection. The [Files section](docs/files-view.md) shares its checkout/session
+and cached-source owner, with a pinned indexed-file catalog, all-symbol outline, explicit cached
+source selection, same-spelling syntax matches and faithful callable mini-sequences. Section
+switches never choose a file or start indexing. Files may separately display the existing net
+HEAD-to-working-tree staged+unstaged Git diff, labelled uncommitted and not indexed; indexed
+navigation and diagrams retain their complete `{indexGeneration,indexRevision}` basis.
 
 **Target: generate Mermaid from the revision-bound structure model and render it with a
 locally served, exact-version-pinned Pele asset.** Mermaid is both the rendered source

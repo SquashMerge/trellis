@@ -416,23 +416,16 @@ fn projection_bounds_preserve_expansion_roots_edges_and_cycles() {
 }
 #[test]
 fn incompatible_index_refuses_without_migrating_durable_data() {
-    let (dir, store, graph, app, session) = setup();
+    let (dir, store, _graph, app, session) = setup();
     let state = dir.path().join("state");
     let workspace = dir.path().join("workspace");
-    let saved = SavedView {
-        id: "view".into(),
-        title: "Class notes".into(),
-        query: serde_json::from_value(json!({"seed":id(&graph,"A")})).unwrap(),
-        pins: BTreeMap::new(),
-        hidden: vec![],
-    };
-    store.put_view(&saved).unwrap();
-    let record = std::fs::read_dir(state.join("data/workspaces"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap()
+    // A retired workspace record is opaque, even when its bytes are corrupt.
+    let record = state
+        .join("data/workspaces")
+        .join(store.root_id())
         .join("workspace.db");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(&record, b"unreadable retired record format").unwrap();
     let before = std::fs::read(&record).unwrap();
     drop(app);
     drop(session);
@@ -592,7 +585,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            22,
+            23,
             "native-v6-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
@@ -601,7 +594,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     assert!(
         store
@@ -1445,16 +1438,14 @@ async fn normal_size_captured_java_python_cold_oracle_attests_full_published_cat
             .iter()
             .find(|n| n.path == file.path && n.kind == SymbolKind::Class)
             .unwrap();
-        let (status, symbol) = call(
-            &app,
-            "GET",
-            &format!("/api/symbol?id={}&{}", first.id, pin_query(pin)),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{symbol}");
+        let selected_symbol = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["symbol"]["id"] == first.id)
+            .unwrap();
         assert_eq!(
-            symbol["symbol"],
+            selected_symbol["symbol"],
             json!(first),
             "selected fresh native graph: {}",
             file.path

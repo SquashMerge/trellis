@@ -1,4 +1,5 @@
 //! Bounded read-only MCP protocol and single-connection stdio transport.
+pub mod architecture;
 pub mod catalog;
 #[cfg(test)]
 mod find_trigram_tests;
@@ -944,9 +945,33 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             let accepted = deadline
                 .checked_sub(workspace.call_deadline)
                 .unwrap_or(deadline);
+            let cancel = &cancel;
             let tool_read: Option<EvidenceToolRead> = match (name.as_str(), args) {
                 _ if !tool.valid_arguments || envelope["error"]["code"] != "index_not_ready" => {
                     None
+                }
+                (name, Some(args))
+                    if architecture::is_tool(name) || name == architecture::PROMPT_NAME =>
+                {
+                    let kind = architecture::operation(name);
+                    let arguments = serde_json::Value::Object(args.clone());
+                    Some(Box::new(move |runtime, response, _sampled| {
+                        let mut check = || {
+                            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                || runtime.mcp_clock_now() >= deadline
+                            {
+                                anyhow::bail!("deadline_exceeded: architecture projection");
+                            }
+                            Ok(())
+                        };
+                        match response.architecture_response(kind, &arguments, &mut check) {
+                            Ok(payload) => Ok(architecture::envelope(id, payload)),
+                            Err(error) if crate::store::cli_read_retryable_contention(&error) => {
+                                Err(error)
+                            }
+                            Err(error) => Ok(architecture::failure(id, &error)),
+                        }
+                    }))
                 }
                 ("trellis_find_symbols", Some(args)) => {
                     let query = args["query"].as_str().expect("validated find query");
@@ -1064,7 +1089,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     selected.as_ref(),
                     deadline,
                     &|| workspace.clock_now(),
-                    &cancel,
+                    cancel,
                     &publish,
                     id,
                     #[cfg(feature = "test-support")]
@@ -1100,7 +1125,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             *resolved.lock().unwrap() = Some((answering.root().to_owned(), sampled_catching_up));
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
-            tool.response = tools::result(&name, envelope, modern);
+            tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
+                architecture::capped(id, &name, envelope, modern)
+            } else {
+                tools::result(&name, envelope, modern)
+            };
             let finals = match selected {
                 Some(witness) => Finals::Selected {
                     witness,
@@ -1773,7 +1802,7 @@ fn coordinate(
             } else {
                 result
             };
-            let response = serde_json::json!({"jsonrpc":"2.0","id":call.id,"result":result});
+            let response = architecture::response(&call.id, result);
             if let Some(value) = session
                 .prepare(token, response)
                 .and_then(|prepared| session.commit(prepared))
@@ -1792,8 +1821,7 @@ fn coordinate(
             let call = in_flight.remove(&token).expect("expired call");
             call.cancel
                 .store(true, std::sync::atomic::Ordering::Release);
-            let response = serde_json::json!({"jsonrpc":"2.0","id":call.id,
-                "result":deadline_answer(&call)});
+            let response = architecture::response(&call.id, deadline_answer(&call));
             if let Some(value) = session
                 .prepare(token, response)
                 .and_then(|prepared| session.commit(prepared))
@@ -1833,7 +1861,9 @@ fn coordinate(
                     if workspace.clock_now() >= deadline {
                         // The deadline overrides any outcome still unsent.
                         refuse("deadline_exceeded")
-                    } else if tools::validate(name, arguments.as_ref()).is_err() {
+                    } else if name != architecture::PROMPT_NAME
+                        && tools::validate(name, arguments.as_ref()).is_err()
+                    {
                         // Application validation precedes capacity.
                         Some(
                             tools::prepare(
@@ -1922,14 +1952,13 @@ fn coordinate(
                         session::Action::Initialize => {
                             catalog::initialize(workspace.build_version())
                         }
+                        session::Action::PromptList => architecture::list(modern),
                         _ => catalog::list(modern),
                     })
                 }
             };
             let response = match result {
-                Some(result) => {
-                    serde_json::json!({"jsonrpc":"2.0","id":admission.id,"result":result})
-                }
+                Some(result) => architecture::response(&admission.id, result),
                 None => wire::ProtocolError::new(-32601, admission.id.clone()).response(),
             };
             // Only the static catalog may use its larger cap.

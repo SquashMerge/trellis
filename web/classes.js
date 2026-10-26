@@ -178,7 +178,7 @@
       document.addEventListener("scroll", event => {
         if (!menu || menu.contains(event.target)) return;
         const previous = menuScroll.get(event.target);
-        if (previous && previous[0] === event.target.scrollTop && previous[1] === event.target.scrollLeft) return;
+        if (!previous || (previous[0] === event.target.scrollTop && previous[1] === event.target.scrollLeft)) return;
         closeContextMenu();
       }, true);
       window.addEventListener("resize", () => closeContextMenu());

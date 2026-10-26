@@ -75,8 +75,8 @@ A good factory issue contains:
 The repository configuration has four operational boundaries:
 
 - `resolve` reads a recognized GitHub Issue and emits the canonical factory payload.
-- `bootstrap` installs the pinned ACP runtime packages in a fresh sandbox without lifecycle scripts.
-- `verify` runs the same Rust, ACP, JavaScript syntax, and browser test commands as CI.
+- `bootstrap` installs the pinned MCP conformance-test packages from `tests/mcp` in a fresh sandbox without lifecycle scripts.
+- `verify` runs the same Rust, MCP conformance, JavaScript syntax, and browser test commands as CI.
 - `publish` declares the future branch-push command. The current factory release still performs its
   guarded Git and GitHub publication flow directly.
 

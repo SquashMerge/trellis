@@ -385,10 +385,9 @@ fn globs_in_sibling_scopes_do_not_hide_candidate_but_enclosing_globs_do() {
 }
 
 #[test]
-fn actual_acp_cached_source_links_constructor_but_never_infers_open_receiver() {
-    let source =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/acp.rs")).unwrap();
-    let (graph, mut view) = fixture_named(&source, "check_file_with_unlinked");
+fn cached_open_options_source_links_constructor_but_never_infers_open_receiver() {
+    let source = include_str!("fixtures/rust/open_options.rs");
+    let (graph, mut view) = fixture_named(source, "check_file_with_unlinked");
     // fixture directory is gone: annotation must use only this cached source.
     let before = view.clone();
     annotate(&mut view, &graph.files[0], &catalog());

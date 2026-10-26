@@ -36,7 +36,7 @@
       document.addEventListener("scroll", event => {
         if (event.target?.closest?.(".classes-context-menu")) return;
         const previous = menuScroll.get(event.target);
-        if (previous && previous[0] === event.target.scrollTop && previous[1] === event.target.scrollLeft) return;
+        if (!previous || (previous[0] === event.target.scrollTop && previous[1] === event.target.scrollLeft)) return;
         serial++;
       }, true);
       window.addEventListener("resize", () => { serial++; });

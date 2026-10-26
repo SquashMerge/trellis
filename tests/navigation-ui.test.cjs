@@ -229,7 +229,7 @@ test("scroll dismissal cancels pending lookup but queued unchanged ancestor/menu
   const h=harness(),gate=deferred();h.request=()=>gate.promise;const pending=h.nav.open(h.event(),selector);
   h.anchor.scrollTop++;h.anchor.fire("scroll");gate.resolve(response());await pending;assert.equal(h.menus.length,1);
   const keep=harness(),later=deferred();keep.request=()=>later.promise;const allowed=keep.nav.open(keep.event(),selector);
-  keep.anchor.fire("scroll");const menu=keep.element("div");menu.className="classes-context-menu";keep.document.body.append(menu);menu.fire("scroll");
+  keep.anchor.fire("scroll");const sibling=keep.element("div");keep.document.body.append(sibling);sibling.scrollTop++;sibling.fire("scroll");const menu=keep.element("div");menu.className="classes-context-menu";keep.document.body.append(menu);menu.fire("scroll");
   later.resolve(response());await allowed;assert.equal(keep.menus.length,2);
 });
 

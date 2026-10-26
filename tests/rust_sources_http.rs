@@ -56,8 +56,6 @@ fn setup() -> (
         IndexOptions::new(workspace.clone()),
         TOKEN.into(),
         "127.0.0.1:7331".parse().unwrap(),
-        None,
-        None,
         workspace,
         vec![("rust".into(), source)],
     )
@@ -321,8 +319,6 @@ async fn old_constructors_have_no_roots_and_configuration_is_validated() {
                 opts.clone(),
                 TOKEN.into(),
                 "127.0.0.1:7331".parse().unwrap(),
-                None,
-                None,
                 workspace.clone(),
                 roots
             )

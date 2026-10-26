@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const source = fs.readFileSync(path.join(__dirname, "../web/sequence.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+const source = ["sequence.js", "files.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;
@@ -19,7 +19,7 @@ function harness() {
   let nextTimer = 0;
   function node(tagName) {
     const classes = new Set();
-    return {tagName, classList: {add(value) { classes.add(value); }, contains(value) { return classes.has(value); }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
+    return {tagName, classList: {add(value) { classes.add(value); }, contains(value) { return classes.has(value); }, toggle(value, force) { const on = force ?? !classes.has(value); if (on) classes.add(value); else classes.delete(value); return on; }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
       addEventListener(type, handler) { this.listeners[type] = handler; },
       replaceChildren(...items) { this.children = items; },
       append(...items) { this.children.push(...items); },
@@ -36,7 +36,7 @@ function harness() {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   // The app receives the production scoped URL; legacy suffixes below remain the
   // fixture handlers' semantic route names, never an unscoped network fallback.
   let handler = context.fetch;
@@ -53,18 +53,7 @@ function harness() {
     if (!url.startsWith(`${SCOPED}/status`)) return result;
     return Promise.resolve(result).then(reply => reply.ok ? {...reply, json:async () => ({workspaceRoot:"/synthetic", ...await reply.json()})} : reply);
   };
-  const preserveNewFocus = () => {
-    run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
-      packet = {packetId:'new'}; focused = {marker:'new'};
-      $('focus-state').textContent = 'new valid focus'; $('error').hidden = true;`);
-    return run("packet");
-  };
-  const assertPreserved = newer => {
-    assert.equal(run("packet"), newer);
-    assert.equal(get("focus-state").textContent, "new valid focus");
-    assert.equal(get("error").hidden, true);
-  };
-  return {context, run, get, blobs, downloads, timers, networkUrls, preserveNewFocus, assertPreserved};
+  return {context, run, get, blobs, downloads, timers, networkUrls};
 }
 
 
@@ -86,7 +75,7 @@ test("collapsed panel loads nothing until explicit action; metadata browsing is 
     return response({items,nextOffset:null,truncated:false});
   };
   h.get("external-sources").open=true; assert.equal(requests.length,0);
-  h.run("selectedMethod={id:'keep'}; seed='keep'; $('sequence-diagram').textContent='keep diagram'; $('source').textContent='workspace source'");
+  h.run("selectedMethod={id:'keep'}; $('sequence-diagram').textContent='keep diagram'; $('source').textContent='workspace source'");
   await h.get("external-load").listeners.click(); assert.deepEqual(requests,["/api/rust-sources"]);
   assert.match(text(h.get("external-roots")),/\/configured\/rust\/library/);
   await click(h.get("external-roots"),"Browse rust");
@@ -102,7 +91,7 @@ test("collapsed panel loads nothing until explicit action; metadata browsing is 
   assert.equal(descendants(h.get("external-source")).some(n=>n.tagName==="script"),false);
   h.get("external-filter").value="OpenOptions"; h.get("external-filter").listeners.input();
   assert.equal(descendants(h.get("external-definitions")).filter(n=>n.tagName==="button").length,1);
-  assert.equal(h.run("seed"),"keep"); assert.equal(h.run("selectedMethod.id"),"keep");
+   assert.equal(h.run("selectedMethod.id"),"keep");
   assert.equal(h.get("sequence-diagram").textContent,"keep diagram"); assert.equal(h.get("source").textContent,"workspace source");
   assert.ok(requests.every(p=>p.startsWith("/api/rust-sources")));
 });
@@ -119,7 +108,7 @@ for(const failure of ["success","http","network","json"]) test(`obsolete file ${
  else if(failure==="http")old.resolve({ok:false,status:409,json:async()=>({error:{message:"obsolete"}})});
  else if(failure==="json")old.resolve({ok:true,status:200,json:async()=>{throw new Error("obsolete");}});
  else old.resolve(response(snapshot("old.rs")));
- await pending; assert.match(h.get("external-source-path").textContent,/new.rs/); assert.equal(h.run("seed"),"root");
+ await pending; assert.match(h.get("external-source-path").textContent,/new.rs/); assert.equal(h.run("selectedMethod"),null);
 });
 for(const request of ["loadExternalRoots()",`loadExternalFile(${JSON.stringify(root)},'std/src/fs.rs')`]) test(`disconnect clears external data and ignores late ${request}`,async()=>{
  const h=harness(), old=deferred(); h.context.fetch=()=>old.promise;

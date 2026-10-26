@@ -6,7 +6,7 @@ network/process execution. Root configures installed rust-src only in deployed d
 
 CLI repeatable --rust-source-root LABEL=PATH. Root validates labels simpleASCII <=48chars; server
 configuration immutable. Existing http constructors keep zero roots. Root main calls new constructor
-new_with_source_roots(store,options,token,address,jev,acp,browse_root,Vec<(String,PathBuf)>).
+new_with_source_roots(store,options,token,address,browse_root,Vec<(String,PathBuf)>).
 APIworker owns mainconstructor API integration in http.rs; rootownsCLI wiring.
 
 GET /api/rust-sources -> {roots:[{id,label,path}]} (configured directories only).

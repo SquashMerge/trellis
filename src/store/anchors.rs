@@ -1,8 +1,8 @@
 use crate::{
     model::{AnchorReason, AnchorResult, DurableAnchor},
-    native_evidence::{Declaration, DocumentKey, Header},
+    native_evidence::{Declaration, Header},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 const HEADER_DOMAIN: &[u8] = b"trellis.header.v1\0";
@@ -191,23 +191,4 @@ pub fn audit_anchor(
         }
     }
     Ok(AnchorResult::attached(anchor.syntax_id.clone()))
-}
-
-pub(crate) fn find_selected<'a>(
-    syntax_id: &str,
-    declarations: &'a [Declaration],
-) -> Result<&'a Declaration> {
-    let mut selected = declarations.iter().filter(|row| row.syntax_id == syntax_id);
-    let row = selected
-        .next()
-        .context("native declaration target missing")?;
-    ensure!(
-        selected.next().is_none(),
-        "ambiguous native declaration target"
-    );
-    Ok(row)
-}
-
-pub(crate) fn document_matches(key: &DocumentKey, declarations: &[Declaration]) -> bool {
-    declarations.iter().all(|row| &row.document == key)
 }

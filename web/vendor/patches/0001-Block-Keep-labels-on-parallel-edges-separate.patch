@@ -1,0 +1,277 @@
+From e720e9cd17154c316d869136e15be2a385701656 Mon Sep 17 00:00:00 2001
+From: Jason Carreira <jcarreira@gmail.com>
+Date: Sun, 25 Oct 2026 10:55:28 -0400
+Subject: [PATCH] Block: Keep labels on parallel edges separate
+
+---
+ src/diagrams/block/render.ts | 119 ++++++++++++++++++++++++++++++++++-
+ tests/render/block.test.ts   | 106 +++++++++++++++++++++++++++++++
+ 2 files changed, 224 insertions(+), 1 deletion(-)
+
+diff --git a/src/diagrams/block/render.ts b/src/diagrams/block/render.ts
+index 68c5ab2..6154058 100644
+--- a/src/diagrams/block/render.ts
++++ b/src/diagrams/block/render.ts
+@@ -478,6 +478,7 @@ function draw(model: BlockModel, config: Config, options: RenderOptions, tight:
+   const check = drawn.length * obstacles.length <= OBSTACLE_BUDGET ? obstacles : undefined;
+   const seen = new Map<number, number>();
+   const routes: Route[] = [];
++  const labelPairs = new Map<number, number[]>();
+   let minX = 0;
+   let minY = 0;
+   let maxX = content.width;
+@@ -516,10 +517,126 @@ function draw(model: BlockModel, config: Config, options: RenderOptions, tight:
+       lx = points[at] + (points[at + 2] - points[at]) * spot;
+       ly = points[at + 1] + (points[at + 3] - points[at + 1]) * spot;
+     }
+-    if (label.width > 0) grow(lx, ly, label.width + 8, label.height);
++    if (label.width > 0 && s !== t && total > 1) {
++      const group = labelPairs.get(key);
++      if (group) group.push(i);
++      else labelPairs.set(key, [i]);
++    }
+     routes.push({ edge: drawn[i], points, loop: s === t ? k + 1 : 0, label, lx, ly });
+   }
+ 
++  let labelChecks = OBSTACLE_BUDGET;
++  let labelLeft = Infinity;
++  let labelRight = -Infinity;
++  let labelTop = Infinity;
++  let labelBottom = -Infinity;
++  const includeLabel = (route: Route): void => {
++    if (route.label.width === 0) return;
++    labelLeft = Math.min(labelLeft, route.lx - (route.label.width + 8) / 2);
++    labelRight = Math.max(labelRight, route.lx + (route.label.width + 8) / 2);
++    labelTop = Math.min(labelTop, route.ly - route.label.height / 2);
++    labelBottom = Math.max(labelBottom, route.ly + route.label.height / 2);
++  };
++  for (const route of routes) includeLabel(route);
++  for (const group of labelPairs.values()) {
++    if (group.length < 2) continue;
++    let overlaps = false;
++    for (let a = 0; a < group.length && !overlaps; a++) {
++      for (let b = a + 1; b < group.length; b++) {
++        const first = routes[group[a]];
++        const second = routes[group[b]];
++        // Repack conservatively when the shared comparison budget is exhausted.
++        if (
++          labelChecks-- <= 0 ||
++          (Math.abs(first.lx - second.lx) < (first.label.width + second.label.width + 16) / 2 &&
++            Math.abs(first.ly - second.ly) < (first.label.height + second.label.height) / 2)
++        ) {
++          overlaps = true;
++          break;
++        }
++      }
++    }
++    if (!overlaps) continue;
++    const [s, t] = ends[group[0]];
++    const vertical = Math.abs(t.y - s.y) >= Math.abs(t.x - s.x);
++    const center = (i: number): number => vertical ? routes[i].lx : routes[i].ly;
++    const extent = (i: number): number => vertical ? routes[i].label.width + 8 : routes[i].label.height;
++    group.sort((a, b) => center(a) - center(b) || a - b);
++    let left = Infinity;
++    let right = -Infinity;
++    let length = -4;
++    for (const i of group) {
++      left = Math.min(left, center(i) - extent(i) / 2);
++      right = Math.max(right, center(i) + extent(i) / 2);
++      length += extent(i) + 4;
++    }
++    let next = (left + right - length) / 2;
++    // Move only this packed bucket if its wider lanes would cover a neighboring label.
++    let low = Infinity;
++    let high = -Infinity;
++    for (const i of group) {
++      const route = routes[i];
++      const along = vertical ? route.ly : route.lx;
++      const half = (vertical ? route.label.height : route.label.width + 8) / 2;
++      low = Math.min(low, along - half);
++      high = Math.max(high, along + half);
++    }
++    let before = Infinity;
++    let after = -Infinity;
++    let blocked = false;
++    if (routes.length * group.length <= labelChecks) {
++      labelChecks -= routes.length * group.length;
++      const members = new Set(group);
++      for (let i = 0; i < routes.length; i++) {
++        const route = routes[i];
++        if (members.has(i) || route.label.width === 0) continue;
++        const along = vertical ? route.ly : route.lx;
++        const half = (vertical ? route.label.height : route.label.width + 8) / 2;
++        if (along + half <= low || along - half >= high) continue;
++        const across = vertical ? route.lx : route.ly;
++        const reach = (vertical ? route.label.width + 8 : route.label.height) / 2;
++        before = Math.min(before, across - reach - length - 4);
++        after = Math.max(after, across + reach + 4);
++        let lane = next;
++        for (const member of group) {
++          const packed = routes[member];
++          const packedAlong = vertical ? packed.ly : packed.lx;
++          const packedHalf = (vertical ? packed.label.height : packed.label.width + 8) / 2;
++          const width = extent(member);
++          if (Math.abs(along - packedAlong) < half + packedHalf && across - reach < lane + width && across + reach > lane) {
++            blocked = true;
++          }
++          lane += width + 4;
++        }
++      }
++    } else {
++      // Above the comparison budget, the cached envelope gives a finite conservative placement.
++      before = (vertical ? labelLeft : labelTop) - length - 4;
++      after = (vertical ? labelRight : labelBottom) + 4;
++      blocked = true;
++    }
++    if (blocked) next = next - before <= after - next ? before : after;
++    for (const i of group) {
++      const route = routes[i];
++      const at = next + extent(i) / 2;
++      next += extent(i) + 4;
++      if (vertical) route.lx = at;
++      else route.ly = at;
++      // Endpoint clamping can collapse parallel lanes. Bend through the measured label lane instead.
++      const [from, to] = ends[i];
++      const start: number[] = [];
++      const end: number[] = [];
++      border(from, route.lx, route.ly, start);
++      border(to, route.lx, route.ly, end);
++      route.points = [...start, route.lx, route.ly, ...end];
++      includeLabel(route);
++    }
++  }
++  for (const route of routes) {
++    if (route.label.width > 0) grow(route.lx, route.ly, route.label.width + 8, route.label.height);
++    for (let i = 0; i < route.points.length; i += 2) grow(route.points[i], route.points[i + 1], 0, 0);
++  }
++
+   const title = titleLabel(model.title, measurer, size, tight ? titleRoom(options) : 4000);
+   const titleHeight = title.height > 0 ? title.height + 12 : 0;
+   const inner = Math.max(maxX - minX, title.width);
+diff --git a/tests/render/block.test.ts b/tests/render/block.test.ts
+index 948dac0..7dcfe23 100644
+--- a/tests/render/block.test.ts
++++ b/tests/render/block.test.ts
+@@ -48,6 +48,48 @@ function paths(svg: string): string[] {
+   return [...svg.matchAll(/class="pele-edge" data-id="[^"]*"><path d="([^"]*)"/g)].map((m) => m[1]);
+ }
+ 
++function expectSeparateLabels(src: string, count: number): void {
++  const result = render(src, options);
++  const model = parse(src);
++  if (model.type !== 'block') throw new Error('not a block model');
++  const el = elements(result.svg);
++  const labels = el.flatMap((element, index) => {
++    if (element.attrs.get('class') !== 'pele-edge-label') return [];
++    const rect = el[index + 1];
++    expect(rect.name).toBe('rect');
++    const w = Number(rect.attrs.get('width'));
++    const h = Number(rect.attrs.get('height'));
++    return [{
++      id: element.attrs.get('data-id'),
++      x: Number(rect.attrs.get('x')) + w / 2,
++      y: Number(rect.attrs.get('y')) + h / 2,
++      w,
++      h,
++    }];
++  });
++  expect(labels).toHaveLength(count);
++  expect(labels.map((label) => label.id)).toEqual(model.edges.filter((edge) => edge.label).map((edge) => edge.id));
++  expect(paths(result.svg)).toHaveLength(model.edges.length);
++  for (let i = 0; i < labels.length; i++) {
++    const a = labels[i];
++    expect(a.w).toBeGreaterThan(0);
++    expect(a.h).toBeGreaterThan(0);
++    expect(a.x - a.w / 2).toBeGreaterThanOrEqual(0);
++    expect(a.y - a.h / 2).toBeGreaterThanOrEqual(0);
++    expect(a.x + a.w / 2).toBeLessThanOrEqual(result.width);
++    expect(a.y + a.h / 2).toBeLessThanOrEqual(result.height);
++    for (const b of labels.slice(i + 1)) {
++      const overlapX = (a.w + b.w) / 2 - Math.abs(a.x - b.x);
++      const overlapY = (a.h + b.h) / 2 - Math.abs(a.y - b.y);
++      expect(Math.min(overlapX, overlapY), `${a.id} overlaps ${b.id}`).toBeLessThanOrEqual(0.01);
++    }
++    // Labels paint last, so a label's center must belong to that label alone.
++    const hits = labels.filter((b) => Math.abs(a.x - b.x) < b.w / 2 && Math.abs(a.y - b.y) < b.h / 2);
++    expect(hits.map((b) => b.id)).toEqual([a.id]);
++  }
++  expect(render(src, options).svg).toBe(result.svg);
++}
++
+ describe('block rendering', () => {
+   it('renders every corpus input that parses, as well-formed and inert SVG', () => {
+     let rendered = 0;
+@@ -267,6 +309,70 @@ describe('block rendering', () => {
+     expect(y(first)).not.toBe(y(second));
+   });
+ 
++  it('separates labels on opposite vertical edges', () => {
++    expectSeparateLabels(
++      'block\n  columns 1\n  a["Upper layer"]\n  space:3\n  b["Lower layer"]\n  a -- "12 production conforming" --> b\n  b -- "12 production deviation" --> a',
++      2
++    );
++  });
++
++  it('separates labels on opposite horizontal edges', () => {
++    expectSeparateLabels(
++      'block\n  a["Left layer"] space:3 b["Right layer"]\n  a -- "12 production<br>conforming" --> b\n  b -- "12 production<br>deviation" --> a',
++      2
++    );
++  });
++
++  it('keeps disjoint labels on their original straight parallel routes', () => {
++    const src = 'block\n  a space:3 b\n  a -- "forward" --> b\n  b -- "reverse" --> a';
++    expectSeparateLabels(src, 2);
++    for (const path of paths(render(src, options).svg)) {
++      expect(path).toMatch(/^M[\d.,]+L[\d.,]+$/);
++    }
++  });
++
++  it('separates wide labels when narrow endpoints clamp the parallel routes', () => {
++    expectSeparateLabels(
++      'block\n  columns 1\n  a["A"]\n  space\n  b["B"]\n  a -- "144 production conforming" --> b\n  b -- "144 production deviation" --> a',
++      2
++    );
++  });
++
++  it('keeps every label for several buckets between the same blocks', () => {
++    expectSeparateLabels(
++      'block\n  columns 1\n  a["A"]\n  space\n  b["B"]\n  a -- "7 production policy" --> b\n  a -- "7 test policy" --> b\n  a -- "7 production exception" --> b\n  b -- "7 production deviation" --> a',
++      4
++    );
++  });
++
++  it('separates labels between composite bands and their shared peer band', () => {
++    expectSeparateLabels(
++      `block
++  columns 1
++  block:upper["Upper band"]
++    a b
++  end
++  block:peers["Peer bands"]
++    columns 2
++    block:left["Left peer"]
++      c d
++    end
++    block:right["Right peer"]
++      e f
++    end
++  end
++  block:lower["Lower band"]
++    g h
++  end
++  upper -- "12 production conforming" --> left
++  left -- "12 production conforming" --> lower
++  lower -- "12 production deviation" --> left
++  right -. "7 test exception" .-> upper
++  right -- "7 production policy" --> lower`,
++      5
++    );
++  });
++
+   it('draws a self-loop as an arc', () => {
+     const { svg } = render('block\n  a\n  a -- "again" --> a', options);
+     expect(paths(svg)[0]).toMatch(/^M[\d.,]+A10,10 0 1 1 [\d.,]+$/);
+-- 
+2.54.0 (Apple Git-157)
+

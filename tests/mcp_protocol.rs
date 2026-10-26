@@ -512,6 +512,23 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
                 symbols.as_array().unwrap().len(),
                 "symbols",
             )
+        } else if data.get("referencesVersion").is_some() {
+            (
+                "trellis_references",
+                data["production"].as_array().unwrap().len()
+                    + data["tests"].as_array().unwrap().len(),
+                "edges",
+            )
+        } else if data.get("rulesVersion").is_some() {
+            (
+                if text.starts_with("trellis_rules_explain:") {
+                    "trellis_rules_explain"
+                } else {
+                    "trellis_rules_check"
+                },
+                data["instances"].as_array().unwrap().len(),
+                "instances",
+            )
         } else if data.get("declaration").is_some() {
             ("trellis_declaration", 1, "declaration")
         } else if let Some(calls) = data.get("calls") {
@@ -553,13 +570,7 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
             format!("{name}: {count} {items}{truncated}; full result in structuredContent."),
         )
     };
-    assert!(
-        fixture()["names"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool == name)
-    );
+    assert!(trellis::mcp::catalog::known(name));
     assert_eq!(text, expected);
     assert_eq!(v["result"]["content"].as_array().unwrap().len(), 1);
 }
@@ -568,8 +579,8 @@ fn validate_structured_content(pairs: &[Value]) {
     let script = r#"
 const {createRequire} = require('node:module');
 const {readFileSync} = require('node:fs');
-const requireFromRuntime = createRequire(process.cwd() + '/runtime/acp/package.json');
-const Ajv2020 = requireFromRuntime('ajv/dist/2020.js').default;
+const requireFromTests = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv2020 = requireFromTests('ajv/dist/2020.js').default;
 const ajv = new Ajv2020({strict: false, allErrors: true});
 const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8'));
 const inputs = JSON.parse(readFileSync(0, 'utf8'));
@@ -874,7 +885,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             ));
             assert_eq!(
                 init["result"],
-                json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"trellis","version":env!("CARGO_PKG_VERSION")}})
+                json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{},"prompts":{}},"serverInfo":{"name":"trellis","version":env!("CARGO_PKG_VERSION")}})
             );
             error(
                 &peer.ask(request(json!(2), "tools/list", json!({}))),
@@ -886,7 +897,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             let discover = peer.ask(modern(json!(1), "server/discover", json!({})));
             assert_eq!(
                 discover["result"],
-                json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"trellis","version":env!("CARGO_PKG_VERSION")}}})
+                json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{},"prompts":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"trellis","version":env!("CARGO_PKG_VERSION")}}})
             );
         }
         let list = if legacy {
@@ -897,7 +908,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 6);
+        assert_eq!(catalog.as_array().unwrap().len(), 9);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -1078,7 +1089,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 6);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 9);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -1183,7 +1194,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        6
+        9
     );
     assert!(peer.finish().0.success());
     // Topology overlap is refused before marker attachment.
@@ -1689,15 +1700,18 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             .iter()
             .map(|entry| entry["name"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(
-            names,
-            fixture()["names"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|name| name.as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
-        );
+        let mut expected_names: Vec<_> = fixture()["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect();
+        expected_names.extend([
+            "trellis_references".to_owned(),
+            "trellis_rules_check".to_owned(),
+            "trellis_rules_explain".to_owned(),
+        ]);
+        assert_eq!(names, expected_names);
         let found = peer.ask(call(
             legacy,
             json!(3),
@@ -2799,7 +2813,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
 #[test]
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 6);
+    assert_eq!(catalog.as_array().unwrap().len(), 9);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         assert_eq!(
@@ -10564,5 +10578,333 @@ async fn incoming_escaped_javascript_declarations_keep_wire_labels_and_later_cal
         assert_eq!(later_callers[0]["calleeText"], later_name);
         assert_eq!(later_callers[0]["ownerSyntaxId"], caller_id);
         assert!(peer.finish().0.success());
+    }
+}
+
+#[test]
+fn architecture_catalog_prompt_and_closed_inputs_use_both_protocol_modes() {
+    for legacy in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        let mut peer = Peer::start(Some(&root));
+        if legacy {
+            ready_legacy(&mut peer);
+        }
+        let frame = |id: i64, method: &str, params: Value| {
+            if legacy {
+                request(json!(id), method, params)
+            } else {
+                modern(json!(id), method, params)
+            }
+        };
+        let list = peer.ask(frame(101, "prompts/list", json!({})));
+        assert_eq!(
+            list["result"]["prompts"][0]["name"],
+            "trellis_propose_layers"
+        );
+        assert_eq!(list["result"]["prompts"][0]["arguments"], json!([]));
+        assert_eq!(list["result"].get("resultType").is_some(), !legacy);
+        for (id, method, params) in [
+            (102, "prompts/list", json!({"cursor":"next"})),
+            (103, "prompts/get", json!({"name":"unknown"})),
+            (
+                104,
+                "prompts/get",
+                json!({"name":"trellis_propose_layers","arguments":{"scope":"src"}}),
+            ),
+            (
+                105,
+                "prompts/get",
+                json!({"name":"trellis_propose_layers","arguments":null}),
+            ),
+            (
+                106,
+                "tools/call",
+                json!({"name":"trellis_propose_layers","arguments":{"schemaVersion":1}}),
+            ),
+        ] {
+            error(&peer.ask(frame(id, method, params)), -32602, json!(id));
+        }
+        let cold = peer.ask(frame(
+            107,
+            "prompts/get",
+            json!({"name":"trellis_propose_layers","arguments":{}}),
+        ));
+        assert_eq!(cold["error"]["code"], -32603, "{cold}");
+        assert_eq!(cold["error"]["data"]["code"], "index_not_ready", "{cold}");
+        assert!(cold.get("result").is_none());
+        for (id, name) in [(108, "trellis_references"), (109, "trellis_rules_check")] {
+            let reply = peer.ask(frame(
+                id,
+                "tools/call",
+                json!({"name":name,"arguments":{"schemaVersion":1}}),
+            ));
+            tool(&reply, Some("index_not_ready"), !legacy);
+        }
+        assert!(peer.finish().0.success());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    for legacy in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (identity, topology) = published_inactive_checkout(
+            temp.path(),
+            &[
+                ("a.js", "import './b.js'; export function a() {}\n"),
+                ("b.js", "export function b() {}\n"),
+            ],
+        );
+        fs::create_dir(identity.root.join(".trellis")).unwrap();
+        let rules = "version = 1\n[layers.top]\norder = 1\npaths = [\"a.js\"]\n[layers.bottom]\norder = 2\npaths = [\"b.js\"]\n";
+        fs::write(identity.root.join(".trellis/rules.toml"), rules).unwrap();
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(129, &identity).unwrap();
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        let (mut client, mut reader, session) = socket_session(&identity, &registry, 129, None);
+        let frame = |id: i64, method: &str, params: Value| {
+            if legacy {
+                request(json!(id), method, params)
+            } else {
+                modern(json!(id), method, params)
+            }
+        };
+        if legacy {
+            writeln!(
+                client,
+                "{}",
+                request(
+                    json!(0),
+                    "initialize",
+                    fixture()["legacyInitialize"].clone()
+                )
+            )
+            .unwrap();
+            assert!(next_reply(&mut reader)["result"].is_object());
+            writeln!(
+                client,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
+            .unwrap();
+        }
+        let mut ask = |id, method, params| {
+            writeln!(client, "{}", frame(id, method, params)).unwrap();
+            next_reply(&mut reader)
+        };
+        let refs = ask(
+            1,
+            "tools/call",
+            json!({"name":"trellis_references","arguments":{"schemaVersion":1}}),
+        );
+        tool(&refs, None, !legacy);
+        let refs_env = &refs["result"]["structuredContent"];
+        assert_eq!(
+            refs_env["data"]["production"].as_array().unwrap().len(),
+            1,
+            "{refs}"
+        );
+        let basis = refs_env["evidenceBasis"].clone();
+        let checked = ask(
+            2,
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{"schemaVersion":1,"expectedBasis":basis}}),
+        );
+        tool(&checked, None, !legacy);
+        let checked_env = &checked["result"]["structuredContent"];
+        assert_eq!(checked_env["evidenceBasis"], basis);
+        assert_eq!(checked_env["data"]["counts"]["conforms"], 1, "{checked}");
+        let instance = &checked_env["data"]["instances"][0];
+        let explain = ask(
+            3,
+            "tools/call",
+            json!({"name":"trellis_rules_explain","arguments":{
+            "schemaVersion":1,"expectedBasis":basis,"rule":instance["rule"],"target":instance["target"],"destination":instance["destination"]}}),
+        );
+        tool(&explain, None, !legacy);
+        assert_eq!(
+            explain["result"]["structuredContent"]["data"]["instances"],
+            checked_env["data"]["instances"]
+        );
+        let mut absent_destination = instance["destination"].clone();
+        absent_destination["sid"] = json!(format!("sid:v1:{}", "f".repeat(32)));
+        let not_found = ask(
+            10,
+            "tools/call",
+            json!({"name":"trellis_rules_explain","arguments":{
+                "schemaVersion":1,"expectedBasis":basis,"rule":"$layers",
+                "target":instance["target"],"destination":absent_destination}}),
+        );
+        tool(&not_found, Some("not_found"), !legacy);
+        let not_found_env = &not_found["result"]["structuredContent"];
+        assert_eq!(not_found_env["workspace"], refs_env["workspace"]);
+        assert!(not_found_env["catchingUp"].is_boolean());
+        let current_basis = &not_found_env["error"]["currentBasis"];
+        assert_eq!(current_basis["indexGeneration"], basis["indexGeneration"]);
+        assert!(
+            current_basis["indexRevision"].as_u64().unwrap()
+                >= basis["indexRevision"].as_u64().unwrap()
+        );
+        assert_eq!(not_found_env["error"]["retryable"], false);
+        assert!(not_found_env.get("data").is_none());
+        validate_structured_content(&[
+            json!({"name":"trellis_rules_explain","structuredContent":not_found_env}),
+        ]);
+        let prompt = ask(4, "prompts/get", json!({"name":"trellis_propose_layers"}));
+        assert!(prompt.get("error").is_none(), "{prompt}");
+        let text = prompt["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("for human review"));
+        assert!(
+            text.contains(
+                checked_env["data"]["rulesFile"]["contentHash"]
+                    .as_str()
+                    .unwrap()
+            )
+        );
+        assert!(text.contains(basis["indexGeneration"].as_str().unwrap()));
+        validate_structured_content(&[
+            json!({"name":"trellis_references","structuredContent":refs_env}),
+            json!({"name":"trellis_rules_check","structuredContent":checked_env}),
+            json!({"name":"trellis_rules_explain","structuredContent":explain["result"]["structuredContent"]}),
+        ]);
+        fs::write(
+            identity.root.join(".trellis/rules.toml"),
+            "version = 1\nunknown = true\n",
+        )
+        .unwrap();
+        let invalid = ask(
+            5,
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{"schemaVersion":1}}),
+        );
+        tool(&invalid, Some("invalid_rules"), !legacy);
+        assert!(invalid["result"]["structuredContent"]["error"]["diagnostic"].is_object());
+        validate_structured_content(&[
+            json!({"name":"trellis_rules_check","structuredContent":invalid["result"]["structuredContent"]}),
+        ]);
+        let bad_prompt = ask(6, "prompts/get", json!({"name":"trellis_propose_layers"}));
+        assert_eq!(
+            bad_prompt["error"]["data"]["code"], "invalid_rules",
+            "{bad_prompt}"
+        );
+        assert!(bad_prompt.get("result").is_none());
+        fs::remove_file(identity.root.join(".trellis/rules.toml")).unwrap();
+        let absent = ask(7, "prompts/get", json!({"name":"trellis_propose_layers"}));
+        assert!(
+            absent["result"]["messages"][0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"rulesText\":null")
+        );
+        let missing = ask(
+            8,
+            "tools/call",
+            json!({"name":"trellis_rules_check","arguments":{"schemaVersion":1}}),
+        );
+        tool(&missing, Some("rules_not_found"), !legacy);
+        let old_pin =
+            json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":0});
+        let stale = ask(
+            9,
+            "tools/call",
+            json!({"name":"trellis_references","arguments":{"schemaVersion":1,"expectedBasis":old_pin}}),
+        );
+        tool(&stale, Some("revision_conflict"), !legacy);
+        drop(ask);
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn architecture_prompt_cancellation_deadline_and_final_root_are_not_tool_results() {
+    for legacy in [false, true] {
+        for scenario in ["cancel", "deadline", "root"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (identity, registry, runtime) = ready_registry(temp.path(), 1290).await;
+            let gate = ReadGate::default();
+            runtime.set_mcp_admitted_gate_for_tests(gate.hook());
+            let deadline = (scenario == "deadline").then_some(Duration::from_millis(300));
+            let (mut client, mut reader, session) =
+                socket_session(&identity, &registry, 1290, deadline);
+            if legacy {
+                writeln!(
+                    client,
+                    "{}",
+                    request(
+                        json!(0),
+                        "initialize",
+                        fixture()["legacyInitialize"].clone()
+                    )
+                )
+                .unwrap();
+                assert!(next_reply(&mut reader)["result"].is_object());
+                writeln!(
+                    client,
+                    "{}",
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+                )
+                .unwrap();
+            }
+            let frame = |id: i64, method: &str, params: Value| {
+                if legacy {
+                    request(json!(id), method, params)
+                } else {
+                    modern(json!(id), method, params)
+                }
+            };
+            writeln!(
+                client,
+                "{}",
+                frame(1, "prompts/get", json!({"name":"trellis_propose_layers"}))
+            )
+            .unwrap();
+            let waiter = gate.clone();
+            tokio::task::spawn_blocking(move || waiter.await_held(1))
+                .await
+                .unwrap();
+            match scenario {
+                "cancel" => {
+                    writeln!(client,"{}",json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})).unwrap();
+                    writeln!(client, "{}", frame(2, "prompts/list", json!({}))).unwrap();
+                    assert_eq!(next_reply(&mut reader)["id"], 2);
+                    gate.open();
+                    drop(reader);
+                    drop(client);
+                    session.join().unwrap().unwrap();
+                }
+                "deadline" => {
+                    let reply = next_reply(&mut reader);
+                    gate.open();
+                    assert_eq!(
+                        reply["error"]["data"]["code"], "deadline_exceeded",
+                        "{reply}"
+                    );
+                    assert!(reply.get("result").is_none());
+                    assert!(reply["error"]["data"].get("attemptedWorkspace").is_none());
+                    drop(reader);
+                    drop(client);
+                    session.join().unwrap().unwrap();
+                }
+                "root" => {
+                    let moved = temp.path().join("moved-checkout");
+                    fs::rename(&identity.root, &moved).unwrap();
+                    fs::create_dir(&identity.root).unwrap();
+                    gate.open();
+                    let reply = next_reply(&mut reader);
+                    assert_eq!(reply["error"]["data"]["code"], "root_changed", "{reply}");
+                    assert!(reply.get("result").is_none());
+                    drop(reader);
+                    drop(client);
+                    session.join().unwrap().unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 }
