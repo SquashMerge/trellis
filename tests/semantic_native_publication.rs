@@ -98,6 +98,25 @@ fn selected_case(change_b: &str) {
     }
     let root = fs::canonicalize(root).unwrap();
     let root_string = root.to_str().unwrap();
+    let mut private_stage_daemon = if change_b == "selected_private_stage" {
+        let mut child = cli(&home)
+            .arg("daemon")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        trellis::testing::wait_until("private-stage daemon election", || {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "fixture daemon exited before election"
+            );
+            fs::read_to_string(home.join("daemon.pid"))
+                .is_ok_and(|marker| marker == child.id().to_string())
+        });
+        Some(child)
+    } else {
+        None
+    };
     let indexed = run(&home, &["index", "--workspace", root_string]);
     let r1: trellis::model::IndexPin =
         serde_json::from_value(indexed["publishedRevision"].clone()).unwrap();
@@ -826,14 +845,18 @@ fn selected_case(change_b: &str) {
         return;
     }
     if change_b == "selected_private_stage" {
-        let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        trellis::testing::wait_until("fixture daemon exit", || {
-            !trellis::testing::process_running(pid)
-        });
+        let mut child = private_stage_daemon.take().unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join("daemon.pid")).unwrap(),
+            child.id().to_string(),
+            "CLI commands must have used the elected fixture daemon",
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "fixture daemon exited early"
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        child.wait().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = trellis::indexer::IndexOptions::new(root.clone());
         let capture = trellis::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
