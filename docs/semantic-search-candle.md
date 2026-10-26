@@ -75,9 +75,10 @@ cargo run --locked --release --features test-support,metal \
   --input /absolute/parity-inputs/c.jsonl --output /absolute/candidate/c.jsonl
 ```
 
-Run it for `a`, `b`, `c` and `queries`, and separately record CPU and Metal claims. Prepare
-inputs directly from current `results/cards.jsonl` and `eval/queries.json`, preserving their
-line/array order. Use the **current** `results/emb` arrays, not older result directories.
+Run it for the chosen form `c` and `queries` on **both CPU and Metal**. Forms `a`
+and `b` are optional diagnostics, not acceptance gates. Prepare inputs directly from current
+`results/cards.jsonl` and `eval/queries.json`, preserving their line/array order. Use the
+**current** `results/emb` arrays, not older result directories.
 
 The offline checker uses NumPy in the evaluation's own Python environment; Python only
 analyzes vectors and does not load or run the model:
@@ -85,7 +86,7 @@ analyzes vectors and does not load or run the model:
 ```sh
 /path/to/evaluation/venv/bin/python tools/semantic-search/check-parity.py \
   --evidence-root /absolute/semantic-search-evidence \
-  --candidate-dir /absolute/candidate \
+  --candidate-dir /absolute/candidate --variants c \
   --model-pin-manifest /absolute/verified-download-manifest.json \
   --output /absolute/parity-result.json
 ```
@@ -96,11 +97,28 @@ focused tests, clippy and reference-vector analysis run unlocked with bounded co
 Use an isolated Cargo target and preserve failed inputs/results. Record source and lockfile
 hashes, model pin, backend, dtype, prompts and batch policy with the run.
 
-Required port parity is **cosine ≥0.999 for every card**, not an average, plus reproduction
-of recall@5, recall@10 and MRR within the benchmark's noise. The checker operationalizes
-reported noise as absolute metric differences ≤0.07 overall and ≤0.08 for concept queries;
-these are explicit acceptance assumptions for review, not newly ratified contract constants.
-It also reports query cosine and document/query cross-arms for diagnosis.
+### Owner-ratified regression test
+
+The [owner ruling on #211](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6405701173)
+and [#337](https://github.com/SquashMerge/trellis/pull/337#issuecomment-6405701393)
+accepts the chosen card form **`c`** with this regression rule:
+
+1. **Every** card vector has cosine **≥0.999** against the pinned saved reference;
+   an average cannot satisfy this check.
+2. **Recall@10 and MRR do not regress** on the complete #214 evaluation set.
+   Compare actual candidate documents and queries with the saved reference documents
+   and queries using full-2048 float vectors.
+3. Both checks pass on **CPU and Metal**, recorded separately.
+
+The checker implements this rule against the saved vectors. Run the checker once for
+each backend's actual form-`c` output. Its self-test covers metric regressions and the
+per-card criterion without claiming small synthetic data proves full-model parity.
+Keep this external-model regression test for future runtime changes.
+
+The earlier **0.07/0.08 thresholds are superseded** and are not acceptance limits.
+Form `a`'s one-query rank 9→11 slip is out of scope because that card form is not used.
+Recall@5, query cosine, subgroup metrics, other card forms and document/query cross-arms
+remain diagnostics; they do not add acceptance gates.
 
 The historical benchmark measured full-2048 document-only int8 and float-prefix-1024
 separately. It did **not** measure combined 1024/int8 or int8 queries. Report the combined
@@ -135,7 +153,8 @@ and 50 queries. Every card exceeded cosine 0.999:
 
 Form `a` recall@10 changed from 0.36 to 0.34 (one of 50 queries); its recall@5
 was unchanged and MRR increased by 0.00032145. Form `b` recall@5/10 was unchanged,
-with MRR delta −0.00001315. These measured deltas are not a ratified noise policy.
+with MRR delta −0.00001315. Both forms are diagnostic and outside the accepted
+form-`c` regression rule.
 For production-form `c`, full-vector recall@5/10 was unchanged from the reference;
 MRR changed from **0.28623468** to **0.28934607**. Query minimum cosine was
 **0.99993938** (diagnostic). Transforming actual vectors to combined 1024/int8
@@ -154,8 +173,9 @@ per-card/per-query reports are local in
 and explicit real-model fixture tests passed separately. The first full `./tools/verify` passed
 on Rust 1.99.1: all five lanes passed, including 1,510 Rust tests (7 skipped).
 Format checks, default/test-support clippy and separate Metal all-target clippy passed.
-The per-card criterion passes for the measured backend/forms; metric-noise acceptance
-still requires owner review of the measured deltas, not ratification by the checker.
+The owner accepted form `c` on both CPU and Metal: every card exceeds 0.999,
+recall@10 is unchanged at 0.56, and MRR improves from 0.28623468 to 0.28934607.
+These measured results satisfy the regression rule above.
 Unlocked numerical inference runs are correctness evidence, not controlled performance
 measurements.
 

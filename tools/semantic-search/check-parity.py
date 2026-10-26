@@ -3,7 +3,10 @@
 
 Run with the existing benchmark venv's Python. This program only reads saved
 artifacts; it never loads a model, downloads files, or changes reference data.
-The metric-noise thresholds below are PROPOSED, not owner-ratified acceptance.
+Owner-ratified acceptance is form c: every card cosine >= .999 and no loss in
+all-query recall@10 or MRR for paired full2048-f32 candidate versus reference.
+Callers must check CPU and Metal outputs separately. Other forms, metrics and
+representations are diagnostic only.
 """
 
 import argparse
@@ -22,9 +25,13 @@ DIMS = 2048
 DEPTH = 100
 CARD_COSINE_MIN = 0.999
 QUERY_COSINE_DIAGNOSTIC = 0.999
-PROPOSED_ALL_DELTA = 0.07
-PROPOSED_CONCEPT_DELTA = 0.08
+CHOSEN_FORM = "c"
+NO_REGRESSION_METRICS = ("recall@10", "mrr")
 METRICS = ("recall@5", "recall@10", "mrr")
+OWNER_RULING_URLS = (
+    "https://github.com/SquashMerge/trellis/issues/211#issuecomment-6405701173",
+    "https://github.com/SquashMerge/trellis/pull/337#issuecomment-6405701393",
+)
 MODEL = "voyage-4-nano"
 SOURCE_HASHES = {
     "results/cards.jsonl": "4ca5a9d3588944094ad2e7ee12a454b60498a3ffff7783d78ee99cb4eb28abe0",
@@ -243,6 +250,18 @@ def compare_metrics(reference, candidate):
                   for name in METRICS} for cat, values in reference.items()}
 
 
+def owner_acceptance_gates(variant, card_cosines, paired_comparison):
+    if variant != CHOSEN_FORM:
+        return []
+    gates = [{"name": f"{variant}/each-card-cosine", "minimum": CARD_COSINE_MIN,
+              "passed": card_cosines["allAtOrAboveThreshold"]}]
+    for metric in NO_REGRESSION_METRICS:
+        values = paired_comparison["all"][metric]
+        gates.append({"name": f"{variant}/all/{metric}", **values,
+                      "minimumDelta": 0.0, "passed": values["delta"] >= 0.0})
+    return gates
+
+
 def baseline_comparison(replayed, saved):
     rounded = {cat: {name: (values[name] if name == "n" else round(values[name], 3))
                      for name in (*METRICS, "n")} for cat, values in replayed["metrics"].items()}
@@ -258,6 +277,7 @@ def analyze(args, result):
     variants = args.variants.split(",")
     require(variants and len(variants) == len(set(variants)) and set(variants) <= set("abc"),
             "--variants must be a nonempty comma-separated subset of a,b,c, without duplicates")
+    require(CHOSEN_FORM in variants, "--variants must include owner-chosen form c; a/b are optional diagnostics")
     selected_sources = [p for p in SOURCE_HASHES if not p.endswith(".docs.npy") or
                         any(p.endswith(f".{v}.docs.npy") for v in variants)]
     paths = {p: root / p for p in selected_sources}
@@ -316,10 +336,8 @@ def analyze(args, result):
         ref_docs = load_reference(root / f"results/emb/{MODEL}.{variant}.docs.npy", DOC_COUNT)
         cand_docs = load_candidate(candidate_paths[variant], ids)
         entry = {"cardCosines": cosine_report(ref_docs, cand_docs, ids, [c["cards"][variant] for c in cards],
-                                               CARD_COSINE_MIN, True), "representations": {}}
+                                               CARD_COSINE_MIN, variant == CHOSEN_FORM), "representations": {}}
         result["variants"][variant] = entry
-        gates.append({"name": f"{variant}/each-card-cosine", "ratification": "explicit per-card criterion",
-                      "passed": entry["cardCosines"]["allAtOrAboveThreshold"]})
         for name in names:
             rd, cd = [representation(v, name, "docs") for v in (ref_docs, cand_docs)]
             rq, cq = [representation(v, name, "queries") for v in (ref_queries, cand_queries)]
@@ -337,29 +355,26 @@ def analyze(args, result):
                           else "saved full-vector reference" if name == "full2048-f32" else "historical representation replay",
                 "shape": [DOC_COUNT, int(rd.shape[1])], "rankingDtype": str(rd.dtype),
                 "arms": arms, "comparisonsAgainstSameRepresentationReference": comparisons,
-                "metricGateApplied": name == "full2048-f32",
+                "metricGateApplied": variant == CHOSEN_FORM and name == "full2048-f32",
             }
             entry["representations"][name] = representation_result
             if name in historical:
                 reproduction = baseline_comparison(reference, baseline[f"{MODEL}/{variant}/{historical[name]}"])
                 representation_result["historicalBaselineReproduction"] = reproduction
                 if name == "full2048-f32":
-                    gates.append({"name": f"{variant}/full-reference-reproduces-saved-eval",
-                                  "passed": reproduction["matchesRoundedMetrics"] and reproduction["matchesMissesAt10"]})
+                    result["integrityChecks"].append({"name": f"{variant}/full-reference-reproduces-saved-eval",
+                                                       "passed": reproduction["matchesRoundedMetrics"] and reproduction["matchesMissesAt10"]})
             if name == "full2048-f32":
-                final = comparisons["candidateDocs_candidateQueries"]
-                for cat, limit in (("all", PROPOSED_ALL_DELTA), ("concept", PROPOSED_CONCEPT_DELTA)):
-                    for metric in METRICS:
-                        difference = final[cat][metric]["absoluteDelta"]
-                        gates.append({"name": f"{variant}/{cat}/{metric}", "ratification": "PROPOSED, NOT OWNER-RATIFIED",
-                                      "absoluteDelta": difference, "maximum": limit,
-                                      "passed": difference <= limit})
+                gates.extend(owner_acceptance_gates(variant, entry["cardCosines"],
+                                                    comparisons["candidateDocs_candidateQueries"]))
+    failed_integrity = [check for check in result["integrityChecks"] if not check["passed"]]
+    require(not failed_integrity, "full reference does not reproduce saved evaluation", failed_integrity)
     result["integrityPassed"] = True
     result["explicitCardCriterionPassed"] = all(g["passed"] for g in gates if g["name"].endswith("each-card-cosine"))
-    result["proposedOperationalGatesPassed"] = all(g["passed"] for g in gates)
-    result["passed"] = result["proposedOperationalGatesPassed"]
-    result["conclusion"] = ("Passes explicit card criterion and PROPOSED metric gates; numerical noise policy still needs owner ratification."
-                            if result["passed"] else "One or more integrity, explicit cosine, or PROPOSED metric checks failed.")
+    result["ownerAcceptancePassed"] = all(g["passed"] for g in gates)
+    result["passed"] = result["integrityPassed"] and result["ownerAcceptancePassed"]
+    result["conclusion"] = ("Passes owner-ratified form-c parity for this candidate run; CPU and Metal must each pass separately."
+                            if result["passed"] else "Owner-ratified form-c card cosine or all-query no-regression criterion failed.")
 
 
 def self_test():
@@ -395,7 +410,45 @@ def self_test():
             pass
         else:
             raise AssertionError("zero/nonfinite vector was accepted")
-    print("PASS: exact ID/shape, finite/nonzero, ties-to-even quantization, original ranker, first-gold metrics")
+    # Independent scalar fixtures exercise acceptance policy, not model parity.
+    reference_metrics = {
+        "all": {"recall@5": 0.75, "recall@10": 0.75, "mrr": 0.5},
+        "concept": {"recall@5": 1.0, "recall@10": 1.0, "mrr": 1.0},
+    }
+    candidate_metrics = {
+        "all": {"recall@5": 0.5, "recall@10": 1.0, "mrr": 0.625},
+        "concept": {"recall@5": 0.0, "recall@10": 0.0, "mrr": 0.0},
+    }
+    card_reference = np.array([[1, 0], [0, 1]], dtype=np.float32)
+    card_candidate = np.array([[1, 0.01], [0.01, 1]], dtype=np.float32)
+    card_report = cosine_report(card_reference, card_candidate, ["one", "two"],
+                                ["first card", "second card"], CARD_COSINE_MIN, True)
+    comparison = compare_metrics(reference_metrics, candidate_metrics)
+    passing_gates = owner_acceptance_gates("c", card_report, comparison)
+    assert len(passing_gates) == 3 and all(g["passed"] for g in passing_gates), \
+        "gains, recall@5 loss and concept loss must not block all-query acceptance"
+    for metric in NO_REGRESSION_METRICS:
+        loss_metrics = {cat: dict(values) for cat, values in candidate_metrics.items()}
+        loss_metrics["all"][metric] = reference_metrics["all"][metric] - 0.001
+        loss_comparison = compare_metrics(reference_metrics, loss_metrics)
+        loss_gates = owner_acceptance_gates("c", card_report, loss_comparison)
+        assert [g["name"] for g in loss_gates if not g["passed"]] == [f"c/all/{metric}"], \
+            f"any {metric} loss must fail, with no noise allowance"
+        loss_metrics["all"][metric] = reference_metrics["all"][metric]
+        assert all(g["passed"] for g in owner_acceptance_gates(
+            "c", card_report, compare_metrics(reference_metrics, loss_metrics))), \
+            f"no {metric} loss must pass"
+    bad_card_candidate = np.array([[1, 0.01], [1, 0]], dtype=np.float32)
+    bad_card_report = cosine_report(card_reference, bad_card_candidate, ["one", "two"],
+                                    ["first card", "second card"], CARD_COSINE_MIN, True)
+    assert bad_card_report["belowThresholdIds"] == ["two"]
+    assert [g["name"] for g in owner_acceptance_gates("c", bad_card_report, comparison)
+            if not g["passed"]] == ["c/each-card-cosine"]
+    diagnostic_loss = compare_metrics(candidate_metrics, reference_metrics)
+    for variant in ("a", "b"):
+        assert owner_acceptance_gates(variant, bad_card_report, diagnostic_loss) == [], \
+            "unchosen-form cosine and metric losses are diagnostic only"
+    print("PASS: input integrity, quantization, original ranker, first-gold metrics; synthetic owner-policy checks (not model parity)")
     return 0
 
 
@@ -404,7 +457,8 @@ def main():
     parser.add_argument("--evidence-root", type=Path)
     parser.add_argument("--candidate-dir", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--variants", default="a,b,c")
+    parser.add_argument("--variants", default=CHOSEN_FORM,
+                        help="include c for acceptance; a/b are optional diagnostics (default: c)")
     parser.add_argument("--model-pin-manifest", type=Path)
     parser.add_argument("--self-test", action="store_true", help="run small offline synthetic checks; no model or saved corpus")
     args = parser.parse_args()
@@ -430,19 +484,22 @@ def main():
         "constants": {"documentCount": DOC_COUNT, "queryCount": QUERY_COUNT, "dimensions": DIMS,
                       "rankingDepth": DEPTH, "eachCardCosineMinimum": CARD_COSINE_MIN,
                       "queryCosineDiagnosticMinimum": QUERY_COSINE_DIAGNOSTIC,
-                      "proposedMaximumAllAbsoluteMetricDelta": PROPOSED_ALL_DELTA,
-                      "proposedMaximumConceptAbsoluteMetricDelta": PROPOSED_CONCEPT_DELTA,
-                      "metricNoiseRatification": "PROPOSED operationalization, NOT owner-ratified"},
+                      "chosenForm": CHOSEN_FORM, "noRegressionMetrics": list(NO_REGRESSION_METRICS),
+                      "minimumMetricDelta": 0.0},
+        "ownerRuling": {"urls": list(OWNER_RULING_URLS), "scope": "Each CPU/Metal run separately"},
         "semantics": {
             "inputs": "Exact current saved corpus SHA-256, counts, NPY v1.0/C-order/<f4 headers, finite nonzero vectors, exact ID order and gold-ID join; no skips.",
             "ranking": "float32 q @ docs.T; np.argsort(-scores) default quicksort descending, depth 100, no secondary ID tie-break",
             "metrics": "Any-gold query success R@5/R@10; first-gold MRR to depth 100; unrounded aggregates for deltas",
             "newInt8": "First 1024 f32 coordinates converted exactly to f64; maxabs/127 and division f64, np.rint ties-to-even, cast int8, cast f32 and normalize, BOTH docs and queries; no redundant prefix L2",
             "newInt8Acceptance": "New reference/candidate same-transformation measurements ONLY; no gate against full-float or historical quality minimum",
+            "ownerAcceptance": "Form c ONLY: every card cosine >= .999 against pinned reference; full2048-f32 candidateDocs_candidateQueries versus referenceDocs_referenceQueries, unrounded all-query recall@10 and MRR deltas >= 0. No tolerance, recall@5 gate or category gate. CPU and Metal checked separately by caller.",
+            "diagnostics": "Form a/b cosines and metrics, recall@5, category metrics, mixed arms and reduced/int8 representations do not block owner acceptance; input integrity is always required.",
+            "historical": "Full-vector saved-eval reproduction is an input integrity check, separate from owner gates. Historical reduced/int8 reproductions remain diagnostics, not the NEW int8 comparison.",
             "queryCosine": "Diagnostic only; not an extra owner-blocking threshold",
             "hybrid": "Not replayed: no FTS/index work or production fusion tuning in this analyzer",
             "modelRuntime": "None. This analyzer does not import Torch/ST, execute embeddings, or download/load model files.",
-        }, "gates": [], "errors": [],
+        }, "gates": [], "integrityChecks": [], "errors": [],
     }
     try:
         analyze(args, result)
@@ -457,7 +514,7 @@ def main():
     except (OSError, ValueError) as error:
         print(f"error writing report: {error}", file=sys.stderr)
         return 1
-    print(f"{'PASS (proposed noise policy)' if result['passed'] else 'FAIL'}: {args.output}")
+    print(f"{'PASS (owner-ratified form-c parity)' if result['passed'] else 'FAIL'}: {args.output}")
     for error in result["errors"]:
         print(f"{error['type']}: {error['message']}", file=sys.stderr)
     return 0 if result["passed"] else 1
