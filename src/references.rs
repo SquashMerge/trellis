@@ -172,6 +172,12 @@ pub fn project(
         check()?;
         scanned += 1;
         let raw = extract(doc, tree, check)?;
+        let declarations = RangeIndex::new(
+            doc.declarations.iter().map(|d| &d.range),
+            &mut owner_work,
+            check,
+        )?;
+        let calls = RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut owner_work, check)?;
         let newlines: Vec<_> = doc
             .file
             .text
@@ -187,14 +193,10 @@ pub fn project(
             }
             site_count += 1;
             ensure!(site_count <= SITES, "bounded_work: reference site count");
-            owner_work = owner_work
-                .saturating_add(doc.declarations.len())
-                .saturating_add(doc.calls.len());
-            ensure!(
-                owner_work <= OWNER_WORK,
-                "bounded_work: reference owner lookup"
+            let owner = owner(
+                doc,
+                declarations.enclosing(item.start, item.end, &mut owner_work, check)?,
             );
-            let owner = owner(doc, item.start, item.end);
             let role = owner.map(|d| match d.role {
                 DeclarationRole::Test => "test",
                 DeclarationRole::Production => "production",
@@ -212,11 +214,11 @@ pub fn project(
                 }),
                 relation_kind: item.kind,
                 spelling: item.spelling.clone(),
-                call_id: doc
-                    .calls
-                    .iter()
-                    .find(|c| c.range.start <= item.start && c.range.end >= item.end)
-                    .map(|c| c.id.clone()),
+                call_id: calls
+                    .enclosing(item.start, item.end, &mut owner_work, check)?
+                    .into_iter()
+                    .min()
+                    .map(|index| doc.calls[index].id.clone()),
             };
             let target = if owner.is_none() {
                 Err("reference_owner_ambiguous")
@@ -343,21 +345,102 @@ fn walk<'a, C: FnMut() -> Result<()>>(
 fn text<'a>(doc: &'a DocumentInput, node: Node<'_>) -> &'a str {
     &doc.file.text[node.byte_range()]
 }
-fn owner(doc: &DocumentInput, start: usize, end: usize) -> Option<&Declaration> {
-    let mut owners: Vec<_> = doc
-        .declarations
-        .iter()
-        .filter(|d| d.range.start <= start && d.range.end >= end)
-        .collect();
-    owners.sort_by_key(|d| {
+struct RangeIndex<'a> {
+    ranges: Vec<(usize, &'a crate::native_evidence::Range)>,
+    max_ends: Vec<usize>,
+}
+impl<'a> RangeIndex<'a> {
+    fn new(
+        ranges: impl Iterator<Item = &'a crate::native_evidence::Range>,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        let mut indexed = Vec::new();
+        for (index, range) in ranges.enumerate() {
+            owner_step(work, check)?;
+            indexed.push((index, range));
+        }
+        indexed.sort_by_key(|(index, range)| (range.start, *index));
+        check()?;
+        let mut result = Self {
+            max_ends: vec![0; indexed.len()],
+            ranges: indexed,
+        };
+        result.build(0, result.ranges.len(), work, check)?;
+        Ok(result)
+    }
+
+    fn build(
+        &mut self,
+        left: usize,
+        right: usize,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<usize> {
+        if left == right {
+            return Ok(0);
+        }
+        owner_step(work, check)?;
+        let mid = left + (right - left) / 2;
+        let end = self.ranges[mid]
+            .1
+            .end
+            .max(self.build(left, mid, work, check)?)
+            .max(self.build(mid + 1, right, work, check)?);
+        self.max_ends[mid] = end;
+        Ok(end)
+    }
+
+    fn enclosing(
+        &self,
+        start: usize,
+        end: usize,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<usize>> {
+        let mut found = Vec::new();
+        let mut pending = vec![(0, self.ranges.len())];
+        while let Some((left, right)) = pending.pop() {
+            if left == right {
+                continue;
+            }
+            owner_step(work, check)?;
+            let mid = left + (right - left) / 2;
+            // A spanning file module must not prevent pruning unrelated subtrees.
+            if self.ranges[left].1.start > start || self.max_ends[mid] < end {
+                continue;
+            }
+            let (index, range) = self.ranges[mid];
+            if range.start <= start && range.end >= end {
+                found.push(index);
+            }
+            pending.push((mid + 1, right));
+            pending.push((left, mid));
+        }
+        Ok(found)
+    }
+}
+
+fn owner_step(work: &mut usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
+    check()?;
+    *work = work.saturating_add(1);
+    ensure!(*work <= OWNER_WORK, "bounded_work: reference owner lookup");
+    Ok(())
+}
+
+fn owner(doc: &DocumentInput, mut owners: Vec<usize>) -> Option<&Declaration> {
+    owners.sort_by_key(|&index| {
+        let d = &doc.declarations[index];
         (
             d.range.end - d.range.start,
             d.kind == "module",
             std::cmp::Reverse(d.ancestors.len()),
+            index,
         )
     });
-    let first = *owners.first()?;
-    if owners.get(1).is_some_and(|d| {
+    let first = &doc.declarations[*owners.first()?];
+    if owners.get(1).is_some_and(|&index| {
+        let d = &doc.declarations[index];
         d.range == first.range && d.kind == first.kind && d.ancestors.len() == first.ancestors.len()
     }) {
         None
@@ -775,4 +858,66 @@ fn relative_path(source: &str, relative: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
+}
+
+#[cfg(test)]
+mod range_index_tests {
+    use super::*;
+    use crate::native_evidence::Range;
+
+    #[test]
+    fn indexed_enclosure_matches_linear_ranges_and_stored_order() {
+        let ranges = [
+            Range { start: 0, end: 100 },
+            Range { start: 20, end: 40 },
+            Range { start: 5, end: 30 },
+            Range { start: 20, end: 40 },
+            Range { start: 40, end: 40 },
+            Range { start: 60, end: 80 },
+        ];
+        let mut work = 0;
+        let index = RangeIndex::new(ranges.iter(), &mut work, &mut || Ok(())).unwrap();
+        for start in 0..=101 {
+            for end in start..=101 {
+                let expected: Vec<_> = ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.start <= start && r.end >= end)
+                    .map(|(i, _)| i)
+                    .collect();
+                let mut found = index
+                    .enclosing(start, end, &mut work, &mut || Ok(()))
+                    .unwrap();
+                // Call enclosure chooses the first stored call, not the narrowest.
+                assert_eq!(found.iter().min(), expected.first());
+                found.sort_unstable();
+                assert_eq!(found, expected, "{start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn range_index_work_is_bounded_and_cancellable() {
+        let ranges = [Range { start: 0, end: 100 }];
+        let mut work = 0;
+        let index = RangeIndex::new(ranges.iter(), &mut work, &mut || Ok(())).unwrap();
+        work = OWNER_WORK;
+        let error = index
+            .enclosing(5, 10, &mut work, &mut || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "bounded_work: reference owner lookup");
+        let mut checks = 0;
+        let error = RangeIndex::new(ranges.iter(), &mut 0, &mut || {
+            checks += 1;
+            ensure!(checks < 3, "cancelled");
+            Ok(())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "cancelled");
+        let error = index
+            .enclosing(5, 10, &mut 0, &mut || anyhow::bail!("cancelled"))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled");
+    }
 }
