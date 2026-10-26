@@ -1783,6 +1783,7 @@ fn run_semantic_request(
             let path = std::path::PathBuf::from(path);
             if !path.exists() {
                 let listener = UnixListener::bind(&path)?;
+                std::fs::write(path.with_extension("ready"), [])?;
                 let (_stream, _) = listener.accept()?;
             }
         }

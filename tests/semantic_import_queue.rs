@@ -776,7 +776,7 @@ fn two_document_case(change_b: &str) {
             .spawn()
             .unwrap();
         let start = Instant::now();
-        while !socket.exists() {
+        while !socket.with_extension("ready").exists() {
             assert!(
                 start.elapsed() < Duration::from_secs(10),
                 "semantic candidate cutoff was not reached"
