@@ -1327,6 +1327,44 @@ def main():
             (EVIDENCE / "smoke-oracle-digest.json").write_text(json.dumps(oracle_digest, indent=2) + "\n")
             require(selected_digest == oracle_digest, "smoke selected/native/raw-linked FULL oracle mismatch: " +
                     json.dumps([table for table in selected_digest if selected_digest[table] != oracle_digest[table]]))
+            # Regression: two same-name parameters in one selected Java document
+            # must remain distinct destinations. Mutate only one on an isolated DB
+            # copy and exercise the exact parity decision used above.
+            negative_db = EVIDENCE / "smoke-negative-graph.db"
+            shutil.copyfile(db_for(oracle_home), negative_db)
+            with closing(sqlite3.connect(negative_db)) as db:
+                rows = db.execute("""SELECT n.gid,n.name,n.kind FROM graph_nodes n
+                    JOIN graph_projections g ON g.gid=n.gid
+                    JOIN revision_documents d ON d.gid=n.gid AND d.revision_id=?
+                    WHERE d.language='java' AND n.kind='parameter'
+                    GROUP BY n.gid,n.name,n.kind HAVING count(*) > 1
+                    ORDER BY n.gid,n.name LIMIT 1""", (oracle_revision,)).fetchone()
+                require(rows is not None, "same-name graph-node control pair missing")
+                gid, name, kind = rows
+                pair = db.execute("SELECT id FROM graph_nodes WHERE gid=? AND name=? AND kind=? "
+                                  "ORDER BY id LIMIT 2", (gid, name, kind)).fetchall()
+                view = SelectedView(db, oracle_revision, oracle_root)
+                require(len(pair) == 2 and view.map("graph-node", pair[0][0]) !=
+                        view.map("graph-node", pair[1][0]),
+                        "same-name graph destinations collapse")
+                db.execute("UPDATE graph_nodes SET name=? WHERE gid=? AND id=?",
+                           (name + "_negative", gid, pair[0][0]))
+                db.commit()
+                mutated_digest = parity_digest(db, oracle_revision, oracle_root)
+            rejected = False
+            try:
+                require(selected_digest == mutated_digest, "expected graph-node parity mismatch")
+            except RuntimeError as exc:
+                require(str(exc) == "expected graph-node parity mismatch",
+                        "negative control failed for unrelated reason")
+                rejected = True
+            require(rejected and oracle_digest["graph_nodes"] != mutated_digest["graph_nodes"]
+                    and oracle_digest["opaque_input_closures"]["graph_hash"] !=
+                    mutated_digest["opaque_input_closures"]["graph_hash"],
+                    "single-node mutation did not alter graph parity closure")
+            record("smoke_negative_graph_rejected", path="java", same_name=name,
+                   original=oracle_digest["graph_nodes"]["sha256"],
+                   mutated=mutated_digest["graph_nodes"]["sha256"])
             record("smoke_pass", r2=prior, local=local["revision"], oracle=oracle_revision,
                    parity_tables=len(selected_digest), timed=False)
             return
