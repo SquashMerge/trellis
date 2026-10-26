@@ -182,6 +182,12 @@ fn two_document_case(change_b: &str) {
         doc.occurrences.push(occurrence);
         binary.documents.push(doc);
     }
+    if change_b == "zero_claims" {
+        for document in &mut binary.documents {
+            document.occurrences.clear();
+            document.symbols.clear();
+        }
+    }
     let bytes = binary.write_to_bytes().unwrap();
     fs::write(root.join("artifact.scip"), &bytes).unwrap();
     let profile: Value = serde_json::from_str(include_str!(
@@ -567,6 +573,12 @@ fn two_document_case(change_b: &str) {
         let rolled_back = store.index_baseline().unwrap();
         assert!(
             store
+                .selected_raw_inputs_at(rolled_back)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
                 .semantic_at(rolled_back)
                 .unwrap()
                 .call_bindings
@@ -590,6 +602,24 @@ fn two_document_case(change_b: &str) {
     let captured_pin: trellis::model::IndexPin =
         serde_json::from_value(captured["publishedRevision"].clone()).unwrap();
     let captured_semantic = store.semantic_at(captured_pin).unwrap();
+    if change_b == "zero_claims" {
+        assert!(captured_semantic.provenance.is_empty());
+        let selected = store.selected_raw_inputs_at(captured_pin).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            store
+                .retained_native_snapshot_at(selected[0].captured_pin)
+                .unwrap()
+                .0
+                .revision
+                .id,
+            native.revision.id
+        );
+        assert!(selected[0].proofs.is_empty());
+        assert_eq!(selected[0].binary_bytes, bytes);
+        assert_eq!(selected[0].requested_documents.len(), 2);
+        return;
+    }
     if partial {
         if change_b == "partial_empty_covered" {
             let a = captured_semantic
@@ -795,6 +825,27 @@ fn two_document_case(change_b: &str) {
     let joined_pin: trellis::model::IndexPin =
         serde_json::from_value(joined["publishedRevision"].clone()).unwrap();
     let selected = store.semantic_at(joined_pin).unwrap();
+    let selected_inputs = store.selected_raw_inputs_at(joined_pin).unwrap();
+    assert_eq!(selected_inputs.len(), 1);
+    let input = &selected_inputs[0];
+    assert_eq!(input.producer_id, "scip-typescript");
+    assert_eq!(
+        store
+            .retained_native_snapshot_at(input.captured_pin)
+            .unwrap()
+            .0
+            .revision
+            .id,
+        native.revision.id
+    );
+    assert_eq!(input.binary_bytes, bytes);
+    assert!(!input.proofs.is_empty());
+    assert!(
+        input
+            .requested_documents
+            .iter()
+            .any(|d| d.path == "src/A.js")
+    );
     if !matches!(
         change_b,
         "cutoff" | "missing_a_real" | "missing_a" | "ambiguous_a"
@@ -984,6 +1035,11 @@ fn partial_manifest_excluded_b_is_not_requested_in_selected_store_and_report() {
 fn partial_manifest_excluded_unsupported_is_omitted_not_native_capability() {
     two_document_case("partial_unsupported");
 }
+#[test]
+fn accepted_zero_claim_capture_is_selected_without_provenance() {
+    two_document_case("zero_claims");
+}
+
 #[test]
 fn partial_manifest_empty_covered_a_remains_complete_without_claims() {
     two_document_case("partial_empty_covered");
@@ -2355,5 +2411,238 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
             .unwrap()
             .unwrap(),
         committed["report"]
+    );
+}
+
+#[test]
+fn replacing_one_selected_raw_capture_copies_the_other_producer() {
+    use protobuf::{EnumOrUnknown, Message};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        scip_admission::{ReferenceProfileAdmission, TrustedSelection, decode_reference_profile},
+        semantic_evidence as semantic,
+    };
+    let temp = Builder::new()
+        .prefix("semantic-selection-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("A.js"), "function a() {}\n").unwrap();
+    fs::write(root.join("B.py"), "def b():\n    pass\n").unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let state = temp.path().join("state");
+    fs::create_dir(&state).unwrap();
+    let store = trellis::store::Store::open_for_tests(&state, &root).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = IndexOptions::new(root.clone());
+    let (graph, native, capture) =
+        index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let r1 = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let (native, sources) = store.retained_native_snapshot_at(r1).unwrap();
+    let (toolchain, config, dependencies) = store.retained_native_components_at(r1).unwrap();
+    let profile: Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let source_documents: Vec<_> = native.revision.documents.iter().map(|d|json!({"language":d.key.language,"relativePath":d.key.path,"contentHash":d.content_hash})).collect();
+    let source_manifest_hash = native_ids::digest(
+        b"",
+        &native_ids::canonical(&json!(
+            native
+                .revision
+                .documents
+                .iter()
+                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
+                .collect::<Vec<_>>()
+        )),
+    );
+    let mut pins = Vec::new();
+    for (producer_id, path, language, replacement) in [
+        ("scip-typescript", "A.js", "javascript", false),
+        ("scip-python", "B.py", "python", false),
+        ("scip-typescript", "A.js", "javascript", true),
+    ] {
+        let producer = profile["semanticProducers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == producer_id)
+            .unwrap();
+        let mut binary = scip::types::Index::new();
+        let mut document = scip::types::Document::new();
+        document.relative_path = path.into();
+        document.language = language.into();
+        document.position_encoding = EnumOrUnknown::from_i32(2);
+        if replacement {
+            document.text = fs::read_to_string(root.join(path)).unwrap();
+        }
+        binary.documents.push(document);
+        let bytes = binary.write_to_bytes().unwrap();
+        let binary_path = root.join(format!("{producer_id}-{replacement}.scip"));
+        fs::write(&binary_path, &bytes).unwrap();
+        let covered: Vec<_> = source_documents
+            .iter()
+            .filter(|d| d["relativePath"] == path)
+            .cloned()
+            .collect();
+        let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+            "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
+            "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":source_manifest_hash,
+            "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
+            "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
+            "sourceDocuments":source_documents,"documents":covered,"exclusions":[],
+            "artifacts":[{"kind":"scipBinary","path":binary_path.file_name().unwrap().to_str().unwrap(),"hash":native_ids::digest(b"",&bytes),"language":language,"documents":[path]}]});
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_path = root.join(format!("{producer_id}-{replacement}.json"));
+        fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let digest = native_ids::digest(b"", &manifest_bytes);
+        let selection = TrustedSelection {
+            expected_manifest_hash: digest,
+            profile_id: "mac-mini-m5-pro-v1".into(),
+            producer_name: producer_id.into(),
+        };
+        let admitted = ReferenceProfileAdmission::from_retained_native(
+            &root,
+            &native,
+            &sources,
+            &binary_path,
+            &bytes,
+            &manifest_path,
+            &manifest_bytes,
+            &selection,
+            &cancel,
+        )
+        .unwrap();
+        let semantic_producer = admitted.producer();
+        let inventory = decode_reference_profile(&admitted, &cancel).unwrap();
+        let mut basis = BTreeMap::new();
+        for doc in &native.revision.documents {
+            if doc.key.language == language {
+                basis.insert(
+                    doc.key.clone(),
+                    semantic::SemanticBasis {
+                        producer_id: semantic_producer.id.clone(),
+                        producer_version: semantic_producer.version.clone(),
+                        producer_hash: semantic_producer.executable_hash.clone(),
+                        artifact_hash: inventory.artifact_hash.clone(),
+                        language: serde_json::from_value(json!(doc.key.language)).unwrap(),
+                        source_set_id: doc.key.source_set_id.clone(),
+                        revision_id: native.revision.id.clone(),
+                        source_manifest_hash: inventory.source_manifest_hash.clone(),
+                        toolchain_hash: native.revision.toolchain_hash.clone(),
+                        config_hash: native.revision.config_hash.clone(),
+                        dependency_hash: native.revision.dependency_hash.clone(),
+                        lookup_dependencies: vec![],
+                    },
+                );
+            }
+        }
+        let result = trellis::semantic_import::rejoin_inventory(
+            &inventory,
+            &native,
+            &sources,
+            &native,
+            &sources,
+            semantic_producer.clone(),
+            &basis,
+            2,
+        )
+        .unwrap();
+        let captured = semantic::CapturedComponents {
+            producer_executables: BTreeMap::new(),
+            artifacts: BTreeMap::from([(producer_id.into(), bytes.clone())]),
+            sources: sources.clone(),
+            captured_revision: native.revision.clone(),
+            native_toolchain: toolchain.clone(),
+            native_config: config.clone(),
+            native_dependencies: dependencies.clone(),
+            requested_producers: vec![semantic_producer],
+            toolchain: native_ids::canonical(&toolchain),
+            config: native_ids::canonical(&json!(config)),
+            dependency: native_ids::canonical(&json!(dependencies)),
+            native_extraction_components: BTreeMap::new(),
+        };
+        let raw = trellis::store::SemanticRawCapture {
+            producer_id: producer_id.into(),
+            source_set_id: native.revision.source_set_id.clone(),
+            captured_revision: native.revision.id.clone(),
+            binary_bytes: bytes.clone(),
+            manifest_bytes: manifest_bytes.clone(),
+            inventory,
+        };
+        let docs = native
+            .revision
+            .documents
+            .iter()
+            .map(|doc| {
+                (
+                    (doc.key.language.clone(), doc.key.path.clone()),
+                    doc.content_hash.clone(),
+                )
+            })
+            .collect();
+        let pin = store
+            .publish_semantic_import(
+                store.index_baseline().unwrap(),
+                &docs,
+                &result.publication,
+                &captured,
+                &native,
+                &raw,
+                &result.report,
+                &leader,
+                &cancel,
+            )
+            .unwrap();
+        pins.push((pin, native_ids::digest(b"", &bytes)));
+    }
+    let old = store.selected_raw_inputs_at(pins[1].0).unwrap();
+    let latest = store.selected_raw_inputs_at(pins[2].0).unwrap();
+    assert_eq!(old.len(), 2);
+    assert_eq!(latest.len(), 2);
+    let old_js = old
+        .iter()
+        .find(|row| row.producer_id == "scip-typescript")
+        .unwrap();
+    let latest_js = latest
+        .iter()
+        .find(|row| row.producer_id == "scip-typescript")
+        .unwrap();
+    assert_eq!(old_js.artifact_hash, pins[0].1);
+    assert_eq!(latest_js.artifact_hash, pins[2].1);
+    assert_ne!(pins[0].1, pins[2].1);
+    assert_eq!(
+        old.iter()
+            .find(|row| row.producer_id == "scip-python")
+            .unwrap()
+            .artifact_hash,
+        pins[1].1
+    );
+    assert_eq!(
+        latest
+            .iter()
+            .find(|row| row.producer_id == "scip-python")
+            .unwrap()
+            .artifact_hash,
+        pins[1].1
+    );
+    assert_eq!(
+        store.selected_raw_inputs_at(pins[1].0).unwrap()[0].artifact_hash,
+        old[0].artifact_hash
     );
 }
