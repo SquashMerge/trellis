@@ -324,7 +324,14 @@ fn rules_layer_exceptions_are_exact_edge_pairs_and_tests_stay_separate() {
     assert_eq!(data["testOnly"].as_array().unwrap().len(), 1);
     assert_eq!(data["testOnly"][0]["status"], "deviates");
     assert_eq!(data["testOnly"][0]["unresolved"], json!(["test_only"]));
-    let explained = rules::explain(data.clone(), "$layers", target, Some(destination)).unwrap();
+    let explained = rules::explain(
+        data.clone(),
+        "$layers",
+        target,
+        Some(destination),
+        &mut || Ok(()),
+    )
+    .unwrap();
     assert_eq!(explained["instances"], json!([row]));
     let config = rules::parse(&text).unwrap();
     let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
@@ -642,6 +649,7 @@ fn rules_external_layers_and_bans_are_distinct_policies_with_closed_descriptor_e
         "$external",
         &row["target"],
         Some(&row["destination"]),
+        &mut || Ok(()),
     )
     .unwrap();
     assert_eq!(explained["instances"].as_array().unwrap().len(), 1);
@@ -663,6 +671,27 @@ fn rules_external_layers_and_bans_are_distinct_policies_with_closed_descriptor_e
             .to_string()
             .starts_with("store_unavailable:")
     );
+}
+
+#[test]
+fn rules_external_explain_propagates_package_closure_cancellation() {
+    let input = snapshot(&[("src/lib.rs", "pub fn run(){}")]);
+    let refs = projected_package(&input, "std", true);
+    let config = rules::parse(
+        "version=1\n[external_policy]\ndeny=[{language='rust',package='std',stdlib=true}]",
+    )
+    .unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    let row = &data["instances"][0];
+    let error = rules::explain(
+        data.clone(),
+        "$external",
+        &row["target"],
+        Some(&row["destination"]),
+        &mut || anyhow::bail!("cancelled"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "cancelled");
 }
 
 #[test]
@@ -724,6 +753,7 @@ fn rules_external_explain_preserves_unassigned_and_trims_only_unused_assigned_de
         "$external",
         &ban["target"],
         Some(&ban["destination"]),
+        &mut || Ok(()),
     )
     .unwrap();
     assert_eq!(explained["unassigned"], data["unassigned"]);
@@ -738,6 +768,7 @@ fn rules_external_explain_preserves_unassigned_and_trims_only_unused_assigned_de
             "$external",
             &ban["target"],
             Some(&destination),
+            &mut || Ok(()),
         )
         .unwrap_err();
         assert!(error.to_string().starts_with("invalid_request:"), "{error}");

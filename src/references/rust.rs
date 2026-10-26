@@ -1,7 +1,81 @@
 //! Bounded, captured-syntax Rust name and module proofs, not compiler bindings.
+//! Foreign-block items and derive-generated sibling names are not modeled.
 use super::*;
 
 const FOLLOW: usize = 4;
+type RouteKey = (usize, String);
+type Route = BTreeSet<RouteKey>;
+
+#[derive(Clone, Copy)]
+struct ResolveContext<'a, 'b> {
+    packages: &'a external::RustPackages,
+    docs: &'a [&'b DocumentInput],
+    waive_external: bool,
+}
+#[derive(Default)]
+struct ExportTrace {
+    consulted: Route,
+    cycle: bool,
+}
+struct ExportMemo {
+    names: std::sync::Arc<Names>,
+    consulted: Route,
+}
+struct ScopeIndex {
+    ranges: Vec<(usize, usize, usize)>,
+    max_ends: Vec<usize>,
+}
+impl ScopeIndex {
+    fn build(
+        &mut self,
+        left: usize,
+        right: usize,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<usize> {
+        if left == right {
+            return Ok(0);
+        }
+        owner_step(work, check)?;
+        let mid = left + (right - left) / 2;
+        let end = self.ranges[mid]
+            .2
+            .max(self.build(left, mid, work, check)?)
+            .max(self.build(mid + 1, right, work, check)?);
+        self.max_ends[mid] = end;
+        Ok(end)
+    }
+    fn enclosing(
+        &self,
+        start: usize,
+        end: usize,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<usize>> {
+        let mut found: Option<(usize, usize)> = None;
+        let mut pending = vec![(0, self.ranges.len())];
+        while let Some((left, right)) = pending.pop() {
+            if left == right {
+                continue;
+            }
+            owner_step(work, check)?;
+            let mid = left + (right - left) / 2;
+            if self.ranges[left].1 > start || self.max_ends[mid] < end {
+                continue;
+            }
+            let (id, scope_start, scope_end) = self.ranges[mid];
+            if scope_start <= start && scope_end >= end {
+                let candidate = (scope_end - scope_start, std::cmp::Reverse(id));
+                if found.is_none_or(|(size, old)| candidate < (size, std::cmp::Reverse(old))) {
+                    found = Some((scope_end - scope_start, id));
+                }
+            }
+            pending.push((mid + 1, right));
+            pending.push((left, mid));
+        }
+        Ok(found.map(|(_, id)| id))
+    }
+}
 type Name = (u8, String);
 const TYPE: u8 = 0;
 const VALUE: u8 = 1;
@@ -66,6 +140,9 @@ struct ModuleEdge {
 }
 pub(super) struct Catalog {
     scopes: Vec<Scope>,
+    scope_indexes: BTreeMap<usize, ScopeIndex>,
+    export_memo: BTreeMap<(usize, usize, bool), std::sync::Arc<ExportMemo>>,
+    export_traces: Vec<ExportTrace>,
     files: BTreeMap<usize, usize>,
     file_declarations: BTreeMap<usize, DeclarationId>,
     roots: BTreeMap<usize, BTreeSet<usize>>,
@@ -83,6 +160,9 @@ impl Catalog {
     ) -> Result<Self> {
         let mut result = Self {
             scopes: Vec::new(),
+            scope_indexes: BTreeMap::new(),
+            export_memo: BTreeMap::new(),
+            export_traces: Vec::new(),
             files: BTreeMap::new(),
             file_declarations: BTreeMap::new(),
             roots: BTreeMap::new(),
@@ -224,6 +304,25 @@ impl Catalog {
                 }
             }
         }
+        for id in 0..result.scopes.len() {
+            result.step(check)?;
+            let scope = &result.scopes[id];
+            result
+                .scope_indexes
+                .entry(scope.document)
+                .or_insert_with(|| ScopeIndex {
+                    ranges: Vec::new(),
+                    max_ends: Vec::new(),
+                })
+                .ranges
+                .push((id, scope.start, scope.end));
+        }
+        for index in result.scope_indexes.values_mut() {
+            index.ranges.sort_by_key(|&(id, start, _)| (start, id));
+            check()?;
+            index.max_ends.resize(index.ranges.len(), 0);
+            index.build(0, index.ranges.len(), &mut result.work, check)?;
+        }
         Ok(result)
     }
     fn step(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
@@ -299,6 +398,9 @@ impl Catalog {
         let mut custom_path = false;
         for child in node.named_children(&mut cursor) {
             self.step(check)?;
+            if matches!(child.kind(), "line_comment" | "block_comment") {
+                continue;
+            }
             if matches!(child.kind(), "attribute_item" | "inner_attribute_item") {
                 let attribute: String = text(doc, child)
                     .chars()
@@ -571,22 +673,11 @@ impl Catalog {
         end: usize,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<usize>> {
-        let mut found = None;
-        for i in 0..self.scopes.len() {
-            self.step(check)?;
-            let scope = &self.scopes[i];
-            if scope.document != document || scope.start > start || scope.end < end {
-                continue;
-            }
-            if found.is_none_or(|old: usize| {
-                let old_scope = &self.scopes[old];
-                (scope.end - scope.start, std::cmp::Reverse(i))
-                    < (old_scope.end - old_scope.start, std::cmp::Reverse(old))
-            }) {
-                found = Some(i);
-            }
-        }
-        Ok(found)
+        self.step(check)?;
+        let Some(index) = self.scope_indexes.get(&document) else {
+            return Ok(None);
+        };
+        index.enclosing(start, end, &mut self.work, check)
     }
     fn root(&self, scope: usize) -> Option<usize> {
         let module = self.scopes[scope].module;
@@ -599,13 +690,15 @@ impl Catalog {
     fn parent_module(&self, module: usize) -> Option<usize> {
         self.scopes[module].parent.map(|p| self.scopes[p].module)
     }
+    #[allow(clippy::too_many_arguments)] // Captured context and route remain explicit.
     fn binding(
         &mut self,
         scope: usize,
         name: &str,
         exported: bool,
         depth: usize,
-        route: &mut BTreeSet<(usize, String)>,
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Names> {
         self.step(check)?;
@@ -614,7 +707,7 @@ impl Catalog {
             result.unknown_set = true;
             return Ok(result);
         }
-        if !route.insert((scope, name.to_owned())) {
+        if !self.enter_route(route, (scope, name.to_owned()), check)? {
             result.unknown_set = true;
             return Ok(result);
         }
@@ -663,7 +756,7 @@ impl Catalog {
                     ..Names::default()
                 }
             } else {
-                self.path(scope, &import.path, depth + 1, route, check)?
+                self.path(scope, &import.path, depth + 1, route, context, check)?
             };
             if resolved.unknown_set && (!exported || import.public) {
                 // An unproved named import has a known spelling but unproved namespace.
@@ -703,7 +796,11 @@ impl Catalog {
         );
         let mut stars = Names::default();
         for import in imports.iter().filter(|i| i.star && (!exported || i.public)) {
-            let expanded = self.expand(scope, import, depth + 1, route, check)?;
+            if self.waived_star(scope, import, context, check)? {
+                continue;
+            }
+            let expanded =
+                self.expand(scope, import, depth + 1, route, context, Some(name), check)?;
             stars.unknown_set |= expanded.unknown_set;
             for (key, bucket) in expanded
                 .names
@@ -796,7 +893,8 @@ impl Catalog {
         scope: usize,
         path: &[String],
         depth: usize,
-        route: &mut BTreeSet<(usize, String)>,
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Names> {
         self.step(check)?;
@@ -860,7 +958,15 @@ impl Catalog {
             proof.insert(self.scopes[current].document);
             let exported = current == self.scopes[current].module
                 && !self.private_access(scope, current, check)?;
-            let mut found = self.binding(current, &path[index], exported, depth, route, check)?;
+            let mut found = self.binding(
+                current,
+                &path[index],
+                exported,
+                depth,
+                route,
+                context,
+                check,
+            )?;
             if lexical
                 && current != self.scopes[current].module
                 && found
@@ -912,12 +1018,15 @@ impl Catalog {
             }
         }
     }
+    #[allow(clippy::too_many_arguments)] // Select a spelling without copying the full export set.
     fn expand(
         &mut self,
         scope: usize,
         import: &Import,
         depth: usize,
-        route: &mut BTreeSet<(usize, String)>,
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
+        spelling: Option<&str>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Names> {
         self.step(check)?;
@@ -927,7 +1036,7 @@ impl Catalog {
                 ..Names::default()
             });
         }
-        let target = self.path(scope, &import.path, depth, route, check)?;
+        let target = self.path(scope, &import.path, depth, route, context, check)?;
         let mut modules = Vec::new();
         let mut unknown = target.unknown_set;
         for ((namespace, _), bucket) in target.names {
@@ -951,29 +1060,163 @@ impl Catalog {
         }
         let (module, mut proof, depth) = modules.pop().expect("one module");
         proof.insert(self.scopes[module].document);
-        let mut result = self.exports(module, depth, route, check)?;
+        let exported = self.exports(module, depth, route, context, check)?;
+        let mut result = self.copy_names(&exported, spelling, check)?;
         result.unknown_set |= unknown;
         for bucket in result.names.values_mut() {
             for candidate in bucket.candidates.values_mut() {
+                self.charge(proof.len(), check)?;
                 candidate.proof.extend(proof.iter().copied());
             }
         }
         Ok(result)
     }
+    fn enter_route(
+        &mut self,
+        route: &mut Route,
+        key: RouteKey,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        self.step(check)?;
+        let inserted = route.insert(key.clone());
+        self.charge(self.export_traces.len(), check)?;
+        for trace in &mut self.export_traces {
+            trace.consulted.insert(key.clone());
+            trace.cycle |= !inserted;
+        }
+        Ok(inserted)
+    }
+    fn waived_star(
+        &mut self,
+        scope: usize,
+        import: &Import,
+        context: ResolveContext<'_, '_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if !context.waive_external || import.uncertain {
+            return Ok(false);
+        }
+        Ok(self
+            .external_target(
+                scope,
+                &import.path,
+                context.packages,
+                context.docs,
+                Some((import.start, import.end)),
+                check,
+            )?
+            .is_some())
+    }
+    fn copy_names(
+        &mut self,
+        names: &Names,
+        spelling: Option<&str>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Names> {
+        let mut copied = Names {
+            names: BTreeMap::new(),
+            unknown_set: names.unknown_set,
+        };
+        if let Some(spelling) = spelling {
+            for namespace in [TYPE, VALUE] {
+                self.step(check)?;
+                let key = (namespace, spelling.to_owned());
+                if let Some(bucket) = names.names.get(&key) {
+                    self.copy_bucket(&mut copied, key, bucket, check)?;
+                }
+            }
+        } else {
+            for (key, bucket) in &names.names {
+                self.step(check)?;
+                self.copy_bucket(&mut copied, key.clone(), bucket, check)?;
+            }
+        }
+        Ok(copied)
+    }
+    fn copy_bucket(
+        &mut self,
+        into: &mut Names,
+        key: Name,
+        bucket: &Bucket,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.step(check)?;
+        for candidate in bucket.candidates.values() {
+            self.step(check)?;
+            self.charge(candidate.proof.len(), check)?;
+        }
+        into.names.insert(key, bucket.clone());
+        Ok(())
+    }
     fn exports(
         &mut self,
         module: usize,
         depth: usize,
-        route: &mut BTreeSet<(usize, String)>,
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<std::sync::Arc<Names>> {
+        self.step(check)?;
+        if depth > FOLLOW {
+            return Ok(std::sync::Arc::new(Names {
+                unknown_set: true,
+                ..Names::default()
+            }));
+        }
+        // Depth and waiver mode affect unknown sets. Cached computations are valid only
+        // when none of their consulted route keys is already visiting in this caller.
+        let key = (module, depth, context.waive_external);
+        if let Some(memo) = self.export_memo.get(&key).cloned() {
+            self.charge(memo.consulted.len(), check)?;
+            if memo.consulted.is_disjoint(route) {
+                for consulted in &memo.consulted {
+                    self.charge(self.export_traces.len(), check)?;
+                    for trace in &mut self.export_traces {
+                        trace.consulted.insert(consulted.clone());
+                    }
+                }
+                return Ok(memo.names.clone());
+            }
+        }
+        self.export_traces.push(ExportTrace::default());
+        let route_key = (module, "*".to_owned());
+        let already_visiting = route.contains(&route_key);
+        let resolved = (|| {
+            if !self.enter_route(route, route_key.clone(), check)? {
+                return Ok(Names {
+                    unknown_set: true,
+                    ..Names::default()
+                });
+            }
+            self.compute_exports(module, depth, route, context, check)
+        })();
+        // Only remove our own insertion; a rejected insertion belongs to the caller.
+        let trace = self.export_traces.pop().expect("export trace");
+        if !already_visiting {
+            route.remove(&route_key);
+        }
+        let names = std::sync::Arc::new(resolved?);
+        if !trace.cycle {
+            self.charge(trace.consulted.len(), check)?;
+            self.export_memo.insert(
+                key,
+                std::sync::Arc::new(ExportMemo {
+                    names: names.clone(),
+                    consulted: trace.consulted,
+                }),
+            );
+        }
+        Ok(names)
+    }
+    fn compute_exports(
+        &mut self,
+        module: usize,
+        depth: usize,
+        route: &mut Route,
+        context: ResolveContext<'_, '_>,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Names> {
         self.step(check)?;
-        if depth > FOLLOW || !route.insert((module, "*".into())) {
-            return Ok(Names {
-                unknown_set: true,
-                ..Names::default()
-            });
-        }
         let mut spellings = BTreeSet::new();
         self.charge(self.scopes[module].explicit.len(), check)?;
         let keys: Vec<_> = self.scopes[module].explicit.keys().cloned().collect();
@@ -993,7 +1236,11 @@ impl Catalog {
         for import in imports.iter().filter(|i| i.public) {
             self.step(check)?;
             if import.star {
-                let expanded = self.expand(module, import, depth + 1, route, check)?;
+                if self.waived_star(module, import, context, check)? {
+                    continue;
+                }
+                let expanded =
+                    self.expand(module, import, depth + 1, route, context, None, check)?;
                 result.unknown_set |= expanded.unknown_set;
                 self.charge(expanded.names.len(), check)?;
                 spellings.extend(expanded.names.into_keys().map(|(_, name)| name));
@@ -1003,13 +1250,12 @@ impl Catalog {
         }
         for name in spellings {
             self.step(check)?;
-            let resolved = self.binding(module, &name, true, depth, route, check)?;
+            let resolved = self.binding(module, &name, true, depth, route, context, check)?;
             result.unknown_set |= resolved.unknown_set;
             for (key, bucket) in resolved.names {
                 result.names.insert(key, bucket);
             }
         }
-        route.remove(&(module, "*".into()));
         Ok(result)
     }
     fn external_target(
@@ -1050,8 +1296,19 @@ impl Catalog {
                     return Ok(None);
                 }
                 if import.star {
-                    let expanded =
-                        self.expand(current_scope, &import, 1, &mut BTreeSet::new(), check)?;
+                    let expanded = self.expand(
+                        current_scope,
+                        &import,
+                        1,
+                        &mut BTreeSet::new(),
+                        ResolveContext {
+                            packages,
+                            docs,
+                            waive_external: false,
+                        },
+                        Some(first),
+                        check,
+                    )?;
                     if expanded
                         .names
                         .get(&(TYPE, first.clone()))
@@ -1153,6 +1410,11 @@ impl Catalog {
                 ..SiteResolution::default()
             });
         }
+        let context = ResolveContext {
+            packages,
+            docs,
+            waive_external: true,
+        };
         let mut route = BTreeSet::new();
         let mut shadowed = false;
         let mut names = if let Some(import) = &import {
@@ -1160,7 +1422,7 @@ impl Catalog {
                 return Ok(SiteResolution::unknown("rust_conditional_export"));
             }
             if import.star {
-                let mut own = self.expand(scope, import, 1, &mut route, check)?;
+                let mut own = self.expand(scope, import, 1, &mut route, context, None, check)?;
                 let others = self.scope_imports(scope, check)?;
                 let mut competing = Names::default();
                 for other in others
@@ -1180,7 +1442,8 @@ impl Catalog {
                     {
                         continue;
                     }
-                    let expanded = self.expand(scope, other, 1, &mut route, check)?;
+                    let expanded =
+                        self.expand(scope, other, 1, &mut route, context, None, check)?;
                     competing.unknown_set |= expanded.unknown_set;
                     for (key, bucket) in expanded.names {
                         self.merge_bucket(competing.names.entry(key).or_default(), bucket, check)?;
@@ -1207,7 +1470,7 @@ impl Catalog {
                                 ..Names::default()
                             }
                         } else {
-                            self.path(scope, &named.path, 1, &mut route, check)?
+                            self.path(scope, &named.path, 1, &mut route, context, check)?
                         };
                         explicit |= resolved.unknown_set
                             || resolved
@@ -1228,11 +1491,11 @@ impl Catalog {
                 }
                 own
             } else {
-                self.path(scope, &import.path, 1, &mut route, check)?
+                self.path(scope, &import.path, 1, &mut route, context, check)?
             }
         } else {
             match parts(&site.spelling) {
-                Some(path) => self.path(scope, &path, 1, &mut route, check)?,
+                Some(path) => self.path(scope, &path, 1, &mut route, context, check)?,
                 None => return Ok(SiteResolution::unknown("rust_path_unsupported")),
             }
         };
@@ -1414,4 +1677,319 @@ pub(super) fn extract(
         (a.start, a.end, a.kind, &a.spelling).cmp(&(b.start, b.end, b.kind, &b.spelling))
     });
     Ok(result)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn scope(document: usize, module: usize) -> Scope {
+        Scope {
+            document,
+            start: 0,
+            end: 100,
+            parent: None,
+            module,
+            directory: "src".into(),
+            explicit: BTreeMap::new(),
+            imports: Vec::new(),
+            opaque: false,
+        }
+    }
+
+    fn candidate(document: usize, module: Option<usize>, proof: &[usize]) -> Candidate {
+        Candidate {
+            declaration: DeclarationId {
+                document,
+                start: 10,
+                end: 20,
+                sid: format!("fixture-{document}"),
+            },
+            module,
+            follow: 0,
+            proof: proof.iter().copied().collect(),
+        }
+    }
+
+    fn bind(scope: &mut Scope, namespace: u8, name: &str, candidate: Candidate) {
+        scope.explicit.insert(
+            (namespace, name.into()),
+            vec![Binding {
+                candidate: Some(candidate),
+                public: true,
+                uncertain: false,
+            }],
+        );
+    }
+
+    fn star(path: &[&str]) -> Import {
+        Import {
+            start: 30,
+            end: 40,
+            path: path.iter().map(|s| (*s).to_owned()).collect(),
+            alias: None,
+            star: true,
+            public: true,
+            uncertain: false,
+        }
+    }
+
+    fn catalog(scopes: Vec<Scope>) -> Catalog {
+        Catalog {
+            roots: (0..scopes.len())
+                .map(|id| (id, BTreeSet::from([0])))
+                .collect(),
+            scopes,
+            scope_indexes: BTreeMap::new(),
+            export_memo: BTreeMap::new(),
+            export_traces: Vec::new(),
+            files: BTreeMap::new(),
+            file_declarations: BTreeMap::new(),
+            ambiguous: BTreeSet::new(),
+            work: 0,
+        }
+    }
+
+    fn exported_function(names: &Names, depth: usize, proof: &[usize]) {
+        assert!(!names.unknown_set);
+        assert_eq!(names.names.len(), 1);
+        let bucket = &names.names[&(VALUE, "f".into())];
+        assert!(!bucket.unknown);
+        assert_eq!(bucket.candidates.len(), 1);
+        let candidate = bucket.candidates.values().next().unwrap();
+        assert_eq!(candidate.follow, depth);
+        assert_eq!(candidate.proof, proof.iter().copied().collect());
+    }
+
+    #[test]
+    fn export_cache_never_reuses_or_publishes_blocked_name_or_star_routes() {
+        let packages = external::RustPackages::default();
+        let context = ResolveContext {
+            packages: &packages,
+            docs: &[],
+            waive_external: false,
+        };
+        for blocked_name in ["f", "*"] {
+            for warm_first in [false, true] {
+                let mut module = scope(0, 0);
+                bind(&mut module, VALUE, "f", candidate(0, None, &[0]));
+                let mut catalog = catalog(vec![module]);
+                let mut check = || Ok(());
+                if warm_first {
+                    let names = catalog
+                        .exports(0, 1, &mut Route::new(), context, &mut check)
+                        .unwrap();
+                    exported_function(&names, 1, &[0]);
+                }
+                let expected_route = Route::from([(0, blocked_name.into())]);
+                let mut route = expected_route.clone();
+                let blocked = catalog
+                    .exports(0, 1, &mut route, context, &mut check)
+                    .unwrap();
+                assert!(blocked.unknown_set);
+                assert!(blocked.names.is_empty());
+                assert_eq!(route, expected_route);
+                let mut route = Route::new();
+                let names = catalog
+                    .exports(0, 1, &mut route, context, &mut check)
+                    .unwrap();
+                exported_function(&names, 1, &[0]);
+                assert!(route.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn nested_cache_hits_propagate_name_and_star_footprints_to_outer_exports() {
+        let packages = external::RustPackages::default();
+        let context = ResolveContext {
+            packages: &packages,
+            docs: &[],
+            waive_external: false,
+        };
+        for blocked_name in ["f", "*"] {
+            for warm_first in [false, true] {
+                let mut outer = scope(0, 0);
+                outer.parent = Some(1);
+                outer.imports.push(star(&["super"]));
+                let mut inner = scope(1, 1);
+                bind(&mut inner, VALUE, "f", candidate(1, None, &[1]));
+                let mut catalog = catalog(vec![outer, inner]);
+                catalog
+                    .file_declarations
+                    .insert(1, candidate(1, Some(1), &[1]).declaration);
+                let mut check = || Ok(());
+                // This completes before the outer computation, whose expansion must hit it.
+                let inner = catalog
+                    .exports(1, 2, &mut Route::new(), context, &mut check)
+                    .unwrap();
+                exported_function(&inner, 2, &[1]);
+                if warm_first {
+                    let names = catalog
+                        .exports(0, 1, &mut Route::new(), context, &mut check)
+                        .unwrap();
+                    exported_function(&names, 2, &[0, 1]);
+                }
+                let expected_route = Route::from([(1, blocked_name.into())]);
+                let mut route = expected_route.clone();
+                let blocked = catalog
+                    .exports(0, 1, &mut route, context, &mut check)
+                    .unwrap();
+                assert!(blocked.unknown_set);
+                assert!(blocked.names.is_empty());
+                assert_eq!(route, expected_route);
+                let names = catalog
+                    .exports(0, 1, &mut Route::new(), context, &mut check)
+                    .unwrap();
+                exported_function(&names, 2, &[0, 1]);
+            }
+        }
+    }
+
+    #[test]
+    fn export_cache_separates_follow_depth_and_external_waiver_mode() {
+        let packages = external::RustPackages::default();
+        let document = DocumentInput {
+            key: DocumentKey {
+                source_set_id: "fixture".into(),
+                language: "rust".into(),
+                path: "src/lib.rs".into(),
+            },
+            file: crate::model::SourceFile {
+                path: "src/lib.rs".into(),
+                hash: String::new(),
+                language: "rust".into(),
+                text: String::new(),
+            },
+            declarations: Vec::new(),
+            calls: Vec::new(),
+        };
+        let docs = [&document];
+        let mut module = scope(0, 0);
+        bind(&mut module, VALUE, "f", candidate(0, None, &[0]));
+        module.imports.push(star(&["std", "collections"]));
+        let mut mode_catalog = catalog(vec![module]);
+        let mut check = || Ok(());
+        for (depth, waive_external) in [
+            (1, true),
+            (FOLLOW, false),
+            (FOLLOW, true),
+            (1, false),
+            (1, true),
+        ] {
+            let context = ResolveContext {
+                packages: &packages,
+                docs: &docs,
+                waive_external,
+            };
+            let names = mode_catalog
+                .exports(0, depth, &mut Route::new(), context, &mut check)
+                .unwrap();
+            assert_eq!(names.unknown_set, !waive_external);
+            let bucket = &names.names[&(VALUE, "f".into())];
+            assert!(!bucket.unknown);
+            assert_eq!(bucket.candidates.len(), 1);
+            assert_eq!(bucket.candidates.values().next().unwrap().follow, depth);
+        }
+        let mut forwarding = scope(0, 0);
+        forwarding.parent = Some(1);
+        forwarding.imports.push(star(&["super"]));
+        let mut origin = scope(1, 1);
+        bind(&mut origin, VALUE, "f", candidate(1, None, &[1]));
+        let mut forwarding_catalog = catalog(vec![forwarding, origin]);
+        forwarding_catalog
+            .file_declarations
+            .insert(1, candidate(1, Some(1), &[1]).declaration);
+        let context = ResolveContext {
+            packages: &packages,
+            docs: &[],
+            waive_external: false,
+        };
+        for depth in [1, FOLLOW, 1] {
+            let names = forwarding_catalog
+                .exports(0, depth, &mut Route::new(), context, &mut check)
+                .unwrap();
+            if depth == 1 {
+                exported_function(&names, 2, &[0, 1]);
+            } else {
+                assert!(names.unknown_set);
+                assert!(names.names.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_exports_keep_importing_path_proofs_out_of_later_callers() {
+        let packages = external::RustPackages::default();
+        let context = ResolveContext {
+            packages: &packages,
+            docs: &[],
+            waive_external: false,
+        };
+        let mut root = scope(0, 0);
+        bind(&mut root, TYPE, "left", candidate(2, Some(1), &[0, 2]));
+        bind(&mut root, TYPE, "right", candidate(3, Some(1), &[0, 3]));
+        let mut target = scope(1, 1);
+        target.parent = Some(0);
+        bind(&mut target, VALUE, "f", candidate(1, None, &[1]));
+        let mut catalog = catalog(vec![root, target]);
+        let mut check = || Ok(());
+        for (name, proof) in [
+            ("left", vec![0, 1, 2]),
+            ("right", vec![0, 1, 3]),
+            ("left", vec![0, 1, 2]),
+        ] {
+            let names = catalog
+                .expand(
+                    0,
+                    &star(&["crate", name]),
+                    1,
+                    &mut Route::new(),
+                    context,
+                    None,
+                    &mut check,
+                )
+                .unwrap();
+            exported_function(&names, 1, &proof);
+        }
+        let names = catalog
+            .exports(1, 1, &mut Route::new(), context, &mut check)
+            .unwrap();
+        exported_function(&names, 1, &[1]);
+    }
+
+    #[test]
+    fn scope_index_preserves_smallest_range_and_reverse_id_tie_break() {
+        let mut index = ScopeIndex {
+            ranges: vec![
+                (0, 0, 100),
+                (1, 10, 90),
+                (2, 20, 40),
+                (3, 20, 40),
+                (4, 60, 80),
+            ],
+            max_ends: vec![0; 5],
+        };
+        let mut work = 0;
+        let mut check = || Ok(());
+        index
+            .build(0, index.ranges.len(), &mut work, &mut check)
+            .unwrap();
+        assert_eq!(
+            index.enclosing(25, 30, &mut work, &mut check).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            index.enclosing(40, 60, &mut work, &mut check).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            index.enclosing(65, 70, &mut work, &mut check).unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            index.enclosing(101, 102, &mut work, &mut check).unwrap(),
+            None
+        );
+    }
 }

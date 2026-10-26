@@ -1626,3 +1626,168 @@ fn references_rust_opaque_local_bindings_block_standard_library_fallback() {
     assert_eq!(data["counts"]["unresolvedSites"], 1);
     assert_eq!(data["unresolved"][0]["site"]["spelling"], "std::Item");
 }
+
+fn retain_rust_manifest(input: &mut Snapshot, bytes: &[u8]) {
+    let source_set_id = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "src/lib.rs")
+        .unwrap()
+        .key
+        .source_set_id
+        .clone();
+    input.manifests.push(references::external::ManifestInput {
+        source_set_id,
+        native_revision_id: "selected-native-revision".into(),
+        dependency_hash: "captured-dependencies".into(),
+        path: "Cargo.toml".into(),
+        content_hash: Some(hex::encode(Sha256::digest(bytes))),
+        bytes: Some(bytes.to_vec()),
+    });
+}
+
+#[test]
+fn references_rust_comments_preserve_custom_path_module_uncertainty() {
+    for comment in ["// custom module", "/* custom module */"] {
+        let source = format!(
+            "#[path = \"actual.rs\"] {comment}\nmod store; fn f() {{ crate::store::run(); }}"
+        );
+        let input = snapshot(&[
+            ("src/lib.rs", &source),
+            ("src/store.rs", "pub fn run() {}"),
+            ("src/actual.rs", "pub fn run() {}"),
+        ]);
+        let data = project_rust_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0, "{data}");
+        assert_eq!(data["counts"]["unresolvedSites"], 1, "{data}");
+    }
+}
+
+#[test]
+fn references_rust_comments_preserve_cfg_module_uncertainty() {
+    for comment in ["// optional module", "/* optional module */"] {
+        let source = format!(
+            "#[cfg(feature = \"optional\")] {comment}\nmod store; fn f() {{ crate::store::run(); }}"
+        );
+        let input = snapshot(&[("src/lib.rs", &source), ("src/store.rs", "pub fn run() {}")]);
+        let data = project_rust_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0, "{data}");
+        assert_eq!(data["counts"]["unresolvedSites"], 1, "{data}");
+    }
+}
+
+#[test]
+fn references_rust_qualified_local_star_path_survives_standard_library_star() {
+    let input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod outer; use crate::outer::*; use std::collections::*; fn f() { inner::g(); }",
+        ),
+        ("src/outer.rs", "pub mod inner;"),
+        ("src/outer/inner.rs", "pub fn g() {}"),
+    ]);
+    let data = project_rust_source(&input, 20);
+    assert!(
+        has_edge(&data, "src/lib.rs", "src/outer/inner.rs"),
+        "{data}"
+    );
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/outer/inner.rs")["count"],
+        1,
+        "{data}"
+    );
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/outer/inner.rs")["sites"][0]["spelling"],
+        "inner::g"
+    );
+    assert_eq!(data["counts"]["mappedSites"], 3, "{data}");
+    assert_eq!(data["counts"]["unresolvedSites"], 0, "{data}");
+}
+
+#[test]
+fn references_rust_public_local_star_forwarding_survives_dependency_star() {
+    let mut input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod origin; mod facade; use crate::facade::*;",
+        ),
+        ("src/facade.rs", "pub use crate::origin::*; pub use dep::*;"),
+        ("src/origin.rs", "pub fn a() {}"),
+    ]);
+    retain_rust_manifest(
+        &mut input,
+        b"[package]\nname = 'fixture'\nversion = '0.1.0'\n[dependencies]\ndep = '1'\n",
+    );
+    let data = project_rust_source(&input, 20);
+    assert!(has_edge(&data, "src/lib.rs", "src/origin.rs"), "{data}");
+    assert_eq!(
+        edge(&data, "production", "src/lib.rs", "src/origin.rs")["count"],
+        1,
+        "{data}"
+    );
+    assert!(!has_edge(&data, "src/lib.rs", "src/facade.rs"));
+    assert_eq!(data["counts"]["mappedSites"], 1, "{data}");
+    assert_eq!(data["counts"]["unresolvedSites"], 0, "{data}");
+}
+
+#[test]
+fn references_rust_repository_src_projects_within_existing_work_budget() {
+    // Use this build's checkout, not a runtime Cargo environment variable or the
+    // caller's working directory. Index a disposable copy through the same
+    // native-backed snapshot helper as the small fixtures.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut pending = vec![root.join("src")];
+    let mut sources = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/");
+                sources.push((relative, std::fs::read_to_string(path).unwrap()));
+            }
+        }
+    }
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    let files: Vec<_> = sources
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let mut input = snapshot(&files);
+    retain_rust_manifest(&mut input, &std::fs::read(root.join("Cargo.toml")).unwrap());
+    assert_eq!(input.documents.len(), sources.len());
+    for path in ["src/store.rs", "src/model.rs"] {
+        assert!(input.documents.iter().any(|doc| doc.key.path == path));
+    }
+    for paths in [
+        vec!["src/store.rs".into(), "src/model.rs".into()],
+        vec!["src/**".into()],
+    ] {
+        let result = references::project(&input, &paths, 1, &mut || Ok(()));
+        assert!(
+            result.is_ok(),
+            "repository src projection {paths:?} must fit the existing budget: {result:?}"
+        );
+        let data = result.unwrap().data;
+        assert_eq!(
+            data["counts"]["scannedDocuments"],
+            if paths.len() == 2 { 2 } else { sources.len() },
+            "{paths:?}"
+        );
+        assert!(data["counts"]["mappedSites"].as_u64().unwrap() > 0);
+        let modules = module_paths(&data);
+        for path in ["src/store.rs", "src/model.rs"] {
+            assert!(modules.contains(&path), "{paths:?}: {path}");
+        }
+    }
+}

@@ -1377,6 +1377,7 @@ impl EvidenceResponse {
                             .context("invalid_request: rule")?,
                         arguments.get("target").context("invalid_request: target")?,
                         arguments.get("destination"),
+                        check,
                     )?
                 } else {
                     result

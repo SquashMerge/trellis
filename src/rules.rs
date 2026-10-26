@@ -1323,6 +1323,7 @@ pub fn explain(
     rule: &str,
     target: &Value,
     destination: Option<&Value>,
+    check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Value> {
     if let Some(destination) = destination.filter(|d| {
         d.get("kind").is_some() || d.get("package").is_some() || d.get("standardLibrary").is_some()
@@ -1365,7 +1366,7 @@ pub fn explain(
             .as_array()
             .context("store_unavailable: unassigned catalog absent")?,
         &mut 0,
-        &mut || Ok(()),
+        check,
     )?);
     Ok(payload)
 }

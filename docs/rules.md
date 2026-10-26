@@ -374,10 +374,19 @@ member binding, custom roots and unproved ownership remain unknown. Root
 bindings distinguish upstream package names from Cargo keys/renames (including
 hyphen normalization). Conflicting normalized bindings and local path dependencies
 are not guessed external packages. Sections, optional and target qualifiers do
-not prove installation/activation or change stored site roles. `std/core/alloc`
-are reviewed root labels, not member/API inventories. Java/Python/JavaScript
+not prove installation/activation or change stored site roles. In particular,
+`build-dependencies` and `dev-dependencies` are retained declaration evidence,
+not a claim that Cargo exposes them to a production lib/bin target. Conflicting
+identities across sections stay unknown; target-applicable Cargo bindings would
+require a separate contract change. `std/core/alloc` are reviewed root labels,
+not member/API inventories. Java/Python/JavaScript
 share the external identity shape but their package adapters are later work;
 Maven groups and Python distribution names alone do not prove import prefixes.
+
+The Rust name inventory does not register foreign function-signature bindings or
+expand procedural derives. Names introduced by those forms are not a complete
+export or shadowing inventory; they are an unsupported coverage gap, not proof
+that no competing name exists. This projection is not compiler name resolution.
 
 `Lines` is the existing inclusive 1-based line shape or null. Target mapping
 always uses the full admitted snapshot module map internally. By the
