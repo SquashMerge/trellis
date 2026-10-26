@@ -184,3 +184,58 @@ fn files_page_reports_a_dangling_graph_projection() {
     );
     assert_eq!(store.disposition(), RecoveryDisposition::Rebuild);
 }
+
+#[test]
+fn incoming_reads_each_selected_source_once_for_repeated_callers() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("target.js"),
+        "function Target() { Target(); }\nfunction Caller() { Target(); Target(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("other.js"),
+        "function Other() { Target(); Target(); }\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &store.writer().unwrap(),
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let target = native
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name.as_deref() == Some("Target"))
+        .unwrap();
+    let (incoming, counts) = whole_request(|| {
+        store
+            .evidence_response()
+            .unwrap()
+            .mcp_incoming_with_lines(&target.syntax_id, 20, Some(pin))
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(incoming.calls.len(), 5);
+    assert!(incoming.calls.iter().all(|call| {
+        call.callee_text == "Target"
+            && call.source.lines.is_some()
+            && call.call.owner_syntax_id == call.caller.syntax_id
+    }));
+    assert_eq!(counts.source_reads, 2);
+}
