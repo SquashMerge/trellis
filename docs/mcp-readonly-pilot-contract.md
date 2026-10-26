@@ -249,8 +249,14 @@ instead carry explicit native document-key/revision/hash/provenance links; these
 identify the captured syntax and never prove the derived target mapping.
 External descriptors instead carry identity, ecosystem and nonempty captured
 manifest or reviewed standard-library catalog evidence, with the exact closed
-shapes in rules.md. Captured manifests are selected through the same admitted
-transaction and revision as source, never read live. Package evidence is not
+shapes in rules.md. Java's `java-standard-library:v1` catalog pairs only with
+entries `java`/`javax` and ecosystem `java`; these are package-family labels,
+not host-JDK discovery or proof that a class exists. Ordinary Java imports and
+qualified-type paths can also map uniquely proved captured public top-level
+types by declared package. Static/nested/member types and third-party prefixes
+without authoritative captured mapping stay unknown; Maven/Gradle coordinates
+alone are not prefix evidence. Captured manifests are selected through the same
+admitted transaction and revision as source, never read live. Package evidence is not
 native measured syntax provenance or library member/API resolution. Browser source
 and metric joins use genuine native modules only. These DTOs add no fabricated
 snapshot or semantic relationship proof. Code comes only

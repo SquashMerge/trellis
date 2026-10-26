@@ -338,3 +338,204 @@ fn repeated_identical_binding_merges_evidence_and_cargo_roots_are_checked_separa
     let packages = RustPackages::new(&[input], &mut 0, &mut || Ok(())).unwrap();
     assert!(packages.resolve("source-set:test", "wire", true).is_none());
 }
+
+fn java_fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in [
+        (
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>fixture</groupId><artifactId>fixture</artifactId><version>1</version><dependencies><dependency><groupId>org.example</groupId><artifactId>widget</artifactId><version>1</version></dependency></dependencies></project>",
+        ),
+        (
+            "build.gradle",
+            "dependencies { implementation 'org.example:widget:1' }",
+        ),
+        (
+            "src/main/java/app/Use.java",
+            "package app; import pkg.*; import java.util.*; import javax.swing.*; import org.example.*; import javaish.util.*; class Use {}",
+        ),
+        (
+            "src/main/java/unassigned/Unlayered.java",
+            "package unassigned; import java.util.List; class Unlayered {}",
+        ),
+        (
+            "src/test/java/app/UseTest.java",
+            "package app; import java.util.*; class UseTest {}",
+        ),
+        (
+            "src/main/java/types/Local.java",
+            "package pkg; public class Local {}",
+        ),
+        (
+            ".trellis/rules.toml",
+            r#"version = 1
+[external_policy]
+deny = [
+  { language = "java", package = "java", stdlib = true },
+  { language = "java", package = "org.example:widget", stdlib = false },
+]
+[layers.source]
+order = 2
+paths = ["src/main/java/app/**", "src/test/java/app/**"]
+[layers.standard]
+order = 1
+external = [{ language = "java", package = "java", stdlib = true }]
+[layers.swing]
+shared = true
+external = [{ language = "java", package = "javax", stdlib = true }]
+"#,
+        ),
+    ] {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    (state, root, store, pin)
+}
+
+#[test]
+fn selected_java_package_families_and_native_types_survive_live_edits() {
+    let (_state, root, store, pin) = java_fixture();
+    let before = read(&store, "references", pin);
+    assert_eq!(before["referencesVersion"], "references:v2");
+    assert_eq!(before["externalPackages"].as_array().unwrap().len(), 2);
+    for name in ["java", "javax"] {
+        let descriptor = package(&before, name);
+        assert_eq!(descriptor["ecosystem"], "java");
+        assert_eq!(descriptor["identity"]["kind"], "externalPackage");
+        assert_eq!(descriptor["identity"]["language"], "java");
+        assert_eq!(descriptor["identity"]["standardLibrary"], true);
+        assert_eq!(
+            descriptor["evidence"],
+            json!([{"kind":"standardLibraryCatalog","catalog":"java-standard-library:v1","entry":name}])
+        );
+        assert!(before["production"].as_array().unwrap().iter().any(|edge| {
+            edge["source"]["path"] == "src/main/java/app/Use.java"
+                && edge["target"] == descriptor["identity"]
+                && edge["target"]["sourceSetId"] == edge["source"]["sourceSetId"]
+        }));
+    }
+    assert!(before["production"].as_array().unwrap().iter().any(|edge| {
+        edge["source"]["path"] == "src/main/java/app/Use.java"
+            && edge["target"]["path"] == "src/main/java/types/Local.java"
+    }));
+    assert!(before["tests"].as_array().unwrap().iter().any(|edge| {
+        edge["source"]["path"] == "src/test/java/app/UseTest.java"
+            && edge["target"] == package(&before, "java")["identity"]
+    }));
+    for spelling in ["org.example", "javaish"] {
+        assert!(
+            before["unresolved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["site"]["spelling"].as_str().unwrap().contains(spelling) })
+        );
+    }
+    for path in ["src/main/java/app/Use.java", "pom.xml", "build.gradle"] {
+        fs::write(root.path().join(path), "invalid live contents = [").unwrap();
+    }
+    fs::write(
+        root.path().join("src/main/java/types/New.java"),
+        "package pkg; public class New {}",
+    )
+    .unwrap();
+    assert_eq!(read(&store, "references", pin), before);
+    for path in ["src/main/java/types/Local.java", "pom.xml", "build.gradle"] {
+        fs::remove_file(root.path().join(path)).unwrap();
+    }
+    assert_eq!(read(&store, "references", pin), before);
+}
+
+#[test]
+fn java_external_rules_explain_and_browser_keep_package_and_native_closure_separate() {
+    let (_state, _root, store, pin) = java_fixture();
+    let refs = read(&store, "references", pin);
+    let checked = read(&store, "check", pin);
+    assert_eq!(checked["rulesVersion"], "rules:v2");
+    let rows = checked["instances"].as_array().unwrap();
+    let ban = rows
+        .iter()
+        .find(|row| {
+            row["rule"] == "$external"
+                && row["target"]["path"] == "src/main/java/unassigned/Unlayered.java"
+        })
+        .unwrap();
+    assert_eq!(ban["status"], "deviates");
+    assert!(ban["sourceLayer"].is_null());
+    assert_eq!(ban["destination"], package(&checked, "java")["identity"]);
+    assert!(rows.iter().any(|row| {
+        row["rule"] == "$layers"
+            && row["target"]["path"] == "src/main/java/app/Use.java"
+            && row["destination"] == package(&checked, "java")["identity"]
+            && row["destinationLayer"] == "standard"
+            && row["status"] == "deviates"
+    }));
+    assert!(checked["testOnly"].as_array().unwrap().iter().any(|row| {
+        row["rule"] == "$external"
+            && row["target"]["path"] == "src/test/java/app/UseTest.java"
+            && row["destination"] == package(&checked, "java")["identity"]
+    }));
+    assert!(!rows.iter().any(|row| {
+        row["target"]["path"] == "src/test/java/app/UseTest.java"
+            || row["destination"]["package"] == "org.example:widget"
+    }));
+    let response = store.evidence_response().unwrap();
+    let explanation = response
+        .architecture_response(
+            "explain",
+            &json!({"expectedBasis":pin,"rule":"$external","target":ban["target"],"destination":ban["destination"]}),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        package(&explanation, "java")["identity"],
+        ban["destination"]
+    );
+    let options = MetricsOptions {
+        pin: Some(pin),
+        ..Default::default()
+    };
+    let view = response
+        .architecture_view(&options, &mut || Ok(()))
+        .unwrap();
+    let metrics = response.metrics_at(&options, &mut || Ok(())).unwrap();
+    for module in view["modules"].as_array().unwrap() {
+        let identity = &module["identity"];
+        assert!(identity.get("package").is_none());
+        let metric = metrics
+            .files
+            .iter()
+            .find(|file| {
+                identity["sourceSetId"] == file.source_set_id
+                    && identity["language"] == file.language
+                    && identity["path"] == file.path
+            })
+            .unwrap();
+        assert_eq!(module["metrics"], metric.metrics);
+    }
+    assert_eq!(
+        view["references"]["externalPackages"],
+        refs["externalPackages"]
+    );
+    assert!(refs["modules"].as_array().unwrap().iter().all(|module| {
+        module["identity"].get("package").is_none() && module["identity"].get("sid").is_some()
+    }));
+    response.finish(()).unwrap();
+}

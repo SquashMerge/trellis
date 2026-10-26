@@ -58,6 +58,28 @@ pub enum ExternalEvidence {
     },
 }
 
+/// Reviewed Java package-family labels, not proof of members or selected-JDK availability.
+/// The caller proves the captured root and local precedence before requesting a label.
+pub fn java_standard_library(source_set_id: &str, import_root: &str) -> Option<ExternalPackage> {
+    if !matches!(import_root, "java" | "javax") {
+        return None;
+    }
+    Some(ExternalPackage {
+        identity: ExternalIdentity {
+            kind: ExternalKind::ExternalPackage,
+            source_set_id: source_set_id.into(),
+            language: "java".into(),
+            package: import_root.into(),
+            standard_library: true,
+        },
+        ecosystem: "java",
+        evidence: vec![ExternalEvidence::StandardLibraryCatalog {
+            catalog: "java-standard-library:v1",
+            entry: import_root.into(),
+        }],
+    })
+}
+
 /// Canonical selector spellings, not proof that a package or library is available.
 pub fn valid_package(language: &str, package: &str, standard_library: bool) -> bool {
     if standard_library {

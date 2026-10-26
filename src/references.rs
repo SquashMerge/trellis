@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser, Tree};
 
 pub mod external;
+mod java;
 mod rust;
 
 const SOURCE_BYTES: usize = 2 * 1024 * 1024;
@@ -184,6 +185,7 @@ pub fn project(
     let mut external_work = 0;
     let packages = external::RustPackages::new(&snapshot.manifests, &mut external_work, check)?;
     let mut rust = rust::Catalog::new(&docs, &trees, &document_map, external_work, check)?;
+    let java = java::Catalog::new(&docs, &trees, &mut rust.work, check)?;
     let mut external_packages = BTreeMap::new();
     let mut edges: BTreeMap<(usize, Target, bool), (usize, Vec<Site>)> = BTreeMap::new();
     let mut emitted_modules = BTreeSet::new();
@@ -258,6 +260,8 @@ pub fn project(
                     &docs,
                     check,
                 )?
+            } else if doc.key.language == "java" {
+                java.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
             } else {
                 match map_target(doc, &item, &document_map) {
                     Ok(target) => SiteResolution {
@@ -319,7 +323,7 @@ pub fn project(
                 "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
                 "JavaScript maps static relative imports/reexports using explicit files or .js/.mjs/.cjs/index.js; dynamic and bare imports remain unresolved.",
                 "Python maps explicit relative module imports using .py/__init__.py; absolute, alias, wildcard and module-versus-attribute forms remain unresolved.",
-                "Java import and qualified type sites remain unresolved; package grouping is not produced."
+                "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java/javax labels identify package families only."
             ]
         }),
         modules,
@@ -531,6 +535,9 @@ fn extract(
     if doc.key.language == "rust" {
         return rust::extract(doc, tree, work, check);
     }
+    if doc.key.language == "java" {
+        return java::extract(doc, tree, work, check);
+    }
     let mut result = Vec::new();
     walk(tree.root_node(), check, &mut |node, _check| {
         ensure!(result.len() < SITES, "bounded_work: reference site count");
@@ -586,26 +593,6 @@ fn extract(
                 }
                 if node.kind() == "import_statement" {
                     result.push(raw(doc, node, "import", Err("absolute_import_unsupported")));
-                    return Ok(true);
-                }
-            }
-            "java" => {
-                if node.kind() == "import_declaration" {
-                    result.push(raw(
-                        doc,
-                        node,
-                        "import",
-                        Err("java_package_mapping_unavailable"),
-                    ));
-                    return Ok(true);
-                }
-                if node.kind() == "scoped_type_identifier" {
-                    result.push(raw(
-                        doc,
-                        node,
-                        "reference",
-                        Err("java_package_mapping_unavailable"),
-                    ));
                     return Ok(true);
                 }
             }
