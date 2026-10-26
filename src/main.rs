@@ -1067,7 +1067,11 @@ async fn run_daemon() -> Result<()> {
     )?);
     owner.listener().set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(owner.listener().try_clone()?)?;
-    let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
+    let search_fill = daemon::search_fill::SearchFill::start(search.clone())?;
+    let mut checkouts = registry::CheckoutRegistry::new();
+    checkouts.set_search_fill(search_fill);
+    checkouts.set_search_service(search.clone());
+    let registry = Arc::new(tokio::sync::Mutex::new(checkouts));
     #[cfg(feature = "test-support")]
     if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_STARTUP_SOCKET") {
         registry

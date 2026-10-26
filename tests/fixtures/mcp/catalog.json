@@ -651,7 +651,7 @@
                   "const": 1
                 },
                 "toolVersion": {
-                  "const": 1
+                  "const": 2
                 },
                 "watcherDegraded": {
                   "type": "boolean"
@@ -1831,6 +1831,1367 @@
                 "scopeCoverage",
                 "provenance",
                 "documents"
+              ],
+              "type": "object"
+            },
+            "evidenceBasis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Basis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncationReason": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "response_bytes",
+                    "limit",
+                    "callee_text"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "warnings": {
+              "items": {
+                "$ref": "#/$defs/Warning"
+              },
+              "type": "array"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "evidenceBasis",
+            "data",
+            "warnings",
+            "partial",
+            "truncated",
+            "truncationReason",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Failure"
+        },
+        {
+          "$ref": "#/$defs/SelectionFailure"
+        },
+        {
+          "$ref": "#/$defs/InvalidWorkspaceFailure"
+        },
+        {
+          "$ref": "#/$defs/AdmissionFailure"
+        },
+        {
+          "$ref": "#/$defs/ArgumentFailure"
+        }
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "$defs": {
+        "Basis": {
+          "additionalProperties": false,
+          "properties": {
+            "indexGeneration": {
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])",
+              "type": "string"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "type": "object"
+        },
+        "UInt": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "expectedBasis": {
+          "$ref": "#/$defs/Basis"
+        },
+        "limit": {
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer",
+          "default": 10
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "1–1024 UTF-8 bytes; no trimming or normalization."
+        },
+        "schemaVersion": {
+          "const": 1
+        },
+        "workspace": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "trellis_search_symbols",
+    "outputSchema": {
+      "$defs": {
+        "Basis": {
+          "additionalProperties": false,
+          "properties": {
+            "indexGeneration": {
+              "pattern": "^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])",
+              "type": "string"
+            },
+            "indexRevision": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "indexGeneration",
+            "indexRevision"
+          ],
+          "type": "object"
+        },
+        "Coverage": {
+          "additionalProperties": false,
+          "properties": {
+            "diagnostic": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "documentPath": {
+              "$ref": "#/$defs/Path"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "observedRoles": {
+              "items": {
+                "$ref": "#/$defs/Role"
+              },
+              "type": "array"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "requested": {
+              "type": "boolean"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "selected": {
+              "type": "boolean"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "state": {
+              "enum": [
+                "notRequested",
+                "omitted",
+                "unsupported",
+                "failed",
+                "partial",
+                "complete"
+              ]
+            },
+            "supportedRoles": {
+              "items": {
+                "$ref": "#/$defs/Role"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "producerId",
+            "language",
+            "sourceSetId",
+            "documentPath",
+            "revisionId",
+            "requested",
+            "selected",
+            "state",
+            "supportedRoles",
+            "observedRoles",
+            "diagnostic"
+          ],
+          "type": "object"
+        },
+        "DerivedFrom": {
+          "additionalProperties": false,
+          "properties": {
+            "factDigest": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "recordKind": {
+              "enum": [
+                "occurrence",
+                "symbolInformation",
+                "relationship"
+              ]
+            }
+          },
+          "required": [
+            "provenanceId",
+            "recordKind",
+            "factDigest"
+          ],
+          "type": "object"
+        },
+        "DocumentKey": {
+          "additionalProperties": false,
+          "properties": {
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "path": {
+              "$ref": "#/$defs/Path"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "sourceSetId",
+            "language",
+            "path"
+          ],
+          "type": "object"
+        },
+        "Failure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "$ref": "#/$defs/ResolvedFailureCode"
+                },
+                "currentBasis": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Basis"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "currentContentHash": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Hash"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "catchingUp": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error",
+            "workspace",
+            "catchingUp"
+          ],
+          "type": "object"
+        },
+        "FailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "rebuild_in_progress",
+            "root_changed",
+            "store_unavailable",
+            "workspace_selection_failed",
+            "checkout_capacity",
+            "daemon_unavailable",
+            "outcome_unknown"
+          ]
+        },
+        "Hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "Kind": {
+          "enum": [
+            "module",
+            "namespace",
+            "type",
+            "implementation",
+            "function",
+            "method",
+            "constructor",
+            "field",
+            "variable",
+            "parameter",
+            "typeParameter",
+            "alias",
+            "anonymousFunction"
+          ]
+        },
+        "Language": {
+          "enum": [
+            "java",
+            "rust",
+            "python",
+            "javascript"
+          ]
+        },
+        "Path": {
+          "minLength": 1,
+          "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|(?![\\s\\S])))(?![\\s\\S]*[\\\\\\u0000])[^/\\\\\\u0000]+(?:/[^/\\\\\\u0000]+)*(?![\\s\\S])",
+          "type": "string"
+        },
+        "Provenance": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "evidenceKind": {
+                    "const": "measuredSyntax"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "basis": {
+                    "const": null
+                  },
+                  "derivedFrom": {
+                    "const": null
+                  },
+                  "freshness": {
+                    "const": "fresh"
+                  }
+                }
+              }
+            }
+          ],
+          "properties": {
+            "basis": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "derivedFrom": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DerivedFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "evidenceKind": {
+              "enum": [
+                "measuredSyntax",
+                "declarationBinding",
+                "semanticReference",
+                "typeRelationship"
+              ]
+            },
+            "freshness": {
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "id",
+            "producerId",
+            "document",
+            "revisionId",
+            "contentHash",
+            "evidenceKind",
+            "basis",
+            "freshness",
+            "derivedFrom"
+          ],
+          "type": "object"
+        },
+        "Range": {
+          "additionalProperties": false,
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/UInt"
+            },
+            "start": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "Role": {
+          "enum": [
+            "definition",
+            "read",
+            "write",
+            "call",
+            "type",
+            "import",
+            "alias"
+          ]
+        },
+        "SemanticBasis": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "configHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "dependencyHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            },
+            "lookupDependencies": {
+              "items": {
+                "$ref": "#/$defs/Text"
+              },
+              "type": "array"
+            },
+            "producerHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "producerId": {
+              "$ref": "#/$defs/Text"
+            },
+            "producerVersion": {
+              "$ref": "#/$defs/Text"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "sourceManifestHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "sourceSetId": {
+              "$ref": "#/$defs/Text"
+            },
+            "toolchainHash": {
+              "$ref": "#/$defs/Hash"
+            }
+          },
+          "required": [
+            "producerId",
+            "producerVersion",
+            "producerHash",
+            "artifactHash",
+            "language",
+            "sourceSetId",
+            "revisionId",
+            "sourceManifestHash",
+            "toolchainHash",
+            "configHash",
+            "dependencyHash",
+            "lookupDependencies"
+          ],
+          "type": "object"
+        },
+        "Symbol": {
+          "additionalProperties": false,
+          "properties": {
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "staleBecause": {
+              "maxItems": 0,
+              "type": "array"
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "doc": {
+              "$ref": "#/$defs/UInt"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "kind",
+            "range",
+            "nameRange",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause",
+            "doc",
+            "lines",
+            "role"
+          ],
+          "type": "object"
+        },
+        "SyntaxId": {
+          "pattern": "^sid:v1:[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "Text": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "UInt": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "Warning": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "enum": [
+                "coverageIncomplete",
+                "staleEvidence",
+                "staleTarget",
+                "bindingAmbiguous",
+                "syntaxOnly"
+              ]
+            },
+            "message": {
+              "$ref": "#/$defs/Text"
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "provenanceId"
+          ],
+          "type": "object"
+        },
+        "AttemptedWorkspace": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "path"
+                },
+                "value": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "utf8Bytes": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "kind",
+                "value",
+                "utf8Bytes",
+                "truncated"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "invalid_type"
+                },
+                "jsonType": {
+                  "enum": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "array",
+                    "object"
+                  ]
+                }
+              },
+              "required": [
+                "kind",
+                "jsonType"
+              ]
+            }
+          ]
+        },
+        "SelectionFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "workspace_selection_failed"
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "attemptedWorkspace": {
+                  "$ref": "#/$defs/AttemptedWorkspace"
+                },
+                "reason": {
+                  "enum": [
+                    "not_absolute",
+                    "not_checkout",
+                    "different_repository",
+                    "identity_changed",
+                    "unavailable"
+                  ]
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "attemptedWorkspace",
+                "reason"
+              ],
+              "type": "object",
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "reason": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "retryable": {
+                        "const": true
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "retryable": {
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
+        },
+        "InvalidWorkspaceFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_request"
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": false
+                },
+                "attemptedWorkspace": {
+                  "$ref": "#/$defs/AttemptedWorkspace"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "attemptedWorkspace"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
+        },
+        "ResolvedFailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "rebuild_in_progress",
+            "root_changed",
+            "store_unavailable",
+            "checkout_capacity",
+            "daemon_unavailable",
+            "outcome_unknown"
+          ]
+        },
+        "AdmissionFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "too_many_requests",
+                    "deadline_exceeded"
+                  ]
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": true
+                },
+                "attemptedWorkspace": {
+                  "$ref": "#/$defs/AttemptedWorkspace"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash",
+                "attemptedWorkspace"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
+        },
+        "LanguageStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "coverage": {
+              "additionalProperties": false,
+              "properties": {
+                "complete": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "failed": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "partial": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "selected": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "unselected": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "selected",
+                "complete",
+                "partial",
+                "failed",
+                "unselected"
+              ],
+              "type": "object"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "language": {
+              "$ref": "#/$defs/Language"
+            }
+          },
+          "required": [
+            "language",
+            "evidenceTier",
+            "coverage"
+          ],
+          "type": "object"
+        },
+        "LineSpan": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "start": {
+              "$ref": "#/$defs/UInt"
+            },
+            "end": {
+              "$ref": "#/$defs/UInt"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ]
+        },
+        "DocumentRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ref": {
+              "$ref": "#/$defs/UInt"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "ref",
+            "document",
+            "revisionId",
+            "contentHash",
+            "provenanceId"
+          ]
+        },
+        "ArgumentFailure": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "range_too_large"
+                  ]
+                },
+                "message": {
+                  "$ref": "#/$defs/Text"
+                },
+                "retryable": {
+                  "const": false
+                },
+                "currentBasis": {
+                  "const": null
+                },
+                "currentContentHash": {
+                  "const": null
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable",
+                "currentBasis",
+                "currentContentHash"
+              ],
+              "type": "object"
+            },
+            "requestId": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "schemaVersion": {
+              "const": 1
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "error"
+          ],
+          "type": "object"
+        },
+        "RequestId": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
+        },
+        "SearchHit": {
+          "additionalProperties": false,
+          "properties": {
+            "displayKey": {
+              "$ref": "#/$defs/Text"
+            },
+            "evidenceTier": {
+              "const": "syntax"
+            },
+            "freshness": {
+              "const": "fresh"
+            },
+            "kind": {
+              "$ref": "#/$defs/Kind"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "nameRange": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Range"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "semanticBasis": {
+              "const": null
+            },
+            "staleBecause": {
+              "maxItems": 0,
+              "type": "array"
+            },
+            "symbolId": {
+              "$ref": "#/$defs/SyntaxId"
+            },
+            "doc": {
+              "$ref": "#/$defs/UInt"
+            },
+            "lines": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/LineSpan"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "test",
+                "production"
+              ]
+            },
+            "rank": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "matchedBy": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "lexical",
+                  "vector"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "oneOf": [
+                {
+                  "const": [
+                    "lexical"
+                  ]
+                },
+                {
+                  "const": [
+                    "vector"
+                  ]
+                },
+                {
+                  "const": [
+                    "lexical",
+                    "vector"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "symbolId",
+            "name",
+            "displayKey",
+            "kind",
+            "range",
+            "nameRange",
+            "evidenceTier",
+            "semanticBasis",
+            "freshness",
+            "staleBecause",
+            "doc",
+            "lines",
+            "role",
+            "rank",
+            "matchedBy"
+          ],
+          "type": "object"
+        },
+        "SearchIndexStatus": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "enum": [
+                "complete",
+                "building",
+                "partial",
+                "unavailable"
+              ]
+            },
+            "modelId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Hash"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "modelName": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "backend": {
+              "enum": [
+                "cpu",
+                "metal",
+                null
+              ]
+            },
+            "declarations": {
+              "$ref": "#/$defs/UInt"
+            },
+            "embedded": {
+              "$ref": "#/$defs/UInt"
+            },
+            "lexical": {
+              "enum": [
+                "complete",
+                "unavailable"
+              ]
+            },
+            "unavailableReason": {
+              "enum": [
+                null,
+                "vector_budget_exceeded"
+              ]
+            }
+          },
+          "required": [
+            "state",
+            "modelId",
+            "modelName",
+            "backend",
+            "declarations",
+            "embedded",
+            "lexical",
+            "unavailableReason"
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "additionalProperties": false,
+              "properties": {
+                "coverage": {
+                  "items": {
+                    "$ref": "#/$defs/Coverage"
+                  },
+                  "type": "array"
+                },
+                "provenance": {
+                  "items": {
+                    "$ref": "#/$defs/Provenance"
+                  },
+                  "type": "array"
+                },
+                "scopeCoverage": {
+                  "items": {
+                    "$ref": "#/$defs/LanguageStatus"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
+                "documents": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/DocumentRef"
+                  }
+                },
+                "hits": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/SearchHit"
+                  }
+                },
+                "searchIndex": {
+                  "$ref": "#/$defs/SearchIndexStatus"
+                }
+              },
+              "required": [
+                "hits",
+                "documents",
+                "coverage",
+                "scopeCoverage",
+                "provenance",
+                "searchIndex"
               ],
               "type": "object"
             },

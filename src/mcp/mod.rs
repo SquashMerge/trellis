@@ -4,6 +4,7 @@ pub mod catalog;
 #[cfg(test)]
 mod find_trigram_tests;
 mod projection;
+pub mod search;
 pub mod session;
 pub mod tools;
 pub mod wire;
@@ -301,14 +302,14 @@ fn evidence_failure_code(error: &anyhow::Error) -> &'static str {
 
 /// One tool's read and projection inside an admitted snapshot. An error is
 /// either retryable contention or a failure to report with its wire code.
-type EvidenceToolRead<'a> = Box<
-    dyn Fn(
-            &crate::daemon::registry::CheckoutRuntime,
-            &crate::daemon::registry::CheckoutEvidence,
-            bool,
-        ) -> anyhow::Result<serde_json::Value>
-        + 'a,
->;
+type EvidenceToolReadFn<'a> = dyn Fn(
+        &crate::daemon::registry::CheckoutRuntime,
+        &crate::daemon::registry::CheckoutEvidence,
+        bool,
+        Option<&crate::daemon::search::SearchQuery>,
+    ) -> anyhow::Result<serde_json::Value>
+    + 'a;
+type EvidenceToolRead<'a> = Box<EvidenceToolReadFn<'a>>;
 
 #[cfg(feature = "test-support")]
 fn capture_evidence_error(
@@ -362,16 +363,14 @@ fn evidence_read(
     selected: Option<&crate::daemon::registry::SelectedCheckout>,
     deadline: std::time::Instant,
     clock_now: &dyn Fn() -> std::time::Instant,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     publish: &dyn Fn(bool),
     id: &serde_json::Value,
     #[cfg(feature = "test-support")] evidence_error: Option<&EvidenceErrorHook>,
-    read: &dyn Fn(
-        &crate::daemon::registry::CheckoutRuntime,
-        &crate::daemon::registry::CheckoutEvidence,
-        bool,
-    ) -> anyhow::Result<serde_json::Value>,
+    query: Option<&str>,
+    read: &EvidenceToolReadFn<'_>,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
+    let _profile = query.map(|_| crate::search_model::SearchPhaseTimer::start("search_total"));
     let cancelled = || cancel.load(std::sync::atomic::Ordering::Acquire);
     let runtime = loop {
         if let Some(runtime) = registry.blocking_lock().runtime(key) {
@@ -398,6 +397,38 @@ fn evidence_read(
     };
     #[cfg(feature = "test-support")]
     runtime.run_mcp_read_hook_for_tests();
+    let search_query = query
+        .map(|query| {
+            if cancelled() || runtime.mcp_clock_now() >= deadline {
+                anyhow::bail!("deadline_exceeded: MCP search query deadline");
+            }
+            let budget_clock = runtime.clone();
+            let budget = crate::search_embed::QueryBudget::new(
+                deadline
+                    .checked_sub(SEARCH_LEXICAL_RESERVE)
+                    .unwrap_or(deadline),
+                std::sync::Arc::new(move || budget_clock.mcp_clock_now()),
+            );
+            match runtime.search_service() {
+                Some(search) => {
+                    match search.query_embedding(query, cancel, deadline, Some(budget.clone())) {
+                        Ok(prepared) => Ok(prepared),
+                        Err(crate::search_embed::EmbedError::BudgetExceeded) => {
+                            Ok(crate::daemon::search::SearchQuery::budget_exceeded(
+                                Some(search.status_handle().backend()),
+                                budget,
+                            ))
+                        }
+                        Err(crate::search_embed::EmbedError::Cancelled) => Err(anyhow::anyhow!(
+                            "deadline_exceeded: MCP search query cancelled"
+                        )),
+                        Err(error) => Err(anyhow::Error::new(error)),
+                    }
+                }
+                None => Ok(crate::daemon::search::SearchQuery::unavailable(None)),
+            }
+        })
+        .transpose()?;
     loop {
         if cancelled() || runtime.mcp_clock_now() >= deadline {
             anyhow::bail!("deadline_exceeded: MCP selected read deadline");
@@ -420,7 +451,7 @@ fn evidence_read(
             #[cfg(not(feature = "test-support"))]
             let status = response.status()?;
             let pin = status.revision;
-            let mut envelope = match read(&runtime, &response, sampled)
+            let mut envelope = match read(&runtime, &response, sampled, search_query.as_ref())
                 .map_err(|error| response.report_index_failure(error))
             {
                 Ok(envelope) => envelope,
@@ -468,6 +499,9 @@ struct DescribedSnapshot {
 /// Every tool call is answered within this deadline; describe reports it as
 /// `limits.deadlineMs` (contract W1).
 pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
+
+/// Keep mandatory lexical/projection work inside the original call deadline.
+const SEARCH_LEXICAL_RESERVE: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// Retry only direct Store contention. Every failed attempt drops its selected
 /// response; the one successful answer is materialized and finished in one snapshot.
@@ -955,7 +989,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 {
                     let kind = architecture::operation(name);
                     let arguments = serde_json::Value::Object(args.clone());
-                    Some(Box::new(move |runtime, response, _sampled| {
+                    Some(Box::new(move |runtime, response, _sampled, _query| {
                         let mut check = || {
                             if cancel.load(std::sync::atomic::Ordering::Acquire)
                                 || runtime.mcp_clock_now() >= deadline
@@ -973,13 +1007,154 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         }
                     }))
                 }
+                ("trellis_search_symbols", Some(args)) => {
+                    let query = args["query"].as_str().expect("validated search query");
+                    let limit = args.get("limit").map_or(search::DEFAULT_LIMIT, |value| {
+                        wire::uint(value).expect("validated search limit") as usize
+                    });
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |runtime, response, sampled, prepared| {
+                        let prepared = prepared.expect("search query prepared before admission");
+                        let mut check = || {
+                            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                || runtime.mcp_clock_now() >= deadline
+                            {
+                                anyhow::bail!("deadline_exceeded: MCP search deadline");
+                            }
+                            Ok(())
+                        };
+                        let candidates =
+                            response.mcp_search_candidates(query, expected, &mut check)?;
+                        let ranked = {
+                            let mut vector_check = || {
+                                check()?;
+                                if let Some(budget) = prepared.budget() {
+                                    budget.check()?;
+                                }
+                                Ok(())
+                            };
+                            let rank =
+                                |snapshot: Option<&crate::search_vectors::VectorSnapshot<'_>>| {
+                                    crate::search_rank::rank_snapshot(
+                                        &candidates.cards,
+                                        &candidates.lexical,
+                                        snapshot,
+                                        prepared.model_id(),
+                                        prepared.vector.as_deref(),
+                                        &mut vector_check,
+                                    )
+                                };
+                            match runtime.search_service() {
+                                Some(service) if prepared.model_id().is_some() => {
+                                    service.with_vector_snapshot_budget(prepared.budget(), rank)
+                                }
+                                _ => crate::search_rank::rank_lexical(
+                                    &candidates.cards,
+                                    &candidates.lexical,
+                                    &mut check,
+                                ),
+                            }
+                        };
+                        let (ranked, budget_exceeded) = match ranked {
+                            Ok(ranked) => (ranked, false),
+                            Err(error)
+                                if matches!(
+                                    error.downcast_ref::<crate::search_embed::EmbedError>(),
+                                    Some(crate::search_embed::EmbedError::BudgetExceeded)
+                                ) =>
+                            {
+                                (
+                                    crate::search_rank::rank_lexical(
+                                        &candidates.cards,
+                                        &candidates.lexical,
+                                        &mut check,
+                                    )?,
+                                    true,
+                                )
+                            }
+                            Err(error) if crate::store::cli_read_retryable_contention(&error) => {
+                                if prepared
+                                    .budget()
+                                    .is_some_and(|budget| budget.check().is_err())
+                                {
+                                    check()?;
+                                    (
+                                        crate::search_rank::rank_lexical(
+                                            &candidates.cards,
+                                            &candidates.lexical,
+                                            &mut check,
+                                        )?,
+                                        true,
+                                    )
+                                } else {
+                                    return Err(error);
+                                }
+                            }
+                            Err(error) if error.is::<crate::search_vectors::StoreUnavailable>() => {
+                                return Ok(tools::failure(id, "store_unavailable"));
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let building = runtime
+                            .browser_scheduler()?
+                            .search_fill_building(candidates.pin);
+                        let mut search_index = prepared.status(
+                            candidates.cards.len() as u64,
+                            ranked.embedded,
+                            building,
+                        );
+                        if budget_exceeded {
+                            search_index.state = crate::search_model::SearchIndexState::Unavailable;
+                            search_index.model_id = None;
+                            search_index.model_name = None;
+                            search_index.embedded = 0;
+                            search_index.unavailable_reason = Some(
+                                crate::search_model::SearchUnavailableReason::VectorBudgetExceeded,
+                            );
+                        }
+                        let has_more = ranked.hits.len() > limit;
+                        let prefix = &ranked.hits[..ranked.hits.len().min(limit)];
+                        let keys: Vec<_> = prefix.iter().map(|hit| hit.key.clone()).collect();
+                        let matched_by = prefix
+                            .iter()
+                            .map(|hit| {
+                                let mut arms = Vec::new();
+                                if hit.lexical_rank.is_some() {
+                                    arms.push("lexical".to_owned());
+                                }
+                                if hit.vector_rank.is_some() {
+                                    arms.push("vector".to_owned());
+                                }
+                                arms
+                            })
+                            .collect();
+                        let mut symbols =
+                            response.mcp_search_hydrate(&keys, candidates.pin, &mut check)?;
+                        symbols.has_more = has_more;
+                        projection::search(
+                            id,
+                            search::SearchResult {
+                                symbols,
+                                matched_by,
+                                search_index,
+                            },
+                            root,
+                            sampled,
+                            modern,
+                        )
+                        .map_err(|error| anyhow::anyhow!(error))
+                        .map(|envelope| {
+                            envelope.unwrap_or_else(|| tools::failure(id, "range_too_large"))
+                        })
+                    }))
+                }
                 ("trellis_find_symbols", Some(args)) => {
                     let query = args["query"].as_str().expect("validated find query");
                     let limit = args
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
-                    Some(Box::new(move |_, response, sampled| {
+                    Some(Box::new(move |_, response, sampled, _query| {
                         let found = response.mcp_find_with_lines(query, limit, expected)?;
                         Ok(projection::find(id, found, root, sampled, modern)
                             .map_err(|error| anyhow::anyhow!(error))?
@@ -989,7 +1164,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 ("trellis_declaration", Some(args)) => {
                     let symbol_id = args["symbolId"].as_str().expect("validated declaration ID");
                     let expected = validated_expected_basis(args);
-                    Some(Box::new(move |_, response, sampled| {
+                    Some(Box::new(move |_, response, sampled, _query| {
                         Ok(
                             match response.mcp_declaration_with_lines(symbol_id, expected)? {
                                 Some(found) => {
@@ -1007,7 +1182,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
-                    Some(Box::new(move |runtime, response, sampled| {
+                    Some(Box::new(move |runtime, response, sampled, _query| {
                         Ok(
                             match response.mcp_outgoing_with_lines(
                                 symbol_id,
@@ -1032,7 +1207,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
-                    Some(Box::new(move |_, response, sampled| {
+                    Some(Box::new(move |_, response, sampled, _query| {
                         Ok(
                             match response.mcp_incoming_with_lines(symbol_id, limit, expected)? {
                                 Some(found) => {
@@ -1051,8 +1226,14 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let end = wire::uint(&args["endLine"]).expect("validated source end");
                     let expected_hash = args.get("expectedContentHash").and_then(|v| v.as_str());
                     let expected = validated_expected_basis(args);
-                    Some(Box::new(move |_, response, sampled| {
-                        match response.mcp_source(path, start, end, expected, expected_hash) {
+                    Some(Box::new(
+                        move |_, response, sampled, _query| match response.mcp_source(
+                            path,
+                            start,
+                            end,
+                            expected,
+                            expected_hash,
+                        ) {
                             Ok(Some(found)) => {
                                 Ok(projection::source(id, found, root, sampled, modern)
                                     .unwrap_or_else(|| tools::failure(id, "range_too_large")))
@@ -1071,8 +1252,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 Ok(envelope)
                             }
                             Err(error) => Err(error),
-                        }
-                    }))
+                        },
+                    ))
                 }
                 _ => None,
             };
@@ -1094,6 +1275,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     id,
                     #[cfg(feature = "test-support")]
                     workspace.hooks.evidence_error.as_ref(),
+                    (name == "trellis_search_symbols").then(|| {
+                        args.expect("validated search arguments")["query"]
+                            .as_str()
+                            .expect("validated search query")
+                    }),
                     &*tool_read,
                 ) {
                     Ok((found, sampled)) => {

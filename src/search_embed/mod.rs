@@ -6,8 +6,11 @@
 mod qwen3;
 
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -17,12 +20,76 @@ use tokenizers::{
     TruncationParams,
 };
 
+/// Absolute query cutoff using the request's clock; never mutates global cancellation.
+#[derive(Clone)]
+pub struct QueryBudget {
+    cutoff: Instant,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl QueryBudget {
+    pub fn new(cutoff: Instant, clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        Self { cutoff, clock }
+    }
+
+    pub fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    pub fn remaining(&self) -> std::time::Duration {
+        self.cutoff.saturating_duration_since(self.now())
+    }
+
+    pub fn check(&self) -> Result<(), EmbedError> {
+        if self.now() >= self.cutoff {
+            Err(EmbedError::BudgetExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub struct EmbeddingControl<'a> {
+    cancel: &'a AtomicBool,
+    budget: Option<&'a QueryBudget>,
+}
+
+impl<'a> EmbeddingControl<'a> {
+    pub fn new(cancel: &'a AtomicBool) -> Self {
+        Self {
+            cancel,
+            budget: None,
+        }
+    }
+
+    pub fn with_budget(cancel: &'a AtomicBool, budget: &'a QueryBudget) -> Self {
+        Self {
+            cancel,
+            budget: Some(budget),
+        }
+    }
+
+    pub fn cancellation(&self) -> &AtomicBool {
+        self.cancel
+    }
+
+    pub fn check(&self) -> Result<(), EmbedError> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(EmbedError::Cancelled);
+        }
+        if let Some(budget) = self.budget {
+            budget.check()?;
+        }
+        Ok(())
+    }
+}
+
 const MAX_BATCH: usize = 16;
 const MAX_TOKENS: usize = 512;
 // Bounds text tokenization work before adding the fixed retrieval prompt.
 const MAX_INPUT_BYTES: usize = 16_384;
 const FULL_DIMENSIONS: usize = 2048;
-const DIMENSIONS: usize = 1024;
+pub(crate) const DIMENSIONS: usize = 1024;
 const QUERY_PROMPT: &str = "Represent the query for retrieving supporting documents: ";
 const DOCUMENT_PROMPT: &str = "Represent the document for retrieval: ";
 
@@ -119,19 +186,132 @@ pub(crate) struct VerifiedModel {
 }
 
 impl VerifiedModel {
-    pub fn from_path(path: &Path) -> Result<Self, EmbedError> {
-        verify_files(path, SUPPORTED_MODEL.files)
+    pub fn from_path(path: &Path, control: &EmbeddingControl<'_>) -> Result<Self, EmbedError> {
+        verify_files(path, SUPPORTED_MODEL.files, control)
     }
 }
 
-fn verify_files(path: &Path, files: &[(&str, &str)]) -> Result<VerifiedModel, EmbedError> {
+/// Only file identities survive a job. Neither weights nor a loaded runtime do.
+#[derive(Default)]
+pub(crate) struct ModelVerification {
+    files: Option<Vec<FileIdentity>>,
+    #[cfg(test)]
+    verifications: usize,
+}
+
+#[derive(PartialEq)]
+struct FileIdentity {
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+fn file_identities(
+    path: &Path,
+    files: &[(&str, &str)],
+    control: &EmbeddingControl<'_>,
+) -> Result<Vec<FileIdentity>, EmbedError> {
+    files
+        .iter()
+        .map(|(name, _)| {
+            control.check()?;
+            let metadata = std::fs::metadata(path.join(name))
+                .map_err(|error| EmbedError::ModelUnavailable(format!("{name}: {error}")))?;
+            Ok(FileIdentity {
+                length: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .map_err(|error| EmbedError::ModelUnavailable(error.to_string()))?,
+                #[cfg(unix)]
+                inode: {
+                    use std::os::unix::fs::MetadataExt;
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    )
+                },
+            })
+        })
+        .collect()
+}
+
+impl ModelVerification {
+    pub(crate) fn unchanged(
+        &self,
+        path: &Path,
+        control: &EmbeddingControl<'_>,
+    ) -> Result<bool, EmbedError> {
+        self.unchanged_files(path, SUPPORTED_MODEL.files, control)
+    }
+
+    fn unchanged_files(
+        &self,
+        path: &Path,
+        files: &[(&str, &str)],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<bool, EmbedError> {
+        let identities = file_identities(path, files, control)?;
+        control.check()?;
+        Ok(self.files.as_ref() == Some(&identities))
+    }
+
+    pub(crate) fn read(
+        &mut self,
+        path: &Path,
+        control: &EmbeddingControl<'_>,
+    ) -> Result<VerifiedModel, EmbedError> {
+        self.read_files(path, SUPPORTED_MODEL.files, control)
+    }
+
+    fn read_files(
+        &mut self,
+        path: &Path,
+        files: &[(&str, &str)],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<VerifiedModel, EmbedError> {
+        let before = file_identities(path, files, control)?;
+        let verified = if self.files.as_ref() == Some(&before) {
+            let read = |name| read_model_file(path, name, None, control);
+            VerifiedModel {
+                config: read("config.json")?,
+                tokenizer: read("tokenizer.json")?,
+                weights: read("model.safetensors")?,
+            }
+        } else {
+            self.files = None;
+            #[cfg(test)]
+            {
+                self.verifications += 1;
+            }
+            verify_files(path, files, control)?
+        };
+        if before != file_identities(path, files, control)? {
+            self.files = None;
+            return Err(EmbedError::ModelUnavailable(
+                "model files changed while loading".into(),
+            ));
+        }
+        control.check()?;
+        self.files = Some(before);
+        Ok(verified)
+    }
+}
+
+fn verify_files(
+    path: &Path,
+    files: &[(&str, &str)],
+    control: &EmbeddingControl<'_>,
+) -> Result<VerifiedModel, EmbedError> {
     let mut verified = VerifiedModel {
         config: Vec::new(),
         tokenizer: Vec::new(),
         weights: Vec::new(),
     };
     for &(name, expected_hash) in files {
-        let bytes = read_verified(path, name, expected_hash)?;
+        let bytes = read_model_file(path, name, Some(expected_hash), control)?;
         match name {
             "config.json" => verified.config = bytes,
             "tokenizer.json" => verified.tokenizer = bytes,
@@ -160,6 +340,7 @@ pub enum EmbedError {
     ModelUnavailable(String),
     InvalidInput(String),
     Cancelled,
+    BudgetExceeded,
     Runtime(String),
 }
 
@@ -169,6 +350,7 @@ impl fmt::Display for EmbedError {
             Self::ModelUnavailable(message) => write!(f, "model unavailable: {message}"),
             Self::InvalidInput(message) => write!(f, "invalid embedding input: {message}"),
             Self::Cancelled => f.write_str("embedding cancelled"),
+            Self::BudgetExceeded => f.write_str("query embedding budget exceeded"),
             Self::Runtime(message) => write!(f, "embedding runtime: {message}"),
         }
     }
@@ -176,9 +358,40 @@ impl fmt::Display for EmbedError {
 
 impl std::error::Error for EmbedError {}
 
+impl From<candle_core::Error> for EmbedError {
+    fn from(error: candle_core::Error) -> Self {
+        runtime(error)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuantizedVector {
     pub values: Vec<i8>,
+}
+
+/// The production model and deterministic test models use the same job path.
+pub trait SearchEmbedder: Send {
+    fn embed(
+        &self,
+        texts: &[String],
+        kind: InputKind,
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<QuantizedVector>, EmbedError>;
+}
+
+pub trait SearchEmbedderFactory: Send + Sync {
+    fn load(&self, control: &EmbeddingControl<'_>) -> Result<Box<dyn SearchEmbedder>, EmbedError>;
+}
+
+impl SearchEmbedder for Embedder {
+    fn embed(
+        &self,
+        texts: &[String],
+        kind: InputKind,
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<QuantizedVector>, EmbedError> {
+        Embedder::embed(self, texts, kind, control)
+    }
 }
 
 pub struct Embedder {
@@ -191,21 +404,29 @@ impl Embedder {
     /// Loads only the supported, hash-pinned snapshot from a local directory.
     /// Metal is explicit: unavailable Metal never falls back to CPU.
     pub fn load(path: &Path, backend: Backend) -> Result<Self, EmbedError> {
+        let cancel = AtomicBool::new(false);
+        let control = EmbeddingControl::new(&cancel);
         let device = backend_device(backend)?;
-        Self::from_verified_on_device(VerifiedModel::from_path(path)?, device)
+        Self::from_verified_on_device(VerifiedModel::from_path(path, &control)?, device, &control)
     }
 
     pub(crate) fn from_verified(
         verified: VerifiedModel,
         backend: Backend,
+        control: &EmbeddingControl<'_>,
     ) -> Result<Self, EmbedError> {
-        Self::from_verified_on_device(verified, backend_device(backend)?)
+        control.check()?;
+        let device = backend_device(backend)?;
+        control.check()?;
+        Self::from_verified_on_device(verified, device, control)
     }
 
     fn from_verified_on_device(
         verified: VerifiedModel,
         device: Device,
+        control: &EmbeddingControl<'_>,
     ) -> Result<Self, EmbedError> {
+        control.check()?;
         let VerifiedModel {
             config,
             tokenizer,
@@ -213,6 +434,7 @@ impl Embedder {
         } = verified;
         let config: qwen3::Config = serde_json::from_slice(&config)
             .map_err(|error| EmbedError::ModelUnavailable(format!("config.json: {error}")))?;
+        control.check()?;
         let mut tokenizer = Tokenizer::from_bytes(&tokenizer)
             .map_err(|error| EmbedError::ModelUnavailable(format!("tokenizer.json: {error}")))?;
         tokenizer
@@ -232,12 +454,17 @@ impl Embedder {
             pad_type_id: 0,
             pad_token: "<|endoftext|>".into(),
         }));
+        control.check()?;
         // The same owned bytes that passed SHA-256 verification are decoded here.
         // No unsafe mmap and no second open of a potentially changed weights file.
         let builder = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)
             .map_err(|error| EmbedError::ModelUnavailable(format!("model.safetensors: {error}")))?;
-        let model = qwen3::Model::new(&config, builder)
-            .map_err(|error| EmbedError::ModelUnavailable(format!("model tensors: {error}")))?;
+        control.check()?;
+        let model = qwen3::Model::new(&config, builder, control).map_err(|error| match error {
+            EmbedError::Cancelled | EmbedError::BudgetExceeded => error,
+            error => EmbedError::ModelUnavailable(format!("model tensors: {error}")),
+        })?;
+        control.check()?;
         Ok(Self {
             model,
             tokenizer,
@@ -245,18 +472,20 @@ impl Embedder {
         })
     }
 
-    /// Embeds at most 16 texts, preserving input order. Cancellation is cooperative
-    /// before and after the bounded forward pass; results are never partial.
+    /// Embeds at most 16 texts, preserving input order. Cancellation and budget
+    /// checks are cooperative between stages and layers; results are never partial.
     pub fn embed(
         &self,
         texts: &[String],
         kind: InputKind,
-        cancel: &AtomicBool,
+        control: &EmbeddingControl<'_>,
     ) -> Result<Vec<QuantizedVector>, EmbedError> {
+        let _phase = (kind == InputKind::Query)
+            .then(|| crate::search_model::SearchPhaseTimer::start("query_embedding"));
         batch_boundary(|| {
-            let vectors = self.encode_float(texts, kind, cancel)?;
+            let vectors = self.encode_float(texts, kind, control)?;
             let result = vectors.iter().map(|vector| quantize(vector)).collect();
-            check_cancel(cancel)?;
+            control.check()?;
             result
         })
     }
@@ -267,18 +496,18 @@ impl Embedder {
         &self,
         texts: &[String],
         kind: InputKind,
-        cancel: &AtomicBool,
+        control: &EmbeddingControl<'_>,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        batch_boundary(|| self.encode_float(texts, kind, cancel))
+        batch_boundary(|| self.encode_float(texts, kind, control))
     }
 
     fn encode_float(
         &self,
         texts: &[String],
         kind: InputKind,
-        cancel: &AtomicBool,
+        control: &EmbeddingControl<'_>,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        check_cancel(cancel)?;
+        control.check()?;
         if texts.len() > MAX_BATCH {
             return Err(EmbedError::InvalidInput(format!(
                 "batch exceeds {MAX_BATCH} texts"
@@ -293,6 +522,7 @@ impl Embedder {
             .tokenizer
             .encode_batch(inputs, false)
             .map_err(|error| EmbedError::Runtime(format!("tokenization: {error}")))?;
+        control.check()?;
         let tokens = encodings[0].len();
         if tokens == 0 || tokens > MAX_TOKENS {
             return Err(EmbedError::Runtime(
@@ -309,9 +539,9 @@ impl Embedder {
             .collect();
         let ids = Tensor::from_vec(ids, (texts.len(), tokens), &self.device).map_err(runtime)?;
         let mask = Tensor::from_vec(masks, (texts.len(), tokens), &self.device).map_err(runtime)?;
-        check_cancel(cancel)?;
-        let hidden = self.model.forward(&ids, &mask).map_err(runtime)?;
-        check_cancel(cancel)?;
+        control.check()?;
+        let hidden = self.model.forward(&ids, &mask, control)?;
+        control.check()?;
         if hidden.dims() != [texts.len(), tokens, FULL_DIMENSIONS] {
             return Err(EmbedError::Runtime("unexpected model output shape".into()));
         }
@@ -343,19 +573,48 @@ impl Embedder {
         if vectors.iter().flatten().any(|value| !value.is_finite()) {
             return Err(EmbedError::Runtime("non-finite model embedding".into()));
         }
-        check_cancel(cancel)?;
+        control.check()?;
         Ok(vectors)
     }
 }
 
-fn read_verified(path: &Path, name: &str, expected_hash: &str) -> Result<Vec<u8>, EmbedError> {
-    let bytes = std::fs::read(path.join(name))
+// Bound work between cooperative checks without changing the owned-byte verification path.
+const MODEL_READ_CHUNK: usize = 1024 * 1024;
+
+fn read_model_file(
+    path: &Path,
+    name: &str,
+    expected_hash: Option<&str>,
+    control: &EmbeddingControl<'_>,
+) -> Result<Vec<u8>, EmbedError> {
+    control.check()?;
+    let unavailable = |error| EmbedError::ModelUnavailable(format!("{name}: {error}"));
+    let mut file = std::fs::File::open(path.join(name)).map_err(unavailable)?;
+    let length = usize::try_from(file.metadata().map_err(unavailable)?.len())
         .map_err(|error| EmbedError::ModelUnavailable(format!("{name}: {error}")))?;
-    if hex::encode(Sha256::digest(&bytes)) != expected_hash {
+    let mut bytes = Vec::with_capacity(length);
+    let mut buffer = vec![0; MODEL_READ_CHUNK];
+    let mut hasher = expected_hash.map(|_| Sha256::new());
+    loop {
+        control.check()?;
+        let count = file.read(&mut buffer).map_err(unavailable)?;
+        control.check()?;
+        if count == 0 {
+            break;
+        }
+        if let Some(hasher) = &mut hasher {
+            hasher.update(&buffer[..count]);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    if let (Some(expected), Some(hasher)) = (expected_hash, hasher)
+        && hex::encode(hasher.finalize()) != expected
+    {
         return Err(EmbedError::ModelUnavailable(format!(
             "{name}: SHA-256 mismatch"
         )));
     }
+    control.check()?;
     Ok(bytes)
 }
 
@@ -384,14 +643,6 @@ fn metal_device() -> Result<Device, EmbedError> {
 
 fn runtime(error: candle_core::Error) -> EmbedError {
     EmbedError::Runtime(error.to_string())
-}
-
-fn check_cancel(cancel: &AtomicBool) -> Result<(), EmbedError> {
-    if cancel.load(Ordering::Acquire) {
-        Err(EmbedError::Cancelled)
-    } else {
-        Ok(())
-    }
 }
 
 fn batch_boundary<T>(operation: impl FnOnce() -> Result<T, EmbedError>) -> Result<T, EmbedError> {
@@ -503,9 +754,80 @@ mod tests {
     }
 
     #[test]
+    fn budget_uses_absolute_clock_and_cancellation_has_precedence() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let start = Instant::now();
+        let tick = Arc::new(AtomicUsize::new(0));
+        let clock_tick = tick.clone();
+        let budget = QueryBudget::new(
+            start + Duration::from_secs(3),
+            Arc::new(move || {
+                start + Duration::from_secs(clock_tick.load(Ordering::Relaxed) as u64)
+            }),
+        );
+        let cancel = AtomicBool::new(false);
+        let control = EmbeddingControl::with_budget(&cancel, &budget);
+        assert!(control.check().is_ok());
+        assert_eq!(budget.remaining(), Duration::from_secs(3));
+        tick.store(3, Ordering::Relaxed);
+        assert_eq!(budget.remaining(), Duration::ZERO);
+        assert!(matches!(control.check(), Err(EmbedError::BudgetExceeded)));
+        assert!(!cancel.load(Ordering::Acquire));
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(control.check(), Err(EmbedError::Cancelled)));
+    }
+
+    #[test]
+    fn budget_interrupts_file_chunks_without_publishing_identity() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = vec![42; MODEL_READ_CHUNK + 1];
+        std::fs::write(directory.path().join("model.safetensors"), &bytes).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let start = Instant::now();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let clock_calls = calls.clone();
+        let budget = QueryBudget::new(
+            start + Duration::from_secs(1),
+            Arc::new(move || {
+                if clock_calls.fetch_add(1, Ordering::Relaxed) >= 4 {
+                    start + Duration::from_secs(1)
+                } else {
+                    start
+                }
+            }),
+        );
+        let cancel = AtomicBool::new(false);
+        let mut verification = ModelVerification::default();
+        assert!(matches!(
+            verification.read_files(
+                directory.path(),
+                &[("model.safetensors", hash.as_str())],
+                &EmbeddingControl::with_budget(&cancel, &budget),
+            ),
+            Err(EmbedError::BudgetExceeded)
+        ));
+        assert!(verification.files.is_none());
+        assert!(!cancel.load(Ordering::Acquire));
+        let verified = verification
+            .read_files(
+                directory.path(),
+                &[("model.safetensors", hash.as_str())],
+                &EmbeddingControl::new(&cancel),
+            )
+            .unwrap();
+        assert_eq!(verified.weights, bytes);
+        assert!(verification.files.is_some());
+    }
+
+    #[test]
     fn cancellation_and_panics_are_typed() {
         assert!(matches!(
-            check_cancel(&AtomicBool::new(true)),
+            EmbeddingControl::new(&AtomicBool::new(true)).check(),
             Err(EmbedError::Cancelled)
         ));
         let result: Result<(), EmbedError> = batch_boundary(|| panic!("runtime failure"));
@@ -566,7 +888,62 @@ mod tests {
     }
 
     #[test]
+    fn model_jobs_rehash_only_when_a_file_identity_changes() {
+        let cancel = AtomicBool::new(false);
+        let control = EmbeddingControl::new(&cancel);
+        let directory = tempfile::tempdir().unwrap();
+        let names = [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors",
+            "provenance.py",
+        ];
+        let hashes = names
+            .iter()
+            .map(|name| {
+                std::fs::write(directory.path().join(name), name).unwrap();
+                hex::encode(Sha256::digest(name.as_bytes()))
+            })
+            .collect::<Vec<_>>();
+        let pins = names
+            .iter()
+            .zip(&hashes)
+            .map(|(name, hash)| (*name, hash.as_str()))
+            .collect::<Vec<_>>();
+        let mut verification = ModelVerification::default();
+        let first = verification
+            .read_files(directory.path(), &pins, &control)
+            .unwrap();
+        assert_eq!(first.weights, b"model.safetensors");
+        drop(first);
+        let second = verification
+            .read_files(directory.path(), &pins, &control)
+            .unwrap();
+        assert_eq!(second.weights, b"model.safetensors");
+        assert_eq!(verification.verifications, 1);
+        assert!(
+            verification
+                .unchanged_files(directory.path(), &pins, &control)
+                .unwrap()
+        );
+        std::fs::write(directory.path().join("provenance.py"), b"changed-file").unwrap();
+        assert!(
+            !verification
+                .unchanged_files(directory.path(), &pins, &control)
+                .unwrap()
+        );
+        assert!(matches!(
+            verification.read_files(directory.path(), &pins, &control),
+            Err(EmbedError::ModelUnavailable(_))
+        ));
+        assert_eq!(verification.verifications, 2);
+        assert!(verification.files.is_none());
+    }
+
+    #[test]
     fn verification_refuses_missing_or_modified_inputs_and_retains_owned_bytes() {
+        let cancel = AtomicBool::new(false);
+        let control = EmbeddingControl::new(&cancel);
         let temp = tempfile::tempdir().unwrap();
         let names = [
             "config.json",
@@ -586,24 +963,24 @@ mod tests {
             .zip(&hashes)
             .map(|(name, hash)| (*name, hash.as_str()))
             .collect();
-        let verified = verify_files(temp.path(), &pins).unwrap();
+        let verified = verify_files(temp.path(), &pins, &control).unwrap();
         std::fs::write(temp.path().join("config.json"), b"changed").unwrap();
         assert_eq!(verified.config, b"config.json");
         assert_eq!(verified.tokenizer, b"tokenizer.json");
         assert_eq!(verified.weights, b"model.safetensors");
         assert!(matches!(
-            verify_files(temp.path(), &pins),
+            verify_files(temp.path(), &pins, &control),
             Err(EmbedError::ModelUnavailable(_))
         ));
         std::fs::write(temp.path().join("config.json"), b"config.json").unwrap();
         std::fs::write(temp.path().join("provenance.py"), b"changed").unwrap();
         assert!(matches!(
-            verify_files(temp.path(), &pins),
+            verify_files(temp.path(), &pins, &control),
             Err(EmbedError::ModelUnavailable(_))
         ));
         std::fs::remove_file(temp.path().join("provenance.py")).unwrap();
         assert!(matches!(
-            verify_files(temp.path(), &pins),
+            verify_files(temp.path(), &pins, &control),
             Err(EmbedError::ModelUnavailable(_))
         ));
     }

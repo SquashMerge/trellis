@@ -1,13 +1,20 @@
-# Semantic search card format — review draft
+# Semantic search card format
 
-2026-10-26 · #211 · **Draft only. Not ratified; does not enable search or authorize wiring.**
+2026-10-26 · #211 · **Capture and search implementation specification.**
 
-This is the narrow serializer, source-head and stopword proposal requested for review.
-Decision [0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) remains
-binding. The evidence input is `issue-211/next-slice-card-lexical-closure-draft.md`
-in the external evidence directory; that input is itself a recommendation, not authority.
-Runtime #337 and Decision 0018 (#339) are merged on main. This draft follows that
-ratified direction without reopening the accepted runtime or authorizing index wiring.
+The owner's 2026-10-26 capture request selects this serializer, the 1,200-source-byte head
+cap and STOP membership. The [pre-code plan](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6411250597)
+records the capture-slice preparation boundary. The subsequent
+[item-8 ruling](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6416445655)
+approves local voyage-4-nano, weighted RRF (20, 200, 1, 4), no extra lexical restriction,
+and search-tool activation after integration and verification.
+
+[Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) owns the
+ratified retrieval contract and exact reviewed tuning and size record. This document
+specifies its serializer, source head and stopwords; proposal wording below records the
+original design rationale, not a separate shipping gate. Historical evaluation vectors
+bind their saved card bytes, not a new native-card retrieval-quality claim. No hosted
+production path is added.
 
 ## 1. Boundary between requirements and choices
 
@@ -17,12 +24,13 @@ and source head. No displayKey parsing, path#qualified-name representation, AST 
 second parse, source reread or read-time extraction. Bounds already required are a
 600-byte doc, 20 literals of at most 100 bytes, 30 types and 40 callees.
 
-**Every additional detail below is a proposed review choice, not a ratified fact.** In
-particular, the 1,200-byte head, exact serializer, eligibility, fact attachment, signature
-rendering and STOP membership require review. The proposed format contains only the
-measured form-c fields; it adds no language, role, identity, location or debug metadata.
-No schema/native-producer version, tool/schema change, index change, FTS wiring, ranking
-constant or activation is allocated here. `cardFormat` is not fixed by publishing this draft.
+The serializer, 1,200-byte head and STOP membership are selected for capture implementation
+by the owner's 2026-10-26 request. Eligibility, fact attachment and splitter details below
+are explicit implementation choices recorded for review, not inferred ratified facts.
+The format contains only the measured form-c fields; it adds no language, role, identity,
+location or debug metadata. Its identifier is `trellis.search-card.v1`. The separate capture
+branch uses disposable schema 24/native-v11 provisionally; reconcile these identifiers onto
+merged main before submission. No tool/catalog change or ranking constant is allocated here.
 
 Decision0018's **32 retained terms for both the whole card and the query** is preserved.
 There is no uncapped card stream, per-field budget reset or hidden original-text append.
@@ -178,9 +186,13 @@ short-term rule also removes it. A membership change requires review, not silent
 
 Use Decision0018's shared splitter: maximal unicode61 token-character runs, whole run
 plus camelCase/letter-number parts, short/STOP removal, first-occurrence deduplication,
-**at most 32 terms across the entire input**. The format review must fix any remaining
-case/acronym boundary details with a small shared example set; this serializer draft does
-not introduce a second general Unicode engine or claim those details are already closed.
+**at most 32 terms across the entire input**. The capture implementation takes original-case token spans from SQLite unicode61, retaining
+its combining-diacritic continuation, and uses the pinned Rust toolchain's character properties
+for camel/acronym and letter-number boundaries. SQLite supplies lowercase folding; no copied
+Unicode category table or ASCII-only token scan is introduced. Whole runs precede parts:
+`fooBar` gives `foobar foo bar`; `HTTPServer2` gives `httpserver2 http server` (the one-character
+`2` is removed); `fooBARBaz` gives `foobarbaz foo bar baz`. These explicit choices are recorded
+for review in the capture plan; they are not fusion constants or historical evaluation results.
 The required tokenizer remains `porter unicode61 remove_diacritics 2`, default L*/N*/Co,
 no tokenchars/separators overrides, `_` a separator.
 
@@ -192,8 +204,8 @@ Labels can consume the same 32 slots; changing that is a separate review choice.
 For queries, use the same splitter/filter/dedup/32 rule. Emit each retained term as an FTS5
 quoted string literal (double embedded quotes), join with ` OR `, and bind the expression.
 Raw caller text never enters MATCH. No terms means an empty lexical arm before FTS runs;
-post-FTS faults remain typed failures, not raw-query or vector-only fallback. These are
-format descriptions, not permission to wire FTS.
+post-FTS faults remain typed failures, not raw-query or vector-only fallback. The capture slice wires the card transform into head-only FTS. The query helper remains
+internal; it does not expose a search tool or choose fusion constants.
 
 The lexical 32-term cap does **not** shorten exactCardBytes before hashing or embedding.
 Model inputPolicy retains its separate byte/token preprocessing limits. No hidden uncapped

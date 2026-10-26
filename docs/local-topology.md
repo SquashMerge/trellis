@@ -72,8 +72,12 @@ uses one active model. It runs after publication and never delays publication, e
 T04’s FIFO stream or adds durable queue state. After restart it recomputes current-head misses.
 Embedding uses its own low-priority thread, never holding locks needed by the checkout worker.
 Inputs are token-budget-bounded before tokenization, batch size is capped, and cancellation is
-honored between batches. The model loads lazily for a job and is dropped afterward, not kept
-resident while idle. Catch embedder panics at the job boundary as typed search-coverage failure,
+honored between batches. The model loads lazily and the single owner reuses verified resident
+weights after query/fill work, dropping them after ten minutes with no query or fill work.
+Each use resets the idle timer. Verification is reused per file identity and repeated on
+change; loading remains lexical-only and explicit Metal errors do not fall back. This is the
+[2026-10-26 owner ruling](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6427400386),
+which supersedes per-job weight drop. Catch embedder panics at the job boundary as typed search-coverage failure,
 never index failure. Read calls never enqueue indexing or write vectors. Changed card bytes change cardHash;
 changed model, prompt, quantization, dimensions or card format changes modelId. Old entries
 need not be deleted on publication. Index recreation preserves the cache. The cache has a
@@ -85,7 +89,14 @@ by the background owner. A database-level failure, including integrity failure, 
 mismatch, unsafe/unreadable storage or I/O failure, instead fails search store_unavailable
 with no hits; it never becomes a lexical-only success. Repair/recreation of this disposable
 cache occurs outside the read. BUSY/LOCKED remains typed retried contention, not corruption,
-cache unavailability or permission to return a best-effort result. There is no per-vector
+cache unavailability or permission to return a best-effort result. Search gives optional
+vector work a single 3,000ms budget from protocol acceptance within the unchanged 5,000ms
+call deadline. On expiry, it stops the operation cooperatively and returns complete lexical
+results with `searchIndex.state:"unavailable"` and reason `vector_budget_exceeded`; incomplete
+vector results/counts are discarded. Optional-cache contention may consume that budget but
+BUSY alone never triggers fallback. Actual observed database faults and mandatory index/FTS
+contention retain their typed failures. No cancellation affects another query or background
+fill, and no model work is detached to make a timeout appear complete. There is no per-vector
 checksum, signing or same-user tamper-detection requirement.
 
 The model is local, pinned and in-process via Candle. One model is active at a time. Supported

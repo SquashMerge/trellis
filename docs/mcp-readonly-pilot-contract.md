@@ -1,6 +1,6 @@
 # MCP read-only pilot: first-release wire contract
 
-**Status: normative read-only MCP wire contract.** [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) records the owner’s #211 direction: a tenth tool, `trellis_search_symbols`, and `toolVersion:2`. Search is specified, not yet implemented; its format and ranking constants require review before activation. [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) adds the sixth syntax-tier incoming tool; [#129 architecture rules](rules.md) adds three read-only tools and one no-argument proposal prompt. The original six tool schemas and meanings remain unchanged. [Decision 0007](semantic-evidence/decisions/0007-user-daemon-and-workspace-selection.md) makes `trellis mcp` a thin stdio client of the per-user daemon, with explicit same-repository worktree selection; #107 amends the schemas below. [Decision 0008](semantic-evidence/decisions/0008-daemon-sole-writer.md) makes that daemon the only index and queue writer; [Decision 0009](semantic-evidence/decisions/0009-checkout-worker.md) assigns each active checkout one worker, pipelines relay calls, starts deadlines at protocol acceptance and sets the capacity and pre-resolution failure shape below. This is the agent-facing projection of [#22 semantic evidence](semantic-evidence/contract-v1.md) and [#23 local topology](local-topology.md). #22 owns evidence meaning, identity, validity, coverage and provenance; #23 owns coherent snapshot eligibility. This document owns only the wire projection. The configured client launches `trellis mcp` for one workspace selected by [#23 discovery](local-topology.md#workspace-discovery). The OS user, not an MCP principal or grant, is the boundary. No network listener, authentication role, ACP permission or tool annotation enforces access. Configuring an agent can disclose indexed checkout text to that agent/provider; repository text is untrusted data.
+**Status: normative read-only MCP wire contract.** [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) records the owner’s #211 direction: a tenth tool, `trellis_search_symbols`, and `toolVersion:2`. The owner approved activation with local voyage-4-nano and fixed weighted-RRF constants (20, 200, 1, 4), without an extra lexical restriction (2026-10-26 item-8 ruling). [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) adds the sixth syntax-tier incoming tool; [#129 architecture rules](rules.md) adds three read-only tools and one no-argument proposal prompt. The original six tool schemas and meanings remain unchanged. [Decision 0007](semantic-evidence/decisions/0007-user-daemon-and-workspace-selection.md) makes `trellis mcp` a thin stdio client of the per-user daemon, with explicit same-repository worktree selection; #107 amends the schemas below. [Decision 0008](semantic-evidence/decisions/0008-daemon-sole-writer.md) makes that daemon the only index and queue writer; [Decision 0009](semantic-evidence/decisions/0009-checkout-worker.md) assigns each active checkout one worker, pipelines relay calls, starts deadlines at protocol acceptance and sets the capacity and pre-resolution failure shape below. This is the agent-facing projection of [#22 semantic evidence](semantic-evidence/contract-v1.md) and [#23 local topology](local-topology.md). #22 owns evidence meaning, identity, validity, coverage and provenance; #23 owns coherent snapshot eligibility. This document owns only the wire projection. The configured client launches `trellis mcp` for one workspace selected by [#23 discovery](local-topology.md#workspace-discovery). The OS user, not an MCP principal or grant, is the boundary. No network listener, authentication role, ACP permission or tool annotation enforces access. Configuring an agent can disclose indexed checkout text to that agent/provider; repository text is untrusted data.
 
 All code evidence in the ten tools and proposal prompt comes from cached index state, never live source files. The original six tools retain their cached-only behavior. The only current-file exception is a bounded, once-per-request read of the fixed root `.trellis/rules.toml` as configuration by rules check/explain and prompt get. Its `{path,source:"checkout-config",contentHash}` descriptor is separate from the code pin; `evidenceBasis` does not identify those rules bytes. References alone do not read configuration. An admitted evidence read keeps one selected snapshot through response finish; describe can instead report not-ready status with a null basis. They never request indexing, start a producer/build, run repository code, open a terminal, invoke a provider or make a durable write. Search alone may embed the caller’s query using a local, pinned, in-process Candle model within the existing call deadline. This is not repository execution, a hosted-provider call, an indexing request or a durable write. Search reads but never fills the vector cache; the daemon’s separate background embedding owner fills it. No configured/verified/ready model permits lexical-only search with `searchIndex.state:"unavailable"`. The daemon checkout worker alone owns mandatory startup reconciliation (H), watcher capture, publication and FIFO work; `catchingUp` reports pending work without waiving validated-head or root checks. No storage table, class or implementation mechanism is prescribed. The catalog order is `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_search_symbols`, `trellis_declaration`, `trellis_outgoing_calls`, `trellis_incoming_calls`, `trellis_read_source`, `trellis_references`, `trellis_rules_check`, `trellis_rules_explain`. Declaration, outgoing calls and incoming calls are separate closed tools, not views of an inspect tool; `trellis_inspect` is not recognized. Source uses the selected stored raw BLOB, verifies its path/version and whole-file hash/length before slicing, then strictly decodes only the requested LF-delimited range. Other selected readers, including public `source_at`, trust the published native, graph and class rows without re-attesting them against source (owner ruling 2026-10-23, #261). Source reads are not a disk fallback.
 
@@ -100,7 +100,7 @@ it never enters card hashes, lookup, ranking, ordering or joins.
 `SearchIndexStatus` is exactly:
 `{state:"complete"|"building"|"partial"|"unavailable",modelId:Hash|null,
 modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
-lexical:"complete"|"unavailable"}`.
+lexical:"complete"|"unavailable",unavailableReason:null|"vector_budget_exceeded"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
 `embedded<=declarations`. No configured/verified/ready model gives `unavailable`, null
@@ -110,7 +110,13 @@ is unavailable; `backend:null` means only that no backend has been selected. Wit
 all candidates have vectors, `building` means vectors are missing and a background job is
 running, and `partial` means vectors are missing and no job is running. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
-can still be returned by the lexical arm.
+can still be returned by the lexical arm. `unavailableReason` is null except when this call
+exhausts its optional vector budget. Then the complete vector arm is discarded, state is
+`unavailable`, model identity is null and `embedded:0` is an unavailable sentinel, not an
+observed cache count. `declarations` remains the exact eligible head count and backend remains
+the selected backend. The reason is `vector_budget_exceeded`, all returned hits are lexical,
+and lexical remains complete. This reason changes no native coverage, warning, truncation or
+partial-result meaning.
 
 Successful search has `lexical:"complete"`. A required head search table that cannot be read
 is a store failure, not a lexical-unavailable success. A query that produces no lexical terms
@@ -130,9 +136,10 @@ Selected partial/failed extraction anywhere in that scope sets `partial:true` an
 `coverageIncomplete/null` before `syntaxOnly/null`, including on zero hits. Missing mandatory
 proof, corrupt digests or mixed revisions fails `store_unavailable`, without partial evidence.
 
-Use the fixed weighted reciprocal rank fusion and deterministic tie-break specified in the
-search decision below. Its constants must be tuned on #214’s evaluation set and fixed by
-contract review before search ships; no defaults are ratified by this amendment. The vector
+Use the fixed weighted reciprocal rank fusion and deterministic tie-break specified in
+[Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#lexical-query-and-ranking):
+(k, D, wL, wV) = (20, 200, 1, 4), with no extra lexical-arm restriction. These are the
+owner-reviewed #214 evaluation choices, not runtime tuning. The vector
 arm and search-index counts use one `vectors.db` read transaction per call. That cache is not
 pinned by `evidenceBasis`. Filling, eviction and re-embedding can change rankings and counts
 between calls at the same basis. There is no cross-call equality promise.
@@ -147,8 +154,17 @@ but adds no warning. There is no pagination. No hits is a successful empty list,
 and not proof of absence.
 
 The existing five-second acceptance-to-decision deadline and cancellation/root checks apply,
-including query inference and cold-load handling. Contention is typed storage_busy, retried
-within that deadline, then deadline_exceeded; it is never corruption or lexical-only success.
+including query inference and cold-load handling. Optional vector work has one absolute
+3,000ms sub-budget from acceptance, leaving 2,000ms for cleanup and mandatory lexical work.
+It covers model admission, verification/read, loading, embedding, cache access and scoring;
+it never resets on retry. Verified model weights are reused by the single owner with the
+[ten-minute idle timeout](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#model-identity-and-runtime),
+reset by query/fill use; loading remains lexical-only. On that budget alone, cooperatively stop vector work, discard the
+whole vector arm and return the complete lexical result with the reason above. Client
+cancellation and mandatory deadline/root checks still apply. Mandatory index/FTS contention
+remains typed storage_busy, retried within the call deadline, then deadline_exceeded. Optional
+cache contention is also typed/retried, but expiry of its vector budget permits this reasoned
+fallback; BUSY itself is not permission for lexical-only success or evidence of corruption.
 Database-level vector-cache failures, including corruption, schema mismatch and unreadable or
 unsafe storage, fail store_unavailable. Only a vector-cache row that fails typed decoding is
 a specified miss under T00/T02; it lowers embedded and is re-embedded outside the read.
@@ -331,7 +347,7 @@ Request cap 16384 bytes counts UTF-8 JSON-RPC line excluding delimiter. Response
 - **Deadline:** a `tools/call`'s five-second deadline starts at **protocol acceptance**, when the relay (or the daemon session, for a direct socket client) reads the complete valid call. It covers application validation, capacity, selection, read admission, the read and the send decision.
 - **Capacity:** after application validation, a connection may have at most four outstanding calls, and a fifth receives `too_many_requests` without queueing. The daemon also runs at most 16 live call-worker threads; a worker keeps its permit until its thread exits, even after its call timed out or was cancelled. Exhausting that budget, or failing to start a thread, also gives `too_many_requests`.
 - **The send decision:** the daemon rechecks cancellation, then the deadline, then selected-root identity. The relay decides each call's client-facing outcome by its own acceptance plus five seconds. The bound covers that decision, not a client that stops reading stdout.
-- **After the deadline:** if mandatory call/read work exceeds it, return `deadline_exceeded` with no partial evidence unless cancellation suppresses output. Optional hint work stops at its separate budget instead of failing the call.
+- **After the deadline:** if mandatory call/read work exceeds it, return `deadline_exceeded` with no partial evidence unless cancellation suppresses output. Optional hint work and the optional search vector arm stop at their separate budgets instead of failing the mandatory answer; search reports `unavailableReason:"vector_budget_exceeded"`.
 
 Before read admission has sampled `catchingUp`, a `too_many_requests` or `deadline_exceeded` uses the pre-resolution failure shape:
 

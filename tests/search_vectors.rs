@@ -56,3 +56,53 @@ fn separate_checkout_consumers_reuse_machine_cache_and_model_namespaces() {
     }
     assert!(!directory.path().join("index.db").exists());
 }
+
+#[test]
+fn batch_replaces_and_evicts_old_rows_in_input_lru_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors.db");
+    let budget = 32 * 1024;
+    let model = "a".repeat(64);
+    let oldest = "0".repeat(64);
+    let replacement = "1".repeat(64);
+    let newest = "2".repeat(64);
+    let mut writer = VectorCacheWriter::open_with_budget(&path, budget).unwrap();
+    writer.put(&model, &oldest, &[1; 1024]).unwrap();
+    writer.put(&model, &replacement, &[2; 1024]).unwrap();
+    writer
+        .put_many(&[
+            (&model, &replacement, &[-3; 1024]),
+            (&model, &newest, &[4; 1024]),
+        ])
+        .unwrap();
+    {
+        let snapshot = writer.snapshot().unwrap();
+        assert_eq!(snapshot.entry_count(), 3);
+        assert_eq!(
+            snapshot.get(&model, &replacement).unwrap(),
+            Some(vec![-3; 1024])
+        );
+        assert_eq!(snapshot.get(&model, &newest).unwrap(), Some(vec![4; 1024]));
+    }
+    let mut all_evicted = false;
+    // Add ordinary 1 KiB rows until the initial rows disappear. A physical
+    // page can require more than one deletion, but eviction must remain LRU.
+    for number in 3..40 {
+        let card = format!("{number:064x}");
+        writer.put_many(&[(&model, &card, &[5; 1024])]).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= budget);
+        let snapshot = writer.snapshot().unwrap();
+        let oldest_missing = snapshot.get(&model, &oldest).unwrap().is_none();
+        let replacement_missing = snapshot.get(&model, &replacement).unwrap().is_none();
+        let newest_missing = snapshot.get(&model, &newest).unwrap().is_none();
+        if replacement_missing {
+            assert!(oldest_missing);
+        }
+        if newest_missing {
+            assert!(replacement_missing);
+            all_evicted = true;
+            break;
+        }
+    }
+    assert!(all_evicted);
+}

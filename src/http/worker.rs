@@ -800,6 +800,7 @@ impl DaemonState {
     /// index-use guard) is held until the watcher and SQLite witnesses are
     /// closed, so GC never sees the index unused mid-close.
     pub(super) fn close(&self, held: Option<Arc<WriterSession>>) {
+        self.search_fill.lock().unwrap().take();
         self.note_state_change();
         *self.watch_status.lock().unwrap() = None;
         *self.watcher_work.lock().unwrap() = None;
