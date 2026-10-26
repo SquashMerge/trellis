@@ -3593,6 +3593,86 @@ fn caller() { Self::target(); module::target(); Type::target(); Type::<u8>::targ
 
 #[test]
 #[cfg(feature = "test-support")]
+fn rust_scoped_non_identifier_name_has_no_verified_token_or_incoming_match() {
+    use trellis::native_evidence::verified_callee_lookup;
+
+    let (state, root, store, cancel) = fixture();
+    let source = "fn r#super() {}\nfn caller() { module::super(); }\n";
+    let expression = "module::super";
+    let start = source.find(expression).unwrap();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    assert!(!tree.root_node().has_error());
+    let callee = tree
+        .root_node()
+        .named_descendant_for_byte_range(start, start + expression.len())
+        .unwrap();
+    assert_eq!(callee.kind(), "scoped_identifier");
+    assert_eq!(callee.parent().unwrap().kind(), "call_expression");
+    let name = callee.child_by_field_name("name").unwrap();
+    assert_eq!(name.kind(), "super");
+    assert_eq!(&source[name.byte_range()], "super");
+
+    fs::write(root.path().join("flow.rs"), source).unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let call = native
+        .calls
+        .iter()
+        .find(|call| call.document.path == "flow.rs")
+        .unwrap();
+    assert_eq!(call.spelling.as_deref(), Some(expression));
+    assert!(call.callee_range.is_none());
+    assert_eq!(verified_callee_lookup("rust", call, source), None);
+    let selected = native
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name.as_deref() == Some("r#super"))
+        .unwrap();
+    assert_eq!(selected.lookup_key.as_deref(), Some("super"));
+    let selected_id = selected.syntax_id.clone();
+
+    let leader = store.publication_for_tests().unwrap();
+    let pin = store
+        .publish_native(
+            &graph,
+            &capture,
+            &native,
+            &leader,
+            store.index_baseline().unwrap(),
+            &cancel,
+        )
+        .unwrap();
+    let db = Connection::open(published_db(state.path(), root.path())).unwrap();
+    let stored: (Option<i64>, Option<i64>, String, Option<String>) = db
+        .query_row(
+            "SELECT callee_start,callee_end,spelling,callee_lookup_key FROM native_version_calls WHERE vid=?1",
+            [live_document_version(&db, "flow.rs")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (None, None, expression.into(), None));
+    drop(db);
+    let read = store.evidence_response().unwrap();
+    let incoming = read
+        .mcp_incoming_with_lines(&selected_id, 20, Some(pin))
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.same_name_declarations, 1);
+    assert!(incoming.calls.is_empty());
+    read.finish(()).unwrap();
+}
+
+#[test]
+#[cfg(feature = "test-support")]
 fn incoming_read_keeps_reverse_roles_scope_and_required_lines() {
     use trellis::native_evidence::DeclarationRole;
     let (state, root, store, cancel) = fixture();
