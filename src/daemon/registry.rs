@@ -1793,7 +1793,9 @@ impl CheckoutRuntime {
         let mut status = response.status()?;
         status.catching_up = catching_up;
         status.watcher = Some(self.resources()?.scheduler.checkout_watcher_witness());
-        Ok(serde_json::to_value(response.finish(status)?)?)
+        let mut status = serde_json::to_value(response.finish(status)?)?;
+        status["build"] = serde_json::to_value(crate::build_info::current())?;
+        Ok(status)
     }
 
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
