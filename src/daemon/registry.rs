@@ -78,8 +78,6 @@ pub struct CheckoutOptions(pub serde_json::Value);
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrowserOptions {
     pub browse_root: Option<PathBuf>,
-    pub scip: Option<PathBuf>,
-    pub manifest: Option<PathBuf>,
     pub max_file_bytes: u64,
     pub rust_source_roots: Vec<(String, PathBuf)>,
     pub rust_library: Option<PathBuf>,
@@ -90,8 +88,6 @@ impl Default for BrowserOptions {
     fn default() -> Self {
         Self {
             browse_root: None,
-            scip: None,
-            manifest: None,
             max_file_bytes: 2_097_152,
             rust_source_roots: Vec::new(),
             rust_library: None,
@@ -661,17 +657,9 @@ impl CheckoutRegistry {
             .transpose()?
             .unwrap_or_default();
         let mut options = IndexOptions::new(root.to_owned());
-        options.scip_path = config.scip;
-        options.manifest_path = config.manifest;
         options.max_file_bytes = config.max_file_bytes;
-        // The raw registration preserves option presence. A supplied default
-        // value (or an explicit null for an optional input) is still explicit;
-        // comparing values would silently reuse an earlier checkout's inputs.
-        let explicit_options = registration.is_some_and(|registered| {
-            ["scip", "manifest", "maxFileBytes"]
-                .iter()
-                .any(|key| registered.0.get(*key).is_some())
-        });
+        let explicit_options =
+            registration.is_some_and(|registered| registered.0.get("maxFileBytes").is_some());
         let browse_root = config
             .browse_root
             .unwrap_or_else(|| options.workspace_root.clone());
@@ -880,10 +868,7 @@ impl CheckoutRegistry {
             .map_err(|_| SelectionError::IdentityChanged)?;
         let config: BrowserOptions =
             serde_json::from_value(options.0.clone()).map_err(|_| SelectionError::Unavailable)?;
-        if config.max_file_bytes == 0
-            || config.max_file_bytes > 16_777_216
-            || config.manifest.is_some() && config.scip.is_none()
-        {
+        if config.max_file_bytes == 0 || config.max_file_bytes > 16_777_216 {
             return Err(SelectionError::Unavailable);
         }
         let browse = config.browse_root.as_deref().unwrap_or(&identity.root);
@@ -917,15 +902,9 @@ impl CheckoutRegistry {
         {
             return Err(SelectionError::Unavailable);
         }
-        for path in [
-            config.scip,
-            config.manifest,
-            config.rust_library,
-            config.trusted_rustc,
-            config.cargo_home,
-        ]
-        .into_iter()
-        .flatten()
+        for path in [config.rust_library, config.trusted_rustc, config.cargo_home]
+            .into_iter()
+            .flatten()
         {
             if !path.is_absolute() {
                 return Err(SelectionError::Unavailable);
@@ -1870,6 +1849,49 @@ impl CheckoutRuntime {
                         &format!("id={}", accepted.id),
                     );
                 }
+                _ => anyhow::bail!("store_unavailable: invalid request state"),
+            }
+        }
+    }
+
+    pub fn cli_semantic_import(
+        &self,
+        options: &crate::store::requests::SemanticImportOptions,
+    ) -> anyhow::Result<serde_json::Value> {
+        let resources = self.resources()?;
+        let accepted = resources.scheduler.enqueue_semantic_import(options)?;
+        let mut busy_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let seen = resources.store.terminal_generation();
+            let row = cli_index_request(
+                || resources.store.request_by_id(&accepted.id),
+                busy_deadline,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
+            busy_deadline = Instant::now() + Duration::from_secs(30);
+            match row.state.as_str() {
+                "done" => {
+                    let pin = row.revision.ok_or_else(|| {
+                        anyhow::anyhow!("store_unavailable: completed semantic request missing pin")
+                    })?;
+                    let report = resources
+                        .store
+                        .semantic_import_report_at(pin, &options.producer_name)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "store_unavailable: completed semantic request missing report"
+                            )
+                        })?;
+                    return Ok(
+                        serde_json::json!({"requestId":accepted.id,"publishedRevision":pin,"report":report}),
+                    );
+                }
+                "failed" => anyhow::bail!(
+                    "{}: request {} failed",
+                    row.error_code.as_deref().unwrap_or("index_failed"),
+                    accepted.id
+                ),
+                "queued" | "running" => resources.store.wait_terminal_change(seen),
                 _ => anyhow::bail!("store_unavailable: invalid request state"),
             }
         }

@@ -120,6 +120,7 @@ async function writeJavaCorpus(
     formatVersion: 1,
     producerId: "native",
     extractionInputs: [],
+    capabilityReports: [],
     declarations: decls,
     calls,
     controls: [],
@@ -194,7 +195,7 @@ async function writeJavaCorpus(
   const support = ["declarationName", "callee", "invocation", "reference"].map(
     (kind) => ({
       kind,
-      available: kind !== "invocation",
+      gaps: [], available: kind !== "invocation",
       diagnostic: kind === "invocation" ? "invocation unavailable" : null,
     }),
   );

@@ -739,8 +739,13 @@ pub fn build(
     parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
     // Bound parser input and time before walking cached syntax.
     let started = std::time::Instant::now();
-    let mut budget =
-        |_: &tree_sitter::ParseState| started.elapsed() > std::time::Duration::from_millis(250);
+    let mut budget = |_: &tree_sitter::ParseState| {
+        if started.elapsed() > std::time::Duration::from_millis(250) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
     let tree = if file.text.len() <= 4 * 1024 * 1024 {
         parser.parse_with_options(
             &mut |offset, _| &file.text.as_bytes()[offset..],

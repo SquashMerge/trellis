@@ -37,8 +37,13 @@ const pinned = {
   maximumCommentPaddingPercentPerOrdinaryFile: 10,
   maximumCommentPaddingPercentPerCohort: 10,
   maximumRustModuleRootFiles: { small: 1, medium: 5, large: 40 },
-  maximumLargeIndexedDeclarationNodes: 900000,
+  maximumLargeIndexedDeclarationNodes: 1200000,
   maximumClassDetailRecordsAtLargestIndexScope: 225000,
+  largeOrdinaryFileOverrides: {
+    minimumCallableBodiesPerOrdinaryFile: 38,
+    maximumCallableBodiesPerOrdinaryFile: 40,
+    maximumJavaMethodsPerFile: 40,
+  },
 };
 const sample = "small/java/Csmall0000.java";
 function checker(root, file) {
@@ -129,5 +134,23 @@ test("all generated source parses with pinned grammars and meets source-derived 
     } finally { writeFileSync(peerFile, peerSource); }
     result = checker(root, sample);
     assert.equal(result.status, 0, outcome(result));
+
+    // LARGE has a separate body-density contract; the other composition rules still apply.
+    const largeSample = "large/java/Clarge0000.java";
+    const largeFile = join(root, largeSample);
+    const largeSource = readFileSync(largeFile, "utf8");
+    const lastWorker = largeSource.match(/public static int f36\(int revision\)\{[\s\S]*?\n\}/)?.[0];
+    assert.ok(lastWorker);
+    try {
+      writeFileSync(largeFile, largeSource.replace(lastWorker, ""));
+      const below = checker(root, largeSample);
+      assert.notEqual(below.status, 0, "LARGE callable floor must apply");
+      assert.match(outcome(below), /callable bodies/);
+      const extraWorkers = lastWorker.replace("f36(", "f37(") + "\n" + lastWorker.replace("f36(", "f38(");
+      writeFileSync(largeFile, largeSource.slice(0, -2) + extraWorkers + "\n}\n");
+      const above = checker(root, largeSample);
+      assert.notEqual(above.status, 0, "LARGE Java signature ceiling must apply");
+      assert.match(outcome(above), /Java method signatures/);
+    } finally { writeFileSync(largeFile, largeSource); }
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });

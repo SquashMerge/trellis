@@ -297,8 +297,7 @@ fn degraded_watcher_reconciles_once_then_waits_for_periodic_scan() {
     // inventory, but an accounted idle generation must not veto maintenance.
     let absent_watch_root = workspace.path().join("absent_watch_root");
     assert!(!absent_watch_root.exists());
-    work.watch =
-        crate::watch::WatchSignals::publishing(absent_watch_root, None, None, work.health.clone());
+    work.watch = crate::watch::WatchSignals::publishing(absent_watch_root, work.health.clone());
     assert!(work.watch.degraded());
     assert!(work.accepted_watch_intent(&options));
     assert!(
@@ -944,6 +943,13 @@ fn cancelled_full_document_stream_never_changes_selected_pin() {
     fs::write(
         workspace.path().join("b.py"),
         "def after():\n    return 2\n",
+    )
+    .unwrap();
+    // Multi-document edits can publish locally; changed native configuration
+    // keeps cancellation inside full-stream document validation.
+    fs::write(
+        workspace.path().join("package.json"),
+        r#"{"type":"module"}"#,
     )
     .unwrap();
     let mut coordinator = IndexJobCoordinator::prepare(&store, Some(prior)).unwrap();

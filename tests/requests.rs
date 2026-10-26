@@ -358,7 +358,7 @@ fn request_rejects_relative_external_input_before_ack() {
     let workspace = tempfile::tempdir().unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let mut options = IndexOptions::new(workspace.path().to_owned());
-    options.scip_path = Some("relative.scip".into());
+    options.max_file_bytes = 0;
     assert!(store.enqueue_request(&options, None).is_err());
     assert!(store.current_request().unwrap().is_none());
 }
@@ -443,7 +443,7 @@ fn incompatible_or_corrupt_existing_queue_never_gets_fresh_ack() {
     let accepted = store.enqueue_request(&options, None).unwrap();
     let path = store.request_db_path();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.pragma_update(None, "user_version", 2).unwrap();
+    db.pragma_update(None, "user_version", 3).unwrap();
     drop(db);
     assert!(
         store
@@ -453,7 +453,7 @@ fn incompatible_or_corrupt_existing_queue_never_gets_fresh_ack() {
             .contains("incompatible_queue")
     );
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.pragma_update(None, "user_version", 1).unwrap();
+    db.pragma_update(None, "user_version", 2).unwrap();
     db.execute(
         "UPDATE queue_identity SET root_key='wrong' WHERE singleton=1",
         [],
@@ -813,7 +813,7 @@ fn replacement_refuses_missing_or_foreign_queue_without_swapping_index() {
                     db.execute("UPDATE queue_identity SET root_key='foreign'", [])
                         .unwrap();
                 } else {
-                    db.pragma_update(None, "user_version", 2).unwrap();
+                    db.pragma_update(None, "user_version", 3).unwrap();
                 }
             }
         }
@@ -1115,7 +1115,7 @@ fn pin_taken_before_noop_request_still_reads_and_cas_holds() {
 }
 
 #[test]
-fn changed_claimed_source_uses_native_fallback_not_unchanged() {
+fn changed_claimed_source_uses_local_publication_not_unchanged() {
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use trellis::index_coordinator::{drain_requests_observed, reconcile_workspace};
     let state = tempfile::tempdir().unwrap();
@@ -1139,8 +1139,8 @@ fn changed_claimed_source_uses_native_fallback_not_unchanged() {
     );
     assert_eq!(
         modes.into_inner().unwrap(),
-        vec!["mode:full"],
-        "declaration change is not #67 local"
+        vec!["mode:local"],
+        "#225 declaration changes publish locally, not as unchanged work"
     );
     assert_eq!(
         store.request_by_id(&request.id).unwrap().unwrap().state,
@@ -1163,8 +1163,8 @@ fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
     let db =
         rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
     db.execute(
-        "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
-        [b"function b() {}\n".as_slice()],
+        "UPDATE document_versions SET extraction_context=printf('%064d',0) WHERE path='a.js'",
+        [],
     )
     .unwrap();
     drop(db);

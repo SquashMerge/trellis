@@ -297,9 +297,9 @@ fn parse(doc: &DocumentInput, check: &mut impl FnMut() -> Result<()>) -> Result<
             tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
                 if let Err(error) = check() {
                     aborted = Some(error);
-                    true
+                    std::ops::ControlFlow::Break(())
                 } else {
-                    false
+                    std::ops::ControlFlow::Continue(())
                 }
             }),
         ),

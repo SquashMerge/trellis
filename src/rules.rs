@@ -733,9 +733,9 @@ fn parse_bases(
             tree_sitter::ParseOptions::new().progress_callback(&mut |_| {
                 if let Err(e) = check() {
                     aborted = Some(e);
-                    true
+                    std::ops::ControlFlow::Break(())
                 } else {
-                    false
+                    std::ops::ControlFlow::Continue(())
                 }
             }),
         ),

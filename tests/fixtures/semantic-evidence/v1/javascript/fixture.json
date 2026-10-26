@@ -1,0 +1,584 @@
+{
+  "formatVersion": 1,
+  "profile": "draft",
+  "language": "javascript",
+  "sourceSets": [
+    {
+      "id": "main",
+      "rootId": "javascript-conformance",
+      "languages": [
+        "javascript"
+      ],
+      "dependencies": []
+    }
+  ],
+  "producers": [
+    {
+      "executableHash": "20da77888a20fd4fcb0e0bcdbd5ef067dbdc7384f56d6be86248196164655230",
+      "id": "trellis.native.syntax",
+      "kind": "native",
+      "languages": [
+        "java",
+        "rust",
+        "python",
+        "javascript"
+      ],
+      "positionEncoding": "utf8",
+      "version": "native-v10"
+    }
+  ],
+  "revisions": [
+    {
+      "id": "r1",
+      "sourceSetId": "main",
+      "documents": [
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/adapters.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/adapters.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/editor.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/editor.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/history.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/history.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/legacy.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/legacy.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/pipeline.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/pipeline.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/plugins.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/plugins.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/public.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/public.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/stages.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/stages.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/text.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/text.js"
+        },
+        {
+          "key": {
+            "sourceSetId": "main",
+            "language": "javascript",
+            "path": "src/workbench.js"
+          },
+          "revisionId": "r1",
+          "sourceFile": "snapshots/r1/src/workbench.js"
+        }
+      ],
+      "toolchainHash": "1ba7bb8e273bd64125f4048d2ecce530e0a6470e565ab1b3aecf0b82b532f7b1",
+      "configHash": "3838a3c68089a20c51735c090f2e83a12327e3abd94ea6fc03bc68a8d978cc59",
+      "dependencyHash": "d6cd541cf774e6541b9e1bb0651931d02cb77977955c823215f1b8552dcc1cd9"
+    }
+  ],
+  "comparison": {
+    "sourceSetId": "main",
+    "revisionId": "r1",
+    "producers": [
+      {
+        "executableHash": "20da77888a20fd4fcb0e0bcdbd5ef067dbdc7384f56d6be86248196164655230",
+        "id": "trellis.native.syntax",
+        "kind": "native",
+        "languages": [
+          "java",
+          "rust",
+          "python",
+          "javascript"
+        ],
+        "positionEncoding": "utf8",
+        "version": "native-v10"
+      }
+    ]
+  },
+  "coverageIntents": [
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/adapters.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/editor.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/history.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/legacy.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/pipeline.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/plugins.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/public.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/stages.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/text.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    },
+    {
+      "producerId": "trellis.native.syntax",
+      "document": {
+        "sourceSetId": "main",
+        "language": "javascript",
+        "path": "src/workbench.js"
+      },
+      "revisionId": "r1",
+      "requestedRoles": [
+        "definition",
+        "call"
+      ],
+      "measurementSupport": [
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "declarationName"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "callee"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "invocation"
+        },
+        {
+          "available": true,
+          "diagnostic": null,
+          "gaps": [],
+          "kind": "reference"
+        }
+      ]
+    }
+  ],
+  "nativeArtifact": "captures/native.json",
+  "semanticArtifacts": [],
+  "annotationFiles": [
+    "snapshots/r1/src/adapters.js.annotations.json",
+    "snapshots/r1/src/editor.js.annotations.json",
+    "snapshots/r1/src/history.js.annotations.json",
+    "snapshots/r1/src/legacy.js.annotations.json",
+    "snapshots/r1/src/pipeline.js.annotations.json",
+    "snapshots/r1/src/plugins.js.annotations.json",
+    "snapshots/r1/src/public.js.annotations.json",
+    "snapshots/r1/src/stages.js.annotations.json",
+    "snapshots/r1/src/text.js.annotations.json",
+    "snapshots/r1/src/workbench.js.annotations.json"
+  ],
+  "answersFile": "expected/answers.json",
+  "dispositionsFile": "expected/dispositions.json",
+  "anchorCasesFile": "expected/anchors.json",
+  "captures": [
+    {
+      "ref": "native-executable",
+      "kind": "executable",
+      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#trellis-native-v10-javascript-test-support",
+      "hash": "20da77888a20fd4fcb0e0bcdbd5ef067dbdc7384f56d6be86248196164655230"
+    },
+    {
+      "ref": "rust-toolchain",
+      "kind": "toolchain",
+      "pinned": "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json#rustc-1.99.1-aarch64-apple-darwin",
+      "hash": "1ba7bb8e273bd64125f4048d2ecce530e0a6470e565ab1b3aecf0b82b532f7b1"
+    },
+    {
+      "ref": "tsconfig",
+      "kind": "config",
+      "file": "snapshots/r1/tsconfig.json",
+      "hash": "3838a3c68089a20c51735c090f2e83a12327e3abd94ea6fc03bc68a8d978cc59"
+    },
+    {
+      "ref": "package",
+      "kind": "dependency",
+      "file": "snapshots/r1/package.json",
+      "hash": "d6cd541cf774e6541b9e1bb0651931d02cb77977955c823215f1b8552dcc1cd9"
+    }
+  ]
+}
