@@ -404,6 +404,21 @@ fn selected_case(change_b: &str) {
         store.semantic_at(prior).unwrap().provenance,
         prior_semantic.provenance
     );
+    if change_b == "oracle_fork_successive_local" {
+        fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
+        prior = serde_json::from_value(
+            run(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
+        )
+        .unwrap();
+        prior_semantic = store.semantic_at(prior).unwrap();
+        assert!(
+            prior_semantic
+                .provenance
+                .iter()
+                .any(|proof| proof.document.path == "src/A.js" && proof.derived_from.is_some()),
+            "first LOCAL did not preserve selected r1 evidence: {prior_semantic:?}"
+        );
+    }
     let (fork_home, store) = if change_b.starts_with("oracle_fork_") {
         let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
             .unwrap()
@@ -418,6 +433,9 @@ fn selected_case(change_b: &str) {
             "oracle_fork_restored_b" | "oracle_fork_retained_target"
         ) {
             fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
+        }
+        if change_b == "oracle_fork_successive_local" {
+            fs::write(root.join("src/B.js"), "function target(){ return 3; }\n").unwrap();
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = trellis::indexer::IndexOptions::new(root.clone());
@@ -547,9 +565,17 @@ fn selected_case(change_b: &str) {
         fs::write(fork.join("force-full"), b"1").unwrap();
         if matches!(
             change_b,
-            "oracle_fork_context" | "oracle_fork_healthy_two_producers"
+            "oracle_fork_context" | "oracle_fork_missing_raw_key"
         ) {
             fs::remove_file(home.join("full-oracle")).unwrap();
+        }
+        if matches!(
+            change_b,
+            "oracle_fork_context"
+                | "oracle_fork_missing_raw_key"
+                | "oracle_fork_healthy_two_producers"
+                | "oracle_fork_successive_local"
+        ) {
             fs::write(home.join("work-counts"), b"1").unwrap();
         }
         drop(store);
@@ -574,6 +600,22 @@ fn selected_case(change_b: &str) {
     } else {
         (None, store)
     };
+    if change_b == "oracle_fork_missing_raw_key" {
+        let capture_id = store.selected_raw_inputs_at(prior).unwrap()[0].capture_id;
+        store
+            .with_index_sql_for_tests(|db| {
+                assert_eq!(db.execute(
+                "DELETE FROM semantic_raw_documents WHERE capture_id=?1 AND path='src/A.js'",
+                [capture_id],
+            )?,1);
+                Ok(())
+            })
+            .unwrap();
+        if let Some(fork) = &fork_home {
+            copy_seed(&home, fork);
+            let _ = fs::remove_file(fork.join("full-oracle"));
+        }
+    }
     if change_b == "oracle_fork_healthy_two_producers" {
         let selected = store.selected_raw_inputs_at(prior).unwrap();
         assert_eq!(selected.len(), 2);
@@ -612,6 +654,9 @@ fn selected_case(change_b: &str) {
             fs::write(root.join("src/C.js"), "function extra(){ return 2; }\n").unwrap()
         }
         "oracle_restored_b" => fs::write(root.join("src/B.js"), b).unwrap(),
+        "oracle_successive_local" => {
+            fs::write(root.join("src/B.js"), "function target(){ return 4; }\n").unwrap()
+        }
         "oracle_deleted_a" => fs::remove_file(root.join("src/A.js")).unwrap(),
         "oracle_deleted_b" => fs::remove_file(root.join("src/B.js")).unwrap(),
         "oracle_moved_a" => fs::rename(root.join("src/A.js"), root.join("src/D.js")).unwrap(),
@@ -943,6 +988,103 @@ fn selected_case(change_b: &str) {
             "native FULL does not enter the LOCAL fallback: {work}"
         );
     }
+    if change_b == "oracle_fork_successive_local" {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        assert_eq!(
+            work["fullFallbacks"], 0,
+            "second LOCAL must witness the earliest original association: {work}"
+        );
+        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+        assert_eq!(work["destinationDocumentRows"], 1, "{work}");
+        assert_eq!(work["destinationRoleParses"], 0, "{work}");
+        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
+        assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        assert!(
+            work["parsedRoleSiteDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["parsedTypeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalNativeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalSourceDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
+        assert!(
+            work["originalSourceHashDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert_eq!(
+            work["indexPin"],
+            serde_json::to_value(next).unwrap(),
+            "{work}"
+        );
+        let (current_native, _) = store.retained_native_snapshot_at(next).unwrap();
+        assert_eq!(
+            work["destinationRevision"], current_native.revision.id,
+            "{work}"
+        );
+        assert!(
+            snapshot
+                .call_bindings
+                .iter()
+                .any(|call| matches!(&call.declared_target,
+            Some(trellis::semantic_evidence::Target::Internal {revision_id,..})
+                if revision_id==&current_native.revision.id)),
+            "second LOCAL must decide the latest target revision: {snapshot:?}"
+        );
+    }
+    if change_b == "oracle_fork_missing_raw_key" {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        assert_eq!(work["fullFallbacks"], 1, "{work}");
+        assert!(
+            work["originalRawProofBytes"].as_u64().unwrap() > 0,
+            "{work}"
+        );
+        assert!(work["originalRawDecodes"].as_u64().unwrap() > 0, "{work}");
+        assert_eq!(
+            work["indexPin"],
+            serde_json::to_value(next).unwrap(),
+            "{work}"
+        );
+        assert!(
+            snapshot
+                .coverage
+                .iter()
+                .any(|row| row.document_path == "src/A.js"
+                    && row.selected
+                    && row.state == trellis::semantic_evidence::CoverageState::Complete),
+            "missing-key fallback published incomplete evidence: {snapshot:?}"
+        );
+    }
     if change_b == "oracle_fork_healthy_two_producers" {
         let work: Value =
             serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
@@ -951,9 +1093,90 @@ fn selected_case(change_b: &str) {
         // Only A and C contain captured source claims; B is a changed native
         // target and must be indexed, not parsed as a destination source claim.
         assert_eq!(work["destinationRoleParses"], 0, "{work}");
-        assert_eq!(work["destinationDocumentRows"], 3, "{work}");
-        assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
+        assert_eq!(work["destinationDocumentRows"], 1, "{work}");
+        assert_eq!(work["originalRoleParses"], 0, "{work}");
+        assert!(work["originalNativeRows"].as_u64().unwrap() <= 2, "{work}");
+        assert!(
+            work["originalNativeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalSourceBytes"].as_u64().unwrap() <= (b.len() * 2) as u64,
+            "{work}"
+        );
+        assert!(
+            work["originalSourceDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert_eq!(work["originalRawProofBytes"], 0, "{work}");
+        assert_eq!(work["originalRawEnvelopeParses"], 0, "{work}");
+        assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        assert!(
+            work["parsedRoleSiteDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["parsedTypeDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["originalSourceHashDocuments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["currentTargetLookups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|doc| doc["path"] == "src/B.js"),
+            "{work}"
+        );
+        assert!(
+            work["currentTargetLookups"].as_array().unwrap().len() <= 4,
+            "{work}"
+        );
+        assert!(work["currentTargetRows"].as_u64().unwrap() >= 1, "{work}");
+        assert!(work["currentTargetRows"].as_u64().unwrap() <= 4, "{work}");
         let (next_native, _) = store.retained_native_snapshot_at(next).unwrap();
+        assert_eq!(
+            work["destinationRevision"], next_native.revision.id,
+            "{work}"
+        );
+        assert_eq!(
+            work["indexPin"],
+            serde_json::to_value(next).unwrap(),
+            "{work}"
+        );
+        assert_eq!(
+            work["producerIds"],
+            json!(["scip-python", "scip-typescript"]),
+            "{work}"
+        );
+        assert_eq!(
+            work["reusedDocuments"].as_array().unwrap().len(),
+            2,
+            "{work}"
+        );
         let changed_target = next_native
             .declarations
             .iter()
@@ -995,10 +1218,21 @@ fn selected_case(change_b: &str) {
         let work: Value =
             serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
         eprintln!("publication work counts {change_b}: {work}");
-        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
-        assert_eq!(work["destinationRoleParses"], 0, "{work}");
+        if change_b == "oracle_body" {
+            assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+            assert_eq!(work["destinationRoleParses"], 0, "{work}");
+            assert_eq!(work["fullFallbacks"], 0, "{work}");
+            assert_eq!(work["originalRoleParses"], 0, "{work}");
+            assert_eq!(work["originalRawDecodes"], 0, "{work}");
+        } else {
+            assert_eq!(work["fullFallbacks"], 1, "{work}");
+            assert_eq!(
+                work["destinationIndexBuilds"], 2,
+                "attempted LOCAL work plus FULL fallback: {work}"
+            );
+            assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
+        }
         assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
-        assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
     }
     assert!(
         snapshot
@@ -1587,6 +1821,16 @@ fn forked_seeded_local_matches_forced_full_oracle() {
 #[test]
 fn two_healthy_producers_share_one_incremental_destination() {
     selected_case("oracle_fork_healthy_two_producers");
+}
+
+#[test]
+fn successive_local_publications_reuse_original_capture_without_unchanged_work() {
+    selected_case("oracle_fork_successive_local");
+}
+
+#[test]
+fn missing_admitted_document_key_uses_same_transaction_full_fallback() {
+    selected_case("oracle_fork_missing_raw_key");
 }
 
 #[test]

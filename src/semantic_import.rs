@@ -13,6 +13,7 @@ type LocalDeclarations = BTreeMap<ScopedKey, BTreeSet<(native::DocumentKey, Stri
 
 /// Import-local native indexes. Distinct native identities, not raw-claim counts,
 /// determine exactness and ambiguity.
+#[derive(Clone)]
 pub struct MeasuredFacts<'a> {
     native: &'a native::Artifact,
     sources: BTreeMap<native::DocumentKey, &'a str>,
@@ -583,7 +584,7 @@ fn complexity_work(update: impl FnOnce(&mut ComplexityWork)) {
 }
 
 #[cfg(feature = "test-support")]
-#[derive(Default, serde::Serialize)]
+#[derive(Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicationWork {
     destination_index_builds: usize,
@@ -591,11 +592,21 @@ pub(crate) struct PublicationWork {
     original_index_builds: usize,
     destination_role_parses: usize,
     original_role_parses: usize,
+    original_native_rows: usize,
+    original_native_documents: Vec<native::DocumentKey>,
+    original_source_bytes: usize,
+    original_source_documents: Vec<native::DocumentKey>,
+    original_raw_proof_bytes: usize,
+    original_raw_envelope_parses: usize,
+    original_raw_decodes: usize,
+    original_source_hash_documents: Vec<native::DocumentKey>,
+    parsed_role_site_documents: Vec<native::DocumentKey>,
+    parsed_type_documents: Vec<native::DocumentKey>,
+    current_target_lookups: Vec<native::DocumentKey>,
+    current_target_rows: usize,
     destination_joins_on_reused_documents: usize,
     destination_document_rows: usize,
-    #[serde(skip)]
     destination_revision: String,
-    #[serde(skip)]
     reused_documents: BTreeSet<native::DocumentKey>,
 }
 #[cfg(feature = "test-support")]
@@ -612,6 +623,56 @@ pub(crate) fn reset_publication_work(revision: &str, reused: BTreeSet<native::Do
     });
 }
 #[cfg(feature = "test-support")]
+pub(crate) fn set_publication_reused(reused: BTreeSet<native::DocumentKey>) {
+    count_publication_work(|work| work.reused_documents = reused);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_selected_original_native_row(doc: &native::DocumentKey) {
+    count_publication_work(|work| {
+        work.original_native_rows += 1;
+        work.original_native_documents.push(doc.clone());
+    });
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_selected_original_source_bytes(doc: &native::DocumentKey, length: usize) {
+    count_publication_work(|work| {
+        work.original_source_bytes += length;
+        work.original_source_documents.push(doc.clone());
+    });
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_selected_original_raw_proof_bytes(length: usize) {
+    count_publication_work(|work| work.original_raw_proof_bytes += length);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_original_raw_envelope_parse() {
+    count_publication_work(|work| work.original_raw_envelope_parses += 1);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_original_raw_decode() {
+    count_publication_work(|work| work.original_raw_decodes += 1);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_original_source_hash(doc: &native::DocumentKey) {
+    count_publication_work(|work| work.original_source_hash_documents.push(doc.clone()));
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_parsed_role_site_document(doc: &native::DocumentKey) {
+    count_publication_work(|work| work.parsed_role_site_documents.push(doc.clone()));
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_parsed_type_document(doc: &native::DocumentKey) {
+    count_publication_work(|work| work.parsed_type_documents.push(doc.clone()));
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_current_target_lookup(doc: &native::DocumentKey) {
+    count_publication_work(|work| work.current_target_lookups.push(doc.clone()));
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_current_target_rows(rows: usize) {
+    count_publication_work(|work| work.current_target_rows += rows);
+}
+#[cfg(feature = "test-support")]
 pub(crate) fn note_full_fallback() {
     count_publication_work(|work| work.full_fallbacks += 1);
 }
@@ -619,6 +680,14 @@ pub(crate) fn note_full_fallback() {
 pub(crate) fn publication_work() -> serde_json::Value {
     PUBLICATION_WORK
         .with(|cell| serde_json::to_value(&*cell.borrow()).expect("work counters serialize"))
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn publication_work_checkpoint() -> PublicationWork {
+    PUBLICATION_WORK.with(|cell| cell.borrow().clone())
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn restore_publication_work(checkpoint: PublicationWork) {
+    PUBLICATION_WORK.with(|cell| *cell.borrow_mut() = checkpoint);
 }
 #[cfg(feature = "test-support")]
 fn count_publication_work(update: impl FnOnce(&mut PublicationWork)) {
@@ -819,6 +888,8 @@ fn join_inventory_indexed(
     let role_sites: BTreeMap<_, _> = sources
         .iter()
         .map(|(doc, bytes)| {
+            #[cfg(feature = "test-support")]
+            note_parsed_role_site_document(doc);
             Ok((
                 doc.clone(),
                 source_role_sites(doc.language.as_str(), bytes)?,
@@ -1182,6 +1253,10 @@ fn join_inventory_indexed(
         }
     }
     for (doc, bytes) in sources {
+        #[cfg(feature = "test-support")]
+        if matches!(doc.language.as_str(), "java" | "javascript" | "python") {
+            note_parsed_type_document(doc);
+        }
         let bases = match doc.language.as_str() {
             "java" => direct_java_types(bytes)?,
             "javascript" => direct_script_types(
@@ -1803,10 +1878,159 @@ fn direct_script_types(
     Ok(result)
 }
 
+pub(crate) fn original_associations_from_selected(
+    snapshot: &semantic::SemanticSnapshot,
+    inventory: &crate::scip_raw::ProofInventory,
+    producer_id: &str,
+) -> Option<JoinedFacts> {
+    let mut by_provenance = BTreeMap::new();
+    for row in snapshot
+        .provenance
+        .iter()
+        .filter(|row| row.producer_id == producer_id)
+    {
+        let derived = row.derived_from.as_ref()?;
+        let kind = serde_json::to_value(derived.record_kind).ok()?;
+        let claim = inventory
+            .lookup(&derived.provenance_id, kind.as_str()?, &derived.fact_digest)
+            .ok()?;
+        if row.document.language != claim.language || row.document.path != claim.path {
+            return None;
+        }
+        by_provenance.insert(row.id.as_str(), derived.provenance_id.as_str());
+    }
+    let expected: BTreeSet<_> = inventory
+        .claims
+        .iter()
+        .map(|claim| claim.proof_id.as_str())
+        .collect();
+    let observed: BTreeSet<_> = by_provenance.values().copied().collect();
+    if expected != observed {
+        return None;
+    }
+    let mut facts = JoinedFacts::default();
+    for row in &snapshot.symbols {
+        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+            let mut value = row.clone();
+            value.provenance_id = (*raw).to_owned();
+            facts.symbols.push(value);
+        }
+    }
+    for row in &snapshot.declaration_bindings {
+        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+            let mut value = row.clone();
+            value.provenance_id = (*raw).to_owned();
+            facts.declaration_bindings.push(value);
+        }
+    }
+    for row in &snapshot.references {
+        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+            if facts.reference_claims.contains_key(*raw) {
+                return None;
+            }
+            let mut value = row.clone();
+            value.provenance_id = (*raw).to_owned();
+            facts
+                .reference_claims
+                .insert((*raw).to_owned(), value.clone());
+            facts.references.push(value);
+        }
+    }
+    for row in &snapshot.call_bindings {
+        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+            let mut value = row.clone();
+            value.provenance_id = (*raw).to_owned();
+            facts.call_bindings.push(value);
+        }
+    }
+    for row in &snapshot.type_relationships {
+        if let Some(raw) = by_provenance.get(row.provenance_id.as_str()) {
+            let mut value = row.clone();
+            value.provenance_id = (*raw).to_owned();
+            facts.type_relationships.push(value);
+        }
+    }
+    // A selected tuple is not a complete original inventory when claims were
+    // fused, omitted, unsupported or unmatched. Fall back instead of guessing.
+    let fact_proofs: BTreeSet<_> = facts
+        .symbols
+        .iter()
+        .map(|row| row.provenance_id.as_str())
+        .chain(
+            facts
+                .declaration_bindings
+                .iter()
+                .map(|row| row.provenance_id.as_str()),
+        )
+        .chain(facts.reference_claims.keys().map(String::as_str))
+        .chain(
+            facts
+                .call_bindings
+                .iter()
+                .map(|row| row.provenance_id.as_str()),
+        )
+        .chain(
+            facts
+                .type_relationships
+                .iter()
+                .map(|row| row.provenance_id.as_str()),
+        )
+        .collect();
+    (expected == fact_proofs).then_some(facts)
+}
+
+pub(crate) fn required_original_targets(
+    snapshot: &semantic::SemanticSnapshot,
+    inventory: &crate::scip_raw::ProofInventory,
+    producer_id: &str,
+) -> Option<BTreeSet<(native::DocumentKey, String)>> {
+    let facts = original_associations_from_selected(snapshot, inventory, producer_id)?;
+    let mut keys = BTreeSet::new();
+    let mut add = |target: &semantic::Target| {
+        if let semantic::Target::Internal {
+            syntax_id,
+            document,
+            ..
+        } = target
+        {
+            keys.insert((document.clone(), syntax_id.clone()));
+        }
+    };
+    for symbol in &facts.symbols {
+        for target in &symbol.declarations {
+            add(target);
+        }
+    }
+    for reference in &facts.references {
+        if let Some(target) = &reference.declared_target {
+            add(target);
+        }
+        for target in &reference.candidates {
+            add(target);
+        }
+    }
+    for call in &facts.call_bindings {
+        if let Some(target) = &call.declared_target {
+            add(target);
+        }
+        for target in &call.candidates {
+            add(target);
+        }
+        for target in &call.possible_dispatch {
+            add(target);
+        }
+    }
+    for row in &facts.type_relationships {
+        add(&row.source);
+        add(&row.target);
+    }
+    Some(keys)
+}
+
 fn reuse_captured_source_associations(
     captured: &JoinedFacts,
     reusable: &BTreeSet<native::DocumentKey>,
-    inventory: &CapturedScipInventory,
+    inventory: &crate::scip_raw::ProofInventory,
     source_set_id: &str,
     revision: &str,
 ) -> JoinedFacts {
@@ -1817,11 +2041,11 @@ fn reuse_captured_source_associations(
         .iter()
         .map(|claim| {
             (
-                claim.captured_proof_id.as_str(),
+                claim.proof_id.as_str(),
                 native::DocumentKey {
                     source_set_id: source_set_id.to_owned(),
                     language: claim.language.clone(),
-                    path: claim.envelope.relative_path.clone(),
+                    path: claim.path.clone(),
                 },
             )
         })
@@ -2191,10 +2415,11 @@ pub(crate) fn rejoin_inventory_with_reuse(
     });
     let filtered_index = InventoryIndex::new(&filtered)?;
     let destination = if let Some(reusable) = reusable {
+        let metadata = inventory.proof_identities();
         let mut facts = reuse_captured_source_associations(
             &captured,
             reusable,
-            inventory,
+            &metadata,
             &destination_native.revision.source_set_id,
             &destination_native.revision.id,
         );
@@ -2256,6 +2481,85 @@ pub(crate) fn rejoin_inventory_with_reuse(
             r2,
         )?
     };
+    let metadata = inventory.proof_identities();
+    let filtered_metadata = filtered.proof_identities();
+    let proofs = ProofIdentityIndex::new(&metadata)?;
+    let filtered_proofs = ProofIdentityIndex::new(&filtered_metadata)?;
+    finish_rejoin(
+        &metadata,
+        captured_native,
+        destination_native,
+        destination_sources,
+        producer,
+        basis,
+        Some(&r1),
+        r2,
+        None,
+        &proofs,
+        &filtered_proofs,
+        &filtered_metadata,
+        &exclusions,
+        captured,
+        destination,
+        requested,
+        failed,
+        unsupported_claims,
+        unsupported_documents,
+    )
+}
+
+struct ProofIdentityIndex<'a> {
+    by_proof: BTreeMap<String, &'a crate::scip_raw::RawProofIdentity>,
+    inventory: &'a crate::scip_raw::ProofInventory,
+}
+impl<'a> ProofIdentityIndex<'a> {
+    fn new(inventory: &'a crate::scip_raw::ProofInventory) -> Result<Self> {
+        let mut by_proof = BTreeMap::new();
+        for claim in &inventory.claims {
+            ensure!(
+                by_proof.insert(claim.proof_id.clone(), claim).is_none(),
+                "non-unique original proof ID"
+            );
+        }
+        Ok(Self {
+            by_proof,
+            inventory,
+        })
+    }
+    fn lookup(
+        &self,
+        id: &str,
+        kind: &str,
+        digest: &str,
+    ) -> Result<&crate::scip_raw::RawProofIdentity> {
+        Ok(self.inventory.lookup(id, kind, digest)?)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_rejoin(
+    inventory: &crate::scip_raw::ProofInventory,
+    captured_native: &native::Artifact,
+    destination_native: &native::Artifact,
+    destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    producer: semantic::Producer,
+    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
+    r1: Option<&MeasuredFacts<'_>>,
+    r2: &MeasuredFacts<'_>,
+    target_projection: Option<
+        &BTreeMap<(native::DocumentKey, String), semantic::TargetDeclaration>,
+    >,
+    raw_index: &ProofIdentityIndex<'_>,
+    filtered_index: &ProofIdentityIndex<'_>,
+    filtered: &crate::scip_raw::ProofInventory,
+    exclusions: &BTreeMap<(&str, &str), &str>,
+    captured: JoinedFacts,
+    destination: JoinedFacts,
+    requested: BTreeSet<native::DocumentKey>,
+    failed: BTreeSet<native::DocumentKey>,
+    unsupported_claims: BTreeSet<String>,
+    unsupported_documents: BTreeSet<native::DocumentKey>,
+) -> Result<RejoinResult> {
     let mut captured_targets: BTreeMap<(native::DocumentKey, String), Vec<semantic::Target>> =
         BTreeMap::new();
     for binding in &captured.declaration_bindings {
@@ -2293,6 +2597,15 @@ pub(crate) fn rejoin_inventory_with_reuse(
         .filter(|(_, targets)| !targets.is_empty())
         .map(|((_, symbol), _)| symbol.clone())
         .collect();
+    let prior_declarations: BTreeSet<_> = captured
+        .declaration_bindings
+        .iter()
+        .filter_map(|row| {
+            row.syntax_id
+                .as_ref()
+                .map(|id| (row.join.anchor.document.clone(), id.clone()))
+        })
+        .collect();
     let retarget = |target: &mut semantic::Target| -> bool {
         match target {
             semantic::Target::External { symbol }
@@ -2305,48 +2618,64 @@ pub(crate) fn rejoin_inventory_with_reuse(
                 document,
                 revision_id,
             } => {
-                if !r1
-                    .declarations
-                    .get(syntax_id)
-                    .into_iter()
-                    .flatten()
-                    .any(|d| {
-                        d.syntax_id == *syntax_id
-                            && d.document == *document
-                            && d.name_range.is_some()
-                    })
-                {
-                    return false;
-                }
-                let candidates: Vec<_> = r2
-                    .declarations
-                    .get(syntax_id)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .filter(|d| {
-                        d.syntax_id == *syntax_id
-                            && d.document == *document
-                            && d.name_range.is_some()
-                    })
-                    .collect();
-                if candidates.len() != 1 {
-                    return false;
-                }
-                let declaration = candidates[0];
-                if !destination_sources.contains_key(document) {
-                    return false;
-                }
-                let Some(name) = declaration.name_range.as_ref() else {
-                    return false;
+                let original = if let Some(r1) = r1 {
+                    r1.declarations
+                        .get(syntax_id)
+                        .into_iter()
+                        .flatten()
+                        .any(|d| {
+                            d.syntax_id == *syntax_id
+                                && d.document == *document
+                                && d.name_range.is_some()
+                        })
+                } else {
+                    prior_declarations.contains(&(document.clone(), syntax_id.clone()))
                 };
-                if r2
-                    .sources
-                    .get(document)
-                    .and_then(|s| s.get(name.start..name.end))
-                    != declaration.name.as_deref()
-                {
+                if !original {
                     return false;
+                }
+                if let Some(projection) = target_projection {
+                    if let Some(decl) = projection.get(&(document.clone(), syntax_id.clone())) {
+                        if decl.name_range.end <= decl.name_range.start || decl.name.is_empty() {
+                            return false;
+                        }
+                        if let Some(source) = r2.sources.get(document)
+                            && source.get(decl.name_range.start..decl.name_range.end)
+                                != Some(decl.name.as_str())
+                        {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else {
+                    let candidates: Vec<_> = r2
+                        .declarations
+                        .get(syntax_id)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|d| {
+                            d.syntax_id == *syntax_id
+                                && d.document == *document
+                                && d.name_range.is_some()
+                        })
+                        .collect();
+                    if candidates.len() != 1 || !destination_sources.contains_key(document) {
+                        return false;
+                    }
+                    let declaration = candidates[0];
+                    let Some(name) = declaration.name_range.as_ref() else {
+                        return false;
+                    };
+                    if r2
+                        .sources
+                        .get(document)
+                        .and_then(|s| s.get(name.start..name.end))
+                        != declaration.name.as_deref()
+                    {
+                        return false;
+                    }
                 }
                 *revision_id = destination_native.revision.id.clone();
                 true
@@ -2363,7 +2692,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             let doc = native::DocumentKey {
                 source_set_id: destination_native.revision.source_set_id.clone(),
                 language: claim.language.clone(),
-                path: claim.envelope.relative_path.clone(),
+                path: claim.path.clone(),
             };
             if let Some(targets) = captured_targets.get(&(doc, symbol.key.symbol.clone())) {
                 symbol.declarations = targets.clone();
@@ -2379,7 +2708,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             omitted.insert(Some(native::DocumentKey {
                 source_set_id: destination_native.revision.source_set_id.clone(),
                 language: claim.language.clone(),
-                path: claim.envelope.relative_path.clone(),
+                path: claim.path.clone(),
             }));
         }
     }
@@ -2551,7 +2880,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
     let eligible_proofs: BTreeSet<_> = filtered
         .claims
         .iter()
-        .map(|claim| claim.captured_proof_id.as_str())
+        .map(|claim| claim.proof_id.as_str())
         .collect();
     let mut relationships = Vec::new();
     // Changed B claims need not survive the destination producer join. Its measured
@@ -2576,7 +2905,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             omitted.insert(Some(native::DocumentKey {
                 source_set_id: destination_native.revision.source_set_id.clone(),
                 language: claim.language.clone(),
-                path: claim.envelope.relative_path.clone(),
+                path: claim.path.clone(),
             }));
         }
     }
@@ -2589,11 +2918,11 @@ pub(crate) fn rejoin_inventory_with_reuse(
             .get(&raw_id)
             .copied()
             .context("missing raw fact for joined provenance")?;
-        raw_index.lookup(&raw_id, &claim.envelope.record_kind, &claim.fact_digest)?;
+        raw_index.lookup(&raw_id, &claim.record_kind, &claim.fact_digest)?;
         let doc = native::DocumentKey {
             source_set_id: destination_native.revision.source_set_id.clone(),
             language: claim.language.clone(),
-            path: claim.envelope.relative_path.clone(),
+            path: claim.path.clone(),
         };
         let captured_basis = basis
             .get(&doc)
@@ -2613,10 +2942,12 @@ pub(crate) fn rejoin_inventory_with_reuse(
             .documents
             .get(&doc)
             .context("missing destination document")?;
-        let freshness = if r1
+        let freshness = if captured_native
+            .revision
             .documents
-            .get(&doc)
-            .is_none_or(|d| d.content_hash != dst.content_hash)
+            .iter()
+            .find(|old| old.key == doc)
+            .is_none_or(|old| old.content_hash != dst.content_hash)
         {
             semantic::Freshness::Stale
         } else if captured_basis.revision_id != destination_native.revision.id
@@ -2650,7 +2981,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             freshness,
             derived_from: Some(semantic::DerivedFrom {
                 provenance_id: raw_id,
-                record_kind: serde_json::from_value(serde_json::json!(claim.envelope.record_kind))?,
+                record_kind: serde_json::from_value(serde_json::json!(claim.record_kind))?,
                 fact_digest: claim.fact_digest.clone(),
             }),
         });
@@ -2659,9 +2990,9 @@ pub(crate) fn rejoin_inventory_with_reuse(
     for claim in inventory
         .claims
         .iter()
-        .filter(|c| c.envelope.record_kind != "symbolInformation")
+        .filter(|c| c.record_kind != "symbolInformation")
     {
-        outcomes.insert(claim.captured_proof_id.clone(), 2);
+        outcomes.insert(claim.proof_id.clone(), 2);
     }
     for raw_id in &unsupported_claims {
         outcomes.insert(raw_id.clone(), 4);
@@ -2830,15 +3161,15 @@ pub(crate) fn rejoin_inventory_with_reuse(
                     .ok()
                     .and_then(|v| v.as_str().map(str::to_owned))
                     .unwrap_or_default()
-                && c.envelope.relative_path == row.document_path
-                && c.envelope.record_kind != "symbolInformation"
+                && c.path == row.document_path
+                && c.record_kind != "symbolInformation"
         }) {
             counts[0] += 1;
             let outcome = if row.state == semantic::CoverageState::Failed {
                 2
             } else {
                 *outcomes
-                    .get(&claim.captured_proof_id)
+                    .get(&claim.proof_id)
                     .context("missing rejoin claim outcome")?
             };
             counts[outcome] += 1;
@@ -2903,6 +3234,105 @@ pub(crate) fn rejoin_inventory_with_reuse(
         },
         report,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rejoin_inventory_with_original_witness(
+    inventory: &crate::scip_raw::ProofInventory,
+    captured_native: &native::Artifact,
+    destination_native: &native::Artifact,
+    changed_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    producer: semantic::Producer,
+    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
+    original: &semantic::SemanticSnapshot,
+    reusable: &BTreeSet<native::DocumentKey>,
+    current_targets: &BTreeMap<(native::DocumentKey, String), semantic::TargetDeclaration>,
+    shared_changed_index: &MeasuredFacts<'_>,
+) -> Result<Option<RejoinResult>> {
+    if inventory.source_manifest_hash != manifest_hash(&captured_native.revision)
+        || captured_native.revision.source_set_id != destination_native.revision.source_set_id
+    {
+        return Ok(None);
+    }
+    let Some(captured) = original_associations_from_selected(original, inventory, &producer.id)
+    else {
+        return Ok(None);
+    };
+    let raw_index = ProofIdentityIndex::new(inventory)?;
+    let mut filtered = inventory.clone();
+    filtered.claims.retain(|claim| {
+        reusable
+            .iter()
+            .any(|doc| doc.language == claim.language && doc.path == claim.path)
+    });
+    let filtered_index = ProofIdentityIndex::new(&filtered)?;
+    let destination = reuse_captured_source_associations(
+        &captured,
+        reusable,
+        inventory,
+        &destination_native.revision.source_set_id,
+        &destination_native.revision.id,
+    );
+    let mut r2 = shared_changed_index.clone();
+    for doc in &destination_native.revision.documents {
+        r2.documents.insert(doc.key.clone(), doc);
+    }
+    let exclusions: BTreeMap<_, _> = inventory
+        .exclusions
+        .iter()
+        .map(|row| {
+            (
+                (row.language.as_str(), row.relative_path.as_str()),
+                row.reason.as_str(),
+            )
+        })
+        .collect();
+    let mut requested = BTreeSet::new();
+    let mut failed = BTreeSet::new();
+    for doc in &captured_native.revision.documents {
+        let language: semantic::Language =
+            serde_json::from_value(serde_json::json!(doc.key.language))?;
+        if producer.languages.contains(&language) {
+            let reason = exclusions.get(&(doc.key.language.as_str(), doc.key.path.as_str()));
+            if reason != Some(&"notRequested") {
+                requested.insert(doc.key.clone());
+            }
+            if reason == Some(&"failed")
+                || (reason != Some(&"notRequested") && !reusable.contains(&doc.key))
+            {
+                failed.insert(doc.key.clone());
+            }
+        }
+    }
+    for claim in &inventory.claims {
+        requested.insert(native::DocumentKey {
+            source_set_id: captured_native.revision.source_set_id.clone(),
+            language: claim.language.clone(),
+            path: claim.path.clone(),
+        });
+    }
+    finish_rejoin(
+        inventory,
+        captured_native,
+        destination_native,
+        changed_sources,
+        producer,
+        basis,
+        None,
+        &r2,
+        Some(current_targets),
+        &raw_index,
+        &filtered_index,
+        &filtered,
+        &exclusions,
+        captured,
+        destination,
+        requested,
+        failed,
+        BTreeSet::new(),
+        BTreeSet::new(),
+    )
+    .map(Some)
 }
 
 fn manifest_hash(revision: &native::Revision) -> String {
