@@ -119,6 +119,44 @@ def provenance(archive, source_root, version, target, commit, smoke_report):
     return result
 
 
+def validate_tag(source_root, tag, commit):
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(source_root), *args], text=True).strip()
+    if git("rev-parse", "--verify", commit + "^{commit}") != commit:
+        raise ValueError("commit must be the full tagged commit hash")
+    if git("rev-parse", "HEAD") != commit or git("rev-parse", "--verify", "refs/tags/" + tag + "^{commit}") != commit:
+        raise ValueError("checkout, tag and event commit must match")
+    import tomllib
+    version = tomllib.loads(git("show", commit + ":Cargo.toml"))["package"]["version"]
+    archive_name(version, next(iter(TARGETS)))
+    if tag != "v" + version:
+        raise ValueError("release tag must be v<Cargo package version>: v" + version)
+    return {"tag": tag, "version": version, "commit": commit}
+
+
+def release_assets(artifact_dir, version, commit):
+    expected_dirs = {"candidate-" + target for target in TARGETS}
+    if {path.name for path in artifact_dir.iterdir()} != expected_dirs:
+        raise ValueError("release requires exactly the three native candidate artifacts")
+    assets = []
+    for target in TARGETS:
+        archive = artifact_dir / ("candidate-" + target) / archive_name(version, target)
+        checksum = Path(str(archive) + ".sha256")
+        provenance_path = Path(str(archive) + ".provenance.json")
+        digest = sha256(archive.read_bytes())
+        if checksum.read_text() != digest + "  " + archive.name + "\n":
+            raise ValueError("release checksum mismatch: " + archive.name)
+        recorded = json.loads(provenance_path.read_text())
+        if (recorded["schemaVersion"] != 1 or recorded["archive"] != archive.name
+                or recorded["archiveSha256"] != digest):
+            raise ValueError("release provenance archive mismatch: " + archive.name)
+        for key, expected in (("version", version), ("target", target), ("commit", commit)):
+            if recorded["build"][key] != expected:
+                raise ValueError("release provenance {} mismatch: {}".format(key, archive.name))
+        assets.extend((archive, checksum, provenance_path))
+    return assets
+
+
 def parse_elf(header, program_headers, versions, dynamic, target):
     if target not in TARGETS or TARGETS[target] is None:
         raise ValueError("ELF audit requires a supported Linux target")
@@ -201,13 +239,25 @@ def main():
     audit = commands.add_parser("audit-elf")
     audit.add_argument("--binary", type=Path, required=True)
     audit.add_argument("--target", choices=TARGETS, required=True)
+    tag = commands.add_parser("validate-tag")
+    tag.add_argument("--source-root", type=Path, required=True)
+    tag.add_argument("--tag", required=True)
+    tag.add_argument("--commit", required=True)
+    assets = commands.add_parser("assets")
+    assets.add_argument("--artifact-dir", type=Path, required=True)
+    assets.add_argument("--version", required=True)
+    assets.add_argument("--commit", required=True)
     args = vars(parser.parse_args())
     command = args.pop("command")
     try:
-        result = {"package": package, "provenance": provenance, "audit-elf": audit_elf}[command](**args)
+        result = {"package": package, "provenance": provenance, "audit-elf": audit_elf,
+                  "validate-tag": validate_tag, "assets": release_assets}[command](**args)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError, tarfile.TarError) as error:
         parser.exit(1, "release: {}\n".format(error))
-    print(json.dumps(result, indent=2, sort_keys=True) if isinstance(result, dict) else str(result))
+    if isinstance(result, list):
+        print("\n".join(str(path) for path in result))
+    else:
+        print(json.dumps(result, indent=2, sort_keys=True) if isinstance(result, dict) else str(result))
 
 
 if __name__ == "__main__":
