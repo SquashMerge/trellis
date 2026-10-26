@@ -416,6 +416,8 @@ impl EvidenceResponse {
         hash: &str,
         provenance: &crate::native_evidence::Provenance,
     ) -> Result<McpCheckedSource> {
+        #[cfg(test)]
+        super::count_selected_read(|counts| counts.source_reads += 1);
         use sha2::{Digest, Sha256};
         let scope =
             v8_native_scope_for(&self.db, &declaration.document, selected)?.ok_or_else(|| {
@@ -1673,8 +1675,14 @@ impl EvidenceResponse {
             .ok_or_else(|| {
                 self.corrupt_evidence("store_unavailable: incoming selected provenance absent")
             })?;
-        let selected_source =
-            self.mcp_document_version(&selected, &owner.declaration, &owner.content_hash, proof)?;
+        let mut source_cache = BTreeMap::new();
+        let selected_source = self.mcp_checked_source(
+            &mut source_cache,
+            &selected,
+            &owner.declaration,
+            &owner.content_hash,
+            proof,
+        )?;
         let owner_lines = selected_source.item(&owner.declaration.range)?;
         let mut calls = Vec::new();
         let mut same_name_declarations = 0;
@@ -1830,7 +1838,13 @@ impl EvidenceResponse {
                     freshness: "fresh".into(),
                     derived_from: None,
                 };
-                let checked = self.mcp_document_version(&selected, caller, hash, &provenance)?;
+                let checked = self.mcp_checked_source(
+                    &mut source_cache,
+                    &selected,
+                    caller,
+                    hash,
+                    &provenance,
+                )?;
                 let bytes = &checked.lines.bytes;
                 let text = std::str::from_utf8(bytes)
                     .map_err(|_| anyhow::anyhow!("store_unavailable: incoming source encoding"))?;
