@@ -142,7 +142,7 @@ between calls at one basis. No cross-call equality, backend equality or runtime-
 ranking guarantee is added. Existing within-call ordering and typed numerical validity must
 still hold; non-finite/malformed vectors cannot enter cosine ordering as valid rows.
 
-## Optional vector budget (owner follow-up, 2026-10-26)
+## Optional vector budget (supervisor review direction, 2026-10-26)
 
 The call deadline stays 5,000ms. Optional vector work uses one absolute 3,000ms budget from
 protocol acceptance, including admission, verification/read, load, embedding, cache access
