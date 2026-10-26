@@ -924,6 +924,8 @@ fn gc_age_and_derived_inventory_are_read_only() {
     }
     let empty = roots.gc_report_at(now).unwrap();
     assert!(empty.derived.is_empty());
+    assert_eq!(empty.vectors.bytes, 0);
+    assert_eq!(empty.vectors.entries, 0);
     assert!(!roots.cache.exists() && !roots.data.exists());
     let store = common::open_store(temp.path(), &work).unwrap();
     drop(store);
@@ -1678,4 +1680,23 @@ fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
         roots.automatic_gc_at(&id, &writer, now + 86_399).unwrap(),
         0
     );
+}
+
+#[test]
+fn vector_report_is_machine_wide_and_does_not_create_checkout_state() {
+    let (temp, roots) = common::fixture();
+    roots.prepare_vectors().unwrap();
+    let mut cache = trellis::search_vectors::VectorCacheWriter::open(&roots.vectors_db()).unwrap();
+    cache
+        .put(&"a".repeat(64), &"b".repeat(64), &[1, -2, 3])
+        .unwrap();
+    drop(cache);
+    let before = gc_manifest(temp.path());
+    let report = roots.gc_report_at(1_800_000_000).unwrap();
+    assert_eq!(report.vectors.entries, 1);
+    assert!(report.vectors.bytes > 0);
+    assert!(report.derived.is_empty());
+    assert_eq!(before, gc_manifest(temp.path()));
+    assert!(!roots.cache.join("indexes").exists());
+    assert!(!roots.data.exists());
 }

@@ -142,6 +142,13 @@ impl TopologyRoots {
     pub fn index_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("index.db")
     }
+    pub fn vectors_db(&self) -> PathBuf {
+        self.cache.join("vectors.db")
+    }
+    /// Prepare only the machine-wide cache, without opening a checkout index.
+    pub fn prepare_vectors(&self) -> Result<()> {
+        managed_tree(&self.cache)
+    }
     pub fn requests_db(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("requests.db")
     }
@@ -1110,6 +1117,7 @@ impl WriterSession {
 #[serde(rename_all = "camelCase")]
 pub struct GcReport {
     pub derived: Vec<DerivedReport>,
+    pub vectors: crate::search_vectors::VectorCacheReport,
 }
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1595,7 +1603,10 @@ impl TopologyRoots {
             }
             derived.sort_by(|a, b| a.root_key.cmp(&b.root_key));
         }
-        Ok(GcReport { derived })
+        Ok(GcReport {
+            derived,
+            vectors: crate::search_vectors::report_existing(&self.vectors_db())?,
+        })
     }
 }
 

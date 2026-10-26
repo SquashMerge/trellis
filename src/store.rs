@@ -2471,7 +2471,7 @@ impl Drop for ProtectedSqliteConnection {
         clean_retired_sqlite_witness(&mut registry, &self.key.0);
     }
 }
-fn protected_sqlite_open(
+pub(crate) fn protected_sqlite_open(
     path: &Path,
     flags: rusqlite::OpenFlags,
 ) -> Result<ProtectedSqliteConnection> {
@@ -2753,7 +2753,41 @@ fn release_deleted_sqlite_witness_kind(
     Ok(())
 }
 
-fn retained_sqlite_file(
+/// Discard a disposable cache only after all local SQLite openers have closed.
+/// Retained descriptors are released under the same opener registry, never
+/// while a connection or an in-progress opener could still depend on its locks.
+pub(crate) fn discard_sqlite_cache(path: &Path) -> Result<()> {
+    let path = std::fs::canonicalize(path.parent().context("cache parent missing")?)?
+        .join(path.file_name().context("cache filename missing")?);
+    let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+    if registry.live.keys().any(|(named, _, _)| named == &path)
+        || registry
+            .by_path
+            .get(&path)
+            .is_some_and(|files| files.iter().any(|file| Arc::strong_count(file) != 1))
+    {
+        return Err(topology::StorageBusy.into());
+    }
+    let removed = (|| -> Result<()> {
+        for suffix in ["-journal", "-wal", "-shm", ""] {
+            let file = path.with_file_name(format!(
+                "{}{suffix}",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            match std::fs::remove_file(file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    })();
+    registry.retired.insert(path.clone());
+    clean_retired_sqlite_witness(&mut registry, &path);
+    removed
+}
+
+pub(crate) fn retained_sqlite_file(
     path: &Path,
     writable: bool,
     create: bool,
