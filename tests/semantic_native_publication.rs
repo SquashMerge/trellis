@@ -89,7 +89,10 @@ fn selected_case(change_b: &str) {
     fs::write(root.join("src/B.js"), b).unwrap();
     if matches!(
         change_b,
-        "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
+        "two_producers"
+            | "oracle_two_producers"
+            | "oracle_fork_two_producers"
+            | "oracle_fork_healthy_two_producers"
     ) {
         fs::write(root.join("src/C.py"), "def helper(): return 1\n").unwrap();
     }
@@ -300,7 +303,10 @@ fn selected_case(change_b: &str) {
     let imported = run(&home, &args);
     let imported = if matches!(
         change_b,
-        "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
+        "two_producers"
+            | "oracle_two_producers"
+            | "oracle_fork_two_producers"
+            | "oracle_fork_healthy_two_producers"
     ) {
         let python = profile["semanticProducers"]
             .as_array()
@@ -520,7 +526,10 @@ fn selected_case(change_b: &str) {
         copy_seed(&home, &fork);
         fs::remove_file(fork.join("full-oracle")).unwrap();
         fs::write(fork.join("force-full"), b"1").unwrap();
-        if change_b == "oracle_fork_context" {
+        if matches!(
+            change_b,
+            "oracle_fork_context" | "oracle_fork_healthy_two_producers"
+        ) {
             fs::remove_file(home.join("full-oracle")).unwrap();
             fs::write(home.join("work-counts"), b"1").unwrap();
         }
@@ -546,14 +555,16 @@ fn selected_case(change_b: &str) {
     } else {
         (None, store)
     };
+    if change_b == "oracle_fork_healthy_two_producers" {
+        let selected = store.selected_raw_inputs_at(prior).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|input| !input.proofs.is_empty()));
+    }
     if matches!(
         change_b,
         "corrupt_capture" | "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
     ) {
-        if matches!(
-            change_b,
-            "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
-        ) {
+        if change_b != "corrupt_capture" {
             assert_eq!(store.selected_raw_inputs_at(prior).unwrap().len(), 2);
         }
         store.with_index_sql_for_tests(|db| {
@@ -909,6 +920,54 @@ fn selected_case(change_b: &str) {
             "native FULL does not enter the LOCAL fallback: {work}"
         );
     }
+    if change_b == "oracle_fork_healthy_two_producers" {
+        let work: Value =
+            serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+        assert_eq!(work["destinationIndexBuilds"], 1, "{work}");
+        assert_eq!(work["destinationJoinsOnReusedDocuments"], 0, "{work}");
+        // Only A and C contain captured source claims; B is a changed native
+        // target and must be indexed, not parsed as a destination source claim.
+        assert_eq!(work["destinationRoleParses"], 0, "{work}");
+        assert_eq!(work["destinationDocumentRows"], 3, "{work}");
+        assert!(work["originalRoleParses"].as_u64().unwrap() > 0, "{work}");
+        let (next_native, _) = store.retained_native_snapshot_at(next).unwrap();
+        let changed_target = next_native
+            .declarations
+            .iter()
+            .find(|row| row.document.path == "src/B.js" && row.name.as_deref() == Some("target"))
+            .unwrap();
+        assert_ne!(
+            next_native
+                .revision
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "src/B.js")
+                .unwrap()
+                .content_hash,
+            native
+                .revision
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "src/B.js")
+                .unwrap()
+                .content_hash,
+            "the changed B target must be measured from new bytes",
+        );
+        assert!(
+            snapshot.call_bindings.iter().any(|call| {
+                matches!(
+                    &call.declared_target,
+                    Some(trellis::semantic_evidence::Target::Internal {
+                        syntax_id,
+                        revision_id,
+                        ..
+                    }) if syntax_id == &changed_target.syntax_id
+                        && revision_id == &next_native.revision.id
+                )
+            }),
+            "changed B declaration must resolve the unchanged A source: {snapshot:?}"
+        );
+    }
     if matches!(change_b, "oracle_body" | "oracle_two_producers") {
         let work: Value =
             serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
@@ -1061,12 +1120,39 @@ fn selected_case(change_b: &str) {
                 .unwrap(),
             "forked selected FULL/LOCAL report differs",
         );
+        if change_b == "oracle_fork_healthy_two_producers" {
+            for producer in ["scip-typescript", "scip-python"] {
+                assert!(
+                    snapshot.coverage.iter().any(|row| {
+                        row.producer_id == producer
+                            && row.selected
+                            && row.requested
+                            && row.state == trellis::semantic_evidence::CoverageState::Complete
+                    }),
+                    "missing healthy selected coverage for {producer}: {snapshot:?}"
+                );
+                assert!(
+                    snapshot.provenance.iter().any(|proof| {
+                        proof.producer_id == producer && proof.derived_from.is_some()
+                    }),
+                    "missing selected proof for {producer}: {snapshot:?}"
+                );
+                assert_eq!(
+                    store.semantic_import_report_at(next, producer).unwrap(),
+                    oracle.semantic_import_report_at(full, producer).unwrap(),
+                    "forked selected FULL/LOCAL report differs for {producer}",
+                );
+            }
+        }
     }
     assert_eq!(
         store.selected_raw_inputs_at(next).unwrap().len(),
         if matches!(
             change_b,
-            "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
+            "two_producers"
+                | "oracle_two_producers"
+                | "oracle_fork_two_producers"
+                | "oracle_fork_healthy_two_producers"
         ) {
             2
         } else {
@@ -1473,6 +1559,11 @@ fn forked_seeded_local_matches_forced_full_oracle() {
         eprintln!("forked oracle scenario: {scenario}");
         selected_case(scenario);
     }
+}
+
+#[test]
+fn two_healthy_producers_share_one_incremental_destination() {
+    selected_case("oracle_fork_healthy_two_producers");
 }
 
 #[test]
