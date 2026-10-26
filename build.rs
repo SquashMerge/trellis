@@ -5,6 +5,7 @@
 include!("build/extractor_inputs.rs");
 
 fn main() {
+    build_identity();
     let read = |path: &str| {
         println!("cargo:rerun-if-changed={path}");
         std::fs::read(path).unwrap_or_else(|error| panic!("read {path}: {error}"))
@@ -23,5 +24,49 @@ fn main() {
     println!(
         "cargo:rustc-env=TRELLIS_EXTRACTOR_HASH={}",
         extractor_hash(&modules, &lock, test_support)
+    );
+}
+
+/// Build metadata is independent of the extractor and never enters index identity.
+fn build_identity() {
+    use std::{env, process::Command};
+
+    println!("cargo:rerun-if-env-changed=TRELLIS_BUILD_COMMIT");
+    let commit = match env::var("TRELLIS_BUILD_COMMIT") {
+        Ok(commit) => {
+            assert!(
+                !commit.trim().is_empty(),
+                "TRELLIS_BUILD_COMMIT must not be empty"
+            );
+            commit
+        }
+        Err(env::VarError::NotPresent) => "dev".into(),
+        Err(error) => panic!("TRELLIS_BUILD_COMMIT: {error}"),
+    };
+    let mut features: Vec<_> = env::vars()
+        .filter_map(|(key, _)| {
+            key.strip_prefix("CARGO_FEATURE_")
+                .map(|feature| feature.to_ascii_lowercase().replace('_', "-"))
+        })
+        .collect();
+    features.sort();
+    let rustc = Command::new(env::var_os("RUSTC").expect("Cargo provides RUSTC"))
+        .arg("--version")
+        .output()
+        .expect("read rustc version");
+    assert!(rustc.status.success(), "rustc --version failed");
+    let toolchain = String::from_utf8(rustc.stdout).expect("rustc version is UTF-8");
+    println!("cargo:rustc-env=TRELLIS_BUILD_COMMIT={commit}");
+    println!(
+        "cargo:rustc-env=TRELLIS_BUILD_TARGET={}",
+        env::var("TARGET").expect("Cargo provides TARGET")
+    );
+    println!(
+        "cargo:rustc-env=TRELLIS_BUILD_FEATURES={}",
+        features.join(",")
+    );
+    println!(
+        "cargo:rustc-env=TRELLIS_BUILD_TOOLCHAIN={}",
+        toolchain.trim()
     );
 }

@@ -5,6 +5,7 @@ mod behavior_java;
 pub mod behavior_js;
 mod behavior_python;
 mod behavior_rust;
+pub mod build_info;
 pub mod capture;
 pub mod class_diagram;
 pub mod classes;

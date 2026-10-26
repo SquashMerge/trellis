@@ -18,7 +18,7 @@ use trellis::{
 #[derive(Parser)]
 #[command(
     name = "trellis",
-    version,
+    version = trellis::build_info::version(),
     about = "Local, read-only JavaScript, Rust, Java and Python code index and inspection daemon"
 )]
 struct Cli {

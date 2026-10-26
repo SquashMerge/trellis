@@ -1,0 +1,94 @@
+name: Release candidates
+# Candidate builds only until #338's full-model/Metal qualification gate is provisioned.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release-candidates.yml'
+      - 'tools/release/**'
+      - 'tools/release-smoke.py'
+      - 'tools/release-linux.Dockerfile'
+      - 'src/build_info.rs'
+      - 'tests/build_identity.rs'
+permissions:
+  contents: read
+jobs:
+  candidate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: Confirm native target and read pinned inputs
+        shell: bash
+        run: |
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          echo "TRELLIS_BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          python3 -c 'import tomllib; print("RELEASE_VERSION=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])' >> "$GITHUB_ENV"
+      - name: Native suite
+        run: ./tools/verify
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
+          TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Build Metal candidate
+        if: runner.os == 'macOS'
+        run: cargo build --locked --release --no-default-features --features metal --bin trellis --target ${{ matrix.target }}
+      - name: Metal feature tests
+        if: runner.os == 'macOS'
+        run: |
+          cargo clippy --locked --all-targets --no-default-features --features metal -- -D warnings
+          cargo nextest run --locked --all-targets --no-fail-fast --no-default-features --features test-support,metal
+      - name: Build native glibc 2.31 candidate
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker build -f tools/release-linux.Dockerfile -t trellis-release-glibc231 .
+          docker run --rm -v "$PWD:/work" -e TRELLIS_BUILD_COMMIT -e CARGO_BUILD_JOBS=2 trellis-release-glibc231 cargo build --locked --release --no-default-features --bin trellis --target ${{ matrix.target }}
+      - name: Package candidate bytes
+        shell: bash
+        run: |
+          python3 tools/release/release.py package --binary 'target/${{ matrix.target }}/release/trellis' --license LICENSE --version "$RELEASE_VERSION" --target '${{ matrix.target }}' --source-date-epoch "$SOURCE_DATE_EPOCH" --output-dir dist
+          mkdir extracted
+          tar -xzf "dist/trellis-$RELEASE_VERSION-${{ matrix.target }}.tar.gz" -C extracted
+      - name: Smoke archived binary on native host
+        run: python3 tools/release-smoke.py --binary extracted/trellis --source . --output dist/smoke-${{ matrix.target }}.json
+      - name: Audit ELF and execute archived bytes on baseline userspace
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/work" trellis-release-glibc231 python3 tools/release/release.py audit-elf --binary extracted/trellis --target '${{ matrix.target }}' > 'dist/elf-${{ matrix.target }}.json'
+          docker run --rm -v "$PWD:/work" trellis-release-glibc231 python3 tools/release-smoke.py --binary extracted/trellis --source . --output 'dist/baseline-smoke-${{ matrix.target }}.json'
+      - name: Record checked candidate provenance
+        shell: bash
+        run: |
+          python3 tools/release/release.py provenance --archive "dist/trellis-$RELEASE_VERSION-${{ matrix.target }}.tar.gz" --source-root . --version "$RELEASE_VERSION" --target '${{ matrix.target }}' --commit "$TRELLIS_BUILD_COMMIT" --smoke-report 'dist/smoke-${{ matrix.target }}.json'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
