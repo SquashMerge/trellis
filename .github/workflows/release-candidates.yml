@@ -1,6 +1,7 @@
 name: Release candidates
-# Candidate builds only until #338's full-model/Metal qualification gate is provisioned.
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
   pull_request:
     paths:
@@ -12,8 +13,40 @@ on:
       - 'tests/build_identity.rs'
 permissions:
   contents: read
+# Never cancel publication midway through its draft/upload/publish sequence.
+concurrency:
+  group: release-candidates-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        with:
+          python-version: '3.12'
+      - name: Validate tag against Cargo version and full source commit
+        id: tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          python3 tools/release/release.py validate-tag --source-root . --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" > release-tag.json
+          python3 -c 'import json; r=json.load(open("release-tag.json")); print("version=" + r["version"]); print("commit=" + r["commit"])' >> "$GITHUB_OUTPUT"
+      - name: Nonpublishing candidate run
+        if: github.event_name != 'push'
+        run: echo 'Manual and pull-request candidates do not publish.'
   candidate:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +65,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -57,9 +91,13 @@ jobs:
           TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}
       - name: Build Metal candidate
         if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '14.0'
         run: cargo build --locked --release --no-default-features --features metal --bin trellis --target ${{ matrix.target }}
       - name: Metal feature tests
         if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '14.0'
         run: |
           cargo clippy --locked --all-targets --no-default-features --features metal -- -D warnings
           cargo nextest run --locked --all-targets --no-fail-fast --no-default-features --features test-support,metal
@@ -92,3 +130,61 @@ jobs:
           name: candidate-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [validate, candidate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Recheck tag and full commit before publishing
+        run: python3 tools/release/release.py validate-tag --source-root . --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: candidate-*
+          path: release-artifacts
+      - name: Check all three same-run archives, checksums and provenance
+        run: python3 tools/release/release.py assets --artifact-dir release-artifacts --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT" > release-assets.txt
+      - name: Prepare release notes
+        run: |
+          cat > release-notes.md <<'NOTES'
+          Native builds from the tagged source: macOS 14+ arm64 with Metal and CPU fallback; Linux x86_64 and arm64 CPU with glibc 2.31 or newer.
+
+          Each target includes an archive, SHA-256 checksum and build provenance. Builds are rebuildable from the tagged source; bit-identical rebuilds are not claimed.
+
+          No model weights are bundled. Configure the model path separately; Trellis verifies the pinned model hash.
+
+          macOS binaries are not signed or notarized. After a browser download and extraction, remove quarantine with:
+          ```sh
+          xattr -d com.apple.quarantine trellis
+          ```
+          Downloads via `curl` or `gh release download`, and source builds, are not quarantined.
+          NOTES
+      - name: Create draft with all assets, then publish
+        shell: bash
+        run: |
+          # List includes authenticated drafts; API errors stop before any write.
+          # On failure, inspect/delete only the failed draft before rerunning.
+          gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name' > existing-release-tags.txt
+          python3 -c 'import os, pathlib; tags=pathlib.Path("existing-release-tags.txt").read_text().splitlines(); tag=os.environ["RELEASE_TAG"]; tag not in tags or exit("Release already exists; refusing to replace it.")'
+          mapfile -t assets < release-assets.txt
+          release_flags=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" --verify-tag --target "$RELEASE_COMMIT" --draft --title "$RELEASE_TAG" --notes-file release-notes.md "${release_flags[@]}" "${assets[@]}"
+          gh release edit "$RELEASE_TAG" --draft=false

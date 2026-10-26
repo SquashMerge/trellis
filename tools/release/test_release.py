@@ -125,7 +125,10 @@ class PackagingTests(unittest.TestCase):
                      "web/index.html", "tools/release-linux.Dockerfile", "LICENSE"):
             file = source / path
             file.parent.mkdir(parents=True, exist_ok=True)
-            file.write_bytes(self.license.read_bytes() if path == "LICENSE" else ("tagged " + path).encode())
+            data = self.license.read_bytes() if path == "LICENSE" else ("tagged " + path).encode()
+            if path == "Cargo.toml":
+                data = b'[package]\nname = "trellis"\nversion = "0.1.0"\n'
+            file.write_bytes(data)
         def git(*args):
             return subprocess.check_output(["git", "-C", str(source), *args], stderr=subprocess.DEVNULL).decode().strip()
         git("init", "-q")
@@ -134,6 +137,27 @@ class PackagingTests(unittest.TestCase):
         commit = git("rev-parse", "HEAD")
         git("tag", "v0.1.0")
         return source, commit
+
+    def test_release_tag_matches_cargo_and_full_checked_out_commit(self):
+        source, commit = self.tagged_repo()
+        expected = {"tag": "v0.1.0", "version": "0.1.0", "commit": commit}
+        self.assertEqual(release.validate_tag(source, "v0.1.0", commit), expected)
+        subprocess.check_call(["git", "-C", str(source), "-c", "user.name=Release Test", "-c",
+                               "user.email=release@example.invalid", "tag", "-f", "-a", "v0.1.0", "-m", "release"],
+                              stdout=subprocess.DEVNULL)
+        self.assertEqual(release.validate_tag(source, "v0.1.0", commit), expected)
+        with self.assertRaisesRegex(ValueError, "full tagged commit"):
+            release.validate_tag(source, "v0.1.0", commit[:12])
+        subprocess.check_call(["git", "-C", str(source), "tag", "v0.2.0", commit])
+        with self.assertRaisesRegex(ValueError, "Cargo package version"):
+            release.validate_tag(source, "v0.2.0", commit)
+        subprocess.check_call(["git", "-C", str(source), "-c", "user.name=Release Test", "-c",
+                               "user.email=release@example.invalid", "commit", "--allow-empty", "-qm", "later"])
+        with self.assertRaisesRegex(ValueError, "checkout, tag and event commit"):
+            release.validate_tag(source, "v0.1.0", commit)
+        later = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        with self.assertRaisesRegex(ValueError, "checkout, tag and event commit"):
+            release.validate_tag(source, "v0.1.0", later)
 
     def report(self, source, commit, target=LINUX):
         metal = target.endswith("apple-darwin")
@@ -199,6 +223,79 @@ class PackagingTests(unittest.TestCase):
         report.write_text(json.dumps(data))
         with self.assertRaisesRegex(ValueError, "shipping features"):
             release.provenance(archive, source, "0.1.0", target, commit, report)
+
+
+class ReleaseAssetsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.commit = "a" * 40
+        self.assets = []
+        for target in release.TARGETS:
+            directory = self.root / ("candidate-" + target)
+            directory.mkdir()
+            archive = directory / release.archive_name("0.1.0", target)
+            archive.write_bytes(("checked archive " + target).encode())
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            checksum = Path(str(archive) + ".sha256")
+            checksum.write_text(digest + "  " + archive.name + "\n")
+            provenance = Path(str(archive) + ".provenance.json")
+            provenance.write_text(json.dumps({"schemaVersion": 1, "archive": archive.name,
+                                             "archiveSha256": digest,
+                                             "build": {"version": "0.1.0", "target": target, "commit": self.commit}}))
+            # Smoke/audit reports stay in CI; only the three public files are selected.
+            (directory / ("smoke-" + target + ".json")).write_text("{}")
+            self.assets.extend((archive, checksum, provenance))
+
+    def select(self):
+        return release.release_assets(self.root, "0.1.0", self.commit)
+
+    def test_selects_all_nine_assets_without_extra_ci_reports(self):
+        self.assertEqual(self.select(), self.assets)
+
+    def test_requires_all_three_artifacts_and_each_public_file(self):
+        directory = self.root / "candidate-unexpected"
+        directory.mkdir()
+        with self.assertRaisesRegex(ValueError, "exactly the three"):
+            self.select()
+        directory.rmdir()
+        directory = self.assets[0].parent
+        moved = directory.with_name("missing")
+        directory.rename(moved)
+        with self.assertRaisesRegex(ValueError, "exactly the three"):
+            self.select()
+        moved.rename(directory)
+        for path in self.assets[:3]:
+            original = path.read_bytes()
+            path.unlink()
+            with self.subTest(path=path.name), self.assertRaises(FileNotFoundError):
+                self.select()
+            path.write_bytes(original)
+
+    def test_rejects_mismatched_archive_checksum_and_provenance(self):
+        archive, checksum, provenance = self.assets[:3]
+        original = archive.read_bytes()
+        archive.write_bytes(b"different archive")
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            self.select()
+        archive.write_bytes(original)
+        original = checksum.read_text()
+        checksum.write_text(original.replace(archive.name, "wrong.tar.gz"))
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            self.select()
+        checksum.write_text(original)
+        recorded = json.loads(provenance.read_text())
+        for key, wrong in (("schemaVersion", 2), ("archive", "wrong.tar.gz"), ("archiveSha256", "wrong")):
+            data = dict(recorded, **{key: wrong})
+            provenance.write_text(json.dumps(data))
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "provenance archive mismatch"):
+                self.select()
+        for key, wrong in (("version", "0.2.0"), ("target", "aarch64-apple-darwin"), ("commit", "b" * 40)):
+            data = dict(recorded, build=dict(recorded["build"], **{key: wrong}))
+            provenance.write_text(json.dumps(data))
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "provenance .* mismatch"):
+                self.select()
 
 
 if __name__ == "__main__":

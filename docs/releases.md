@@ -9,14 +9,30 @@ runtime's automatic backend selection and selected-backend status belong to
 #211. Explicit Metal parity runs must fail if Metal is unavailable; CPU fallback
 cannot satisfy that gate.
 
-## Candidate workflow
+## Tagged releases and candidates
 
-The manually dispatched `release-candidates.yml` workflow builds the three
-native candidates, runs the native suite, packages them, smokes the archived
-bytes and records checksums/provenance. Linux artifacts also run the smoke in
-the glibc 2.31 build userspace and pass ELF import/dependency checks. These are
-CI artifacts, not GitHub Releases. It has no tag trigger or publication job
-until the complete parity/Metal gate is provisioned and approved.
+The `release-candidates.yml` workflow uses the same three native rows for tag,
+manual and release-path pull-request builds. It runs the native suite, packages
+the binaries, smokes the actual archived bytes and records checksums/provenance.
+Linux archives also pass ELF import/dependency checks and smoke in glibc 2.31
+userspace. The ARM64 macOS build sets deployment target 14.0 and includes Metal with
+automatic CPU fallback. Hosted native smoke runs on the workflow's macOS runner;
+it is not a claim of a separate macOS 14 execution test.
+
+Only a pushed `v<Cargo package version>` tag can publish to GitHub Releases on
+`SquashMerge/trellis`. The tag must match the checked-out package version exactly.
+Publication waits for all three target rows to succeed and attaches their
+archives, per-archive SHA-256 checksums and build provenance. Manual and
+pull-request runs remain CI candidates; they cannot publish. See the
+[owner ruling](https://github.com/SquashMerge/trellis/issues/338#issuecomment-6415629491).
+
+Publication validates all three targets' archives, checksums and provenance from
+that workflow run before creating a draft release. It uploads all nine required
+assets before making the release public. An existing release, including a draft,
+causes failure: published assets are never overwritten. If publication fails
+partway, inspect the unpublished draft, delete that draft explicitly, then rerun.
+Do not delete or replace a public release as a retry step. A Cargo prerelease
+version (for example `0.1.0-rc.1`) is published as a GitHub prerelease.
 
 ## Build and inspect a Linux candidate
 
@@ -52,8 +68,11 @@ cargo build --locked --release --no-default-features --bin trellis \
   --target aarch64-apple-darwin --features metal
 ```
 
-Run Metal feature tests and actual full-model parity on a Mac with a working
-Metal device. Hosted macOS labels do not guarantee device availability.
+Run Metal feature tests on the native Mac. Full-model CPU/Metal parity is a
+separate change-triggered check: re-run it when the model, Candle version or
+embedding code changes, not on every release. A parity run needs a working Metal
+device; hosted macOS labels do not guarantee one, and CPU fallback is not Metal
+parity evidence.
 
 Unsigned browser downloads may be quarantined. After checking the published
 SHA-256 checksum, remove quarantine with:
@@ -66,11 +85,13 @@ xattr -d com.apple.quarantine trellis
 
 ## Qualification before publication
 
-Every target must pass the native suite, archived-binary indexing/status/browser
-smoke, and its backend's full form-c parity gate described in
+Every target must pass the native suite and archived-binary
+indexing/status/browser smoke; Linux also needs the baseline userspace smoke and
+ELF audit. There is **no per-release parity gate**. When the model, Candle version
+or embedding code changes, re-run the full form-c CPU/Metal parity check in
 [semantic-search-candle.md](semantic-search-candle.md). The seven-row fixture is
-not a substitute for all 6,722 cards and 50 queries. Missing external model or
-reference provisioning fails qualification, rather than skipping successfully.
+not a substitute for all 6,722 cards and 50 queries, and a missing model or
+reference corpus is not a successful parity run.
 
 Release archives, SHA-256 checksums and provenance belong on GitHub Releases.
 Provenance records the tagged commit, target, compiled features, toolchain,
@@ -78,7 +99,7 @@ locked inputs and archived bytes. Rebuildable source is not a claim of proven
 bit-for-bit binary reproducibility. No tagged release has been qualified by
 this document alone.
 
-CI parity provisioning and real-Metal execution are pending owner selection on
-#338. Publication must not proceed without that gate. These instructions are
-candidate-build groundwork, not a completed release workflow or a release
-acceptance claim.
+The workflow does not bundle or download model weights. Per-release native
+builds and archived-byte smoke do not claim fresh full-model parity or actual
+Metal inference. No tag creation or release publication is implied by a local
+workflow edit; a real tagged CI run and its assets must be observed separately.
