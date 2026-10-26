@@ -1180,7 +1180,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1860,7 +1860,7 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
 }
 
 #[test]
-fn gc_classifies_current_schema22_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema23_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1912,9 +1912,9 @@ fn gc_classifies_current_schema22_but_refuses_spoofed_shapes() {
     }
     db.pragma_update(None, "user_version", 0).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 23).unwrap();
+    db.pragma_update(None, "user_version", 24).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 22).unwrap();
+    db.pragma_update(None, "user_version", 23).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -1922,7 +1922,7 @@ fn gc_classifies_current_schema22_but_refuses_spoofed_shapes() {
 }
 
 #[test]
-fn complete_schema22_index_remains_gc_eligible() {
+fn complete_schema23_index_remains_gc_eligible() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1931,7 +1931,7 @@ fn complete_schema22_index_remains_gc_eligible() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     let now = 1_800_000_000_i64;
     db.execute(

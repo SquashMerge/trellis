@@ -182,6 +182,12 @@ fn two_document_case(change_b: &str) {
         doc.occurrences.push(occurrence);
         binary.documents.push(doc);
     }
+    if change_b == "zero_claims" {
+        for document in &mut binary.documents {
+            document.occurrences.clear();
+            document.symbols.clear();
+        }
+    }
     let bytes = binary.write_to_bytes().unwrap();
     fs::write(root.join("artifact.scip"), &bytes).unwrap();
     let profile: Value = serde_json::from_str(include_str!(
@@ -567,6 +573,12 @@ fn two_document_case(change_b: &str) {
         let rolled_back = store.index_baseline().unwrap();
         assert!(
             store
+                .selected_raw_inputs_at(rolled_back)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
                 .semantic_at(rolled_back)
                 .unwrap()
                 .call_bindings
@@ -590,6 +602,24 @@ fn two_document_case(change_b: &str) {
     let captured_pin: trellis::model::IndexPin =
         serde_json::from_value(captured["publishedRevision"].clone()).unwrap();
     let captured_semantic = store.semantic_at(captured_pin).unwrap();
+    if change_b == "zero_claims" {
+        assert!(captured_semantic.provenance.is_empty());
+        let selected = store.selected_raw_inputs_at(captured_pin).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            store
+                .retained_native_snapshot_at(selected[0].captured_pin)
+                .unwrap()
+                .0
+                .revision
+                .id,
+            native.revision.id
+        );
+        assert!(selected[0].proofs.is_empty());
+        assert_eq!(selected[0].binary_bytes, bytes);
+        assert_eq!(selected[0].requested_documents.len(), 2);
+        return;
+    }
     if partial {
         if change_b == "partial_empty_covered" {
             let a = captured_semantic
@@ -795,6 +825,27 @@ fn two_document_case(change_b: &str) {
     let joined_pin: trellis::model::IndexPin =
         serde_json::from_value(joined["publishedRevision"].clone()).unwrap();
     let selected = store.semantic_at(joined_pin).unwrap();
+    let selected_inputs = store.selected_raw_inputs_at(joined_pin).unwrap();
+    assert_eq!(selected_inputs.len(), 1);
+    let input = &selected_inputs[0];
+    assert_eq!(input.producer_id, "scip-typescript");
+    assert_eq!(
+        store
+            .retained_native_snapshot_at(input.captured_pin)
+            .unwrap()
+            .0
+            .revision
+            .id,
+        native.revision.id
+    );
+    assert_eq!(input.binary_bytes, bytes);
+    assert!(!input.proofs.is_empty());
+    assert!(
+        input
+            .requested_documents
+            .iter()
+            .any(|d| d.path == "src/A.js")
+    );
     if !matches!(
         change_b,
         "cutoff" | "missing_a_real" | "missing_a" | "ambiguous_a"
@@ -984,6 +1035,11 @@ fn partial_manifest_excluded_b_is_not_requested_in_selected_store_and_report() {
 fn partial_manifest_excluded_unsupported_is_omitted_not_native_capability() {
     two_document_case("partial_unsupported");
 }
+#[test]
+fn accepted_zero_claim_capture_is_selected_without_provenance() {
+    two_document_case("zero_claims");
+}
+
 #[test]
 fn partial_manifest_empty_covered_a_remains_complete_without_claims() {
     two_document_case("partial_empty_covered");

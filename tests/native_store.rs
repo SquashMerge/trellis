@@ -240,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     let count: i64 = db
         .query_row(
@@ -836,7 +836,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        22
+        23
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -3057,7 +3057,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            22
+            23
         );
         assert_eq!(
             rebuilt
@@ -3066,7 +3066,7 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
                     0
                 ))
                 .unwrap(),
-            22
+            23
         );
         for table in [
             "native_version_references",
@@ -3086,6 +3086,78 @@ fn schemas16_and19_recreate_exclusively_without_migration_and_preserve_queue() {
         }
     }
 }
+#[test]
+#[cfg(feature = "test-support")]
+fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let r1 = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_002, 2);
+    let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
+    let capture_id = store.with_index_sql_for_tests(|db| {
+        db.execute("INSERT INTO semantic_raw_captures(producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,manifest_bytes,decoder_version) SELECT 'fixture','artifact',source_set_id,native_revision_id,x'01',x'02','fixture' FROM native_revisions WHERE published_index_revision=?1", [r1.index_revision as i64])?;
+        let capture_id = db.last_insert_rowid();
+        db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,language,path,canonical_bytes) VALUES(?1,'unselected','occurrence',?2,'javascript','flow.js',x'03')",rusqlite::params![capture_id,"a".repeat(64)])?;
+        db.execute("INSERT INTO semantic_revision_raw_selections(revision_id,producer_id,capture_id,captured_pin) VALUES(?1,'fixture',?2,?3)",rusqlite::params![format!("pin:v1:{}:{}",r2.index_generation,r2.index_revision),capture_id,format!("pin:v1:{}:{}",r1.index_generation,r1.index_revision)])?;
+        Ok(capture_id)
+    }).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    assert!(store.release_revision(r1, &leader).is_err());
+    let (retained_native, retained_sources) = store.retained_native_snapshot_at(r1).unwrap();
+    assert!(!retained_native.revision.documents.is_empty());
+    assert!(!retained_native.declarations.is_empty());
+    assert_eq!(
+        retained_sources.len(),
+        retained_native.revision.documents.len()
+    );
+    store
+        .with_index_sql_for_tests(|db| {
+            let retained: i64 = db.query_row(
+                "SELECT count(*) FROM semantic_raw_proofs WHERE capture_id=?1",
+                [capture_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(retained, 1);
+            Ok(())
+        })
+        .unwrap();
+    store.set_retention_clock_for_tests(1_902, 902);
+    store.release_revision(r2, &leader).unwrap();
+    store.release_revision(r1, &leader).unwrap();
+    store
+        .with_index_sql_for_tests(|db| {
+            let selections: i64 = db.query_row(
+                "SELECT count(*) FROM semantic_revision_raw_selections WHERE capture_id=?1",
+                [capture_id],
+                |r| r.get(0),
+            )?;
+            let proofs: i64 = db.query_row(
+                "SELECT count(*) FROM semantic_raw_proofs WHERE capture_id=?1",
+                [capture_id],
+                |r| r.get(0),
+            )?;
+            let captures: i64 = db.query_row(
+                "SELECT count(*) FROM semantic_raw_captures WHERE capture_id=?1",
+                [capture_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!((selections, proofs, captures), (0, 0, 0));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.status().unwrap().revision, r3);
+}
+
 #[test]
 #[cfg(feature = "test-support")]
 fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
@@ -3111,7 +3183,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=23").unwrap();
+    db.execute_batch("PRAGMA user_version=24").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3131,13 +3203,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 22);
+    assert_eq!(metadata_version, 23);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
