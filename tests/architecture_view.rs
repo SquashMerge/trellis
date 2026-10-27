@@ -250,11 +250,9 @@ fn architecture_exceptions_preserve_unexcepted_deviations_and_unknown_evidence()
         .unwrap();
     let target = |v: &Value| {
         format!(
-            "{{source_set='{}',language='{}',path='{}',sid='{}'}}",
-            v["sourceSetId"].as_str().unwrap(),
+            "{{language='{}',path='{}'}}",
             v["language"].as_str().unwrap(),
-            v["path"].as_str().unwrap(),
-            v["sid"].as_str().unwrap()
+            v["path"].as_str().unwrap()
         )
     };
     rules(

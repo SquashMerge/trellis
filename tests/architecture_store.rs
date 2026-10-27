@@ -159,11 +159,9 @@ fn live_config_has_separate_digest_and_exact_pair_exception_round_trips() {
         .unwrap();
     let identity = |value: &Value| {
         format!(
-            "{{ source_set = {:?}, language = {:?}, path = {:?}, sid = {:?} }}",
-            value["sourceSetId"].as_str().unwrap(),
+            "{{ language = {:?}, path = {:?} }}",
             value["language"].as_str().unwrap(),
-            value["path"].as_str().unwrap(),
-            value["sid"].as_str().unwrap()
+            value["path"].as_str().unwrap()
         )
     };
     config(
@@ -256,4 +254,99 @@ fn config_and_pin_failures_are_atomic_and_cancelled_reads_do_not_publish_results
             .to_string()
             .contains("cancelled")
     );
+}
+
+#[test]
+fn portable_exception_matches_two_real_clones_without_replacing_native_identities() {
+    let (_state_a, root_a, store_a, pin_a) = fixture();
+    let (_state_b, root_b, store_b, pin_b) = fixture();
+    let stores = [(&store_a, &root_a, pin_a), (&store_b, &root_b, pin_b)];
+    let mut native_pairs = Vec::new();
+    let portable = format!(
+        "{RULES}\n[[exceptions]]\nrule='$layers'\ntarget={{language='rust',path='src/low.rs'}}\ndestination={{language='rust',path='src/high.rs'}}\nreason='Reviewed portable pair'\n"
+    );
+    for (store, root, pin) in stores {
+        config(root.path(), RULES);
+        let before = read(store, "check", json!({"expectedBasis":pin}));
+        let edge = before["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["rule"] == "$layers" && row["target"]["path"] == "src/low.rs")
+            .unwrap();
+        native_pairs.push((edge["target"].clone(), edge["destination"].clone()));
+        config(root.path(), &portable);
+    }
+    for endpoint in 0..2 {
+        let a = if endpoint == 0 {
+            &native_pairs[0].0
+        } else {
+            &native_pairs[0].1
+        };
+        let b = if endpoint == 0 {
+            &native_pairs[1].0
+        } else {
+            &native_pairs[1].1
+        };
+        assert_ne!(
+            a["sourceSetId"], b["sourceSetId"],
+            "fixture must be distinct clones"
+        );
+        assert_ne!(a["sid"], b["sid"], "native module SIDs must really differ");
+        assert_eq!(a["language"], b["language"]);
+        assert_eq!(a["path"], b["path"]);
+    }
+    assert_eq!(
+        fs::read(root_a.path().join(trellis::rules::RULES_PATH)).unwrap(),
+        fs::read(root_b.path().join(trellis::rules::RULES_PATH)).unwrap()
+    );
+    let mut hashes = Vec::new();
+    for ((store, _root, pin), (target, destination)) in stores.into_iter().zip(native_pairs) {
+        let checked = read(store, "check", json!({"expectedBasis":pin}));
+        hashes.push(checked["rulesFile"]["contentHash"].clone());
+        let row = checked["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["rule"] == "$layers" && row["target"] == target)
+            .unwrap();
+        assert_eq!(row["destination"], destination);
+        assert_eq!(row["status"], "deviates");
+        assert_eq!(row["referenceCount"], 2);
+        assert_eq!(row["excepted"], true);
+        assert_eq!(row["exceptionReason"], "Reviewed portable pair");
+        assert!(!row["evidence"].as_array().unwrap().is_empty());
+        assert_eq!(checked["counts"]["deviates"], 0);
+        let test = &checked["testOnly"][0];
+        assert_eq!(test["target"], target);
+        assert_eq!(test["destination"], destination);
+        assert_eq!(test["excepted"], true);
+        assert_eq!(test["referenceCount"], 1);
+        assert_eq!(test["unresolved"], json!(["test_only"]));
+        let explained = read(
+            store,
+            "explain",
+            json!({"expectedBasis":pin,"rule":"$layers","target":target,"destination":destination}),
+        );
+        assert_eq!(explained["instances"], json!([row]));
+        assert_eq!(explained["testOnly"], json!([test]));
+        let mut wrong = target.clone();
+        wrong["sid"] = json!("sid:v1:00000000000000000000000000000000");
+        let response = store.evidence_response().unwrap();
+        let error = response
+            .architecture_response(
+                "explain",
+                &json!({"expectedBasis":pin,"rule":"$layers","target":wrong,"destination":destination}),
+                &mut || Ok(()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().starts_with("not_found:"), "{error}");
+        assert!(response.architecture_response(
+            "explain",
+            &json!({"expectedBasis":pin,"rule":"$layers","target":{"language":"rust","path":"src/low.rs"},"destination":{"language":"rust","path":"src/high.rs"}}),
+            &mut || Ok(()),
+        ).is_err(), "portable config does not make portable explain identities");
+        response.finish(()).unwrap();
+    }
+    assert_eq!(hashes[0], hashes[1]);
 }

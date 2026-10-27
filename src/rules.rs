@@ -168,12 +168,37 @@ impl ConfigTarget {
         json!({"sourceSetId":self.source_set,"language":self.language,"path":self.path,"sid":self.sid})
     }
 }
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct ModulePathTarget {
+    language: String,
+    path: String,
+}
+impl ModulePathTarget {
+    fn valid(&self) -> bool {
+        languages(&self.language)
+            && !self.path.is_empty()
+            && crate::file_tree::valid_path(&self.path)
+            && !self.path.contains(['*', '?'])
+    }
+    fn matches(&self, identity: &Value, source_set: &str) -> bool {
+        identity["sourceSetId"] == source_set
+            && identity["language"] == self.language
+            && identity["path"] == self.path
+    }
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(untagged)]
+enum ExceptionTarget {
+    Native(ConfigTarget),
+    ModulePath(ModulePathTarget),
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawException {
     rule: Spanned<String>,
-    target: Spanned<ConfigTarget>,
-    destination: Option<Spanned<ConfigTarget>>,
+    target: Spanned<ExceptionTarget>,
+    destination: Option<Spanned<ExceptionTarget>>,
     reason: Spanned<String>,
 }
 struct LayerPattern {
@@ -203,10 +228,17 @@ struct Rule {
     role: String,
     constraints: Vec<Constraint>,
 }
+enum ExceptionKind {
+    Declaration(Value),
+    ModulePair {
+        source: ModulePathTarget,
+        destination: ModulePathTarget,
+        span: std::ops::Range<usize>,
+    },
+}
 struct Exception {
     rule: String,
-    target: Value,
-    destination: Option<Value>,
+    kind: ExceptionKind,
     reason: String,
 }
 pub struct Config {
@@ -636,28 +668,35 @@ pub fn parse(text: &str) -> Result<Config> {
                 "unknown exception rule",
             ));
         }
-        if !target_valid(e.target.get_ref())
-            || e.destination
-                .as_ref()
-                .is_some_and(|d| !target_valid(d.get_ref()))
-        {
-            return Err(error(
-                text,
-                e.target.span(),
-                "reference",
-                "token",
-                "malformed exception target identity",
-            ));
-        }
-        if (e.rule.get_ref() == "$layers") != e.destination.is_some() {
-            return Err(error(
-                text,
-                raw.span(),
-                "reference",
-                "token",
-                "destination is required only for a layer edge exception",
-            ));
-        }
+        let kind = match (
+            e.rule.get_ref().as_str(),
+            e.target.get_ref(),
+            e.destination.as_ref().map(Spanned::get_ref),
+        ) {
+            (
+                "$layers",
+                ExceptionTarget::ModulePath(source),
+                Some(ExceptionTarget::ModulePath(destination)),
+            ) if source.valid() && destination.valid() => ExceptionKind::ModulePair {
+                source: source.clone(),
+                destination: destination.clone(),
+                span: raw.span(),
+            },
+            (rule, ExceptionTarget::Native(target), None)
+                if rule != "$layers" && target_valid(target) =>
+            {
+                ExceptionKind::Declaration(target.wire())
+            }
+            _ => {
+                return Err(error(
+                    text,
+                    raw.span(),
+                    "reference",
+                    "token",
+                    "layer exceptions require two literal language/path endpoints; declaration exceptions require one native identity",
+                ));
+            }
+        };
         if e.reason.get_ref().trim().is_empty() {
             return Err(error(
                 text,
@@ -683,8 +722,7 @@ pub fn parse(text: &str) -> Result<Config> {
         }
         exceptions.push(Exception {
             rule: e.rule.get_ref().clone(),
-            target: e.target.get_ref().wire(),
-            destination: e.destination.as_ref().map(|d| d.get_ref().wire()),
+            kind,
             reason: e.reason.get_ref().clone(),
         });
     }
@@ -843,13 +881,77 @@ fn layer_status(
         ("deviates", vec![])
     }
 }
-fn decorate(config: &Config, row: &mut Value) {
+fn portable_source_set<'a>(
+    config: &Config,
+    snapshot: &'a Snapshot,
+    work: &mut usize,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Option<&'a str>> {
+    let Some(span) = config
+        .exceptions
+        .iter()
+        .find_map(|exception| match &exception.kind {
+            ExceptionKind::ModulePair { span, .. } => Some(span),
+            ExceptionKind::Declaration(_) => None,
+        })
+    else {
+        return Ok(None);
+    };
+    let mut scope = None;
+    for source_set in snapshot
+        .documents
+        .iter()
+        .map(|doc| doc.key.source_set_id.as_str())
+        .chain(
+            snapshot
+                .manifests
+                .iter()
+                .map(|manifest| manifest.source_set_id.as_str()),
+        )
+    {
+        check()?;
+        *work = work.saturating_add(1);
+        ensure!(
+            *work <= WORK_LIMIT,
+            "bounded_work: portable exception scope budget"
+        );
+        if scope.is_some_and(|current| current != source_set) {
+            return Err(error(
+                &config.text,
+                span.clone(),
+                "ambiguity",
+                "token",
+                "portable layer exceptions require one source set across the full checkout",
+            ));
+        }
+        scope = Some(source_set);
+    }
+    scope.map(Some).ok_or_else(|| {
+        error(
+            &config.text,
+            span.clone(),
+            "reference",
+            "token",
+            "portable layer exceptions require an admitted source set",
+        )
+    })
+}
+fn decorate(config: &Config, source_set: Option<&str>, row: &mut Value) {
     if let Some(e) = config.exceptions.iter().find(|e| {
         row["rule"] == e.rule
-            && row["target"] == e.target
-            && e.destination
-                .as_ref()
-                .map_or(row["destination"].is_null(), |d| row["destination"] == *d)
+            && match &e.kind {
+                ExceptionKind::Declaration(target) => {
+                    row["target"] == *target && row["destination"].is_null()
+                }
+                ExceptionKind::ModulePair {
+                    source,
+                    destination,
+                    ..
+                } => source_set.is_some_and(|scope| {
+                    source.matches(&row["target"], scope)
+                        && destination.matches(&row["destination"], scope)
+                }),
+            }
     }) {
         row["excepted"] = json!(true);
         row["exceptionReason"] = json!(e.reason);
@@ -1150,6 +1252,7 @@ pub(crate) fn evaluate_with_layers<'a>(
         "bounded_work: layer assignment pattern budget"
     );
     let mut work = modules.len().saturating_mul(layer_patterns);
+    let source_set = portable_source_set(config, snapshot, &mut work, check)?;
     let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
     let mut assignments = BTreeMap::new();
@@ -1255,7 +1358,7 @@ pub(crate) fn evaluate_with_layers<'a>(
                     "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]});
                 work = work.saturating_add(config.exceptions.len());
                 ensure!(work <= WORK_LIMIT, "bounded_work: exception match budget");
-                decorate(config, &mut row);
+                decorate(config, source_set, &mut row);
                 rows.push(row);
             }
             if denied {
@@ -1395,7 +1498,7 @@ pub(crate) fn evaluate_with_layers<'a>(
                     "constraints":constraints,"evidence":[native_evidence(d)],"unresolved":unresolved,"referenceCount":0});
                 work = work.saturating_add(config.exceptions.len());
                 ensure!(work <= WORK_LIMIT, "bounded_work: exception match budget");
-                decorate(config, &mut row);
+                decorate(config, source_set, &mut row);
                 if test {
                     test_only.push(row)
                 } else {
@@ -1523,5 +1626,56 @@ mod specificity_tests {
             .select("src/aa.rs", &mut { WORK_LIMIT }, &mut || Ok(()))
             .unwrap_err();
         assert!(error.to_string().contains("bounded_work"));
+    }
+}
+
+#[cfg(test)]
+mod portable_exception_tests {
+    use super::*;
+
+    #[test]
+    fn portable_scope_scan_is_cancellable_and_shares_existing_work_limit() {
+        let config = parse("version=1\n[[exceptions]]\nrule='$layers'\ntarget={language='rust',path='a.rs'}\ndestination={language='rust',path='b.rs'}\nreason='Reviewed'").unwrap();
+        let snapshot = Snapshot {
+            pin: crate::model::IndexPin {
+                index_generation: uuid::Uuid::nil(),
+                index_revision: 1,
+            },
+            documents: Vec::new(),
+            manifests: vec![crate::references::external::ManifestInput {
+                source_set_id: "one".into(),
+                native_revision_id: "revision".into(),
+                dependency_hash: "hash".into(),
+                path: "Cargo.toml".into(),
+                content_hash: None,
+                bytes: None,
+            }],
+        };
+        let error = portable_source_set(&config, &snapshot, &mut 0, &mut || {
+            anyhow::bail!("cancelled")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled");
+        let error = portable_source_set(&config, &snapshot, &mut { WORK_LIMIT }, &mut || Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("bounded_work"));
+        let mut work = 17;
+        assert_eq!(
+            portable_source_set(&config, &snapshot, &mut work, &mut || Ok(())).unwrap(),
+            Some("one")
+        );
+        assert_eq!(work, 18);
+        let declarations_only = parse("version=1").unwrap();
+        assert_eq!(
+            portable_source_set(
+                &declarations_only,
+                &snapshot,
+                &mut work,
+                &mut || anyhow::bail!("should not scan")
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(work, 18);
     }
 }
