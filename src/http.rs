@@ -1183,6 +1183,90 @@ impl DaemonState {
             .is_some_and(|fill| fill.building_for(pin))
     }
 
+    pub(crate) fn search_root_key(&self) -> String {
+        self.store.root_key().to_owned()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn search_head_slot_for_tests(
+        &self,
+    ) -> Option<std::sync::Arc<crate::daemon::search_head::HeadSlot>> {
+        self.search_fill
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|fill| fill.head_slot())
+    }
+
+    pub(crate) fn search_head_slot(
+        &self,
+        request: bool,
+    ) -> Option<std::sync::Arc<crate::daemon::search_head::HeadSlot>> {
+        let slot = self
+            .search_fill
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|fill| fill.head_slot());
+        if request && let Some(slot) = &slot {
+            slot.request();
+        }
+        slot
+    }
+
+    pub(crate) fn search_head_update(
+        &self,
+        previous: Option<IndexPin>,
+        check: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<crate::daemon::search_head::HeadUpdate>> {
+        use crate::daemon::search_head::{HeadChange, HeadUpdate};
+        if !matches!(*self.runtime.lock().unwrap(), RuntimeState::Ready(_)) {
+            return Err(crate::daemon::search_fill::SearchDeferred.into());
+        }
+        let response = self.store.evidence_response()?;
+        let pin = response.status()?.revision;
+        let mut check = || check();
+        let update = match previous {
+            Some(previous) if previous == pin => HeadUpdate {
+                pin,
+                declarations: response.mcp_search_head_count(pin, &mut check)?,
+                change: HeadChange::Delta {
+                    removed_version_ids: Vec::new(),
+                    added: std::sync::Arc::from([]),
+                },
+            },
+            Some(previous) => match response.mcp_search_head_delta(previous, pin, &mut check) {
+                Ok(delta) => HeadUpdate {
+                    pin: delta.pin,
+                    declarations: delta.head_card_count,
+                    change: HeadChange::Delta {
+                        removed_version_ids: delta.removed_version_ids,
+                        added: delta.added,
+                    },
+                },
+                Err(error) if error.is::<crate::store::SearchDeltaColdRebuild>() => {
+                    let (pin, cards) = response.mcp_search_head(Some(pin), &mut check)?;
+                    HeadUpdate {
+                        pin,
+                        declarations: cards.len(),
+                        change: HeadChange::Full(cards),
+                    }
+                }
+                Err(error) => return Err(error),
+            },
+            None => {
+                let (pin, cards) = response.mcp_search_head(Some(pin), &mut check)?;
+                HeadUpdate {
+                    pin,
+                    declarations: cards.len(),
+                    change: HeadChange::Full(cards),
+                }
+            }
+        };
+        response.finish(())?;
+        Ok(Some(update))
+    }
+
     pub(crate) fn search_fill_page(
         &self,
         expected: Option<IndexPin>,
@@ -1191,10 +1275,9 @@ impl DaemonState {
     ) -> anyhow::Result<crate::store::HeadSearchCards> {
         // A fill is not a read admission lease: disposable work must never
         // cancel retirement or retain a writer session while loading weights.
-        anyhow::ensure!(
-            matches!(*self.runtime.lock().unwrap(), RuntimeState::Ready(_)),
-            "index_not_ready: checkout is not ready for search fill"
-        );
+        if !matches!(*self.runtime.lock().unwrap(), RuntimeState::Ready(_)) {
+            return Err(crate::daemon::search_fill::SearchDeferred.into());
+        }
         self.store.head_search_cards(expected, after, limit)
     }
 

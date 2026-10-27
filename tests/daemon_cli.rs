@@ -498,6 +498,90 @@ fn status_readiness_does_not_retry_other_failures() {
 }
 
 #[test]
+fn daemon_keeps_accepting_while_search_startup_discovery_is_paused() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::{UnixListener, UnixStream},
+    };
+    use trellis::daemon::protocol;
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let startup_path = home.join("search-startup.sock");
+    let startup_listener = UnixListener::bind(&startup_path).unwrap();
+    startup_listener.set_nonblocking(true).unwrap();
+    let mut command = cli(&home);
+    command
+        .arg("daemon")
+        .env("TRELLIS_TEST_SEARCH_STARTUP_SOCKET", &startup_path)
+        .env("TRELLIS_SEARCH_BACKEND", "cpu")
+        .env_remove("TRELLIS_SEARCH_MODEL");
+    let mut daemon = detached(command);
+    let socket = fixture_socket_paths(&home).socket;
+    let mut startup = None;
+    trellis::testing::wait_until("search startup discovery gate", || {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited before search startup: {}",
+            fixture_daemon_diagnostic(&home, &socket)
+        );
+        match startup_listener.accept() {
+            Ok((stream, _)) => {
+                startup = Some(stream);
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("accept search startup fixture: {error}"),
+        }
+    });
+    let mut startup = startup.unwrap();
+    startup.set_nonblocking(false).unwrap();
+    startup
+        .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    startup
+        .set_write_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut phase = [0];
+    startup.read_exact(&mut phase).unwrap();
+    assert_eq!(phase, [1], "discovery did not enter its pre-SQL gate");
+
+    let report = |id| {
+        let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        protocol::write_frame_until(
+            &mut stream,
+            &protocol::Request {
+                id,
+                operation: "gc_report".into(),
+                payload: serde_json::json!({}),
+            },
+            deadline,
+        )
+        .unwrap();
+        let reply: protocol::Reply = protocol::read_frame_until(&mut stream, deadline)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "daemon request did not reply while search discovery was gated: {error}; {}",
+                    fixture_daemon_diagnostic(&home, &socket)
+                )
+            });
+        assert_eq!(reply.id, id);
+        assert!(reply.payload.get("error").is_none(), "{reply:?}");
+        assert!(reply.payload["result"]["derived"].is_array(), "{reply:?}");
+    };
+    // A completed protocol reply, not merely a listening socket, proves the
+    // actual daemon accept/dispatch path is independent of optional discovery.
+    report(1);
+    startup.write_all(&[1]).unwrap();
+    startup.read_exact(&mut phase).unwrap();
+    assert_eq!(phase, [2], "released discovery did not complete");
+    report(2);
+    assert!(daemon.0.try_wait().unwrap().is_none());
+}
+
+#[test]
 fn daemon_keeps_private_socket_after_transient_accept_errors() {
     use std::os::unix::{
         fs::MetadataExt,

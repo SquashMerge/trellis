@@ -120,6 +120,7 @@ struct Admission {
     phase: ModelPhase,
     queries: VecDeque<QueryRequest>,
     idle_until: Option<std::time::Instant>,
+    head_users: usize,
 }
 
 struct QueuedQuery<'a> {
@@ -161,6 +162,24 @@ impl Drop for ModelJob<'_> {
             admission.idle_until = resident.then(|| (self.0.model_clock)() + MODEL_IDLE);
             self.0.model_changed.notify_all();
         }
+        self.0.wake_maintenance();
+    }
+}
+
+pub(super) struct HeadUse<'a>(&'a SearchService);
+impl Drop for HeadUse<'_> {
+    fn drop(&mut self) {
+        let mut admission = self
+            .0
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admission.head_users -= 1;
+        if admission.phase == ModelPhase::Idle {
+            admission.idle_until = Some((self.0.model_clock)() + MODEL_IDLE);
+        }
+        self.0.model_changed.notify_all();
+        drop(admission);
         self.0.wake_maintenance();
     }
 }
@@ -266,7 +285,7 @@ impl SearchService {
         }
     }
 
-    pub(crate) fn model_configured(&self) -> bool {
+    pub fn model_configured(&self) -> bool {
         self.model_configured
     }
 
@@ -421,7 +440,10 @@ impl SearchService {
             .admission
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if admission.phase != ModelPhase::Idle || !admission.queries.is_empty() {
+        if admission.phase != ModelPhase::Idle
+            || !admission.queries.is_empty()
+            || admission.head_users != 0
+        {
             return None;
         }
         admission
@@ -437,6 +459,7 @@ impl SearchService {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if admission.phase != ModelPhase::Idle
+            || admission.head_users != 0
             || !admission.queries.is_empty()
             || !admission
                 .idle_until
@@ -468,6 +491,45 @@ impl SearchService {
             .unwrap_or_else(|error| error.into_inner())
             .phase = ModelPhase::Ready;
         self.model_changed.notify_all();
+        let core = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(core) = core {
+            core.model_ready();
+        }
+    }
+
+    pub(super) fn begin_head_use(&self) -> Option<HeadUse<'_>> {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if admission.phase == ModelPhase::Closing {
+            return None;
+        }
+        admission.head_users += 1;
+        admission.idle_until = None;
+        Some(HeadUse(self))
+    }
+
+    pub(super) fn publish_head_vectors(
+        &self,
+        model_id: &str,
+        vectors: &[(String, Vec<i8>)],
+    ) -> Result<()> {
+        let core = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(core) = core {
+            core.committed(model_id, self.cache_epoch(), vectors)?;
+        }
+        Ok(())
     }
 
     /// No store/registry/cache lock may be held by the caller at this boundary.
@@ -1319,6 +1381,35 @@ mod tests {
         );
         assert_eq!(loads.load(Ordering::Acquire), 2);
         drop(fill);
+    }
+
+    #[test]
+    fn matrix_scoring_use_defers_expiry_and_resets_same_idle_cutoff() {
+        let (_directory, mut service, started, resume, _drops, _loads) = gated_service();
+        let now = std::time::Instant::now();
+        let clock = Arc::new(Mutex::new(now));
+        let observed = clock.clone();
+        Arc::get_mut(&mut service)
+            .unwrap()
+            .set_model_clock_for_tests(Arc::new(move || *observed.lock().unwrap()));
+        resume.send(()).unwrap();
+        service
+            .query_embedding(
+                "resident",
+                &Arc::new(AtomicBool::new(false)),
+                std::time::Instant::now() + crate::testing::HANG_BACKSTOP,
+                None,
+            )
+            .unwrap();
+        started.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let use_guard = service.begin_head_use().unwrap();
+        *clock.lock().unwrap() = now + MODEL_IDLE;
+        assert!(!service.begin_idle_expiry());
+        drop(use_guard);
+        assert_eq!(service.idle_remaining(), Some(MODEL_IDLE));
+        *clock.lock().unwrap() += MODEL_IDLE;
+        assert!(service.begin_idle_expiry());
+        service.finish_idle_expiry();
     }
 
     #[test]

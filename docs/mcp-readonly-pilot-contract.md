@@ -2,7 +2,7 @@
 
 **Status: normative read-only MCP wire contract.** [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) records the owner’s #211 direction: a tenth tool, `trellis_search_symbols`, and `toolVersion:2`. The owner approved activation with local voyage-4-nano and fixed weighted-RRF constants (20, 200, 1, 4), without an extra lexical restriction (2026-10-26 item-8 ruling). [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) adds the sixth syntax-tier incoming tool; [#129 architecture rules](rules.md) adds three read-only tools and one no-argument proposal prompt. The original six tool schemas and meanings remain unchanged. [Decision 0007](semantic-evidence/decisions/0007-user-daemon-and-workspace-selection.md) makes `trellis mcp` a thin stdio client of the per-user daemon, with explicit same-repository worktree selection; #107 amends the schemas below. [Decision 0008](semantic-evidence/decisions/0008-daemon-sole-writer.md) makes that daemon the only index and queue writer; [Decision 0009](semantic-evidence/decisions/0009-checkout-worker.md) assigns each active checkout one worker, pipelines relay calls, starts deadlines at protocol acceptance and sets the capacity and pre-resolution failure shape below. This is the agent-facing projection of [#22 semantic evidence](semantic-evidence/contract-v1.md) and [#23 local topology](local-topology.md). #22 owns evidence meaning, identity, validity, coverage and provenance; #23 owns coherent snapshot eligibility. This document owns only the wire projection. The configured client launches `trellis mcp` for one workspace selected by [#23 discovery](local-topology.md#workspace-discovery). The OS user, not an MCP principal or grant, is the boundary. No network listener, authentication role, ACP permission or tool annotation enforces access. Configuring an agent can disclose indexed checkout text to that agent/provider; repository text is untrusted data.
 
-All code evidence in the ten tools and proposal prompt comes from cached index state, never live source files. The original six tools retain their cached-only behavior. The only current-file exception is a bounded, once-per-request read of the fixed root `.trellis/rules.toml` as configuration by rules check/explain and prompt get. Its `{path,source:"checkout-config",contentHash}` descriptor is separate from the code pin; `evidenceBasis` does not identify those rules bytes. References alone do not read configuration. An admitted evidence read keeps one selected snapshot through response finish; describe can instead report not-ready status with a null basis. They never request indexing, start a producer/build, run repository code, open a terminal, invoke a provider or make a durable write. Search alone may embed the caller’s query using a local, pinned, in-process Candle model within the existing call deadline. This is not repository execution, a hosted-provider call, an indexing request or a durable write. Search reads but never fills the vector cache; the daemon’s separate background embedding owner fills it. No configured/verified/ready model permits lexical-only search with `searchIndex.state:"unavailable"`. The daemon checkout worker alone owns mandatory startup reconciliation (H), watcher capture, publication and FIFO work; `catchingUp` reports pending work without waiving validated-head or root checks. No storage table, class or implementation mechanism is prescribed. The catalog order is `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_search_symbols`, `trellis_declaration`, `trellis_outgoing_calls`, `trellis_incoming_calls`, `trellis_read_source`, `trellis_references`, `trellis_rules_check`, `trellis_rules_explain`. Declaration, outgoing calls and incoming calls are separate closed tools, not views of an inspect tool; `trellis_inspect` is not recognized. Source uses the selected stored raw BLOB, verifies its path/version and whole-file hash/length before slicing, then strictly decodes only the requested LF-delimited range. Other selected readers, including public `source_at`, trust the published native, graph and class rows without re-attesting them against source (owner ruling 2026-10-23, #261). Source reads are not a disk fallback.
+All code evidence in the ten tools and proposal prompt comes from cached index state, never live source files. The original six tools retain their cached-only behavior. The only current-file exception is a bounded, once-per-request read of the fixed root `.trellis/rules.toml` as configuration by rules check/explain and prompt get. Its `{path,source:"checkout-config",contentHash}` descriptor is separate from the code pin; `evidenceBasis` does not identify those rules bytes. References alone do not read configuration. An admitted evidence read keeps one selected snapshot through response finish; describe can instead report not-ready status with a null basis. They never request indexing, start a producer/build, run repository code, open a terminal, invoke a provider or make a durable write. Search alone may embed the caller’s query using a local, pinned, in-process Candle model within the existing call deadline. This is not repository execution, a hosted-provider call, an indexing request or a durable write. Search reads but never fills the vector cache; the daemon’s separate background embedding owner fills it. No configured/verified/ready model, or no matching resident matrix under the owner’s memory policy, permits lexical-only search with `searchIndex.state:"unavailable"`. The daemon checkout worker alone owns mandatory startup reconciliation (H), watcher capture, publication and FIFO work; `catchingUp` reports pending work without waiving validated-head or root checks. No storage table, class or implementation mechanism is prescribed. The catalog order is `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_search_symbols`, `trellis_declaration`, `trellis_outgoing_calls`, `trellis_incoming_calls`, `trellis_read_source`, `trellis_references`, `trellis_rules_check`, `trellis_rules_explain`. Declaration, outgoing calls and incoming calls are separate closed tools, not views of an inspect tool; `trellis_inspect` is not recognized. Source uses the selected stored raw BLOB, verifies its path/version and whole-file hash/length before slicing, then strictly decodes only the requested LF-delimited range. Other selected readers, including public `source_at`, trust the published native, graph and class rows without re-attesting them against source (owner ruling 2026-10-23, #261). Source reads are not a disk fallback.
 
 ## Protocol, negotiation and transport
 
@@ -103,10 +103,14 @@ modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
 lexical:"complete"|"unavailable",unavailableReason:null|"vector_budget_exceeded"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
-`embedded<=declarations`. No configured/verified/ready model gives `unavailable`, null
-`modelId`, null `modelName`, and `embedded:0`. Backend selection is independent: report the
+`embedded<=declarations`. No configured/verified/ready model, or no matching admitted
+resident matrix (including first search, eviction, head-change races or an oversized head),
+gives `unavailable`, null `modelId`, null `modelName`, and `embedded:0`. The zero is an
+unavailable sentinel, not a measured vector count; `unavailableReason` remains null for
+these cases. Backend selection is independent: report the
 backend actually selected whenever known, including while loading/building or when the model
-is unavailable; `backend:null` means only that no backend has been selected. With a ready model, `complete` means
+is unavailable; `backend:null` means only that no backend has been selected. With a ready
+model and an admitted matching resident matrix, `complete` means
 all candidates have vectors, `building` means vectors are missing and a background job is
 running, and `partial` means vectors are missing and no job is running. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
@@ -139,10 +143,35 @@ proof, corrupt digests or mixed revisions fails `store_unavailable`, without par
 Use the fixed weighted reciprocal rank fusion and deterministic tie-break specified in
 [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#lexical-query-and-ranking):
 (k, D, wL, wV) = (20, 200, 1, 4), with no extra lexical-arm restriction. These are the
-owner-reviewed #214 evaluation choices, not runtime tuning. The vector
-arm and search-index counts use one `vectors.db` read transaction per call. That cache is not
-pinned by `evidenceBasis`. Filling, eviction and re-embedding can change rankings and counts
-between calls at the same basis. There is no cross-call equality promise.
+owner-reviewed #214 evaluation choices, not runtime tuning. Under the
+[resident-matrix amendment](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819),
+the vector arm and search-index counts use one immutable published int8 matrix snapshot for
+the admitted index pin and active model, together with the same mandatory index snapshot.
+The [#358 owner memory/startup policy](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6446057555)
+sets a 2 GiB aggregate matrix-allocation cap, including in-progress builds, replacements and
+staging buffers, using conservative estimated allocation capacity and bookkeeping before
+allocation. It is not an exact process-RSS cap and excludes model weights. Query use shares
+the owner's existing matrix charge, not a second copy. Normal work uses LRU eviction of
+eligible matrices. The
+600-second query/fill idle eviction also remains. Startup warming selects at most the four
+most recently opened checkouts within seven days (newest first, root-key byte-order ties),
+using existing open-age metadata read-only without activation, metadata writes or a durable
+MRU catalog. It is low-priority background work that never blocks daemon socket acceptance,
+and stops at cap admission failure without evicting matrices for more startup work.
+
+Other checkouts return complete lexical results on first search while the independent
+background owner builds their matrices. A single head that cannot fit remains lexical-only.
+When no matching matrix is retained or acquisition races with a head change, search also
+returns lexical-only with unavailable status, null model identity, embedded:0, selected
+backend and unavailableReason:null. It never waits for the owner or embeds a query without
+an admitted resident matrix; the streaming scorer cannot bypass the cap. This supersedes
+the earlier missing-matrix streaming fallback. Exact admitted declaration counts and lexical
+retrieval remain mandatory, and observed store faults remain typed failures rather than
+lexical-only success. Counts and ranks never mix snapshots. Neither cache state nor matrix
+publication is pinned by `evidenceBasis`.
+A valid retained published matrix remains usable after backing-cache eviction. Owner updates,
+residency changes, filling and re-embedding can change rankings and counts between calls at
+the same basis. There is no cross-call or bit-parity promise.
 
 Emit the longest ordered hit prefix fitting the complete 65,536-byte response line, including
 summary, LF and fixed scope/status overhead. Recompute emitted-only documents, closure and
@@ -159,15 +188,20 @@ including query inference and cold-load handling. Optional vector work has one a
 It covers model admission, verification/read, loading, embedding, cache access and scoring;
 it never resets on retry. Verified model weights are reused by the single owner with the
 [ten-minute idle timeout](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#model-identity-and-runtime),
-reset by query/fill use; loading remains lexical-only. On that budget alone, cooperatively stop vector work, discard the
-whole vector arm and return the complete lexical result with the reason above. Client
+reset by query/fill use; resident matrices share that 600-second idle policy and loading
+remains lexical-only. On that budget alone, cooperatively stop query vector work, discard the
+whole vector arm and return the complete lexical result with the reason above. Query model
+inference is never detached. An independent matrix build remains with the single background
+fill owner and finishes/publishes after vector-budget fallback or query cancellation/drop;
+it is not query inference or a read-side cache write. Client
 cancellation and mandatory deadline/root checks still apply. Mandatory index/FTS contention
 remains typed storage_busy, retried within the call deadline, then deadline_exceeded. Optional
 cache contention is also typed/retried, but expiry of its vector budget permits this reasoned
 fallback; BUSY itself is not permission for lexical-only success or evidence of corruption.
 Database-level vector-cache failures, including corruption, schema mismatch and unreadable or
-unsafe storage, fail store_unavailable. Only a vector-cache row that fails typed decoding is
-a specified miss under T00/T02; it lowers embedded and is re-embedded outside the read.
+unsafe storage, fail store_unavailable. A vector-cache row that fails typed decoding is a
+specified miss under T00/T02, excluded from the selected cache snapshot's embedded count and
+re-embedded outside the read. This does not invalidate a valid retained published matrix.
 
 The tool description states: “Find candidate declarations by lexical and local vector
 retrieval. Relevance is not evidence. Inspect hits with trellis_declaration at the returned

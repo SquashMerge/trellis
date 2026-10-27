@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::search::SearchService;
+use super::{
+    search::SearchService,
+    search_head::{HeadSlot, HeadUpdate},
+};
 use crate::{
     http::DaemonState,
     model::IndexPin,
@@ -25,12 +28,116 @@ use anyhow::Result;
 const BATCH: usize = SEARCH_CARD_BATCH_SIZE;
 const FAULT_RETRY: Duration = Duration::from_millis(250);
 const MAX_FAULT_RETRIES: usize = 3;
+const MATRIX_RAM_LIMIT: usize = 2 * 1024 * 1024 * 1024;
+// One existing driver reuses this resident reservation for bounded fill batches.
+pub(super) const MATRIX_FILL_SCRATCH: usize = BATCH * (3 * DIMENSIONS + 256);
+
+/// Accounted bytes include unpublished builds, not just query-visible matrices.
+pub(super) struct MatrixBudget(Mutex<BudgetState>);
+struct BudgetState {
+    limit: usize,
+    used: usize,
+}
+impl Default for MatrixBudget {
+    fn default() -> Self {
+        Self(Mutex::new(BudgetState {
+            limit: MATRIX_RAM_LIMIT,
+            used: 0,
+        }))
+    }
+}
+pub(super) struct MatrixCharge {
+    budget: Arc<MatrixBudget>,
+    bytes: usize,
+}
+impl MatrixBudget {
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<MatrixCharge> {
+        let mut state = self.0.lock().unwrap();
+        if bytes > state.limit.saturating_sub(state.used) {
+            return None;
+        }
+        state.used += bytes;
+        Some(MatrixCharge {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+impl MatrixCharge {
+    pub(super) fn split(&mut self, bytes: usize) -> Self {
+        assert!(bytes <= self.bytes);
+        self.bytes -= bytes;
+        Self {
+            budget: self.budget.clone(),
+            bytes,
+        }
+    }
+    pub(super) fn absorb(&mut self, mut old: Self) {
+        self.bytes += old.bytes;
+        old.bytes = 0;
+    }
+    pub(super) fn shrink(&mut self, bytes: usize) {
+        assert!(
+            bytes <= self.bytes,
+            "matrix estimate did not cover allocation"
+        );
+        self.budget.0.lock().unwrap().used -= self.bytes - bytes;
+        self.bytes = bytes;
+    }
+}
+impl Drop for MatrixCharge {
+    fn drop(&mut self) {
+        self.budget.0.lock().unwrap().used -= self.bytes;
+    }
+}
+#[derive(Debug)]
+pub(super) struct MemoryDeclined;
+impl std::fmt::Display for MemoryDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("search matrix is not resident")
+    }
+}
+impl std::error::Error for MemoryDeclined {}
+
+/// A live checkout cannot supply background work during a transient owner phase.
+/// It is not a storage fault and only a later explicit hint retries it.
+#[derive(Debug)]
+pub(crate) struct SearchDeferred;
+impl std::fmt::Display for SearchDeferred {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("search background work deferred")
+    }
+}
+impl std::error::Error for SearchDeferred {}
 
 type Source = Weak<dyn FillSource>;
-trait FillSource: Send + Sync {
+pub(crate) trait FillSource: Send + Sync {
+    fn is_startup(&self) -> bool {
+        false
+    }
+    fn head(
+        &self,
+        _previous: Option<IndexPin>,
+        _check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<HeadUpdate>> {
+        Ok(None)
+    }
+    fn root_key(&self) -> Option<String> {
+        None
+    }
     fn page(&self, pin: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards>;
 }
 impl FillSource for DaemonState {
+    fn root_key(&self) -> Option<String> {
+        Some(self.search_root_key())
+    }
+    fn head(
+        &self,
+        previous: Option<IndexPin>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<HeadUpdate>> {
+        self.search_head_update(previous, check)
+    }
     fn page(&self, pin: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
         self.search_fill_page(pin, after, BATCH)
     }
@@ -48,6 +155,17 @@ struct Outcome {
     result: Result<()>,
 }
 trait FillBackend: Send + Sync {
+    fn search(&self) -> Weak<SearchService> {
+        Weak::new()
+    }
+    fn prepare(
+        &self,
+        _source: &dyn FillSource,
+        _cancel: &AtomicBool,
+        _head: &HeadSlot,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn idle_remaining(&self) -> Option<Duration> {
         None
     }
@@ -66,6 +184,65 @@ trait FillBackend: Send + Sync {
 }
 struct LocalBackend(Arc<SearchService>);
 impl FillBackend for LocalBackend {
+    fn search(&self) -> Weak<SearchService> {
+        Arc::downgrade(&self.0)
+    }
+    fn prepare(&self, source: &dyn FillSource, cancel: &AtomicBool, head: &HeadSlot) -> Result<()> {
+        let model_id = model_id_for_card_format(CardFormat::V1.as_str());
+        if source.is_startup() && head.startup_at_cap() {
+            return Err(MemoryDeclined.into());
+        }
+        if head.dormant() {
+            return Err(MemoryDeclined.into());
+        }
+        if !self.0.model_configured() {
+            return Ok(());
+        }
+        self.0.with_vector_writer(|_| Ok(()))?;
+        let previous = head.previous(&model_id, self.0.cache_epoch());
+        let Some(update) = source.head(previous, &mut || check_cancel(cancel))? else {
+            return Err(SearchDeferred.into());
+        };
+        check_cancel(cancel)?;
+        if previous == Some(update.pin) && !head.needs_build() {
+            head.settle();
+            return Ok(());
+        }
+        // Loading and matrix I/O never retain a checkout snapshot or owner inbox.
+        if self.0.model_configured() {
+            self.0.with_model_job(cancel, |_| Ok(()))?;
+        }
+        let epoch = self.0.cache_epoch();
+        let built = self.0.with_vector_snapshot(|snapshot| {
+            head.build_mode(
+                update,
+                &model_id,
+                epoch,
+                snapshot,
+                source.is_startup(),
+                &mut || check_cancel(cancel),
+            )
+        });
+        if built
+            .as_ref()
+            .is_err_and(|error| error.is::<MemoryDeclined>())
+            && !source.is_startup()
+            && head.retry_cold()
+        {
+            // A patch can need more transient space than its final cold head.
+            // Dropping the old matrix is already accounted; finish this owner
+            // job from a full captured head without another user request.
+            let Some(update) = source.head(None, &mut || check_cancel(cancel))? else {
+                return Err(SearchDeferred.into());
+            };
+            return self.0.with_vector_snapshot(|snapshot| {
+                head.build_mode(update, &model_id, epoch, snapshot, false, &mut || {
+                    check_cancel(cancel)
+                })
+            });
+        }
+        built
+    }
     fn idle_remaining(&self) -> Option<Duration> {
         self.0.idle_remaining()
     }
@@ -180,6 +357,8 @@ impl LocalBackend {
                 .map(|(card, _)| card)
                 .collect();
             if !cards.is_empty() {
+                // The resident head reserves this bounded batch's staging.
+                // Only this driver fills matrices, so batches cannot overlap.
                 let texts = cards
                     .iter()
                     .map(|card| card.card_text.clone())
@@ -203,6 +382,14 @@ impl LocalBackend {
                         .collect::<Vec<_>>();
                     writer.put_many(&entries)
                 })?;
+                self.0.publish_head_vectors(
+                    model_id,
+                    &cards
+                        .iter()
+                        .zip(&vectors)
+                        .map(|(card, vector)| (card.card_hash.clone(), vector.values.clone()))
+                        .collect::<Vec<_>>(),
+                )?;
             }
             self.0.serve_queries(model);
             let Some(after) = next_cursor(&page) else {
@@ -227,6 +414,9 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
 
 struct Slot {
     source: Source,
+    head: Arc<HeadSlot>,
+    root_key: Option<String>,
+    startup: bool,
     cancel: Arc<AtomicBool>,
     queued: bool,
     dirty: bool,
@@ -242,23 +432,246 @@ struct Inbox {
     next_id: u64,
     slots: BTreeMap<u64, Slot>,
     ready: VecDeque<u64>,
+    roots: BTreeMap<String, u64>,
+    startup: Option<crate::store::topology::TopologyRoots>,
+    discovering: bool,
     shutdown: bool,
 }
 impl Inbox {
+    fn next_ready(&mut self) -> Option<u64> {
+        self.ready
+            .iter()
+            .position(|id| self.slots.get(id).is_some_and(|slot| !slot.startup))
+            .and_then(|position| self.ready.remove(position))
+            .or_else(|| self.ready.pop_front())
+    }
     fn has_pending_work(&self) -> bool {
-        self.slots
-            .values()
-            .any(|slot| slot.running || slot.queued || slot.dirty || slot.retry_at.is_some())
+        self.startup.is_some()
+            || self.discovering
+            || self
+                .slots
+                .values()
+                .any(|slot| slot.running || slot.queued || slot.dirty || slot.retry_at.is_some())
     }
 }
 
 #[derive(Default)]
 pub(super) struct Core {
     inbox: Mutex<Inbox>,
+    search: Mutex<Weak<SearchService>>,
+    startup_sources: Mutex<Vec<(Arc<dyn FillSource>, FillRegistration)>>,
+    #[cfg(test)]
+    before_startup_discovery: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    startup_discovery_sources: Mutex<Option<Vec<Arc<dyn FillSource>>>>,
     changed: Condvar,
+    budget: Arc<MatrixBudget>,
+    touches: std::sync::atomic::AtomicU64,
+    startup_at_cap: AtomicBool,
 }
 
 impl Core {
+    pub(super) fn startup_at_cap(&self) -> bool {
+        self.startup_at_cap.load(Ordering::Acquire)
+    }
+    pub(super) fn touch(&self) -> u64 {
+        self.touches.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    pub(super) fn can_fit_alone(&self, bytes: usize) -> bool {
+        bytes <= self.budget.0.lock().unwrap().limit
+    }
+    pub(super) fn reserve(&self, id: u64, bytes: usize, startup: bool) -> Option<MatrixCharge> {
+        if let Some(charge) = self.budget.reserve(bytes) {
+            return Some(charge);
+        }
+        if bytes > self.budget.0.lock().unwrap().limit {
+            if startup {
+                self.startup_at_cap.store(true, Ordering::Release);
+            }
+            return None;
+        }
+        if startup {
+            self.startup_at_cap.store(true, Ordering::Release);
+            return None;
+        }
+        // Never hold the registry or budget while waiting for a scoring head.
+        let mut heads = self
+            .inbox
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .filter(|(other, _)| **other != id)
+            .map(|(_, slot)| slot.head.clone())
+            .collect::<Vec<_>>();
+        heads.sort_by_key(|head| head.last_touch());
+        for head in heads {
+            head.clear();
+            if let Some(charge) = self.budget.reserve(bytes) {
+                return Some(charge);
+            }
+        }
+        None
+    }
+    fn register_source(self: &Arc<Self>, source: Source) -> FillRegistration {
+        self.register_source_mode(source, false)
+            .expect("active registration is never skipped")
+    }
+    fn register_source_mode(
+        self: &Arc<Self>,
+        source: Source,
+        startup: bool,
+    ) -> Option<FillRegistration> {
+        let mut inbox = self.inbox.lock().unwrap();
+        let id = inbox.next_id;
+        inbox.next_id += 1;
+        let root_key = source.upgrade().and_then(|source| source.root_key());
+        let startup = startup || source.upgrade().is_some_and(|source| source.is_startup());
+        if startup
+            && (inbox.shutdown
+                || root_key
+                    .as_ref()
+                    .is_some_and(|key| inbox.roots.contains_key(key)))
+        {
+            return None;
+        }
+        if inbox.shutdown {
+            let head = Arc::new(HeadSlot::new(
+                Arc::downgrade(self),
+                id,
+                self.search.lock().unwrap().clone(),
+            ));
+            head.stop();
+            return Some(FillRegistration {
+                head,
+                core: Arc::downgrade(self),
+                id,
+            });
+        }
+        let previous = root_key
+            .as_ref()
+            .and_then(|key| inbox.roots.remove(key))
+            .and_then(|old_id| {
+                inbox.ready.retain(|queued| *queued != old_id);
+                inbox.slots.remove(&old_id)
+            });
+        let mut retired = None;
+        let head = match previous {
+            Some(previous) => {
+                previous.cancel.store(true, Ordering::Release);
+                if previous.running {
+                    retired = Some(previous.head);
+                    Arc::new(HeadSlot::new(
+                        Arc::downgrade(self),
+                        id,
+                        self.search.lock().unwrap().clone(),
+                    ))
+                } else {
+                    previous.head.rebind(id);
+                    previous.head
+                }
+            }
+            None => Arc::new(HeadSlot::new(
+                Arc::downgrade(self),
+                id,
+                self.search.lock().unwrap().clone(),
+            )),
+        };
+        if let Some(key) = &root_key {
+            inbox.roots.insert(key.clone(), id);
+        }
+        inbox.slots.insert(
+            id,
+            Slot {
+                source,
+                head: head.clone(),
+                root_key,
+                startup,
+                cancel: Arc::new(AtomicBool::new(false)),
+                queued: false,
+                dirty: false,
+                running: false,
+                running_pin: None,
+                completed: None,
+                retries: 0,
+                retry_at: None,
+                fault_cooldown: None,
+            },
+        );
+        drop(inbox);
+        if let Some(retired) = retired {
+            retired.stop();
+        }
+        Some(FillRegistration {
+            head,
+            core: Arc::downgrade(self),
+            id,
+        })
+    }
+    pub(super) fn request(&self, id: u64) {
+        let mut inbox = self.inbox.lock().unwrap();
+        if inbox.shutdown {
+            return;
+        }
+        let Some(head) = inbox.slots.get(&id).map(|slot| slot.head.clone()) else {
+            return;
+        };
+        drop(inbox);
+        head.rearm();
+        if !head.needs_build() {
+            return;
+        }
+        head.begin();
+        inbox = self.inbox.lock().unwrap();
+        if inbox.shutdown {
+            return;
+        }
+        let Some(slot) = inbox.slots.get_mut(&id) else {
+            return;
+        };
+        if slot.running || slot.queued || slot.retry_at.is_some() {
+            return;
+        }
+        slot.dirty = true;
+        slot.queued = true;
+        inbox.ready.push_back(id);
+        self.changed.notify_all();
+    }
+    pub(super) fn model_ready(&self) {
+        let heads = self
+            .inbox
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .map(|(id, slot)| (*id, slot.head.clone()))
+            .collect::<Vec<_>>();
+        for (id, head) in heads {
+            if !head.dormant() && head.needs_build() {
+                self.request(id);
+            }
+        }
+    }
+    pub(super) fn committed(
+        &self,
+        model_id: &str,
+        epoch: u64,
+        vectors: &[(String, Vec<i8>)],
+    ) -> Result<()> {
+        let heads = self
+            .inbox
+            .lock()
+            .unwrap()
+            .slots
+            .values()
+            .map(|s| s.head.clone())
+            .collect::<Vec<_>>();
+        for head in heads {
+            head.committed(model_id, epoch, vectors)?;
+        }
+        self.model_ready();
+        Ok(())
+    }
     pub(super) fn wake(&self) {
         let _inbox = self.inbox.lock().unwrap();
         self.changed.notify_all();
@@ -279,8 +692,27 @@ impl SearchFill {
         Ok(owner)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_with_limit_for_tests(
+        search: Arc<SearchService>,
+        limit: usize,
+    ) -> Result<Arc<Self>> {
+        let core = Core {
+            budget: Arc::new(MatrixBudget(Mutex::new(BudgetState { limit, used: 0 }))),
+            ..Core::default()
+        };
+        let owner = Self::start_core(Arc::new(LocalBackend(search.clone())), core)?;
+        search.set_maintenance(Arc::downgrade(&owner.core));
+        owner.core.wake();
+        Ok(owner)
+    }
+
     fn start_with(backend: Arc<dyn FillBackend>) -> Result<Arc<Self>> {
-        let core = Arc::new(Core::default());
+        Self::start_core(backend, Core::default())
+    }
+    fn start_core(backend: Arc<dyn FillBackend>, core: Core) -> Result<Arc<Self>> {
+        let core = Arc::new(core);
+        *core.search.lock().unwrap() = backend.search();
         let driver = core.clone();
         std::thread::Builder::new()
             .name("trellis-search-fill".into())
@@ -292,15 +724,30 @@ impl SearchFill {
     pub fn wait_until_idle_for_tests(&self) {
         let deadline = Instant::now() + crate::testing::HANG_BACKSTOP;
         let mut inbox = self.core.inbox.lock().unwrap();
-        while inbox
-            .slots
-            .values()
-            .any(|slot| slot.running || slot.queued || slot.retry_at.is_some())
+        while inbox.startup.is_some()
+            || inbox.discovering
+            || inbox
+                .slots
+                .values()
+                .any(|slot| slot.running || slot.queued || slot.retry_at.is_some())
         {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "fill did not settle");
             inbox = self.core.changed.wait_timeout(inbox, remaining).unwrap().0;
         }
+    }
+
+    pub fn queue_startup(&self, roots: crate::store::topology::TopologyRoots) {
+        let mut inbox = self.core.inbox.lock().unwrap();
+        if !inbox.shutdown {
+            inbox.startup = Some(roots);
+            self.core.changed.notify_all();
+        }
+    }
+
+    /// Resident and reserved in-progress matrix bytes, daemon-wide.
+    pub fn matrix_storage_bytes(&self) -> usize {
+        self.core.budget.0.lock().unwrap().used
     }
 
     pub(crate) fn register(&self, scheduler: &Arc<DaemonState>) -> FillRegistration {
@@ -309,46 +756,39 @@ impl SearchFill {
     }
 
     fn register_source(&self, source: Source) -> FillRegistration {
-        let mut inbox = self.core.inbox.lock().unwrap();
-        let id = inbox.next_id;
-        inbox.next_id += 1;
-        inbox.slots.insert(
-            id,
-            Slot {
-                source,
-                cancel: Arc::new(AtomicBool::new(false)),
-                queued: false,
-                dirty: false,
-                running: false,
-                running_pin: None,
-                completed: None,
-                retries: 0,
-                retry_at: None,
-                fault_cooldown: None,
-            },
-        );
-        FillRegistration {
-            core: Arc::downgrade(&self.core),
-            id,
-        }
+        self.core.register_source(source)
     }
 }
 impl Drop for SearchFill {
     fn drop(&mut self) {
-        let mut inbox = self.core.inbox.lock().unwrap();
-        inbox.shutdown = true;
-        for slot in inbox.slots.values() {
-            slot.cancel.store(true, Ordering::Release);
+        let heads = {
+            let mut inbox = self.core.inbox.lock().unwrap();
+            inbox.shutdown = true;
+            for slot in inbox.slots.values() {
+                slot.cancel.store(true, Ordering::Release);
+            }
+            self.core.changed.notify_one();
+            inbox
+                .slots
+                .values()
+                .map(|slot| slot.head.clone())
+                .collect::<Vec<_>>()
+        };
+        for head in heads {
+            head.stop();
         }
-        self.core.changed.notify_one();
     }
 }
 
 pub(crate) struct FillRegistration {
+    head: Arc<HeadSlot>,
     core: Weak<Core>,
     id: u64,
 }
 impl FillRegistration {
+    pub(crate) fn head_slot(&self) -> Arc<HeadSlot> {
+        self.head.clone()
+    }
     /// The owner publishes the exact running head, separately from queued hints.
     /// A successor registration or another admitted head cannot borrow its work.
     pub(crate) fn building_for(&self, pin: IndexPin) -> bool {
@@ -367,6 +807,7 @@ impl FillRegistration {
         let Some(core) = self.core.upgrade() else {
             return;
         };
+        self.head.begin();
         let mut inbox = core.inbox.lock().unwrap();
         let Some(slot) = inbox.slots.get_mut(&self.id) else {
             return;
@@ -388,13 +829,24 @@ impl Drop for FillRegistration {
         let Some(core) = self.core.upgrade() else {
             return;
         };
-        let mut inbox = core.inbox.lock().unwrap();
-        if let Some(slot) = inbox.slots.remove(&self.id) {
-            slot.cancel.store(true, Ordering::Release);
+        let removed = {
+            let mut inbox = core.inbox.lock().unwrap();
+            let removed = inbox.slots.remove(&self.id);
+            if let Some(slot) = &removed {
+                slot.cancel.store(true, Ordering::Release);
+                if let Some(key) = &slot.root_key
+                    && inbox.roots.get(key) == Some(&self.id)
+                {
+                    inbox.roots.remove(key);
+                }
+            }
+            inbox.ready.retain(|id| *id != self.id);
+            core.changed.notify_one();
+            removed
+        };
+        if let Some(slot) = removed {
+            slot.head.stop();
         }
-        // Removing the ID keeps the queue bounded across runtime replacement.
-        inbox.ready.retain(|id| *id != self.id);
-        core.changed.notify_one();
     }
 }
 
@@ -412,11 +864,49 @@ fn retryable_fault(error: &anyhow::Error) -> bool {
 
 fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
     loop {
-        let (id, source, cancel, completed) = {
+        let (id, source, cancel, completed, head) = {
             let mut inbox = core.inbox.lock().unwrap();
             loop {
                 if inbox.shutdown {
                     return;
+                }
+                let normal_ready = inbox
+                    .ready
+                    .iter()
+                    .any(|id| inbox.slots.get(id).is_some_and(|slot| !slot.startup));
+                if !normal_ready && let Some(roots) = inbox.startup.take() {
+                    inbox.discovering = true;
+                    drop(inbox);
+                    #[cfg(test)]
+                    if let Some(hook) = core.before_startup_discovery.lock().unwrap().take() {
+                        hook();
+                    }
+                    #[cfg(test)]
+                    let override_sources = core.startup_discovery_sources.lock().unwrap().take();
+                    #[cfg(test)]
+                    let sources = override_sources
+                        .unwrap_or_else(|| super::search_startup::discover_sources(roots));
+                    #[cfg(not(test))]
+                    let sources = super::search_startup::discover_sources(roots);
+                    for source in sources {
+                        if core.inbox.lock().unwrap().shutdown {
+                            break;
+                        }
+                        let Some(registration) =
+                            core.register_source_mode(Arc::downgrade(&source), true)
+                        else {
+                            continue;
+                        };
+                        registration.notify();
+                        core.startup_sources
+                            .lock()
+                            .unwrap()
+                            .push((source, registration));
+                    }
+                    inbox = core.inbox.lock().unwrap();
+                    inbox.discovering = false;
+                    core.changed.notify_all();
+                    continue;
                 }
                 let now = Instant::now();
                 let due = inbox
@@ -430,7 +920,7 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
                     slot.queued = true;
                     inbox.ready.push_back(id);
                 }
-                if let Some(id) = inbox.ready.pop_front() {
+                if let Some(id) = inbox.next_ready() {
                     let Some(slot) = inbox.slots.get_mut(&id) else {
                         continue;
                     };
@@ -438,13 +928,27 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
                     slot.dirty = false;
                     slot.running = true;
                     slot.running_pin = None;
-                    break (id, slot.source.clone(), slot.cancel.clone(), slot.completed);
+                    break (
+                        id,
+                        slot.source.clone(),
+                        slot.cancel.clone(),
+                        slot.completed,
+                        slot.head.clone(),
+                    );
                 }
                 let pending_fill = inbox.has_pending_work();
                 // Inbox -> admission only claims the transition. Never wait for
                 // the model with this inbox held; notifications use this mutex.
                 if !pending_fill && backend.begin_idle_expiry() {
+                    let heads = inbox
+                        .slots
+                        .values()
+                        .map(|s| s.head.clone())
+                        .collect::<Vec<_>>();
                     drop(inbox);
+                    for head in heads {
+                        head.clear();
+                    }
                     backend.finish_idle_expiry();
                     inbox = core.inbox.lock().unwrap();
                     continue;
@@ -472,11 +976,43 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
                 };
             }
         };
+        head.begin();
         let Some(source) = source.upgrade() else {
+            head.stop();
             core.inbox.lock().unwrap().slots.remove(&id);
             continue;
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if source.is_startup() && core.startup_at_cap() {
+                return Outcome {
+                    pin: None,
+                    cache_epoch: 0,
+                    result: Err(MemoryDeclined.into()),
+                };
+            }
+            if let Err(error) = backend.prepare(source.as_ref(), &cancel, &head) {
+                return Outcome {
+                    pin: None,
+                    cache_epoch: 0,
+                    result: Err(error),
+                };
+            }
+            // Cancellation/unregister can discard the resident head during
+            // inference. Keep its already-reserved staging charge until the
+            // running job physically drops every vector buffer.
+            let _scratch = head.fill_scratch();
+            if backend
+                .search()
+                .upgrade()
+                .is_some_and(|search| search.model_configured())
+                && _scratch.is_none()
+            {
+                return Outcome {
+                    pin: None,
+                    cache_epoch: 0,
+                    result: Err(MemoryDeclined.into()),
+                };
+            }
             backend.run(source.as_ref(), &cancel, completed, &|pin| {
                 let mut inbox = core.inbox.lock().unwrap();
                 if let Some(slot) = inbox.slots.get_mut(&id) {
@@ -493,8 +1029,12 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
         // Release the source before publishing completion. It does not keep a
         // retired checkout alive while this owner waits for its next hint.
         drop(source);
+        head.finish(&outcome.result);
         let mut inbox = core.inbox.lock().unwrap();
         let Some(slot) = inbox.slots.get_mut(&id) else {
+            // A dropped registration can still have held staging until this
+            // owner transition. Publish that its physical cleanup completed.
+            core.changed.notify_all();
             continue;
         };
         slot.running = false;
@@ -504,7 +1044,25 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
             .as_ref()
             .is_err_and(|error| error.is::<SearchHeadChanged>());
         let retryable = outcome.result.as_ref().is_err_and(retryable_fault);
-        if changed {
+        let deferred = outcome
+            .result
+            .as_ref()
+            .is_err_and(|error| error.is::<SearchDeferred>());
+        let memory_declined = outcome
+            .result
+            .as_ref()
+            .is_err_and(|error| error.is::<MemoryDeclined>());
+        if memory_declined {
+            slot.completed = None;
+            slot.retries = 0;
+            // An explicit successor hint can name a smaller/newer pin. It
+            // must survive this attempt's admission failure.
+        } else if deferred {
+            slot.completed = None;
+            slot.retries = 0;
+            // dirty records only an explicit hint received after this attempt
+            // started; that successor must survive transient deferral.
+        } else if changed {
             slot.completed = None;
             slot.retries = 0;
         } else if retryable && slot.retries < MAX_FAULT_RETRIES {
@@ -538,6 +1096,10 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
         core.changed.notify_all();
     }
 }
+
+#[cfg(test)]
+#[path = "search_memory_tests.rs"]
+mod memory_tests;
 
 #[cfg(test)]
 mod tests {
@@ -624,6 +1186,351 @@ mod tests {
     }
     fn event(events: &Receiver<TestEvent>) -> TestEvent {
         events.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap()
+    }
+
+    struct PausedMatrixBackend {
+        entered: Sender<()>,
+        resume: Mutex<Receiver<()>>,
+    }
+    impl FillBackend for PausedMatrixBackend {
+        fn prepare(&self, _: &dyn FillSource, cancel: &AtomicBool, head: &HeadSlot) -> Result<()> {
+            self.entered.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+            check_cancel(cancel)?;
+            head.build(
+                super::super::search_head::HeadUpdate {
+                    pin: pin(1),
+                    declarations: 0,
+                    change: super::super::search_head::HeadChange::Full(Vec::new().into()),
+                },
+                "model",
+                0,
+                None,
+                &mut || check_cancel(cancel),
+            )
+        }
+        fn run(
+            &self,
+            _: &dyn FillSource,
+            _: &AtomicBool,
+            _: Option<Completed>,
+            _: &dyn Fn(IndexPin),
+        ) -> Outcome {
+            Outcome {
+                pin: Some(pin(1)),
+                cache_epoch: 0,
+                result: Ok(()),
+            }
+        }
+    }
+    #[test]
+    fn owner_finishes_matrix_after_waiter_budget_fallback() {
+        let (entered, arrived) = mpsc::channel();
+        let (resume, released) = mpsc::channel();
+        let owner = SearchFill::start_with(Arc::new(PausedMatrixBackend {
+            entered,
+            resume: Mutex::new(released),
+        }))
+        .unwrap();
+        let (_source, registration) = register(&owner, 1);
+        let head = registration.head_slot();
+        head.request();
+        arrived.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let now = Instant::now();
+        let budget = crate::search_embed::QueryBudget::new(now, Arc::new(move || now));
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            head.wait_latest(&cancel, &budget)
+                .unwrap_err()
+                .downcast_ref::<EmbedError>(),
+            Some(EmbedError::BudgetExceeded)
+        ));
+        assert!(!cancel.load(Ordering::Acquire));
+        resume.send(()).unwrap();
+        owner.wait_until_idle_for_tests();
+        assert_eq!(head.declarations(pin(1), "model", 0).unwrap(), Some(0));
+    }
+
+    struct RootSource;
+    impl FillSource for RootSource {
+        fn root_key(&self) -> Option<String> {
+            Some("root".into())
+        }
+        fn page(&self, _: Option<IndexPin>, _: Option<&str>) -> Result<HeadSearchCards> {
+            Ok(HeadSearchCards {
+                pin: pin(1),
+                cards: Vec::new(),
+            })
+        }
+    }
+    #[test]
+    fn startup_head_adoption_survives_old_registration_drop() {
+        let (owner, _events, _resume) = paused(false);
+        let source: Arc<dyn FillSource> = Arc::new(RootSource);
+        let old = owner.register_source(Arc::downgrade(&source));
+        let head = old.head_slot();
+        head.build(
+            super::super::search_head::HeadUpdate {
+                pin: pin(1),
+                declarations: 0,
+                change: super::super::search_head::HeadChange::Full(Vec::new().into()),
+            },
+            "model",
+            0,
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let successor = owner.register_source(Arc::downgrade(&source));
+        assert!(Arc::ptr_eq(&head, &successor.head_slot()));
+        drop(old);
+        assert_eq!(head.declarations(pin(1), "model", 0).unwrap(), Some(0));
+        assert!(
+            owner
+                .core
+                .inbox
+                .lock()
+                .unwrap()
+                .slots
+                .contains_key(&successor.id)
+        );
+    }
+
+    fn publish_empty(head: &HeadSlot, revision: u64) {
+        head.build(
+            HeadUpdate {
+                pin: pin(revision),
+                declarations: 0,
+                change: super::super::search_head::HeadChange::Full(Vec::new().into()),
+            },
+            "model",
+            0,
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    }
+    fn wait_warm(head: Arc<HeadSlot>) {
+        let (completed, result) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let now = Instant::now();
+            let budget = crate::search_embed::QueryBudget::new(
+                now + crate::testing::HANG_BACKSTOP,
+                Arc::new(Instant::now),
+            );
+            completed
+                .send(head.wait_latest(&AtomicBool::new(false), &budget))
+                .unwrap();
+        });
+        result
+            .recv_timeout(crate::testing::HANG_BACKSTOP)
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+    }
+    #[test]
+    fn warm_matrix_does_not_wait_for_its_fill_or_a_sibling_checkout() {
+        let (owner, events, resume) = paused(false);
+        let (_a_source, a) = register(&owner, 1);
+        let (_b_source, b) = register(&owner, 2);
+        publish_empty(&a.head_slot(), 1);
+        publish_empty(&b.head_slot(), 2);
+        a.notify();
+        assert_eq!(event(&events).0, pin(1));
+        wait_warm(a.head_slot());
+        b.notify();
+        // B's published matrix remains usable while its hint is queued behind A.
+        wait_warm(b.head_slot());
+        resume.send(()).unwrap();
+        assert_eq!(event(&events).0, pin(2));
+        wait_warm(b.head_slot());
+        resume.send(()).unwrap();
+        owner.wait_until_idle_for_tests();
+    }
+
+    struct DeferredMatrixBackend {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FillBackend for DeferredMatrixBackend {
+        fn prepare(&self, _: &dyn FillSource, _: &AtomicBool, head: &HeadSlot) -> Result<()> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Err(SearchDeferred.into());
+            }
+            publish_empty(head, 1);
+            Ok(())
+        }
+        fn run(
+            &self,
+            _: &dyn FillSource,
+            _: &AtomicBool,
+            _: Option<Completed>,
+            _: &dyn Fn(IndexPin),
+        ) -> Outcome {
+            Outcome {
+                pin: Some(pin(1)),
+                cache_epoch: 0,
+                result: Ok(()),
+            }
+        }
+    }
+    #[test]
+    fn transient_background_deferral_is_not_a_fault_and_a_later_hint_recovers() {
+        let backend = Arc::new(DeferredMatrixBackend {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let owner = SearchFill::start_with(backend.clone()).unwrap();
+        let (_source, registration) = register(&owner, 1);
+        registration.notify();
+        owner.wait_until_idle_for_tests();
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+        registration.head_slot().fault().unwrap();
+        assert_eq!(
+            registration
+                .head_slot()
+                .declarations(pin(1), "model", 0)
+                .unwrap(),
+            None
+        );
+        registration.notify();
+        owner.wait_until_idle_for_tests();
+        assert_eq!(backend.calls.load(Ordering::Acquire), 2);
+        assert_eq!(
+            registration
+                .head_slot()
+                .declarations(pin(1), "model", 0)
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    struct PausedDeferredBackend {
+        entered: Sender<()>,
+        resume: Mutex<Receiver<()>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FillBackend for PausedDeferredBackend {
+        fn prepare(&self, _: &dyn FillSource, _: &AtomicBool, head: &HeadSlot) -> Result<()> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.entered.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+                return Err(SearchDeferred.into());
+            }
+            publish_empty(head, 1);
+            Ok(())
+        }
+        fn run(
+            &self,
+            _: &dyn FillSource,
+            _: &AtomicBool,
+            _: Option<Completed>,
+            _: &dyn Fn(IndexPin),
+        ) -> Outcome {
+            Outcome {
+                pin: Some(pin(1)),
+                cache_epoch: 0,
+                result: Ok(()),
+            }
+        }
+    }
+    #[test]
+    fn explicit_hint_during_deferred_attempt_is_preserved() {
+        let (entered, arrived) = mpsc::channel();
+        let (resume, release) = mpsc::channel();
+        let backend = Arc::new(PausedDeferredBackend {
+            entered,
+            resume: Mutex::new(release),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let owner = SearchFill::start_with(backend.clone()).unwrap();
+        let (_source, registration) = register(&owner, 1);
+        registration.notify();
+        arrived.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        registration.notify();
+        resume.send(()).unwrap();
+        owner.wait_until_idle_for_tests();
+        assert_eq!(backend.calls.load(Ordering::Acquire), 2);
+        assert_eq!(
+            registration
+                .head_slot()
+                .declarations(pin(1), "model", 0)
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn startup_discovery_runs_on_existing_driver_without_holding_the_inbox() {
+        let (owner, _events, _resume) = paused(false);
+        let directory = tempfile::tempdir().unwrap();
+        let roots = crate::store::topology::TopologyRoots::isolated_for_tests(
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        );
+        let (entered, arrived) = mpsc::channel();
+        let (resume, released) = mpsc::channel();
+        *owner.core.before_startup_discovery.lock().unwrap() = Some(Box::new(move || {
+            entered
+                .send(std::thread::current().name().map(str::to_owned))
+                .unwrap();
+            released
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+        owner.queue_startup(roots);
+        assert_eq!(
+            arrived
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap()
+                .as_deref(),
+            Some("trellis-search-fill")
+        );
+        // Discovery is paused, but registration can still acquire the owner inbox.
+        let (_source, registration) = register(&owner, 1);
+        assert!(
+            owner
+                .core
+                .inbox
+                .lock()
+                .unwrap()
+                .slots
+                .contains_key(&registration.id)
+        );
+        resume.send(()).unwrap();
+        owner.wait_until_idle_for_tests();
+    }
+
+    #[test]
+    fn startup_discovery_cannot_replace_a_checkout_activated_during_discovery() {
+        let (owner, _events, _resume) = paused(false);
+        let directory = tempfile::tempdir().unwrap();
+        let roots = crate::store::topology::TopologyRoots::isolated_for_tests(
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        );
+        let startup: Arc<dyn FillSource> = Arc::new(RootSource);
+        *owner.core.startup_discovery_sources.lock().unwrap() = Some(vec![startup]);
+        let (entered, arrived) = mpsc::channel();
+        let (resume, released) = mpsc::channel();
+        *owner.core.before_startup_discovery.lock().unwrap() = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            released
+                .recv_timeout(crate::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+        owner.queue_startup(roots);
+        arrived.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
+        let active: Arc<dyn FillSource> = Arc::new(RootSource);
+        let registration = owner.register_source(Arc::downgrade(&active));
+        let head = registration.head_slot();
+        publish_empty(&head, 1);
+        resume.send(()).unwrap();
+        owner.wait_until_idle_for_tests();
+        let inbox = owner.core.inbox.lock().unwrap();
+        assert_eq!(inbox.roots.get("root"), Some(&registration.id));
+        assert_eq!(inbox.slots.len(), 1);
+        assert!(!inbox.slots[&registration.id].cancel.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&inbox.slots[&registration.id].head, &head));
+        assert_eq!(head.declarations(pin(1), "model", 0).unwrap(), Some(0));
     }
 
     #[test]
@@ -877,6 +1784,9 @@ mod tests {
             1,
             Slot {
                 source: Arc::downgrade(&source),
+                head: Arc::new(HeadSlot::new(Weak::new(), 0, Weak::new())),
+                root_key: None,
+                startup: false,
                 cancel: Arc::new(AtomicBool::new(false)),
                 queued: false,
                 dirty: false,
@@ -1144,6 +2054,91 @@ mod tests {
         let service =
             Arc::new(SearchService::with_embedder_for_tests(roots, Arc::new(factory)).unwrap());
         (directory, service)
+    }
+
+    struct MatrixOnlySource;
+    impl FillSource for MatrixOnlySource {
+        fn head(
+            &self,
+            previous: Option<IndexPin>,
+            check: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<Option<HeadUpdate>> {
+            check()?;
+            let change = if previous == Some(pin(1)) {
+                super::super::search_head::HeadChange::Delta {
+                    removed_version_ids: Vec::new(),
+                    added: Vec::new().into(),
+                }
+            } else {
+                super::super::search_head::HeadChange::Full(
+                    vec![crate::search_rank::SearchCandidate {
+                        key: crate::search_rank::SearchCandidateKey {
+                            version_id: 1,
+                            syntax_id: "head-symbol".into(),
+                        },
+                        card_hash: "a".repeat(64),
+                    }]
+                    .into(),
+                )
+            };
+            Ok(Some(HeadUpdate {
+                pin: pin(1),
+                declarations: 1,
+                change,
+            }))
+        }
+        fn page(&self, _: Option<IndexPin>, _: Option<&str>) -> Result<HeadSearchCards> {
+            Ok(HeadSearchCards {
+                pin: pin(1),
+                cards: Vec::new(),
+            })
+        }
+    }
+    #[test]
+    fn matrix_and_model_evict_together_and_periodic_hints_do_not_reload_them() {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_directory, mut service) = recording_service(RecordingFactory {
+            loads: loads.clone(),
+            drops: drops.clone(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            pause: None,
+        });
+        let now = Instant::now();
+        let clock = Arc::new(Mutex::new(now));
+        let observed = clock.clone();
+        Arc::get_mut(&mut service)
+            .unwrap()
+            .set_model_clock_for_tests(Arc::new(move || *observed.lock().unwrap()));
+        let owner = SearchFill::start(service.clone()).unwrap();
+        let source: Arc<dyn FillSource> = Arc::new(MatrixOnlySource);
+        let registration = owner.register_source(Arc::downgrade(&source));
+        registration.notify();
+        owner.wait_until_idle_for_tests();
+        assert!(owner.matrix_storage_bytes() > 0);
+        assert_eq!(loads.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        *clock.lock().unwrap() = now + Duration::from_secs(600);
+        service.wake_model_clock_for_tests();
+        service.wait_for_model_eviction_for_tests();
+        assert_eq!(owner.matrix_storage_bytes(), 0);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+
+        registration.notify();
+        owner.wait_until_idle_for_tests();
+        assert_eq!(owner.matrix_storage_bytes(), 0);
+        assert_eq!(
+            loads.load(Ordering::Acquire),
+            1,
+            "periodic hints cannot revive evicted search state"
+        );
+
+        registration.head_slot().request();
+        owner.wait_until_idle_for_tests();
+        assert!(owner.matrix_storage_bytes() > 0);
+        assert_eq!(loads.load(Ordering::Acquire), 2);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
 
     #[test]

@@ -1068,6 +1068,13 @@ async fn run_daemon() -> Result<()> {
     owner.listener().set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(owner.listener().try_clone()?)?;
     let search_fill = daemon::search_fill::SearchFill::start(search.clone())?;
+    let startup_search = search.model_configured();
+    #[cfg(feature = "test-support")]
+    let startup_search =
+        startup_search || std::env::var_os("TRELLIS_TEST_SEARCH_STARTUP_SOCKET").is_some();
+    if startup_search {
+        search_fill.queue_startup(TopologyRoots::production()?);
+    }
     let mut checkouts = registry::CheckoutRegistry::new();
     checkouts.set_search_fill(search_fill);
     checkouts.set_search_service(search.clone());

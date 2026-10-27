@@ -4,8 +4,13 @@ pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 pub mod requests;
 mod search;
+mod search_startup;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
-pub use search::{HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchHeadChanged};
+pub use search::{
+    HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
+    SearchHeadChanged, SearchHeadDelta,
+};
+pub use search_startup::RecentSearchCheckout;
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
@@ -11427,6 +11432,9 @@ impl Store {
 
     pub fn root_id(&self) -> &str {
         &self.identity.record_id
+    }
+    pub(crate) fn root_key(&self) -> &str {
+        &self.identity.root_key
     }
     pub fn workspace_root(&self) -> &str {
         &self.workspace_root

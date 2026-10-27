@@ -1,6 +1,10 @@
 //! Version-owned capture cards and the lexical corpus of the selected head.
 use super::*;
 
+#[cfg(test)]
+#[path = "search_matrix_tests.rs"]
+mod matrix_tests;
+
 /// The fill owner releases its index snapshot between these bounded pages.
 pub(crate) const SEARCH_CARD_BATCH_SIZE: usize = 16;
 
@@ -202,12 +206,60 @@ pub(super) fn publish_head(db: &Connection, revision: &str) -> Result<()> {
     Ok(())
 }
 
+/// A retained-revision membership change, not a fresh enumeration of the head.
+#[derive(Debug)]
+pub struct SearchHeadDelta {
+    pub pin: IndexPin,
+    pub removed_version_ids: Vec<i64>,
+    pub added: std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+    /// Required head corpus count; callers validate their patched membership
+    /// against it before publishing a new in-memory matrix.
+    pub head_card_count: usize,
+}
+
+/// The previous matrix basis belongs to another generation or is no longer
+/// retained. This is a cold rebuild request, never a corruption fallback.
+#[derive(Debug)]
+pub struct SearchDeltaColdRebuild;
+impl std::fmt::Display for SearchDeltaColdRebuild {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("search_delta_cold_rebuild: previous head is no longer retained")
+    }
+}
+impl std::error::Error for SearchDeltaColdRebuild {}
+
 /// Candidate identities and lexical order from one admitted head.
 #[derive(Debug)]
 pub struct McpSearchCandidates {
     pub pin: IndexPin,
     pub cards: Vec<crate::search_rank::SearchCandidate>,
     pub lexical: Vec<crate::search_rank::SearchCandidateKey>,
+}
+
+fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::SearchCandidate> {
+    use crate::search_rank::{SearchCandidate, SearchCandidateKey};
+    let card_hash: String = row.get(2)?;
+    ensure!(
+        card_hash.len() == 64
+            && card_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        SelectedIntegrity("store_unavailable: invalid search card hash".into())
+    );
+    Ok(SearchCandidate {
+        key: SearchCandidateKey {
+            version_id: row.get(0)?,
+            syntax_id: stored_id_row(row, 1, false)?,
+        },
+        card_hash,
+    })
+}
+
+fn search_head_count(db: &Connection) -> Result<usize> {
+    let count: i64 = db.query_row("SELECT count(*) FROM head_search_fts", [], |row| row.get(0))?;
+    usize::try_from(count).context(SelectedIntegrity(
+        "store_unavailable: invalid head search count".into(),
+    ))
 }
 
 // The callback and guard are scoped to a synchronous admitted read. Preserve the
@@ -282,52 +334,196 @@ impl EvidenceResponse {
         }
     }
 
-    pub fn mcp_search_candidates(
+    /// Read all candidate identities from this admitted head for a cold matrix
+    /// build. No source or card text is materialized. Warm callers use the delta
+    /// and lexical reads instead of enumerating these identities again.
+    pub fn mcp_search_head(
         &self,
-        query: &str,
         expected: Option<IndexPin>,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<McpSearchCandidates> {
-        use crate::search_rank::{CANDIDATE_DEPTH, SearchCandidate, SearchCandidateKey};
+    ) -> Result<(
+        IndexPin,
+        std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+    )> {
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
-            ensure!(expected.is_none_or(|pin| pin == selected.pin),
-                "revision conflict: expected basis differs from admitted head");
-            let candidates_phase = crate::search_model::SearchPhaseTimer::start("head_candidates");
+            ensure!(
+                expected.is_none_or(|pin| pin == selected.pin),
+                "revision conflict: expected basis differs from admitted head"
+            );
+            let _phase = crate::search_model::SearchPhaseTimer::start("head_candidates");
             let mut statement = self.db.prepare(
                 "SELECT c.vid,c.syntax_id,c.card_hash
                  FROM native_version_search_cards c
                  JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
                  JOIN document_versions v ON v.vid=c.vid
                  JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id
-                 ORDER BY c.syntax_id"
+                 ORDER BY c.syntax_id",
             )?;
             let mut rows = statement.query([&selected.key])?;
             let mut cards = Vec::new();
             while let Some(row) = rows.next()? {
                 check()?;
-                let card_hash: String = row.get(2)?;
-                ensure!(card_hash.len() == 64 && card_hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                    SelectedIntegrity("store_unavailable: invalid search card hash".into()));
-                cards.push(SearchCandidate {
-                    key: SearchCandidateKey { version_id: row.get(0)?, syntax_id: stored_id_row(row,1,false)? },
-                    card_hash,
-                });
+                cards.push(search_candidate(row)?);
             }
+            ensure!(
+                search_head_count(&self.db)? == cards.len(),
+                SelectedIntegrity("store_unavailable: head search corpus mismatch".into())
+            );
+            Ok((selected.pin, cards.into()))
+        })
+    }
+
+    /// Read only candidates in added document versions and the removed version
+    /// IDs between two pins, using this response's admitted SQLite snapshot.
+    /// A missing/released old pin or generation change requests a cold rebuild;
+    /// retained revision corruption and read faults remain errors.
+    pub fn mcp_search_head_delta(
+        &self,
+        previous: IndexPin,
+        expected_new: IndexPin,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<SearchHeadDelta> {
+        self.search_read(check, |check| {
+            let selected = self.store.read_revision_for(&self.db, None, true)?;
+            ensure!(
+                selected.pin == expected_new,
+                "revision conflict: expected basis differs from admitted head"
+            );
+            if previous.index_generation != selected.pin.index_generation {
+                return Err(SearchDeltaColdRebuild.into());
+            }
+            ensure!(
+                previous.index_revision > 0
+                    && previous.index_revision <= selected.pin.index_revision,
+                "revision conflict: invalid previous search basis"
+            );
+            let old_key = format!(
+                "pin:v1:{}:{}",
+                previous.index_generation, previous.index_revision
+            );
+            let retained: Option<(i64, bool)> = self
+                .db
+                .query_row(
+                    "SELECT r.published_index_revision,
+                     EXISTS(SELECT 1 FROM revision_capture_inputs i
+                        WHERE i.revision_id=r.id
+                        AND i.input_key IN ('__released:v1','__pending_release:v1'))
+                     FROM native_revisions r WHERE r.id=?1",
+                    [&old_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((revision, false)) = retained else {
+                return Err(SearchDeltaColdRebuild.into());
+            };
+            ensure!(
+                u64::try_from(revision).ok() == Some(previous.index_revision),
+                SelectedIntegrity("store_unavailable: invalid retained search basis".into())
+            );
+            // Retention is checked above; corruption in a retained revision is
+            // still an integrity failure, never permission for a cold fallback.
+            self.store
+                .read_revision_for(&self.db, Some(previous), true)?;
+            let _phase = crate::search_model::SearchPhaseTimer::start("head_delta");
+            let mut removed_statement = self.db.prepare(
+                "SELECT vid FROM revision_documents WHERE revision_id=?1
+                 EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2",
+            )?;
+            let mut removed_rows = removed_statement.query(params![old_key, selected.key])?;
+            let mut removed_version_ids = Vec::new();
+            while let Some(row) = removed_rows.next()? {
+                check()?;
+                removed_version_ids.push(row.get(0)?);
+            }
+            let mut added_statement = self.db.prepare(
+                "WITH added(vid) AS MATERIALIZED
+                 (SELECT vid FROM revision_documents WHERE revision_id=?1
+                  EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2)
+                 SELECT c.vid,c.syntax_id,c.card_hash,v.vid,d.vid
+                 FROM added
+                 CROSS JOIN native_version_search_cards c ON c.vid=added.vid
+                 LEFT JOIN document_versions v ON v.vid=c.vid
+                 LEFT JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id
+                 ORDER BY c.syntax_id",
+            )?;
+            let mut added_rows = added_statement.query(params![selected.key, old_key])?;
+            let mut added = Vec::new();
+            while let Some(row) = added_rows.next()? {
+                check()?;
+                let candidate = search_candidate(row)?;
+                ensure!(
+                    row.get::<_, Option<i64>>(3)?.is_some()
+                        && row.get::<_, Option<i64>>(4)?.is_some(),
+                    SelectedIntegrity("store_unavailable: search candidate owner absent".into())
+                );
+                added.push(candidate);
+            }
+            let head_card_count = search_head_count(&self.db)?;
+            Ok(SearchHeadDelta {
+                pin: selected.pin,
+                removed_version_ids,
+                added: added.into(),
+                head_card_count,
+            })
+        })
+    }
+
+    /// Count canonical head cards without enumerating candidates or trusting
+    /// the derived FTS corpus that the lexical read must independently check.
+    pub fn mcp_search_head_count(
+        &self,
+        expected: IndexPin,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<usize> {
+        self.search_read(check, |_| {
+            let selected = self.store.read_revision_for(&self.db, None, true)?;
+            ensure!(
+                selected.pin == expected,
+                "revision conflict: expected basis differs from admitted head"
+            );
+            let count: i64 = self.db.query_row(
+                "SELECT count(*)
+                 FROM native_version_search_cards c
+                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                 JOIN document_versions v ON v.vid=c.vid
+                 JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id",
+                [&selected.key],
+                |row| row.get(0),
+            )?;
+            usize::try_from(count).context(SelectedIntegrity(
+                "store_unavailable: invalid head search count".into(),
+            ))
+        })
+    }
+
+    /// Rank the lexical arm at the admitted pin without reloading candidates.
+    /// Even a termless query validates the required corpus against the caller's
+    /// complete head membership count. Errors never yield a partial arm.
+    pub fn mcp_search_lexical(
+        &self,
+        query: &str,
+        expected: IndexPin,
+        expected_cards: usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<crate::search_rank::SearchCandidateKey>> {
+        use crate::search_rank::{CANDIDATE_DEPTH, SearchCandidateKey};
+        self.search_read(check, |check| {
+            let selected = self.store.read_revision_for(&self.db, None, true)?;
+            ensure!(selected.pin == expected,
+                "revision conflict: expected basis differs from admitted head");
             // Even a termless query must read the required head corpus. Schema,
             // stepping and I/O errors never become lexical-only best effort.
-            let corpus: i64 = self.db.query_row("SELECT count(*) FROM head_search_fts", [], |row| row.get(0))?;
-            ensure!(usize::try_from(corpus).ok() == Some(cards.len()),
+            ensure!(search_head_count(&self.db)? == expected_cards,
                 SelectedIntegrity("store_unavailable: head search corpus mismatch".into()));
-            drop(candidates_phase);
             let _phase = crate::search_model::SearchPhaseTimer::start("lexical_search");
             let mut lexical = Vec::new();
             if let Some(expression) = crate::search_lexical::query_expression(&self.db, query)? {
                 let mut statement = self.db.prepare(
                     "SELECT head_search_fts.vid,head_search_fts.syntax_id,bm25(head_search_fts)
                      FROM head_search_fts
-                     JOIN native_version_search_cards c ON c.vid=head_search_fts.vid AND c.syntax_id=head_search_fts.syntax_id
-                     JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                     CROSS JOIN native_version_search_cards c ON c.vid=head_search_fts.vid AND c.syntax_id=head_search_fts.syntax_id
+                     CROSS JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
                      WHERE head_search_fts MATCH ?2
                      ORDER BY bm25(head_search_fts),head_search_fts.syntax_id LIMIT ?3"
                 )?;
@@ -339,7 +535,23 @@ impl EvidenceResponse {
                     lexical.push(SearchCandidateKey { version_id: row.get(0)?, syntax_id: stored_id_row(row,1,false)? });
                 }
             }
-            Ok(McpSearchCandidates { pin: selected.pin, cards, lexical })
+            Ok(lexical)
+        })
+    }
+
+    /// Read complete head candidates and the lexical arm for existing callers.
+    pub fn mcp_search_candidates(
+        &self,
+        query: &str,
+        expected: Option<IndexPin>,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<McpSearchCandidates> {
+        let (pin, cards) = self.mcp_search_head(expected, check)?;
+        let lexical = self.mcp_search_lexical(query, pin, cards.len(), check)?;
+        Ok(McpSearchCandidates {
+            pin,
+            cards: cards.to_vec(),
+            lexical,
         })
     }
 

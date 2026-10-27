@@ -1,7 +1,9 @@
 # Decision 0018: semantic symbol retrieval
 
 - Status: owner-ratified direction on #211 (2026-10-21), amended by the 2026-10-25 parity and
-  backend rulings and the 2026-10-26 item-8 approval. The initial reviewed constants are
+  backend rulings, the 2026-10-26 item-8 approval, and the
+  [2026-10-27 resident-matrix ruling](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819).
+  The initial reviewed constants are
   (k, D, wL, wV) = (20, 200, 1, 4), with no additional lexical-arm restriction.
 - Amends: #24’s catalog/wire projection and #23’s optional-vector-cache topology as stated in
   their amended sections. No #22 evidence record, identity, provenance or warning shape changes.
@@ -82,10 +84,18 @@ inputs, and this adds no cross-call numerical equality requirement.
 
 One supported model is active at a time, selected from Trellis’s closed reviewed pins.
 Configured files are verified before loading against the reviewed immutable model descriptor.
-The model loads lazily. After a query or fill loads the verified model, the single embedding
-owner keeps its weights resident and reuses them for later queries and fill batches. It drops
-them after ten minutes with no query and no fill work; each use resets the idle timer. File
-verification is reused per file identity and is repeated when files change, before reusing
+The single embedding owner retains verified model weights for reuse by queries and fill
+batches, dropping them after 600 seconds with no query or fill work; each use resets the idle
+timer. When the model becomes ready, the owner pre-warms active-checkout head matrices.
+Daemon startup pre-warms at most the four most recently opened checkouts whose recorded
+last-opened time is within seven days, newest first (root-key byte order breaks ties).
+Existing index metadata is the approved open-recency proxy; discovery is read-only, does
+not activate checkouts or refresh open age, and creates no durable MRU catalog. Startup
+work is low-priority background work, below normal query/active-checkout work, and never
+delays daemon socket acceptance. Startup warming stops when the aggregate matrix memory
+cap below prevents admission; it does not evict useful matrices to warm more checkouts.
+This records the [#358 owner policy, 2026-10-27](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6446057555).
+File verification is reused per file identity and is repeated when files change, before reusing
 changed model inputs. Loading remains lexical-only for concurrent callers and the explicit
 Metal-unavailable error is unchanged. The owner avoids blocking checkout worker locks while
 loading. This amends the earlier per-job drop rule (owner ruling
@@ -134,13 +144,45 @@ The initial weighted-RRF constants are **k=20, D=200, wL=1 and wV=4**. Each arm 
 
 The lexical arm has **no additional exact-phrase, literal, identifier, substring, language or query-category gate**. It uses the shared card/query 32-term transform, bound quoted OR expression, BM25 ascending and symbolId-byte tie-break already specified in this record. No terms means an empty lexical arm. A store or FTS failure is still a typed failure, never vector-only best-effort success. `matchedBy` records arm membership after each depth cutoff, not relevance. These constants and any future lexical restriction are reviewed contract choices, not silent runtime tuning. This adds no score field or cross-call/backend ranking-equality promise.
 
-Within a call, one index snapshot and one vector-cache read transaction give coherent
-candidates, counts and matchedBy/order. evidenceBasis pins only the index head, not the
-asynchronous evictable cache. Re-embedding the same (modelId,cardHash) need not reproduce
-identical bytes. Cache filling, eviction or changed numerical output may change retrieval
-between calls at one basis. No cross-call equality, backend equality or runtime-independent
-ranking guarantee is added. Existing within-call ordering and typed numerical validity must
-still hold; non-finite/malformed vectors cannot enter cosine ordering as valid rows.
+The resident int8 head matrix is published as an immutable snapshot for one complete
+index pin and active model. The single existing background fill owner builds it, patches
+only changed document-version IDs from vectors.db for a new head pin, and tops up missing
+vectors as fill completes. A query uses one published matrix snapshot matching its admitted
+index pin for vector ranks, embedded counts and matchedBy/order, together with that same
+mandatory index snapshot. Resident matrices have a 2 GiB aggregate allocation budget,
+including in-progress builds, replacements and staging buffers. Admission accounts
+conservatively for estimated allocation capacity and bookkeeping before allocation, not
+just vector payload. This is a matrix-allocation budget, not an exact process-RSS limit or
+a limit on model weights. Query use shares the owner's existing matrix charge, not a
+second copy. Normal work evicts least-recently-used eligible matrices to admit a build. Startup warming
+does not evict matrices and stops on cap admission failure. A head that alone exceeds the
+cap stays lexical-only. Matrix residency also follows the model's 600-second query/fill
+idle eviction; the cap does not replace that idle rule.
+
+A checkout not already warmed returns complete lexical results on its first search while
+the independent background owner builds its matrix. No query waits for that build or embeds
+a query without an admitted resident matrix. If no matching matrix remains, including after
+eviction, a head change or a concurrent acquisition race, the query also returns lexical-only;
+it does not bypass the memory cap with the streaming scorer. These unavailable results
+have null model identity, embedded:0, the selected backend and unavailableReason:null.
+The admitted declaration count and lexical retrieval remain mandatory. Known observed
+store faults retain typed failures rather than becoming lexical-only success. This
+supersedes the earlier missing-matrix streaming fallback, under the same
+[#358 owner policy](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6446057555).
+This does not adopt sqlite-vec or remove existing bounds.
+
+Resident scoring uses NEON/SIMD with a scalar fallback and the stored-norm dot product.
+Acceptance is no R@5, R@10 or MRR regression on the gold set, not bit-identical scores or
+rankings. The earlier model-inference parity requirement is unchanged.
+
+evidenceBasis pins only the index head, not the asynchronous evictable cache or resident
+matrix publication. A valid retained published matrix remains usable after backing-cache
+eviction; owner updates or residency changes can change retrieval between calls at one basis.
+Re-embedding the same (modelId,cardHash) need not reproduce identical bytes. No cross-call
+equality, backend equality or runtime-independent ranking guarantee is added. Existing
+within-call ordering and typed numerical validity still hold; non-finite/malformed vectors
+cannot enter cosine ordering as valid rows. Observed database/schema/I/O faults retain their
+typed failures, never lexical-only success.
 
 ## Optional vector budget (supervisor review direction, 2026-10-26)
 
@@ -148,7 +190,11 @@ The call deadline stays 5,000ms. Optional vector work uses one absolute 3,000ms 
 protocol acceptance, including admission, verification/read, load, embedding, cache access
 and scoring. It never restarts on retries. Expiry stops the operation cooperatively and
 discards its entire vector arm before completing lexical retrieval at the admitted head.
-No model work is detached. Resident weights follow the ten-minute idle rule above. The remaining 2,000ms is reserved
+Query model inference is never detached to satisfy a timeout. The independent matrix build
+belongs to the existing single background fill owner, not the query: it continues to completion
+and publishes after the query's 3,000ms fallback or cancellation/drop. Query cancellation
+does not cancel that shared build. Resident weights and matrices follow the 600-second idle
+rule above. The remaining 2,000ms is reserved
 for cleanup and mandatory lexical/projection/final checks, not a guarantee against an
 uninterruptible filesystem/device operation or mandatory-work overrun.
 
