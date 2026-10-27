@@ -1429,7 +1429,10 @@ impl EvidenceResponse {
             .architecture_snapshot(Some(selected.pin), check)
             .map_err(|error| self.store.report_index_failure(error))?;
         let mut references = crate::references::project(&snapshot, &[], 5, check)?;
-        let mut rules = crate::rules::evaluate(config, &snapshot, &references, &[], check)?;
+        let evaluated =
+            crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
+        let mut rules = evaluated.data;
+        let assignments = evaluated.layers;
         let metrics = self.metrics_at(
             &MetricsOptions {
                 pin: Some(snapshot.pin),
@@ -1492,13 +1495,18 @@ impl EvidenceResponse {
                 .get(&key)
                 .context("store_unavailable: architecture source join")?;
             let mut row = module.clone();
-            row["layer"] = serde_json::json!(crate::rules::layer_for(config, key.2)?);
+            row["layer"] = serde_json::json!(
+                assignments
+                    .get(key.2)
+                    .context("store_unavailable: architecture layer assignment absent")?
+            );
             row["physicalLines"] = serde_json::json!(doc.file.text.lines().count());
             row["declarationCount"] = serde_json::json!(file.declaration_count);
             row["roleCounts"] = serde_json::json!(file.role_counts);
             row["metrics"] = file.metrics.clone();
             modules.push(row);
         }
+        drop(assignments);
         // Keep policy and exception contributions separate even on the same pair.
         type SummaryKey = (String, String, String, String, bool, Option<String>);
         let mut summaries: BTreeMap<SummaryKey, serde_json::Value> = BTreeMap::new();
