@@ -12135,15 +12135,30 @@ async fn mcp_search_inference_budget_returns_complete_lexical_and_keeps_required
         // Seed documents so the query-only inference gate cannot block fill.
         fixture.seed_vectors(&service);
         fixture.prewarm().await;
-        let waiter = fill.unwrap();
-        tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
-            .await
-            .unwrap();
         let runtime = fixture
             .registry
             .lock()
             .await
             .runtime(&fixture.identity.root_key)
+            .unwrap();
+        let scheduler = runtime.browser_scheduler().unwrap();
+        // Worker steps publish fill hints even at an unchanged head. Hold future
+        // hints, then drain prior work so recovery cannot clear an injected fault.
+        // Keep the synchronous guard on a blocking thread, not across an await.
+        let worker_gate = ReadGate::default();
+        let _release_worker_on_failure = McpFillRelease([worker_gate.clone(), ReadGate::default()]);
+        let held = worker_gate.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _worker = scheduler.hold_worker_for_tests();
+            (held.hook())();
+        });
+        let held = worker_gate.clone();
+        tokio::task::spawn_blocking(move || held.await_held(1))
+            .await
+            .unwrap();
+        let waiter = fill.unwrap();
+        tokio::task::spawn_blocking(move || waiter.wait_until_idle_for_tests())
+            .await
             .unwrap();
         let origin = std::time::Instant::now() - trellis::mcp::CALL_DEADLINE;
         runtime.freeze_mcp_call_clock_for_tests(origin);
@@ -12231,6 +12246,10 @@ async fn mcp_search_inference_budget_returns_complete_lexical_and_keeps_required
                 assert!(reply["result"]["structuredContent"].get("data").is_none());
                 schema_pairs.push(search_schema_pair(&reply));
             } else if scenario == "native_fts" || scenario == "owner_fault" {
+                assert_eq!(
+                    reply["result"]["isError"], true,
+                    "{scenario}: required fault must survive optional budget expiry: {reply}"
+                );
                 tool(&reply, Some("store_unavailable"), true);
                 assert!(reply["result"]["structuredContent"].get("data").is_none());
                 schema_pairs.push(search_schema_pair(&reply));
@@ -12271,6 +12290,8 @@ async fn mcp_search_inference_budget_returns_complete_lexical_and_keeps_required
         drop(reader);
         drop(client);
         session.join().unwrap().unwrap();
+        worker_gate.open();
+        worker.await.unwrap();
     }
     validate_structured_content(&schema_pairs);
 }
@@ -12588,7 +12609,15 @@ async fn mcp_search_fill_serves_queued_query_between_real_batches_and_reports_bu
     );
     assert_eq!(factory.loads.load(std::sync::atomic::Ordering::Acquire), 0);
     assert!(factory.batches.lock().unwrap().is_empty());
-    assert_eq!(fill.as_ref().unwrap().matrix_storage_bytes(), 0);
+    // The owner has reserved the input candidates before model loading, but
+    // has not allocated a resident matrix or its fill scratch yet.
+    let candidate_bytes = 17
+        * (2 * std::mem::size_of::<trellis::search_rank::SearchCandidate>() + 39 + 64)
+        + 2 * std::mem::size_of::<usize>();
+    assert_eq!(
+        fill.as_ref().unwrap().matrix_storage_bytes(),
+        candidate_bytes
+    );
     // Receiving the complete reply above while the load gate is still held
     // proves the cold query did not wait or enqueue inference behind the owner.
     before_load.open();

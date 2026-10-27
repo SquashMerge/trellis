@@ -460,7 +460,7 @@ fn main() -> Result<()> {
     );
     for card in cards.iter() {
         ensure!(
-            matrix.candidate_for_key(&card.key) == Some(card),
+            matrix.candidate_for_key(&card.key).as_ref() == Some(card),
             "fixture identity preservation"
         );
     }

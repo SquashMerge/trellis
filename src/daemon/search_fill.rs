@@ -76,13 +76,17 @@ impl MatrixCharge {
         self.bytes += old.bytes;
         old.bytes = 0;
     }
-    pub(super) fn shrink(&mut self, bytes: usize) {
-        assert!(
-            bytes <= self.bytes,
-            "matrix estimate did not cover allocation"
-        );
+    pub(super) fn shrink(&mut self, bytes: usize) -> Result<()> {
+        if bytes > self.bytes {
+            return Err(MatrixEstimateExceeded {
+                reserved: self.bytes,
+                actual: bytes,
+            }
+            .into());
+        }
         self.budget.0.lock().unwrap().used -= self.bytes - bytes;
         self.bytes = bytes;
+        Ok(())
     }
 }
 impl Drop for MatrixCharge {
@@ -90,6 +94,22 @@ impl Drop for MatrixCharge {
         self.budget.0.lock().unwrap().used -= self.bytes;
     }
 }
+#[derive(Debug)]
+pub(super) struct MatrixEstimateExceeded {
+    pub(super) reserved: usize,
+    pub(super) actual: usize,
+}
+impl std::fmt::Display for MatrixEstimateExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "search matrix allocation exceeded reservation ({} > {} bytes)",
+            self.actual, self.reserved
+        )
+    }
+}
+impl std::error::Error for MatrixEstimateExceeded {}
+
 #[derive(Debug)]
 pub(super) struct MemoryDeclined;
 impl std::fmt::Display for MemoryDeclined {
@@ -118,6 +138,7 @@ pub(crate) trait FillSource: Send + Sync {
     fn head(
         &self,
         _previous: Option<IndexPin>,
+        _admit: &mut dyn FnMut(usize, usize, bool) -> Result<()>,
         _check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<HeadUpdate>> {
         Ok(None)
@@ -134,9 +155,10 @@ impl FillSource for DaemonState {
     fn head(
         &self,
         previous: Option<IndexPin>,
+        admit: &mut dyn FnMut(usize, usize, bool) -> Result<()>,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<HeadUpdate>> {
-        self.search_head_update(previous, check)
+        self.search_head_update(previous, admit, check)
     }
     fn page(&self, pin: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
         self.search_fill_page(pin, after, BATCH)
@@ -165,6 +187,9 @@ trait FillBackend: Send + Sync {
         _head: &HeadSlot,
     ) -> Result<()> {
         Ok(())
+    }
+    fn idle_now(&self) -> Instant {
+        Instant::now()
     }
     fn idle_remaining(&self) -> Option<Duration> {
         None
@@ -200,48 +225,59 @@ impl FillBackend for LocalBackend {
         }
         self.0.with_vector_writer(|_| Ok(()))?;
         let previous = head.previous(&model_id, self.0.cache_epoch());
-        let Some(update) = source.head(previous, &mut || check_cancel(cancel))? else {
-            return Err(SearchDeferred.into());
-        };
-        check_cancel(cancel)?;
-        if previous == Some(update.pin) && !head.needs_build() {
-            head.settle();
-            return Ok(());
-        }
-        // Loading and matrix I/O never retain a checkout snapshot or owner inbox.
-        if self.0.model_configured() {
-            self.0.with_model_job(cancel, |_| Ok(()))?;
-        }
-        let epoch = self.0.cache_epoch();
-        let built = self.0.with_vector_snapshot(|snapshot| {
-            head.build_mode(
-                update,
-                &model_id,
-                epoch,
-                snapshot,
-                source.is_startup(),
+        let prepare = |previous, startup| {
+            let mut candidates_charge = None;
+            let update = source.head(
+                previous,
+                &mut |added, removed, full| {
+                    candidates_charge = head.reserve_candidates(
+                        added,
+                        removed,
+                        full,
+                        &model_id,
+                        self.0.cache_epoch(),
+                        startup,
+                    )?;
+                    Ok(())
+                },
                 &mut || check_cancel(cancel),
-            )
-        });
-        if built
-            .as_ref()
-            .is_err_and(|error| error.is::<MemoryDeclined>())
-            && !source.is_startup()
-            && head.retry_cold()
-        {
-            // A patch can need more transient space than its final cold head.
-            // Dropping the old matrix is already accounted; finish this owner
-            // job from a full captured head without another user request.
-            let Some(update) = source.head(None, &mut || check_cancel(cancel))? else {
+            )?;
+            let Some(update) = update else {
                 return Err(SearchDeferred.into());
             };
-            return self.0.with_vector_snapshot(|snapshot| {
-                head.build_mode(update, &model_id, epoch, snapshot, false, &mut || {
+            check_cancel(cancel)?;
+            if previous == Some(update.pin) && !head.needs_build() {
+                head.settle();
+                return Ok(());
+            }
+            // No checkout snapshot or owner inbox survives model loading.
+            self.0.with_model_job(cancel, |_| Ok(()))?;
+            let epoch = self.0.cache_epoch();
+            let result = self.0.with_vector_snapshot(|snapshot| {
+                head.build_mode(update, &model_id, epoch, snapshot, startup, &mut || {
                     check_cancel(cancel)
                 })
             });
+            drop(candidates_charge);
+            result
+        };
+        let built = prepare(previous, source.is_startup());
+        if built
+            .as_ref()
+            .is_err_and(|error| error.is::<MemoryDeclined>())
+            && previous.is_some()
+            && !source.is_startup()
+            && head.can_retry_cold()
+        {
+            // Admission can fail before candidate allocation or during patch
+            // staging. Release the old matrix before one same-job cold attempt.
+            head.discard_for_cold();
+            return prepare(None, false);
         }
         built
+    }
+    fn idle_now(&self) -> Instant {
+        self.0.idle_now()
     }
     fn idle_remaining(&self) -> Option<Duration> {
         self.0.idle_remaining()
@@ -286,6 +322,7 @@ impl FillBackend for LocalBackend {
             cache_epoch = self.0.cache_epoch();
             reader = self.0.fill_reader()?;
             loop {
+                self.0.expire_idle_matrices();
                 check_cancel(cancel)?;
                 let missing = Self::missing(reader.as_mut(), &model_id, &page)?;
                 if missing.iter().any(|value| *value) {
@@ -346,6 +383,7 @@ impl LocalBackend {
     ) -> Result<()> {
         let (mut page, mut missing) = first_page;
         loop {
+            self.0.expire_idle_matrices();
             self.0.serve_queries(model);
             check_cancel(cancel)?;
             let mut hashes = std::collections::BTreeSet::new();
@@ -485,9 +523,8 @@ impl Core {
             return Some(charge);
         }
         if bytes > self.budget.0.lock().unwrap().limit {
-            if startup {
-                self.startup_at_cap.store(true, Ordering::Release);
-            }
+            // A single oversized head says nothing about whether the other
+            // recent checkouts fit. Only aggregate pressure stops prewarming.
             return None;
         }
         if startup {
@@ -512,6 +549,23 @@ impl Core {
             }
         }
         None
+    }
+    pub(super) fn expire_idle_matrices(&self, now: Instant) -> Option<Duration> {
+        // Ranking and publication lock individual heads. Never wait for those
+        // locks with the inbox held, and let each head recheck its own timer.
+        let heads = self
+            .inbox
+            .lock()
+            .unwrap()
+            .slots
+            .values()
+            // Only the owner changes running state. A batch sweep must not
+            // evict its own live matrix or scratch; the next owner transition
+            // rechecks it without extending the last user/publication touch.
+            .filter(|slot| !slot.running)
+            .map(|slot| slot.head.clone())
+            .collect::<Vec<_>>();
+        heads.iter().filter_map(|head| head.expire_idle(now)).min()
     }
     fn register_source(self: &Arc<Self>, source: Source) -> FillRegistration {
         self.register_source_mode(source, false)
@@ -867,6 +921,9 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
         let (id, source, cancel, completed, head) = {
             let mut inbox = core.inbox.lock().unwrap();
             loop {
+                drop(inbox);
+                let matrix_idle = core.expire_idle_matrices(backend.idle_now());
+                inbox = core.inbox.lock().unwrap();
                 if inbox.shutdown {
                     return;
                 }
@@ -940,15 +997,9 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
                 // Inbox -> admission only claims the transition. Never wait for
                 // the model with this inbox held; notifications use this mutex.
                 if !pending_fill && backend.begin_idle_expiry() {
-                    let heads = inbox
-                        .slots
-                        .values()
-                        .map(|s| s.head.clone())
-                        .collect::<Vec<_>>();
                     drop(inbox);
-                    for head in heads {
-                        head.clear();
-                    }
+                    // Model lifetime is global. Each resident matrix has its
+                    // own timer and is not invalidated by model unloading.
                     backend.finish_idle_expiry();
                     inbox = core.inbox.lock().unwrap();
                     continue;
@@ -966,10 +1017,7 @@ fn drive(core: Arc<Core>, backend: Arc<dyn FillBackend>) {
                 } else {
                     backend.idle_remaining()
                 };
-                let remaining = match (retry, idle) {
-                    (Some(retry), Some(idle)) => Some(retry.min(idle)),
-                    (retry, idle) => retry.or(idle),
-                };
+                let remaining = [retry, idle, matrix_idle].into_iter().flatten().min();
                 inbox = match remaining {
                     Some(remaining) => core.changed.wait_timeout(inbox, remaining).unwrap().0,
                     None => core.changed.wait(inbox).unwrap(),
@@ -1223,6 +1271,40 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn underestimated_charge_returns_typed_error_without_mutation_or_poisoning() {
+        let budget = Arc::new(MatrixBudget(Mutex::new(BudgetState { limit: 64, used: 0 })));
+        let mut charge = budget.reserve(32).unwrap();
+        let error = charge.shrink(33).unwrap_err();
+        let estimate = error.downcast_ref::<MatrixEstimateExceeded>().unwrap();
+        assert_eq!((estimate.reserved, estimate.actual), (32, 33));
+        assert_eq!(charge.bytes, 32);
+        assert_eq!(budget.0.lock().unwrap().used, 32);
+        charge.shrink(16).unwrap();
+        assert_eq!(budget.0.lock().unwrap().used, 16);
+        drop(charge);
+        assert_eq!(budget.0.lock().unwrap().used, 0);
+    }
+
+    #[test]
+    fn one_oversized_startup_head_does_not_stop_smaller_recent_heads() {
+        let core = Arc::new(Core {
+            budget: Arc::new(MatrixBudget(Mutex::new(BudgetState { limit: 64, used: 0 }))),
+            ..Core::default()
+        });
+        assert!(core.reserve(0, 65, true).is_none());
+        assert!(!core.startup_at_cap());
+        let smaller = core.reserve(1, 32, true).unwrap();
+        assert!(!core.startup_at_cap());
+        assert_eq!(core.budget.0.lock().unwrap().used, 32);
+        // Aggregate pressure still terminates startup rather than evicting a
+        // previous matrix or competing with explicit demand.
+        assert!(core.reserve(2, 33, true).is_none());
+        assert!(core.startup_at_cap());
+        assert_eq!(core.budget.0.lock().unwrap().used, 32);
+        drop(smaller);
+    }
+
     #[test]
     fn owner_finishes_matrix_after_waiter_budget_fallback() {
         let (entered, arrived) = mpsc::channel();
@@ -1839,7 +1921,7 @@ mod tests {
         let model_id = model_id_for_card_format(CardFormat::V1.as_str());
         let cards = (0..BATCH)
             .map(|index| HeadSearchCard {
-                syntax_id: format!("card-{index:03}"),
+                syntax_id: format!("sid:v1:{index:032x}"),
                 card_text: "cached".into(),
                 card_hash: format!("{index:064x}"),
             })
@@ -2022,7 +2104,7 @@ mod tests {
         PagedSource {
             cards: (0..BATCH + 3)
                 .map(|index| HeadSearchCard {
-                    syntax_id: format!("{index:04}"),
+                    syntax_id: format!("sid:v1:{index:032x}"),
                     card_text: format!(
                         "text-{}",
                         if index == BATCH + 2 {
@@ -2061,9 +2143,15 @@ mod tests {
         fn head(
             &self,
             previous: Option<IndexPin>,
+            admit: &mut dyn FnMut(usize, usize, bool) -> Result<()>,
             check: &mut dyn FnMut() -> Result<()>,
         ) -> Result<Option<HeadUpdate>> {
             check()?;
+            admit(
+                usize::from(previous != Some(pin(1))),
+                0,
+                previous != Some(pin(1)),
+            )?;
             let change = if previous == Some(pin(1)) {
                 super::super::search_head::HeadChange::Delta {
                     removed_version_ids: Vec::new(),
@@ -2074,7 +2162,7 @@ mod tests {
                     vec![crate::search_rank::SearchCandidate {
                         key: crate::search_rank::SearchCandidateKey {
                             version_id: 1,
-                            syntax_id: "head-symbol".into(),
+                            syntax_id: "sid:v1:00000000000000000000000000000001".into(),
                         },
                         card_hash: "a".repeat(64),
                     }]
@@ -2095,7 +2183,107 @@ mod tests {
         }
     }
     #[test]
-    fn matrix_and_model_evict_together_and_periodic_hints_do_not_reload_them() {
+    fn matrix_idle_is_per_checkout_even_with_a_pending_sibling_retry() {
+        let (_directory, mut service) = recording_service(RecordingFactory {
+            loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            drops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            pause: None,
+        });
+        let now = Instant::now();
+        let clock = Arc::new(Mutex::new(now));
+        let observed = clock.clone();
+        Arc::get_mut(&mut service)
+            .unwrap()
+            .set_model_clock_for_tests(Arc::new(move || *observed.lock().unwrap()));
+        let core = Arc::new(Core::default());
+        *core.search.lock().unwrap() = Arc::downgrade(&service);
+        service.set_maintenance(Arc::downgrade(&core));
+        let a_source: Arc<dyn FillSource> = Arc::new(TestSource(pin(1)));
+        let a = core.register_source(Arc::downgrade(&a_source));
+        let b_source: Arc<dyn FillSource> = Arc::new(TestSource(pin(2)));
+        let b = core.register_source(Arc::downgrade(&b_source));
+        let model_id = model_id_for_card_format(CardFormat::V1.as_str());
+        let epoch = service.cache_epoch();
+        let publish = |head: &HeadSlot, revision| {
+            head.build(
+                HeadUpdate {
+                    pin: pin(revision),
+                    declarations: 0,
+                    change: super::super::search_head::HeadChange::Full(Vec::new().into()),
+                },
+                &model_id,
+                epoch,
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap();
+        };
+        publish(&a.head, 1);
+        publish(&b.head, 2);
+        let both = core.budget.0.lock().unwrap().used;
+        assert!(both > 0);
+        assert_eq!(
+            core.expire_idle_matrices(now + Duration::from_secs(599)),
+            Some(Duration::from_secs(1))
+        );
+        *clock.lock().unwrap() = now + Duration::from_secs(599);
+        assert!(b.head.resident().unwrap());
+        {
+            let mut inbox = core.inbox.lock().unwrap();
+            inbox.slots.get_mut(&b.id).unwrap().retry_at = Some(now + Duration::from_secs(601));
+            assert!(inbox.has_pending_work());
+        }
+        // The same maintenance route runs between bounded fill batches.
+        *clock.lock().unwrap() = now + Duration::from_secs(600);
+        service.expire_idle_matrices();
+        // B's query and pending work must not extend A's ten-minute timer.
+        assert_eq!(
+            core.expire_idle_matrices(now + Duration::from_secs(600)),
+            Some(Duration::from_secs(599))
+        );
+        assert_eq!(a.head.declarations(pin(1), &model_id, epoch).unwrap(), None);
+        assert!(a.head.dormant());
+        assert_eq!(
+            b.head.declarations(pin(2), &model_id, epoch).unwrap(),
+            Some(0)
+        );
+        let remaining = core.budget.0.lock().unwrap().used;
+        assert!(remaining > 0 && remaining < both);
+        // A batch sweep skips the current owner job but does not reset its
+        // timer. Finishing that job makes its already-expired head eligible.
+        core.inbox
+            .lock()
+            .unwrap()
+            .slots
+            .get_mut(&b.id)
+            .unwrap()
+            .running = true;
+        assert_eq!(
+            core.expire_idle_matrices(now + Duration::from_secs(1199)),
+            None
+        );
+        assert_eq!(
+            b.head.declarations(pin(2), &model_id, epoch).unwrap(),
+            Some(0)
+        );
+        core.inbox
+            .lock()
+            .unwrap()
+            .slots
+            .get_mut(&b.id)
+            .unwrap()
+            .running = false;
+        assert_eq!(
+            core.expire_idle_matrices(now + Duration::from_secs(1199)),
+            None
+        );
+        assert!(b.head.dormant());
+        assert_eq!(core.budget.0.lock().unwrap().used, 0);
+    }
+
+    #[test]
+    fn idle_matrix_and_model_expire_and_periodic_hints_do_not_reload_them() {
         let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (_directory, mut service) = recording_service(RecordingFactory {

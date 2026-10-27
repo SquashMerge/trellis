@@ -1217,6 +1217,7 @@ impl DaemonState {
     pub(crate) fn search_head_update(
         &self,
         previous: Option<IndexPin>,
+        admit: &mut dyn FnMut(usize, usize, bool) -> anyhow::Result<()>,
         check: &mut dyn FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<Option<crate::daemon::search_head::HeadUpdate>> {
         use crate::daemon::search_head::{HeadChange, HeadUpdate};
@@ -1235,7 +1236,12 @@ impl DaemonState {
                     added: std::sync::Arc::from([]),
                 },
             },
-            Some(previous) => match response.mcp_search_head_delta(previous, pin, &mut check) {
+            Some(previous) => match response.mcp_search_head_delta_admitted(
+                previous,
+                pin,
+                &mut check,
+                &mut |added, removed| admit(added, removed, false),
+            ) {
                 Ok(delta) => HeadUpdate {
                     pin: delta.pin,
                     declarations: delta.head_card_count,
@@ -1245,7 +1251,10 @@ impl DaemonState {
                     },
                 },
                 Err(error) if error.is::<crate::store::SearchDeltaColdRebuild>() => {
-                    let (pin, cards) = response.mcp_search_head(Some(pin), &mut check)?;
+                    let (pin, cards) =
+                        response.mcp_search_head_admitted(Some(pin), &mut check, &mut |count| {
+                            admit(count, 0, true)
+                        })?;
                     HeadUpdate {
                         pin,
                         declarations: cards.len(),
@@ -1255,7 +1264,10 @@ impl DaemonState {
                 Err(error) => return Err(error),
             },
             None => {
-                let (pin, cards) = response.mcp_search_head(Some(pin), &mut check)?;
+                let (pin, cards) =
+                    response.mcp_search_head_admitted(Some(pin), &mut check, &mut |count| {
+                        admit(count, 0, true)
+                    })?;
                 HeadUpdate {
                     pin,
                     declarations: cards.len(),

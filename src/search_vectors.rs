@@ -172,7 +172,6 @@ fn validate(db: &rusqlite::Connection) -> Result<()> {
 pub struct VectorCacheWriter {
     db: ProtectedSqliteConnection,
     byte_budget: u64,
-    eviction_epoch: u64,
 }
 impl VectorCacheWriter {
     /// The daemon must prepare the private parent directory and own all writes.
@@ -211,20 +210,15 @@ impl VectorCacheWriter {
             let tx = storage(db.transaction())?;
             validate(&tx)?;
         }
-        let mut cache = Self {
-            db,
-            byte_budget,
-            eviction_epoch: 0,
-        };
+        let mut cache = Self { db, byte_budget };
         // A smaller configured budget takes effect even without another insert.
         let tx = storage(
             cache
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate),
         )?;
-        let evicted = evict(&tx, byte_budget, &[])?;
+        evict(&tx, byte_budget, &[])?;
         storage(tx.commit())?;
-        cache.eviction_epoch += u64::from(evicted);
         Ok(cache)
     }
     /// Invalid input is rejected before any transaction. If this entry cannot
@@ -258,9 +252,8 @@ impl VectorCacheWriter {
             let age = next_age(&tx)?;
             storage(tx.execute("INSERT INTO vectors VALUES (?1, ?2, ?3, ?4) ON CONFLICT(model_id,card_hash) DO UPDATE SET vector=excluded.vector,touched=excluded.touched", params![model_id, card_hash, bytes, age]))?;
         }
-        let evicted = evict(&tx, self.byte_budget, &retained)?;
+        evict(&tx, self.byte_budget, &retained)?;
         storage(tx.commit())?;
-        self.eviction_epoch += u64::from(evicted);
         Ok(())
     }
     /// Explicit owner operation. Reads never call this and never change age.
@@ -275,16 +268,10 @@ impl VectorCacheWriter {
             "UPDATE vectors SET touched=?3 WHERE model_id=?1 AND card_hash=?2",
             params![model_id, card_hash, age],
         ))?;
-        let evicted = evict(&tx, self.byte_budget, &[])?;
+        evict(&tx, self.byte_budget, &[])?;
         storage(tx.commit())?;
-        self.eviction_epoch += u64::from(evicted);
         Ok(())
     }
-    /// In-process invalidation only; inserts that retain every row do not advance it.
-    pub fn eviction_epoch(&self) -> u64 {
-        self.eviction_epoch
-    }
-
     pub fn snapshot(&mut self) -> Result<VectorSnapshot<'_>> {
         snapshot(&mut self.db)
     }
@@ -311,8 +298,7 @@ fn compact_bytes(db: &rusqlite::Connection) -> Result<u64> {
         .and_then(|pages| pages.checked_mul(size))
         .ok_or_else(|| StoreUnavailable.into())
 }
-fn evict(tx: &Transaction<'_>, budget: u64, retained: &[(&str, &str)]) -> Result<bool> {
-    let mut evicted = false;
+fn evict(tx: &Transaction<'_>, budget: u64, retained: &[(&str, &str)]) -> Result<()> {
     while compact_bytes(tx)? > budget {
         let oldest = {
             let mut statement = storage(tx.prepare(
@@ -338,9 +324,8 @@ fn evict(tx: &Transaction<'_>, budget: u64, retained: &[(&str, &str)]) -> Result
             "DELETE FROM vectors WHERE model_id=?1 AND card_hash=?2",
             params![model, card],
         ))?;
-        evicted = true;
     }
-    Ok(evicted)
+    Ok(())
 }
 
 pub struct VectorCacheReader {
@@ -973,11 +958,6 @@ mod tests {
         let card = key(3);
         writer.put(&model_a, &card, &[1; 1024]).unwrap();
         writer.put(&model_b, &card, &[-1; 1024]).unwrap();
-        assert_eq!(
-            writer.eviction_epoch(),
-            0,
-            "non-evicting inserts preserve completed heads"
-        );
         let mut evicted = false;
         for number in 4..40 {
             // Reading model A must not refresh its LRU age; the owner explicitly
@@ -1016,10 +996,6 @@ mod tests {
             }
         }
         assert!(evicted);
-        assert!(
-            writer.eviction_epoch() > 0,
-            "only committed eviction invalidates completed heads"
-        );
         assert_eq!(
             writer.snapshot().unwrap().get(&model_b, &card).unwrap(),
             Some(vec![-1; 1024])

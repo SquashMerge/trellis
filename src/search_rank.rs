@@ -349,6 +349,7 @@ struct MatrixBlock {
     dimensions: Box<[[i8; MATRIX_LANES]]>,
     inverse_norms: [f32; MATRIX_LANES],
     present: u16,
+    active: u16,
 }
 
 /// Counts for the changed rows only; `present` is added rows with valid vectors.
@@ -359,14 +360,85 @@ pub struct MatrixDeltaStats {
     pub present: usize,
 }
 
-/// Resident matrix with stable, reusable slots. Only the owner changes its pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MatrixRow {
+    version_id: i64,
+    syntax_id: [u8; 16],
+    card_hash: [u8; 32],
+}
+
+fn compact_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != N * 2 {
+        return None;
+    }
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    let mut bytes = [0; N];
+    for (out, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+        *out = nibble(pair[0])? << 4 | nibble(pair[1])?;
+    }
+    Some(bytes)
+}
+
+fn expand_hex(bytes: &[u8], prefix: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(prefix.len() + bytes.len() * 2);
+    text.push_str(prefix);
+    for byte in bytes {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 15) as usize] as char);
+    }
+    text
+}
+
+impl MatrixRow {
+    fn parse(candidate: &SearchCandidate) -> Result<Self> {
+        let syntax_id = candidate
+            .key
+            .syntax_id
+            .strip_prefix("sid:v1:")
+            .and_then(compact_hex);
+        let card_hash = compact_hex(&candidate.card_hash);
+        match (syntax_id, card_hash) {
+            (Some(syntax_id), Some(card_hash)) => Ok(Self {
+                version_id: candidate.key.version_id,
+                syntax_id,
+                card_hash,
+            }),
+            _ => Err(crate::store::SelectedIntegrity(
+                "store_unavailable: noncanonical search candidate".into(),
+            )
+            .into()),
+        }
+    }
+
+    fn key(&self) -> (i64, [u8; 16]) {
+        (self.version_id, self.syntax_id)
+    }
+
+    fn candidate(&self) -> SearchCandidate {
+        SearchCandidate {
+            key: SearchCandidateKey {
+                version_id: self.version_id,
+                syntax_id: expand_hex(&self.syntax_id, "sid:v1:"),
+            },
+            card_hash: expand_hex(&self.card_hash, ""),
+        }
+    }
+}
+
+/// Resident matrix with stable integer row IDs. The two indexes contain only
+/// u32 IDs; canonical wire strings are decoded only for returned candidates.
 pub struct SearchMatrix {
-    candidates: Vec<SearchCandidate>,
-    active: Vec<bool>,
-    key_ordinals: BTreeMap<SearchCandidateKey, usize>,
-    version_slots: BTreeMap<i64, Vec<usize>>,
-    missing: BTreeMap<String, BTreeSet<usize>>,
-    free_slots: Vec<usize>,
+    rows: Vec<MatrixRow>,
+    key_ordinals: Vec<u32>,
+    hash_ordinals: Vec<u32>,
+    free_slots: Vec<u32>,
     blocks: Vec<MatrixBlock>,
     embedded: u64,
 }
@@ -377,27 +449,51 @@ impl SearchMatrix {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         check()?;
+        ensure!(
+            candidates.len() <= u32::MAX as usize,
+            crate::store::SelectedIntegrity("store_unavailable: matrix capacity overflow".into())
+        );
+        let count = candidates.len();
         let mut matrix = Self {
-            candidates: Vec::new(),
-            active: Vec::new(),
-            key_ordinals: BTreeMap::new(),
-            version_slots: BTreeMap::new(),
-            missing: BTreeMap::new(),
+            rows: Vec::new(),
+            key_ordinals: Vec::new(),
+            hash_ordinals: Vec::new(),
             free_slots: Vec::new(),
             blocks: Vec::new(),
             embedded: 0,
         };
-        let mut added = Vec::new();
-        added.try_reserve_exact(candidates.len())?;
+        matrix.rows.try_reserve_exact(count)?;
+        matrix.key_ordinals.try_reserve_exact(count)?;
+        matrix.hash_ordinals.try_reserve_exact(count)?;
+        matrix
+            .blocks
+            .try_reserve_exact(count.div_ceil(MATRIX_LANES))?;
         for candidate in candidates.iter() {
             check()?;
-            added.push((candidate.clone(), None));
+            matrix.rows.push(MatrixRow::parse(candidate)?);
         }
-        matrix.apply_delta(&[], added, check)?;
+        matrix.key_ordinals.extend(0..count as u32);
+        matrix.hash_ordinals.extend(0..count as u32);
+        matrix.sort_indexes();
+        ensure!(
+            matrix.key_ordinals.windows(2).all(|pair| {
+                matrix.rows[pair[0] as usize].key() != matrix.rows[pair[1] as usize].key()
+            }),
+            crate::store::SelectedIntegrity("store_unavailable: duplicate search candidate".into())
+        );
+        for block_index in 0..count.div_ceil(MATRIX_LANES) {
+            check()?;
+            let mut block = Self::empty_block()?;
+            let lanes = (count - block_index * MATRIX_LANES).min(MATRIX_LANES);
+            block.active = ((1_u32 << lanes) - 1) as u16;
+            matrix.blocks.push(block);
+        }
+        check()?;
         Ok(matrix)
     }
 
-    /// Cold-load once with a coherent scan. Later pins use apply_delta/fill.
+    /// Cold loading walks the resident hash index; no second ordinal list or
+    /// candidate/vector staging is allocated.
     pub fn from_snapshot(
         candidates: std::sync::Arc<[SearchCandidate]>,
         snapshot: Option<&crate::search_vectors::VectorSnapshot<'_>>,
@@ -408,34 +504,25 @@ impl SearchMatrix {
         let Some(snapshot) = snapshot else {
             return Ok(matrix);
         };
-        let mut ordinals: Vec<_> = (0..matrix.candidates.len()).collect();
-        ordinals.sort_unstable_by(|a, b| {
-            matrix.candidates[*a]
-                .card_hash
-                .as_bytes()
-                .cmp(matrix.candidates[*b].card_hash.as_bytes())
-                .then_with(|| a.cmp(b))
-        });
-        check()?;
         let mut head = 0;
-        let mut decoded = vec![0_i8; DIMENSIONS];
+        let mut decoded = [0_i8; DIMENSIONS];
         snapshot.scan_model(model_id, &mut |hash, vector| {
             check()?;
-            let Some(hash) = hash else { return Ok(()) };
-            while head < ordinals.len()
-                && matrix.candidates[ordinals[head]].card_hash.as_bytes() < hash
+            let Some(hash) = hash
+                .and_then(|hash| std::str::from_utf8(hash).ok())
+                .and_then(compact_hex::<32>)
+            else {
+                return Ok(());
+            };
+            while head < matrix.hash_ordinals.len()
+                && matrix.rows[matrix.hash_ordinals[head] as usize].card_hash < hash
             {
                 check()?;
                 head += 1;
             }
-            if head == ordinals.len()
-                || matrix.candidates[ordinals[head]].card_hash.as_bytes() != hash
-            {
-                return Ok(());
-            }
             let start = head;
-            while head < ordinals.len()
-                && matrix.candidates[ordinals[head]].card_hash.as_bytes() == hash
+            while head < matrix.hash_ordinals.len()
+                && matrix.rows[matrix.hash_ordinals[head] as usize].card_hash == hash
             {
                 check()?;
                 head += 1;
@@ -447,9 +534,9 @@ impl SearchMatrix {
             for (value, byte) in decoded.iter_mut().zip(vector) {
                 *value = *byte as i8;
             }
-            for ordinal in &ordinals[start..head] {
+            for index in start..head {
                 check()?;
-                matrix.insert(*ordinal, &decoded)?;
+                matrix.store_vector(matrix.hash_ordinals[index] as usize, &decoded);
             }
             check()
         })?;
@@ -457,22 +544,52 @@ impl SearchMatrix {
         Ok(matrix)
     }
 
-    pub fn candidate(&self, ordinal: usize) -> Option<&SearchCandidate> {
-        self.active
-            .get(ordinal)
-            .copied()
-            .unwrap_or(false)
-            .then(|| &self.candidates[ordinal])
+    fn empty_block() -> Result<MatrixBlock> {
+        let mut dimensions = Vec::new();
+        dimensions.try_reserve_exact(DIMENSIONS)?;
+        dimensions.resize(DIMENSIONS, [0; MATRIX_LANES]);
+        Ok(MatrixBlock {
+            dimensions: dimensions.into_boxed_slice(),
+            inverse_norms: [1.0; MATRIX_LANES],
+            present: 0,
+            active: 0,
+        })
     }
 
-    pub fn candidate_for_key(&self, key: &SearchCandidateKey) -> Option<&SearchCandidate> {
+    fn sort_indexes(&mut self) {
         self.key_ordinals
-            .get(key)
-            .map(|ordinal| &self.candidates[*ordinal])
+            .sort_unstable_by_key(|row| self.rows[*row as usize].key());
+        self.hash_ordinals
+            .sort_unstable_by_key(|row| (self.rows[*row as usize].card_hash, *row));
+    }
+
+    fn active(&self, ordinal: usize) -> bool {
+        ordinal < self.rows.len()
+            && self.blocks[ordinal / MATRIX_LANES].active & (1 << (ordinal % MATRIX_LANES)) != 0
+    }
+
+    fn present(&self, ordinal: usize) -> bool {
+        self.blocks[ordinal / MATRIX_LANES].present & (1 << (ordinal % MATRIX_LANES)) != 0
+    }
+
+    pub fn candidate(&self, ordinal: usize) -> Option<SearchCandidate> {
+        self.active(ordinal).then(|| self.rows[ordinal].candidate())
+    }
+
+    pub fn candidate_for_key(&self, key: &SearchCandidateKey) -> Option<SearchCandidate> {
+        self.ordinal(key)
+            .map(|ordinal| self.rows[ordinal].candidate())
     }
 
     pub fn ordinal(&self, key: &SearchCandidateKey) -> Option<usize> {
-        self.key_ordinals.get(key).copied()
+        let sid = key
+            .syntax_id
+            .strip_prefix("sid:v1:")
+            .and_then(compact_hex::<16>)?;
+        self.key_ordinals
+            .binary_search_by_key(&(key.version_id, sid), |row| self.rows[*row as usize].key())
+            .ok()
+            .map(|index| self.key_ordinals[index] as usize)
     }
 
     pub fn active_count(&self) -> usize {
@@ -480,91 +597,173 @@ impl SearchMatrix {
     }
 
     pub fn slot_count(&self) -> usize {
-        self.candidates.len()
+        self.rows.len()
     }
 
     pub fn embedded_count(&self) -> u64 {
         self.embedded
     }
 
-    pub fn missing_hashes(&self) -> impl Iterator<Item = &str> {
-        self.missing.keys().map(String::as_str)
+    pub fn missing_hashes(&self) -> impl Iterator<Item = String> + '_ {
+        let mut previous = None;
+        self.hash_ordinals.iter().filter_map(move |ordinal| {
+            let ordinal = *ordinal as usize;
+            let hash = self.rows[ordinal].card_hash;
+            if self.present(ordinal) || previous == Some(hash) {
+                return None;
+            }
+            previous = Some(hash);
+            Some(expand_hex(&hash, ""))
+        })
     }
 
-    /// Heap accounting estimate for residency admission, including tombstones,
-    /// string capacity and conservative B-tree node allowances. Allocator bookkeeping
-    /// is not observable here; this is not a process RSS measurement.
+    /// Exact owned payload capacity, including tombstones and SIMD padding.
+    /// Allocator metadata and the separately admitted caller slice are not owned.
     pub fn storage_bytes(&self) -> usize {
-        let buffers = self.blocks.len() * DIMENSIONS * MATRIX_LANES
+        self.rows.capacity() * std::mem::size_of::<MatrixRow>()
+            + (self.key_ordinals.capacity()
+                + self.hash_ordinals.capacity()
+                + self.free_slots.capacity())
+                * std::mem::size_of::<u32>()
             + self.blocks.capacity() * std::mem::size_of::<MatrixBlock>()
-            + self.candidates.capacity() * std::mem::size_of::<SearchCandidate>()
-            + self.active.capacity() * std::mem::size_of::<bool>()
-            + self.free_slots.capacity() * std::mem::size_of::<usize>();
-        let strings = self.candidates.iter().fold(0_usize, |bytes, candidate| {
-            bytes
-                .saturating_add(candidate.key.syntax_id.capacity())
-                .saturating_add(candidate.card_hash.capacity())
-        });
-        let keys = self.key_ordinals.keys().fold(0_usize, |bytes, key| {
-            bytes
-                .saturating_add(key.syntax_id.capacity())
-                .saturating_add(matrix_tree_entry_bytes::<(SearchCandidateKey, usize)>())
-        });
-        let versions = self.version_slots.values().fold(0_usize, |bytes, slots| {
-            bytes
-                .saturating_add(slots.capacity() * std::mem::size_of::<usize>())
-                .saturating_add(matrix_tree_entry_bytes::<(i64, Vec<usize>)>())
-        });
-        let missing = self.missing.iter().fold(0_usize, |bytes, (hash, slots)| {
-            bytes
-                .saturating_add(hash.capacity())
-                .saturating_add(matrix_tree_entry_bytes::<(String, BTreeSet<usize>)>())
-                .saturating_add(slots.len() * matrix_tree_entry_bytes::<usize>())
-        });
-        buffers
-            .saturating_add(strings)
-            .saturating_add(keys)
-            .saturating_add(versions)
-            .saturating_add(missing)
+            + self.blocks.len() * DIMENSIONS * MATRIX_LANES
     }
 
-    /// Conservative reservation before cold construction, including its temporary
-    /// candidate/vector staging. The owner enforces the aggregate resident limit.
+    /// Resident bytes after cold construction. Canonical IDs always have fixed
+    /// widths; source string bytes belong to the caller, not the matrix.
     pub fn estimated_new_bytes(candidates: &[SearchCandidate]) -> usize {
-        // Cold loading streams one decoded vector. It does not stage one
-        // vector per candidate; only the lane matrix owns vector-sized rows.
-        matrix_added_bytes(candidates.iter(), 1)
-            .saturating_add(DIMENSIONS)
+        Self::estimated_new_bytes_for_count(candidates.len())
+    }
+
+    pub fn estimated_new_bytes_for_count(count: usize) -> usize {
+        Self::estimated_new_bytes_for_counts(count, 0, 0)
+    }
+
+    pub fn estimated_new_bytes_for_counts(
+        count: usize,
+        _syntax_id_bytes: usize,
+        _card_hash_bytes: usize,
+    ) -> usize {
+        count
+            .saturating_mul(std::mem::size_of::<MatrixRow>() + 2 * std::mem::size_of::<u32>())
             .saturating_add(
-                candidates
-                    .len()
-                    .saturating_mul(std::mem::size_of::<usize>()),
+                count
+                    .div_ceil(MATRIX_LANES)
+                    .saturating_mul(DIMENSIONS * MATRIX_LANES + std::mem::size_of::<MatrixBlock>()),
             )
     }
 
-    /// Candidate-only form allows owner admission before vector staging exists.
-    pub fn estimated_delta_candidate_bytes(&self, added: &[SearchCandidate]) -> usize {
-        self.storage_bytes()
-            .saturating_add(matrix_added_bytes(added.iter(), 3))
+    /// Additional cold-build scratch, beyond resident bytes and the caller's
+    /// candidate slice, is only one decoded vector. Sorting is in place.
+    pub fn estimated_new_build_bytes_for_counts(
+        count: usize,
+        syntax_id_bytes: usize,
+        card_hash_bytes: usize,
+    ) -> usize {
+        Self::estimated_new_bytes_for_counts(count, syntax_id_bytes, card_hash_bytes)
+            .saturating_add(DIMENSIONS)
     }
 
-    /// Reserve before staging a patch. Deliberately assumes every added row needs
-    /// a new slot, even when removals will let apply_delta reuse existing slots.
-    pub fn estimated_delta_bytes(&self, added: &[(SearchCandidate, Option<Vec<i8>>)]) -> usize {
-        self.storage_bytes().saturating_add(matrix_added_bytes(
-            added.iter().map(|(candidate, _)| candidate),
-            3,
-        ))
-    }
-
-    fn forget_missing(&mut self, ordinal: usize) {
-        let hash = &self.candidates[ordinal].card_hash;
-        if let Some(slots) = self.missing.get_mut(hash) {
-            slots.remove(&ordinal);
-            if slots.is_empty() {
-                self.missing.remove(hash);
+    /// Additional peak reservation while the existing matrix stays live. Source
+    /// candidates, the caller's prepared vectors, compact validation staging,
+    /// new blocks and sequential realloc overlaps are all bounded here.
+    pub fn estimated_delta_candidate_bytes(
+        &self,
+        removed_vids: &[i64],
+        added: &[SearchCandidate],
+    ) -> usize {
+        let mut deleted = 0;
+        // No allocation in admission. Duplicate/unsorted removals may overcount,
+        // so only use their count to reserve free slots, never to discount growth.
+        for vid in removed_vids {
+            let start = self
+                .key_ordinals
+                .partition_point(|row| self.rows[*row as usize].version_id < *vid);
+            let end = self
+                .key_ordinals
+                .partition_point(|row| self.rows[*row as usize].version_id <= *vid);
+            deleted += end - start;
+        }
+        let reusable = if removed_vids.windows(2).all(|pair| pair[0] < pair[1]) {
+            deleted
+        } else {
+            0
+        };
+        let extra = added
+            .len()
+            .saturating_sub(self.free_slots.len().saturating_add(reusable));
+        let slots = self.rows.len().saturating_add(extra);
+        let active = self.active_count().saturating_add(added.len());
+        let blocks = slots.div_ceil(MATRIX_LANES);
+        let free = self.free_slots.len().saturating_add(deleted);
+        let mut growth = blocks
+            .saturating_sub(self.blocks.len())
+            .saturating_mul(DIMENSIONS * MATRIX_LANES);
+        let mut overlap = 0;
+        for (required, capacity, width) in [
+            (
+                slots,
+                self.rows.capacity(),
+                std::mem::size_of::<MatrixRow>(),
+            ),
+            (
+                active,
+                self.key_ordinals.capacity(),
+                std::mem::size_of::<u32>(),
+            ),
+            (
+                active,
+                self.hash_ordinals.capacity(),
+                std::mem::size_of::<u32>(),
+            ),
+            (free, self.free_slots.capacity(), std::mem::size_of::<u32>()),
+            (
+                blocks,
+                self.blocks.capacity(),
+                std::mem::size_of::<MatrixBlock>(),
+            ),
+        ] {
+            if required > capacity {
+                growth = growth.saturating_add((required - capacity).saturating_mul(width));
+                overlap = overlap.max(capacity.saturating_mul(width));
             }
         }
+        let strings = added.iter().fold(0_usize, |total, candidate| {
+            total
+                .saturating_add(candidate.key.syntax_id.capacity())
+                .saturating_add(candidate.card_hash.capacity())
+        });
+        growth
+            .saturating_add(overlap)
+            .saturating_add(
+                removed_vids
+                    .len()
+                    .saturating_mul(std::mem::size_of::<i64>()),
+            )
+            .saturating_add(added.len().saturating_mul(
+                std::mem::size_of::<MatrixRow>()
+                    + std::mem::size_of::<u32>()
+                    + std::mem::size_of::<(SearchCandidate, Option<Vec<i8>>)>()
+                    + DIMENSIONS,
+            ))
+            .saturating_add(strings)
+            .saturating_add(
+                blocks
+                    .saturating_sub(self.blocks.len())
+                    .saturating_mul(std::mem::size_of::<MatrixBlock>()),
+            )
+            // One streamed missing lookup, hash cursor and decoded vector.
+            .saturating_add(DIMENSIONS + 64)
+    }
+
+    fn hash_range(&self, hash: &[u8; 32]) -> std::ops::Range<usize> {
+        let start = self
+            .hash_ordinals
+            .partition_point(|row| self.rows[*row as usize].card_hash < *hash);
+        let end = self
+            .hash_ordinals
+            .partition_point(|row| self.rows[*row as usize].card_hash <= *hash);
+        start..end
     }
 
     fn store_vector(&mut self, ordinal: usize, values: &[i8]) {
@@ -589,7 +788,7 @@ impl SearchMatrix {
     /// Invalid vectors remain misses; tombstone ordinals are rejected.
     pub fn insert(&mut self, ordinal: usize, values: &[i8]) -> Result<bool> {
         ensure!(
-            self.candidate(ordinal).is_some(),
+            self.active(ordinal),
             crate::store::SelectedIntegrity(
                 "store_unavailable: matrix ordinal outside admitted head".into()
             )
@@ -598,13 +797,11 @@ impl SearchMatrix {
             return Ok(false);
         }
         self.store_vector(ordinal, values);
-        self.forget_missing(ordinal);
         Ok(true)
     }
 
-    /// Patch only changed versions, reusing removed slots. All returned errors,
-    /// including cancellation, precede publication. The synchronous commit has
-    /// no callbacks or recoverable failures (allocator OOM aborts the process).
+    /// Only changed rows are staged. Every error/cancellation precedes the
+    /// synchronous commit; unchanged row IDs and vector allocations stay intact.
     pub fn apply_delta(
         &mut self,
         removed_vids: &[i64],
@@ -612,39 +809,65 @@ impl SearchMatrix {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<MatrixDeltaStats> {
         check()?;
-        let mut removed = BTreeSet::new();
+        let mut removed = Vec::new();
+        removed.try_reserve_exact(removed_vids.len())?;
+        removed.extend_from_slice(removed_vids);
+        removed.sort_unstable();
+        removed.dedup();
         let mut deleted = 0;
-        for vid in removed_vids {
+        for ordinal in &self.key_ordinals {
             check()?;
-            if removed.insert(*vid)
-                && let Some(slots) = self.version_slots.get(vid)
-            {
-                for _ in slots {
-                    check()?;
-                    deleted += 1;
-                }
-            }
+            deleted += usize::from(
+                removed
+                    .binary_search(&self.rows[*ordinal as usize].version_id)
+                    .is_ok(),
+            );
         }
-        let mut keys = BTreeSet::new();
+        let mut prepared = Vec::new();
+        prepared.try_reserve_exact(added.len())?;
+        let mut order = Vec::new();
+        order.try_reserve_exact(added.len())?;
+        ensure!(
+            added.len() <= u32::MAX as usize,
+            crate::store::SelectedIntegrity("store_unavailable: matrix capacity overflow".into())
+        );
         let mut present = 0;
         for (candidate, vector) in &added {
             check()?;
+            let row = MatrixRow::parse(candidate)?;
             ensure!(
-                keys.insert(&candidate.key)
-                    && (!self.key_ordinals.contains_key(&candidate.key)
-                        || removed.contains(&candidate.key.version_id)),
+                self.ordinal(&candidate.key).is_none()
+                    || removed.binary_search(&row.version_id).is_ok(),
                 crate::store::SelectedIntegrity(
                     "store_unavailable: duplicate search candidate".into()
                 )
             );
+            prepared.push(row);
             present += usize::from(vector.as_deref().is_some_and(valid_vector));
         }
+        order.extend(0..added.len() as u32);
+        order.sort_unstable_by_key(|index| prepared[*index as usize].key());
+        ensure!(
+            order
+                .windows(2)
+                .all(|pair| prepared[pair[0] as usize].key() != prepared[pair[1] as usize].key()),
+            crate::store::SelectedIntegrity("store_unavailable: duplicate search candidate".into())
+        );
         let extra = added.len().saturating_sub(self.free_slots.len() + deleted);
-        let slots = self.candidates.len().checked_add(extra).ok_or_else(|| {
-            crate::store::SelectedIntegrity("store_unavailable: matrix capacity overflow".into())
-        })?;
-        self.candidates.try_reserve_exact(extra)?;
-        self.active.try_reserve_exact(extra)?;
+        let slots = self
+            .rows
+            .len()
+            .checked_add(extra)
+            .filter(|slots| *slots <= u32::MAX as usize)
+            .ok_or_else(|| {
+                crate::store::SelectedIntegrity(
+                    "store_unavailable: matrix capacity overflow".into(),
+                )
+            })?;
+        self.rows.try_reserve_exact(extra)?;
+        // Reserve before removing old index entries so publication cannot allocate.
+        self.key_ordinals.try_reserve_exact(added.len())?;
+        self.hash_ordinals.try_reserve_exact(added.len())?;
         self.free_slots.try_reserve_exact(deleted)?;
         let block_count = slots
             .div_ceil(MATRIX_LANES)
@@ -654,62 +877,55 @@ impl SearchMatrix {
         new_blocks.try_reserve_exact(block_count)?;
         for _ in 0..block_count {
             check()?;
-            let mut dimensions = Vec::new();
-            dimensions.try_reserve_exact(DIMENSIONS)?;
-            dimensions.resize(DIMENSIONS, [0; MATRIX_LANES]);
-            new_blocks.push(MatrixBlock {
-                dimensions: dimensions.into_boxed_slice(),
-                inverse_norms: [1.0; MATRIX_LANES],
-                present: 0,
-            });
+            new_blocks.push(Self::empty_block()?);
         }
         check()?;
-        // Publication starts here. Never call check or return Err below here.
-        drop(keys);
+        // Publication: no callbacks or recoverable failures below this point.
         self.blocks.extend(new_blocks);
-        for vid in removed {
-            if let Some(ordinals) = self.version_slots.remove(&vid) {
-                for ordinal in ordinals {
-                    self.key_ordinals.remove(&self.candidates[ordinal].key);
-                    self.forget_missing(ordinal);
-                    let block = &mut self.blocks[ordinal / MATRIX_LANES];
-                    let bit = 1_u16 << (ordinal % MATRIX_LANES);
-                    if block.present & bit != 0 {
-                        self.embedded -= 1;
-                    }
-                    block.present &= !bit;
-                    self.active[ordinal] = false;
-                    self.free_slots.push(ordinal);
+        for ordinal in &self.key_ordinals {
+            let ordinal = *ordinal as usize;
+            if removed
+                .binary_search(&self.rows[ordinal].version_id)
+                .is_ok()
+            {
+                let bit = 1 << (ordinal % MATRIX_LANES);
+                let block = &mut self.blocks[ordinal / MATRIX_LANES];
+                if block.present & bit != 0 {
+                    self.embedded -= 1;
                 }
+                block.present &= !bit;
+                block.active &= !bit;
+                self.free_slots.push(ordinal as u32);
             }
         }
+        self.key_ordinals.retain(|ordinal| {
+            removed
+                .binary_search(&self.rows[*ordinal as usize].version_id)
+                .is_err()
+        });
+        self.hash_ordinals.retain(|ordinal| {
+            removed
+                .binary_search(&self.rows[*ordinal as usize].version_id)
+                .is_err()
+        });
         let added_count = added.len();
-        for (candidate, vector) in added {
+        for (row, (_, vector)) in prepared.into_iter().zip(added) {
             let ordinal = if let Some(ordinal) = self.free_slots.pop() {
-                self.candidates[ordinal] = candidate;
-                self.active[ordinal] = true;
-                ordinal
+                self.rows[ordinal as usize] = row;
+                ordinal as usize
             } else {
-                let ordinal = self.candidates.len();
-                self.candidates.push(candidate);
-                self.active.push(true);
+                let ordinal = self.rows.len();
+                self.rows.push(row);
                 ordinal
             };
-            let candidate = &self.candidates[ordinal];
-            self.key_ordinals.insert(candidate.key.clone(), ordinal);
-            self.version_slots
-                .entry(candidate.key.version_id)
-                .or_default()
-                .push(ordinal);
+            self.blocks[ordinal / MATRIX_LANES].active |= 1 << (ordinal % MATRIX_LANES);
+            self.key_ordinals.push(ordinal as u32);
+            self.hash_ordinals.push(ordinal as u32);
             if let Some(vector) = vector.filter(|values| valid_vector(values)) {
                 self.store_vector(ordinal, &vector);
-            } else {
-                self.missing
-                    .entry(candidate.card_hash.clone())
-                    .or_default()
-                    .insert(ordinal);
             }
         }
+        self.sort_indexes();
         Ok(MatrixDeltaStats {
             deleted,
             added: added_count,
@@ -717,68 +933,118 @@ impl SearchMatrix {
         })
     }
 
-    /// Fill current missing cards only. Removed cards cannot be resurrected,
-    /// even if their former slot has been reused. Errors precede publication.
+    /// A hash-index cursor advances through absent and shared hashes alike.
+    /// Only one cache lookup/vector and one decoded hash are live at a time.
+    pub fn refresh_missing(
+        &mut self,
+        snapshot: Option<&crate::search_vectors::VectorSnapshot<'_>>,
+        model_id: &str,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+        let mut index = 0;
+        while index < self.hash_ordinals.len() {
+            check()?;
+            let start = index;
+            let hash = self.rows[self.hash_ordinals[index] as usize].card_hash;
+            let mut missing = false;
+            while index < self.hash_ordinals.len()
+                && self.rows[self.hash_ordinals[index] as usize].card_hash == hash
+            {
+                check()?;
+                missing |= !self.present(self.hash_ordinals[index] as usize);
+                index += 1;
+            }
+            if missing && let Some(vector) = snapshot.get(model_id, &expand_hex(&hash, ""))? {
+                if !valid_vector(&vector) {
+                    continue;
+                }
+                for _ in start..index {
+                    check()?;
+                }
+                check()?;
+                for offset in start..index {
+                    let ordinal = self.hash_ordinals[offset] as usize;
+                    if !self.present(ordinal) {
+                        self.store_vector(ordinal, &vector);
+                    }
+                }
+            }
+        }
+        check()
+    }
+
+    /// Fill only current missing rows. The two-pass operation allocates no
+    /// staging, and every error/cancellation precedes publication.
     pub fn fill(
         &mut self,
         vectors: &[(String, Vec<i8>)],
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<usize> {
         check()?;
-        for (hash, values) in vectors {
+        for (hash, vector) in vectors {
             check()?;
-            if valid_vector(values)
-                && let Some(slots) = self.missing.get(hash)
+            if valid_vector(vector)
+                && let Some(hash) = compact_hex(hash)
             {
-                for _ in slots {
+                for _ in self.hash_range(&hash) {
                     check()?;
                 }
             }
         }
         check()?;
         let mut filled = 0;
-        for (hash, values) in vectors {
-            if valid_vector(values)
-                && let Some(slots) = self.missing.remove(hash)
+        for (hash, vector) in vectors {
+            if valid_vector(vector)
+                && let Some(hash) = compact_hex(hash)
             {
-                for ordinal in slots {
-                    self.store_vector(ordinal, values);
-                    filled += 1;
+                for index in self.hash_range(&hash) {
+                    let ordinal = self.hash_ordinals[index] as usize;
+                    if !self.present(ordinal) {
+                        self.store_vector(ordinal, vector);
+                        filled += 1;
+                    }
                 }
             }
         }
         Ok(filled)
     }
 
-    /// Publish a committed cache batch across both present and missing current
-    /// candidates. The owner selects the matching model and cache lifetime.
+    /// Publish the last valid committed value for each hash, including already
+    /// present rows. Staging is compact and bounded by the caller's batch size.
     pub fn update_vectors(
         &mut self,
         vectors: &[(String, Vec<i8>)],
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<usize> {
         check()?;
-        let mut values = BTreeMap::new();
-        for (hash, vector) in vectors {
+        let mut values = Vec::new();
+        values.try_reserve_exact(vectors.len())?;
+        for (index, (hash, vector)) in vectors.iter().enumerate() {
             check()?;
-            if valid_vector(vector) {
-                values.insert(hash.as_str(), vector.as_slice());
+            if valid_vector(vector)
+                && let Some(hash) = compact_hex::<32>(hash)
+            {
+                values.push((hash, index));
             }
         }
-        if values.is_empty() {
-            return Ok(0);
-        }
-        for _ in &self.candidates {
-            check()?;
+        values.sort_unstable();
+        for (hash, _) in &values {
+            for _ in self.hash_range(hash) {
+                check()?;
+            }
         }
         check()?;
         let mut updated = 0;
-        for ordinal in 0..self.candidates.len() {
-            if self.active[ordinal]
-                && let Some(vector) = values.get(self.candidates[ordinal].card_hash.as_str())
-            {
-                self.store_vector(ordinal, vector);
-                self.forget_missing(ordinal);
+        for index in 0..values.len() {
+            let (hash, vector) = values[index];
+            if values.get(index + 1).is_some_and(|next| next.0 == hash) {
+                continue;
+            }
+            for offset in self.hash_range(&hash) {
+                self.store_vector(self.hash_ordinals[offset] as usize, &vectors[vector].1);
                 updated += 1;
             }
         }
@@ -806,28 +1072,6 @@ impl SearchMatrix {
         }
         check()
     }
-}
-
-// Three entry widths plus a node allowance covers partially occupied tree nodes.
-fn matrix_tree_entry_bytes<T>() -> usize {
-    3 * std::mem::size_of::<T>() + 256
-}
-
-fn matrix_added_bytes<'a>(
-    candidates: impl Iterator<Item = &'a SearchCandidate>,
-    vector_copies: usize,
-) -> usize {
-    candidates.fold(DIMENSIONS * MATRIX_LANES, |bytes, candidate| {
-        bytes
-            .saturating_add(vector_copies * DIMENSIONS)
-            .saturating_add(3 * std::mem::size_of::<SearchCandidate>())
-            .saturating_add(3 * candidate.key.syntax_id.capacity())
-            .saturating_add(3 * candidate.card_hash.capacity())
-            .saturating_add(matrix_tree_entry_bytes::<(SearchCandidateKey, usize)>())
-            .saturating_add(matrix_tree_entry_bytes::<(i64, Vec<usize>)>())
-            .saturating_add(matrix_tree_entry_bytes::<(String, BTreeSet<usize>)>())
-            .saturating_add(matrix_tree_entry_bytes::<usize>())
-    })
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -888,7 +1132,48 @@ fn matrix_scores(query: &[f32], block: &MatrixBlock) -> [f32; MATRIX_LANES] {
     scores
 }
 
-/// Rank one coherent published matrix; counts and scores use the same state.
+// Heap entries contain integer row IDs and fixed-width SID tie keys, never
+// candidate strings. Larger members are worse retained vector results.
+#[derive(Eq, PartialEq)]
+struct MatrixVectorScore {
+    row: u32,
+    syntax_id: [u8; 16],
+    cosine_bits: u32,
+}
+
+impl PartialOrd for MatrixVectorScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MatrixVectorScore {
+    fn cmp(&self, other: &Self) -> Ordering {
+        f32::from_bits(other.cosine_bits)
+            .total_cmp(&f32::from_bits(self.cosine_bits))
+            .then_with(|| self.syntax_id.cmp(&other.syntax_id))
+            .then_with(|| self.row.cmp(&other.row))
+    }
+}
+
+struct MatrixFusedHit {
+    row: u32,
+    lexical_rank: Option<usize>,
+    vector_rank: Option<usize>,
+}
+
+impl MatrixFusedHit {
+    fn score(&self) -> f64 {
+        self.lexical_rank
+            .map_or(0.0, |rank| LEXICAL_WEIGHT / (RRF_K + rank as f64))
+            + self
+                .vector_rank
+                .map_or(0.0, |rank| VECTOR_WEIGHT / (RRF_K + rank as f64))
+    }
+}
+
+/// Rank one coherent published matrix. Both arms and fusion retain integer row
+/// IDs; only the bounded final ranking is decoded to wire IDs.
 pub fn rank_matrix(
     matrix: &SearchMatrix,
     lexical: &[SearchCandidateKey],
@@ -901,46 +1186,103 @@ pub fn rank_matrix(
         query.is_none_or(valid_vector),
         crate::search_vectors::InvalidVector
     );
-    let mut fused = BTreeMap::new();
+    let mut fused: Vec<MatrixFusedHit> = Vec::with_capacity(2 * CANDIDATE_DEPTH);
     for (index, key) in lexical.iter().take(CANDIDATE_DEPTH).enumerate() {
         check()?;
-        ensure!(
-            matrix.key_ordinals.contains_key(key),
+        let row = matrix.ordinal(key).ok_or_else(|| {
             crate::store::SelectedIntegrity(
-                "store_unavailable: lexical candidate outside admitted head".into()
+                "store_unavailable: lexical candidate outside admitted head".into(),
             )
-        );
+        })? as u32;
         ensure!(
-            !fused.contains_key(key),
+            !fused.iter().any(|hit| hit.row == row),
             crate::store::SelectedIntegrity(
                 "store_unavailable: duplicate lexical candidate".into()
             )
         );
-        fused.insert(
-            key.clone(),
-            RankedHit {
-                key: key.clone(),
-                lexical_rank: Some(index + 1),
-                vector_rank: None,
-            },
-        );
+        fused.push(MatrixFusedHit {
+            row,
+            lexical_rank: Some(index + 1),
+            vector_rank: None,
+        });
     }
-    let mut state = RankingState {
-        candidates: &matrix.candidates,
-        fused,
-        query_direction: query.map(direction),
-        vector_scores: BinaryHeap::with_capacity(CANDIDATE_DEPTH),
-        embedded: matrix.embedded,
-    };
-    if let Some(query) = state.query_direction.take() {
+    let mut scores = BinaryHeap::with_capacity(CANDIDATE_DEPTH);
+    if let Some(query) = query {
+        let query = direction(query);
         let _scoring = crate::search_model::SearchPhaseTimer::start("vector_scoring");
-        let mut admit = |ordinal, cosine| {
-            state.offer_score(ordinal, cosine);
+        matrix.visit_direction(&query, check, &mut |ordinal, cosine| {
+            let scored = MatrixVectorScore {
+                row: ordinal as u32,
+                syntax_id: matrix.rows[ordinal].syntax_id,
+                cosine_bits: cosine.to_bits(),
+            };
+            if scores.len() < CANDIDATE_DEPTH {
+                scores.push(scored);
+            } else if let Some(mut worst) = scores.peek_mut()
+                && scored < *worst
+            {
+                *worst = scored;
+            }
             Ok(())
-        };
-        matrix.visit_direction(&query, check, &mut admit)?;
+        })?;
     }
-    state.finish(check)
+    check()?;
+    let _fusion = crate::search_model::SearchPhaseTimer::start("fusion");
+    for (index, scored) in scores.into_sorted_vec().into_iter().enumerate() {
+        if let Some(hit) = fused.iter_mut().find(|hit| hit.row == scored.row) {
+            hit.vector_rank = Some(index + 1);
+        } else {
+            fused.push(MatrixFusedHit {
+                row: scored.row,
+                lexical_rank: None,
+                vector_rank: Some(index + 1),
+            });
+        }
+    }
+    fused.sort_by(|a, b| {
+        b.score()
+            .total_cmp(&a.score())
+            .then_with(|| {
+                a.lexical_rank
+                    .into_iter()
+                    .chain(a.vector_rank)
+                    .min()
+                    .cmp(&b.lexical_rank.into_iter().chain(b.vector_rank).min())
+            })
+            .then_with(|| {
+                a.lexical_rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&b.lexical_rank.unwrap_or(usize::MAX))
+            })
+            .then_with(|| {
+                matrix.rows[a.row as usize]
+                    .syntax_id
+                    .cmp(&matrix.rows[b.row as usize].syntax_id)
+            })
+            // The old BTreeMap's stable sort used key order when all contract
+            // tie-breaks were equal (the same SID at distinct versions).
+            .then_with(|| {
+                matrix.rows[a.row as usize]
+                    .version_id
+                    .cmp(&matrix.rows[b.row as usize].version_id)
+            })
+    });
+    let hits = fused
+        .into_iter()
+        .map(|hit| RankedHit {
+            key: SearchCandidateKey {
+                version_id: matrix.rows[hit.row as usize].version_id,
+                syntax_id: expand_hex(&matrix.rows[hit.row as usize].syntax_id, "sid:v1:"),
+            },
+            lexical_rank: hit.lexical_rank,
+            vector_rank: hit.vector_rank,
+        })
+        .collect();
+    check()?;
+    Ok(SearchRanking {
+        hits,
+        embedded: matrix.embedded,
+    })
 }
 
 fn cosine_bytes(query: &[f32], vector: &[u8]) -> f32 {
@@ -1153,6 +1495,199 @@ mod tests {
     }
 
     #[test]
+    fn resident_capacity_matches_estimate_with_missing_and_complete_vectors() {
+        assert_eq!(std::mem::size_of::<MatrixRow>(), 56);
+        for count in [1, 16, 17, 257, 1024] {
+            let cards: Vec<_> = (0..count).map(|i| candidate(i, i)).collect();
+            let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
+            let estimate =
+                SearchMatrix::estimated_new_bytes_for_counts(count, count * 39, count * 64);
+            let missing = matrix.storage_bytes();
+            assert_eq!(estimate, missing);
+            for ordinal in 0..count {
+                matrix.insert(ordinal, &vector(1, 2)).unwrap();
+            }
+            assert_eq!(matrix.storage_bytes(), missing);
+            assert_eq!(matrix.embedded_count(), count as u64);
+            assert!(estimate.abs_diff(matrix.storage_bytes()) * 10 <= estimate);
+        }
+        let large = 756_140;
+        let resident = SearchMatrix::estimated_new_bytes_for_count(large);
+        assert!(resident < 850_000_000, "LARGE resident bytes: {resident}");
+        assert!(resident > large * DIMENSIONS);
+    }
+
+    #[test]
+    fn matrix_rejects_noncanonical_identity_without_string_fallback() {
+        for (sid, hash) in [
+            ("sid:v1:1".into(), format!("{:064x}", 1)),
+            (format!("sid:v1:{:032x}", 1), "hash".into()),
+            (format!("sid:v1:{:032X}", 255), format!("{:064x}", 1)),
+        ] {
+            let card = SearchCandidate {
+                key: SearchCandidateKey {
+                    version_id: 1,
+                    syntax_id: sid,
+                },
+                card_hash: hash,
+            };
+            let result = SearchMatrix::new([card].into(), &mut || Ok(()));
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .is::<crate::store::SelectedIntegrity>()
+            );
+        }
+    }
+
+    #[test]
+    fn integer_matrix_fusion_matches_reference_with_shared_sid_versions() {
+        let mut cards: Vec<_> = (0..CANDIDATE_DEPTH + 5)
+            .rev()
+            .map(|i| candidate(i, i % 7))
+            .collect();
+        cards[0].key.syntax_id = cards[1].key.syntax_id.clone();
+        cards[0].card_hash = cards[1].card_hash.clone();
+        let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
+        let values = vector(1, 0);
+        for ordinal in 0..cards.len() {
+            matrix.insert(ordinal, &values).unwrap();
+        }
+        let lexical: Vec<_> = cards.iter().take(7).map(|card| card.key.clone()).collect();
+        let expected = rank(
+            &cards,
+            &lexical,
+            &mut |_| Ok(Some(values.clone())),
+            Some(&values),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let actual = rank_matrix(&matrix, &lexical, Some(&values), &mut || Ok(())).unwrap();
+        assert_eq!(actual.embedded, expected.embedded);
+        assert_eq!(actual.hits, expected.hits);
+    }
+
+    #[test]
+    fn cold_estimate_covers_physical_layout_and_large_card_count() {
+        for count in [0, 1, 10, 11, 16, 17, 257] {
+            let cards: Vec<_> = (0..count).map(|i| candidate(i, i)).collect();
+            let estimate = SearchMatrix::estimated_new_bytes(&cards);
+            let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
+            assert!(estimate >= matrix.storage_bytes(), "missing rows: {count}");
+            for ordinal in 0..count {
+                matrix.insert(ordinal, &vector(1, 2)).unwrap();
+            }
+            assert!(estimate >= matrix.storage_bytes(), "present rows: {count}");
+        }
+        // LARGE is a card count, not a byte-derived count. Exercise arithmetic,
+        // not a gigabyte-sized allocation in the ordinary test suite.
+        let large = 75_614 * 10;
+        let exemplar = candidate(0, 0);
+        assert_eq!(exemplar.key.syntax_id.len(), 39);
+        assert_eq!(exemplar.card_hash.len(), 64);
+        let input = large * (2 * std::mem::size_of::<SearchCandidate>() + 39 + 64) + 16;
+        let peak = SearchMatrix::estimated_new_bytes_for_count(large) + input;
+        assert!(peak < 2 * 1024 * 1024 * 1024, "LARGE peak: {peak}");
+    }
+
+    #[test]
+    fn delta_reserves_transient_reallocation_of_identity_buffers_not_old_vectors() {
+        let candidates: std::sync::Arc<[_]> = (0..64)
+            .map(|index| candidate(index, index))
+            .collect::<Vec<_>>()
+            .into();
+        let mut matrix = SearchMatrix::new(candidates, &mut || Ok(())).unwrap();
+        for ordinal in 0..64 {
+            matrix.insert(ordinal, &vector(1, 2)).unwrap();
+        }
+        let appended = candidate(1000, 1000);
+        let reserve = matrix.estimated_delta_candidate_bytes(&[], std::slice::from_ref(&appended));
+        let identity_buffer = matrix.rows.capacity() * std::mem::size_of::<MatrixRow>();
+        let before = matrix.storage_bytes();
+        let replacement =
+            matrix.estimated_delta_candidate_bytes(&[0], std::slice::from_ref(&appended));
+        assert!(replacement < reserve);
+        matrix
+            .apply_delta(&[], vec![(appended, Some(vector(1, 2)))], &mut || Ok(()))
+            .unwrap();
+        let growth = matrix.storage_bytes().saturating_sub(before);
+        assert!(reserve >= growth + identity_buffer);
+        assert!(reserve < before);
+    }
+
+    #[test]
+    fn incremental_delta_reservation_covers_reuse_growth_and_duplicate_removals() {
+        for (removed, additions) in [(vec![1], 1), (vec![], 19), (vec![1, 1], 19)] {
+            let original: Vec<_> = (0..17).map(|i| candidate(i, i)).collect();
+            let mut matrix = SearchMatrix::new(original.into(), &mut || Ok(())).unwrap();
+            for ordinal in 0..17 {
+                matrix.insert(ordinal, &vector(1, 2)).unwrap();
+            }
+            let added: Vec<_> = (100..100 + additions).map(|i| candidate(i, i)).collect();
+            let old = matrix.storage_bytes();
+            let increment = matrix.estimated_delta_candidate_bytes(&removed, &added);
+            let prepared: Vec<_> = added
+                .into_iter()
+                .map(|card| (card, Some(vector(1, 2))))
+                .collect();
+            matrix
+                .apply_delta(&removed, prepared, &mut || Ok(()))
+                .unwrap();
+            assert!(old + increment >= matrix.storage_bytes());
+            if additions == 1 {
+                assert_eq!(matrix.slot_count(), 17);
+                assert!(
+                    increment < old / 2,
+                    "in-place delta reserved old matrix: {increment}/{old}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delta_refresh_reservation_does_not_charge_present_rows_or_all_missing_vectors() {
+        let cards: Vec<_> = (0..257).map(|i| candidate(i, i)).collect();
+        let mut matrix = SearchMatrix::new(cards.into(), &mut || Ok(())).unwrap();
+        let missing = matrix.estimated_delta_candidate_bytes(&[], &[]);
+        for ordinal in 0..257 {
+            matrix.insert(ordinal, &vector(1, 2)).unwrap();
+        }
+        let present = matrix.estimated_delta_candidate_bytes(&[], &[]);
+        assert!(missing < 4 * DIMENSIONS);
+        assert!(present < 4 * DIMENSIONS);
+        assert!(missing - present <= 3 * 64);
+    }
+
+    #[test]
+    fn missing_refresh_streams_past_cache_misses_and_shared_hashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = format!("{:064x}", 1);
+        let mut writer =
+            crate::search_vectors::VectorCacheWriter::open(&directory.path().join("vectors.db"))
+                .unwrap();
+        let cards = [
+            candidate(0, 0),
+            candidate(1, 1),
+            candidate(2, 1),
+            candidate(3, 2),
+        ];
+        writer
+            .put(&model, &cards[1].card_hash, &vector(1, 2))
+            .unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
+        matrix
+            .refresh_missing(Some(&snapshot), &model, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(matrix.embedded_count(), 2);
+        assert_eq!(
+            matrix.missing_hashes().collect::<Vec<_>>(),
+            [cards[0].card_hash.as_str(), cards[3].card_hash.as_str()]
+        );
+    }
+
+    #[test]
     fn admitted_lexical_fallback_is_bounded_and_rejects_duplicates() {
         let keys: Vec<_> = (0..CANDIDATE_DEPTH + 1)
             .map(|index| candidate(index, index).key)
@@ -1290,7 +1825,7 @@ mod tests {
         let error = matrix
             .apply_delta(&[0], vec![(replacement, Some(vector(1, 2)))], &mut || {
                 checks += 1;
-                anyhow::ensure!(checks < 5, "cancelled");
+                anyhow::ensure!(checks < 4, "cancelled");
                 Ok(())
             })
             .unwrap_err();
@@ -1332,7 +1867,7 @@ mod tests {
             matrix
                 .update_vectors(&batch, &mut || {
                     checks += 1;
-                    anyhow::ensure!(checks < 6, "cancelled");
+                    anyhow::ensure!(checks < 5, "cancelled");
                     Ok(())
                 })
                 .is_err()

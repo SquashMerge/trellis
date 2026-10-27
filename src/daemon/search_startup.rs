@@ -33,10 +33,15 @@ impl FillSource for StartupSource {
     fn head(
         &self,
         _previous: Option<IndexPin>,
+        admit: &mut dyn FnMut(usize, usize, bool) -> Result<()>,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<HeadUpdate>> {
-        let (pin, cards) =
-            Store::read_existing_search_head(&self.roots, &self.checkout, &mut || check())?;
+        let (pin, cards) = Store::read_existing_search_head_admitted(
+            &self.roots,
+            &self.checkout,
+            &mut || check(),
+            &mut |count| admit(count, 0, true),
+        )?;
         Ok(Some(HeadUpdate {
             pin,
             declarations: cards.len(),
@@ -47,9 +52,7 @@ impl FillSource for StartupSource {
     fn page(&self, pin: Option<IndexPin>, _after: Option<&str>) -> Result<HeadSearchCards> {
         let current = match pin {
             Some(pin) => pin,
-            None => {
-                Store::read_existing_search_head(&self.roots, &self.checkout, &mut || Ok(()))?.0
-            }
+            None => Store::read_existing_search_pin(&self.roots, &self.checkout)?,
         };
         // Startup warms resident cache rows. Active checkout ownership fills
         // missing document vectors using its normal bounded card pages.

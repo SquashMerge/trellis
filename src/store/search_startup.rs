@@ -67,12 +67,39 @@ impl Store {
         Ok(recent)
     }
 
+    pub(crate) fn read_existing_search_pin(
+        roots: &topology::TopologyRoots,
+        checkout: &RecentSearchCheckout,
+    ) -> Result<IndexPin> {
+        with_existing_search_store(roots, checkout, |store, db| {
+            storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+            begin_read_snapshot(
+                &db,
+                &roots.index_db(&store.identity),
+                Duration::from_secs(5),
+            )?;
+            let selected = store.read_revision_for(&db, None, true)?;
+            store.identity.verify_readonly()?;
+            db._use_guard.verify()?;
+            Ok(selected.pin)
+        })
+    }
+
     /// Read candidate identities only. Startup work owns no registry admission,
     /// writer session, watcher, or long-lived SQLite connection.
     pub fn read_existing_search_head(
         roots: &topology::TopologyRoots,
         checkout: &RecentSearchCheckout,
         check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<(IndexPin, Arc<[SearchCandidate]>)> {
+        Self::read_existing_search_head_admitted(roots, checkout, check, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn read_existing_search_head_admitted(
+        roots: &topology::TopologyRoots,
+        checkout: &RecentSearchCheckout,
+        check: &mut impl FnMut() -> Result<()>,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<(IndexPin, Arc<[SearchCandidate]>)> {
         check()?;
         with_existing_search_store(roots, checkout, |mut store, db| {
@@ -91,7 +118,7 @@ impl Store {
                 db,
                 fence: ReadFence(selected.pin),
             };
-            let value = response.mcp_search_head(Some(selected.pin), check)?;
+            let value = response.mcp_search_head_admitted(Some(selected.pin), check, admit)?;
             check()?;
             // The ordinary response fence opens the Git marker read/write.
             // Preserve its selected-snapshot check using readonly identity opens.

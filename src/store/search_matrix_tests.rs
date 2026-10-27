@@ -154,6 +154,45 @@ fn two_document_edits_and_deletion_patch_exactly_without_retained_candidates() {
 }
 
 #[test]
+fn head_admission_precedes_candidate_decoding_and_delta_materialization() {
+    #[derive(Debug)]
+    struct AdmissionDeclined;
+    impl std::fmt::Display for AdmissionDeclined {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("candidate admission declined")
+        }
+    }
+    impl std::error::Error for AdmissionDeclined {}
+    let fixture = Fixture::new();
+    let first = fixture.publish();
+    let response = fixture.store.evidence_response().unwrap();
+    let mut count = None;
+    let error = response
+        .mcp_search_head_admitted(Some(first), &mut || Ok(()), &mut |rows| {
+            count = Some(rows);
+            Err(AdmissionDeclined.into())
+        })
+        .unwrap_err();
+    assert_eq!(count, Some(2));
+    assert!(error.is::<AdmissionDeclined>());
+    response.finish(()).unwrap();
+    drop(response);
+    fixture.edit();
+    let second = fixture.publish();
+    let response = fixture.store.evidence_response().unwrap();
+    let mut counts = None;
+    let error = response
+        .mcp_search_head_delta_admitted(first, second, &mut || Ok(()), &mut |added, removed| {
+            counts = Some((added, removed));
+            Err(AdmissionDeclined.into())
+        })
+        .unwrap_err();
+    assert_eq!(counts, Some((2, 1)));
+    assert!(error.is::<AdmissionDeclined>());
+    response.finish(()).unwrap();
+}
+
+#[test]
 fn split_reads_reject_wrong_head_and_invalid_previous_pins() {
     let fixture = Fixture::new();
     let pin = fixture.publish();

@@ -345,12 +345,36 @@ impl EvidenceResponse {
         IndexPin,
         std::sync::Arc<[crate::search_rank::SearchCandidate]>,
     )> {
+        self.mcp_search_head_admitted(expected, check, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn mcp_search_head_admitted(
+        &self,
+        expected: Option<IndexPin>,
+        check: &mut impl FnMut() -> Result<()>,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<(
+        IndexPin,
+        std::sync::Arc<[crate::search_rank::SearchCandidate]>,
+    )> {
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
             ensure!(
                 expected.is_none_or(|pin| pin == selected.pin),
                 "revision conflict: expected basis differs from admitted head"
             );
+            let count: i64 = self.db.query_row(
+                "SELECT count(*) FROM native_version_search_cards c
+                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                 JOIN document_versions v ON v.vid=c.vid
+                 JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id",
+                [&selected.key],
+                |row| row.get(0),
+            )?;
+            let count = usize::try_from(count).context(SelectedIntegrity(
+                "store_unavailable: invalid head search count".into(),
+            ))?;
+            admit(count)?;
             let _phase = crate::search_model::SearchPhaseTimer::start("head_candidates");
             let mut statement = self.db.prepare(
                 "SELECT c.vid,c.syntax_id,c.card_hash
@@ -362,10 +386,19 @@ impl EvidenceResponse {
             )?;
             let mut rows = statement.query([&selected.key])?;
             let mut cards = Vec::new();
+            cards.try_reserve_exact(count)?;
             while let Some(row) = rows.next()? {
                 check()?;
+                ensure!(
+                    cards.len() < count,
+                    SelectedIntegrity("store_unavailable: head search count mismatch".into())
+                );
                 cards.push(search_candidate(row)?);
             }
+            ensure!(
+                cards.len() == count,
+                SelectedIntegrity("store_unavailable: head search count mismatch".into())
+            );
             ensure!(
                 search_head_count(&self.db)? == cards.len(),
                 SelectedIntegrity("store_unavailable: head search corpus mismatch".into())
@@ -383,6 +416,16 @@ impl EvidenceResponse {
         previous: IndexPin,
         expected_new: IndexPin,
         check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<SearchHeadDelta> {
+        self.mcp_search_head_delta_admitted(previous, expected_new, check, &mut |_, _| Ok(()))
+    }
+
+    pub(crate) fn mcp_search_head_delta_admitted(
+        &self,
+        previous: IndexPin,
+        expected_new: IndexPin,
+        check: &mut impl FnMut() -> Result<()>,
+        admit: &mut dyn FnMut(usize, usize) -> Result<()>,
     ) -> Result<SearchHeadDelta> {
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
@@ -426,14 +469,35 @@ impl EvidenceResponse {
             self.store
                 .read_revision_for(&self.db, Some(previous), true)?;
             let _phase = crate::search_model::SearchPhaseTimer::start("head_delta");
+            let added_count: i64 = self.db.query_row(
+                "WITH added(vid) AS (SELECT vid FROM revision_documents WHERE revision_id=?1
+                 EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2)
+                 SELECT count(*) FROM added JOIN native_version_search_cards c ON c.vid=added.vid",
+                params![selected.key, old_key],
+                |row| row.get(0),
+            )?;
+            let removed_count: i64 = self.db.query_row(
+                "SELECT count(*) FROM (SELECT vid FROM revision_documents WHERE revision_id=?1
+                 EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2)",
+                params![old_key, selected.key],
+                |row| row.get(0),
+            )?;
+            let added_count = usize::try_from(added_count)?;
+            let removed_count = usize::try_from(removed_count)?;
+            admit(added_count, removed_count)?;
             let mut removed_statement = self.db.prepare(
                 "SELECT vid FROM revision_documents WHERE revision_id=?1
                  EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2",
             )?;
             let mut removed_rows = removed_statement.query(params![old_key, selected.key])?;
             let mut removed_version_ids = Vec::new();
+            removed_version_ids.try_reserve_exact(removed_count)?;
             while let Some(row) = removed_rows.next()? {
                 check()?;
+                ensure!(
+                    removed_version_ids.len() < removed_count,
+                    SelectedIntegrity("store_unavailable: delta removed count mismatch".into())
+                );
                 removed_version_ids.push(row.get(0)?);
             }
             let mut added_statement = self.db.prepare(
@@ -449,8 +513,13 @@ impl EvidenceResponse {
             )?;
             let mut added_rows = added_statement.query(params![selected.key, old_key])?;
             let mut added = Vec::new();
+            added.try_reserve_exact(added_count)?;
             while let Some(row) = added_rows.next()? {
                 check()?;
+                ensure!(
+                    added.len() < added_count,
+                    SelectedIntegrity("store_unavailable: delta added count mismatch".into())
+                );
                 let candidate = search_candidate(row)?;
                 ensure!(
                     row.get::<_, Option<i64>>(3)?.is_some()
@@ -459,6 +528,10 @@ impl EvidenceResponse {
                 );
                 added.push(candidate);
             }
+            ensure!(
+                added.len() == added_count && removed_version_ids.len() == removed_count,
+                SelectedIntegrity("store_unavailable: delta search count mismatch".into())
+            );
             let head_card_count = search_head_count(&self.db)?;
             Ok(SearchHeadDelta {
                 pin: selected.pin,

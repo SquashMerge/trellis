@@ -285,6 +285,10 @@ impl SearchService {
         }
     }
 
+    pub(super) fn idle_now(&self) -> std::time::Instant {
+        (self.model_clock)()
+    }
+
     pub fn model_configured(&self) -> bool {
         self.model_configured
     }
@@ -432,6 +436,19 @@ impl SearchService {
             .and_then(Weak::upgrade);
         if let Some(core) = core {
             core.wake();
+        }
+    }
+
+    /// The existing fill owner also maintains other heads between batches.
+    pub(super) fn expire_idle_matrices(&self) {
+        let core = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(core) = core {
+            core.expire_idle_matrices(self.idle_now());
         }
     }
 
@@ -702,11 +719,10 @@ impl SearchService {
             *writer = Some(VectorCacheWriter::open(&self.roots.vectors_db())?);
             self.cache_epoch.fetch_add(1, Ordering::AcqRel);
         }
-        let before = writer.as_ref().unwrap().eviction_epoch();
+        // Resident matrices own their vectors; ordinary backing-cache LRU
+        // eviction does not change their validity. Only cache replacement or
+        // corruption advances the epoch.
         let result = operation(writer.as_mut().expect("vector writer initialized"));
-        if writer.as_ref().unwrap().eviction_epoch() != before {
-            self.cache_epoch.fetch_add(1, Ordering::AcqRel);
-        }
         if result.as_ref().is_err_and(is_corrupt_cache) {
             // Reopen/recreate on the next job, not within a failed operation.
             *writer = None;
@@ -1499,6 +1515,158 @@ mod tests {
         assert!(service.begin_idle_expiry());
         service.finish_idle_expiry();
         assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn backing_cache_eviction_preserves_resident_heads_but_corruption_invalidates_them() {
+        use super::super::search_head::{HeadChange, HeadSlot, HeadUpdate};
+        use crate::search_rank::{SearchCandidate, SearchCandidateKey};
+
+        let (_directory, service) = service();
+        let service = Arc::new(service);
+        // Exercise the normal writer path with a small physical cache budget.
+        service.roots.prepare_vectors().unwrap();
+        *service.vectors.lock().unwrap() = Some(
+            VectorCacheWriter::open_with_budget(&service.roots.vectors_db(), 32 * 1024).unwrap(),
+        );
+        let model = crate::search_embed::model_id_for_card_format(CardFormat::V1.as_str());
+        let epoch = service.cache_epoch();
+        let pin = crate::model::IndexPin {
+            index_generation: uuid::Uuid::nil(),
+            index_revision: 1,
+        };
+        let cards: Vec<_> = (1..=2)
+            .map(|id| SearchCandidate {
+                key: SearchCandidateKey {
+                    version_id: id,
+                    syntax_id: format!("sid:v1:{id:032x}"),
+                },
+                card_hash: format!("{id:064x}"),
+            })
+            .collect();
+        let heads: Vec<_> = cards
+            .iter()
+            .map(|card| {
+                service
+                    .with_vector_writer(|writer| {
+                        writer.put(&model, &card.card_hash, &[1; DIMENSIONS])
+                    })
+                    .unwrap();
+                let head = HeadSlot::new(Weak::new(), 1, Arc::downgrade(&service));
+                service
+                    .with_vector_snapshot(|snapshot| {
+                        head.build(
+                            HeadUpdate {
+                                pin,
+                                declarations: 1,
+                                change: HeadChange::Full(vec![card.clone()].into()),
+                            },
+                            &model,
+                            epoch,
+                            snapshot,
+                            &mut || Ok(()),
+                        )
+                    })
+                    .unwrap();
+                assert!(head.resident().unwrap());
+                head
+            })
+            .collect();
+
+        let mut evicted = false;
+        for id in 3..40 {
+            service
+                .with_vector_writer(|writer| {
+                    writer.put_many(&[(&model, &format!("{id:064x}"), &[2; DIMENSIONS])])
+                })
+                .unwrap();
+            evicted = service
+                .with_vector_snapshot(|snapshot| {
+                    let snapshot = snapshot.unwrap();
+                    Ok(cards
+                        .iter()
+                        .all(|card| snapshot.get(&model, &card.card_hash).unwrap().is_none()))
+                })
+                .unwrap();
+            if evicted {
+                break;
+            }
+        }
+        assert!(evicted, "both resident heads' backing rows must be evicted");
+        assert_eq!(service.cache_epoch(), epoch);
+        for (head, card) in heads.iter().zip(&cards) {
+            assert!(head.resident().unwrap());
+            assert!(!head.needs_build());
+            assert_eq!(head.previous(&model, service.cache_epoch()), Some(pin));
+            let ranking = head
+                .rank(
+                    pin,
+                    &model,
+                    service.cache_epoch(),
+                    &[],
+                    Some(&[1; DIMENSIONS]),
+                    &mut || Ok(()),
+                )
+                .unwrap()
+                .expect("resident vectors remain usable without backing rows");
+            assert_eq!(ranking.embedded, 1);
+            assert_eq!(ranking.hits[0].key, card.key);
+            assert_eq!(ranking.hits[0].vector_rank, Some(1));
+            head.committed(
+                &model,
+                service.cache_epoch(),
+                &[(card.card_hash.clone(), vec![3; DIMENSIONS])],
+            )
+            .unwrap();
+            assert!(
+                head.resident().unwrap(),
+                "a later fill must retain the head"
+            );
+        }
+
+        let error = service
+            .with_vector_writer::<()>(|_| {
+                Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                    None,
+                ))
+                .context(StoreUnavailable))
+            })
+            .unwrap_err();
+        assert!(error.is::<StoreUnavailable>());
+        assert!(is_corrupt_cache(&error));
+        assert_eq!(service.cache_epoch(), epoch + 1);
+        assert!(service.vectors.lock().unwrap().is_none());
+        for head in &heads {
+            assert!(!head.resident().unwrap());
+            assert!(head.needs_build());
+        }
+        // The writer is dropped before installing a broken disposable cache.
+        std::fs::write(service.roots.vectors_db(), b"not a SQLite database").unwrap();
+        service
+            .with_vector_writer(|writer| {
+                assert_eq!(writer.snapshot()?.entry_count(), 0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(service.cache_epoch(), epoch + 2);
+        for head in &heads {
+            assert!(!head.resident().unwrap());
+            assert!(head.needs_build());
+            assert!(head.previous(&model, service.cache_epoch()).is_none());
+            assert!(
+                head.rank(
+                    pin,
+                    &model,
+                    service.cache_epoch(),
+                    &[],
+                    Some(&[1; DIMENSIONS]),
+                    &mut || Ok(()),
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
     }
 
     #[test]

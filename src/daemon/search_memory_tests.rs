@@ -22,7 +22,7 @@ fn cards(rows: usize) -> Arc<[SearchCandidate]> {
         .map(|row| SearchCandidate {
             key: SearchCandidateKey {
                 version_id: row as i64,
-                syntax_id: format!("sid-{row}"),
+                syntax_id: format!("sid:v1:{row:032x}"),
             },
             card_hash: format!("{row:064x}"),
         })
@@ -55,7 +55,7 @@ fn build(head: &HeadSlot, revision: u64, rows: usize) -> Result<()> {
 }
 #[test]
 fn oversized_head_is_lexical_only_without_allocating_or_evicting_others() {
-    let one = SearchMatrix::estimated_new_bytes(&cards(1)) + MATRIX_FILL_SCRATCH;
+    let one = SearchMatrix::estimated_new_build_bytes_for_counts(1, 39, 64) + MATRIX_FILL_SCRATCH;
     let core = core(one);
     let (_a, resident) = register(&core);
     build(&resident.head, 1, 1).unwrap();
@@ -76,8 +76,41 @@ fn oversized_head_is_lexical_only_without_allocating_or_evicting_others() {
     assert!(!resident.head.resident().unwrap());
 }
 #[test]
+fn oversized_candidate_admission_is_cached_by_count_before_enumeration() {
+    let core = core(MATRIX_FILL_SCRATCH + 100_000);
+    let (_source, registration) = register(&core);
+    for _ in 0..2 {
+        assert!(
+            registration
+                .head
+                .reserve_candidates(10_000, 0, true, "model", 1, false)
+                .err()
+                .unwrap()
+                .is::<MemoryDeclined>()
+        );
+        assert_eq!(used(&core), 0);
+    }
+    // A successor with the same card count is already known not to fit.
+    assert!(
+        build(&registration.head, 2, 10_000)
+            .unwrap_err()
+            .is::<MemoryDeclined>()
+    );
+    assert_eq!(used(&core), 0);
+    let candidates = registration
+        .head
+        .reserve_candidates(1, 0, true, "model", 1, false)
+        .unwrap();
+    assert!(used(&core) > 0);
+    build(&registration.head, 3, 1).unwrap();
+    drop(candidates);
+    assert!(registration.head.resident().unwrap());
+}
+
+#[test]
 fn pressure_evicts_the_least_recently_queried_head_not_the_last_registered() {
-    let estimate = SearchMatrix::estimated_new_bytes(&cards(1)) + MATRIX_FILL_SCRATCH;
+    let estimate =
+        SearchMatrix::estimated_new_build_bytes_for_counts(1, 39, 64) + MATRIX_FILL_SCRATCH;
     let probe = HeadSlot::new(Weak::new(), 99, Weak::new());
     build(&probe, 1, 1).unwrap();
     let resident_bytes = probe.storage_bytes() + MATRIX_FILL_SCRATCH;
@@ -101,7 +134,8 @@ fn pressure_evicts_the_least_recently_queried_head_not_the_last_registered() {
 }
 #[test]
 fn startup_stops_at_cap_without_evicting_an_active_matrix() {
-    let estimate = SearchMatrix::estimated_new_bytes(&cards(1)) + MATRIX_FILL_SCRATCH;
+    let estimate =
+        SearchMatrix::estimated_new_build_bytes_for_counts(1, 39, 64) + MATRIX_FILL_SCRATCH;
     let core = core(estimate);
     let (_a, active) = register(&core);
     build(&active.head, 1, 1).unwrap();
@@ -225,16 +259,26 @@ fn known_fault_is_not_hidden_by_nonresidency() {
 }
 
 #[test]
-fn cold_streaming_estimate_covers_normal_build_without_tripling_vector_storage() {
-    let candidates = cards(64);
-    let estimate = SearchMatrix::estimated_new_bytes(&candidates);
-    let matrix = SearchMatrix::new(candidates, &mut || Ok(())).unwrap();
-    let resident = matrix.storage_bytes();
-    assert!(estimate >= resident);
-    // Project a representative 820 MiB resident head using normal-size rows.
-    // No production-size input or allocation is used in this arithmetic check.
-    let projected_cold = (820_u64 * 1024 * 1024).div_ceil(resident as u64) * estimate as u64;
-    assert!(projected_cold < MATRIX_RAM_LIMIT as u64);
+fn large_card_count_with_real_id_lengths_is_admitted_under_the_unchanged_cap() {
+    let count: usize = 75_614 * 10;
+    let estimate =
+        SearchMatrix::estimated_new_build_bytes_for_counts(count, count * 39, count * 64);
+    let core = core(MATRIX_RAM_LIMIT);
+    let (_source, registration) = register(&core);
+    let candidates = registration
+        .head
+        .reserve_candidates(count, 0, true, "model", 1, false)
+        .unwrap();
+    let charge = core
+        .reserve(registration.id, estimate + MATRIX_FILL_SCRATCH, false)
+        .unwrap();
+    assert!(used(&core) < MATRIX_RAM_LIMIT);
+    assert!(
+        SearchMatrix::estimated_new_bytes_for_counts(count, count * 39, count * 64) < 900_000_000
+    );
+    drop(charge);
+    drop(candidates);
+    assert_eq!(used(&core), 0);
 }
 
 struct BatchFactory;
@@ -265,8 +309,10 @@ impl FillSource for BatchSource {
     fn head(
         &self,
         _: Option<IndexPin>,
+        admit: &mut dyn FnMut(usize, usize, bool) -> Result<()>,
         _: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<HeadUpdate>> {
+        admit(BATCH, 0, true)?;
         Ok(Some(update(1, BATCH)))
     }
     fn page(&self, _: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
@@ -296,7 +342,10 @@ fn exact_cold_limit_keeps_fill_allowance_and_completes_without_another_query() {
     );
     let service =
         Arc::new(SearchService::with_embedder_for_tests(roots, Arc::new(BatchFactory)).unwrap());
-    let limit = SearchMatrix::estimated_new_bytes(&cards(BATCH)) + MATRIX_FILL_SCRATCH;
+    let limit = SearchMatrix::estimated_new_build_bytes_for_counts(BATCH, BATCH * 39, BATCH * 64)
+        + MATRIX_FILL_SCRATCH
+        + 2 * BATCH * (std::mem::size_of::<SearchCandidate>() + 39 + 64)
+        + 2 * std::mem::size_of::<usize>();
     let owner = SearchFill::start_with_limit_for_tests(service.clone(), limit).unwrap();
     let source: Arc<dyn FillSource> = Arc::new(BatchSource);
     let registration = owner.register_source(Arc::downgrade(&source));
@@ -422,9 +471,12 @@ impl FillSource for DeltaPeakSource {
     fn head(
         &self,
         previous: Option<IndexPin>,
+        admit: &mut dyn FnMut(usize, usize, bool) -> Result<()>,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<HeadUpdate>> {
         check()?;
+        let delta = self.revised.load(Ordering::Acquire) && previous == Some(pin(1));
+        admit(if delta { 1 } else { 2 }, usize::from(delta), !delta)?;
         self.heads.lock().unwrap().push(previous);
         if self.revised.load(Ordering::Acquire) {
             Ok(Some(HeadUpdate {
@@ -462,7 +514,7 @@ impl FillSource for DeltaPeakSource {
     }
 }
 #[test]
-fn local_delta_peak_decline_retries_cold_in_same_owner_job_without_second_query() {
+fn local_delta_keeps_resident_matrix_without_full_head_enumeration() {
     let directory = tempfile::tempdir().unwrap();
     let roots = crate::store::topology::TopologyRoots::isolated_for_tests(
         directory.path().join("cache"),
@@ -488,7 +540,7 @@ fn local_delta_peak_decline_retries_cold_in_same_owner_job_without_second_query(
             writer.put_many(&entries)
         })
         .unwrap();
-    let limit = SearchMatrix::estimated_new_bytes(&cards(2)) + MATRIX_FILL_SCRATCH;
+    let limit = 100_000;
     let owner = SearchFill::start_with_limit_for_tests(service.clone(), limit).unwrap();
     let source = Arc::new(DeltaPeakSource {
         revised: AtomicBool::new(false),
@@ -505,21 +557,12 @@ fn local_delta_peak_decline_retries_cold_in_same_owner_job_without_second_query(
             .unwrap(),
         Some(2)
     );
-    // Establish the exact peak rejection precondition using the same estimator
-    // as build_mode, rather than assuming this small fixture exceeds the cap.
-    let mut matrix = SearchMatrix::new(cards(2), &mut || Ok(())).unwrap();
-    matrix.insert(0, &[1; DIMENSIONS]).unwrap();
-    matrix.insert(1, &[1; DIMENSIONS]).unwrap();
-    let delta_peak = matrix.estimated_delta_candidate_bytes(&cards(1))
-        + MATRIX_FILL_SCRATCH
-        + matrix.active_count() * (DIMENSIONS + 128);
-    assert!(owner.matrix_storage_bytes() + delta_peak > limit);
     source.heads.lock().unwrap().clear();
     source.revised.store(true, Ordering::Release);
     // One ordinary publication hint only. No second query or request retries it.
     registration.notify();
     owner.wait_until_idle_for_tests();
-    assert_eq!(*source.heads.lock().unwrap(), vec![Some(pin(1)), None]);
+    assert_eq!(*source.heads.lock().unwrap(), vec![Some(pin(1))]);
     assert_eq!(
         registration
             .head
