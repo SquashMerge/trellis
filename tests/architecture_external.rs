@@ -600,3 +600,257 @@ fn selected_javax_jdk_maven_coordinates_do_not_prove_non_jdk_namespaces() {
             .any(|descriptor| descriptor["identity"]["standardLibrary"] == false)
     );
 }
+
+fn python_fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in [
+        (
+            "pyproject.toml",
+            "[project]\nname = 'fixture'\nversion = '1'\ndependencies = ['requests>=2']\n",
+        ),
+        ("requirements.txt", "requests>=2\n"),
+        (
+            "app.py",
+            "import json as j\nfrom pathlib import Path\nimport requests\nimport email\n",
+        ),
+        ("other.py", "import json\n"),
+        (
+            "tests/test_external.py",
+            "def test_catalog():\n    import sys\n",
+        ),
+        (
+            ".trellis/rules.toml",
+            r#"version = 1
+[external_policy]
+deny = [
+  { language = "python", package = "json", stdlib = true },
+  { language = "python", package = "sys", stdlib = true },
+  { language = "python", package = "requests", stdlib = false },
+  { language = "python", package = "email", stdlib = true },
+]
+[layers.source]
+order = 2
+paths = ["app.py", "tests/**"]
+[layers.standard]
+order = 1
+external = [
+  { language = "python", package = "json", stdlib = true },
+  { language = "python", package = "pathlib", stdlib = true },
+  { language = "python", package = "sys", stdlib = true },
+]
+"#,
+        ),
+    ] {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    (state, root, store, pin)
+}
+
+#[test]
+fn python_catalog_labels_are_exact_and_selectors_do_not_prove_membership() {
+    use trellis::references::external::{python_standard_library, valid_package};
+    for name in ["json", "pathlib", "sys"] {
+        let descriptor =
+            serde_json::to_value(python_standard_library("fixture", name).unwrap()).unwrap();
+        assert_eq!(
+            descriptor["identity"],
+            json!({
+                "kind":"externalPackage", "sourceSetId":"fixture", "language":"python",
+                "package":name, "standardLibrary":true
+            })
+        );
+        assert_eq!(descriptor["ecosystem"], "python");
+        assert_eq!(
+            descriptor["evidence"],
+            json!([{
+                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v1", "entry":name
+            }])
+        );
+    }
+    for name in ["jsonish", "JSON", "json.tool", "email"] {
+        assert!(python_standard_library("fixture", name).is_none());
+    }
+    assert!(valid_package("python", "email", true));
+    assert!(valid_package("python", "requests", false));
+}
+
+#[test]
+fn selected_python_catalog_edges_and_unknowns_survive_live_source_and_manifest_edits() {
+    let (_state, root, store, pin) = python_fixture();
+    let before = read(&store, "references", pin);
+    assert_eq!(before["externalPackages"].as_array().unwrap().len(), 3);
+    for name in ["json", "pathlib", "sys"] {
+        let descriptor = package(&before, name);
+        assert_eq!(descriptor["identity"]["language"], "python");
+        assert_eq!(descriptor["identity"]["standardLibrary"], true);
+        assert_eq!(descriptor["ecosystem"], "python");
+        assert_eq!(
+            descriptor["evidence"],
+            json!([{
+                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v1", "entry":name
+            }])
+        );
+    }
+    for spelling in ["requests", "email"] {
+        assert!(
+            before["unresolved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["site"]["spelling"].as_str().unwrap().contains(spelling) })
+        );
+        assert!(
+            !before["externalPackages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["identity"]["package"] == spelling })
+        );
+    }
+    assert!(before["tests"].as_array().unwrap().iter().any(|edge| {
+        edge["source"]["path"] == "tests/test_external.py"
+            && edge["target"] == package(&before, "sys")["identity"]
+            && edge["sites"][0]["role"] == "test"
+    }));
+    for field in ["production", "tests"] {
+        for edge in before[field].as_array().unwrap() {
+            assert_eq!(edge["source"]["sourceSetId"], edge["target"]["sourceSetId"]);
+            assert!(
+                before["modules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|module| { module["identity"] == edge["source"] })
+            );
+            let source =
+                fs::read_to_string(root.path().join(edge["source"]["path"].as_str().unwrap()))
+                    .unwrap();
+            for site in edge["sites"].as_array().unwrap() {
+                let start = site["range"]["start"].as_u64().unwrap() as usize;
+                let end = site["range"]["end"].as_u64().unwrap() as usize;
+                assert_eq!(&source[start..end], site["spelling"].as_str().unwrap());
+            }
+        }
+    }
+    let checked = read(&store, "check", pin);
+    let response = store.evidence_response().unwrap();
+    let ban = checked["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "$external" && row["target"]["path"] == "other.py")
+        .unwrap();
+    let arguments = json!({"expectedBasis":pin,"rule":"$external",
+        "target":ban["target"],"destination":ban["destination"]});
+    let explained = response
+        .architecture_response("explain", &arguments, &mut || Ok(()))
+        .unwrap();
+    response.finish(()).unwrap();
+    for path in [
+        "app.py",
+        "tests/test_external.py",
+        "pyproject.toml",
+        "requirements.txt",
+    ] {
+        fs::write(root.path().join(path), "invalid live contents = [").unwrap();
+    }
+    fs::remove_file(root.path().join("other.py")).unwrap();
+    assert_eq!(read(&store, "references", pin), before);
+    assert_eq!(read(&store, "check", pin), checked);
+    let response = store.evidence_response().unwrap();
+    assert_eq!(
+        response
+            .architecture_response("explain", &arguments, &mut || Ok(()))
+            .unwrap(),
+        explained
+    );
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn python_external_rules_explain_and_browser_keep_native_metrics_separate() {
+    let (_state, _root, store, pin) = python_fixture();
+    let refs = read(&store, "references", pin);
+    let checked = read(&store, "check", pin);
+    let rows = checked["instances"].as_array().unwrap();
+    let ban = rows
+        .iter()
+        .find(|row| row["rule"] == "$external" && row["target"]["path"] == "other.py")
+        .unwrap();
+    assert_eq!(ban["status"], "deviates");
+    assert!(ban["sourceLayer"].is_null());
+    assert_eq!(ban["destination"], package(&checked, "json")["identity"]);
+    assert!(rows.iter().any(|row| {
+        row["rule"] == "$layers"
+            && row["target"]["path"] == "app.py"
+            && row["destination"] == package(&checked, "json")["identity"]
+            && row["destinationLayer"] == "standard"
+            && row["status"] == "deviates"
+    }));
+    assert!(!rows.iter().any(|row| {
+        row["target"]["path"] == "tests/test_external.py"
+            || matches!(
+                row["destination"]["package"].as_str(),
+                Some("requests" | "email")
+            )
+    }));
+    assert!(checked["testOnly"].as_array().unwrap().iter().any(|row| {
+        row["rule"] == "$external"
+            && row["target"]["path"] == "tests/test_external.py"
+            && row["destination"] == package(&checked, "sys")["identity"]
+    }));
+    let response = store.evidence_response().unwrap();
+    let explanation = response.architecture_response("explain", &json!({
+        "expectedBasis":pin,"rule":"$external","target":ban["target"],"destination":ban["destination"]
+    }), &mut || Ok(())).unwrap();
+    assert_eq!(
+        package(&explanation, "json")["identity"],
+        ban["destination"]
+    );
+    let options = MetricsOptions {
+        pin: Some(pin),
+        ..Default::default()
+    };
+    let view = response
+        .architecture_view(&options, &mut || Ok(()))
+        .unwrap();
+    let metrics = response.metrics_at(&options, &mut || Ok(())).unwrap();
+    for module in view["modules"].as_array().unwrap() {
+        let identity = &module["identity"];
+        assert!(identity.get("package").is_none());
+        assert!(identity.get("sid").is_some());
+        let metric = metrics
+            .files
+            .iter()
+            .find(|file| {
+                identity["sourceSetId"] == file.source_set_id
+                    && identity["language"] == file.language
+                    && identity["path"] == file.path
+            })
+            .unwrap();
+        assert_eq!(module["metrics"], metric.metrics);
+    }
+    assert_eq!(
+        view["references"]["externalPackages"],
+        refs["externalPackages"]
+    );
+    response.finish(()).unwrap();
+}

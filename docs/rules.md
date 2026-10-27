@@ -191,9 +191,25 @@ Supported mapping is deliberately narrow:
 - **JavaScript:** static relative imports/reexports/side-effect imports; unique
   explicit indexed extension or `.js`/`.mjs`/`.cjs` and `index.js` convention.
   Bare, dynamic and ambiguous imports remain unresolved.
-- **Python:** explicit relative imports with a unique `.py`/`__init__.py` directory
-  convention. Module-versus-attribute ambiguity is not guessed. Absolute roots,
-  aliases and wildcards remain unresolved.
+- **Python:** captured checkout-root `m.py` or `m/__init__.py` layouts require
+  unique module ownership and proved `__init__.py` package prefixes. Relative
+  imports follow captured package membership; absolute imports use only that
+  proved root convention. No suffix search, namespace-package or `sys.path`
+  discovery is performed. A single unconditional literal `__all__` list of
+  supported string literals selects exactly its proved names, including private
+  spellings. Without `__all__`, proved public top-level names are exposed.
+  Dynamic, mutated or conditional `__all__` cannot fall back to that public-name
+  inventory. Proved simple import aliases and forwarding retain original native
+  declaration identities and follow at most four module/import edges; wildcard
+  edges reach final declaration-owner files and keep real intermediate proof
+  separately. Distinct competing names, cycles, a fifth edge, missing selected
+  names, dynamic exports, unsupported string decoding and unproved local layout
+  remain unknown. Independently proved names can map while residual uncertainty
+  remains visible; partial decoding or inventory never claims complete exports.
+  Explicit/local bindings settle matching names, but an external star supplies no
+  names and keeps wildcard-only bindings uncertain. Reviewed stdlib labels are
+  package-only; third-party distributions remain unknown without authoritative
+  captured import-name mapping. This is not Python execution or runtime binding.
 - **Java:** captured declared packages and public top-level class/interface/enum/record
   declarations prove ordinary single-type and on-demand imports and qualified-type
   paths. On-demand imports enumerate only the exact package, not subpackages.
@@ -343,7 +359,7 @@ is invented for a package. A config descriptor is exactly
  counts:{scannedDocuments:UInt,mappedSites:UInt,unresolvedSites:UInt},
  limitations:string[]}
 Module = {identity:Target,revisionId,contentHash,provenanceId}
-ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust"|"java",evidence:PackageEvidence[]}
+ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust"|"java"|"python",evidence:PackageEvidence[]}
 ExternalIdentity = {kind:"externalPackage",sourceSetId,language,package,standardLibrary:boolean}
 PackageEvidence = ManifestEvidence | CatalogEvidence
 ManifestEvidence = {kind:"manifest",sourceSetId,nativeRevisionId,dependencyHash,
@@ -352,6 +368,8 @@ CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:
                    entry:"std"|"core"|"alloc"}
                 | {kind:"standardLibraryCatalog",catalog:"java-standard-library:v2",
                    entry:"java"|"javax"}
+                | {kind:"standardLibraryCatalog",catalog:"python-standard-library:v1",
+                   entry:"json"|"pathlib"|"sys"}
 Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
         omittedSites:UInt,mapping:"structural"}
 Unresolved = {source:Target,site:Site,reason:string}
@@ -367,8 +385,18 @@ Rust standard-library catalog. Java uses `ecosystem:"java"` and the reviewed
 The `java` root policy is unchanged. The `javax` label requires exact containing-package
 membership in the pinned OpenJDK 25 public-export catalog; parent packages and
 invented descendants are not implied. These entries label package families, not
-member existence or selected-JDK availability. Lookalike roots are not catalog matches.
-Manifest evidence identifies the selected source
+member existence or selected-JDK availability. Python uses `ecosystem:"python"` and the
+`python-standard-library:v1` catalog, with exactly `json`, `pathlib` and `sys`.
+This is a deliberately partial, code-shipped catalog of CPython 3.12 root labels
+for Windows, macOS and Linux, not a complete stdlib inventory or proof of the
+checkout runtime, installation, submodules or members. It does not discover or
+check the host Python version. Unlisted roots remain unknown, including genuine
+stdlib roots. Local module precedence and ambiguity are resolved before catalog
+lookup; an unproved or ambiguous local root never falls back to an external
+label. Python external star imports supply package edges, not member inventories;
+their unknown names keep wildcard-only bindings uncertain unless a proved
+explicit import or local declaration settles that name. Lookalike roots are not
+catalog matches. Manifest evidence identifies the selected source
 set/native revision and retained dependency hash, captured manifest path/content
 hash, actual import root, declaration section/key and nullable original version
 constraint. Catalog evidence identifies a reviewed code-shipped entry, not a
@@ -399,8 +427,10 @@ not member/API inventories. Java's `java`/`javax` labels share this external
 identity shape; the javax package gate does not change that identity. Non-JDK javax
 packages require independent captured mapping evidence or remain unknown; no
 third-party Maven/Gradle prefix mapping is inferred. Python
-and JavaScript package adapters are later work. Maven groups and Python
-distribution names alone do not prove import prefixes.
+third-party distribution mappings and JavaScript package adapters are later work.
+Maven groups and Python distribution names alone do not prove import prefixes.
+No Python third-party mapping table, installed-distribution lookup or additional
+mapping-metadata capture is part of this slice.
 
 The Rust name inventory does not register foreign function-signature bindings or
 expand procedural derives. Names introduced by those forms are not a complete

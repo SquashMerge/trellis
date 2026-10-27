@@ -186,6 +186,29 @@ pub fn java_standard_library(source_set_id: &str, package_path: &str) -> Option<
     })
 }
 
+/// Partial, code-shipped CPython 3.12 root labels for Windows, macOS and Linux.
+/// This is not a complete catalog or proof of installation, submodules or members.
+/// The caller proves local precedence and charges work before requesting a label.
+pub fn python_standard_library(source_set_id: &str, import_root: &str) -> Option<ExternalPackage> {
+    if !matches!(import_root, "json" | "pathlib" | "sys") {
+        return None;
+    }
+    Some(ExternalPackage {
+        identity: ExternalIdentity {
+            kind: ExternalKind::ExternalPackage,
+            source_set_id: source_set_id.into(),
+            language: "python".into(),
+            package: import_root.into(),
+            standard_library: true,
+        },
+        ecosystem: "python",
+        evidence: vec![ExternalEvidence::StandardLibraryCatalog {
+            catalog: "python-standard-library:v1",
+            entry: import_root.into(),
+        }],
+    })
+}
+
 /// Canonical selector spellings, not proof that a package or library is available.
 pub fn valid_package(language: &str, package: &str, standard_library: bool) -> bool {
     if standard_library {

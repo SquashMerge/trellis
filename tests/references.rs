@@ -101,6 +101,24 @@ fn module_paths(data: &Value) -> Vec<&str> {
 }
 
 #[test]
+fn references_python_direct_root_wildcard_expands_public_declaration_owner() {
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        ("provider.py", "def public_name():\n    pass\n"),
+    ]);
+    let data = references::project(&input, &["use.py".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(has_edge(&data, "use.py", "provider.py"), "{data}");
+    assert_eq!(
+        edge(&data, "production", "use.py", "provider.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
 fn references_java_direct_package_wildcard_expands_public_type_owner() {
     let input = snapshot(&[
         ("app/Use.java", "package app; import pkg.*; class Use {}"),
@@ -281,6 +299,7 @@ fn references_relative_imports_and_java_unresolved_are_honest() {
             "from .b import x\nfrom . import b\nimport external\n",
         ),
         ("pkg/b.py", "x = 1\n"),
+        ("pkg/__init__.py", ""),
         ("A.java", "import example.B; class A { example.B value; }"),
     ]);
     let data = project(&input);
@@ -298,7 +317,18 @@ fn references_relative_imports_and_java_unresolved_are_honest() {
         .iter()
         .map(|u| u["reason"].as_str().unwrap())
         .collect();
-    assert!(reasons.contains(&"module_or_attribute_ambiguous"));
+    assert_eq!(
+        edge(&data, "production", "pkg/a.py", "pkg/__init__.py")["count"],
+        1
+    );
+    let python_unknowns: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["source"]["path"] == "pkg/a.py")
+        .collect();
+    assert_eq!(python_unknowns.len(), 1);
+    assert_eq!(python_unknowns[0]["site"]["spelling"], "external");
     let java_unknowns: Vec<_> = data["unresolved"]
         .as_array()
         .unwrap()
@@ -319,6 +349,7 @@ fn references_ambiguous_import_files_never_choose_arbitrary_target() {
         ("pkg/a.py", "from .b import x\n"),
         ("pkg/b.py", ""),
         ("pkg/b/__init__.py", ""),
+        ("pkg/__init__.py", ""),
     ]);
     let data = project(&input);
     assert!(data["production"].as_array().unwrap().is_empty());
@@ -3011,4 +3042,1245 @@ fn references_javax_jdk_native_ownership_and_ambiguity_never_fall_back_to_stdlib
         "import javax.servlet.*;"
     );
     assert!(data["externalPackages"].as_array().unwrap().is_empty());
+}
+
+fn project_python_source(input: &Snapshot, limit: usize) -> Value {
+    references::project(input, &["use.py".into()], limit, &mut || Ok(()))
+        .unwrap()
+        .data
+}
+
+#[test]
+fn references_python_public_top_level_names_share_one_owner_edge() {
+    for definition in [
+        "def public_name():\n    pass\n",
+        "class PublicType:\n    pass\n",
+        "VALUE = 1\n",
+    ] {
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", definition),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.py", "provider.py")["count"],
+            1
+        );
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        (
+            "provider.py",
+            "def function():\n    pass\nclass PublicType:\n    def method(self):\n        pass\nVALUE = 1\ndef _private():\n    pass\n",
+        ),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+    assert_eq!(
+        edge(&data, "production", "use.py", "provider.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    for private_only in [
+        "def _private():\n    pass\n",
+        "class _Private:\n    def public_method(self):\n        pass\n",
+        "def _outer():\n    def public_nested():\n        pass\n",
+        "_PRIVATE = 1\n",
+    ] {
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", private_only),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+#[test]
+fn references_python_literal_all_selects_exact_names_including_private_and_empty() {
+    for (selection, expected_owner) in [
+        ("['public_name']", Some("public.py")),
+        ("['_private']", Some("private.py")),
+        ("['public_name', 'public_name']", Some("public.py")),
+        ("[]", None),
+    ] {
+        let provider = format!(
+            "from public import public_name\nfrom private import _private\n__all__ = {selection}\n"
+        );
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", &provider),
+            ("public.py", "def public_name():\n    pass\n"),
+            ("private.py", "def _private():\n    pass\n"),
+        ]);
+        let data = project_python_source(&input, 20);
+        match expected_owner {
+            Some(owner) => {
+                assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+                assert_eq!(edge(&data, "production", "use.py", owner)["count"], 1);
+                assert_eq!(data["counts"]["mappedSites"], 1);
+                assert_eq!(data["counts"]["unresolvedSites"], 0);
+            }
+            None => {
+                assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+                assert_eq!(data["counts"]["mappedSites"], 0);
+                assert_eq!(data["counts"]["unresolvedSites"], 1);
+            }
+        }
+        assert!(!has_edge(&data, "use.py", "provider.py"));
+    }
+}
+
+#[test]
+fn references_python_all_literal_names_do_not_evaluate_expressions_or_mutations() {
+    for exports in [
+        "__all__ = names\n",
+        "__all__ = ('public_name',)\n",
+        "__all__ = ['public_' + 'name']\n",
+        "__all__ = [f'public_name']\n",
+        "__all__ = [*names]\n",
+        "__all__ = [name]\n",
+        "__all__ = ['public_name']\n__all__ = names\n",
+        "__all__ = ['public_name']\n__all__ += names\n",
+        "__all__ = ['public_name']\n__all__.append('other')\n",
+        "__all__ = ['public_name']\n__all__[0] = 'other'\n",
+        "__all__ = ['public_name']\ndef mutate():\n    __all__.append('other')\n",
+        "__all__ = ['public_name']\ndef mutate():\n    __all__[0] = 'other'\n",
+        "if enabled:\n    __all__ = ['public_name']\n",
+        "try:\n    __all__ = ['public_name']\nexcept Exception:\n    pass\n",
+    ] {
+        let provider = format!("def public_name():\n    pass\n{exports}");
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", &provider),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert!(
+            data["production"].as_array().unwrap().is_empty(),
+            "{exports}: {data}"
+        );
+        assert_eq!(data["counts"]["mappedSites"], 0, "{exports}");
+        assert_eq!(data["counts"]["unresolvedSites"], 1, "{exports}");
+    }
+}
+
+#[test]
+fn references_python_all_missing_name_keeps_independent_proved_name() {
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        (
+            "provider.py",
+            "def good():\n    pass\n__all__ = ['good', 'missing']\n",
+        ),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.py", "provider.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn references_python_literal_all_preserves_string_spelling_not_source_tokens() {
+    for exports in [
+        "__all__ = [\"public_name\"]\n",
+        "__all__ = ['public_name']\n",
+        "__all__ = ['public\\x5fname']\n",
+        "__all__ = ['public\\u005fname']\n",
+        "__all__ = ['public\\U0000005fname']\n",
+        "__all__ = ['''public_name''']\n",
+        "__all__ = [r'public_name']\n",
+    ] {
+        let provider = format!("def public_name():\n    pass\n{exports}");
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", &provider),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.py", "provider.py")["count"],
+            1
+        );
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        (
+            "provider.py",
+            "def public_name():\n    pass\n__all__ = ['public\\N{LOW LINE}name']\n",
+        ),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_python_dynamic_namespace_cannot_prove_wildcard_uniqueness() {
+    for dynamic in [
+        "exec(source)\n",
+        "globals()[name] = value\n",
+        "def mutate():\n    globals().update({\"public_name\": replacement})\n",
+    ] {
+        let provider = format!("def public_name():\n    pass\n{dynamic}");
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", &provider),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert!(
+            data["production"].as_array().unwrap().is_empty(),
+            "{dynamic}: {data}"
+        );
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        (
+            "provider.py",
+            "def good():\n    pass\nif enabled:\n    def maybe():\n        pass\n",
+        ),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.py", "provider.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_python_missing_or_nonunique_native_export_proof_is_not_invented() {
+    for duplicate in [false, true] {
+        let mut input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            (
+                "provider.py",
+                "def good():\n    pass\ndef uncertain():\n    pass\n",
+            ),
+        ]);
+        let provider = input
+            .documents
+            .iter_mut()
+            .find(|doc| doc.key.path == "provider.py")
+            .unwrap();
+        let row = provider
+            .declarations
+            .iter()
+            .find(|row| row.name.as_deref() == Some("uncertain"))
+            .unwrap()
+            .clone();
+        if duplicate {
+            let mut other = row;
+            other.syntax_id = "sid:v1:duplicate-python-export".into();
+            provider.declarations.push(other);
+        } else {
+            provider
+                .declarations
+                .retain(|row| row.name.as_deref() != Some("uncertain"));
+        }
+        let data = project_python_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.py", "provider.py")["count"],
+            1
+        );
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+#[test]
+fn references_python_explicit_local_and_unproved_names_block_matching_star_names() {
+    for source in [
+        "from provider import *\ndef same():\n    pass\n",
+        "def same():\n    pass\nfrom provider import *\n",
+        "from provider import *\nfrom missing import original as same\n",
+    ] {
+        let input = snapshot(&[
+            ("use.py", source),
+            ("provider.py", "def same():\n    pass\n"),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert!(
+            !has_edge(&data, "use.py", "provider.py"),
+            "{source}: {data}"
+        );
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert!(!data["unresolved"].as_array().unwrap().is_empty());
+    }
+    let input = snapshot(&[
+        (
+            "use.py",
+            "from provider import *\nfrom other import original as same\n",
+        ),
+        ("provider.py", "def same():\n    pass\n"),
+        ("other.py", "def original():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert!(!has_edge(&data, "use.py", "provider.py"), "{data}");
+    assert_eq!(edge(&data, "production", "use.py", "other.py")["count"], 1);
+    let input = snapshot(&[
+        (
+            "use.py",
+            "from provider import *\ndef unrelated():\n    same = 1\n",
+        ),
+        ("provider.py", "def same():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.py", "provider.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_python_distinct_star_names_collide_without_source_order_precedence() {
+    for source in [
+        "from left import *\nfrom right import *\n",
+        "from right import *\nfrom left import *\n",
+    ] {
+        let input = snapshot(&[
+            ("use.py", source),
+            ("left.py", "def same():\n    pass\ndef good():\n    pass\n"),
+            ("right.py", "def same():\n    pass\n"),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+        assert_eq!(edge(&data, "production", "use.py", "left.py")["count"], 1);
+        assert!(!has_edge(&data, "use.py", "right.py"));
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 2);
+    }
+}
+
+#[test]
+fn references_python_external_and_unproved_star_sets_veto_local_wildcard_names() {
+    for external in ["json", "not_a_proved_package"] {
+        for source in [
+            format!("from provider import *\nfrom {external} import *\n"),
+            format!("from {external} import *\nfrom provider import *\n"),
+        ] {
+            let input = snapshot(&[
+                ("use.py", &source),
+                ("provider.py", "def public_name():\n    pass\n"),
+            ]);
+            let data = project_python_source(&input, 20);
+            assert!(!has_edge(&data, "use.py", "provider.py"), "{data}");
+            assert_eq!(data["counts"]["unresolvedSites"], 2);
+            if external == "json" {
+                let pairs = data["production"].as_array().unwrap();
+                assert_eq!(pairs.len(), 1, "{data}");
+                assert_eq!(pairs[0]["target"]["kind"], "externalPackage");
+                assert_eq!(pairs[0]["target"]["package"], "json");
+                assert_eq!(pairs[0]["count"], 1);
+                assert_eq!(data["counts"]["mappedSites"], 1);
+            } else {
+                assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+                assert!(data["externalPackages"].as_array().unwrap().is_empty());
+                assert_eq!(data["counts"]["mappedSites"], 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn references_python_literal_alias_forwarding_uses_original_owner_not_facade() {
+    let input = snapshot(&[
+        ("use.py", "from pkg import *\n"),
+        (
+            "pkg/__init__.py",
+            "from .model import original as alias\n__all__ = ['alias']\n",
+        ),
+        ("pkg/model.py", "def original():\n    pass\n"),
+        ("unrelated.py", "def unused():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+    assert_eq!(
+        edge(&data, "production", "use.py", "pkg/model.py")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "use.py", "pkg/__init__.py"));
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(
+        module_paths(&data),
+        ["pkg/__init__.py", "pkg/model.py", "use.py"]
+    );
+}
+
+#[test]
+fn references_python_repeated_routes_deduplicate_original_identity_not_sites() {
+    let input = snapshot(&[
+        ("use.py", "from left import *\nfrom right import *\n"),
+        (
+            "left.py",
+            "from origin import original as same\n__all__ = ['same']\n",
+        ),
+        (
+            "right.py",
+            "from origin import original as same\n__all__ = ['same']\n",
+        ),
+        ("origin.py", "def original():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+    assert_eq!(edge(&data, "production", "use.py", "origin.py")["count"], 2);
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_python_forwarding_depth_counts_initial_lookup_and_cycles_stay_unknown() {
+    for (m2, m4, extra, resolves) in [
+        (
+            "from m3 import forwarded\n",
+            "def forwarded():\n    pass\n",
+            None,
+            true,
+        ),
+        (
+            "from m3 import forwarded\n",
+            "from m5 import forwarded\n",
+            Some(("m5.py", "def forwarded():\n    pass\n")),
+            false,
+        ),
+        ("from m1 import forwarded\n", "", None, false),
+    ] {
+        let mut files = vec![
+            ("use.py", "from m1 import *\n"),
+            ("m1.py", "def good():\n    pass\nfrom m2 import forwarded\n"),
+            ("m2.py", m2),
+            ("m3.py", "from m4 import forwarded\n"),
+            ("m4.py", m4),
+        ];
+        if let Some(extra) = extra {
+            files.push(extra);
+        }
+        let input = snapshot(&files);
+        let data = project_python_source(&input, 20);
+        assert_eq!(edge(&data, "production", "use.py", "m1.py")["count"], 1);
+        assert_eq!(has_edge(&data, "use.py", "m4.py"), resolves, "{data}");
+        assert!(!has_edge(&data, "use.py", "m2.py"));
+        assert!(!has_edge(&data, "use.py", "m3.py"));
+        assert!(!has_edge(&data, "use.py", "m5.py"));
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], usize::from(!resolves));
+    }
+}
+
+#[test]
+fn references_python_relative_packages_require_every_unique_prefix() {
+    let input = snapshot(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/sub/__init__.py", ""),
+        ("pkg/sub/use.py", "from ..model import *\n"),
+        ("pkg/model.py", "def public_name():\n    pass\n"),
+    ]);
+    let data = references::project(&input, &["pkg/sub/use.py".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(
+        edge(&data, "production", "pkg/sub/use.py", "pkg/model.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    for files in [
+        vec![
+            ("use.py", "from provider import *\n"),
+            ("provider.py", "def public_name():\n    pass\n"),
+            ("provider/__init__.py", "def other():\n    pass\n"),
+        ],
+        vec![
+            ("use.py", "from pkg.model import *\n"),
+            ("pkg.py", ""),
+            ("pkg/__init__.py", ""),
+            ("pkg/model.py", "def public_name():\n    pass\n"),
+        ],
+        vec![
+            ("use.py", "from pkg.sub.model import *\n"),
+            ("pkg/__init__.py", ""),
+            ("pkg/sub/model.py", "def public_name():\n    pass\n"),
+        ],
+    ] {
+        let input = snapshot(&files);
+        let data = project_python_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+#[test]
+fn references_python_missing_package_roots_never_guess_namespaces_sys_path_or_suffixes() {
+    for files in [
+        vec![
+            ("use.py", "from provider import *\n"),
+            ("src/provider.py", "def public_name():\n    pass\n"),
+        ],
+        vec![
+            ("use.py", "from provider import *\n"),
+            ("other/provider.py", "def public_name():\n    pass\n"),
+        ],
+        vec![
+            ("use.py", "from pkg.model import *\n"),
+            ("pkg/model.py", "def public_name():\n    pass\n"),
+        ],
+    ] {
+        let input = snapshot(&files);
+        let data = project_python_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+    for import in ["from .model import *\n", "from ..model import *\n"] {
+        let input = snapshot(&[
+            ("pkg/use.py", import),
+            ("pkg/model.py", "def public_name():\n    pass\n"),
+        ]);
+        let data = references::project(&input, &["pkg/use.py".into()], 20, &mut || Ok(()))
+            .unwrap()
+            .data;
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+#[test]
+fn references_python_full_catalog_and_source_sets_bound_resolution() {
+    let mut input = snapshot(&[
+        ("use.py", "from left import *\nfrom right import *\n"),
+        ("left.py", "def same():\n    pass\n"),
+        ("right.py", "def same():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["scannedDocuments"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+    let separate = snapshot(&[("missing.py", "def public_name():\n    pass\n")]);
+    let separate_source_set = separate.documents[0].key.source_set_id.clone();
+    assert_ne!(input.documents[0].key.source_set_id, separate_source_set);
+    input.documents.extend(separate.documents);
+    let mut isolated = snapshot(&[("use.py", "from missing import *\n")]);
+    isolated.documents.extend(
+        input
+            .documents
+            .into_iter()
+            .filter(|doc| doc.key.source_set_id == separate_source_set),
+    );
+    let data = project_python_source(&isolated, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_python_fanout_clipping_preserves_counts_roles_ranges_and_native_proof() {
+    let mut input = snapshot(&[
+        ("use.py", "from facade import *\nfrom facade import *\n"),
+        ("tests/test_use.py", "from facade import *\n"),
+        ("facade.py", "from left import a\nfrom right import b\n"),
+        ("left.py", "def a():\n    pass\n"),
+        ("right.py", "def b():\n    pass\n"),
+        ("unrelated.py", "from unavailable import *\n"),
+    ]);
+    let paths = ["use.py".into(), "tests/test_use.py".into()];
+    let complete = references::project(&input, &paths, 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let clipped = references::project(&input, &paths, 1, &mut || Ok(()))
+        .unwrap()
+        .data;
+    for data in [&complete, &clipped] {
+        assert_eq!(data["counts"]["scannedDocuments"], 2);
+        assert_eq!(data["counts"]["mappedSites"], 3);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        assert_eq!(data["production"].as_array().unwrap().len(), 2);
+        assert_eq!(data["tests"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            module_paths(data),
+            [
+                "facade.py",
+                "left.py",
+                "right.py",
+                "tests/test_use.py",
+                "use.py"
+            ]
+        );
+        for (section, role, path, count) in [
+            ("production", "production", "use.py", 2),
+            ("tests", "test", "tests/test_use.py", 1),
+        ] {
+            let doc = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == path)
+                .unwrap();
+            let owner = doc
+                .declarations
+                .iter()
+                .find(|row| row.kind == "module" && row.ancestors.is_empty())
+                .unwrap();
+            assert_eq!(serde_json::to_value(owner.role).unwrap(), role);
+            for target in ["left.py", "right.py"] {
+                let pair = edge(data, section, path, target);
+                assert_eq!(pair["count"], count);
+                assert_eq!(pair["mapping"], "structural");
+                for site in pair["sites"].as_array().unwrap() {
+                    let start = site["range"]["start"].as_u64().unwrap() as usize;
+                    let end = site["range"]["end"].as_u64().unwrap() as usize;
+                    assert_eq!(
+                        &doc.file.text[start..end],
+                        site["spelling"].as_str().unwrap()
+                    );
+                    assert_eq!(site["ownerSyntaxId"], owner.syntax_id);
+                    assert_eq!(site["role"], role);
+                    assert_eq!(site["relationKind"], "import");
+                    assert!(site["callId"].is_null());
+                    assert_eq!(
+                        site["lines"]["start"],
+                        doc.file.text[..start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1
+                    );
+                }
+            }
+        }
+        for module in data["modules"].as_array().unwrap() {
+            let doc = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == module["identity"]["path"].as_str().unwrap())
+                .unwrap();
+            let root = doc
+                .declarations
+                .iter()
+                .find(|row| row.kind == "module" && row.ancestors.is_empty())
+                .unwrap();
+            assert_eq!(module["identity"]["sid"], root.syntax_id);
+            assert_eq!(module["revisionId"], root.revision_id);
+            assert_eq!(module["provenanceId"], root.provenance_id);
+            assert_eq!(module["contentHash"], doc.file.hash);
+        }
+    }
+    assert_eq!(complete["modules"], clipped["modules"]);
+    for target in ["left.py", "right.py"] {
+        let pair = edge(&clipped, "production", "use.py", target);
+        assert_eq!(pair["omittedSites"], 1);
+        assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+    }
+    input.documents.reverse();
+    for doc in &mut input.documents {
+        doc.declarations.reverse();
+    }
+    assert_eq!(
+        references::project(&input, &paths, 1, &mut || Ok(()))
+            .unwrap()
+            .data,
+        clipped
+    );
+}
+
+#[test]
+fn references_python_stdlib_catalog_is_limited_and_has_nonempty_shipped_evidence() {
+    for root in ["json", "pathlib", "sys"] {
+        let source = format!("import {root}\n");
+        let input = snapshot(&[("use.py", &source)]);
+        let data = project_python_source(&input, 20);
+        let descriptors = data["externalPackages"].as_array().unwrap();
+        assert_eq!(descriptors.len(), 1, "{data}");
+        let descriptor = &descriptors[0];
+        assert_eq!(descriptor["identity"]["kind"], "externalPackage");
+        assert_eq!(descriptor["identity"]["language"], "python");
+        assert_eq!(descriptor["identity"]["package"], root);
+        assert_eq!(descriptor["identity"]["standardLibrary"], true);
+        assert_eq!(
+            descriptor["identity"]["sourceSetId"],
+            input.documents[0].key.source_set_id
+        );
+        assert_eq!(descriptor["ecosystem"], "python");
+        let evidence = descriptor["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["kind"], "standardLibraryCatalog");
+        assert_eq!(evidence[0]["catalog"], "python-standard-library:v1");
+        assert_eq!(evidence[0]["entry"], root);
+        let pairs = data["production"].as_array().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0]["target"], descriptor["identity"]);
+        assert_eq!(pairs[0]["count"], 1);
+        assert_eq!(module_paths(&data), ["use.py"]);
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+    for root in ["os", "jsonish", "unknown_package"] {
+        let source = format!("import {root}\n");
+        let input = snapshot(&[("use.py", &source)]);
+        let data = project_python_source(&input, 20);
+        assert!(
+            data["externalPackages"].as_array().unwrap().is_empty(),
+            "{data}"
+        );
+        assert!(data["production"].as_array().unwrap().is_empty());
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+#[test]
+fn references_python_local_stdlib_roots_and_ambiguous_prefixes_never_fall_back_external() {
+    for root in ["json", "pathlib", "sys"] {
+        let source = format!("from {root} import *\n");
+        let file = format!("{root}.py");
+        let init = format!("{root}/__init__.py");
+        for local in [&file, &init] {
+            let input = snapshot(&[
+                ("use.py", &source),
+                (local, "def public_name():\n    pass\n"),
+            ]);
+            let data = project_python_source(&input, 20);
+            assert_eq!(edge(&data, "production", "use.py", local)["count"], 1);
+            assert!(
+                data["externalPackages"].as_array().unwrap().is_empty(),
+                "{data}"
+            );
+            assert_eq!(data["counts"]["unresolvedSites"], 0);
+        }
+        let input = snapshot(&[
+            ("use.py", &source),
+            (&file, "def public_name():\n    pass\n"),
+            (&init, "def other():\n    pass\n"),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert!(
+            data["externalPackages"].as_array().unwrap().is_empty(),
+            "{data}"
+        );
+        assert!(data["production"].as_array().unwrap().is_empty());
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+
+    for files in [
+        vec![
+            ("use.py", "import json.child\n"),
+            ("json/child.py", "def public_name():\n    pass\n"),
+        ],
+        vec![
+            ("use.py", "import json.missing\n"),
+            ("json/__init__.py", ""),
+        ],
+    ] {
+        let input = snapshot(&files);
+        let data = project_python_source(&input, 20);
+        assert!(
+            data["externalPackages"].as_array().unwrap().is_empty(),
+            "{data}"
+        );
+        assert!(data["production"].as_array().unwrap().is_empty());
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+#[test]
+fn references_python_test_only_export_does_not_prove_production_availability() {
+    let input = snapshot(&[
+        ("use.py", "from tests.provider import *\n"),
+        ("tests/__init__.py", ""),
+        ("tests/provider.py", "def test_only():\n    pass\n"),
+    ]);
+    let declaration = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "tests/provider.py")
+        .unwrap()
+        .declarations
+        .iter()
+        .find(|row| row.name.as_deref() == Some("test_only"))
+        .unwrap();
+    assert_eq!(serde_json::to_value(declaration.role).unwrap(), "test");
+    let data = project_python_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_python_comments_strings_and_decorated_native_ranges_do_not_invent_exports() {
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        (
+            "provider.py",
+            "# exec(source)\n_TEXT = 'globals()[name] = value'\ndef public_name():\n    pass\n",
+        ),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.py", "provider.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        ("provider.py", "@decorator\ndef public_name():\n    pass\n"),
+    ]);
+    let declaration = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "provider.py")
+        .unwrap()
+        .declarations
+        .iter()
+        .find(|row| row.name.as_deref() == Some("public_name"))
+        .unwrap();
+    assert_eq!(declaration.kind, "function");
+    let data = project_python_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_python_shadowing_one_name_preserves_other_final_owners() {
+    let input = snapshot(&[
+        ("use.py", "from facade import *\ndef same():\n    pass\n"),
+        (
+            "facade.py",
+            "from collision import same\nfrom good import unique\n",
+        ),
+        ("collision.py", "def same():\n    pass\n"),
+        ("good.py", "def unique():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+    assert_eq!(edge(&data, "production", "use.py", "good.py")["count"], 1);
+    assert!(!has_edge(&data, "use.py", "collision.py"));
+    assert!(!has_edge(&data, "use.py", "facade.py"));
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_python_explicit_name_is_not_vetoed_by_external_star_uncertainty() {
+    let input = snapshot(&[
+        (
+            "use.py",
+            "from provider import *\nfrom json import *\nfrom origin import original as same\n",
+        ),
+        ("provider.py", "def same():\n    pass\n"),
+        ("origin.py", "def original():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert!(!has_edge(&data, "use.py", "provider.py"), "{data}");
+    assert_eq!(edge(&data, "production", "use.py", "origin.py")["count"], 1);
+    assert_eq!(data["externalPackages"].as_array().unwrap().len(), 1);
+    assert_eq!(data["externalPackages"][0]["identity"]["package"], "json");
+    assert_eq!(data["production"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn references_python_stdlib_dotted_paths_label_only_the_catalog_root() {
+    let input = snapshot(&[(
+        "use.py",
+        "import json.decoder\nfrom json.decoder import JSONDecoder\n",
+    )]);
+    let data = project_python_source(&input, 20);
+    let descriptors = data["externalPackages"].as_array().unwrap();
+    assert_eq!(descriptors.len(), 1, "{data}");
+    assert_eq!(descriptors[0]["identity"]["package"], "json");
+    let pairs = data["production"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0]["target"], descriptors[0]["identity"]);
+    assert_eq!(pairs[0]["count"], 2);
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(module_paths(&data), ["use.py"]);
+}
+
+#[test]
+fn references_python_chained_assignments_are_not_proved_direct_exports() {
+    for provider in ["a = b = 1\n", "a = b = 1\n__all__ = ['a', 'b']\n"] {
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", provider),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+#[test]
+fn references_python_dotted_import_binds_root_unless_a_literal_alias_selects_child() {
+    for (provider, owner) in [
+        ("import pkg.child\n__all__ = ['pkg']\n", "pkg/__init__.py"),
+        (
+            "import pkg.child as alias\n__all__ = ['alias']\n",
+            "pkg/child.py",
+        ),
+    ] {
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", provider),
+            ("pkg/__init__.py", "def package_member():\n    pass\n"),
+            ("pkg/child.py", "def child_member():\n    pass\n"),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+        assert_eq!(edge(&data, "production", "use.py", owner)["count"], 1);
+        assert!(!has_edge(&data, "use.py", "provider.py"));
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        (
+            "provider.py",
+            "import pkg.child\n__all__ = ['child_member']\n",
+        ),
+        ("pkg/__init__.py", ""),
+        ("pkg/child.py", "def child_member():\n    pass\n"),
+    ]);
+    let data = project_python_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_python_prior_simple_name_alias_preserves_original_identity_not_rebound_names() {
+    let input = snapshot(&[
+        ("use.py", "from provider import *\n"),
+        (
+            "provider.py",
+            "def original():\n    pass\nalias = original\n__all__ = ['alias']\n",
+        ),
+    ]);
+    let provider = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "provider.py")
+        .unwrap();
+    let original = provider
+        .declarations
+        .iter()
+        .find(|row| row.name.as_deref() == Some("original"))
+        .unwrap();
+    assert_eq!(original.kind, "function");
+    let data = project_python_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.py", "provider.py")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    for (provider, resolves) in [
+        (
+            "from origin import original\nalias = original\n__all__ = ['alias']\n",
+            true,
+        ),
+        (
+            "alias = original\nfrom origin import original\n__all__ = ['alias']\n",
+            false,
+        ),
+        (
+            "from origin import original\noriginal = 1\nalias = original\n__all__ = ['alias']\n",
+            false,
+        ),
+        (
+            "from origin import original\nalias = original\nalias = 1\n__all__ = ['alias']\n",
+            false,
+        ),
+    ] {
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", provider),
+            ("origin.py", "def original():\n    pass\n"),
+        ]);
+        let original = input
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == "origin.py")
+            .unwrap()
+            .declarations
+            .iter()
+            .find(|row| row.name.as_deref() == Some("original"))
+            .unwrap();
+        assert_eq!(original.kind, "function");
+        let data = project_python_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "use.py", "origin.py"),
+            resolves,
+            "{provider}: {data}"
+        );
+        assert!(
+            !has_edge(&data, "use.py", "provider.py"),
+            "{provider}: {data}"
+        );
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            usize::from(resolves)
+        );
+        assert_eq!(data["counts"]["mappedSites"], usize::from(resolves));
+        assert_eq!(data["counts"]["unresolvedSites"], usize::from(!resolves));
+        if resolves {
+            assert_eq!(edge(&data, "production", "use.py", "origin.py")["count"], 1);
+        }
+    }
+}
+
+#[test]
+fn references_python_annotation_requires_a_value_to_prove_an_export() {
+    for (provider, resolves) in [("value: int\n", false), ("value: int = 1\n", true)] {
+        let input = snapshot(&[
+            ("use.py", "from provider import *\n"),
+            ("provider.py", provider),
+        ]);
+        let document = input
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == "provider.py")
+            .unwrap();
+        if resolves {
+            let declaration = document
+                .declarations
+                .iter()
+                .find(|row| row.kind == "variable" && row.name.as_deref() == Some("value"))
+                .unwrap();
+            assert_eq!(
+                &document.file.text[declaration.range.start..declaration.range.end],
+                "value: int = 1"
+            );
+        }
+        let data = project_python_source(&input, 20);
+        assert_eq!(has_edge(&data, "use.py", "provider.py"), resolves, "{data}");
+        assert_eq!(data["counts"]["mappedSites"], usize::from(resolves));
+        assert_eq!(data["counts"]["unresolvedSites"], usize::from(!resolves));
+        if resolves {
+            assert_eq!(
+                edge(&data, "production", "use.py", "provider.py")["count"],
+                1
+            );
+            let native_module = document
+                .declarations
+                .iter()
+                .find(|row| row.kind == "module" && row.ancestors.is_empty())
+                .unwrap();
+            let module = data["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|module| module["identity"]["path"] == "provider.py")
+                .unwrap();
+            assert_eq!(module["identity"]["sid"], native_module.syntax_id);
+        } else {
+            assert!(data["production"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn references_python_named_child_fallback_requires_no_competing_package_attribute() {
+    for (package, resolves) in [
+        ("", true),
+        ("import pkg.child as child\n", true),
+        ("def child():\n    pass\n", false),
+        ("if enabled:\n    child = 1\n", false),
+        ("from missing import child\n", false),
+        ("exec(source)\n", false),
+    ] {
+        let input = snapshot(&[
+            ("use.py", "from facade import *\n"),
+            (
+                "facade.py",
+                "from pkg import child\ndef good():\n    pass\n__all__ = ['child', 'good']\n",
+            ),
+            ("pkg/__init__.py", package),
+            ("pkg/child.py", "def member():\n    pass\n"),
+        ]);
+        let data = project_python_source(&input, 20);
+        assert_eq!(edge(&data, "production", "use.py", "facade.py")["count"], 1);
+        assert_eq!(
+            has_edge(&data, "use.py", "pkg/child.py"),
+            resolves,
+            "{package}: {data}"
+        );
+        assert!(
+            !has_edge(&data, "use.py", "pkg/__init__.py"),
+            "{package}: {data}"
+        );
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            1 + usize::from(resolves)
+        );
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], usize::from(!resolves));
+        if resolves {
+            assert_eq!(
+                edge(&data, "production", "use.py", "pkg/child.py")["count"],
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn references_python_normal_checkout_catalog_and_selected_sources_share_unchanged_work_budget() {
+    let padding = (0..110)
+        .map(|index| format!("    value_{index:03} = {index}\n"))
+        .collect::<String>();
+    let mut files = vec![
+        (
+            "shared_a.py".to_owned(),
+            format!("__all__ = ['alpha']\ndef alpha():\n{padding}"),
+        ),
+        (
+            "shared_b.py".to_owned(),
+            format!("__all__ = ['beta']\ndef beta():\n{padding}"),
+        ),
+        (
+            "shared_c.py".to_owned(),
+            format!(
+                "from shared_b import beta as gamma\n__all__ = ['gamma']\ndef _padding():\n{padding}"
+            ),
+        ),
+    ];
+    for index in 0..497 {
+        files.push((
+            format!("consumer_{index:03}.py"),
+            format!("from shared_a import *\nfrom shared_b import *\nfrom shared_c import *\ndef ordinary_work():\n{padding}"),
+        ));
+    }
+    assert_eq!(files.len(), 500);
+    assert!(
+        files
+            .iter()
+            .all(|(_, text)| (100..=200).contains(&text.lines().count()))
+    );
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let input = snapshot(&borrowed);
+    assert_eq!(input.documents.len(), 500);
+
+    let selected = references::project(&input, &["consumer_000.py".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(selected["counts"]["scannedDocuments"], 1);
+    assert_eq!(selected["counts"]["mappedSites"], 3);
+    assert_eq!(selected["counts"]["unresolvedSites"], 0);
+    assert_eq!(selected["production"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        edge(&selected, "production", "consumer_000.py", "shared_a.py")["count"],
+        1
+    );
+    assert_eq!(
+        edge(&selected, "production", "consumer_000.py", "shared_b.py")["count"],
+        2
+    );
+    assert!(!has_edge(&selected, "consumer_000.py", "shared_c.py"));
+    assert_eq!(
+        module_paths(&selected),
+        [
+            "consumer_000.py",
+            "shared_a.py",
+            "shared_b.py",
+            "shared_c.py"
+        ]
+    );
+    assert!(selected["tests"].as_array().unwrap().is_empty());
+    assert!(selected["externalPackages"].as_array().unwrap().is_empty());
+
+    let complete = references::project(&input, &["**".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(complete["counts"]["scannedDocuments"], 500);
+    assert_eq!(complete["counts"]["mappedSites"], 497 * 3 + 1);
+    assert_eq!(complete["counts"]["unresolvedSites"], 0);
+    assert_eq!(
+        complete["production"].as_array().unwrap().len(),
+        497 * 2 + 1
+    );
+    assert_eq!(module_paths(&complete).len(), 500);
+    for index in 0..497 {
+        let source = format!("consumer_{index:03}.py");
+        assert_eq!(
+            edge(&complete, "production", &source, "shared_a.py")["count"],
+            1
+        );
+        assert_eq!(
+            edge(&complete, "production", &source, "shared_b.py")["count"],
+            2
+        );
+        assert!(!has_edge(&complete, &source, "shared_c.py"));
+    }
+    assert_eq!(
+        edge(&complete, "production", "shared_c.py", "shared_b.py")["count"],
+        1
+    );
+    assert!(complete["tests"].as_array().unwrap().is_empty());
+    assert!(complete["externalPackages"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn references_python_declared_distributions_do_not_prove_import_names() {
+    use trellis::references::external::ManifestInput;
+    for (path, manifest, root) in [
+        ("requirements.txt", "requests==2.32.0\n", "requests"),
+        (
+            "requirements.txt",
+            "some-distribution==1\n",
+            "some_distribution",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = 'app'\nversion = '1'\ndependencies = ['requests>=2']\n",
+            "requests",
+        ),
+        (
+            "pyproject.toml",
+            "[project\ndependencies = ???\n",
+            "requests",
+        ),
+    ] {
+        let source = format!("import {root}\n");
+        let mut input = snapshot(&[("use.py", &source)]);
+        input.manifests.push(ManifestInput {
+            source_set_id: input.documents[0].key.source_set_id.clone(),
+            native_revision_id: input.documents[0].declarations[0].revision_id.clone(),
+            dependency_hash: "captured-python-dependencies".into(),
+            path: path.into(),
+            content_hash: Some(format!("{:x}", Sha256::digest(manifest.as_bytes()))),
+            bytes: Some(manifest.as_bytes().to_vec()),
+        });
+        let data = project_python_source(&input, 20);
+        assert!(
+            data["externalPackages"].as_array().unwrap().is_empty(),
+            "{data}"
+        );
+        assert!(data["production"].as_array().unwrap().is_empty());
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
 }

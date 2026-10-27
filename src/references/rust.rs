@@ -2,7 +2,6 @@
 //! Foreign-block items and derive-generated sibling names are not modeled.
 use super::*;
 
-const FOLLOW: usize = 4;
 type RouteKey = (usize, String);
 type Route = BTreeSet<RouteKey>;
 
