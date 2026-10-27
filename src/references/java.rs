@@ -361,7 +361,7 @@ impl Catalog {
             return Ok(SiteResolution::unknown("java_member_type_unsupported"));
         }
         if let Some(resolution) =
-            standard_library(source_set, path, external_packages, work, check)?
+            standard_library(source_set, package_path, external_packages, work, check)?
         {
             return Ok(resolution);
         }
@@ -483,7 +483,13 @@ fn standard_library(
         return Ok(None);
     };
     owner_step(work, check)?;
-    let Some(package) = external::java_standard_library(source_set, root) else {
+    let package_path = if root == "javax" {
+        charge(path.len(), work, check)?;
+        path.join(".")
+    } else {
+        root.clone()
+    };
+    let Some(package) = external::java_standard_library(source_set, &package_path) else {
         return Ok(None);
     };
     owner_step(work, check)?;

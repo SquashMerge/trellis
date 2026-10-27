@@ -423,7 +423,7 @@ fn selected_java_package_families_and_native_types_survive_live_edits() {
         assert_eq!(descriptor["identity"]["standardLibrary"], true);
         assert_eq!(
             descriptor["evidence"],
-            json!([{"kind":"standardLibraryCatalog","catalog":"java-standard-library:v1","entry":name}])
+            json!([{"kind":"standardLibraryCatalog","catalog":"java-standard-library:v2","entry":name}])
         );
         assert!(before["production"].as_array().unwrap().iter().any(|edge| {
             edge["source"]["path"] == "src/main/java/app/Use.java"
@@ -538,4 +538,65 @@ fn java_external_rules_explain_and_browser_keep_package_and_native_closure_separ
         module["identity"].get("package").is_none() && module["identity"].get("sid").is_some()
     }));
     response.finish(()).unwrap();
+}
+
+#[test]
+fn selected_javax_jdk_maven_coordinates_do_not_prove_non_jdk_namespaces() {
+    let (_state, root, store, _pin) = java_fixture();
+    fs::write(
+        root.path().join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>fixture</groupId><artifactId>fixture</artifactId><version>1</version><dependencies><dependency><groupId>javax.inject</groupId><artifactId>javax.inject</artifactId><version>1</version></dependency></dependencies></project>",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("src/main/java/app/Use.java"),
+        "package app; import javax.inject.*; import javax.inject.Inject; class Use { javax.inject.Inject field; }",
+    )
+    .unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    let data = read(&store, "references", pin);
+    let source = "src/main/java/app/Use.java";
+    assert!(
+        !data["production"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["source"]["path"] == source),
+        "Maven coordinates alone must not prove javax.inject: {data}"
+    );
+    let unknowns: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["source"]["path"] == source)
+        .map(|row| row["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        unknowns,
+        [
+            "import javax.inject.*;",
+            "import javax.inject.Inject;",
+            "javax.inject.Inject"
+        ]
+    );
+    assert!(
+        !data["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|descriptor| descriptor["identity"]["standardLibrary"] == false)
+    );
 }

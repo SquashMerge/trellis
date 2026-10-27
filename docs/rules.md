@@ -199,8 +199,10 @@ Supported mapping is deliberately narrow:
   paths. On-demand imports enumerate only the exact package, not subpackages.
   Explicit/local type bindings shadow on-demand names; distinct competing native
   types remain unknown, while independent names can still map. Static imports,
-  nested/member types and unproved bindings stay unknown. Reviewed `java`/`javax`
-  roots supply package-family labels, not selected-JDK member availability.
+  nested/member types and unproved bindings stay unknown. The reviewed `java`
+  root supplies a package-family label. `javax` requires an exact containing
+  package in the [pinned OpenJDK 25 public-export catalog](java-standard-library-catalog.md).
+  Both labels remain package families, not selected-JDK member availability.
   Maven/Gradle coordinates alone do not prove third-party import prefixes.
 
 Comments and string decoys are ignored; actual import module-specifier strings
@@ -348,7 +350,7 @@ ManifestEvidence = {kind:"manifest",sourceSetId,nativeRevisionId,dependencyHash,
                     path,contentHash,importRoot,section,key,versionConstraint:string|null}
 CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:v1",
                    entry:"std"|"core"|"alloc"}
-                | {kind:"standardLibraryCatalog",catalog:"java-standard-library:v1",
+                | {kind:"standardLibraryCatalog",catalog:"java-standard-library:v2",
                    entry:"java"|"javax"}
 Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
         omittedSites:UInt,mapping:"structural"}
@@ -361,9 +363,12 @@ Site = {ownerSyntaxId:string|null,role:"production"|"test"|null,
 Each external descriptor has nonempty `evidence`. Rust derives
 `ecosystem:"cargo"` for declared packages and `ecosystem:"rust"` for the reviewed
 Rust standard-library catalog. Java uses `ecosystem:"java"` and the reviewed
-`java-standard-library:v1` catalog, with exact entries `java` and `javax`.
-These Java entries label package families; they do not claim every subpackage or
-type exists on the selected JDK. Lookalike roots are not catalog matches. Manifest evidence identifies the selected source
+`java-standard-library:v2` catalog, with exact entries `java` and `javax`.
+The `java` root policy is unchanged. The `javax` label requires exact containing-package
+membership in the pinned OpenJDK 25 public-export catalog; parent packages and
+invented descendants are not implied. These entries label package families, not
+member existence or selected-JDK availability. Lookalike roots are not catalog matches.
+Manifest evidence identifies the selected source
 set/native revision and retained dependency hash, captured manifest path/content
 hash, actual import root, declaration section/key and nullable original version
 constraint. Catalog evidence identifies a reviewed code-shipped entry, not a
@@ -391,7 +396,9 @@ not a claim that Cargo exposes them to a production lib/bin target. Conflicting
 identities across sections stay unknown; target-applicable Cargo bindings would
 require a separate contract change. `std/core/alloc` are reviewed root labels,
 not member/API inventories. Java's `java`/`javax` labels share this external
-identity shape; no third-party Maven/Gradle prefix mapping is inferred. Python
+identity shape; the javax package gate does not change that identity. Non-JDK javax
+packages require independent captured mapping evidence or remain unknown; no
+third-party Maven/Gradle prefix mapping is inferred. Python
 and JavaScript package adapters are later work. Maven groups and Python
 distribution names alone do not prove import prefixes.
 
