@@ -29,7 +29,7 @@ impl ScopeIndex {
         &mut self,
         left: usize,
         right: usize,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<usize> {
         if left == right {
@@ -48,7 +48,7 @@ impl ScopeIndex {
         &self,
         start: usize,
         end: usize,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<usize>> {
         let mut found: Option<(usize, usize)> = None;
@@ -146,7 +146,7 @@ pub(super) struct Catalog {
     file_declarations: BTreeMap<usize, DeclarationId>,
     roots: BTreeMap<usize, BTreeSet<usize>>,
     ambiguous: BTreeSet<usize>,
-    pub(super) work: usize,
+    pub(super) work: Work,
 }
 
 impl Catalog {
@@ -154,7 +154,7 @@ impl Catalog {
         docs: &[&DocumentInput],
         trees: &[Tree],
         documents: &BTreeMap<DocumentKey, usize>,
-        work: usize,
+        work: Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         let mut result = Self {
@@ -326,9 +326,8 @@ impl Catalog {
     }
     fn step(&mut self, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
         check()?;
-        self.work = self.work.saturating_add(1);
         ensure!(
-            self.work <= OWNER_WORK,
+            self.work.charge(1),
             "bounded_work: reference Rust resolution"
         );
         Ok(())
@@ -1562,7 +1561,7 @@ fn imports(
     root: Node<'_>,
     public: bool,
     uncertain: bool,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Import>> {
     let mut pending = vec![(root, Vec::<String>::new())];
@@ -1635,7 +1634,7 @@ fn imports(
 pub(super) fn extract(
     doc: &DocumentInput,
     tree: &Tree,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<RawSite>> {
     let mut result = Vec::new();
@@ -1745,7 +1744,7 @@ mod cache_tests {
             files: BTreeMap::new(),
             file_declarations: BTreeMap::new(),
             ambiguous: BTreeSet::new(),
-            work: 0,
+            work: Work::new(work::reference_limit(0, 0)),
         }
     }
 
@@ -1958,6 +1957,16 @@ mod cache_tests {
     }
 
     #[test]
+    fn catalog_steps_use_the_injected_request_limit() {
+        let mut catalog = catalog(Vec::new());
+        catalog.work = Work::new(1);
+        catalog.step(&mut || Ok(())).unwrap();
+        let error = catalog.step(&mut || Ok(())).unwrap_err();
+        assert!(error.to_string().starts_with("bounded_work:"));
+        assert_eq!(catalog.work.used, 2);
+    }
+
+    #[test]
     fn scope_index_preserves_smallest_range_and_reverse_id_tie_break() {
         let mut index = ScopeIndex {
             ranges: vec![
@@ -1969,7 +1978,7 @@ mod cache_tests {
             ],
             max_ends: vec![0; 5],
         };
-        let mut work = 0;
+        let mut work = Work::new(work::reference_limit(0, 0));
         let mut check = || Ok(());
         index
             .build(0, index.ranges.len(), &mut work, &mut check)

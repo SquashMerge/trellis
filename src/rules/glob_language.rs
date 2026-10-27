@@ -5,7 +5,9 @@
 use anyhow::{Result, ensure};
 use std::collections::{HashSet, VecDeque};
 
-use super::WORK_LIMIT;
+#[cfg(test)]
+use crate::references::work;
+use crate::references::work::Work;
 // The existing file_tree::valid_path bound; inclusion includes this bound too.
 const PATH_BYTES: usize = 8192;
 
@@ -20,7 +22,7 @@ pub(super) enum Relation {
 pub(super) fn relation(
     a: &str,
     b: &str,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Relation> {
     let mut budget = Budget { work, check };
@@ -30,15 +32,14 @@ pub(super) fn relation(
 }
 
 struct Budget<'a, F> {
-    work: &'a mut usize,
+    work: &'a mut Work,
     check: &'a mut F,
 }
 impl<F: FnMut() -> Result<()>> Budget<'_, F> {
     fn charge(&mut self, amount: usize) -> Result<()> {
         (self.check)()?;
-        *self.work = self.work.saturating_add(amount);
         ensure!(
-            *self.work <= WORK_LIMIT,
+            self.work.charge(amount),
             "bounded_work: glob language comparison budget"
         );
         Ok(())
@@ -435,14 +436,14 @@ mod tests {
         Nfa::compile(
             pattern,
             &mut Budget {
-                work: &mut 0,
+                work: &mut Work::new(work::rules_limit(0, 0)),
                 check: &mut || Ok(()),
             },
         )
         .unwrap()
     }
     fn accepts(nfa: &Nfa, path: &str) -> bool {
-        let mut work = 0;
+        let mut work = Work::new(work::rules_limit(0, 0));
         let mut check = || Ok(());
         let mut budget = Budget {
             work: &mut work,
@@ -465,7 +466,13 @@ mod tests {
         state.accepts()
     }
     fn related(a: &str, b: &str) -> Relation {
-        relation(a, b, &mut 0, &mut || Ok(())).unwrap()
+        relation(
+            a,
+            b,
+            &mut Work::new(work::rules_limit(0, 0)),
+            &mut || Ok(()),
+        )
+        .unwrap()
     }
     fn bounded_relation(a: &str, b: &str, limit: usize) -> Relation {
         compare(
@@ -473,7 +480,7 @@ mod tests {
             &compile(b),
             limit,
             &mut Budget {
-                work: &mut 0,
+                work: &mut Work::new(work::rules_limit(0, 0)),
                 check: &mut || Ok(()),
             },
         )
@@ -646,14 +653,20 @@ mod tests {
 
     #[test]
     fn compilation_and_product_growth_are_bounded_and_cancelled() {
-        let mut work = WORK_LIMIT;
+        let mut work = Work::new(0);
         let error = relation("*", "?", &mut work, &mut || Ok(())).unwrap_err();
         assert!(error.to_string().contains("bounded_work"));
-        let error = relation("*", "?", &mut 0, &mut || anyhow::bail!("cancelled")).unwrap_err();
+        let error = relation(
+            "*",
+            "?",
+            &mut Work::new(work::rules_limit(0, 0)),
+            &mut || anyhow::bail!("cancelled"),
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), "cancelled");
         let a = compile("a/**");
         let b = compile("**/a");
-        let mut exhausted = WORK_LIMIT;
+        let mut exhausted = Work::new(0);
         let error = compare(
             &a,
             &b,
@@ -670,7 +683,7 @@ mod tests {
             &b,
             PATH_BYTES,
             &mut Budget {
-                work: &mut 0,
+                work: &mut Work::new(work::rules_limit(0, 0)),
                 check: &mut || anyhow::bail!("cancelled"),
             },
         )

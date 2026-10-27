@@ -643,7 +643,22 @@ id="implements-check"
 for_each="implementing"
 forbid=[{implements="any"}]
 "#;
-    let data = evaluate(text, &input);
+    let config = rules::parse(text).unwrap();
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    #[cfg(feature = "test-support")]
+    let data = {
+        let serial =
+            rules::evaluate_with_workers(&config, &input, &refs, &[], 1, &mut || Ok(())).unwrap();
+        let parallel =
+            rules::evaluate_with_workers(&config, &input, &refs, &[], 4, &mut || Ok(())).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&serial).unwrap(),
+            serde_json::to_vec(&parallel).unwrap()
+        );
+        serial
+    };
+    #[cfg(not(feature = "test-support"))]
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
     let rows = data["instances"].as_array().unwrap();
     for path in ["A.java", "a.py", "a.js"] {
         assert!(
@@ -673,6 +688,52 @@ forbid=[{implements="any"}]
         json!(["call_binding_unavailable"])
     );
 }
+#[cfg(feature = "test-support")]
+#[test]
+fn rules_parallel_preparation_failures_are_typed_and_atomic() {
+    let mut input = snapshot(&[
+        ("A.java", "class A extends Base { int value; }"),
+        ("B.java", "class B extends Base { int value; }"),
+        ("C.java", "class C extends Base { int value; }"),
+        ("Z.java", "class Z extends Base { int value; }"),
+    ]);
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    let config = rules::parse(
+        r#"version=1
+[roles.inherited]
+select={extends="Base"}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="inherited-calls"
+for_each="inherited"
+require=[{calls="any"}]
+"#,
+    )
+    .unwrap();
+    let last = input
+        .documents
+        .iter()
+        .position(|doc| doc.key.path == "Z.java")
+        .unwrap();
+    for (source, code) in [
+        ("class Z extends {".to_owned(), "invalid_source_syntax"),
+        (" ".repeat(2 * 1024 * 1024 + 1), "bounded_work"),
+    ] {
+        input.documents[last].file.text = source;
+        for workers in [1, 4] {
+            // Evaluation must fail rather than publish assignments for A/B/C.
+            let error =
+                rules::evaluate_with_workers(&config, &input, &refs, &[], workers, &mut || Ok(()))
+                    .unwrap_err();
+            assert!(
+                error.to_string().starts_with(code),
+                "workers={workers}: {error:#}"
+            );
+        }
+    }
+}
+
 #[test]
 fn rules_config_load_hash_and_cancellation_are_atomic() {
     let root = tempfile::tempdir().unwrap();

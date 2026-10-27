@@ -65,6 +65,80 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
         manifests: Vec::new(),
     }
 }
+// Snapshot construction is outside the deadline. Each run covers references and
+// rules with one shared absolute deadline, including the final serialization.
+fn scaled_checkout_projection(input: &Snapshot, sample_limit: usize) -> Value {
+    let config = trellis::rules::parse(
+        r#"version=1
+[layers.checkout]
+order=0
+paths=["**"]
+[roles.inherited]
+select={extends="Base"}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="inherited-calls"
+for_each="inherited"
+require=[{calls="any"}]
+"#,
+    )
+    .unwrap();
+    let run = |workers: usize| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut check = || {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "deadline_exceeded");
+            Ok(())
+        };
+        #[cfg(feature = "test-support")]
+        let projection =
+            references::project_with_workers(input, &[], sample_limit, workers, &mut check)
+                .unwrap();
+        #[cfg(not(feature = "test-support"))]
+        let projection = {
+            let _ = workers;
+            references::project(input, &[], sample_limit, &mut check).unwrap()
+        };
+        assert_eq!(projection.data["counts"]["scannedDocuments"], 500);
+        #[cfg(feature = "test-support")]
+        let rules = trellis::rules::evaluate_with_workers(
+            &config,
+            input,
+            &projection,
+            &[],
+            workers,
+            &mut check,
+        )
+        .unwrap();
+        #[cfg(not(feature = "test-support"))]
+        let rules = trellis::rules::evaluate(&config, input, &projection, &[], &mut check).unwrap();
+        assert!(rules["unassigned"].as_array().unwrap().is_empty());
+        assert!(!rules["instances"].as_array().unwrap().is_empty());
+        let bytes = (
+            serde_json::to_vec(&projection.data).unwrap(),
+            serde_json::to_vec(&rules).unwrap(),
+        );
+        check().unwrap();
+        (projection.data, bytes)
+    };
+    let (serial, serial_bytes) = run(1);
+    #[cfg(feature = "test-support")]
+    {
+        let (_, parallel_bytes) = run(4);
+        assert_eq!(
+            serial_bytes.0, parallel_bytes.0,
+            "reference output changed with workers"
+        );
+        assert_eq!(
+            serial_bytes.1, parallel_bytes.1,
+            "rule output changed with workers"
+        );
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = serial_bytes;
+    serial
+}
+
 fn project(snapshot: &Snapshot) -> Value {
     references::project(snapshot, &[], 20, &mut || Ok(()))
         .unwrap()
@@ -436,6 +510,40 @@ fn references_bad_syntax_work_bounds_and_cancellation_fail_atomically() {
     let error =
         references::project(&input, &[], 20, &mut || anyhow::bail!("cancelled")).unwrap_err();
     assert!(error.to_string().contains("cancelled"));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn references_parallel_failures_are_typed_and_atomic() {
+    let mut input = snapshot(&[
+        (
+            "src/lib.rs",
+            "mod a; mod b; mod c; fn run() { crate::a::run(); }",
+        ),
+        ("src/a.rs", "pub fn run() {}"),
+        ("src/b.rs", "pub fn run() {}"),
+        ("src/c.rs", "pub fn run() {}"),
+    ]);
+    let last = input
+        .documents
+        .iter()
+        .position(|doc| doc.key.path == "src/c.rs")
+        .unwrap();
+    for (source, code) in [
+        ("fn broken( {".to_owned(), "invalid_source_syntax"),
+        (" ".repeat(2 * 1024 * 1024 + 1), "bounded_work"),
+    ] {
+        input.documents[last].file.text = source;
+        for workers in [1, 4] {
+            // An Err has no projection: earlier successful files cannot escape.
+            let error = references::project_with_workers(&input, &[], 5, workers, &mut || Ok(()))
+                .unwrap_err();
+            assert!(
+                error.to_string().starts_with(code),
+                "workers={workers}: {error:#}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1816,6 +1924,93 @@ fn references_rust_public_local_star_forwarding_survives_dependency_star() {
 }
 
 #[test]
+fn references_rust_normal_checkout_all_sources_share_scaled_work_budget() {
+    let methods = |count: usize| {
+        (0..count)
+            .map(|method| {
+                format!(
+                    r#"pub fn calculate{method}(amount: i64, multiplier: i64) -> i64 {{
+    let base = (amount + 7) * (multiplier + 1);
+    let weight = (amount + 11) * (multiplier + 2) + (amount & 255);
+    let mut result = base + weight;
+    for step in 0..4 {{
+        if (step & 1) == 0 {{
+            result = result * 31 + amount * step;
+        }} else {{
+            result = result - multiplier * step;
+        }}
+    }}
+    (result + base) * (multiplier + 1) + (weight & 1023)
+}}
+"#
+                )
+            })
+            .collect::<String>()
+    };
+    let mut root = String::new();
+    for index in 0..499 {
+        root.push_str(&format!("pub mod service_{index:03};"));
+        if index % 5 == 4 {
+            root.push('\n');
+        }
+    }
+    root.push('\n');
+    root.push_str(&methods(1));
+    let body = methods(9);
+    let mut files = vec![("src/lib.rs".to_owned(), root)];
+    for index in 0..499 {
+        let mut source = String::from("pub fn run() {\n");
+        for offset in 1..=3 {
+            let target = (index + offset) % 499;
+            source.push_str(&format!(
+                "    crate::service_{target:03}::calculate0(7, 3);\n"
+            ));
+        }
+        source.push_str("}\n");
+        source.push_str(&body);
+        files.push((format!("src/service_{index:03}.rs"), source));
+    }
+    assert_eq!(files.len(), 500);
+    assert!(
+        files
+            .iter()
+            .all(|(_, text)| (100..=200).contains(&text.lines().count()))
+    );
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let input = snapshot(&borrowed);
+    assert_eq!(input.documents.len(), 500);
+    let data = scaled_checkout_projection(&input, 1);
+    assert_eq!(data["counts"]["mappedSites"], 499 * 3);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(data["production"].as_array().unwrap().len(), 499 * 3);
+    assert_eq!(module_paths(&data).len(), 500);
+    assert!(data["tests"].as_array().unwrap().is_empty());
+    assert!(data["unresolved"].as_array().unwrap().is_empty());
+    for index in 0..499 {
+        let source = format!("src/service_{index:03}.rs");
+        for offset in 1..=3 {
+            let target = (index + offset) % 499;
+            let pair = edge(
+                &data,
+                "production",
+                &source,
+                &format!("src/service_{target:03}.rs"),
+            );
+            assert_eq!(pair["count"], 1);
+            assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+            assert!(
+                pair["sites"][0]["ownerSyntaxId"]
+                    .as_str()
+                    .is_some_and(|sid| !sid.is_empty())
+            );
+        }
+    }
+}
+
+#[test]
 fn references_rust_repository_src_projects_within_existing_work_budget() {
     // Use this build's checkout, not a runtime Cargo environment variable or the
     // caller's working directory. Index a disposable copy through the same
@@ -2764,12 +2959,13 @@ fn java_review_maven_snapshot() -> &'static Snapshot {
 
 fn assert_java_review_maven_projection(paths: &[String], all: bool) {
     let input = java_review_maven_snapshot();
-    let result = references::project(input, paths, 1, &mut || Ok(()));
-    assert!(
-        result.is_ok(),
-        "500-file Maven Java projection {paths:?} must fit the unchanged work budget: {result:?}"
-    );
-    let data = result.unwrap().data;
+    let data = if all {
+        scaled_checkout_projection(input, 1)
+    } else {
+        references::project(input, paths, 1, &mut || Ok(()))
+            .unwrap()
+            .data
+    };
     let scanned = if all { 500 } else { 1 };
     assert_eq!(data["counts"]["scannedDocuments"], scanned);
     assert_eq!(data["counts"]["mappedSites"], scanned * 3);
@@ -2831,7 +3027,7 @@ fn assert_java_review_maven_projection(paths: &[String], all: bool) {
 }
 
 #[test]
-fn references_java_review_maven_one_file_fits_unchanged_work_budget() {
+fn references_java_review_maven_one_file_fits_scaled_work_budget() {
     assert_java_review_maven_projection(
         &["src/main/java/com/example/p000/Service000.java".into()],
         false,
@@ -2839,7 +3035,7 @@ fn references_java_review_maven_one_file_fits_unchanged_work_budget() {
 }
 
 #[test]
-fn references_java_review_maven_all_files_fit_unchanged_work_budget() {
+fn references_java_review_maven_all_files_fit_scaled_work_budget() {
     assert_java_review_maven_projection(&["**".into()], true);
 }
 
@@ -4169,30 +4365,34 @@ fn references_python_named_child_fallback_requires_no_competing_package_attribut
 }
 
 #[test]
-fn references_python_normal_checkout_catalog_and_selected_sources_share_unchanged_work_budget() {
-    let padding = (0..110)
-        .map(|index| format!("    value_{index:03} = {index}\n"))
+fn references_python_normal_checkout_catalog_and_selected_sources_share_scaled_work_budget() {
+    let body = (0..12)
+        .map(|index| {
+            format!(
+                "    subtotal_{index} = {index}\n    for step in range(4):\n        amount = step * 31 + {index}\n        if amount % 2 == 0:\n            subtotal_{index} += amount\n        else:\n            subtotal_{index} -= amount\n    weighted_{index} = subtotal_{index} * ({index} + 1)\n    clipped_{index} = weighted_{index} & 1023\n"
+            )
+        })
         .collect::<String>();
     let mut files = vec![
         (
             "shared_a.py".to_owned(),
-            format!("__all__ = ['alpha']\ndef alpha():\n{padding}"),
+            format!("__all__ = ['alpha']\ndef alpha():\n{body}"),
         ),
         (
             "shared_b.py".to_owned(),
-            format!("__all__ = ['beta']\ndef beta():\n{padding}"),
+            format!("__all__ = ['beta']\ndef beta():\n{body}"),
         ),
         (
             "shared_c.py".to_owned(),
             format!(
-                "from shared_b import beta as gamma\n__all__ = ['gamma']\ndef _padding():\n{padding}"
+                "from shared_b import beta as gamma\n__all__ = ['gamma']\ndef _ordinary_work():\n{body}"
             ),
         ),
     ];
     for index in 0..497 {
         files.push((
             format!("consumer_{index:03}.py"),
-            format!("from shared_a import *\nfrom shared_b import *\nfrom shared_c import *\ndef ordinary_work():\n{padding}"),
+            format!("from shared_a import *\nfrom shared_b import *\nfrom shared_c import *\ndef ordinary_work():\n{body}"),
         ));
     }
     assert_eq!(files.len(), 500);
@@ -4236,9 +4436,7 @@ fn references_python_normal_checkout_catalog_and_selected_sources_share_unchange
     assert!(selected["tests"].as_array().unwrap().is_empty());
     assert!(selected["externalPackages"].as_array().unwrap().is_empty());
 
-    let complete = references::project(&input, &["**".into()], 20, &mut || Ok(()))
-        .unwrap()
-        .data;
+    let complete = scaled_checkout_projection(&input, 20);
     assert_eq!(complete["counts"]["scannedDocuments"], 500);
     assert_eq!(complete["counts"]["mappedSites"], 497 * 3 + 1);
     assert_eq!(complete["counts"]["unresolvedSites"], 0);
@@ -5482,9 +5680,13 @@ fn references_javascript_external_stars_veto_native_names_in_both_orders_but_exp
 }
 
 #[test]
-fn references_javascript_normal_checkout_selected_and_all_sources_share_unchanged_budget() {
-    let statements = (0..110)
-        .map(|index| format!("    value += {index};\n"))
+fn references_javascript_normal_checkout_selected_and_all_sources_share_scaled_budget() {
+    let statements = (0..14)
+        .map(|index| {
+            format!(
+                "    for (let step = 0; step < 4; step++) {{\n        const amount = step * 31 + {index};\n        if ((amount & 1) === 0) {{\n            value += amount;\n        }} else {{\n            value -= amount;\n        }}\n    }}\n"
+            )
+        })
         .collect::<String>();
     let body = format!(
         "function ordinary_work() {{\n    let value = 0;\n{statements}    return value;\n}}\n"
@@ -5539,9 +5741,7 @@ fn references_javascript_normal_checkout_selected_and_all_sources_share_unchange
         ["bridge.js", "consumer_000.js", "facade.js", "provider.js"]
     );
     assert_javascript_native_modules(&input, &selected);
-    let complete = references::project(&input, &["**".into()], 20, &mut || Ok(()))
-        .unwrap()
-        .data;
+    let complete = scaled_checkout_projection(&input, 20);
     assert_eq!(complete["counts"]["scannedDocuments"], 500);
     assert_eq!(complete["counts"]["mappedSites"], 1493);
     assert_eq!(complete["counts"]["unresolvedSites"], 0);

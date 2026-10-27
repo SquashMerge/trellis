@@ -402,12 +402,44 @@ defaults to 5 sample sites per edge; MCP references and the prompt use the same 
 The fixed configuration read is limited to 2 MiB, with at most 1,024 entries per
 named collection and 8,192 aggregate glob patterns. The locked TOML parser keeps
 its default recursion guard of 80; unbounded parsing is not enabled. Structural
-accounting is iterative. Projection admits at most 2 MiB per captured source,
-256 MiB total selected source bytes, 1,000,000 AST visits per document, AST depth
-128 and 250,000 total sites. Reference samples accept at most 50 sites per edge.
-Snapshot admission also caps the inventory at 100,000 documents and 512 MiB of
-aggregate stored input. These bounds refuse the entire result rather than
-silently dropping evidence.
+accounting is iterative. Projection admits at most 2 MiB per captured source or
+retained manifest and 256 MiB total admitted captured source and present
+retained-manifest bytes, before source filters. AST depth remains 128. Reference
+walks retain the 1,000,000-visit bound per walk; rule selector walks retain it per
+document. The 250,000-site bound applies both to each raw source extraction and
+to deduplicated selected sites across the request. Reference samples accept at
+most 50 sites per edge. Snapshot admission also caps the inventory at 100,000
+documents and 512 MiB of aggregate stored input. These bounds refuse the entire
+result rather than silently dropping evidence.
+
+Reference work has one request-wide allowance of
+`min(100_000_000, 5_000_000 + 20_000*N + 512*K)` units. Rules use a separate
+allowance of `min(50_000_000, 5_000_000 + 10_000*N + 256*K)` units, shared by
+layer assignment, exact glob comparisons, declaration evaluation and evidence.
+`N` counts all admitted source documents, including empty documents and
+unselected languages. `K` is the ceiling KiB of the aggregate captured UTF-8
+source bytes plus present retained-manifest bytes, rounded once after summing.
+Absent manifests add no bytes; configuration bytes do not enlarge either
+allowance. Both allowances use the whole admitted snapshot before source
+filters, sample limits or rule selection, and arithmetic saturates at the
+absolute ceilings. Explain only prunes an already admitted evaluation; its
+package-closure recomputation is bounded by the 50,000,000-unit rules ceiling.
+
+The growth terms are capacity policy, not measured runtime guarantees. AST visit
+and site bounds stay fixed: visits already reset for each local traversal, and
+measurements showed no visit or site pressure. Adding unrelated files should
+not enlarge a pathological document's local traversal allowance or evidence
+memory bound. The five-second MCP request deadline and cancellation checks are
+unchanged and independent of work accounting.
+
+Per-file parsing, source extraction/owner-call binding and rule declaration
+work run in bounded batches of at most eight workers. Independent language
+catalog builds may run concurrently; Rust name resolution remains ordered.
+Workers count local work against the phase's remaining allowance; one ordered
+owner admits their counts and rows into the request total. A batch may perform
+bounded speculative work, but workers never receive independent admitted
+request budgets. Serial and parallel plans use the same phases, charge units
+and output order. Failure discards the whole result.
 
 A rule diagnostic is exactly
 `{code,kind,path,range,line,column,attribution,message}`. `code` is `invalid_rules`;
