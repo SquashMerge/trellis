@@ -134,11 +134,11 @@ def stop_home_processes(home, binary):
 
     def candidates(pid=None):
         args = ["/bin/ps", "eww"]
-        args += ["-p", str(pid)] if pid is not None else ["-a", "-x"]
+        args += ["-p", str(pid)] if pid is not None else ["-A"]
         args += ["-o", "pid=", "-o", "stat=", "-o", "command="]
         result = subprocess.run(args, capture_output=True, text=True, timeout=10)
         require(result.returncode == 0 or (pid is not None and result.returncode == 1),
-                "cannot enumerate private HOME daemon processes")
+                f"cannot enumerate private HOME daemon processes (ps exit {result.returncode}): {result.stderr.strip()}")
         found = set()
         for line in result.stdout.splitlines():
             fields = line.strip().split(None, 2)
