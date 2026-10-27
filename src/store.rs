@@ -7903,7 +7903,7 @@ fn selected_native_rejoin_once(
                                 document_path: doc.key.path.clone(),
                                 revision_id: native.revision.id.clone(),
                                 requested: requested.contains(&doc.key),
-                                selected: true,
+                                selected: requested.contains(&doc.key),
                                 state: if requested.contains(&doc.key) {
                                     sem::CoverageState::Failed
                                 } else {

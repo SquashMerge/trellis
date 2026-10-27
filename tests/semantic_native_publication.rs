@@ -70,6 +70,15 @@ fn copy_seed(from: &Path, to: &Path) {
 
 fn selected_case(change_b: &str) {
     use protobuf::{EnumOrUnknown, Message};
+    let add_unrequested_document = matches!(
+        change_b,
+        "corrupt_capture_new_document" | "two_producers_new_document"
+    );
+    let change_b = match change_b {
+        "corrupt_capture_new_document" => "corrupt_capture",
+        "two_producers_new_document" => "two_producers",
+        other => other,
+    };
     let temp = Builder::new()
         .prefix("semantic-two-")
         .tempdir_in("/tmp")
@@ -992,6 +1001,9 @@ fn selected_case(change_b: &str) {
         }
         _ => fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap(),
     }
+    if add_unrequested_document {
+        fs::write(root.join("src/C.js"), "function extra(){ return 2; }\n").unwrap();
+    }
     if change_b == "corrupt_rebaseline" {
         let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
             .unwrap()
@@ -1657,6 +1669,38 @@ fn selected_case(change_b: &str) {
         change_b,
         "corrupt_capture" | "two_producers" | "oracle_two_producers" | "oracle_fork_two_producers"
     ) {
+        if add_unrequested_document {
+            let added = snapshot
+                .coverage
+                .iter()
+                .find(|row| row.producer_id == "scip-typescript" && row.document_path == "src/C.js")
+                .expect("new document must have coverage for the selected producer");
+            assert_eq!(
+                (added.requested, added.selected, added.state),
+                (
+                    false,
+                    false,
+                    trellis::semantic_evidence::CoverageState::NotRequested
+                ),
+                "new document was never requested by the corrupt capture: {added:?}"
+            );
+            for path in ["src/A.js", "src/B.js"] {
+                let requested = snapshot
+                    .coverage
+                    .iter()
+                    .find(|row| row.producer_id == "scip-typescript" && row.document_path == path)
+                    .unwrap();
+                assert_eq!(
+                    (requested.requested, requested.selected, requested.state),
+                    (
+                        true,
+                        true,
+                        trellis::semantic_evidence::CoverageState::Failed
+                    ),
+                    "requested document must retain failed selected coverage: {requested:?}"
+                );
+            }
+        }
         let failed: Vec<_> = snapshot
             .coverage
             .iter()
@@ -1682,10 +1726,9 @@ fn selected_case(change_b: &str) {
                 .filter(|row| row.producer_id == "scip-python" && row.requested)
                 .collect();
             assert!(!good.is_empty());
-            assert!(
-                good.iter()
-                    .all(|row| row.state == trellis::semantic_evidence::CoverageState::Complete)
-            );
+            assert!(good.iter().all(|row| {
+                row.selected && row.state == trellis::semantic_evidence::CoverageState::Complete
+            }));
             assert!(snapshot.provenance.iter().any(|proof|
                 proof.producer_id == "scip-python" && proof.derived_from.is_some()));
         } else {
@@ -2129,6 +2172,12 @@ fn structural_selection_corruption_rolls_back_without_failed_producer_rows() {
 #[test]
 fn native_publication_isolates_corrupt_selected_artifact() {
     selected_case("corrupt_capture");
+}
+
+#[test]
+fn corrupt_selected_capture_does_not_request_new_documents() {
+    selected_case("corrupt_capture_new_document");
+    selected_case("two_producers_new_document");
 }
 
 #[test]
