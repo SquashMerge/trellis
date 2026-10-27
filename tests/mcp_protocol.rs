@@ -11018,6 +11018,102 @@ async fn architecture_tools_and_prompt_share_pinned_evidence_and_current_rules()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_architecture_external_descriptors_validate_in_structured_tool_results() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[(
+            "app.py",
+            "import json as j\nfrom pathlib import Path\nimport os\nimport collections\nimport http.client\nimport winreg\n",
+        )],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        r#"version = 1
+[external_policy]
+deny = [{ language = "python", package = "json", stdlib = true }]
+[layers.source]
+order = 1
+paths = ["app.py"]
+[layers.standard]
+order = 2
+external = [{ language = "python", package = "json", stdlib = true }]
+"#,
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(163, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 163, None);
+    let mut ask = |id, params| {
+        writeln!(client, "{}", modern(json!(id), "tools/call", params)).unwrap();
+        next_reply(&mut reader)
+    };
+    let refs = ask(
+        1,
+        json!({"name":"trellis_references","arguments":{"schemaVersion":1}}),
+    );
+    tool(&refs, None, true);
+    let refs_env = &refs["result"]["structuredContent"];
+    let descriptor = refs_env["data"]["externalPackages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["identity"]["package"] == "json")
+        .unwrap();
+    for name in ["json", "pathlib", "os", "collections", "http", "winreg"] {
+        let item = refs_env["data"]["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["identity"]["package"] == name)
+            .unwrap();
+        assert_eq!(item["ecosystem"], "python");
+        assert_eq!(
+            item["evidence"],
+            json!([{
+                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v2", "entry":name
+            }])
+        );
+    }
+    let basis = refs_env["evidenceBasis"].clone();
+    let checked = ask(
+        2,
+        json!({"name":"trellis_rules_check","arguments":{
+            "schemaVersion":1,"expectedBasis":basis
+        }}),
+    );
+    tool(&checked, None, true);
+    let checked_env = &checked["result"]["structuredContent"];
+    let instance = checked_env["data"]["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["rule"] == "$external")
+        .unwrap();
+    assert_eq!(instance["destination"], descriptor["identity"]);
+    let explanation = ask(
+        3,
+        json!({"name":"trellis_rules_explain","arguments":{
+            "schemaVersion":1,"expectedBasis":basis,"rule":"$external",
+            "target":instance["target"],"destination":instance["destination"]
+        }}),
+    );
+    tool(&explanation, None, true);
+    validate_structured_content(&[
+        json!({"name":"trellis_references","structuredContent":refs_env}),
+        json!({"name":"trellis_rules_check","structuredContent":checked_env}),
+        json!({"name":"trellis_rules_explain","structuredContent":explanation["result"]["structuredContent"]}),
+    ]);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn architecture_prompt_cancellation_deadline_and_final_root_are_not_tool_results() {
     for legacy in [false, true] {
         for scenario in ["cancel", "deadline", "root"] {

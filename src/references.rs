@@ -9,7 +9,10 @@ use tree_sitter::{Node, Parser, Tree};
 
 pub mod external;
 mod java;
+mod python;
 mod rust;
+
+const FOLLOW: usize = 4;
 
 const SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const TOTAL_BYTES: usize = 256 * 1024 * 1024;
@@ -191,6 +194,14 @@ pub fn project(
     let packages = external::RustPackages::new(&snapshot.manifests, &mut external_work, check)?;
     let mut rust = rust::Catalog::new(&docs, &trees, &document_map, external_work, check)?;
     let java = java::Catalog::new(&docs, &trees, &selected, &mut rust.work, check)?;
+    let python = python::Catalog::new(
+        &docs,
+        &trees,
+        &document_map,
+        &selected,
+        &mut rust.work,
+        check,
+    )?;
     let mut external_packages = BTreeMap::new();
     let mut edges: BTreeMap<(usize, Target, bool), (usize, Vec<Site>)> = BTreeMap::new();
     let mut emitted_modules = BTreeSet::new();
@@ -266,6 +277,8 @@ pub fn project(
                 )?
             } else if doc.key.language == "java" {
                 java.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
+            } else if doc.key.language == "python" {
+                python.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
             } else {
                 match map_target(doc, &item, &document_map) {
                     Ok(target) => SiteResolution {
@@ -326,7 +339,7 @@ pub fn project(
                 "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
                 "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
                 "JavaScript maps static relative imports/reexports using explicit files or .js/.mjs/.cjs/index.js; dynamic and bare imports remain unresolved.",
-                "Python maps explicit relative module imports using .py/__init__.py; absolute, alias, wildcard and module-versus-attribute forms remain unresolved.",
+                "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
                 "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability."
             ]
         }),
@@ -542,6 +555,9 @@ fn extract(
     if doc.key.language == "java" {
         return java::extract(doc, tree, work, check);
     }
+    if doc.key.language == "python" {
+        return python::extract(doc, tree, work, check);
+    }
     let mut result = Vec::new();
     walk(tree.root_node(), check, &mut |node, _check| {
         ensure!(result.len() < SITES, "bounded_work: reference site count");
@@ -569,34 +585,6 @@ fn extract(
                         .is_some_and(|n| matches!(text(doc, n), "import" | "require"))
                 {
                     result.push(raw(doc, node, "import", Err("dynamic_import_unsupported")));
-                    return Ok(true);
-                }
-            }
-            "python" => {
-                if node.kind() == "import_from_statement" {
-                    let module = node.child_by_field_name("module_name");
-                    let has_alias = text(doc, node).split_whitespace().any(|p| p == "as");
-                    let destination = if has_alias {
-                        Err("import_alias_unsupported")
-                    } else if text(doc, node).contains('*') {
-                        Err("import_wildcard_unsupported")
-                    } else if let Some(module) = module {
-                        let spelling = text(doc, module);
-                        if !spelling.starts_with('.') {
-                            Err("absolute_import_unsupported")
-                        } else if spelling.chars().all(|c| c == '.') {
-                            Err("module_or_attribute_ambiguous")
-                        } else {
-                            Ok(vec![spelling.into()])
-                        }
-                    } else {
-                        Err("module_or_attribute_ambiguous")
-                    };
-                    result.push(raw(doc, module.unwrap_or(node), "import", destination));
-                    return Ok(true);
-                }
-                if node.kind() == "import_statement" {
-                    result.push(raw(doc, node, "import", Err("absolute_import_unsupported")));
                     return Ok(true);
                 }
             }
@@ -630,15 +618,6 @@ fn map_target(
                     format!("{path}/index.js"),
                 ]
             }
-        }
-        "python" => {
-            let value = &parts[0];
-            let dots = value.chars().take_while(|c| *c == '.').count();
-            let tail = value[dots..].replace('.', "/");
-            let relative = format!("{}{tail}", "../".repeat(dots.saturating_sub(1)));
-            let path =
-                relative_path(&doc.key.path, &relative).ok_or("relative_import_outside_source")?;
-            vec![format!("{path}.py"), format!("{path}/__init__.py")]
         }
         _ => return Err("module_mapping_unavailable"),
     };
