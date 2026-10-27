@@ -9290,7 +9290,7 @@
               "additionalProperties": false,
               "properties": {
                 "catalog": {
-                  "const": "java-standard-library:v1"
+                  "const": "java-standard-library:v2"
                 },
                 "entry": {
                   "enum": [
@@ -10948,7 +10948,7 @@
               "additionalProperties": false,
               "properties": {
                 "catalog": {
-                  "const": "java-standard-library:v1"
+                  "const": "java-standard-library:v2"
                 },
                 "entry": {
                   "enum": [
@@ -12853,7 +12853,7 @@
               "additionalProperties": false,
               "properties": {
                 "catalog": {
-                  "const": "java-standard-library:v1"
+                  "const": "java-standard-library:v2"
                 },
                 "entry": {
                   "enum": [

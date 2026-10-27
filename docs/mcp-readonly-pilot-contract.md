@@ -265,9 +265,11 @@ instead carry explicit native document-key/revision/hash/provenance links; these
 identify the captured syntax and never prove the derived target mapping.
 External descriptors instead carry identity, ecosystem and nonempty captured
 manifest or reviewed standard-library catalog evidence, with the exact closed
-shapes in rules.md. Java's `java-standard-library:v1` catalog pairs only with
-entries `java`/`javax` and ecosystem `java`; these are package-family labels,
-not host-JDK discovery or proof that a class exists. Ordinary Java imports and
+shapes in rules.md. Java's `java-standard-library:v2` catalog pairs only with
+entries `java`/`javax` and ecosystem `java`. The `java` root policy is unchanged;
+`javax` requires an exact containing package in the
+[pinned OpenJDK 25 public-export catalog](java-standard-library-catalog.md).
+These remain package-family labels, not host-JDK discovery or proof that a class exists. Ordinary Java imports and
 qualified-type paths can also map uniquely proved captured public top-level
 types by declared package. Static/nested/member types and third-party prefixes
 without authoritative captured mapping stay unknown; Maven/Gradle coordinates

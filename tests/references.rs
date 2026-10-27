@@ -2845,3 +2845,170 @@ fn references_java_review_nested_on_demand_collision_keeps_explicit_proof() {
         );
     }
 }
+
+#[test]
+fn references_javax_jdk_exact_packages_share_the_existing_family_identity() {
+    let packages = [
+        ("javax.crypto", "Cipher"),
+        ("javax.net", "SocketFactory"),
+        ("javax.net.ssl", "SSLContext"),
+        ("javax.sql", "DataSource"),
+        ("javax.xml.parsers", "DocumentBuilder"),
+        ("javax.naming", "Context"),
+        ("javax.management", "MBeanServer"),
+        ("javax.security.auth", "Subject"),
+        ("javax.swing", "JButton"),
+        ("javax.tools", "JavaCompiler"),
+        ("javax.lang.model", "SourceVersion"),
+        ("javax.annotation.processing", "Processor"),
+    ];
+    let mut source = String::from("package app;\n");
+    for (package, name) in packages {
+        source.push_str(&format!("import {package}.*;\nimport {package}.{name};\n"));
+    }
+    source.push_str("class Use {\n");
+    for (index, (package, name)) in packages.iter().enumerate() {
+        source.push_str(&format!("    {package}.{name} field{index};\n"));
+    }
+    source.push_str("}\n");
+    let input = snapshot(&[("app/Use.java", &source)]);
+    let data = project_java_source(&input, 50);
+    assert_eq!(data["production"].as_array().unwrap().len(), 1, "{data}");
+    assert_eq!(data["externalPackages"].as_array().unwrap().len(), 1);
+    assert_eq!(data["counts"]["mappedSites"], packages.len() * 3);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    let pair = &data["production"][0];
+    assert_eq!(
+        pair["target"],
+        serde_json::json!({"kind":"externalPackage", "sourceSetId":input.documents[0].key.source_set_id, "language":"java", "package":"javax", "standardLibrary":true})
+    );
+    assert_eq!(pair["count"], packages.len() * 3);
+    assert_eq!(pair["omittedSites"], 0);
+    let sites = pair["sites"].as_array().unwrap();
+    for (package, name) in packages {
+        for spelling in [
+            format!("import {package}.*;"),
+            format!("import {package}.{name};"),
+            format!("{package}.{name}"),
+        ] {
+            assert!(sites.iter().any(|site| site["spelling"] == spelling));
+        }
+    }
+    let descriptor = &data["externalPackages"][0];
+    assert_eq!(descriptor["identity"], pair["target"]);
+    assert_eq!(descriptor["ecosystem"], "java");
+    for evidence in descriptor["evidence"].as_array().unwrap() {
+        assert_eq!(evidence["kind"], "standardLibraryCatalog");
+        assert_eq!(evidence["entry"], "javax");
+        assert!(!evidence["catalog"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(module_paths(&data), ["app/Use.java"]);
+}
+
+#[test]
+fn references_javax_jdk_non_jdk_and_prefix_only_packages_remain_unknown() {
+    let packages = [
+        "javax.inject",
+        "javax.servlet",
+        "javax.persistence",
+        "javax.ws.rs",
+        "javax",
+        "javax.security",
+        "javax.swing.fake",
+        "javax.swingish",
+        "javax.net.ssl.fake",
+        "javax.xml.bind",
+    ];
+    let mut source = String::from("package app;\n");
+    let mut expected = Vec::new();
+    for (index, package) in packages.iter().enumerate() {
+        for spelling in [
+            format!("import {package}.*;"),
+            format!("import {package}.Widget{index};"),
+        ] {
+            source.push_str(&format!("{spelling}\n"));
+            expected.push(spelling);
+        }
+    }
+    source.push_str("class Use {\n");
+    for (index, package) in packages.iter().enumerate() {
+        let spelling = format!("{package}.Widget{index}");
+        source.push_str(&format!("    {spelling} field{index};\n"));
+        expected.push(spelling);
+    }
+    source.push_str("}\n");
+    let input = snapshot(&[("app/Use.java", &source)]);
+    let data = project_java_source(&input, 50);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], expected.len());
+    let actual: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(module_paths(&data), ["app/Use.java"]);
+}
+
+#[test]
+fn references_javax_jdk_native_ownership_and_ambiguity_never_fall_back_to_stdlib() {
+    for ambiguous in [false, true] {
+        let mut files = vec![
+            (
+                "app/Use.java",
+                "package app; import javax.swing.*; import javax.swing.Local; class Use { javax.swing.Local field; }",
+            ),
+            (
+                "types/Local.java",
+                "package javax.swing; public class Local {}",
+            ),
+        ];
+        if ambiguous {
+            files.push((
+                "other/Local.java",
+                "package javax.swing; public class Local {}",
+            ));
+        }
+        let input = snapshot(&files);
+        let data = project_java_source(&input, 20);
+        assert!(
+            data["externalPackages"].as_array().unwrap().is_empty(),
+            "{data}"
+        );
+        assert_eq!(data["counts"]["mappedSites"], if ambiguous { 0 } else { 2 });
+        assert_eq!(
+            data["counts"]["unresolvedSites"],
+            if ambiguous { 3 } else { 1 }
+        );
+        if ambiguous {
+            assert!(data["production"].as_array().unwrap().is_empty());
+        } else {
+            let pair = edge(&data, "production", "app/Use.java", "types/Local.java");
+            assert_eq!(pair["count"], 2);
+            assert_eq!(pair["sites"][0]["spelling"], "import javax.swing.Local;");
+            assert_eq!(pair["sites"][1]["spelling"], "javax.swing.Local");
+        }
+    }
+    let input = snapshot(&[
+        (
+            "app/Use.java",
+            "package app; import pkg.*; import javax.servlet.*; class Use { Local field; }",
+        ),
+        ("types/Local.java", "package pkg; public class Local {}"),
+    ]);
+    let data = project_java_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "app/Use.java", "types/Local.java")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    assert_eq!(
+        data["unresolved"][0]["site"]["spelling"],
+        "import javax.servlet.*;"
+    );
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+}
