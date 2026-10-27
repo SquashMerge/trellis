@@ -88,8 +88,14 @@ rust() {
   TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs
 }
 tests() {
-  if ! cargo nextest --version >/dev/null 2>&1; then
+  if ! nextest_version=$(cargo nextest --version 2>/dev/null); then
     echo "verify: cargo-nextest is required (brew install cargo-nextest, or cargo install cargo-nextest --locked)" >&2
+    exit 127
+  fi
+  # GHSA-vc25-qg58-w57c: cargo-nextest 0.9.125–0.9.149 can execute code when rerunning a recording.
+  nextest_version=$(printf '%s\n' "$nextest_version" | awk 'NR == 1 { print $2 }')
+  if [ "$(printf '%s\n%s\n' 0.9.150 "$nextest_version" | sort -V | head -n 1)" != 0.9.150 ]; then
+    echo "verify: cargo-nextest $nextest_version is affected by GHSA-vc25-qg58-w57c; upgrade to 0.9.150 or newer" >&2
     exit 127
   fi
   CARGO_TARGET_DIR="$target_dir-test-support" cargo nextest run --locked --all-targets --no-fail-fast --features test-support

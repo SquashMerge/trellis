@@ -181,6 +181,7 @@ done
 if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
 if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ] && [ "$2" = install-deps ]; then echo $$ > "$FAKE_VERIFY_HANG_DEPS"; exec sleep 600; fi
 if [ "\${FAKE_VERIFY_NO_NEXTEST:-0}" = 1 ] && [ "$1" = nextest ]; then exit 101; fi
+if [ "$1" = nextest ] && [ "$2" = --version ]; then echo "cargo-nextest \${FAKE_VERIFY_NEXTEST_VERSION:-0.9.150}"; exit 0; fi
 if [ "\${FAKE_VERIFY_FAIL_CLIPPY:-0}" = 1 ] && [ "$1" = clippy ]; then
   # Fail only once a hanging install is running, so the test is deterministic.
   if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ]; then while [ ! -s "$FAKE_VERIFY_HANG_DEPS" ]; do sleep 0.1; done; fi
@@ -310,6 +311,12 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assertRan(noNextest.commands, { ...lanes, tests: lanes.tests.slice(0, 1) });
     assert.match(noNextest.result.stderr, /failed lane\(s\): tests$/m);
     assert.match(noNextest.result.stdout, /cargo-nextest is required/);
+    rmSync(log);
+    // GHSA-vc25-qg58-w57c: an affected nextest is refused before any test runs.
+    const oldNextest = runVerify({ FAKE_VERIFY_NEXTEST_VERSION: "0.9.148" });
+    assert.equal(oldNextest.result.status, 127);
+    assertRan(oldNextest.commands, { ...lanes, tests: lanes.tests.slice(0, 1) });
+    assert.match(oldNextest.result.stdout, /cargo-nextest 0\.9\.148 is affected by GHSA-vc25-qg58-w57c/);
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }
