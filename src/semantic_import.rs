@@ -589,6 +589,8 @@ fn complexity_work(update: impl FnOnce(&mut ComplexityWork)) {
 pub(crate) struct PublicationWork {
     destination_index_builds: usize,
     full_fallbacks: usize,
+    witnessed_rejoins: usize,
+    fallback_reasons: Vec<String>,
     original_index_builds: usize,
     destination_role_parses: usize,
     original_role_parses: usize,
@@ -675,6 +677,18 @@ pub(crate) fn note_current_target_rows(rows: usize) {
 #[cfg(feature = "test-support")]
 pub(crate) fn note_full_fallback() {
     count_publication_work(|work| work.full_fallbacks += 1);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_witnessed_rejoin() {
+    count_publication_work(|work| work.witnessed_rejoins += 1);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn clear_witnessed_rejoins() {
+    count_publication_work(|work| work.witnessed_rejoins = 0);
+}
+#[cfg(feature = "test-support")]
+pub(crate) fn note_fallback_reason(reason: &str) {
+    count_publication_work(|work| work.fallback_reasons.push(reason.to_owned()));
 }
 #[cfg(feature = "test-support")]
 pub(crate) fn publication_work() -> serde_json::Value {

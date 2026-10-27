@@ -6773,8 +6773,13 @@ fn witnessed_native_destination(
             else {
                 continue;
             };
-            if !reuse.for_path(&doc.key.path).native || current.content_hash != doc.content_hash {
+            if current.content_hash != doc.content_hash {
                 continue;
+            }
+            // Captured bytes may have been restored after the prior publication.
+            // Without version reuse, FULL must measure their original associations.
+            if !reuse.for_path(&doc.key.path).native {
+                return Err(WitnessFallback("restored_document_requires_measurement").into());
             }
             let Some(captured_version) = native_version_at(tx, raw.captured_pin, &doc.key)? else {
                 return Ok(None);
@@ -7216,13 +7221,55 @@ fn try_original_witness_rejoin(
 }
 
 #[derive(Debug)]
-struct WitnessFallback;
+struct WitnessFallback(&'static str);
 impl std::fmt::Display for WitnessFallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("selected original association requires FULL rejoin")
+        write!(
+            f,
+            "selected original association requires FULL rejoin: {}",
+            self.0
+        )
     }
 }
 impl std::error::Error for WitnessFallback {}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+struct RejoinOracleMismatch;
+#[cfg(feature = "test-support")]
+impl std::fmt::Display for RejoinOracleMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LOCAL publication differs from independent FULL rejoin oracle")
+    }
+}
+#[cfg(feature = "test-support")]
+impl std::error::Error for RejoinOracleMismatch {}
+#[cfg(feature = "test-support")]
+thread_local! {
+    static TEST_REJOIN_ORACLE_MISMATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rejoin_storage_failure(error: &anyhow::Error) -> bool {
+    error.is::<rusqlite::Error>()
+        || error.is::<std::io::Error>()
+        || error.is::<SelectedIntegrity>()
+        || error.is::<ControlIntegrity>()
+        || error.is::<SqliteContention>()
+        || error.is::<HotIndexJournal>()
+}
+
+fn rejoin_storage_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<rusqlite::Error>() {
+        Ok(sqlite) => storage_result::<()>(Err(sqlite)).expect_err("SQLite error remains an error"),
+        Err(error) => error,
+    }
+}
+
+fn record_rejoin_fallback(reason: &'static str) {
+    tracing::debug!(reason, "selected semantic rejoin uses FULL fallback");
+    #[cfg(feature = "test-support")]
+    crate::semantic_import::note_fallback_reason(reason);
+}
 
 fn decoded_selected_inventory(
     raw: &SelectedRawInput,
@@ -7314,9 +7361,12 @@ fn selected_native_rejoin(
                 tx.execute_batch(
                     "ROLLBACK TO original_witness_rejoin; RELEASE original_witness_rejoin",
                 )?;
-                if error.downcast_ref::<WitnessFallback>().is_none() {
+                let Some(fallback) = error.downcast_ref::<WitnessFallback>() else {
                     return Err(error);
-                }
+                };
+                #[cfg(feature = "test-support")]
+                crate::semantic_import::clear_witnessed_rejoins();
+                record_rejoin_fallback(fallback.0);
                 let prior = prior_pin.context("missing selected prior pin for FULL fallback")?;
                 let read = ReadRevision::new(prior, semantic_pin_key(prior));
                 let full = store.selected_native_inputs_from_db(tx, &read, prior, None)?;
@@ -7385,14 +7435,16 @@ fn selected_native_rejoin_once(
         None
     };
     if incremental.is_none() && selected.iter().any(|input| input.lightweight) {
-        return Err(WitnessFallback.into());
+        return Err(WitnessFallback("destination_witness_unavailable").into());
     }
-    #[cfg(feature = "test-support")]
     let used_full_fallback = incremental.is_none()
         && local_reuse.is_some()
         && prior_pin.is_some()
         && !force_full
         && !force_full_after_witness;
+    if used_full_fallback {
+        record_rejoin_fallback("incremental_destination_unavailable");
+    }
     let (candidate, selected_sources, reusable) = match incremental {
         Some((candidate, sources, reusable)) => (candidate, sources, Some(reusable)),
         None if let (Some(reuse), Some(prior)) = (local_reuse, prior_pin) => {
@@ -7416,7 +7468,8 @@ fn selected_native_rejoin_once(
         }
     }
     #[cfg(feature = "test-support")]
-    let full_oracle = if std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE").is_some()
+    let full_oracle = if (std::env::var_os("TRELLIS_TEST_LOCAL_FULL_ORACLE").is_some()
+        || TEST_REJOIN_ORACLE_MISMATCH.get())
         && let (Some(reuse), Some(prior)) = (local_reuse, prior_pin)
         && reusable
             .as_ref()
@@ -7510,7 +7563,7 @@ fn selected_native_rejoin_once(
                 let (Some(prior), Some(per_producer), Some(indexed)) =
                     (prior_pin, reusable.as_ref(), fast_index.as_ref())
                 else {
-                    return Err(WitnessFallback.into());
+                    return Err(WitnessFallback("shared_witness_index_unavailable").into());
                 };
                 let (outcome, captured, raw_capture, attested, witnesses, targets, measured) =
                     match try_original_witness_rejoin(
@@ -7531,7 +7584,10 @@ fn selected_native_rejoin_once(
                         indexed,
                     ) {
                         Ok(Some(witness)) => witness,
-                        Ok(None) | Err(_) => return Err(WitnessFallback.into()),
+                        Ok(None) => {
+                            return Err(WitnessFallback("source_witness_unavailable").into());
+                        }
+                        Err(error) => return Err(error),
                     };
                 let witness_validation = sem::validate_evidence_with_witnessed_raw(
                     &outcome.publication,
@@ -7543,8 +7599,10 @@ fn selected_native_rejoin_once(
                     &targets,
                 );
                 if witness_validation.is_err() {
-                    return Err(WitnessFallback.into());
+                    return Err(WitnessFallback("witness_validation_failed").into());
                 }
+                #[cfg(feature = "test-support")]
+                crate::semantic_import::note_witnessed_rejoin();
                 #[cfg(feature = "test-support")]
                 if let Some(file) = std::env::var_os("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE") {
                     let mut work = crate::semantic_import::publication_work();
@@ -7662,13 +7720,14 @@ fn selected_native_rejoin_once(
                             sem::PositionEncoding::UnicodeScalar => 3,
                         },
                     )?;
-                    ensure!(
-                        serde_json::to_vec(&outcome.publication)?
+                    if TEST_REJOIN_ORACLE_MISMATCH.get()
+                        || !(serde_json::to_vec(&outcome.publication)?
                             == serde_json::to_vec(&full.publication)?
                             && serde_json::to_vec(&outcome.report)?
-                                == serde_json::to_vec(&full.report)?,
-                        "witnessed LOCAL publication differs from independent FULL oracle"
-                    );
+                                == serde_json::to_vec(&full.report)?)
+                    {
+                        return Err(RejoinOracleMismatch.into());
+                    }
                     crate::semantic_import::restore_publication_work(work_checkpoint);
                 }
                 return Ok((outcome.publication, captured));
@@ -7789,13 +7848,14 @@ fn selected_native_rejoin_once(
                     &basis,
                     encoding,
                 )?;
-                ensure!(
-                    serde_json::to_vec(&outcome.publication)?
+                if TEST_REJOIN_ORACLE_MISMATCH.get()
+                    || !(serde_json::to_vec(&outcome.publication)?
                         == serde_json::to_vec(&full.publication)?
                         && serde_json::to_vec(&outcome.report)?
-                            == serde_json::to_vec(&full.report)?,
-                    "incremental LOCAL publication differs from independent FULL rejoin oracle"
-                );
+                            == serde_json::to_vec(&full.report)?)
+                {
+                    return Err(RejoinOracleMismatch.into());
+                }
             }
             sem::validate_evidence_with_attested_raw(
                 &outcome.publication,
@@ -7809,9 +7869,17 @@ fn selected_native_rejoin_once(
         check_cancel(cancel)?;
         let (publication, captured) = match attempt {
             Ok(good) => good,
+            Err(error) if rejoin_storage_failure(&error) => {
+                return Err(rejoin_storage_error(error));
+            }
+            #[cfg(feature = "test-support")]
+            Err(error) if error.is::<RejoinOracleMismatch>() => return Err(error),
             Err(error) if input.lightweight => {
-                let _ = error;
-                return Err(WitnessFallback.into());
+                return Err(if error.is::<WitnessFallback>() {
+                    error
+                } else {
+                    WitnessFallback("retained_input_unavailable").into()
+                });
             }
             Err(error) => {
                 let diagnostic = format!("selected raw capture unavailable: {error:#}");
@@ -13723,6 +13791,49 @@ impl Store {
 
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
+    pub fn publish_local_oracle_mismatch_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        let expected = self.publication_index_baseline()?;
+        ensure!(
+            expected.compatible,
+            "oracle fixture baseline is incompatible"
+        );
+        ensure!(
+            self.disposition() != RecoveryDisposition::Rebuild,
+            "oracle fixture store requires rebuild"
+        );
+        ensure!(
+            self.selected_links_for_reconciliation(
+                expected.pin().context("oracle fixture missing pin")?
+            )?,
+            "oracle fixture has no selected raw capture"
+        );
+        let prepared = self
+            .prepare_local_revision(capture, &expected, cancel)?
+            .context("document-local publication unavailable")?;
+        let changed = crate::indexer::project_native_documents(
+            options,
+            capture,
+            &prepared.native,
+            &prepared.changed_paths,
+            cancel,
+            &|_| {},
+        )?;
+        let graph = self.compose_local_revision(capture, &prepared, changed, cancel)?;
+        TEST_REJOIN_ORACLE_MISMATCH.set(true);
+        let result =
+            self.publish_local_native_recovery(&graph, capture, prepared, leader, expected, cancel);
+        TEST_REJOIN_ORACLE_MISMATCH.set(false);
+        result
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn publish_local_semantic_for_tests(
         &self,
@@ -16441,7 +16552,8 @@ impl Store {
                     cancel,
                     local.map(|_| &reuse),
                     old_pin.filter(|_| !rebaseline),
-                )?;
+                )
+                .map_err(rejoin_storage_error)?;
                 if let Some(prior) = old_pin.filter(|pin| !rebaseline && pin.index_revision > 0) {
                     fill_semantic_coverage(
                         &tx,
@@ -16851,6 +16963,12 @@ impl Store {
                     },
                 })
             })();
+            let input = match input {
+                Err(error) if rejoin_storage_failure(&error) => {
+                    return Err(rejoin_storage_error(error));
+                }
+                other => other,
+            };
             inputs.push((producer, requested_documents, input));
         }
         Ok(inputs)
@@ -16863,6 +16981,7 @@ impl Store {
     ) -> Result<Vec<SelectedNativeInput>> {
         self.native_at_reconcile(pin, |db, selected| {
             self.selected_native_inputs_from_db(db, selected, pin, loaded_docs)
+                .map_err(rejoin_storage_error)
         })
     }
 
@@ -16876,6 +16995,10 @@ impl Store {
         self.selected_raw_input_results_from_db(db,selected,pin,loaded_docs.is_some())?
             .into_iter()
             .map(|(producer, requested_documents, raw)| {
+                let raw = match raw {
+                    Err(error) if rejoin_storage_failure(&error) => return Err(rejoin_storage_error(error)),
+                    other => other,
+                };
                 let proof_identities = if let (Some(_),Ok(input)) = (loaded_docs,&raw) {
                     db.prepare("SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs WHERE capture_id=?1 ORDER BY proof_id")?
                         .query_map([input.capture_id],|r|Ok(crate::scip_raw::RawProofIdentity {
@@ -16886,9 +17009,9 @@ impl Store {
                 let captured = match &raw {
                     Ok(input) => {
                         let captured_pin=ReadRevision::new(input.captured_pin,semantic_pin_key(input.captured_pin));
-                        self.retained_native_snapshot_from_db(db,&captured_pin,loaded_docs)
-                            .and_then(|(native,sources)| self.retained_native_components_from_db(db,&captured_pin)
-                                .map(|components|(native,sources,components)))
+                        let (native, sources) = self.retained_native_snapshot_from_db(db,&captured_pin,loaded_docs)?;
+                        let components = self.retained_native_components_from_db(db,&captured_pin)?;
+                        Ok((native,sources,components))
                     },
                     Err(error) => Err(SelectedIntegrity(format!(
                         "incompatible_index: selected capture unavailable: {error:#}"
