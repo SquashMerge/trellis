@@ -109,6 +109,7 @@ cohorts() {
 checks() {
   node --test tests/mcp-catalog-sdk.test.mjs
   python3 tools/stage3-watcher-runner-test.py
+  python3 tools/verify-67-mixed-performance-test.py
   python3 -m unittest discover -s tools/release -p 'test_*.py'
   node --test tests/factory-config.test.cjs
   node docs/semantic-evidence/check-policy.mjs --self-test

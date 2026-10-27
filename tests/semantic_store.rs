@@ -2857,6 +2857,17 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         )
         .unwrap();
     assert_eq!(store.semantic_at(newer).unwrap().provenance.len(), 2);
+    let selected_inputs = store.selected_raw_inputs_at(newer).unwrap();
+    assert_eq!(selected_inputs.len(), 1);
+    assert_eq!(selected_inputs[0].captured_pin, first);
+    assert_eq!(selected_inputs[0].producer, semantic.producers[0]);
+    assert_eq!(selected_inputs[0].binary_bytes, raw.binary_bytes);
+    assert_eq!(selected_inputs[0].manifest_bytes, raw.manifest_bytes);
+    assert_eq!(selected_inputs[0].proofs.len(), raw.inventory.claims.len());
+    assert_eq!(
+        selected_inputs[0].requested_documents,
+        vec![document.key.clone()]
+    );
     let (r1_native, r1_sources) = store.retained_native_snapshot_at(first).unwrap();
     let (r2_native, r2_sources) = store.retained_native_snapshot_at(newer).unwrap();
     let engine = trellis::semantic_import::rejoin_inventory(
@@ -3118,7 +3129,16 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         assert_eq!(stored.fact_digest, derived.fact_digest);
     }
     store.set_retention_clock_for_tests(1_901, 901);
-    store.release_revision(first, &leader).unwrap();
+    assert_eq!(
+        store.retained_native_snapshot_at(first).unwrap().0,
+        r1_native
+    );
+    assert_eq!(
+        store.selected_raw_inputs_at(rejoined).unwrap()[0]
+            .proofs
+            .len(),
+        raw.inventory.claims.len()
+    );
     assert!(
         store
             .semantic_raw_proof_at(

@@ -172,12 +172,18 @@ async function expandSources(page) {
   await page.locator('.file-pick[title="src/nested/other.js"]').waitFor();
 }
 async function assertLegend(page, payload, metric) {
-  const rows = await page.locator("#file-tree .file-pick").evaluateAll(nodes => nodes.map(node => ({
-    path:node.title, directory:node.classList.contains("directory-pick"),
-    value:node.querySelector(".metric-value > span:last-child")?.textContent,
-    band:node.querySelector(".metric-swatch")?.className,
-    background:node.querySelector(".metric-swatch") && getComputedStyle(node.querySelector(".metric-swatch")).backgroundColor,
-  })));
+  const {rows, legend} = await page.evaluate(() => ({
+    rows:[...document.querySelectorAll("#file-tree .file-pick")].map(node => ({
+      path:node.title, directory:node.classList.contains("directory-pick"),
+      value:node.querySelector(".metric-value > span:last-child")?.textContent,
+      band:node.querySelector(".metric-swatch")?.className,
+      background:node.querySelector(".metric-swatch") && getComputedStyle(node.querySelector(".metric-swatch")).backgroundColor,
+    })),
+    legend:[...document.querySelectorAll("#metric-legend .metric-legend-entry")].map(node => ({
+      text:node.lastElementChild.textContent, band:node.firstElementChild.className,
+      background:getComputedStyle(node.firstElementChild).backgroundColor,
+    })),
+  }));
   const valueAt = values => metric.split(".").reduce((value, key) => value[key], values);
   const values = rows.map(row => {
     const path = row.directory ? row.path.replace(/\/$/, "") : row.path;
@@ -189,10 +195,6 @@ async function assertLegend(page, payload, metric) {
   });
   const sorted = [...values].sort((a, b) => a - b);
   const cuts = [.25, .5, .75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]);
-  const legend = await page.locator("#metric-legend .metric-legend-entry").evaluateAll(nodes => nodes.map(node => ({
-    text:node.lastElementChild.textContent, band:node.firstElementChild.className,
-    background:getComputedStyle(node.firstElementChild).backgroundColor,
-  })));
   assert.deepEqual(legend.map(row => row.text), [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`]);
   assert.equal(new Set(legend.map(row => row.background)).size, 4, "legend shows four actual, distinct heat colors");
   assert.ok(legend.every(row => row.background !== "rgba(0, 0, 0, 0)"), "heat is painted, not only class names");
