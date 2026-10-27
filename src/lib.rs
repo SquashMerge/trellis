@@ -1,5 +1,3 @@
-pub mod acp;
-pub mod answer;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;
@@ -7,6 +5,7 @@ mod behavior_java;
 pub mod behavior_js;
 mod behavior_python;
 mod behavior_rust;
+pub mod build_info;
 pub mod capture;
 pub mod class_diagram;
 pub mod classes;
@@ -18,6 +17,8 @@ pub mod dependency_rust_symbols;
 #[cfg(test)]
 mod extractor_inputs_tests;
 pub mod file_tree;
+pub mod files_view;
+pub mod git_status;
 pub mod http;
 pub mod index_coordinator;
 pub mod indexer;
@@ -35,16 +36,21 @@ pub mod native_evidence;
 pub mod native_ids;
 pub mod navigation;
 mod parallel;
+pub mod references;
+pub mod rules;
 mod rust_sources;
 pub mod scip_admission;
 mod scip_raw;
+pub mod search_capture;
+pub mod search_card;
+pub mod search_embed;
+pub mod search_lexical;
+pub mod search_model;
+pub mod search_rank;
+pub mod search_vectors;
 pub mod semantic_evidence;
 pub mod semantic_import;
 pub mod store;
 #[doc(hidden)]
 pub mod testing;
 pub mod watch;
-
-pub mod jev;
-pub mod live_jev;
-pub mod planning;

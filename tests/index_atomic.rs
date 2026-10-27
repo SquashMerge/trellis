@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        24
+        25
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,111 +739,86 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Schema 20 keeps the derived graph and labels, and compacts native IDs
-    // and document/projection references into BLOB keys and surrogates.
-    // Supersession state and the paired producer bindings are additive.
-    // Check exact names, not just a count: an unknown table must not escape the
-    // independent cold-source comparison.
-    const REQUIRED_V20_TABLES: [&str; 57] = [
-        "native_producers",
-        "native_producer_languages",
-        "native_producer_inputs",
-        "native_source_sets",
-        "native_source_set_languages",
-        "native_source_set_dependencies",
-        "native_revisions",
-        "revision_capture_inputs",
-        "document_versions",
-        "graph_projections",
-        "graph_nodes",
-        "graph_display_labels",
+    // Check exact schema-25 names before comparing evidence and the logical
+    // search corpus. FTS shadow bytes depend on publication/merge history.
+    const REQUIRED_V25_TABLES: [&str; 72] = [
         "class_projections",
-        "classes",
         "class_relations",
-        "revision_documents",
-        "native_version_coverage_roles",
-        "native_version_declarations",
-        "native_version_declaration_ancestors",
-        "native_version_own_signature_types",
+        "classes",
+        "document_versions",
+        "graph_display_labels",
+        "graph_nodes",
+        "graph_projections",
+        "head_search_fts",
+        "head_search_fts_config",
+        "head_search_fts_content",
+        "head_search_fts_data",
+        "head_search_fts_docsize",
+        "head_search_fts_idx",
+        "native_binding_epoch",
+        "native_producer_inputs",
+        "native_producer_languages",
+        "native_producers",
+        "native_release_candidate_classes",
+        "native_release_candidate_graphs",
+        "native_release_candidate_versions",
+        "native_revision_release_debt",
+        "native_revision_supersessions",
+        "native_revisions",
+        "native_source_set_dependencies",
+        "native_source_set_languages",
+        "native_source_sets",
         "native_version_ancestor_signature_types",
-        "native_version_headers",
-        "native_version_header_items",
-        "native_version_parameters",
-        "native_version_references",
+        "native_version_call_regions",
+        "native_version_calls",
         "native_version_capability_families",
         "native_version_capability_gaps",
-        "native_version_calls",
         "native_version_control_regions",
-        "native_version_call_regions",
-        "native_revision_release_debt",
-        "native_release_candidate_versions",
-        "native_release_candidate_graphs",
-        "native_release_candidate_classes",
-        "semantic_producers",
-        "semantic_producer_languages",
-        "semantic_revision_producers",
-        "semantic_requested_producers",
-        "semantic_requested_producer_languages",
-        "semantic_coverage",
-        "semantic_coverage_roles",
+        "native_version_coverage_roles",
+        "native_version_declaration_ancestors",
+        "native_version_declarations",
+        "native_version_header_items",
+        "native_version_headers",
+        "native_version_own_signature_types",
+        "native_version_parameters",
+        "native_version_references",
+        "native_version_search_cards",
+        "revision_capture_inputs",
+        "revision_documents",
+        "revision_producer_bindings",
         "semantic_basis",
         "semantic_basis_lookup_dependencies",
-        "semantic_provenance",
-        "semantic_symbols",
-        "semantic_symbol_targets",
-        "semantic_declaration_bindings",
-        "semantic_declaration_binding_symbols",
-        "semantic_declaration_join_candidates",
-        "semantic_references",
-        "semantic_reference_roles",
-        "semantic_reference_candidates",
         "semantic_call_bindings",
         "semantic_call_candidates",
-        "semantic_call_possible_dispatch",
         "semantic_call_join_candidates",
+        "semantic_call_possible_dispatch",
+        "semantic_coverage",
+        "semantic_coverage_roles",
+        "semantic_declaration_binding_symbols",
+        "semantic_declaration_bindings",
+        "semantic_declaration_join_candidates",
+        "semantic_import_reports",
+        "semantic_producer_languages",
+        "semantic_producers",
+        "semantic_provenance",
+        "semantic_raw_captures",
+        "semantic_raw_documents",
+        "semantic_raw_proofs",
+        "semantic_reference_candidates",
+        "semantic_reference_roles",
+        "semantic_references",
+        "semantic_requested_producer_languages",
+        "semantic_requested_producers",
+        "semantic_revision_producers",
+        "semantic_revision_raw_selections",
+        "semantic_symbol_targets",
+        "semantic_symbols",
         "semantic_type_relationships",
     ];
-    let required: std::collections::BTreeSet<_> = REQUIRED_V20_TABLES.into_iter().collect();
-    let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
-    let optional = [
-        "native_revision_supersessions",
-        "native_binding_epoch",
-        "revision_producer_bindings",
-        "semantic_import_reports",
-        "semantic_raw_captures",
-        "semantic_revision_raw_selections",
-        "semantic_raw_proofs",
-        "semantic_raw_documents",
-    ];
     assert_eq!(
-        required.len(),
-        57,
-        "v20 mandatory table list must be unique"
-    );
-    assert!(
-        required.is_subset(&actual),
-        "missing v20 evidence tables: {:?}",
-        required.difference(&actual).collect::<Vec<_>>()
-    );
-    assert!(
-        actual
-            .difference(&required)
-            .all(|table| optional.contains(table)),
-        "unexpected v20 evidence table: {:?}",
-        actual.difference(&required).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        actual.len(),
-        57 + optional
-            .iter()
-            .filter(|name| actual.contains(*name))
-            .count(),
-        "exact v20 base and optional table count"
-    );
-    assert_eq!(
-        actual.contains("native_binding_epoch"),
-        actual.contains("revision_producer_bindings"),
-        "producer binding tables must be paired"
+        tables.iter().map(String::as_str).collect::<Vec<_>>(),
+        REQUIRED_V25_TABLES,
+        "exact schema-25 evidence and search table inventory"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
@@ -860,8 +835,44 @@ fn sqlite_snapshot(
             "new selected revision must have its own producer consistency binding"
         );
     }
+    let corpus = |sql: &str, revision: &str| {
+        let mut rows = db
+            .prepare(sql)
+            .unwrap()
+            .query_map([revision], |row| {
+                let vid: i64 = row.get(1)?;
+                Ok(vec![
+                    format!("t:{}", row.get::<_, String>(0)?),
+                    format!("t:{}", versions.get(&vid).unwrap()),
+                    format!("b:{}", hex::encode(row.get::<_, Vec<u8>>(2)?)),
+                ])
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.sort();
+        rows
+    };
+    let card_corpus_sql = "SELECT c.terms,c.vid,c.syntax_id FROM native_version_search_cards c
+        JOIN revision_documents m ON m.vid=c.vid WHERE m.revision_id=?1";
+    let head_revision = format!("pin:v1:{generation}:{published_revision}");
+    assert_eq!(
+        corpus(
+            "SELECT terms,vid,syntax_id FROM head_search_fts WHERE ?1 IS NOT NULL",
+            &head_revision
+        ),
+        corpus(card_corpus_sql, &head_revision),
+        "physical head search corpus must contain exactly the current version cards"
+    );
+    // The FTS corpus belongs only to the head, while old pins keep their version
+    // cards. Compare the selected pin's logical corpus, never FTS segment bytes.
+    let selected_corpus = (
+        "head_search_fts".into(),
+        corpus(card_corpus_sql, &revision_id),
+    );
     tables
         .into_iter()
+        .filter(|table| table != "head_search_fts" && !table.starts_with("head_search_fts_"))
         // Generation-specific control provenance is checked via pinned reads,
         // not compared to a cold oracle with a different generation UUID.
         .filter(|table| !matches!(table.as_str(),
@@ -890,7 +901,7 @@ fn sqlite_snapshot(
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
-                _ => panic!("unhandled v20 evidence table: {table}"),
+                _ => panic!("unhandled schema-25 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
@@ -970,6 +981,7 @@ fn sqlite_snapshot(
             rows.sort();
             (table, rows)
         })
+        .chain(std::iter::once(selected_corpus))
         .collect()
 }
 
@@ -3010,21 +3022,21 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     );
     assert!(
         store
-            .views()
+            .files_at(None, 0, 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         store
-            .view("missing")
+            .source_at("flow.js", None)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         store
-            .annotations()
+            .symbols_at("go", 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3054,7 +3066,7 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     assert!(store.recovery_pending_for_tests());
     assert!(
         clone
-            .views()
+            .files_at(None, 0, 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3077,7 +3089,7 @@ fn live_control_decode_corruption_latches_direct_reads_and_control_clones() {
     assert!(store.recovery_pending_for_tests());
     assert!(
         clone
-            .annotations()
+            .symbols_at("go", 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3104,21 +3116,21 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
     );
     assert!(
         clone
-            .views()
+            .files_at(None, 0, 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         clone
-            .view("missing")
+            .source_at("flow.js", None)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
     );
     assert!(
         clone
-            .annotations()
+            .symbols_at("go", 10)
             .unwrap_err()
             .to_string()
             .contains("incompatible_index")
@@ -3132,7 +3144,7 @@ fn live_structural_inventory_and_control_first_reads_fail_closed() {
     db.execute("UPDATE index_metadata SET stats='not-json'", [])
         .unwrap();
     drop(db);
-    let error = store.views().unwrap_err();
+    let error = store.status().unwrap_err();
     assert!(
         error.to_string().starts_with("incompatible_index:"),
         "{error:#}"

@@ -835,6 +835,10 @@ fn relay_admission_failure(
 ) -> serde_json::Value {
     use serde_json::json;
     let id = value.get("id").cloned().unwrap_or_default();
+    if value.get("method").and_then(serde_json::Value::as_str) == Some("prompts/get") {
+        return json!({"jsonrpc":"2.0","id":id,"error":{
+            "code":-32603,"message":"Architecture prompt unavailable","data":{"code":code}}});
+    }
     let name = value
         .pointer("/params/name")
         .and_then(|v| v.as_str())
@@ -1129,7 +1133,7 @@ impl<W: std::io::Write> Relay<'_, W> {
         if method == "notifications/initialized" && mode == session::Mode::LegacyReady {
             self.legacy_ready = true;
         }
-        let call = method == "tools/call";
+        let call = matches!(method.as_str(), "tools/call" | "prompts/get");
         let deadline = call.then(|| accepted + self.call_deadline);
         if has_id {
             let calls = self
@@ -2420,5 +2424,28 @@ mod relay_failure_tests {
             "unavailable"
         );
         assert!(reply["result"].get("resultType").is_none(), "{reply}");
+    }
+    #[test]
+    fn prompt_relay_admission_failures_are_protocol_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        std::fs::create_dir(&root).unwrap();
+        let workspace =
+            crate::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        for modern in [false, true] {
+            let mut value = json!({"jsonrpc":"2.0","id":129,"method":"prompts/get",
+                "params":{"name":"trellis_propose_layers","arguments":{}}});
+            if modern {
+                value["params"]["_meta"] = json!({
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}});
+            }
+            for code in ["deadline_exceeded", "too_many_requests"] {
+                let reply = relay_admission_failure(&value, code, &workspace);
+                assert_eq!(reply["error"]["code"], -32603);
+                assert_eq!(reply["error"]["data"]["code"], code);
+                assert!(reply.get("result").is_none());
+            }
+        }
     }
 }

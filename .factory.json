@@ -3,7 +3,7 @@
   "verify": "./tools/verify",
   "pr_draft": true,
   "verify_timeout_ms": 1800000,
-  "bootstrap": "npm ci --prefix runtime/acp --ignore-scripts",
+  "bootstrap": "npm ci --prefix tests/mcp --ignore-scripts",
   "bootstrap_timeout_ms": 900000,
   "max_retries": 5
 }

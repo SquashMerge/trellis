@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tree_sitter::{Node, Parser};
 
-use crate::native_evidence::{Call, ControlRegion, Declaration, Range};
+use crate::native_evidence::{Call, ControlRegion, Declaration, DeclarationRole, Range};
 use crate::store::SelectedIntegrity;
 
 #[cfg(feature = "test-support")]
@@ -141,6 +141,20 @@ pub struct SourceInput<'a> {
     pub content_hash: &'a str,
     pub text: &'a str,
 }
+// Memo scores follow source positions, never path-dependent native ID order.
+fn callable_declarations(declarations: &[Declaration]) -> Vec<&Declaration> {
+    let mut callables: Vec<_> = declarations.iter().filter(|d| callable(&d.kind)).collect();
+    callables.sort_by(|a, b| {
+        (a.range.start, a.range.end, &a.kind, &a.name).cmp(&(
+            b.range.start,
+            b.range.end,
+            &b.kind,
+            &b.name,
+        ))
+    });
+    callables
+}
+
 fn bind(
     source: &str,
     declarations: &[Declaration],
@@ -176,9 +190,8 @@ fn bind(
         None
     };
     let mut rows = Vec::new();
-    for (d, mut metrics) in declarations
-        .iter()
-        .filter(|d| callable(&d.kind))
+    for (d, mut metrics) in callable_declarations(declarations)
+        .into_iter()
         .zip(source_only)
     {
         check()?;
@@ -221,11 +234,14 @@ fn bind(
             .unwrap_or(0);
         metrics.parameters = d.header.parameters.len();
         rows.push(DeclarationMetrics {
+            role: d.role,
             source_set_id: d.document.source_set_id.clone(),
             language: d.document.language.clone(),
             path: d.document.path.clone(),
             sid: d.syntax_id.clone(),
             range: d.range.clone(),
+            name: d.name.clone(),
+            kind: d.kind.clone(),
             metrics,
         });
     }
@@ -272,11 +288,16 @@ pub fn callable(kind: &str) -> bool {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeclarationMetrics {
+    pub role: DeclarationRole,
     pub source_set_id: String,
     pub language: String,
     pub path: String,
     pub sid: String,
     pub range: Range,
+    #[serde(skip)]
+    pub name: Option<String>,
+    #[serde(skip)]
+    pub kind: String,
     pub metrics: Score,
 }
 
@@ -424,7 +445,7 @@ fn compute_source(
         .filter_map(|(i, b)| (b == b'\n').then_some(i))
         .collect();
     let mut result = Vec::new();
-    for d in declarations.iter().filter(|d| callable(&d.kind)) {
+    for d in callable_declarations(declarations) {
         check()?;
         ensure!(
             d.range.start <= d.range.end

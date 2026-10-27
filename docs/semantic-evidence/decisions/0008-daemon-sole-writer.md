@@ -34,14 +34,14 @@ PR #117 shows the cost: cross-process ownership transitions contributed substant
 ### 1. One writer
 
 - **The user daemon is the only process that writes** a checkout's derived index (`index.db`) and request queue (`requests.db`). It is also the only process that runs watchers, mandatory H, publication, retention, release and GC.
-- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `trellis mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, `gc --report`, and browser writes such as saved views and notes.
+- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `trellis mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, `gc --report`, and browser indexing requests.
 - **There is no standalone fallback**, for reads or writes, so there is one read path.
   - Connect-or-start is bounded. If the daemon can't be reached or started within that bound, the command fails with a typed `daemon_unavailable` error. It never opens the index itself.
   - Commands that touch no index data, such as `--help` and `--version`, don't start the daemon.
 
 ### 2. One cross-process writer-election lock
 
-- The daemon's existing **single-instance lock** (per user data directory) is the only cross-process **writer-election** lock. Index-use and durable-record locks are covered below.
+- The daemon's existing **single-instance lock** (per user data directory) is the only cross-process **writer-election** lock. Index-use locks are covered below.
 - These are removed:
   - the per-checkout leader lock;
   - incarnation markers (`reconciled_incarnation`) as an ownership or read gate;
@@ -53,7 +53,7 @@ PR #117 shows the cost: cross-process ownership transitions contributed substant
   2. a **daemon-local admission gate** replaces the lock. The gate must cover every active snapshot, every retained SQLite handle and every new opener, and stay held from GC's eligibility check through the unlink.
 
   A registry lookup alone isn't enough to protect GC. Decision 0006 §2's nonblocking exclusive use lock stays until this gate is proved; the gate then supersedes only that lock mechanism, not GC eligibility.
-- **The separate durable-record lock** (saved views, notes, ledgers) stays unless its removal gets its own proof of safety.
+- **Saved views, notes and provider ledgers retired** by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). Their files and locks remain in place and ignored; no durable-record or provider-ledger opener remains. This removes those workflows, not the index-use protection above.
 
 ### 3. Recovery: a new daemon instance, or a live root replacement
 

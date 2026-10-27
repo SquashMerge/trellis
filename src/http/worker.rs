@@ -548,7 +548,7 @@ impl DaemonState {
     /// Publish whether accepted FIFO work remains (an unreadable queue counts
     /// as pending). When it drains, wake the lifecycle: a declined release
     /// may now proceed.
-    fn publish_fifo_pending(&self) {
+    pub(super) fn publish_fifo_pending(&self) {
         let pending = if matches!(
             *self.runtime.lock().unwrap(),
             RuntimeState::Closing | RuntimeState::Retired
@@ -800,6 +800,7 @@ impl DaemonState {
     /// index-use guard) is held until the watcher and SQLite witnesses are
     /// closed, so GC never sees the index unused mid-close.
     pub(super) fn close(&self, held: Option<Arc<WriterSession>>) {
+        self.search_fill.lock().unwrap().take();
         self.note_state_change();
         *self.watch_status.lock().unwrap() = None;
         *self.watcher_work.lock().unwrap() = None;
@@ -967,12 +968,11 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
             return;
         }
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.worker_step()));
-        state.publish_fifo_pending();
+        if step.is_err() {
+            state.publish_fifo_pending();
+        }
         deadline = match step {
             Ok(Ok(())) => {
-                // The witness reads phase only after the step released its locks.
-                #[cfg(feature = "test-support")]
-                state.report_causal_startup_ready();
                 if state.maintenance_ready() {
                     state.run_maintenance_unit();
                 }

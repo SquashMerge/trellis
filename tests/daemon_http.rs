@@ -411,120 +411,8 @@ async fn later_serve_compares_configuration_while_http_is_running() {
     serving.await.unwrap().unwrap();
 }
 
-static JEV_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct JevKeyRestore(Option<std::ffi::OsString>);
-impl JevKeyRestore {
-    fn set(key: &str) -> Self {
-        let old = std::env::var_os("JEV_KEY");
-        // Only these tests mutate JEV_KEY, under JEV_ENV_LOCK.
-        unsafe { std::env::set_var("JEV_KEY", key) };
-        Self(old)
-    }
-}
-impl Drop for JevKeyRestore {
-    fn drop(&mut self) {
-        if let Some(value) = &self.0 {
-            unsafe { std::env::set_var("JEV_KEY", value) };
-        } else {
-            unsafe { std::env::remove_var("JEV_KEY") };
-        }
-    }
-}
-
-async fn assert_rejected_before_provision(config: BrowserOptions, root: &Path) {
-    let identity = checkout(&root.join("checkout"));
-    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
-    let mut browser = BrowserProvisioner::new();
-    let token = root.join("token");
-    assert!(
-        browser
-            .register_serve(
-                &registry,
-                &identity,
-                CheckoutOptions(serde_json::to_value(config).unwrap()),
-                "127.0.0.1:0".parse().unwrap(),
-                &token,
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        browser.address().is_none(),
-        "invalid registration published listener"
-    );
-    assert!(!token.exists(), "invalid registration created token");
-    assert!(
-        registry
-            .lock()
-            .await
-            .registration(&identity.root_key)
-            .is_none(),
-        "invalid registration retained checkout"
-    );
-}
-
-#[tokio::test]
-async fn whitespace_and_invalid_header_jev_key_fail_before_provision() {
-    let _lock = JEV_ENV_LOCK.lock().await;
-    for (name, key) in [("whitespace", "  \t  "), ("invalid-header", "key\nvalue")] {
-        let temp = tempfile::tempdir().unwrap();
-        let _key = JevKeyRestore::set(key);
-        assert_rejected_before_provision(
-            BrowserOptions {
-                jev_budget_dir: Some(temp.path().join("budget")),
-                jev_budget_cents: Some(10),
-                ..BrowserOptions::default()
-            },
-            &temp.path().join(name),
-        )
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn non_private_existing_jev_budget_dir_fails_before_provision() {
-    use std::os::unix::fs::PermissionsExt;
-    let _lock = JEV_ENV_LOCK.lock().await;
-    let _key = JevKeyRestore::set("valid-key");
-    let temp = tempfile::tempdir().unwrap();
-    let budget = temp.path().join("budget");
-    fs::create_dir(&budget).unwrap();
-    fs::set_permissions(&budget, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_rejected_before_provision(
-        BrowserOptions {
-            jev_budget_dir: Some(budget),
-            jev_budget_cents: Some(10),
-            ..BrowserOptions::default()
-        },
-        temp.path(),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn dangling_symlink_acp_state_fails_before_provision() {
-    use std::os::unix::fs::symlink;
-    let temp = tempfile::tempdir().unwrap();
-    let runner = temp.path().join("runner");
-    fs::write(&runner, "runner").unwrap();
-    let state = temp.path().join("state");
-    symlink(temp.path().join("missing"), &state).unwrap();
-    assert_rejected_before_provision(
-        BrowserOptions {
-            acp_runner: Some(runner),
-            acp_state_dir: Some(state),
-            acp_max_attempts: Some(1),
-            ..BrowserOptions::default()
-        },
-        temp.path(),
-    )
-    .await;
-}
-
 #[tokio::test]
 async fn invalid_options_fail_before_listener_or_token_and_valid_options_are_retained() {
-    let _jev_env_lock = JEV_ENV_LOCK.lock().await;
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -553,34 +441,6 @@ async fn invalid_options_fail_before_listener_or_token_and_valid_options_are_ret
             ..BrowserOptions::default()
         });
     }
-    // A missing key is distinct from a configured valid provider.
-    if std::env::var("JEV_KEY").is_err() {
-        variants.push(BrowserOptions {
-            jev_budget_dir: Some(outside.join("budget")),
-            jev_budget_cents: Some(10),
-            ..BrowserOptions::default()
-        });
-    }
-    variants.push(BrowserOptions {
-        acp_runner: Some(outside.join("missing")),
-        acp_state_dir: Some(outside.join("private")),
-        acp_max_attempts: Some(1),
-        ..BrowserOptions::default()
-    });
-    let inside = identity.root.join("runner");
-    fs::write(&inside, "runner").unwrap();
-    variants.push(BrowserOptions {
-        acp_runner: Some(inside),
-        acp_state_dir: Some(outside.join("private")),
-        acp_max_attempts: Some(1),
-        ..BrowserOptions::default()
-    });
-    variants.push(BrowserOptions {
-        acp_runner: Some(runner.clone()),
-        acp_state_dir: Some(identity.root.join("private")),
-        acp_max_attempts: Some(1),
-        ..BrowserOptions::default()
-    });
     for config in variants {
         assert!(
             browser
@@ -598,10 +458,7 @@ async fn invalid_options_fail_before_listener_or_token_and_valid_options_are_ret
         assert!(!token_file.exists());
     }
     let config = BrowserOptions {
-        trusted_rustc: Some(runner.clone()),
-        acp_runner: Some(runner),
-        acp_state_dir: Some(outside.join("private")),
-        acp_max_attempts: Some(2),
+        trusted_rustc: Some(runner),
         rust_source_roots: vec![("source_1".into(), outside)],
         ..BrowserOptions::default()
     };
@@ -644,6 +501,9 @@ async fn provisioned_page_serves_all_referenced_assets() {
         "style.css",
         "classes.css",
         "navigation.css",
+        "treemap.css",
+        "treemap.js",
+        "treemap-pele.js",
         "sequence.js",
         "shell.js",
         "classes.js",
@@ -668,7 +528,7 @@ async fn provisioned_page_serves_all_referenced_assets() {
             }
         );
     }
-    for asset in ["sequence-pele.js", "vendor/pele-1.6.0.js"] {
+    for asset in ["sequence-pele.js", "vendor/pele-1.10.0-trellis.2.js"] {
         let reply = response(
             browser.router().unwrap(),
             address,

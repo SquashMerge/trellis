@@ -275,7 +275,7 @@ fn gc_releases_only_deleted_candidate_witnesses_child() {
         pin.index_generation
     );
     assert!(
-        replacement.saved_views_at(Some(pin)).is_err(),
+        replacement.files_at(Some(pin), 0, 100).is_err(),
         "old generation pins cannot reopen"
     );
 }

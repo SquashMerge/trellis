@@ -3,7 +3,7 @@ use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 6] = super::catalog::NAMES;
+const TOOLS: [&str; 10] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
     pub name: String,
@@ -76,7 +76,32 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
     };
     let (fields, required): (&[&str], &[&str]) = match name {
         "trellis_workspace_describe" => (&["schemaVersion", "workspace"], &["schemaVersion"]),
-        "trellis_find_symbols" => (
+        "trellis_references" => (
+            &[
+                "schemaVersion",
+                "workspace",
+                "expectedBasis",
+                "paths",
+                "limit",
+            ],
+            &["schemaVersion"],
+        ),
+        "trellis_rules_check" => (
+            &["schemaVersion", "workspace", "expectedBasis", "paths"],
+            &["schemaVersion"],
+        ),
+        "trellis_rules_explain" => (
+            &[
+                "schemaVersion",
+                "workspace",
+                "expectedBasis",
+                "rule",
+                "target",
+                "destination",
+            ],
+            &["schemaVersion", "rule", "target"],
+        ),
+        "trellis_find_symbols" | "trellis_search_symbols" => (
             &[
                 "schemaVersion",
                 "query",
@@ -121,9 +146,44 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
     }
     let validated = match name {
         "trellis_workspace_describe" => Ok(()),
-        "trellis_find_symbols" => {
+        "trellis_references" | "trellis_rules_check" => {
+            if !o.get("paths").is_none_or(|value| {
+                value.as_array().is_some_and(|paths| {
+                    paths.iter().all(|path| {
+                        path.as_str().is_some_and(|path| {
+                            path.len() <= 4096 && crate::references::valid_path_glob(path)
+                        })
+                    })
+                })
+            }) {
+                return Err("invalid_request");
+            }
+            limit(o)
+        }
+        "trellis_rules_explain" => {
+            let rule = string(o.get("rule")).ok_or("invalid_request")?;
+            if rule.is_empty()
+                || rule.len() > 256
+                || !o
+                    .get("target")
+                    .is_some_and(super::architecture::valid_identity)
+                || !o
+                    .get("destination")
+                    .is_none_or(super::architecture::valid_destination)
+                || (!matches!(rule, "$layers" | "$external") && o.contains_key("destination"))
+            {
+                return Err("invalid_request");
+            }
+            Ok(())
+        }
+        "trellis_find_symbols" | "trellis_search_symbols" => {
             let q = string(o.get("query")).ok_or("invalid_request")?;
-            if q.is_empty() || q.len() > 256 {
+            let max_bytes = if name == "trellis_search_symbols" {
+                1024
+            } else {
+                256
+            };
+            if q.is_empty() || q.len() > max_bytes {
                 return Err("invalid_request");
             }
             limit(o)
@@ -195,6 +255,11 @@ fn details(code: &str) -> (&'static str, bool) {
         "checkout_capacity" => ("Checkout capacity reached", true),
         "daemon_unavailable" => ("Daemon is unavailable", true),
         "outcome_unknown" => ("Outcome unknown; inspect request status", false),
+        "invalid_rules" => ("Invalid architecture rules", false),
+        "rules_not_found" => ("Rules file not found", false),
+        "bounded_work" => ("Architecture projection work bound exceeded", false),
+        "invalid_source_syntax" => ("Captured source cannot be parsed", false),
+        "response_too_large" => ("Architecture result is too large", false),
         _ => ("Store is unavailable", false),
     }
 }
@@ -267,6 +332,9 @@ pub fn resolved_root_changed(
 /// Keep the full, schema-valid envelope in structuredContent. Text is only a
 /// bounded display summary, not a second JSON representation of the evidence.
 pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
+    if name == super::architecture::PROMPT_NAME {
+        return super::architecture::prompt_result(envelope, modern);
+    }
     let error = envelope.get("error").is_some();
     let text = if error {
         format!(
@@ -288,7 +356,32 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
                     .len(),
                 "symbols",
             ),
+            "trellis_search_symbols" => (
+                envelope["data"]["hits"]
+                    .as_array()
+                    .expect("search hits")
+                    .len(),
+                "hits",
+            ),
             "trellis_declaration" => (1, "declaration"),
+            "trellis_references" => (
+                envelope["data"]["production"]
+                    .as_array()
+                    .expect("production edges")
+                    .len()
+                    + envelope["data"]["tests"]
+                        .as_array()
+                        .expect("test edges")
+                        .len(),
+                "edges",
+            ),
+            "trellis_rules_check" | "trellis_rules_explain" => (
+                envelope["data"]["instances"]
+                    .as_array()
+                    .expect("rule instances")
+                    .len(),
+                "instances",
+            ),
             "trellis_incoming_calls" => (
                 envelope["data"]["callers"]
                     .as_array()
@@ -355,7 +448,11 @@ pub fn prepare(
     modern: bool,
     workspace: &OpenedWorkspace,
 ) -> PreparedTool {
-    let validation = validate(name, args);
+    let validation = if name == super::architecture::PROMPT_NAME {
+        Ok(())
+    } else {
+        validate(name, args)
+    };
     let valid_arguments = validation.is_ok();
     let invalid_workspace = args.and_then(Value::as_object).and_then(|object| {
         let value = object
@@ -391,7 +488,11 @@ pub fn prepare(
     };
     PreparedTool {
         name: name.to_owned(),
-        response: result(name, envelope, modern),
+        response: if name == super::architecture::PROMPT_NAME {
+            json!({"structuredContent":envelope})
+        } else {
+            result(name, envelope, modern)
+        },
         valid_arguments,
         id: id.clone(),
         modern,
@@ -438,7 +539,12 @@ mod tests {
     fn good(name: &str) -> Value {
         match name {
             "trellis_workspace_describe" => json!({"schemaVersion":1}),
-            "trellis_find_symbols" => json!({"schemaVersion":1,"query":"a"}),
+            "trellis_find_symbols" | "trellis_search_symbols" => {
+                json!({"schemaVersion":1,"query":"a"})
+            }
+            "trellis_references" | "trellis_rules_check" => json!({"schemaVersion":1}),
+            "trellis_rules_explain" => json!({"schemaVersion":1,"rule":"rule-a",
+                "target":{"sourceSetId":"app","language":"rust","path":"src/a.rs","sid":sid()}}),
             "trellis_declaration" | "trellis_outgoing_calls" | "trellis_incoming_calls" => {
                 json!({"schemaVersion":1,"symbolId":sid()})
             }
@@ -450,7 +556,7 @@ mod tests {
     }
     #[test]
     fn closed_application_objects_and_pins() {
-        let n = TOOLS[0];
+        let n = "trellis_workspace_describe";
         assert_eq!(validate(n, Some(&good(n))), Ok(()));
         for v in [
             json!({}),
@@ -472,7 +578,7 @@ mod tests {
             let mut v = good(n);
             v["unknown"] = json!(true);
             check(n, &v, "invalid_request");
-            if n == TOOLS[0] {
+            if n == "trellis_workspace_describe" {
                 continue;
             }
             for wrong in [
@@ -495,7 +601,7 @@ mod tests {
     }
     #[test]
     fn find_and_inspect_boundaries() {
-        let n = TOOLS[1];
+        let n = "trellis_find_symbols";
         for q in ["", &"é".repeat(129), &"x".repeat(257)] {
             let mut v = good(n);
             v["query"] = json!(q);
@@ -509,7 +615,11 @@ mod tests {
         let mut v = good(n);
         v["query"] = json!(null);
         check(n, &v, "invalid_request");
-        for name in [TOOLS[1], TOOLS[3], TOOLS[4]] {
+        for name in [
+            "trellis_find_symbols",
+            "trellis_outgoing_calls",
+            "trellis_incoming_calls",
+        ] {
             let original = good(name);
             for (number, expected) in [
                 (json!(0), Some("range_too_large")),
@@ -527,7 +637,7 @@ mod tests {
                 assert_eq!(validate(name, Some(&v)).err(), expected, "{name} {v}");
             }
         }
-        let n = TOOLS[2];
+        let n = "trellis_declaration";
         for view in [
             "incoming_calls",
             "call_paths",
@@ -544,9 +654,9 @@ mod tests {
         let mut v = good(n);
         v["limit"] = json!(1);
         check(n, &v, "invalid_request");
-        let mut v = good(TOOLS[3]);
+        let mut v = good("trellis_outgoing_calls");
         v["view"] = json!("outgoing_calls");
-        check(TOOLS[3], &v, "invalid_request");
+        check("trellis_outgoing_calls", &v, "invalid_request");
         for wrong in [
             "sid:v1:ABCDEF0123456789abcdef0123456789",
             "sid:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -560,8 +670,63 @@ mod tests {
         }
     }
     #[test]
+    fn search_is_closed_and_bounds_decoded_utf8_bytes() {
+        let name = "trellis_search_symbols";
+        assert_eq!(super::super::search::DEFAULT_LIMIT, 10);
+        for query in [
+            "x".repeat(1024),
+            "é".repeat(512),
+            "  a  ".into(),
+            "\n".into(),
+        ] {
+            assert_eq!(
+                validate(name, Some(&json!({"schemaVersion":1,"query":query}))),
+                Ok(())
+            );
+        }
+        for query in [
+            json!(""),
+            json!("x".repeat(1025)),
+            json!("é".repeat(513)),
+            json!(null),
+            json!(1),
+        ] {
+            check(
+                name,
+                &json!({"schemaVersion":1,"query":query}),
+                "invalid_request",
+            );
+        }
+        for field in [
+            "filter", "filters", "backend", "score", "scores", "debug", "cursor", "index", "view",
+        ] {
+            let mut args = good(name);
+            args[field] = json!(true);
+            check(name, &args, "invalid_request");
+        }
+        for (limit, expected) in [
+            (json!(1), Ok(())),
+            (json!(50), Ok(())),
+            (json!(0), Err("range_too_large")),
+            (json!(51), Err("range_too_large")),
+            (json!(-1), Err("invalid_request")),
+            (json!(1.5), Err("invalid_request")),
+            (json!(null), Err("invalid_request")),
+            (json!("10"), Err("invalid_request")),
+        ] {
+            assert_eq!(
+                validate(
+                    name,
+                    Some(&json!({"schemaVersion":1,"query":"q","limit":limit}))
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn source_path_hash_and_line_matrix() {
-        let n = TOOLS[5];
+        let n = "trellis_read_source";
         for path in [
             "",
             "/a",
@@ -625,7 +790,7 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":1,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":2,"schemaVersion":1,
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
         assert_eq!(describe(&json!(7), workspace.label()), describe_expected);
@@ -636,17 +801,17 @@ mod tests {
                     let prepared = prepare(name, Some(&good), id, modern, &workspace);
                     let result = &prepared.response;
                     assert_eq!(result.get("resultType").is_some(), modern);
-                    assert_eq!(result["isError"], name != TOOLS[0]);
+                    assert_eq!(result["isError"], name != "trellis_workspace_describe");
                     assert_eq!(
                         result["content"][0]["text"],
-                        if name == TOOLS[0] {
+                        if name == "trellis_workspace_describe" {
                             format!("{name}: 1 workspace; full result in structuredContent.")
                         } else {
                             format!("{name} failed: index_not_ready: Index is not ready")
                         }
                     );
                     assert_eq!(result["structuredContent"]["requestId"], *id);
-                    if name != TOOLS[0] {
+                    if name != "trellis_workspace_describe" {
                         assert_eq!(
                             result["structuredContent"]["error"]["code"],
                             "index_not_ready"
@@ -711,8 +876,8 @@ mod tests {
             }
         }
         let mut unsent = prepare(
-            TOOLS[0],
-            Some(&good(TOOLS[0])),
+            "trellis_workspace_describe",
+            Some(&good("trellis_workspace_describe")),
             &json!("pending"),
             true,
             &workspace,
@@ -760,8 +925,8 @@ mod tests {
         let workspace =
             OpenedWorkspace::new(WorkspaceIdentity::discover(Some(&root), temp.path()).unwrap());
         let mut prepared = prepare(
-            TOOLS[0],
-            Some(&good(TOOLS[0])),
+            "trellis_workspace_describe",
+            Some(&good("trellis_workspace_describe")),
             &json!(5),
             false,
             &workspace,
@@ -775,13 +940,19 @@ mod tests {
             attributed(failure(&json!(5), "store_unavailable"), &workspace, false)
         );
         assert!(!marker.exists());
-        let valid = prepare(TOOLS[1], Some(&good(TOOLS[1])), &json!(6), true, &workspace);
+        let valid = prepare(
+            "trellis_find_symbols",
+            Some(&good("trellis_find_symbols")),
+            &json!(6),
+            true,
+            &workspace,
+        );
         assert_eq!(
             valid.response["structuredContent"]["error"]["code"],
             "store_unavailable"
         );
         let invalid = prepare(
-            TOOLS[1],
+            "trellis_find_symbols",
             Some(&json!({"schemaVersion":1,"query":""})),
             &json!(7),
             true,
@@ -833,6 +1004,8 @@ mod tests {
         for (name, data, text) in [
             ("trellis_find_symbols", json!({"symbols":[{}]}), "1 symbol"),
             ("trellis_find_symbols", json!({"symbols":[]}), "0 symbols"),
+            ("trellis_search_symbols", json!({"hits":[{}]}), "1 hit"),
+            ("trellis_search_symbols", json!({"hits":[]}), "0 hits"),
             ("trellis_outgoing_calls", json!({"calls":[{}]}), "1 call"),
             ("trellis_incoming_calls", json!({"callers":[{}]}), "1 call"),
             ("trellis_incoming_calls", json!({"callers":[]}), "0 calls"),
@@ -859,5 +1032,66 @@ mod tests {
                 format!("{name}: {text}; full result in structuredContent.")
             );
         }
+    }
+    #[test]
+    fn architecture_inputs_are_closed_and_prompt_is_private() {
+        let identity = json!({"sourceSetId":"app","language":"rust","path":"src/a.rs","sid":sid()});
+        for name in ["trellis_references", "trellis_rules_check"] {
+            assert_eq!(
+                validate(name, Some(&json!({"schemaVersion":1,"paths":["src/**"]}))),
+                Ok(())
+            );
+            for paths in [
+                json!(null),
+                json!("src/**"),
+                json!(["src/[ab].rs"]),
+                json!(["src/**bad"]),
+                json!(["../src"]),
+                json!(["/src"]),
+                json!([true]),
+            ] {
+                assert_eq!(
+                    validate(name, Some(&json!({"schemaVersion":1,"paths":paths}))),
+                    Err("invalid_request")
+                );
+            }
+        }
+        assert_eq!(
+            validate(
+                "trellis_references",
+                Some(&json!({"schemaVersion":1,"limit":51}))
+            ),
+            Err("range_too_large")
+        );
+        assert_eq!(
+            validate(
+                "trellis_rules_check",
+                Some(&json!({"schemaVersion":1,"limit":1}))
+            ),
+            Err("invalid_request")
+        );
+        assert_eq!(
+            validate(
+                "trellis_rules_explain",
+                Some(&json!({"schemaVersion":1,"rule":"$layers","target":identity}))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate(
+                "trellis_rules_explain",
+                Some(
+                    &json!({"schemaVersion":1,"rule":"named","target":identity,"destination":identity})
+                )
+            ),
+            Err("invalid_request")
+        );
+        assert_eq!(
+            validate(
+                super::super::architecture::PROMPT_NAME,
+                Some(&json!({"schemaVersion":1}))
+            ),
+            Err("invalid_request")
+        );
     }
 }

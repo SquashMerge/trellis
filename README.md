@@ -3,7 +3,6 @@
 A diagram-first code browser with native JavaScript, Rust, Java and Python indexing, SQLite snapshots,
 and an authenticated local inspector. Browse files, expand their functions/methods, and
 open source-linked static sequence diagrams. These are possible paths, not runtime traces.
-Optional Jev selection and ACP answers are separate, explicitly authorized provider features.
 
 ## Start here
 
@@ -29,14 +28,13 @@ For the existing feature-factory snapshot with semantic resolution, see
 [the daemon guide](docs/daemon-v1.md#use-the-existing-semantic-snapshot).
 
 Current storage uses fixed per-user cache/data locations **outside the repository**; `--state-dir`
-is removed. A disposable index follows the checkout path. Saved views and notes use a Git UUID
-marker and follow a moved Git checkout; a copied marker shares those items. Non-Git saved records
-are path-bound. `serve` requires an explicit private `--token-file` outside the selected checkout;
-Jev and ACP ledgers also require explicit external paths when enabled. No old state migrates
-automatically. Indexing never runs package scripts, installs source dependencies, or edits source.
+is removed. A disposable index follows the checkout path. The Git workspace UUID remains shared
+evidence identity. `serve` requires an explicit private `--token-file` outside the selected checkout.
+Saved views, notes and Jev/ACP providers are retired; their existing files remain in place and ignored,
+not migrated or deleted. Indexing never runs package scripts, installs source dependencies, or edits source.
 See [local topology](docs/local-topology.md#t02--locations-and-store-responsibilities).
 
-`trellis gc --report` only inventories derived-index and saved-record candidates. A historical
+`trellis gc --report` only inventories derived-index candidates. A historical
 index marked `eligible` is **not deleted**. Trellis has no derived-index deletion command or
 automatic deletion path today. Future [#16](https://github.com/SquashMerge/trellis/issues/16)
 automatic GC needs a separate guarded public contract: authenticate the exact historical schema,
@@ -53,16 +51,12 @@ never trigger removal.
 - Source hashes, provenance, explicit unresolved boundaries, callbacks and control regions.
 - Atomic full-index publication to SQLite; background refresh, progress and cancellation.
 - Snapshot-consistent source reads and bounded, cycle-safe static call queries.
-- Durable saved queries, pins, hidden IDs and annotations; explicit orphan reporting.
 - Loopback-only API with bearer authentication, Host/Origin checks and a cached-source viewer.
-- Separate offline question focus: bounded evidence, literal-name preview, and strict display limits.
-- Jev request export, unverified response import, and explicit budget-controlled live selection.
 - Inline file → method browsing and source-linked static sequence diagrams for all four supported languages.
 - Java/Python class diagrams with scoped candidate links, right-click related-class expansion, and source/method navigation.
 - Reversible fluent Rust chain grouping, with every measured call retained.
 - Automatic local Rust/Cargo library declaration catalog and explicit source viewing. Candidate type lanes are terminal; compiler receiver/dispatch resolution is still unavailable.
 - Compact outgoing call rows with deliberate one-level branch expansion.
-- Opt-in ACP answers with source-quote validation and a separate attempt allowance.
 
 The workbench starts with immediate calls. Select a call or control to inspect its evidence,
 then open its cached source. Expand deeper only when needed. Unsupported language constructs
@@ -74,12 +68,12 @@ Java/Python indexing never runs Gradle, Maven, Python imports, decorators or pac
 The accepted direction supports agents running directly in a terminal (including terminal tabs in
 Trellis or optional Herdr panes), and agents connected through ACP, primarily Mimir. Both use the
 same portable MCP tools. The local `trellis mcp` stdio protocol layer is shipped; general coding-agent
-ACP sessions and embedded terminals are **not implemented yet**. The existing one-shot ACP answer
-feature and authenticated browser `serve` daemon remain separate.
+ACP sessions and embedded terminals are **not implemented yet**. The authenticated browser
+`serve` daemon remains separate.
 
-Run `trellis mcp --workspace <path>` for the local, read-only stdio daemon client. Its five tools,
+Run `trellis mcp --workspace <path>` for the local, read-only stdio daemon client. The original six tools,
 in order, are `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_declaration`,
-`trellis_outgoing_calls` and `trellis_read_source`. The daemon serves evidence from one selected,
+`trellis_outgoing_calls`, `trellis_incoming_calls` and `trellis_read_source`. The daemon serves evidence from one selected,
 validated cached snapshot; before a valid head is ready, evidence tools return typed
 `index_not_ready`, while describe can report not-ready status. Declaration takes a `symbolId` with
 no `limit` or `view`; outgoing calls takes a `symbolId` and optional `limit`, with no `view`.
@@ -92,6 +86,13 @@ schema-valid result is in `structuredContent`. MCP does not execute repository c
 on-demand indexing, enroll grants, expose an HTTP listener or accept authenticated MCP intake.
 See the [MCP contract](docs/mcp-readonly-pilot-contract.md) for limits and schemas. Run the native
 protocol fixtures with `cargo test --locked --test mcp_protocol`.
+
+[Reviewed architecture rules](docs/rules.md) adds three read-only MCP tools
+(`trellis_references`, `trellis_rules_check`, `trellis_rules_explain`), the no-argument
+`trellis_propose_layers` proposal prompt, and CLI JSON references/rules checks.
+Code evidence remains pinned and cached; only the fixed `.trellis/rules.toml` is
+read as current configuration with its own digest. Proposals are diffs for human
+review, never server-applied changes.
 
 The daemon already watches and refreshes native evidence. Snapshot text search, versioned diagram
 artifacts, the unified terminal workbench and a browser project picker remain separate work.
@@ -109,7 +110,7 @@ See the [local topology](docs/local-topology.md), [integration plan](docs/agent-
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
-node --test tests/question-ui.test.cjs
+node --test tests/shell-ui.test.cjs
 cargo run --locked -- --help
 ```
 
@@ -126,7 +127,8 @@ issue-writing guidance.
 
 ## Repository layout
 
-- `src/`, `web/`, `runtime/`: daemon, browser and ACP answer adapter.
+- `src/`, `web/`: daemon and browser.
+- `tests/mcp/`: pinned MCP conformance-test dependencies.
 - `tests/fixtures/`: synthetic fixtures and retained feature-factory evidence.
 - `tools/extraction/`, `tools/selection/`: standalone offline research harnesses.
 - `docs/research/`: historical reports and screenshots, separate from runtime implementation.
@@ -152,8 +154,9 @@ summary does not.
 
 Versions published before the switch remain available under the MIT License. Third-party material
 is not part of the Licensed Work: bundled fonts keep their own SIL OFL licenses under `web/fonts/`,
-and the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-factory/` and
-`tests/fixtures/extraction/feature-factory.*`) carry their original project's terms.
+the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-factory/` and
+`tests/fixtures/extraction/feature-factory.*`) carry their original project's terms, and the
+Candle/Voyage embedding adaptation retains its [upstream terms](src/search_embed/licenses/README.md).
 
 ## Read more
 
@@ -169,12 +172,6 @@ and the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-fact
 - [Agent integration architecture diagrams](docs/architecture/agent-integration-context.md)
 - [Daemon usage, data contract, security and limitations](docs/daemon-v1.md)
 - [First-pass validation record](docs/daemon-validation.md)
-- [Offline question focus and provider boundary](docs/question-workflow.md)
-- [Question-slice validation](docs/question-validation.md)
-- [Live Jev opt-in, source sharing and durable budget](docs/live-jev.md)
-- [Live validation and retained failures](docs/live-jev-validation.md)
-- [Source-backed ACP answers and separate authorization](docs/acp-answers.md)
-- [ACP validation and current authentication blocker](docs/acp-answer-validation.md)
 - [Automatic local libraries and resolution limits](docs/automatic-libraries.md)
 - [Rust indexing and static sequences](docs/rust-support.md)
 - [Java and Python indexing and static sequences](docs/java-python-support.md)
@@ -188,7 +185,5 @@ The [semantic-index program](https://github.com/SquashMerge/trellis/issues/8) no
 cached snapshots through the daemon and stdio MCP ([#17](https://github.com/SquashMerge/trellis/issues/17));
 its watcher refreshes native evidence without running repository code. Next: multi-language SCIP
 import and separately gated snapshot search, diagram artifacts and embedded terminal/ACP integration.
-Continue static sequence coverage and library adapters beyond Rust/Cargo; source-backed provider
-validation still requires authorization and working authentication.
-The local literal preview does not understand questions. TypeScript parsing, terminal UI,
+Continue static sequence coverage and library adapters beyond Rust/Cargo. TypeScript parsing, terminal UI,
 React/Tauri and database diagrams remain outside the current implementation.

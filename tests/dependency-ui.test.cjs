@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const source = fs.readFileSync(path.join(__dirname, "../web/sequence.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+const source = ["sequence.js", "shell.js", "app.js"].map(file => fs.readFileSync(path.join(__dirname, "../web", file), "utf8")).join("\n");
 
 function deferred() {
   let resolve, reject;
@@ -19,7 +19,7 @@ function harness() {
   let nextTimer = 0;
   function node(tagName) {
     const classes = new Set();
-    return {tagName, classList: {add(value) { classes.add(value); }, contains(value) { return classes.has(value); }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
+    return {tagName, classList: {add(value) { classes.add(value); }, remove(value) { classes.delete(value); }, contains(value) { return classes.has(value); }, toggle(value, force) { const on = force ?? !classes.has(value); if (on) classes.add(value); else classes.delete(value); return on; }}, focus() {}, hidden: true, disabled: false, value: "", textContent: "", children: [], listeners: {},
       addEventListener(type, handler) { this.listeners[type] = handler; },
       replaceChildren(...items) { this.children = items; },
       append(...items) { this.children.push(...items); },
@@ -28,15 +28,15 @@ function harness() {
       click() { downloads.push(this.download); }};
   }
   function get(id) { if (!elements.has(id)) elements.set(id, node()); return elements.get(id); }
-  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController,
+  const context = vm.createContext({console, TextEncoder, DOMException, Blob, AbortController, URLSearchParams,
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, {callback, delay}); return id; }, clearTimeout(id) { timers.delete(id); },
     window: {confirm: () => true},
     URL: {createObjectURL(blob) { blobs.push(blob); return "blob:synthetic"; }, revokeObjectURL() {}},
-    document: {getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
+    document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text}), body: node()},
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   // The app receives the production scoped URL; legacy suffixes below remain the
   // fixture handlers' semantic route names, never an unscoped network fallback.
   let handler = context.fetch;
@@ -53,18 +53,7 @@ function harness() {
     if (!url.startsWith(`${SCOPED}/status`)) return result;
     return Promise.resolve(result).then(reply => reply.ok ? {...reply, json:async () => ({workspaceRoot:"/synthetic", ...await reply.json()})} : reply);
   };
-  const preserveNewFocus = () => {
-    run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
-      packet = {packetId:'new'}; focused = {marker:'new'};
-      $('focus-state').textContent = 'new valid focus'; $('error').hidden = true;`);
-    return run("packet");
-  };
-  const assertPreserved = newer => {
-    assert.equal(run("packet"), newer);
-    assert.equal(get("focus-state").textContent, "new valid focus");
-    assert.equal(get("error").hidden, true);
-  };
-  return {context, run, get, blobs, downloads, timers, networkUrls, preserveNewFocus, assertPreserved};
+  return {context, run, get, blobs, downloads, timers, networkUrls};
 }
 
 
@@ -99,7 +88,7 @@ test("automatic workspace status refresh requests only catalog metadata; optiona
 });
 test("package, paged declaration filter, and explicit source browsing preserve the primary workspace",async()=>{
  const h=harness(), requests=[];
- h.run("selectedMethod={id:'keep'}; seed='keep'; $('sequence-diagram').textContent='diagram'; $('source').textContent='workspace source'");
+ h.run("selectedMethod={id:'keep'}; $('sequence-diagram').textContent='diagram'; $('source').textContent='workspace source'");
  h.context.fetch=async url=>{requests.push(url);if(url==="/api/dependencies")return response(catalog());
  if(url.startsWith("/api/dependencies/source?"))return response(snapshot());
  const params=new URL(url,"http://local").searchParams;
@@ -124,7 +113,7 @@ test("package, paged declaration filter, and explicit source browsing preserve t
  assert.ok(descendants(h.get("external-source")).length<1900);
  const count=requests.length;h.get("external-next").listeners.click();assert.equal(requests.length,count);
  assert.match(text(h.get("external-source")),/Showing lines 601–1200/);
- assert.equal(h.run("seed"),"keep");assert.equal(h.run("selectedMethod.id"),"keep");
+ assert.equal(h.run("selectedMethod.id"),"keep");
  assert.equal(h.get("sequence-diagram").textContent,"diagram");assert.equal(h.get("source").textContent,"workspace source");
  assert.ok(requests.every(url=>url.startsWith("/api/dependencies")));
 });
@@ -149,7 +138,7 @@ for(const failure of ["success","http","network","json"]) test(`obsolete ${failu
  else if(failure==="http")old.resolve({ok:false,status:409,json:async()=>({error:{message:"old"}})});
  else if(failure==="json")old.resolve({ok:true,status:200,json:async()=>{throw Error("old");}});
  else old.resolve(response(snapshot()));
- await pending;assert.match(h.get("external-source-path").textContent,/newhash/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("seed"),"root");
+ await pending;assert.match(h.get("external-source-path").textContent,/newhash/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("selectedMethod"),null);
 });
 for(const change of ["clearDependencyCatalog()","status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}","status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:'new'}","$('logout').listeners.click()"])
  test(`late catalog and source ignored after ${change}`,async()=>{
@@ -172,7 +161,7 @@ test("newer catalog status wins over obsolete failures",async()=>{
 test("source conflicts remain local and require status refresh; no implicit request",async()=>{
  const h=harness();await select(h);let requests=0;h.context.fetch=async()=>{requests++;return {ok:false,status:409,json:async()=>({error:{message:"Source changed"}})};};
  await h.run(`loadDependencySource(${JSON.stringify(symbol)})`);assert.equal(requests,1);assert.equal(h.run("externalSnapshot"),null);
- assert.match(h.get("external-source-path").textContent,/Source changed.*Refresh library status/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("seed"),"root");
+ assert.match(h.get("external-source-path").textContent,/Source changed.*Refresh library status/);assert.equal(h.get("error").hidden,true);assert.equal(h.run("selectedMethod"),null);
 });
 test("mismatched declaration/source provenance never paints",async()=>{
  const h=harness();await ready(h);h.context.fetch=async()=>response(symbols([symbol],null,"other"));await h.run(`selectDependencyPackage(${JSON.stringify(pkg)})`);
@@ -203,8 +192,6 @@ test("connect and completed workspace index automatically refresh metadata, neve
  if(url==="/api/status")return response({revision,stats:{}});
  if(url==="/api/dependencies")return response({...catalog(),workspaceRevision:revision});
  if(url.startsWith("/api/tree?"))return response({revision,path:"",root:"/workspace",items:[],nextOffset:null});
- if(url==="/api/views"||url==="/api/annotations")return response([]);
- if(url==="/api/jev/status"||url==="/api/acp/status")return response({enabled:false});
  if(url==="/api/jobs/current")return response(null);
  if(url==="/api/index")return response({id:"job",state:"running"});
  if(url==="/api/jobs/job"){revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2};return response({id:"job",state:"done"});}

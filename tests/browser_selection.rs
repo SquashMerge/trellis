@@ -194,6 +194,287 @@ impl Drop for Server {
 }
 
 #[tokio::test]
+async fn git_reads_do_not_activate_or_renew_and_keep_the_final_identity_fence() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::registry::{
+            BROWSER_IDLE_DELAY, CHECKOUT_RELEASE_DELAY, CheckoutOptions, CheckoutRegistry,
+        },
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index = roots.index_db(&identity);
+    let now = std::time::Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = browser.clone().router();
+    let path = format!("/api/checkouts/{}/git", identity.root_key);
+    for active in [false, true] {
+        if active {
+            registry
+                .lock()
+                .await
+                .browser_request_at(&identity, now)
+                .unwrap();
+        }
+        let (status, headers, body) = selected_json(app.clone(), "GET", &path, Value::Null).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["git"]["state"], "unavailable");
+        assert!(body["changes"].is_null());
+        assert_eq!(headers["x-trellis-workspace"], root.to_str().unwrap());
+        assert_eq!(headers["x-trellis-catching-up"], "false");
+        assert!(registry.lock().await.runtime(&identity.root_key).is_none());
+        assert_eq!(registry.lock().await.active_count(), usize::from(active));
+        assert!(!index.exists());
+    }
+    let tick = registry
+        .lock()
+        .await
+        .advance(now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY)
+        .unwrap();
+    assert_eq!(tick.released, vec![identity.root_key.clone()]);
+    let moved = root.with_file_name("moved");
+    let changed_root = root.clone();
+    browser.set_selected_response_hook_for_tests(Arc::new(move |stage| {
+        if stage == "after_handler" {
+            fs::rename(&changed_root, &moved).unwrap();
+        }
+    }));
+    let (status, headers, body) = selected_json(app, "GET", &path, Value::Null).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "root_changed");
+    assert_eq!(headers["x-trellis-workspace"], root.to_str().unwrap());
+    assert_eq!(headers["x-trellis-catching-up"], "false");
+    assert!(registry.lock().await.runtime(&identity.root_key).is_none());
+}
+
+#[tokio::test]
+async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = FixtureDaemon::new(&home);
+    let cold = temp.path().join("cold");
+    let discovered = temp.path().join("discovered");
+    for root in [&cold, &discovered] {
+        fs::create_dir(root).unwrap();
+        git(root, &["init", "-qb", "main"]);
+        git(root, &["config", "user.email", "test@example.invalid"]);
+        git(root, &["config", "user.name", "Test"]);
+        fs::write(root.join("core.js"), "function original() { return 1; }\n").unwrap();
+        git(root, &["add", "core.js"]);
+        git(root, &["commit", "-qm", "base"]);
+    }
+    let indexed = command(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&discovered)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    drop(FixtureDaemon::new(&home));
+    let cold = cold.canonicalize().unwrap();
+    let cold_key = WorkspaceIdentity::discover(Some(&cold), &cold)
+        .unwrap()
+        .root_key;
+    let discovered_key = WorkspaceIdentity::discover(Some(&discovered), &discovered)
+        .unwrap()
+        .root_key;
+    fs::write(cold.join("core.js"), "function changed() { return 2; }\n").unwrap();
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let token_file = home.join("token");
+    fs::write(&token_file, token).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let log = temp.path().join("git-serve-stderr");
+    let child = command(&home)
+        .arg("serve")
+        .arg("--workspace")
+        .arg(&cold)
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--token-file")
+        .arg(token_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut server = Server(child);
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            if client
+                .get(format!("{base}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "{}",
+                fs::read_to_string(&log).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let listing: Value = client
+        .get(format!("{base}/api/checkouts"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for key in [&cold_key, &discovered_key] {
+        let row = listing["checkouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rootKey"] == *key)
+            .unwrap();
+        assert_eq!(row["git"]["state"], "available", "{listing}");
+        assert_eq!(row["git"]["head"]["name"], "main");
+        assert!(!row.as_object().unwrap().contains_key("changes"));
+        assert_eq!(row["active"], false);
+    }
+    let prefix = format!("{base}/api/checkouts/{cold_key}/git");
+    for suffix in ["", "/diff?path=core.js"] {
+        let response = client
+            .get(format!("{prefix}{suffix}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-trellis-workspace"],
+            cold.to_str().unwrap()
+        );
+        assert_eq!(response.headers()["x-trellis-catching-up"], "false");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(response.headers().contains_key("content-security-policy"));
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["git"]["state"], "available", "{body}");
+        if suffix.is_empty() {
+            assert!(
+                body["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|change| change["path"] == "core.js" && change["status"] == "modified")
+            );
+        } else {
+            assert_eq!(body["file"]["path"], "core.js");
+            assert!(!body["file"]["hunks"].as_array().unwrap().is_empty());
+        }
+    }
+    for suffix in [
+        "?unknown=1",
+        "/diff",
+        "/diff?path=core.js&path=core.js",
+        "/diff?path=core.js&extra=1",
+        "/diff?path=../core.js",
+        "/diff?path=/core.js",
+        "/diff?path=",
+    ] {
+        let response = client
+            .get(format!("{prefix}{suffix}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{suffix}"
+        );
+    }
+    let response = client
+        .get(format!("{prefix}/diff?path=missing.js"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    for (header, value, expected) in [
+        (
+            "authorization",
+            "Bearer invalid",
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        ("host", "not-local:1", reqwest::StatusCode::FORBIDDEN),
+        (
+            "origin",
+            "http://not-local:1",
+            reqwest::StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let response = client
+            .get(&prefix)
+            .bearer_auth(token)
+            .header(header, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{header}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("x-trellis-workspace"));
+    }
+    let state: Value = client
+        .get(format!("{base}/api/daemon/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["activeCheckouts"], 0);
+    let cache = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.squashmerge.trellis")
+    } else {
+        home.join(".cache/trellis")
+    };
+    assert!(
+        !cache
+            .join("indexes")
+            .join(&cold_key)
+            .join("index.db")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn production_browser_selects_two_real_worktrees_without_global_attachment() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -310,11 +591,6 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .arg(format!("127.0.0.1:{port}"))
         .arg("--token-file")
         .arg(token_file)
-        .arg("--jev-budget-dir")
-        .arg(temp.path().join("jev-budget"))
-        .arg("--jev-budget-cents")
-        .arg("10")
-        .env("JEV_KEY", "offline-synthetic-key")
         .stdout(Stdio::null())
         .stderr(Stdio::from(fs::File::create(&log).unwrap()))
         .spawn()
@@ -444,41 +720,6 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .to_owned();
         let status: Value = status.json().await.unwrap();
         assert_eq!(status["workspaceRoot"], verified_root.to_str().unwrap());
-        // TODO(runtime-recovery): prior-head admission must make this read
-        // immediately available during startup reconciliation, as the preceding status was 200.
-        // Until that slice lands, only a typed cold/startup reconciliation index_not_ready may wait.
-        let jev = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-            loop {
-                let response = client
-                    .get(format!("{base}/api/checkouts/{key}/jev/status"))
-                    .bearer_auth(token)
-                    .send()
-                    .await
-                    .unwrap();
-                if response.status() == reqwest::StatusCode::OK {
-                    break response;
-                }
-                let code = response.status();
-                let body = response.text().await.unwrap_or_default();
-                assert_eq!(code, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-                assert!(body.contains("index_not_ready"), "{body}");
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("JEV selected read stayed unavailable: root={root:?} key={key} status={status} catching-up-header={status_header}"));
-        assert_eq!(
-            jev.headers()["X-Trellis-Workspace"],
-            verified_root.to_str().unwrap()
-        );
-        assert_eq!(jev.headers()["cache-control"], "no-store");
-        let jev: Value = jev.json().await.unwrap();
-        assert_eq!(jev["enabled"], root == &a, "{jev}");
-        if root == &a {
-            assert!(!jev["budget"].is_null());
-        } else {
-            assert!(jev["budget"].is_null());
-        }
         assert!(status["catchingUp"].is_boolean());
         assert_eq!(
             status["catchingUp"].as_bool().unwrap().to_string(),
@@ -511,6 +752,18 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         })
         .await
         .expect("selected checkout did not finish reconciliation");
+        let dependencies = client
+            .get(format!("{base}/api/checkouts/{key}/dependencies"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dependencies.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            dependencies.headers()["X-Trellis-Workspace"],
+            verified_root.to_str().unwrap()
+        );
+        assert_eq!(dependencies.headers()["cache-control"], "no-store");
         let tree = client
             .get(format!("{base}/api/checkouts/{key}/tree"))
             .bearer_auth(token)
@@ -648,16 +901,6 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         assert!(!wrong.status().is_success());
         assert!(wrong.headers().contains_key("X-Trellis-Workspace"));
 
-        let symbols = client
-            .get(format!("{base}/api/checkouts/{key}/symbols"))
-            .query(&[("q", expected)])
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(symbols.status(), reqwest::StatusCode::OK);
-        let symbols: Value = symbols.json().await.unwrap();
-        assert!(symbols.to_string().contains(expected), "{symbols}");
         let source = client
             .get(format!("{base}/api/checkouts/{key}/source"))
             .query(&[("path", "core.js")])
@@ -681,268 +924,14 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         (&a_key, &b_key, &seeds[0], "alpha_checkout"),
         (&b_key, &a_key, &seeds[1], "beta_checkout"),
     ] {
-        let query = client
-            .post(format!("{base}/api/checkouts/{key}/query"))
-            .bearer_auth(token)
-            .json(&serde_json::json!({"seed":seed}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            query.status(),
-            reqwest::StatusCode::OK,
-            "{}",
-            query.text().await.unwrap_or_default()
-        );
-        assert!(query.headers().contains_key("X-Trellis-Catching-Up"));
-        let view: Value = query.json().await.unwrap();
-        assert_eq!(view["query"]["seed"], seed.as_str());
-        assert!(view.to_string().contains(expected_name), "{view}");
-        let revision = &view["revision"];
-        let pinned = format!(
-            "indexGeneration={}&indexRevision={}",
-            revision["indexGeneration"].as_str().unwrap(),
-            revision["indexRevision"].as_u64().unwrap()
-        );
-        let record = serde_json::json!({"id":"saved","title":"Mine","query":{"seed":seed},"pins":{},"hidden":[]});
-        let saved = client
-            .put(format!("{base}/api/checkouts/{key}/views/saved?{pinned}"))
-            .bearer_auth(token)
-            .json(&record)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            saved.status(),
-            reqwest::StatusCode::OK,
-            "{}",
-            saved.text().await.unwrap_or_default()
-        );
-        assert!(saved.headers().contains_key("X-Trellis-Workspace"));
-        let other_view = client
-            .get(format!("{base}/api/checkouts/{other}/views/saved"))
+        let status = client
+            .get(format!("{base}/api/checkouts/{key}/status"))
             .bearer_auth(token)
             .send()
             .await
             .unwrap();
-        if key == &a_key {
-            assert_eq!(other_view.status(), reqwest::StatusCode::NOT_FOUND);
-        } else {
-            assert_eq!(other_view.status(), reqwest::StatusCode::OK);
-            let other_value: Value = other_view.json().await.unwrap();
-            assert_eq!(other_value["view"]["query"]["seed"], seeds[0]);
-        }
-        let note = serde_json::json!({"id":"note","nodeId":seed,"body":"Only here"});
-        let saved = client
-            .put(format!(
-                "{base}/api/checkouts/{key}/annotations/note?{pinned}"
-            ))
-            .bearer_auth(token)
-            .json(&note)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            saved.status(),
-            reqwest::StatusCode::OK,
-            "{}",
-            saved.text().await.unwrap_or_default()
-        );
-        let other_notes = client
-            .get(format!("{base}/api/checkouts/{other}/annotations"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(other_notes.status(), reqwest::StatusCode::OK);
-        let other_notes: Value = other_notes.json().await.unwrap();
-        if key == &a_key {
-            assert_eq!(other_notes, serde_json::json!([]));
-        } else {
-            assert_eq!(other_notes[0]["annotation"]["nodeId"], seeds[0]);
-        }
-        let preview = client.post(format!("{base}/api/checkouts/{key}/questions/preview"))
-            .bearer_auth(token).json(&serde_json::json!({"seed":seed,"question":"What calls?","expectedRevision":revision}))
-            .send().await.unwrap();
-        assert_eq!(
-            preview.status(),
-            reqwest::StatusCode::OK,
-            "{}",
-            preview.text().await.unwrap_or_default()
-        );
-        let preview: Value = preview.json().await.unwrap();
-        let packet_id = preview["packet"]["packetId"].as_str().unwrap();
-        let exported = client
-            .get(format!(
-                "{base}/api/checkouts/{key}/questions/{packet_id}/jev-request"
-            ))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(exported.status(), reqwest::StatusCode::OK);
-        if key == &a_key {
-            assert_eq!(
-                preview["packet"]["context"]["calls"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                0
-            );
-            let jev_status_url = format!("{base}/api/checkouts/{a_key}/jev/status");
-            let before: Value = client
-                .get(&jev_status_url)
-                .bearer_auth(token)
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert_eq!(before["enabled"], true);
-            let refused = client
-                .post(format!(
-                    "{base}/api/checkouts/{a_key}/questions/{packet_id}/jev-run"
-                ))
-                .bearer_auth(token)
-                .json(&serde_json::json!({}))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-            assert_eq!(
-                refused.headers()["X-Trellis-Workspace"],
-                a.canonicalize().unwrap().to_str().unwrap()
-            );
-            assert_eq!(refused.headers()["cache-control"], "no-store");
-            let refusal: Value = refused.json().await.unwrap();
-            assert_eq!(refusal["error"]["code"], "jev_no_candidates", "{refusal}");
-            let after: Value = client
-                .get(&jev_status_url)
-                .bearer_auth(token)
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert_eq!(
-                after["budget"], before["budget"],
-                "pre-network refusal must not reserve"
-            );
-            let foreign = client
-                .post(format!(
-                    "{base}/api/checkouts/{b_key}/questions/{packet_id}/jev-run"
-                ))
-                .bearer_auth(token)
-                .json(&serde_json::json!({}))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
-            assert_eq!(
-                foreign.headers()["X-Trellis-Workspace"],
-                b.canonicalize().unwrap().to_str().unwrap()
-            );
-            assert_eq!(
-                foreign.json::<Value>().await.unwrap()["error"]["code"],
-                "not_found"
-            );
-        }
-        let imported = client
-            .post(format!(
-                "{base}/api/checkouts/{key}/questions/{packet_id}/jev-response"
-            ))
-            .bearer_auth(token)
-            .json(&serde_json::json!({"model":"jev-1.13.0","answers":{}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            imported.status(),
-            reqwest::StatusCode::OK,
-            "{}",
-            imported.text().await.unwrap_or_default()
-        );
-        assert_eq!(
-            imported.headers()["X-Trellis-Workspace"],
-            (if key == &a_key {
-                a.canonicalize().unwrap()
-            } else {
-                b.canonicalize().unwrap()
-            })
-            .to_str()
-            .unwrap()
-        );
-        let selection = client
-            .post(format!(
-                "{base}/api/checkouts/{key}/questions/{packet_id}/selection"
-            ))
-            .bearer_auth(token)
-            .json(&preview["selection"])
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            selection.status(),
-            reqwest::StatusCode::OK,
-            "{}",
-            selection.text().await.unwrap_or_default()
-        );
-        let invalid_selection = client
-            .post(format!(
-                "{base}/api/checkouts/{key}/questions/{packet_id}/selection"
-            ))
-            .bearer_auth(token)
-            .json(&serde_json::json!({"packetId":"wrong","decisions":[]}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            invalid_selection.status(),
-            reqwest::StatusCode::UNPROCESSABLE_ENTITY
-        );
-        assert_eq!(
-            invalid_selection.json::<Value>().await.unwrap()["error"]["code"],
-            "invalid_question_selection"
-        );
-        let missing_seed = client.post(format!("{base}/api/checkouts/{key}/questions/preview"))
-            .bearer_auth(token).json(&serde_json::json!({"seed":"missing","question":"What calls?","expectedRevision":revision}))
-            .send().await.unwrap();
-        assert_eq!(missing_seed.status(), reqwest::StatusCode::NOT_FOUND);
-        assert_eq!(
-            missing_seed.json::<Value>().await.unwrap()["error"]["code"],
-            "not_found"
-        );
-        let foreign = client
-            .get(format!(
-                "{base}/api/checkouts/{other}/questions/{packet_id}/jev-request"
-            ))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
-        assert!(foreign.headers().contains_key("X-Trellis-Workspace"));
-        for (action, payload) in [
-            (
-                "jev-response",
-                serde_json::json!({"model":"jev-1.13.0","answers":{}}),
-            ),
-            ("selection", preview["selection"].clone()),
-        ] {
-            let foreign = client
-                .post(format!(
-                    "{base}/api/checkouts/{other}/questions/{packet_id}/{action}"
-                ))
-                .bearer_auth(token)
-                .json(&payload)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
-            assert!(foreign.headers().contains_key("X-Trellis-Workspace"));
-        }
+        assert_eq!(status.status(), reqwest::StatusCode::OK);
+        let view: Value = status.json().await.unwrap();
         let sequence = client
             .post(format!("{base}/api/checkouts/{key}/sequence"))
             .bearer_auth(token)
@@ -956,24 +945,21 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             "{}",
             sequence.text().await.unwrap_or_default()
         );
-        let foreign_symbol = client
-            .get(format!("{base}/api/checkouts/{other}/symbol"))
-            .query(&[("id", seed)])
+        let sequence: Value = sequence.json().await.unwrap();
+        assert!(sequence.to_string().contains(expected_name), "{sequence}");
+        let foreign_sequence = client
+            .post(format!("{base}/api/checkouts/{other}/sequence"))
             .bearer_auth(token)
+            .json(&serde_json::json!({"seed":seed,"expectedRevision":view["revision"]}))
             .send()
             .await
             .unwrap();
-        assert_eq!(foreign_symbol.status(), reqwest::StatusCode::NOT_FOUND);
-        assert!(foreign_symbol.headers().contains_key("X-Trellis-Workspace"));
-        let foreign_query = client
-            .post(format!("{base}/api/checkouts/{other}/query"))
-            .bearer_auth(token)
-            .json(&serde_json::json!({"seed":seed}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(foreign_query.status(), reqwest::StatusCode::NOT_FOUND);
-        assert!(foreign_query.headers().contains_key("X-Trellis-Workspace"));
+        assert!(!foreign_sequence.status().is_success());
+        assert!(
+            foreign_sequence
+                .headers()
+                .contains_key("X-Trellis-Workspace")
+        );
         let accepted = client
             .post(format!("{base}/api/checkouts/{key}/index"))
             .bearer_auth(token)
@@ -1028,51 +1014,6 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(foreign_cancel.status(), reqwest::StatusCode::NOT_FOUND);
-    }
-    for suffix in ["views/saved", "annotations/note"] {
-        let deleted = client
-            .delete(format!("{base}/api/checkouts/{a_key}/{suffix}"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
-        assert_eq!(
-            deleted.headers()["X-Trellis-Workspace"],
-            a.canonicalize().unwrap().to_str().unwrap()
-        );
-        assert!(deleted.headers().contains_key("X-Trellis-Catching-Up"));
-        let surviving = client
-            .get(format!(
-                "{base}/api/checkouts/{b_key}/{}",
-                suffix.split('/').next().unwrap()
-            ))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(surviving.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            surviving
-                .json::<Value>()
-                .await
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        let deleted = client
-            .delete(format!("{base}/api/checkouts/{b_key}/{suffix}"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
-        assert_eq!(
-            deleted.headers()["X-Trellis-Workspace"],
-            b.canonicalize().unwrap().to_str().unwrap()
-        );
     }
     let missing = client
         .get(format!("{base}/api/status"))
@@ -1356,8 +1297,8 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         ("before_read_finish", "files"),
         ("after_handler", "tree"),
         ("before_read_finish", "classes"),
-        ("after_handler", "symbols"),
-        ("before_read_finish", "views"),
+        ("after_handler", "classes"),
+        ("before_read_finish", "dependencies"),
     ] {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("checkout");
@@ -1443,325 +1384,6 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
             serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(error["error"]["code"], "root_changed", "{stage}: {error}");
-    }
-}
-
-#[tokio::test]
-async fn selected_question_export_keeps_legacy_oversize_error() {
-    use std::sync::Arc;
-    use trellis::{
-        daemon::registry::{CheckoutOptions, CheckoutRegistry},
-        http::ProvisionedBrowser,
-        store::topology::TopologyRoots,
-    };
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("checkout");
-    fs::create_dir(&root).unwrap();
-    fs::write(
-        root.join("large.js"),
-        format!(
-            "function big() {{\n/*{}*/\nreturn 1;\n}}\n",
-            "x".repeat(180_000)
-        ),
-    )
-    .unwrap();
-    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let roots =
-        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let mut registry = CheckoutRegistry::with_roots(roots);
-    registry
-        .register(&identity, CheckoutOptions(serde_json::json!({})))
-        .unwrap();
-    let app = ProvisionedBrowser::new(
-        Arc::new(tokio::sync::Mutex::new(registry)),
-        TOKEN.to_owned(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap()
-    .router();
-    let prefix = format!("/api/checkouts/{}", identity.root_key);
-    let pin = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let (status, _, value) =
-                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
-            if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
-                break value["revision"].clone();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let (status, _, symbols) = selected_json(
-        app.clone(),
-        "GET",
-        &format!("{prefix}/symbols?q=big"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(status, axum::http::StatusCode::OK);
-    let seed = symbols["items"][0]["id"].as_str().unwrap();
-    let (status, _, preview) = selected_json(
-        app.clone(),
-        "POST",
-        &format!("{prefix}/questions/preview"),
-        serde_json::json!({"seed":seed,"question":"Explain this","expectedRevision":pin}),
-    )
-    .await;
-    assert_eq!(
-        status,
-        axum::http::StatusCode::OK,
-        "{status}: {}",
-        preview["error"]
-    );
-    let id = preview["packet"]["packetId"].as_str().unwrap();
-    let (status, headers, error) = selected_json(
-        app,
-        "GET",
-        &format!("{prefix}/questions/{id}/jev-request"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        status,
-        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-        "{error}"
-    );
-    assert_eq!(error["error"]["code"], "evidence_too_large");
-    assert_eq!(
-        headers["X-Trellis-Workspace"],
-        identity.root.to_str().unwrap()
-    );
-}
-
-#[tokio::test]
-async fn selected_question_preview_keeps_legacy_oversize_error() {
-    use std::sync::Arc;
-    use trellis::{
-        daemon::registry::{CheckoutOptions, CheckoutRegistry},
-        http::ProvisionedBrowser,
-        store::topology::TopologyRoots,
-    };
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let temp = TempDir::new().unwrap();
-    let root = temp.path().join("checkout");
-    fs::create_dir(&root).unwrap();
-    fs::write(
-        root.join("large.js"),
-        format!(
-            "function big() {{\n/*{}*/\nreturn 1;\n}}\n",
-            "x".repeat(1_060_000)
-        ),
-    )
-    .unwrap();
-    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let roots =
-        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let mut registry = CheckoutRegistry::with_roots(roots);
-    registry
-        .register(&identity, CheckoutOptions(serde_json::json!({})))
-        .unwrap();
-    let registry = Arc::new(tokio::sync::Mutex::new(registry));
-    let app = ProvisionedBrowser::new(
-        registry.clone(),
-        TOKEN.to_owned(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap()
-    .router();
-    let prefix = format!("/api/checkouts/{}", identity.root_key);
-    let mut last_status = None;
-    let mut first_startup_error = None;
-    let mut saw_retry_waiting = false;
-    let pin = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let (status, _, value) =
-                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
-            last_status = Some((status, value.clone()));
-            // Sample while startup reconciliation is still retrying. The first error can disappear
-            // after a successful retry, before the final timeout diagnostic.
-            if (status != axum::http::StatusCode::OK || value["catchingUp"] != false)
-                && let Some(runtime) = registry.lock().await.runtime(&identity.root_key)
-            {
-                let waiting = runtime.retry_waiting_for_tests();
-                saw_retry_waiting |= waiting;
-                if first_startup_error.is_none() {
-                    first_startup_error =
-                        runtime.reconciliation_error().map(|error| (error, waiting));
-                }
-            }
-            if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
-                break value["revision"].clone();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    let pin = pin.unwrap_or_else(|_| {
-        panic!("cold selected preview status stayed not-ready: {last_status:?}; first startup reconciliation error/retry: {first_startup_error:?}; saw retry waiting: {saw_retry_waiting}")
-    });
-    let (status, _, symbols) = selected_json(
-        app.clone(),
-        "GET",
-        &format!("{prefix}/symbols?q=big"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(status, axum::http::StatusCode::OK);
-    let seed = symbols["items"][0]["id"].as_str().unwrap();
-    let (status, headers, error) = selected_json(
-        app,
-        "POST",
-        &format!("{prefix}/questions/preview"),
-        serde_json::json!({"seed":seed,"question":"Explain this","expectedRevision":pin}),
-    )
-    .await;
-    assert_eq!(
-        status,
-        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-        "{error}"
-    );
-    assert_eq!(error["error"]["code"], "evidence_too_large");
-    assert_eq!(
-        headers["X-Trellis-Workspace"],
-        identity.root.to_str().unwrap()
-    );
-}
-
-#[tokio::test]
-async fn selected_saved_mutation_reports_committed_drift_and_preserves_real_record_state() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
-    use trellis::{
-        daemon::registry::{CheckoutOptions, CheckoutRegistry},
-        http::ProvisionedBrowser,
-        store::topology::{DurableRecords, TopologyRoots},
-    };
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    for kind in ["view", "annotation"] {
-        for method in ["PUT", "DELETE"] {
-            for stage in ["before_mutation", "after_handler"] {
-                let temp = TempDir::new().unwrap();
-                let root = temp.path().join("checkout");
-                fs::create_dir(&root).unwrap();
-                fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
-                let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-                let roots = TopologyRoots::isolated_for_tests(
-                    temp.path().join("cache"),
-                    temp.path().join("data"),
-                );
-                let mut registry = CheckoutRegistry::with_roots(roots.clone());
-                registry
-                    .register(&identity, CheckoutOptions(serde_json::json!({})))
-                    .unwrap();
-                let browser = ProvisionedBrowser::new(
-                    Arc::new(tokio::sync::Mutex::new(registry)),
-                    TOKEN.to_owned(),
-                    "127.0.0.1:7331".parse().unwrap(),
-                )
-                .unwrap();
-                let app = browser.clone().router();
-                let prefix = format!("/api/checkouts/{}", identity.root_key);
-                let pin = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-                    loop {
-                        let (status, _, value) = selected_json(
-                            app.clone(),
-                            "GET",
-                            &format!("{prefix}/status"),
-                            Value::Null,
-                        )
-                        .await;
-                        if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
-                            break value["revision"].clone();
-                        }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await
-                .unwrap();
-                let (status, _, symbols) = selected_json(
-                    app.clone(),
-                    "GET",
-                    &format!("{prefix}/symbols?q=stable"),
-                    Value::Null,
-                )
-                .await;
-                assert_eq!(status, axum::http::StatusCode::OK);
-                let seed = symbols["items"][0]["id"].as_str().unwrap();
-                let pin = format!(
-                    "indexGeneration={}&indexRevision={}",
-                    pin["indexGeneration"].as_str().unwrap(),
-                    pin["indexRevision"].as_u64().unwrap()
-                );
-                let (suffix, payload) = if kind == "view" {
-                    (
-                        "views/saved",
-                        serde_json::json!({"id":"saved","title":"Saved","query":{"seed":seed},"pins":{},"hidden":[]}),
-                    )
-                } else {
-                    (
-                        "annotations/note",
-                        serde_json::json!({"id":"note","nodeId":seed,"body":"Saved"}),
-                    )
-                };
-                let uri = format!("{prefix}/{suffix}?{pin}");
-                if method == "DELETE" {
-                    let (status, _, value) =
-                        selected_json(app.clone(), "PUT", &uri, payload.clone()).await;
-                    assert_eq!(status, axum::http::StatusCode::OK, "{value}");
-                }
-                let moved = temp.path().join("moved");
-                let changed = Arc::new(AtomicBool::new(false));
-                let changed_hook = changed.clone();
-                let old_root = root.clone();
-                let target = moved.clone();
-                browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
-                    if at == stage && !changed_hook.swap(true, Ordering::AcqRel) {
-                        fs::rename(&old_root, &target).unwrap();
-                    }
-                }));
-                let (status, headers, value) =
-                    selected_json(app.clone(), method, &uri, payload).await;
-                assert!(changed.load(Ordering::Acquire));
-                assert_eq!(
-                    status,
-                    axum::http::StatusCode::CONFLICT,
-                    "{kind} {method} {stage}: {value}"
-                );
-                assert_eq!(value["error"]["code"], "root_changed");
-                assert_eq!(
-                    headers["X-Trellis-Workspace"],
-                    identity.root.to_str().unwrap()
-                );
-                assert!(headers.contains_key("X-Trellis-Catching-Up"));
-                if stage == "after_handler" {
-                    assert_eq!(value["mutationOutcome"], "committed");
-                    assert_eq!(headers["X-Trellis-Mutation-Outcome"], "committed");
-                } else {
-                    assert!(value.get("mutationOutcome").is_none());
-                    assert!(!headers.contains_key("X-Trellis-Mutation-Outcome"));
-                }
-                fs::rename(&moved, &root).unwrap();
-                let records = DurableRecords::new(&roots, &identity);
-                let exists = if kind == "view" {
-                    records.view_record("saved").unwrap().is_some()
-                } else {
-                    records
-                        .annotation_records()
-                        .unwrap()
-                        .iter()
-                        .any(|row| row.id == "note")
-                };
-                assert_eq!(
-                    exists,
-                    (method == "PUT") == (stage == "after_handler"),
-                    "{kind} {method} {stage}"
-                );
-            }
-        }
     }
 }
 
@@ -2026,7 +1648,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
 }
 
 #[cfg(feature = "test-support")]
-/// After startup reconciliation, the navigation, classes, sequence and query
+/// After startup reconciliation, the navigation, classes and sequence
 /// surfaces serve the reconciled head with `catchingUp` cleared. Returns false
 /// when a later watcher wake moved the head between reads, so the caller retries.
 async fn fresh_read_surfaces(app: axum::Router, prefix: &str, revision: &Value) -> bool {
@@ -2067,17 +1689,20 @@ async fn fresh_read_surfaces(app: axum::Router, prefix: &str, revision: &Value) 
         navigation["targets"].to_string().contains("FreshWidget"),
         "{navigation}"
     );
-    let (code, _, symbols) = selected_json(
+    let (code, _, methods) = selected_json(
         app.clone(),
         "GET",
-        &format!("{prefix}/symbols?q=fresh_step"),
+        &format!("{prefix}/methods?path=core.js"),
         Value::Null,
     )
     .await;
-    if code != axum::http::StatusCode::OK || symbols["revision"] != *revision {
+    if code != axum::http::StatusCode::OK || methods["revision"] != *revision {
         return false;
     }
-    let seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
+    let seed = methods["items"][0]["symbol"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let (code, headers, sequence) = selected_json(
         app.clone(),
         "POST",
@@ -2089,17 +1714,6 @@ async fn fresh_read_surfaces(app: axum::Router, prefix: &str, revision: &Value) 
         return false;
     }
     assert_eq!(sequence["seed"]["name"], "fresh_step", "{sequence}");
-    let (code, headers, query) = selected_json(
-        app,
-        "POST",
-        &format!("{prefix}/query"),
-        serde_json::json!({"seed":seed}),
-    )
-    .await;
-    if !fresh(code, &headers, &query) {
-        return false;
-    }
-    assert!(query["nodes"].to_string().contains("fresh_step"), "{query}");
     true
 }
 
@@ -2178,32 +1792,18 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
     .await
     .unwrap();
     let prefix = format!("/api/checkouts/{}", identity.root_key);
-    let (code, _, symbols) = selected_json(
+    let (code, _, methods) = selected_json(
         app.clone(),
         "GET",
-        &format!("{prefix}/symbols?q=old_step"),
+        &format!("{prefix}/methods?path=core.js"),
         Value::Null,
     )
     .await;
     assert_eq!(code, axum::http::StatusCode::OK);
-    let seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
-    let pin = format!(
-        "indexGeneration={}&indexRevision={}",
-        old_revision["indexGeneration"].as_str().unwrap(),
-        old_revision["indexRevision"].as_u64().unwrap()
-    );
-    let view = serde_json::json!({"id":"saved","title":"Original","query":{"seed":seed},"pins":{},"hidden":[]});
-    let note = serde_json::json!({"id":"note","nodeId":seed,"body":"Original"});
-    for (path, value) in [("views/saved", &view), ("annotations/note", &note)] {
-        let (code, _, body) = selected_json(
-            app.clone(),
-            "PUT",
-            &format!("{prefix}/{path}?{pin}"),
-            value.clone(),
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::OK, "{body}");
-    }
+    let seed = methods["items"][0]["symbol"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let release_at = std::time::Instant::now() + Duration::from_secs(30 * 60);
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
@@ -2247,39 +1847,6 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
     })
     .await
     .unwrap();
-    for (path, value) in [("views/saved", &view), ("annotations/note", &note)] {
-        let mut changed = value.clone();
-        if path.starts_with("views/") {
-            changed["title"] = serde_json::json!("Forbidden pre-H");
-        } else {
-            changed["body"] = serde_json::json!("Forbidden pre-H");
-        }
-        let (code, headers, body) = selected_json(
-            app.clone(),
-            "PUT",
-            &format!("{prefix}/{path}?{pin}"),
-            changed,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "index_not_ready");
-        assert_eq!(headers["X-Trellis-Catching-Up"], "true");
-        let (code, _, body) = selected_json(
-            app.clone(),
-            "DELETE",
-            &format!("{prefix}/{path}"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "index_not_ready");
-    }
-    let records = trellis::store::topology::DurableRecords::new(&roots, &identity);
-    assert_eq!(
-        records.view_record("saved").unwrap().unwrap().title,
-        "Original"
-    );
-    assert_eq!(records.annotation_records().unwrap()[0].body, "Original");
     let (code, headers, prior) = status(app.clone()).await;
     assert_eq!(code, axum::http::StatusCode::OK, "{prior}");
     assert_eq!(headers["X-Trellis-Catching-Up"], "true");
@@ -2354,11 +1921,7 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
     assert_eq!(code, axum::http::StatusCode::OK, "{dependencies}");
     assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     assert_eq!(dependencies["workspaceRevision"], old_revision);
-    for route in [
-        "dependencies/refresh",
-        "questions/foreign/jev-run",
-        "questions/foreign/acp-answer",
-    ] {
+    for route in ["dependencies/refresh"] {
         let (code, headers, error) = selected_json(
             app.clone(),
             "POST",
@@ -2418,18 +1981,6 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
     assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     assert_eq!(sequence["revision"], old_revision);
     assert!(sequence.to_string().contains("old_step"), "{sequence}");
-    let (code, headers, query) = selected_json(
-        app.clone(),
-        "POST",
-        &format!("{prefix}/query"),
-        serde_json::json!({"seed":seed}),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{query}");
-    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
-    assert_eq!(query["revision"], old_revision);
-    assert_eq!(query["query"]["seed"], seed.as_str());
-    assert!(query.to_string().contains("old_step"), "{query}");
     resume_tx.send(()).unwrap();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
         loop {
@@ -2480,449 +2031,6 @@ async fn selected_status_serves_validated_pre_startup_head_and_clears_freshness_
 }
 
 #[tokio::test]
-async fn provider_routes_use_only_the_selected_checkout() {
-    use std::sync::Arc;
-    use trellis::{
-        daemon::registry::{CheckoutOptions, CheckoutRegistry},
-        http::ProvisionedBrowser,
-        store::topology::TopologyRoots,
-    };
-    let temp = TempDir::new().unwrap();
-    let roots =
-        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let a = temp.path().join("a");
-    let b = temp.path().join("b");
-    for root in [&a, &b] {
-        fs::create_dir(root).unwrap();
-        fs::write(
-            root.join("core.js"),
-            "function selected_root() { return 1; }\n",
-        )
-        .unwrap();
-        fs::create_dir(root.join("library")).unwrap();
-    }
-    let external_library = temp.path().join("dependency-library");
-    fs::create_dir_all(external_library.join("std/src")).unwrap();
-    fs::create_dir(a.join("src")).unwrap();
-    fs::create_dir(temp.path().join("empty-cargo")).unwrap();
-    fs::write(
-        a.join("Cargo.toml"),
-        "[package]\nname = 'selected_a'\nversion = '0.1.0'\nedition = '2021'\n",
-    )
-    .unwrap();
-    fs::write(a.join("src/lib.rs"), "pub fn workspace_only() {}\n").unwrap();
-    fs::write(
-        external_library.join("std/Cargo.toml"),
-        "[package]\nname = 'std'\nversion = '0.0.0'\n",
-    )
-    .unwrap();
-    let library_text =
-        "// café\npub struct LibraryType;\nimpl LibraryType { pub fn method(&self) {} }\n";
-    fs::write(external_library.join("std/src/lib.rs"), library_text).unwrap();
-    fs::write(a.join("library/source.rs"), "pub fn from_a() {}\n").unwrap();
-    fs::write(b.join("library/source.rs"), "pub fn from_b() {}\n").unwrap();
-    let a_id = WorkspaceIdentity::discover(Some(&a), &a).unwrap();
-    let b_id = WorkspaceIdentity::discover(Some(&b), &b).unwrap();
-    let runner = temp.path().join("acp-runner");
-    fs::write(
-        &runner,
-        format!(
-            "#!/bin/sh\ncat > /dev/null\ncat '{}'\n",
-            temp.path().join("acp-response.json").display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&runner, fs::Permissions::from_mode(0o700)).unwrap();
-    let mut registry = CheckoutRegistry::with_roots(roots);
-    for (identity, root) in [(&a_id, &a), (&b_id, &b)] {
-        registry.register(identity, CheckoutOptions(serde_json::json!({
-            "rustSourceRoots": if root == &a {
-                serde_json::json!([["library",root.join("library")],["a_only",root.join("library")]])
-            } else {
-                serde_json::json!([["library",root.join("library")]])
-            },
-            "acpRunner": if root == &a { Some(runner.clone()) } else { None },
-            "acpStateDir": if root == &a { Some(temp.path().join("acp-state")) } else { None },
-            "acpMaxAttempts": if root == &a { Some(2) } else { None },
-            "rustLibrary": if root == &a { Some(external_library.clone()) } else { None },
-            "cargoHome": temp.path().join("empty-cargo")
-        }))).unwrap();
-    }
-    let app = ProvisionedBrowser::new(
-        Arc::new(tokio::sync::Mutex::new(registry)),
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap()
-    .router();
-    let a_prefix = format!("/api/checkouts/{}", a_id.root_key);
-    let b_prefix = format!("/api/checkouts/{}", b_id.root_key);
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let (a_code, _, _) = selected_json(
-                app.clone(),
-                "GET",
-                &format!("{a_prefix}/status"),
-                Value::Null,
-            )
-            .await;
-            let (b_code, _, _) = selected_json(
-                app.clone(),
-                "GET",
-                &format!("{b_prefix}/status"),
-                Value::Null,
-            )
-            .await;
-            if a_code.is_success() && b_code.is_success() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    for (prefix, identity, expected) in [(&a_prefix, &a_id, "from_a"), (&b_prefix, &b_id, "from_b")]
-    {
-        for (suffix, field) in [("jev/status", "budget"), ("acp/status", "status")] {
-            let (code, headers, body) = selected_json(
-                app.clone(),
-                "GET",
-                &format!("{prefix}/{suffix}"),
-                Value::Null,
-            )
-            .await;
-            assert_eq!(code, axum::http::StatusCode::OK, "{body}");
-            if suffix == "acp/status" && prefix == &a_prefix {
-                assert_eq!(body["enabled"], true);
-                assert!(!body[field].is_null());
-            } else {
-                assert_eq!(body["enabled"], false);
-                assert!(body[field].is_null());
-            }
-            assert_eq!(
-                headers["X-Trellis-Workspace"],
-                identity.root.to_str().unwrap()
-            );
-            assert_eq!(headers["cache-control"], "no-store");
-        }
-        let (code, _, roots) = selected_json(
-            app.clone(),
-            "GET",
-            &format!("{prefix}/rust-sources"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::OK);
-        assert_eq!(roots["roots"][0]["label"], "library");
-        let (code, _, tree) = selected_json(
-            app.clone(),
-            "GET",
-            &format!("{prefix}/rust-sources/tree?root=library"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::OK, "{tree}");
-        assert_eq!(tree["items"][0]["path"], "source.rs");
-        let (code, _, file) = selected_json(
-            app.clone(),
-            "GET",
-            &format!("{prefix}/rust-sources/file?root=library&path=source.rs"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::OK, "{file}");
-        assert!(file.to_string().contains(expected), "{file}");
-        if prefix == &b_prefix {
-            let (code, _, error) = selected_json(
-                app.clone(),
-                "GET",
-                &format!("{prefix}/rust-sources/file?root=a_only&path=source.rs"),
-                Value::Null,
-            )
-            .await;
-            assert_eq!(code, axum::http::StatusCode::NOT_FOUND, "{error}");
-        }
-        let (code, _, deps) = selected_json(
-            app.clone(),
-            "GET",
-            &format!("{prefix}/dependencies"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::OK, "{deps}");
-        let (code, _, error) = selected_json(
-            app.clone(),
-            "GET",
-            &format!("{prefix}/dependencies/symbols?catalogId=foreign"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{error}");
-        assert_eq!(error["error"]["code"], "stale_catalog");
-        let (code, _, error) = selected_json(
-            app.clone(),
-            "GET",
-            &format!("{prefix}/dependencies/source?catalogId=foreign&sourceRef=foreign"),
-            Value::Null,
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{error}");
-        let (code, _, error) = selected_json(
-            app.clone(),
-            "POST",
-            &format!("{prefix}/questions/foreign/acp-answer"),
-            serde_json::json!({}),
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::NOT_FOUND, "{error}");
-        let (code, _, error) = selected_json(
-            app.clone(),
-            "POST",
-            &format!("{prefix}/questions/foreign/jev-run"),
-            serde_json::json!({}),
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::NOT_FOUND, "{error}");
-    }
-    let (code, headers, initial_refresh) = selected_json(
-        app.clone(),
-        "POST",
-        &format!("{a_prefix}/dependencies/refresh"),
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{initial_refresh}");
-    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
-    let a_catalog = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let (code, _, status) = selected_json(
-                app.clone(),
-                "GET",
-                &format!("{a_prefix}/dependencies"),
-                Value::Null,
-            )
-            .await;
-            assert_eq!(code, axum::http::StatusCode::OK, "{status}");
-            if status["state"] == "ready" && status["catalogId"].is_string() {
-                break status;
-            }
-            if status["state"] == "failed" {
-                panic!("A dependency catalog failed: {status}");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("selected A catalog did not become ready");
-    let catalog_id = a_catalog["catalogId"].as_str().unwrap();
-    assert!(
-        a_catalog["symbolCount"].as_u64().unwrap() >= 1,
-        "{a_catalog}"
-    );
-    let symbol_url =
-        format!("{a_prefix}/dependencies/symbols?catalogId={catalog_id}&q=LibraryType");
-    let (code, headers, symbols) =
-        selected_json(app.clone(), "GET", &symbol_url, Value::Null).await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{symbols}");
-    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
-    assert!(headers.contains_key("X-Trellis-Catching-Up"));
-    assert_eq!(headers["cache-control"], "no-store");
-    assert_eq!(symbols["catalogId"], catalog_id);
-    let library_symbol = symbols["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|symbol| symbol["name"] == "LibraryType")
-        .expect("selected A library symbol");
-    let source_ref = library_symbol["sourceRef"].as_str().unwrap();
-    let source_url =
-        format!("{a_prefix}/dependencies/source?catalogId={catalog_id}&sourceRef={source_ref}");
-    let (code, headers, source) = selected_json(app.clone(), "GET", &source_url, Value::Null).await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{source}");
-    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
-    assert!(headers.contains_key("X-Trellis-Catching-Up"));
-    assert_eq!(headers["cache-control"], "no-store");
-    assert_eq!(source["rootLabel"], "std");
-    assert_eq!(source["file"]["text"], library_text);
-    assert_eq!(source["id"], source_ref);
-    for route in [
-        format!("{b_prefix}/dependencies/symbols?catalogId={catalog_id}&q=LibraryType"),
-        format!("{b_prefix}/dependencies/source?catalogId={catalog_id}&sourceRef={source_ref}"),
-    ] {
-        let (code, headers, error) = selected_json(app.clone(), "GET", &route, Value::Null).await;
-        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{error}");
-        assert_eq!(error["error"]["code"], "stale_catalog");
-        assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
-    }
-    let (code, headers, b_refresh) = selected_json(
-        app.clone(),
-        "POST",
-        &format!("{b_prefix}/dependencies/refresh"),
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{b_refresh}");
-    assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
-    let b_catalog_before = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let (code, _, status) = selected_json(
-                app.clone(),
-                "GET",
-                &format!("{b_prefix}/dependencies"),
-                Value::Null,
-            )
-            .await;
-            assert_eq!(code, axum::http::StatusCode::OK, "{status}");
-            if status["state"] != "loading" {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("selected B catalog did not settle");
-    let (code, headers, refresh) = selected_json(
-        app.clone(),
-        "POST",
-        &format!("{a_prefix}/dependencies/refresh"),
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{refresh}");
-    assert_eq!(refresh["state"], "loading");
-    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
-    tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
-        loop {
-            let (code, _, status) = selected_json(
-                app.clone(),
-                "GET",
-                &format!("{a_prefix}/dependencies"),
-                Value::Null,
-            )
-            .await;
-            assert_eq!(code, axum::http::StatusCode::OK, "{status}");
-            if status["state"] == "ready" {
-                break;
-            }
-            if status["state"] == "failed" {
-                panic!("selected A refresh failed: {status}");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("selected A refresh did not finish");
-    let (code, headers, b_catalog_after) = selected_json(
-        app.clone(),
-        "GET",
-        &format!("{b_prefix}/dependencies"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{b_catalog_after}");
-    assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
-    assert_eq!(
-        b_catalog_after, b_catalog_before,
-        "A refresh must not touch B catalog"
-    );
-    let (code, _, symbols) = selected_json(
-        app.clone(),
-        "GET",
-        &format!("{a_prefix}/symbols?q=selected_root"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{symbols}");
-    let (code, _, status) = selected_json(
-        app.clone(),
-        "GET",
-        &format!("{a_prefix}/status"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK);
-    let seed = symbols["items"][0]["id"].as_str().unwrap();
-    let (code, _, preview) = selected_json(app.clone(), "POST", &format!("{a_prefix}/questions/preview"),
-        serde_json::json!({"seed":seed,"question":"Describe the function","expectedRevision":status["revision"]})).await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{preview}");
-    let packet = preview["packet"]["packetId"].as_str().unwrap();
-    for action in ["acp-answer", "jev-run"] {
-        let (code, headers, error) = selected_json(
-            app.clone(),
-            "POST",
-            &format!("{b_prefix}/questions/{packet}/{action}"),
-            serde_json::json!({}),
-        )
-        .await;
-        assert_eq!(code, axum::http::StatusCode::NOT_FOUND, "{error}");
-        assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
-    }
-    let response = serde_json::json!({"answer":{"packetId":packet,"summary":[{"text":"Returns 1.",
-        "citations":[{"path":"core.js","startLine":1,"endLine":1,
-            "quote":"function selected_root() { return 1; }"}]}],
-        "branches":[],"limitations":[]},"estimatedUsd":0.01});
-    fs::write(temp.path().join("acp-response.json"), response.to_string()).unwrap();
-    let (code, _, answer) = selected_json(
-        app.clone(),
-        "POST",
-        &format!("{a_prefix}/questions/{packet}/acp-answer"),
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::OK, "{answer}");
-    assert_eq!(answer["packetId"], packet);
-    assert_eq!(answer["source"], "liveAcp");
-    use axum::{body::Body, http::Request};
-    use tower::ServiceExt;
-    for (host, authorization, origin, expected) in [
-        (
-            "127.0.0.1:7331",
-            "",
-            "",
-            axum::http::StatusCode::UNAUTHORIZED,
-        ),
-        (
-            "example.invalid",
-            "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "",
-            axum::http::StatusCode::FORBIDDEN,
-        ),
-        (
-            "127.0.0.1:7331",
-            "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "https://example.invalid",
-            axum::http::StatusCode::FORBIDDEN,
-        ),
-    ] {
-        let response = app
-            .clone()
-            .oneshot({
-                let mut request = Request::builder()
-                    .uri(format!("{b_prefix}/jev/status"))
-                    .header("host", host);
-                if !authorization.is_empty() {
-                    request = request.header("authorization", authorization);
-                }
-                if !origin.is_empty() {
-                    request = request.header("origin", origin);
-                }
-                request.body(Body::empty()).unwrap()
-            })
-            .await
-            .unwrap();
-        assert_eq!(response.status(), expected);
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert!(!response.headers().contains_key("X-Trellis-Workspace"));
-    }
-    for suffix in ["jev/status", "acp/status", "dependencies", "rust-sources"] {
-        let (code, headers, _) =
-            selected_json(app.clone(), "GET", &format!("/api/{suffix}"), Value::Null).await;
-        assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
-        assert!(!headers.contains_key("X-Trellis-Workspace"));
-    }
-}
-
-#[tokio::test]
 async fn production_browser_rejects_every_selector_free_checkout_route_without_attachment() {
     use std::sync::Arc;
     use trellis::{
@@ -2936,6 +2044,8 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
     // implicit default is allowed merely because selection is unambiguous.
     let old_routes = [
         ("GET", "/api/status"),
+        ("GET", "/api/git"),
+        ("GET", "/api/git/diff?path=core.js"),
         ("GET", "/api/tree"),
         ("GET", "/api/files"),
         ("GET", "/api/methods"),
@@ -3147,14 +2257,14 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
                 .any(|file| file["path"] == "core.js"),
             "{files}"
         );
-        let (code, headers, provider) = selected_json(
+        let (code, headers, dependencies) = selected_json(
             app.clone(),
             "GET",
-            &format!("{prefix}/jev/status"),
+            &format!("{prefix}/dependencies"),
             Value::Null,
         )
         .await;
-        assert_eq!(code, axum::http::StatusCode::OK, "{provider}");
+        assert_eq!(code, axum::http::StatusCode::OK, "{dependencies}");
         assert_eq!(headers["X-Trellis-Workspace"], first.root.to_str().unwrap());
         assert!(headers.contains_key("X-Trellis-Catching-Up"));
         let (code, headers, mutation) = selected_json(

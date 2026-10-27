@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use trellis::indexer::{IndexOptions, index_workspace};
 #[cfg(feature = "test-support")]
 #[test]
-fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
+fn real_syntax_rename_retires_old_identity_and_cached_graph_preserves_call_order() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let state = temp.path().join("state");
@@ -38,13 +38,7 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     )
     .unwrap();
     assert_eq!(store.graph().unwrap(), graph);
-    store
-        .put_annotation(&Annotation {
-            id: "note".into(),
-            node_id: old_id.clone(),
-            body: "belongs to first".into(),
-        })
-        .unwrap();
+
     let query = ViewQuery {
         seed: old_id.clone(),
         depth: 1,
@@ -74,11 +68,7 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
         &cancel,
     )
     .unwrap();
-    assert!(store.annotations().unwrap()[0].orphaned);
-    assert_eq!(
-        store.annotations().unwrap()[0].annotation.body,
-        "belongs to first"
-    );
+    assert!(store.symbol(&old_id).unwrap().is_none());
 }
 
 #[test]

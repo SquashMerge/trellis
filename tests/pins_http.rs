@@ -87,7 +87,7 @@ fn query(pin: IndexPin) -> String {
 }
 #[tokio::test]
 async fn optional_endpoint_matrix() {
-    let (_temp, store, _graph, app, id) = fixture();
+    let (_temp, store, _graph, app, _id) = fixture();
     let pin = store.status().unwrap().revision;
     let old = IndexPin {
         index_generation: pin.index_generation,
@@ -97,14 +97,9 @@ async fn optional_endpoint_matrix() {
         "/api/files",
         "/api/methods?path=Types.java",
         "/api/classes",
-        "/api/symbol?",
         "/api/source?path=Types.java",
     ] {
-        let path = if path.ends_with('?') {
-            format!("{path}id={id}")
-        } else {
-            path.to_owned()
-        };
+        let path = path.to_owned();
         assert_eq!(call(&app, "GET", &path, Value::Null).await.0, 200, "{path}");
         let separator = if path.contains('?') { '&' } else { '?' };
         let pinned = format!("{path}{separator}{}", query(pin));
@@ -227,9 +222,9 @@ async fn recreated_index_rejects_old_generation_at_reused_numeric_revision() {
 
 #[tokio::test]
 async fn producer_endpoint_matrix() {
-    let (_temp, store, _graph, app, id) = fixture();
+    let (_temp, store, _graph, app, _id) = fixture();
     let pin = store.status().unwrap().revision;
-    for path in ["/api/status", "/api/tree", "/api/symbols?q=run"] {
+    for path in ["/api/status", "/api/tree"] {
         let (status, value) = call(&app, "GET", path, Value::Null).await;
         assert_eq!(status, 200, "{path}: {value}");
         assert_eq!(value["revision"], json!(pin));
@@ -246,20 +241,6 @@ async fn producer_endpoint_matrix() {
             400
         );
     }
-    let (status, result) = call(&app, "POST", "/api/query", json!({"seed":id})).await;
-    assert_eq!(status, 200);
-    assert_eq!(result["revision"], json!(pin));
-    assert_eq!(
-        call(
-            &app,
-            "POST",
-            "/api/query",
-            json!({"seed":id,"expectedRevision":pin})
-        )
-        .await
-        .0,
-        400
-    );
 }
 #[tokio::test]
 async fn required_endpoint_matrix() {
@@ -291,19 +272,11 @@ async fn required_endpoint_matrix() {
             "/api/class-diagram",
             json!({"seed":class.symbol.id,"expectedRevision":pin}),
         ),
-        (
-            "/api/questions/preview",
-            json!({"seed":id,"question":"What runs?","expectedRevision":pin}),
-        ),
     ];
     for (path, body) in selectors {
         let (status, value) = call(&app, "POST", path, body.clone()).await;
         assert_eq!(status, 200, "{path}: {value}");
-        let response_pin = if path == "/api/questions/preview" {
-            &value["packet"]["revision"]
-        } else {
-            &value["revision"]
-        };
+        let response_pin = &value["revision"];
         assert_eq!(*response_pin, json!(pin));
         for bad in [
             json!(1),

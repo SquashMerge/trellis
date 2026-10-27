@@ -64,9 +64,7 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
         .unwrap();
     let response = app.clone().oneshot(req).await.unwrap();
     let code = response.status();
-    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
-        .await
-        .unwrap();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 #[tokio::test]
@@ -148,17 +146,22 @@ async fn validation_and_limit() {
         assert_eq!(call(&app, "GET", path, Value::Null).await.0, 400)
     }
     assert_eq!(
-        call(&app, "POST", "/api/query", json!({"seed":"x","depth":6}))
-            .await
-            .0,
+        call(
+            &app,
+            "POST",
+            "/api/sequence",
+            json!({"seed":"x","expectedRevision":6})
+        )
+        .await
+        .0,
         400
     );
     assert_eq!(
         call(
             &app,
-            "PUT",
-            "/api/views/test",
-            json!({"id":"other","title":"v","query":{"seed":"x"}})
+            "POST",
+            "/api/navigation",
+            json!({"path":"../secret","line":1})
         )
         .await
         .0,
@@ -497,9 +500,13 @@ async fn local_design_assets_preserve_same_origin_guards() {
     for (path, mime) in [
         ("/shell.js", "text/javascript; charset=utf-8"),
         ("/fonts/jetbrains-mono-latin.woff2", "font/woff2"),
-        ("/fonts/space-grotesk-latin.woff2", "font/woff2"),
+        ("/fonts/inter-variable.woff2", "font/woff2"),
+        ("/fonts/manrope-variable.woff2", "font/woff2"),
         ("/fonts/JetBrainsMono-OFL.txt", "text/plain; charset=utf-8"),
-        ("/fonts/SpaceGrotesk-OFL.txt", "text/plain; charset=utf-8"),
+        ("/fonts/Inter-OFL.txt", "text/plain; charset=utf-8"),
+        ("/fonts/Manrope-OFL.txt", "text/plain; charset=utf-8"),
+        ("/brand/trellis-mark-transparent-v1.png", "image/png"),
+        ("/brand/trellis-logo-dark-v1.webp", "image/webp"),
     ] {
         let response = app
             .clone()
@@ -519,13 +526,31 @@ async fn local_design_assets_preserve_same_origin_guards() {
             .to_str()
             .unwrap();
         assert!(csp.contains("font-src 'self'"));
+        assert!(csp.contains("img-src 'self' data:"));
         assert!(!csp.contains("unsafe-inline"));
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         if mime == "font/woff2" {
             assert_eq!(&bytes[..4], b"wOF2");
+        } else if mime == "image/png" {
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        } else if mime == "image/webp" {
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WEBP");
         } else if path.ends_with("OFL.txt") {
             assert!(String::from_utf8_lossy(&bytes).contains("SIL OPEN FONT LICENSE"));
         }
+        let bad_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("host", "evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), 403);
         let bad = app
             .clone()
             .oneshot(
@@ -540,12 +565,16 @@ async fn local_design_assets_preserve_same_origin_guards() {
             .unwrap();
         assert_eq!(bad.status(), 403);
     }
-    assert_eq!(
-        call(&app, "GET", "/fonts/missing.woff2", Value::Null)
-            .await
-            .0,
-        404
-    );
+    for path in [
+        "/fonts/missing.woff2",
+        "/fonts/inter-latin.woff2",
+        "/fonts/manrope-latin.woff2",
+        "/fonts/space-grotesk-latin.woff2",
+        "/fonts/SpaceGrotesk-OFL.txt",
+        "/brand/missing.png",
+    ] {
+        assert_eq!(call(&app, "GET", path, Value::Null).await.0, 404);
+    }
 }
 
 #[tokio::test]
@@ -565,7 +594,6 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
             |_| {},
         )
         .unwrap();
-        let symbol_id = graph.nodes[0].id.clone();
         let pin = store
             .publish_native(
                 &graph,
@@ -603,7 +631,7 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
                 )
                 .unwrap();
                 format!(
-                    "/api/symbol?id={symbol_id}&indexGeneration={}&indexRevision={}",
+                    "/api/files?indexGeneration={}&indexRevision={}",
                     pin.index_generation, pin.index_revision
                 )
             }
@@ -965,7 +993,7 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
 }
 
 #[tokio::test]
-async fn expired_pin_saved_items_require_explicit_head_reattachment() {
+async fn expired_pin_reads_require_an_explicit_head_request() {
     // Control retention with the explicit clock and forced ticks below.
     let (dir, store, state, app) = setup_without_tick();
     let workspace = dir.path().join("workspace");
@@ -1009,32 +1037,15 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
             pin.index_revision
         )
     };
-    let view = json!({"id":"saved-view","title":"Saved", "query":{"seed":seed}});
-    let note = json!({"id":"saved-note","nodeId":seed,"body":"Durable note"});
-    for (route, payload) in [
-        ("/api/views/saved-view", &view),
-        ("/api/annotations/saved-note", &note),
-    ] {
-        let (status, saved) = call(&app, "PUT", &pin_route(route, old), payload.clone()).await;
-        assert_eq!(status, StatusCode::OK, "{saved}");
-        assert_eq!(saved["attachment"]["result"]["status"], "attached");
-    }
     let head = publish(old); // identical source and measured IDs, but a different revision.
     assert_eq!(store.status().unwrap().revision, head);
     store.set_retention_clock_for_tests(1_900, 900);
     state.force_retention_idle_tick_for_tests().unwrap();
     for (method, route, payload) in [
         ("GET", "/api/source?path=a.js", Value::Null),
-        ("GET", "/api/symbol?id=missing", Value::Null),
         ("GET", "/api/files", Value::Null),
         ("GET", "/api/methods?path=a.js", Value::Null),
         ("GET", "/api/classes", Value::Null),
-        ("POST", "/api/query", json!({"seed":seed})),
-        ("GET", "/api/views", Value::Null),
-        ("GET", "/api/views/saved-view", Value::Null),
-        ("GET", "/api/annotations", Value::Null),
-        ("PUT", "/api/views/saved-view", view.clone()),
-        ("PUT", "/api/annotations/saved-note", note.clone()),
     ] {
         let (status, body) = call(&app, method, &pin_route(route, old), payload).await;
         assert_eq!(status, StatusCode::CONFLICT, "{method} {route}: {body}");
@@ -1052,15 +1063,6 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "pin_expired");
-    let (status, body) = call(
-        &app,
-        "POST",
-        "/api/questions/preview",
-        json!({"seed":seed,"question":"What does seed do?", "expectedRevision":old}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], "pin_expired");
     let foreign = IndexPin {
         index_generation: uuid::Uuid::new_v4(),
         ..old
@@ -1070,7 +1072,7 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
         ..old
     };
     for invalid in [foreign, missing] {
-        for route in ["/api/views/saved-view", "/api/annotations"] {
+        for route in ["/api/files", "/api/source?path=a.js"] {
             let (status, body) = call(&app, "GET", &pin_route(route, invalid), Value::Null).await;
             assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
             assert_eq!(
@@ -1079,29 +1081,11 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
             );
         }
     }
-    // An explicit head read, not a retry at the expired pin, is the only reattachment.
-    for (route, expected) in [
-        ("/api/views/saved-view", &view),
-        ("/api/annotations", &note),
-    ] {
+    // An explicit head read must succeed without falling back from the expired pin.
+    for route in ["/api/files", "/api/source?path=a.js"] {
         let (status, body) = call(&app, "GET", &pin_route(route, head), Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let attached = if route == "/api/annotations" {
-            &body[0]
-        } else {
-            &body
-        };
-        assert_eq!(
-            attached["attachment"]["result"]["status"], "attached",
-            "{body}"
-        );
-        let durable = if route == "/api/annotations" {
-            &attached["annotation"]
-        } else {
-            &attached["view"]
-        };
-        assert_eq!(durable["id"], expected["id"]);
-        assert_eq!(attached["indexRevision"], head.index_revision);
+        assert_eq!(body["revision"], json!(head));
     }
     assert_eq!(store.status().unwrap().revision, head);
 }
@@ -1251,8 +1235,16 @@ async fn pele_assets_are_local_and_keep_csp() {
             include_bytes!("../web/sequence-pele.js").as_slice(),
         ),
         (
-            "/vendor/pele-1.6.0.js",
-            include_bytes!("../web/vendor/pele-1.6.0.js").as_slice(),
+            "/vendor/pele-1.10.0-trellis.2.js",
+            include_bytes!("../web/vendor/pele-1.10.0-trellis.2.js").as_slice(),
+        ),
+        (
+            "/treemap.js",
+            include_bytes!("../web/treemap.js").as_slice(),
+        ),
+        (
+            "/treemap-pele.js",
+            include_bytes!("../web/treemap-pele.js").as_slice(),
         ),
     ] {
         let req = Request::builder()
@@ -1283,8 +1275,8 @@ async fn pele_assets_are_local_and_keep_csp() {
     assert_eq!(
         format!(
             "{:x}",
-            Sha256::digest(include_bytes!("../web/vendor/pele-1.6.0.js"))
+            Sha256::digest(include_bytes!("../web/vendor/pele-1.10.0-trellis.2.js"))
         ),
-        "b82d1bcd435302779a945e1e0f4a54ea56fb26e010ce3f2122f4216fcfc095d7"
+        "bb4220ed66550152469e0e9a3afb6c532d5812ad62c45126234ed2ca42a0ccea"
     );
 }

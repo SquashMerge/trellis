@@ -250,8 +250,8 @@ def db_for(home):
 
 
 def published(db, output, size):
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 24,
-            "mixed performance requires schema24")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 25,
+            "mixed performance requires schema25")
     index_result = json.loads(output)
     pin = index_result["publishedRevision"]
     revision = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
@@ -595,7 +595,8 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema24 tables, immutable surrogate keys, and current pin normalization.
+# schema25 tables, immutable surrogate keys, and current pin normalization.
+# Match tests/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
 native_source_sets native_source_set_languages native_source_set_dependencies
@@ -603,6 +604,7 @@ native_revisions revision_capture_inputs document_versions
 graph_projections graph_nodes graph_display_labels
 class_projections classes class_relations
 revision_documents native_version_coverage_roles native_version_declarations
+native_version_search_cards head_search_fts
 native_version_declaration_ancestors native_version_own_signature_types native_version_ancestor_signature_types
 native_version_headers native_version_header_items native_version_parameters
 native_version_references native_version_capability_families native_version_capability_gaps
@@ -619,6 +621,8 @@ semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_rela
 semantic_raw_captures semantic_revision_raw_selections semantic_raw_proofs semantic_raw_documents semantic_import_reports
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
+FTS_SHADOW_TABLES = {"head_search_fts_config", "head_search_fts_content", "head_search_fts_data",
+                     "head_search_fts_docsize", "head_search_fts_idx"}
 DEBT_TABLES = {"native_revision_release_debt", "native_release_candidate_versions",
                "native_release_candidate_graphs", "native_release_candidate_classes"}
 
@@ -635,21 +639,26 @@ def typed_cells(value):
 
 def parity_digest(db, revision, physical_root):
     view = SelectedView(db, revision, physical_root)
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 24, "selected parity requires schema24")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == 25, "selected parity requires schema25")
     generation, number = revision.removeprefix("pin:v1:").rsplit(":", 1)
     require(db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
             == (generation, int(number)), "parity pin is not frozen head")
     require(db.execute("PRAGMA foreign_key_check").fetchone() is None, "retained evidence foreign-key violation")
     tables = {row[0] for row in db.execute("""SELECT name FROM sqlite_master WHERE type='table'
         AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%'""")}
-    require(tables == REQUIRED_TABLES | CONTROL_TABLES,
-            f"schema24 selected inventory mismatch: missing={REQUIRED_TABLES|CONTROL_TABLES-tables}, "
-            f"extra={tables-REQUIRED_TABLES-CONTROL_TABLES}")
+    expected_tables = REQUIRED_TABLES | CONTROL_TABLES | FTS_SHADOW_TABLES
+    require(tables == expected_tables,
+            f"schema25 selected inventory mismatch: missing={expected_tables-tables}, "
+            f"extra={tables-expected_tables}")
     output = {}
     selected = "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?"
-    for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES):
+    # FTS shadow segment bytes depend on publication history, not selected output.
+    for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES - FTS_SHADOW_TABLES):
         if table == "native_revisions":
             where = "id=?"
+        elif table == "head_search_fts":
+            # Read the entire corpus: filtering by selected vid would hide stale rows.
+            where = "? IS NOT NULL"
         elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
                        "semantic_requested_producers", "semantic_requested_producer_languages",
                        "semantic_coverage", "semantic_revision_raw_selections"}:
@@ -700,7 +709,7 @@ def parity_digest(db, revision, physical_root):
                      "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
                      "AND r.producer_id=selected.producer_id)")
         else:
-            raise RuntimeError(f"unclassified schema24 selected table: {table}")
+            raise RuntimeError(f"unclassified schema25 selected table: {table}")
         columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
         require(columns, f"empty table schema: {table}")
         digest, count = hashlib.sha256(), 0
@@ -719,6 +728,17 @@ def parity_digest(db, revision, physical_root):
     require(output["native_revisions"]["rows"] == 1
             and output["revision_documents"]["rows"] in (1000, 10000),
             "selected native corpus incomplete")
+    # Exact logical corpus equality, including multiplicity, as in tests/cli.rs.
+    # Card keys are unique; equal counts plus both set differences reject missing,
+    # extra, duplicate, stale-version, or altered-term FTS rows.
+    require(output["head_search_fts"]["rows"] == output["native_version_search_cards"]["rows"],
+            "logical head search corpus/card count mismatch")
+    cards = ("SELECT terms,vid,syntax_id FROM native_version_search_cards WHERE vid IN "
+             "(SELECT vid FROM revision_documents WHERE revision_id=?)")
+    corpus = "SELECT terms,vid,syntax_id FROM head_search_fts"
+    for query in (f"{corpus} EXCEPT {cards}", f"{cards} EXCEPT {corpus}"):
+        require(db.execute(query, (revision,)).fetchone() is None,
+                "logical head search corpus differs from selected version cards")
     # Root-derived opaque hashes cannot be compared byte-for-byte across roots.
     # Bind each normalized role to a complete, independently hashed input closure;
     # every input table above retains every selected row and column.
@@ -917,7 +937,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-24 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-25 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)

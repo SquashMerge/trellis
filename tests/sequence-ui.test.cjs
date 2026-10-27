@@ -518,16 +518,16 @@ test("Pele projection keeps human labels separate from encoded Mermaid and refus
   }
 });
 
-test("frozen real Pele 1.6.0 sequence and grammar output remain byte-identical", () => {
+test("frozen real Pele 1.10.0-trellis.2 sequence and grammar output remain byte-identical", () => {
   const sandbox = {};
-  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0.js", "utf8"), sandbox);
+  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.10.0-trellis.2.js", "utf8"), sandbox);
   assert.equal(typeof sandbox.pele.render, "function");
   for (const name of ["sequence", "representative"]) {
-    const source = fs.readFileSync(`tests/fixtures/pele-1.6.0/${name}.mmd`, "utf8");
+    const source = fs.readFileSync(`tests/fixtures/pele-1.10.0-trellis.2/${name}.mmd`, "utf8");
     const output = sandbox.pele.render(source).svg;
-    assert.equal(output, fs.readFileSync(`tests/fixtures/pele-1.6.0/${name}.svg`, "utf8"));
+    assert.equal(output, fs.readFileSync(`tests/fixtures/pele-1.10.0-trellis.2/${name}.svg`, "utf8"));
   }
-  const actual = fs.readFileSync("tests/fixtures/pele-1.6.0/sequence.svg", "utf8");
+  const actual = fs.readFileSync("tests/fixtures/pele-1.10.0-trellis.2/sequence.svg", "utf8");
   assert.deepEqual([...actual.matchAll(/class="pele-note" data-id="(i\d+)"/g)].map(match => match[1]),
     ["i0", "i1", "i2", "i3", "i4", "i5", "i6", "i8", "i10"]);
   assert.match(actual, /class="pele-frame pele-frame-alt"/);
@@ -552,7 +552,7 @@ test("negative control: original step identity check detects altered projector",
 
 test("pinned Pele renders all four producer Mermaid sources and bounded near-cap input", () => {
   const sandbox = {};
-  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.6.0.js", "utf8"), sandbox);
+  vm.runInNewContext(fs.readFileSync("web/vendor/pele-1.10.0-trellis.2.js", "utf8"), sandbox);
   const adapter = peleProjector();
   for (const language of ["javascript", "rust", "java", "python"]) {
     const projection = adapter.project(peleFixture(language));
@@ -576,7 +576,7 @@ test("pinned Pele renders all four producer Mermaid sources and bounded near-cap
 
 test("Pele rejects changed inline style and oversized SVG before DOMParser", async () => {
   const source = fs.readFileSync("web/sequence-pele.js", "utf8");
-  const frozen = fs.readFileSync("tests/fixtures/pele-1.6.0/sequence.svg", "utf8");
+  const frozen = fs.readFileSync("tests/fixtures/pele-1.10.0-trellis.2/sequence.svg", "utf8");
   const view = peleFixture("rust");
   let parses = 0;
   const sandbox = {window:{pele:{render:() => ({svg:frozen.replace("max-width:100%", "max-width:200%")})}},
@@ -612,11 +612,11 @@ test("real Chromium validates pinned SVG and source note identity under unchange
     page.on("pageerror", error => errors.push(error.message));
     await page.route("http://127.0.0.1:43987/**", route => {
       const path = new URL(route.request().url()).pathname;
-      const assets = {"/vendor/pele-1.6.0.js":"web/vendor/pele-1.6.0.js", "/sequence-pele.js":"web/sequence-pele.js"};
+      const assets = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js"};
       if (assets[path]) return route.fulfill({status:200, contentType:"text/javascript; charset=utf-8", body:fs.readFileSync(assets[path])});
       if (path === "/test.css") return route.fulfill({status:200, contentType:"text/css", body:"#diagram { width:240px; height:110px; overflow:auto }"});
       return route.fulfill({status:200, contentType:"text/html; charset=utf-8", body:
-        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.6.0.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
+        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.10.0-trellis.2.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
     });
     await page.goto("http://127.0.0.1:43987/");
     await page.evaluate(() => document.addEventListener("securitypolicyviolation", event =>

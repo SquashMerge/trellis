@@ -31,7 +31,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v9";
+pub(crate) const NATIVE_VERSION: &str = "native-v11";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -537,6 +537,9 @@ pub struct Artifact {
     pub control_regions: Vec<ControlRegion>,
     pub references: Vec<Reference>,
     pub capability_reports: Vec<CapabilityReport>,
+    /// Search-only capture; never part of the native evidence wire shape.
+    #[serde(skip)]
+    pub search_cards: Vec<crate::search_capture::CapturedCard>,
 }
 
 fn stable_witness_rows<'a, T: Serialize + 'a>(
@@ -736,6 +739,7 @@ pub(crate) fn measure_fixture(
         control_regions: vec![],
         references: vec![],
         capability_reports: vec![],
+        search_cards: Vec::new(),
     };
     let mut ids = IdentityRegistry::default();
     let mut witnesses = FixtureHeaderWitnesses::new();
@@ -956,6 +960,7 @@ fn build_native_header<'a>(
         control_regions: vec![],
         references: vec![],
         capability_reports: vec![],
+        search_cards: Vec::new(),
     };
     Ok((artifact, files))
 }
@@ -1120,6 +1125,7 @@ fn build_native_with(
             artifact.control_regions.extend(shell.control_regions);
             artifact.references.extend(shell.references);
             artifact.capability_reports.extend(shell.capability_reports);
+            artifact.search_cards.extend(shell.search_cards);
             on_extract(&document.key);
         }
     }
@@ -1134,6 +1140,7 @@ fn build_native_with(
 struct SpoolFactsRef<'a> {
     artifact: &'a Artifact,
     references: SpoolReferencesRef<'a>,
+    search_cards: &'a [crate::search_capture::CapturedCard],
 }
 
 struct SpoolReferencesRef<'a>(&'a [Reference]);
@@ -1166,6 +1173,7 @@ impl Serialize for SpoolReferencesRef<'_> {
 struct SpoolFacts {
     artifact: Artifact,
     references: Vec<SpoolReference>,
+    search_cards: Vec<crate::search_capture::CapturedCard>,
 }
 
 #[derive(Deserialize)]
@@ -1220,6 +1228,7 @@ fn encode_spool_facts(mut artifact: Artifact, document: &Document) -> Result<Vec
     serde_json::to_vec(&SpoolFactsRef {
         artifact: &artifact,
         references: SpoolReferencesRef(&references),
+        search_cards: &artifact.search_cards,
     })
     .context("encode native spool facts")
 }
@@ -1275,7 +1284,9 @@ impl FullDocumentSpool {
         let SpoolFacts {
             mut artifact,
             references,
+            search_cards,
         } = serde_json::from_slice(&facts)?;
+        artifact.search_cards = search_cards;
         ensure!(
             artifact.references.is_empty()
                 && artifact.revision.documents.is_empty()
@@ -1566,6 +1577,7 @@ fn spool_full_capture_with(
         control_regions: Vec::new(),
         references: Vec::new(),
         capability_reports: Vec::new(),
+        search_cards: Vec::new(),
     };
     let documents = &spool.header.revision.documents;
     let pairs: Vec<(&SourceFile, &Document)> = files.into_iter().zip(documents).collect();
@@ -1661,6 +1673,7 @@ pub struct SelectedDocument {
     pub control_regions: Vec<ControlRegion>,
     pub references: Vec<Reference>,
     pub capability_report: CapabilityReport,
+    pub search_cards: Vec<crate::search_capture::CapturedCard>,
 }
 
 /// Extract only the selected admitted source; all header fields retain the full
@@ -1747,6 +1760,7 @@ pub(crate) fn measure_captured_document(
         control_regions: artifact.control_regions,
         references: artifact.references,
         capability_report: artifact.capability_reports.remove(0),
+        search_cards: artifact.search_cards,
     })
 }
 
@@ -1918,6 +1932,7 @@ pub(crate) fn assemble_selected_revision(
         artifact.control_regions.extend(entry.control_regions);
         artifact.references.extend(entry.references);
         artifact.capability_reports.push(entry.capability_report);
+        artifact.search_cards.extend(entry.search_cards);
     }
     artifact.validate_structure(&capture.files)?;
     capture.verify(cancel)?;
@@ -2568,6 +2583,13 @@ fn extract_known_with_witnesses(
     let module_id=ids.stable(&json!({"sourceSet":a.source_set.id,"path":f.path,"language":f.language,"ancestors":[],"declaration":module_key}))?;
     // A file-level inner `#![cfg(test)]` makes the whole document test code.
     let file_test = test_path(&f.path) || local_test_marker(tree.root_node(), f);
+    let mut module_range = Range::node(tree.root_node());
+    if !f.text.is_empty() && module_range.start == module_range.end {
+        module_range = Range {
+            start: 0,
+            end: f.text.len(),
+        };
+    }
     a.declarations.push(Declaration {
         syntax_id: module_id.clone(),
         role: declaration_role(file_test),
@@ -2578,7 +2600,7 @@ fn extract_known_with_witnesses(
         lookup_key: None,
         ancestors: vec![],
         key: module_key,
-        range: Range::node(tree.root_node()),
+        range: module_range,
         name_range: None,
         header: Header {
             kind: "module".into(),
@@ -2591,7 +2613,9 @@ fn extract_known_with_witnesses(
         },
         provenance_id: proof_id.clone(),
     });
+    let declaration_start = a.declarations.len() - 1;
     let mut state = ParserState {
+        search_nodes: BTreeMap::new(),
         call_start: a.calls.len(),
         control_start: a.control_regions.len(),
         reference_start: a.references.len(),
@@ -2623,6 +2647,16 @@ fn extract_known_with_witnesses(
         (file_test, false),
     )?;
     state.finish_occurrences()?;
+    state
+        .artifact
+        .search_cards
+        .extend(crate::search_capture::capture(
+            tree.root_node(),
+            f,
+            &state.artifact.declarations[declaration_start..],
+            &state.artifact.calls[state.call_start..],
+            &state.search_nodes,
+        )?);
     state.artifact.capability_reports.push(CapabilityReport {
         document: state.document.clone(),
         revision_id: state.artifact.revision.id.clone(),
@@ -2689,6 +2723,7 @@ fn occurrence_input<'a>(
     }
 }
 struct ParserState<'a> {
+    search_nodes: BTreeMap<usize, String>,
     artifact: &'a mut Artifact,
     call_start: usize,
     control_start: usize,
@@ -2918,6 +2953,7 @@ impl ParserState<'_> {
                 }
             }
             self.saw_definition |= k != "module";
+            self.search_nodes.insert(n.id(), id.clone());
             self.artifact.declarations.push(Declaration {
                 syntax_id: id.clone(),
                 role: declaration_role(test_context),
@@ -3836,7 +3872,7 @@ mod borrowed_witness_tests {
         let expected = digest(b"trellis.native-version-witness.v1\0", &bytes);
         assert_eq!(
             expected,
-            "2a7e943da6efa71b84150964c5efd59fc30275a9466912893fcb3e0c29abe053"
+            "50ecc8c8f7a610f77b2dd5d9bf9f3e5c4efa3b7a3c2027e603d636e260cbed14"
         );
         assert_eq!(witness(&f).unwrap(), expected);
         let declarations: Vec<_> = f.declarations.iter().collect();
@@ -3972,6 +4008,7 @@ mod occurrence_identity_tests {
             control_regions: vec![],
             references: vec![],
             capability_reports: vec![],
+            search_cards: Vec::new(),
         };
         let document = artifact.revision.documents[0].clone();
         extract_known(

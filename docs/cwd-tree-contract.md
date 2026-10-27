@@ -6,12 +6,12 @@ No source execution, provider calls, credential reads, or budget changes.
 
 Daemon browse root: explicit CLI --browse-root (optional); defaults to process cwd captured
 at startup. Existing API constructors/tests can default to IndexOptions.root; add
-new_with_browser_root(store,options,token,address,jev,acp,browse_root:PathBuf) for CLI.
+new_with_browser_root(store,options,token,address,browse_root:PathBuf) for CLI.
 Root is immutable for server lifetime; client cannot choose an absolute root. Label it in UI.
 Current configured index workspace is a nested feature-factory sample under Trellis cwd;
 map tree file absolute paths inside that workspace back to relative indexedPath when present
 in cache. Other files remain visible, labeled not indexed; never fabricate methods for Rust/etc.
-No implicit indexing or new workspace switch. Existing saved views/budgets stay bound to sample.
+No implicit indexing or new workspace switch. Retired saved views/budgets remain in place and ignored.
 
 GET /api/tree?path=<relative directory, default empty>&offset=0&limit=200
 -> {root:String,indexedWorkspace:String,path:String,revision:u64,items:[{name:String,path:String,kind:String,indexedPath:Option<String>,methodCount:Option<usize>}],nextOffset:Option<usize>,truncated:bool}
@@ -29,4 +29,4 @@ or Unsupportedlanguage hint ONLYifknown. Explain indexedWorkspace!=root (indexsa
 showingempty/no-methods falsely. Existing graph/schema unaffected. Filter optional labelwhatitfilters.
 Per-directory pagination and independent generation guards. Keep file/directory expansion/selection
 onrerender andsameRevisionrefresh; clearonroot/session/revisionchange. Directory rawfilenames safeDOM.
-Never convert this into filesystem source/execution capability forACP/Jev.
+Never convert this into arbitrary filesystem source/execution capability.

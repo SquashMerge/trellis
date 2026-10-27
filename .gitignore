@@ -9,6 +9,8 @@ __pycache__/
 .DS_Store
 
 /target/
+# tools/verify's tests lane builds with CARGO_TARGET_DIR=<target>-test-support.
+/target-test-support/
 /.trellis/
 /.factory-sandboxes/
 .factory/

@@ -1,0 +1,10 @@
+{
+  "name": "trellis-mcp-conformance-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "ajv": "8.20.0"
+  }
+}

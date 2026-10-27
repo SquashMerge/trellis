@@ -4,6 +4,8 @@ pub mod causal_witness;
 pub mod client;
 pub mod protocol;
 pub mod registry;
+pub mod search;
+pub mod search_fill;
 
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};

@@ -1,5 +1,4 @@
 mod common;
-use std::collections::BTreeMap;
 #[cfg(feature = "test-support")]
 use std::{
     collections::BTreeSet,
@@ -54,7 +53,7 @@ fn private_stage_build_is_unpublished_and_cleans_only_its_own_inode() {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!((version, metadata_version), (24, 24));
+        assert_eq!((version, metadata_version), (25, 25));
         for name in [
             "document_versions",
             "revision_documents",
@@ -246,6 +245,8 @@ fn call(id: &str, from: &str, to: &str) -> CallSite {
         provenance: node("").provenance,
     }
 }
+
+#[cfg(feature = "test-support")]
 fn query() -> ViewQuery {
     serde_json::from_str(r#"{"seed":"a"}"#).unwrap()
 }
@@ -716,7 +717,7 @@ fn query_view_structurally_sorts_then_limits_then_excludes() {
     // ordering of the three stages in the implementation as approved in S-3.
     let source = include_str!("../src/store.rs");
     let method = source.split_once("fn query_view_in_for(").unwrap().1;
-    let method = method.split_once("pub fn put_view(").unwrap().0;
+    let method = method.split_once("\n    }\n").unwrap().0;
     let sort = method
         .find("ordered.sort_by(crate::indexer::compare_reader_calls)")
         .unwrap();
@@ -731,148 +732,8 @@ fn query_view_structurally_sorts_then_limits_then_excludes() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn durable_user_data_survives_cache_loss_and_resolves_orphans() {
-    let (state, work, store) = fixture();
-    write_source(&work);
-    let captured = bundle(&store, &work);
-    let leader = store.publication_for_tests().unwrap();
-    publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-    let a = symbol_id(&captured.0, "a");
-    let b = symbol_id(&captured.0, "b");
-    let annotation = Annotation {
-        id: "note".into(),
-        node_id: a.clone(),
-        body: "hello".into(),
-    };
-    store.put_annotation(&annotation).unwrap();
-    let mut view_query = query();
-    view_query.seed = a.clone();
-    let view = SavedView {
-        id: "view".into(),
-        title: "Title".into(),
-        query: view_query,
-        pins: BTreeMap::from([("missing".into(), Position { x: 1., y: 2. })]),
-        hidden: vec![b.clone()],
-    };
-    store.put_view(&view).unwrap();
-    let saved_note = store.annotations().unwrap().remove(0);
-    assert!(saved_note.orphaned);
-    assert_eq!(
-        saved_note.attachment.availability,
-        AttachmentAvailability::Anchorless
-    );
-    let saved_view = store.views().unwrap().remove(0);
-    assert!(saved_view.orphaned_ids.contains(&a));
-    assert!(saved_view.orphaned_ids.contains(&"missing".into()));
-    assert_eq!(
-        saved_view.attachment.availability,
-        AttachmentAvailability::Anchorless
-    );
-    drop(leader);
-    drop(store);
-    std::fs::remove_file(index_db(state.path())).unwrap();
-    let store = crate::common::open_store(state.path(), work.path()).unwrap();
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
-    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
-    let unavailable_note = store.annotations().unwrap().remove(0);
-    assert!(unavailable_note.orphaned);
-    assert_eq!(
-        unavailable_note.attachment.availability,
-        AttachmentAvailability::IndexUnavailable
-    );
-    assert_eq!(unavailable_note.annotation, annotation);
-    let orphaned = store.view("view").unwrap().unwrap().orphaned_ids;
-    assert_eq!(orphaned.len(), 3);
-    assert!(orphaned.contains(&a) && orphaned.contains(&b) && orphaned.contains(&"missing".into()));
-    let saved = store.views().unwrap();
-    assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].view, view);
-    assert_eq!(saved[0].orphaned_ids.len(), 3);
-    assert_eq!(
-        saved[0]
-            .orphaned_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([a.clone(), b.clone(), "missing".into()])
-    );
-    let fresh = bundle(&store, &work);
-    let leader = store.publication_for_tests().unwrap();
-    publish_bundle(&store, &fresh, store.index_baseline().unwrap(), &leader);
-    let restored_note = store.annotations().unwrap().remove(0);
-    assert!(restored_note.orphaned);
-    assert_eq!(
-        restored_note.attachment.availability,
-        AttachmentAvailability::Anchorless
-    );
-    // Public graph-only writes cannot remove indexed symbols.
-    let expected = store.status().unwrap().revision;
-    assert!(
-        store
-            .publish(&Graph::default(), &leader, expected, &cancel())
-            .unwrap_err()
-            .to_string()
-            .contains("native_evidence_required")
-    );
-    std::fs::write(
-        work.path().join("a.js"),
-        "function c() {}
-",
-    )
-    .unwrap();
-    let removed = bundle(&store, &work);
-    publish_bundle(&store, &removed, store.index_baseline().unwrap(), &leader);
-    assert!(store.annotations().unwrap()[0].orphaned);
-    assert!(store.delete_annotation("note").unwrap());
-    assert!(!store.delete_annotation("note").unwrap());
-    assert!(store.delete_view("view").unwrap());
-    assert!(store.view("view").unwrap().is_none());
-    let mut invalid = view;
-    invalid
-        .pins
-        .insert(a.clone(), Position { x: f64::NAN, y: 0. });
-    assert!(store.put_view(&invalid).is_err());
-    assert!(
-        store
-            .put_annotation(&Annotation {
-                id: "".into(),
-                node_id: a,
-                body: "".into()
-            })
-            .is_err()
-    );
-}
-
-#[test]
-#[cfg(feature = "test-support")]
-fn live_current_decode_failure_hard_latches_saved_views() {
-    let seed_records = |store: &Store| {
-        store
-            .put_annotation(&Annotation {
-                id: "legacy-note".into(),
-                node_id: "a".into(),
-                body: "durable annotation".into(),
-            })
-            .unwrap();
-        store
-            .put_view(&SavedView {
-                id: "legacy-view".into(),
-                title: "Durable view".into(),
-                query: query(),
-                pins: BTreeMap::from([("missing".into(), Position { x: 1., y: 2. })]),
-                hidden: vec!["b".into()],
-            })
-            .unwrap();
-    };
-
+fn live_current_decode_failure_hard_latches_shared_reads() {
     let (stats_state, stats_work, stats_store) = fixture();
-    seed_records(&stats_store);
     write_source(&stats_work);
     let captured = bundle(&stats_store, &stats_work);
     let session = stats_store.writer_session_for_tests().unwrap();
@@ -882,21 +743,15 @@ fn live_current_decode_failure_hard_latches_saved_views() {
         stats_store.index_baseline().unwrap(),
         session.writer_guard().unwrap(),
     );
-    assert_eq!(
-        stats_store.annotations().unwrap()[0].annotation.id,
-        "legacy-note"
-    );
-    assert_eq!(
-        stats_store.view("legacy-view").unwrap().unwrap().view.id,
-        "legacy-view"
-    );
+    assert_eq!(stats_store.status().unwrap().revision.index_revision, 1);
+    assert!(stats_store.source("a.js").unwrap().is_some());
     let stats_clone = stats_store.clone();
     let stats_path = index_db(stats_state.path());
     let stats_db = rusqlite::Connection::open(&stats_path).unwrap();
     stats_db
         .execute("UPDATE index_metadata SET stats='not-json'", [])
         .unwrap();
-    let first = stats_store.annotations().unwrap_err();
+    let first = stats_store.symbols("a", 10).unwrap_err();
     assert!(
         first.to_string().starts_with("incompatible_index:")
             && format!("{first:#}").contains("native header/control graph metadata mismatch"),
@@ -904,14 +759,14 @@ fn live_current_decode_failure_hard_latches_saved_views() {
     );
     assert!(stats_store.recovery_pending_for_tests());
     for closed in [
-        stats_store.view("legacy-view").unwrap_err(),
-        stats_clone.view("legacy-view").unwrap_err(),
-        stats_clone.views().unwrap_err(),
+        stats_store.status().unwrap_err(),
+        stats_clone.source("a.js").unwrap_err(),
+        stats_clone.query_view(&query()).unwrap_err(),
     ] {
         assert_eq!(
             closed.to_string(),
             "incompatible_index: reconciliation required after invalid current index",
-            "every selected saved read must reject the latched corrupt current head"
+            "every selected shared read must reject the latched corrupt current head"
         );
     }
     drop(stats_clone);
@@ -993,17 +848,12 @@ fn concurrent_publish_cas_has_one_winner() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn durable_orphan_fallback_does_not_mask_current_index_corruption() {
+fn current_reconcile_options_corruption_rejects_selected_reads() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
     let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-    let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"saved","title":"Saved","query":{"seed":"missing"}
-    }))
-    .unwrap();
-    store.put_view(&saved).unwrap();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.execute(
@@ -1011,7 +861,10 @@ fn durable_orphan_fallback_does_not_mask_current_index_corruption() {
         [],
     )
     .unwrap();
-    for error in [store.views().unwrap_err(), clone.view("saved").unwrap_err()] {
+    for error in [
+        store.symbols("a", 10).unwrap_err(),
+        clone.source("a.js").unwrap_err(),
+    ] {
         assert!(
             error.to_string().contains("incompatible_index"),
             "{error:#}"
@@ -1024,43 +877,13 @@ fn durable_orphan_fallback_does_not_mask_current_index_corruption() {
 }
 
 #[test]
-fn durable_storage_io_failure_is_never_converted_to_orphan_success() {
-    let (state, _work, store) = fixture();
-    let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"durable-io","title":"Durable IO","query":{"seed":"missing"}
-    }))
-    .unwrap();
-    store.put_view(&saved).unwrap();
-    let record = state.path().join("data/workspaces").join(store.root_id());
-    let database = record.join("workspace.db");
-    let retained = record.join("workspace.db.retained");
-    std::fs::rename(&database, &retained).unwrap();
-    std::fs::create_dir(&database).unwrap();
-    let error = store.views().unwrap_err();
-    assert!(!error.to_string().contains("index_not_ready"), "{error:#}");
-    std::fs::remove_dir(&database).unwrap();
-    std::fs::rename(&retained, &database).unwrap();
-}
-
-#[test]
 #[cfg(feature = "test-support")]
-fn selected_root_mismatch_never_enables_durable_orphans() {
+fn selected_root_mismatch_rejects_shared_reads() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
     let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-    let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"root-mismatch","title":"Root mismatch","query":{"seed":"missing"}
-    }))
-    .unwrap();
-    let annotation = Annotation {
-        id: "root-note".into(),
-        node_id: "missing".into(),
-        body: "keep".into(),
-    };
-    store.put_view(&saved).unwrap();
-    store.put_annotation(&annotation).unwrap();
     drop(leader);
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.execute(
@@ -1076,7 +899,12 @@ fn selected_root_mismatch_never_enables_durable_orphans() {
         acquisition.to_string().contains("root_changed"),
         "{acquisition:#}"
     );
-    for error in [store.views().unwrap_err(), store.annotations().unwrap_err()] {
+    for error in [
+        store.status().unwrap_err(),
+        store.symbols("a", 10).unwrap_err(),
+        store.source("a.js").unwrap_err(),
+        store.query_view(&query()).unwrap_err(),
+    ] {
         assert!(error.to_string().contains("root_changed"), "{error:#}");
         assert!(!error.to_string().contains("index_not_ready"), "{error:#}");
     }
@@ -1086,17 +914,12 @@ fn selected_root_mismatch_never_enables_durable_orphans() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn durable_orphans_after_cancelled_reconciliation_but_not_current_native_header_corruption() {
+fn cancelled_reconciliation_keeps_validated_prior_head_selected() {
     let (_state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
     let leader = store.publication_for_tests().unwrap();
-    publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-    let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"takeover","title":"Takeover","query":{"seed":"missing"}
-    }))
-    .unwrap();
-    store.put_view(&saved).unwrap();
+    let prior = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     drop(leader);
     let failed_takeover = store.writer_session_for_tests().unwrap();
     let coordinator = trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(
@@ -1122,62 +945,28 @@ fn durable_orphans_after_cancelled_reconciliation_but_not_current_native_header_
             .to_string()
             .contains("index_not_ready")
     );
-    // A canceled startup reconciliation keeps public status latched, but daemon-local selected
-    // evidence can still resolve the validated prior head and saved record.
+    // A canceled startup reconciliation keeps public status latched, but daemon-local
+    // selected evidence can still read the validated prior head.
     let selected = store.evidence_response_daemon_local().unwrap();
-    let orphan = selected.saved_view_at("takeover", None).unwrap().unwrap();
+    assert_eq!(selected.status().unwrap().revision, prior);
+    let (revision, source) = selected.source_at("a.js", Some(prior)).unwrap().unwrap();
+    assert_eq!(revision, prior);
+    assert_eq!(source, captured.0.files[0]);
+    let a = symbol_id(&captured.0, "a");
+    let (revision, symbol) = selected.symbol_at(&a, Some(prior)).unwrap().unwrap();
+    assert_eq!(revision, prior);
+    assert_eq!(symbol.id, a);
     selected.finish(()).unwrap();
-    assert_eq!(orphan.view, saved);
-    assert_eq!(orphan.orphaned_ids, vec!["missing"]);
-
-    let (state, work, store) = fixture();
-    write_source(&work);
-    let captured = bundle(&store, &work);
-    let leader = store.publication_for_tests().unwrap();
-    publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-    store.put_view(&saved).unwrap();
-    let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
-    db.execute(
-        "UPDATE native_revisions SET graph_stats='{}' WHERE published_index_revision=1",
-        [],
-    )
-    .unwrap();
-    // Keep the independent SQLite connection open while this Store and its
-    // clone may hold SQLite locks on the same index inode.
-    let clone = store.clone();
-    let first = store.status().unwrap_err();
-    assert!(
-        first.to_string().contains("incompatible_index"),
-        "{first:#}"
-    );
-    for error in [
-        store.views().unwrap_err(),
-        clone.view("takeover").unwrap_err(),
-    ] {
-        assert!(
-            error.to_string().contains("incompatible_index"),
-            "{error:#}"
-        );
-    }
-    drop(leader);
-    drop(clone);
-    drop(store);
-    drop(db);
 }
 
 #[test]
 #[cfg(feature = "test-support")]
-fn wrong_current_native_header_latches_before_durable_orphan_fallback() {
+fn wrong_current_native_header_latches_shared_reads() {
     let (state, work, store) = fixture();
     write_source(&work);
     let captured = bundle(&store, &work);
     let leader = store.publication_for_tests().unwrap();
     publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-    let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"wrong-native-header","title":"Wrong native header","query":{"seed":"missing"}
-    }))
-    .unwrap();
-    store.put_view(&saved).unwrap();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.execute(
@@ -1192,11 +981,18 @@ fn wrong_current_native_header_latches_before_durable_orphan_fallback() {
         first.to_string().contains("incompatible_index"),
         "{first:#}"
     );
-    let latched = clone.views().unwrap_err();
-    assert!(
-        latched.to_string().contains("incompatible_index"),
-        "{latched:#}"
-    );
+    assert!(store.recovery_pending_for_tests());
+    for latched in [
+        store.symbols("a", 10).unwrap_err(),
+        clone.source("a.js").unwrap_err(),
+        clone.query_view(&query()).unwrap_err(),
+    ] {
+        assert_eq!(
+            latched.to_string(),
+            "incompatible_index: reconciliation required after invalid current index",
+            "{latched:#}"
+        );
+    }
     drop(leader);
     drop(clone);
     drop(store);
@@ -1207,20 +1003,24 @@ fn wrong_current_native_header_latches_before_durable_orphan_fallback() {
 #[cfg(feature = "test-support")]
 fn virgin_head_without_selected_revision_is_explicitly_not_ready() {
     let (state, work, store) = fixture();
-    let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"legacy","title":"Legacy","query":{"seed":"missing"}
-    }))
-    .unwrap();
-    store.put_view(&saved).unwrap();
     let leader = store.publication_for_tests().unwrap();
     // Acquiring a local publication guard must not create a selected revision.
     let before = std::fs::read(index_db(state.path())).unwrap();
     let error = store.status().unwrap_err();
     assert!(error.to_string().contains("index_not_ready"), "{error:#}");
     assert!(!error.to_string().contains("no such column"), "{error:#}");
-    let orphan = store.view("legacy").unwrap().unwrap();
-    assert_eq!(orphan.view, saved);
-    assert_eq!(orphan.orphaned_ids, vec!["missing"]);
+    for error in [
+        store.source("a.js").unwrap_err(),
+        store.symbols("a", 10).unwrap_err(),
+        store.query_view(&query()).unwrap_err(),
+        store
+            .evidence_response_daemon_local()
+            .err()
+            .expect("virgin head must not select a revision"),
+    ] {
+        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
+    }
+    assert_eq!(store.index_baseline().unwrap().index_revision, 0);
     assert_eq!(std::fs::read(index_db(state.path())).unwrap(), before);
     drop(leader);
     drop(work);
@@ -1565,190 +1365,7 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
 
 #[test]
 #[cfg(feature = "test-support")]
-fn removed_or_renamed_anchor_documents_are_missing_without_poisoning_saved_lists() {
-    for rename in [false, true] {
-        let (_state, work, store) = fixture();
-        std::fs::write(
-            work.path().join("a.js"),
-            "function stable() { return 1; }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            work.path().join("b.js"),
-            "function target() { return 2; }\n",
-        )
-        .unwrap();
-        let captured = bundle(&store, &work);
-        let leader = store.publication_for_tests().unwrap();
-        let stable = captured
-            .1
-            .declarations
-            .iter()
-            .find(|row| row.document.path == "a.js" && row.name.as_deref() == Some("stable"))
-            .unwrap()
-            .syntax_id
-            .clone();
-        let target = captured
-            .1
-            .declarations
-            .iter()
-            .find(|row| row.document.path == "b.js" && row.name.as_deref() == Some("target"))
-            .unwrap()
-            .syntax_id
-            .clone();
-        let first = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-        let saved_view = |id: &str, title: &str, seed: &str| SavedView {
-            id: id.into(),
-            title: title.into(),
-            query: ViewQuery {
-                seed: seed.into(),
-                ..query()
-            },
-            pins: BTreeMap::new(),
-            hidden: vec![],
-        };
-        let missing_view = store
-            .save_view_at(first, &saved_view("target-view", "Target", &target))
-            .unwrap();
-        let stable_view = store
-            .save_view_at(first, &saved_view("stable-view", "Stable", &stable))
-            .unwrap();
-        let missing_note = store
-            .save_annotation_at(
-                first,
-                &AnnotationRequest {
-                    id: "target-note".into(),
-                    node_id: target.clone(),
-                    body: "target note".into(),
-                    title: None,
-                },
-            )
-            .unwrap();
-        let stable_note = store
-            .save_annotation_at(
-                first,
-                &AnnotationRequest {
-                    id: "stable-note".into(),
-                    node_id: stable,
-                    body: "stable note".into(),
-                    title: None,
-                },
-            )
-            .unwrap();
-        let missing_view_anchor = missing_view.view.anchor.unwrap().get().to_owned();
-        let stable_view_anchor = stable_view.view.anchor.unwrap().get().to_owned();
-        let missing_note_anchor = missing_note.annotation.anchor.unwrap().get().to_owned();
-        let stable_note_anchor = stable_note.annotation.anchor.unwrap().get().to_owned();
-
-        if rename {
-            std::fs::rename(work.path().join("b.js"), work.path().join("renamed.js")).unwrap();
-        } else {
-            std::fs::remove_file(work.path().join("b.js")).unwrap();
-        }
-        let fresh = bundle(&store, &work);
-        let second = publish_bundle(&store, &fresh, first, &leader);
-
-        let views = store.saved_views_at(Some(second)).unwrap();
-        assert_eq!(views.len(), 2, "rename={rename}");
-        let missing = views
-            .iter()
-            .find(|state| state.view.id == "target-view")
-            .unwrap();
-        assert_eq!(
-            missing.attachment.availability,
-            AttachmentAvailability::Ready,
-            "rename={rename}"
-        );
-        assert_eq!(
-            missing.attachment.result.as_ref().unwrap().status,
-            AnchorStatus::Orphaned,
-            "rename={rename}"
-        );
-        assert_eq!(
-            missing.attachment.result.as_ref().unwrap().reason,
-            AnchorReason::Missing,
-            "rename={rename}"
-        );
-        assert_eq!(
-            missing.view.anchor.as_deref().unwrap().get(),
-            missing_view_anchor,
-            "rename={rename}"
-        );
-        let unaffected = views
-            .iter()
-            .find(|state| state.view.id == "stable-view")
-            .unwrap();
-        assert_eq!(
-            unaffected.attachment.result.as_ref().unwrap().status,
-            AnchorStatus::Attached,
-            "rename={rename}"
-        );
-        assert_eq!(
-            unaffected.view.anchor.as_deref().unwrap().get(),
-            stable_view_anchor,
-            "rename={rename}"
-        );
-        let opened = store
-            .saved_view_at("target-view", Some(second))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            opened.attachment.result.as_ref().unwrap().reason,
-            AnchorReason::Missing,
-            "rename={rename}"
-        );
-        assert_eq!(
-            opened.view.anchor.as_deref().unwrap().get(),
-            missing_view_anchor,
-            "rename={rename}"
-        );
-
-        let notes = store.saved_annotations_at(Some(second)).unwrap();
-        assert_eq!(notes.len(), 2, "rename={rename}");
-        let missing = notes
-            .iter()
-            .find(|state| state.annotation.id == "target-note")
-            .unwrap();
-        assert_eq!(
-            missing.attachment.availability,
-            AttachmentAvailability::Ready,
-            "rename={rename}"
-        );
-        assert_eq!(
-            missing.attachment.result.as_ref().unwrap().status,
-            AnchorStatus::Orphaned,
-            "rename={rename}"
-        );
-        assert_eq!(
-            missing.attachment.result.as_ref().unwrap().reason,
-            AnchorReason::Missing,
-            "rename={rename}"
-        );
-        assert_eq!(
-            missing.annotation.anchor.as_deref().unwrap().get(),
-            missing_note_anchor,
-            "rename={rename}"
-        );
-        let unaffected = notes
-            .iter()
-            .find(|state| state.annotation.id == "stable-note")
-            .unwrap();
-        assert_eq!(
-            unaffected.attachment.result.as_ref().unwrap().status,
-            AnchorStatus::Attached,
-            "rename={rename}"
-        );
-        assert_eq!(
-            unaffected.annotation.anchor.as_deref().unwrap().get(),
-            stable_note_anchor,
-            "rename={rename}"
-        );
-    }
-}
-
-#[test]
-#[cfg(feature = "test-support")]
-fn same_path_different_association_is_missing_but_dangling_revision_fails_closed() {
+fn dangling_selected_revision_fails_closed() {
     let (state, work, store) = fixture();
     std::fs::write(
         work.path().join("b.js"),
@@ -1757,95 +1374,10 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
     .unwrap();
     let captured = bundle(&store, &work);
     let leader = store.publication_for_tests().unwrap();
-    let target = captured
-        .1
-        .declarations
-        .iter()
-        .find(|row| row.document.path == "b.js" && row.name.as_deref() == Some("target"))
-        .unwrap()
-        .syntax_id
-        .clone();
     let pin = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
-    store
-        .save_view_at(
-            pin,
-            &SavedView {
-                id: "association".into(),
-                title: "Association".into(),
-                query: ViewQuery {
-                    seed: target,
-                    ..query()
-                },
-                pins: BTreeMap::new(),
-                hidden: vec![],
-            },
-        )
-        .unwrap();
-
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
-            .unwrap();
-    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
-        state.path().join("cache"),
-        state.path().join("data"),
-    );
-    let records = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
-    let original_payload: String = records
-        .query_row(
-            "SELECT payload FROM views WHERE id='association'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let mut changed_association: serde_json::Value =
-        serde_json::from_str(&original_payload).unwrap();
-    changed_association["anchor"]["document"]["sourceSetId"] =
-        serde_json::json!("source-set:v1:changed");
-    let changed_anchor = serde_json::value::to_raw_value(&changed_association["anchor"])
-        .unwrap()
-        .get()
-        .to_owned();
-    records
-        .execute(
-            "UPDATE views SET payload=?1 WHERE id='association'",
-            [serde_json::to_string(&changed_association).unwrap()],
-        )
-        .unwrap();
-
-    let listed = store.saved_views_at(Some(pin)).unwrap();
-    let listed = listed
-        .iter()
-        .find(|state| state.view.id == "association")
-        .unwrap();
-    assert_eq!(
-        listed.attachment.availability,
-        AttachmentAvailability::Ready
-    );
-    assert_eq!(
-        listed.attachment.result.as_ref().unwrap().status,
-        AnchorStatus::Orphaned
-    );
-    assert_eq!(
-        listed.attachment.result.as_ref().unwrap().reason,
-        AnchorReason::Missing
-    );
-    assert_eq!(listed.view.anchor.as_deref().unwrap().get(), changed_anchor);
-    let opened = store
-        .saved_view_at("association", Some(pin))
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        opened.attachment.result.as_ref().unwrap().reason,
-        AnchorReason::Missing
-    );
-    assert_eq!(opened.view.anchor.as_deref().unwrap().get(), changed_anchor);
-
-    records
-        .execute(
-            "UPDATE views SET payload=?1 WHERE id='association'",
-            [&original_payload],
-        )
-        .unwrap();
+    let before = store.source_at("b.js", Some(pin)).unwrap().unwrap();
+    assert_eq!(before.0, pin);
+    assert_eq!(before.1.text, captured.0.files[0].text);
     let cache = rusqlite::Connection::open(index_db(state.path())).unwrap();
     cache.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
     cache
@@ -1853,14 +1385,14 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
         .unwrap();
     cache.execute_batch("PRAGMA foreign_keys=ON").unwrap();
 
-    let first = store.saved_views_at(Some(pin)).unwrap_err();
+    let first = store.source_at("b.js", Some(pin)).unwrap_err();
     let first_detail = format!("{first:#}");
     assert_eq!(
         first_detail,
-        "incompatible_index: selected native version missing"
+        "incompatible_index: selected source version absent"
     );
     assert!(store.recovery_pending_for_tests());
-    let second = store.saved_view_at("association", Some(pin)).unwrap_err();
+    let second = store.query_view(&query()).unwrap_err();
     assert_eq!(
         second.to_string(),
         "incompatible_index: reconciliation required after invalid current index",
@@ -1869,48 +1401,17 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
     drop(leader);
     drop(store);
     drop(cache);
-    drop(records);
 }
 
 #[test]
-fn saved_reads_without_records_are_conservative_and_write_nothing() {
-    let (state, work, store) = fixture();
-    let cache = index_db(state.path());
-    let before = std::fs::read(&cache).unwrap();
-    assert!(store.views().unwrap().is_empty());
-    assert!(store.annotations().unwrap().is_empty());
-    assert!(store.view("missing").unwrap().is_none());
-    assert_eq!(
-        std::fs::read(&cache).unwrap(),
-        before,
-        "saved reads changed the cache database"
-    );
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
-            .unwrap();
-    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
-        state.path().join("cache"),
-        state.path().join("data"),
-    );
-    assert!(
-        !roots.record_db(&identity).exists(),
-        "saved reads created a durable database"
-    );
-}
-
-#[test]
-fn partial_v8_bootstrap_never_turns_saved_records_into_index_unavailable() {
+fn partial_v8_bootstrap_rejects_shared_reads() {
     let (state, _work, store) = fixture();
-    let saved: SavedView = serde_json::from_value(serde_json::json!({
-        "id":"saved","title":"Durable","query":{"seed":"missing"}
-    }))
-    .unwrap();
-    store.put_view(&saved).unwrap();
-    let unavailable = store.view("saved").unwrap().unwrap();
-    assert_eq!(unavailable.view, saved);
-    assert_eq!(
-        unavailable.attachment.availability,
-        AttachmentAvailability::IndexUnavailable
+    assert!(
+        store
+            .status()
+            .unwrap_err()
+            .to_string()
+            .contains("index_not_ready")
     );
     let db = rusqlite::Connection::open(index_db(state.path())).unwrap();
     db.execute(
@@ -1919,107 +1420,17 @@ fn partial_v8_bootstrap_never_turns_saved_records_into_index_unavailable() {
     )
     .unwrap();
     let clone = store.clone();
-    let first = store.views().unwrap_err();
+    let first = store.symbols("a", 10).unwrap_err();
     assert!(
         first.to_string().contains("incompatible_index"),
         "{first:#}"
     );
-    let closed = clone.view("saved").unwrap_err();
+    let closed = clone.source("a.js").unwrap_err();
     assert!(
         closed.to_string().contains("incompatible_index"),
         "{closed:#}"
     );
     drop(clone);
-    drop(store);
-    drop(db);
-}
-
-#[test]
-fn malformed_persisted_anchors_fail_closed_without_an_index() {
-    let (state, work, store) = fixture();
-    let view = SavedView {
-        id: "view-malformed".into(),
-        title: "View".into(),
-        query: query(),
-        pins: BTreeMap::new(),
-        hidden: vec![],
-    };
-    let note = Annotation {
-        id: "note-malformed".into(),
-        node_id: "node".into(),
-        body: "body".into(),
-    };
-    store.put_view(&view).unwrap();
-    store.put_annotation(&note).unwrap();
-    let identity =
-        trellis::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
-            .unwrap();
-    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
-        state.path().join("cache"),
-        state.path().join("data"),
-    );
-    let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
-    let original_view: String = db
-        .query_row("SELECT payload FROM views WHERE id=?1", [&view.id], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let original_note: String = db
-        .query_row(
-            "SELECT payload FROM annotations WHERE id=?1",
-            [&note.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let malformed_anchor = serde_json::json!({
-        "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef",
-        "document":{"sourceSetId":"set","language":"typescript","path":"../escape.rs"},
-        "capturedRevisionId":"revision",
-        "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "siblingGroupHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "siblingCount":1,"identicalHeaderCount":1
-    });
-    let mut malformed_view: serde_json::Value = serde_json::from_str(&original_view).unwrap();
-    malformed_view["anchor"] = malformed_anchor.clone();
-    db.execute(
-        "UPDATE views SET payload=?1 WHERE id=?2",
-        rusqlite::params![serde_json::to_string(&malformed_view).unwrap(), view.id],
-    )
-    .unwrap();
-    assert!(
-        store
-            .views()
-            .unwrap_err()
-            .to_string()
-            .contains("invalid durable anchor")
-    );
-    assert!(
-        store
-            .view("view-malformed")
-            .unwrap_err()
-            .to_string()
-            .contains("invalid durable anchor")
-    );
-    db.execute(
-        "UPDATE views SET payload=?1 WHERE id=?2",
-        rusqlite::params![original_view, view.id],
-    )
-    .unwrap();
-
-    let mut malformed_note: serde_json::Value = serde_json::from_str(&original_note).unwrap();
-    malformed_note["anchor"] = malformed_anchor;
-    db.execute(
-        "UPDATE annotations SET payload=?1 WHERE id=?2",
-        rusqlite::params![serde_json::to_string(&malformed_note).unwrap(), note.id],
-    )
-    .unwrap();
-    assert!(
-        store
-            .annotations()
-            .unwrap_err()
-            .to_string()
-            .contains("invalid durable anchor")
-    );
     drop(store);
     drop(db);
 }

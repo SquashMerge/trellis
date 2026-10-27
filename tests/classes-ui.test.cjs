@@ -22,7 +22,7 @@ function harness({navigation = false} = {}) {
   let request = async (url, options) => options ? diagram() : {revision,items:[definition("A")],nextOffset:null,warnings:[],truncated:false};
   const document = {activeElement:null, addEventListener(type, fn) { (docListeners[type] ||= []).push(fn); }};
   function element(tagName) {
-    const n = {tagName, textContent:"", className:"", attrs:{},dataset:{},style:{},children:[],listeners:{},parentNode:null,value:"",checked:false,disabled:false,tabIndex:-1,
+    const n = {tagName, textContent:"", className:"", attrs:{},dataset:{},style:{},children:[],listeners:{},parentNode:null,value:"",checked:false,disabled:false,tabIndex:-1,scrollTop:0,scrollLeft:0,
       setAttribute(k,v) { this.attrs[k] = String(v); if(k==="class")this.className=String(v); },
       getAttribute(k) {return this.attrs[k];},
       get isConnected() {return this === document.body || !!this.parentNode?.isConnected;},
@@ -134,7 +134,7 @@ test("menu keyboard navigation skips disabled items, clamps viewport, and restor
 });
 test("visible touch menu and ContextMenu key work; scroll dismisses",async()=>{
  const h=harness();await h.controller.open({seed:"A"});await h.button(h.card("A"),"⋯").fire("click");assert.ok(h.menu());
- await h.event("scroll",h.get("classes-diagram"));assert.equal(h.menu(),null);
+ h.get("classes-diagram").scrollTop++;await h.event("scroll",h.get("classes-diagram"));assert.equal(h.menu(),null);
  await h.card("A").fire("keydown",{key:"ContextMenu"});assert.ok(h.menu());await h.menu().fire("keydown",{key:"Tab"});assert.equal(h.menu(),null);
 });
 test("stale open responses, revision responses and old actions do not affect new view",async()=>{
@@ -238,6 +238,8 @@ test("queued pre-menu scroll is ignored but actual subsequent scrolling dismisse
   const h=harness(), anchor=h.get("file-trigger"), parent=anchor.parentNode;
   parent.scrollTop=100;parent.scrollLeft=0;
   h.controller.showContextMenu({currentTarget:anchor,preventDefault(){},stopPropagation(){}},[{label:"Class diagram",run(){}}]);
+  const sibling=h.get("file-tree");sibling.scrollTop=40;
+  await h.event("scroll",sibling);assert.ok(h.menu());
   await h.event("scroll",parent);assert.ok(h.menu());
   parent.scrollTop=101;await h.event("scroll",parent);assert.equal(h.menu(),null);
 });
@@ -442,7 +444,7 @@ for(const dismissal of ["focus","escape","outside","scroll","reset"])test(`share
  if(dismissal==="focus")h.get("other-anchor").focus();
  if(dismissal==="escape")await h.menu().fire("keydown",{key:"Escape"});
  if(dismissal==="outside")await h.event("pointerdown",h.get("other-anchor"));
- if(dismissal==="scroll")await h.event("scroll",h.get("classes-diagram"));
+ if(dismissal==="scroll"){anchor.scrollTop++;await h.event("scroll",anchor);}
  if(dismissal==="reset")h.controller.reset();
  assert.equal(h.menu(),null);assert.deepEqual(reasons,["dismiss"]);
 });

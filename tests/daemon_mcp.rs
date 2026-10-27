@@ -1384,7 +1384,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
                         socket,
                         "{relay} {}",
                         json!({"jsonrpc":"2.0","id":1,"result":{
-                            "protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+                            "protocolVersion":"2025-11-25","capabilities":{"tools":{},"prompts":{}},
                             "serverInfo":{"name":"trellis","version":"fixture"}}
                         })
                     )

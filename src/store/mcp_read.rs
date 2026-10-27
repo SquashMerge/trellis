@@ -416,6 +416,8 @@ impl EvidenceResponse {
         hash: &str,
         provenance: &crate::native_evidence::Provenance,
     ) -> Result<McpCheckedSource> {
+        #[cfg(test)]
+        super::count_selected_read(|counts| counts.source_reads += 1);
         use sha2::{Digest, Sha256};
         let scope =
             v8_native_scope_for(&self.db, &declaration.document, selected)?.ok_or_else(|| {
@@ -518,7 +520,6 @@ impl EvidenceResponse {
         limit: usize,
         expected: Option<IndexPin>,
     ) -> Result<McpFind> {
-        use crate::native_evidence::{DocumentKey, Provenance};
         #[cfg(feature = "test-support")]
         if self
             .store
@@ -535,6 +536,62 @@ impl EvidenceResponse {
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"
         );
+        let scope = self.mcp_find_scope(&selected, &mut || Ok(()))?;
+        let hits = super::symbol_trigrams::w2_hits(
+            &self.db,
+            &selected.key,
+            query,
+            i64::try_from(limit + 1)?,
+        )?;
+        let has_more = hits.len() > limit;
+        self.mcp_hydrate_find(
+            &selected,
+            &scope,
+            hits.into_iter().take(limit),
+            has_more,
+            &mut || Ok(()),
+        )
+    }
+}
+
+pub struct McpFindSymbolWithLines {
+    pub symbol: McpFindSymbol,
+    pub source: McpItemSource,
+}
+
+pub struct McpFindWithLines {
+    pub symbols: Vec<McpFindSymbolWithLines>,
+    pub scope: [[u64; 5]; 4],
+    pub provenance: Vec<crate::native_evidence::Provenance>,
+    pub has_more: bool,
+    pub pin: IndexPin,
+}
+
+impl EvidenceResponse {
+    pub fn mcp_find_with_lines(
+        &self,
+        query: &str,
+        limit: usize,
+        expected: Option<IndexPin>,
+    ) -> Result<McpFindWithLines> {
+        let found = self.mcp_find(query, limit, expected)?;
+        self.mcp_find_lines(found, &mut || Ok(()))
+    }
+}
+
+pub(super) struct McpFindScope {
+    pub counts: [[u64; 5]; 4],
+    coverage: BTreeMap<String, crate::native_evidence::Coverage>,
+    scopes: BTreeMap<String, V8NativeScope>,
+}
+
+impl EvidenceResponse {
+    pub(super) fn mcp_find_scope(
+        &self,
+        selected: &ReadRevision,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<McpFindScope> {
+        use crate::native_evidence::DocumentKey;
         // Include manifest rows without native declarations, including failed and unselected rows.
         let keys = self
             .db
@@ -556,7 +613,8 @@ impl EvidenceResponse {
         let mut coverage = BTreeMap::new();
         let mut scopes = BTreeMap::new();
         for key in keys {
-            let scope = v8_native_scope_for(&self.db, &key, &selected)?.ok_or_else(|| {
+            check()?;
+            let scope = v8_native_scope_for(&self.db, &key, selected)?.ok_or_else(|| {
                 self.corrupt_evidence("store_unavailable: missing native coverage scope")
             })?;
             let row = read_native_coverage_v8(&self.db, &scope)?;
@@ -631,13 +689,24 @@ impl EvidenceResponse {
                 counts[4] += 1;
             }
         }
-        let hits = super::symbol_trigrams::w2_hits(
-            &self.db,
-            &selected.key,
-            query,
-            i64::try_from(limit + 1)?,
-        )?;
-        let has_more = hits.len() > limit;
+        Ok(McpFindScope {
+            counts: scope_counts,
+            coverage,
+            scopes,
+        })
+    }
+
+    pub(super) fn mcp_hydrate_find(
+        &self,
+        selected: &ReadRevision,
+        scope: &McpFindScope,
+        hits: impl IntoIterator<Item = (String, String)>,
+        has_more: bool,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<McpFind> {
+        use crate::native_evidence::Provenance;
+        let scopes = &scope.scopes;
+        let coverage = &scope.coverage;
         let mut symbols = Vec::new();
         let mut provenance = Vec::new();
         let mut loaded: BTreeMap<
@@ -647,7 +716,8 @@ impl EvidenceResponse {
                 String,
             ),
         > = BTreeMap::new();
-        for (version, id) in hits.into_iter().take(limit) {
+        for (version, id) in hits {
+            check()?;
             let scope = scopes
                 .get(&version)
                 .ok_or_else(|| self.corrupt_evidence("store_unavailable: find scope absent"))?;
@@ -699,35 +769,18 @@ impl EvidenceResponse {
         provenance.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(McpFind {
             symbols,
-            scope: scope_counts,
+            scope: scope.counts,
             provenance,
             has_more,
             pin: selected.pin,
         })
     }
-}
 
-pub struct McpFindSymbolWithLines {
-    pub symbol: McpFindSymbol,
-    pub source: McpItemSource,
-}
-
-pub struct McpFindWithLines {
-    pub symbols: Vec<McpFindSymbolWithLines>,
-    pub scope: [[u64; 5]; 4],
-    pub provenance: Vec<crate::native_evidence::Provenance>,
-    pub has_more: bool,
-    pub pin: IndexPin,
-}
-
-impl EvidenceResponse {
-    pub fn mcp_find_with_lines(
+    pub(super) fn mcp_find_lines(
         &self,
-        query: &str,
-        limit: usize,
-        expected: Option<IndexPin>,
+        found: McpFind,
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<McpFindWithLines> {
-        let found = self.mcp_find(query, limit, expected)?;
         let selected = self
             .store
             .read_revision_for(&self.db, Some(found.pin), true)?;
@@ -745,8 +798,10 @@ impl EvidenceResponse {
             .take(found.symbols.len())
             .collect();
         for indexes in by_document.into_values() {
+            check()?;
             let mut source_cache = BTreeMap::new();
             for index in indexes {
+                check()?;
                 let symbol = &found.symbols[index];
                 let proof = found
                     .provenance
@@ -1673,8 +1728,14 @@ impl EvidenceResponse {
             .ok_or_else(|| {
                 self.corrupt_evidence("store_unavailable: incoming selected provenance absent")
             })?;
-        let selected_source =
-            self.mcp_document_version(&selected, &owner.declaration, &owner.content_hash, proof)?;
+        let mut source_cache = BTreeMap::new();
+        let selected_source = self.mcp_checked_source(
+            &mut source_cache,
+            &selected,
+            &owner.declaration,
+            &owner.content_hash,
+            proof,
+        )?;
         let owner_lines = selected_source.item(&owner.declaration.range)?;
         let mut calls = Vec::new();
         let mut same_name_declarations = 0;
@@ -1830,7 +1891,13 @@ impl EvidenceResponse {
                     freshness: "fresh".into(),
                     derived_from: None,
                 };
-                let checked = self.mcp_document_version(&selected, caller, hash, &provenance)?;
+                let checked = self.mcp_checked_source(
+                    &mut source_cache,
+                    &selected,
+                    caller,
+                    hash,
+                    &provenance,
+                )?;
                 let bytes = &checked.lines.bytes;
                 let text = std::str::from_utf8(bytes)
                     .map_err(|_| anyhow::anyhow!("store_unavailable: incoming source encoding"))?;

@@ -759,7 +759,7 @@ impl WatcherWork {
             self.last_inventory = std::time::Instant::now();
             self.retry_after = None;
             #[cfg(feature = "test-support")]
-            self.report_request_ack(store, certificate.batch.generation, pin);
+            self.report_request_pending(certificate.batch.generation);
         } else {
             self.last_accounted_pin = None;
             self.watch.require_full();
@@ -767,21 +767,15 @@ impl WatcherWork {
         Ok(())
     }
 
-    /// A request's covered generation settles like a watcher inventory: the
-    /// fixture witness announces it, then ACKs it once the FIFO is empty.
+    /// Announce request-covered intent; the worker ACKs after publishing status.
     #[cfg(feature = "test-support")]
-    fn report_request_ack(&mut self, store: &Store, generation: u64, pin: IndexPin) {
+    fn report_request_pending(&mut self, generation: u64) {
         let (Some(reporter), Some(lineage)) = (self.witness.clone(), self.causal_lineage()) else {
             return;
         };
         if self.witness_reported_generation != Some(generation) {
             reporter.watch_pending(lineage, generation);
             self.witness_reported_generation = Some(generation);
-        }
-        if !self.accepted_watch_intent(&self.options)
-            && matches!(store.earliest_unfinished_request(), Ok(None))
-        {
-            reporter.watch_ack(lineage, generation, pin, true);
         }
     }
 
@@ -1789,6 +1783,7 @@ fn run_semantic_request(
             let path = std::path::PathBuf::from(path);
             if !path.exists() {
                 let listener = UnixListener::bind(&path)?;
+                std::fs::write(path.with_extension("ready"), [])?;
                 let (_stream, _) = listener.accept()?;
             }
         }

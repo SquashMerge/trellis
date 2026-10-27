@@ -72,8 +72,8 @@ impl SelectionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckoutOptions(pub serde_json::Value);
 
-/// Values are retained as data. No browser provider or checkout descriptor is
-/// opened by registration; activation uses only its selected checkout's values.
+/// Values are retained as data. No checkout descriptor is opened by
+/// registration; activation uses only its selected checkout's values.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrowserOptions {
@@ -83,12 +83,6 @@ pub struct BrowserOptions {
     pub rust_library: Option<PathBuf>,
     pub trusted_rustc: Option<PathBuf>,
     pub cargo_home: Option<PathBuf>,
-    pub jev_budget_dir: Option<PathBuf>,
-    pub jev_budget_cents: Option<u64>,
-    pub jev_key: Option<String>,
-    pub acp_runner: Option<PathBuf>,
-    pub acp_state_dir: Option<PathBuf>,
-    pub acp_max_attempts: Option<u64>,
 }
 impl Default for BrowserOptions {
     fn default() -> Self {
@@ -99,12 +93,6 @@ impl Default for BrowserOptions {
             rust_library: None,
             trusted_rustc: None,
             cargo_home: None,
-            jev_budget_dir: None,
-            jev_budget_cents: None,
-            jev_key: None,
-            acp_runner: None,
-            acp_state_dir: None,
-            acp_max_attempts: None,
         }
     }
 }
@@ -179,6 +167,7 @@ impl CheckoutMetadata {
 struct BrowserCheckoutEntry {
     identity: CheckoutMetadata,
     active: bool,
+    runtime: Option<Arc<CheckoutRuntime>>,
     replacement_idle: bool,
     lost_reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -191,6 +180,7 @@ pub struct BrowserCheckoutsProbe {
 impl BrowserCheckoutsProbe {
     pub fn check(self) -> Vec<serde_json::Value> {
         let mut rows = std::collections::BTreeMap::new();
+        let mut replacements = HashSet::new();
         let roots = self
             .roots
             .clone()
@@ -229,9 +219,12 @@ impl BrowserCheckoutsProbe {
                             })
                 });
             let state = if replaced_available {
+                replacements.insert(key.clone());
                 "available"
             } else if !old_verified {
                 "unavailable"
+            } else if entry.runtime.is_some() {
+                "available"
             } else if index.as_ref().is_some_and(|index| index.is_file()) {
                 roots
                     .as_ref()
@@ -250,7 +243,7 @@ impl BrowserCheckoutsProbe {
                 }),
             );
         }
-        if let Ok(roots) = roots
+        if let Ok(roots) = &roots
             && let Ok(indexes) = fs::read_dir(roots.cache.join("indexes"))
         {
             for candidate in indexes.flatten() {
@@ -263,7 +256,7 @@ impl BrowserCheckoutsProbe {
                 {
                     continue;
                 }
-                let row = match Store::browser_index_root_existing(&roots, &key) {
+                let row = match Store::browser_index_root_existing(roots, &key) {
                     Ok(spelling)
                         if WorkspaceIdentity::discover_unattached(
                             Some(Path::new(&spelling)),
@@ -284,8 +277,96 @@ impl BrowserCheckoutsProbe {
                 rows.insert(key, row);
             }
         }
+        for (key, row) in &mut rows {
+            row["revision"] = serde_json::Value::Null;
+            row["catchingUp"] = serde_json::Value::Null;
+            row["indexError"] = serde_json::Value::Null;
+            if row["state"] != "available" {
+                row["indexError"] = row["state"].clone();
+                continue;
+            }
+            let entry = self.entries.get(key);
+            // A selectable replacement has no claim on its predecessor's pin.
+            if replacements.contains(key) {
+                row["indexError"] = serde_json::json!("index_not_ready");
+                continue;
+            }
+            let runtime = entry.and_then(|entry| entry.runtime.as_ref());
+            let observation = (|| {
+                if let Some(entry) = entry {
+                    entry.identity.rediscover()?;
+                }
+                if let Some(runtime) = runtime {
+                    let (response, catching_up) = runtime.evidence_response()?;
+                    let revision = response.status()?.revision;
+                    response.finish((revision, Some(catching_up)))
+                } else {
+                    let roots = roots
+                        .as_ref()
+                        .map_err(|_| anyhow::anyhow!("unavailable: topology roots unavailable"))?;
+                    let spelling = row["workspaceRoot"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("unavailable: checkout root unavailable"))?;
+                    let root = Path::new(spelling);
+                    let identity = WorkspaceIdentity::discover_unattached(Some(root), root)?
+                        .attach_existing_marker_readonly()?;
+                    anyhow::ensure!(
+                        identity.root_key == *key,
+                        "root_changed: checkout key changed"
+                    );
+                    let status = Store::status_existing_readonly(roots.clone(), identity)?;
+                    Ok((status.revision, None))
+                }
+            })();
+            match observation {
+                Ok((revision, catching_up)) => {
+                    row["revision"] = serde_json::json!(revision);
+                    row["catchingUp"] = serde_json::json!(catching_up);
+                }
+                Err(error) => {
+                    let code = browser_index_error(&error);
+                    row["indexError"] = serde_json::json!(code);
+                    if code == "index_not_ready" {
+                        row["catchingUp"] =
+                            serde_json::json!(runtime.map(|runtime| runtime.catching_up()));
+                    } else {
+                        row["state"] = serde_json::json!(match code {
+                            "storage_busy" => "storage_busy",
+                            "corrupt" => "corrupt",
+                            _ => "unavailable",
+                        });
+                    }
+                }
+            }
+        }
         rows.into_values().collect()
     }
+}
+
+fn browser_index_error(error: &anyhow::Error) -> &'static str {
+    if crate::store::transient_storage_contention(error) {
+        return "storage_busy";
+    }
+    for cause in error.chain() {
+        let text = cause.to_string();
+        for code in [
+            "root_changed",
+            "root_key_collision",
+            "workspace_id_changed",
+            "index_not_ready",
+        ] {
+            if text.starts_with(code) {
+                return code;
+            }
+        }
+        if text.starts_with("incompatible_index")
+            || text.starts_with("corrupt")
+            || text.starts_with("recovery_required: exceptional index format")
+        {
+            return "corrupt";
+        }
+    }
+    "unavailable"
 }
 
 /// Captured registry incarnations; preparation performs no registry mutation.
@@ -377,6 +458,8 @@ struct Entry {
 pub struct CheckoutRegistry {
     entries: HashMap<String, Entry>,
     roots: Option<TopologyRoots>,
+    search_fill: Option<Arc<super::search_fill::SearchFill>>,
+    search: Option<Arc<super::search::SearchService>>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
     idle_exit_at: Option<Instant>,
     clock_override: Option<Instant>,
@@ -387,8 +470,6 @@ pub struct CheckoutRegistry {
     test_after_due_release: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(feature = "test-support")]
     test_next_startup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(all(test, feature = "test-support"))]
-    test_jev_endpoint: Option<String>,
 }
 
 impl Default for CheckoutRegistry {
@@ -406,6 +487,8 @@ impl CheckoutRegistry {
         Self {
             entries: HashMap::new(),
             roots: None,
+            search_fill: None,
+            search: None,
             runtimes: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
             clock_override: None,
@@ -414,9 +497,16 @@ impl CheckoutRegistry {
             test_after_due_release: None,
             #[cfg(feature = "test-support")]
             test_next_startup_hook: None,
-            #[cfg(all(test, feature = "test-support"))]
-            test_jev_endpoint: None,
         }
+    }
+
+    /// Supply the daemon-wide fill owner before checkout activation.
+    pub fn set_search_fill(&mut self, search_fill: Arc<super::search_fill::SearchFill>) {
+        self.search_fill = Some(search_fill);
+    }
+
+    pub fn set_search_service(&mut self, search: Arc<super::search::SearchService>) {
+        self.search = Some(search);
     }
 
     /// Pause the next activation's startup reconciliation, installed before
@@ -431,11 +521,6 @@ impl CheckoutRegistry {
     #[doc(hidden)]
     pub fn set_after_due_release_for_tests(&mut self, hook: impl FnOnce() + Send + 'static) {
         self.test_after_due_release = Some(Box::new(hook));
-    }
-
-    #[cfg(all(test, feature = "test-support"))]
-    pub(crate) fn set_jev_endpoint_for_tests(&mut self, endpoint: String) {
-        self.test_jev_endpoint = Some(endpoint);
     }
 
     /// Supply isolated roots in fixtures. The default uses the user's normal
@@ -541,6 +626,7 @@ impl CheckoutRegistry {
             }))),
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing,
+            search: self.search.clone(),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
@@ -569,6 +655,9 @@ impl CheckoutRegistry {
         if let Some(hook) = self.test_next_startup_hook.take() {
             scheduler.set_startup_hook_for_tests(hook);
         }
+        if let Some(search_fill) = &self.search_fill {
+            scheduler.set_search_fill(search_fill.register(&scheduler));
+        }
         scheduler.begin_startup_reconciliation();
         Ok(runtime)
     }
@@ -588,38 +677,6 @@ impl CheckoutRegistry {
         options.max_file_bytes = config.max_file_bytes;
         let explicit_options =
             registration.is_some_and(|registered| registered.0.get("maxFileBytes").is_some());
-        let provider = match (config.jev_budget_dir, config.jev_budget_cents) {
-            (Some(dir), Some(cap)) => {
-                let key = config
-                    .jev_key
-                    .or_else(|| std::env::var("JEV_KEY").ok())
-                    .ok_or_else(|| anyhow::anyhow!("JEV_KEY must be configured"))?;
-                let live = crate::live_jev::LiveJev::open(&dir, key, cap, &options.workspace_root)?;
-                #[cfg(all(test, feature = "test-support"))]
-                let live = if let Some(endpoint) = &self.test_jev_endpoint {
-                    live.with_test_endpoint(endpoint.clone())
-                } else {
-                    live
-                };
-                Some(Arc::new(live))
-            }
-            _ => None,
-        };
-        let acp = match (
-            config.acp_runner,
-            config.acp_state_dir,
-            config.acp_max_attempts,
-        ) {
-            (Some(runner), Some(state_dir), Some(max_attempts)) => {
-                Some(Arc::new(crate::acp::Acp::open(crate::acp::AcpConfig {
-                    runner,
-                    state_dir,
-                    max_attempts,
-                    workspace: options.workspace_root.clone(),
-                })?))
-            }
-            _ => None,
-        };
         let browse_root = config
             .browse_root
             .unwrap_or_else(|| options.workspace_root.clone());
@@ -632,8 +689,6 @@ impl CheckoutRegistry {
                 cargo_home: config.cargo_home,
                 rust_library: config.rust_library,
             }),
-            provider,
-            acp,
         )
     }
 
@@ -789,6 +844,7 @@ impl CheckoutRegistry {
                         BrowserCheckoutEntry {
                             identity: entry.identity.clone(),
                             active: self.runtimes.contains_key(key),
+                            runtime: self.runtimes.get(key).cloned(),
                             replacement_idle: entry.released
                                 && !self.runtimes.contains_key(key)
                                 && entry.sessions.is_empty()
@@ -836,18 +892,6 @@ impl CheckoutRegistry {
         if !browse.is_dir() || !browse.is_absolute() {
             return Err(SelectionError::Unavailable);
         }
-        if config.jev_budget_dir.is_some() != config.jev_budget_cents.is_some()
-            || config.acp_runner.is_some() != config.acp_state_dir.is_some()
-            || config.acp_runner.is_some() != config.acp_max_attempts.is_some()
-            || config
-                .jev_budget_cents
-                .is_some_and(|cap| !(10..=500).contains(&cap))
-            || config
-                .acp_max_attempts
-                .is_some_and(|cap| !(1..=20).contains(&cap))
-        {
-            return Err(SelectionError::Unavailable);
-        }
         if config.rust_source_roots.len() > 8 {
             return Err(SelectionError::Unavailable);
         }
@@ -865,76 +909,6 @@ impl CheckoutRegistry {
                 return Err(SelectionError::Unavailable);
             }
         }
-        if let Some(dir) = &config.jev_budget_dir {
-            let environment_key = std::env::var("JEV_KEY").ok();
-            let key = config
-                .jev_key
-                .as_deref()
-                .or(environment_key.as_deref())
-                .ok_or(SelectionError::Unavailable)?;
-            if key.trim().is_empty()
-                || reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err()
-            {
-                return Err(SelectionError::Unavailable);
-            }
-            match fs::symlink_metadata(dir) {
-                Ok(m) => {
-                    if !m.is_dir()
-                        || m.file_type().is_symlink()
-                        || m.uid() != unsafe { libc::geteuid() }
-                        || m.mode() & 0o777 != 0o700
-                    {
-                        return Err(SelectionError::Unavailable);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(SelectionError::Unavailable),
-            }
-        }
-        if let (Some(runner), Some(state)) = (&config.acp_runner, &config.acp_state_dir) {
-            let workspace = identity
-                .root
-                .canonicalize()
-                .map_err(|_| SelectionError::Unavailable)?;
-            let runner = runner
-                .canonicalize()
-                .map_err(|_| SelectionError::Unavailable)?;
-            if !runner.is_file()
-                || runner.starts_with(&workspace)
-                || state
-                    .components()
-                    .any(|c| matches!(c, Component::ParentDir))
-            {
-                return Err(SelectionError::Unavailable);
-            }
-            let mut ancestor = state.as_path();
-            while !ancestor
-                .try_exists()
-                .map_err(|_| SelectionError::Unavailable)?
-            {
-                ancestor = ancestor.parent().ok_or(SelectionError::Unavailable)?;
-            }
-            if ancestor
-                .canonicalize()
-                .map_err(|_| SelectionError::Unavailable)?
-                .starts_with(&workspace)
-            {
-                return Err(SelectionError::Unavailable);
-            }
-            match fs::symlink_metadata(state) {
-                Ok(m) => {
-                    if !m.is_dir()
-                        || m.file_type().is_symlink()
-                        || m.uid() != unsafe { libc::geteuid() }
-                        || m.mode() & 0o777 != 0o700
-                    {
-                        return Err(SelectionError::Unavailable);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(SelectionError::Unavailable),
-            }
-        }
         if let Some(compiler) = &config.trusted_rustc
             && (!compiler.is_absolute()
                 || !compiler.is_file()
@@ -945,16 +919,9 @@ impl CheckoutRegistry {
         {
             return Err(SelectionError::Unavailable);
         }
-        for path in [
-            config.rust_library,
-            config.trusted_rustc,
-            config.cargo_home,
-            config.jev_budget_dir,
-            config.acp_runner,
-            config.acp_state_dir,
-        ]
-        .into_iter()
-        .flatten()
+        for path in [config.rust_library, config.trusted_rustc, config.cargo_home]
+            .into_iter()
+            .flatten()
         {
             if !path.is_absolute() {
                 return Err(SelectionError::Unavailable);
@@ -1242,6 +1209,18 @@ impl CheckoutRegistry {
         launch: &WorkspaceIdentity,
         selected: &Path,
     ) -> Result<SelectedCheckout, SelectionError> {
+        Self::capacity_witness_with_common_dirs(launch, selected, |identity| {
+            identity
+                .git_common_dir()
+                .map_err(|_| SelectionError::Unavailable)
+        })
+    }
+
+    fn capacity_witness_with_common_dirs(
+        launch: &WorkspaceIdentity,
+        selected: &Path,
+        mut common_dir: impl FnMut(&WorkspaceIdentity) -> Result<PathBuf, SelectionError>,
+    ) -> Result<SelectedCheckout, SelectionError> {
         launch
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
@@ -1249,8 +1228,13 @@ impl CheckoutRegistry {
         let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)
             .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
             .map_err(|_| SelectionError::IdentityChanged)?;
-        let launch_common = common_identity(launch)?;
-        let selected_common = common_identity(&identity)?;
+        let inode = |path| {
+            fs::metadata(path)
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .map_err(|_| SelectionError::Unavailable)
+        };
+        let launch_common = inode(common_dir(launch)?)?;
+        let selected_common = inode(common_dir(&identity)?)?;
         if launch_common != selected_common {
             return Err(SelectionError::IdentityChanged);
         }
@@ -1268,7 +1252,13 @@ impl CheckoutRegistry {
             launch_common,
             selected_common,
         };
-        witness.before_answer()?;
+        witness.launch.verify_readonly().map_err(identity_fault)?;
+        witness.identity.verify_readonly().map_err(identity_fault)?;
+        let dirs = CommonDirs {
+            launch: common_dir(&witness.launch)?,
+            selected: common_dir(&witness.identity)?,
+        };
+        witness.verify_at_send(&dirs)?;
         Ok(witness)
     }
 
@@ -1707,6 +1697,7 @@ pub struct CheckoutRuntime {
     #[cfg(feature = "test-support")]
     mcp_admitted_gate: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
+    search: Option<Arc<super::search::SearchService>>,
     /// Released because its root was lost: a stale handle answers root_changed.
     root_lost: std::sync::atomic::AtomicBool,
     initial_indexing: bool,
@@ -1774,6 +1765,10 @@ impl CheckoutRuntime {
         Ok(self.resources()?.scheduler.clone())
     }
 
+    pub(crate) fn search_service(&self) -> Option<&Arc<super::search::SearchService>> {
+        self.search.as_ref()
+    }
+
     /// Invoked through a weak edge AFTER a queue tick releases all stream and
     /// watcher locks. This is a snapshot of the current verified startup reconciliation owner, not a
     /// claim that startup reconciliation ran again when a serving watcher gets a new epoch.
@@ -1822,7 +1817,9 @@ impl CheckoutRuntime {
         let mut status = response.status()?;
         status.catching_up = catching_up;
         status.watcher = Some(self.resources()?.scheduler.checkout_watcher_witness());
-        Ok(serde_json::to_value(response.finish(status)?)?)
+        let mut status = serde_json::to_value(response.finish(status)?)?;
+        status["build"] = serde_json::to_value(crate::build_info::current())?;
+        Ok(status)
     }
 
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
@@ -2261,6 +2258,33 @@ impl CheckoutRuntime {
         hooks: MetricsResponseHooks<'_>,
         max_bytes: usize,
     ) -> anyhow::Result<(Vec<u8>, bool)> {
+        self.projected_response(check, hooks, max_bytes, |response, check| {
+            response.metrics_at(options, &mut || check())
+        })
+    }
+
+    pub fn architecture_response(
+        &self,
+        options: &crate::store::MetricsOptions,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+        hooks: MetricsResponseHooks<'_>,
+        max_bytes: usize,
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
+        self.projected_response(check, hooks, max_bytes, |response, check| {
+            response.architecture_view(options, &mut || check())
+        })
+    }
+
+    fn projected_response<P: serde::Serialize, F: FnMut() -> anyhow::Result<()> + Send>(
+        &self,
+        check: &mut F,
+        hooks: MetricsResponseHooks<'_>,
+        max_bytes: usize,
+        materialize: impl FnOnce(
+            &CheckoutEvidence,
+            &mut (dyn FnMut() -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<P>,
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
         use serde::Serialize;
         struct Bounded<'a, F> {
             bytes: Vec<u8>,
@@ -2289,17 +2313,36 @@ impl CheckoutRuntime {
         }
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct Envelope<'a> {
+        struct Envelope<'a, P> {
             catching_up: bool,
-            payload: &'a crate::store::MetricsPayload,
+            payload: &'a P,
         }
         let (response, catching_up) = self.evidence_response()?;
         (hooks.before_work)();
         check()?;
-        let payload = response.metrics_at(options, &mut || {
+        let payload = match materialize(&response, &mut || {
             (hooks.on_progress)();
             check()
-        })?;
+        }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // Located config failures are public evidence too. Fence and bound
+                // them before the HTTP layer preserves the structured diagnostic.
+                if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                    crate::metrics::serialize_checked(
+                        &serde_json::json!({"error": diagnostic}),
+                        max_bytes,
+                        check,
+                    )?;
+                    (hooks.before_finish)();
+                    check()?;
+                    response.finish(())?;
+                    (hooks.after_finish)();
+                    check()?;
+                }
+                return Err(error);
+            }
+        };
         let mut writer = Bounded {
             bytes: Vec::new(),
             check,
@@ -2821,10 +2864,23 @@ mod selection_tests {
         let identity = WorkspaceIdentity::discover(Some(&launch), &launch).unwrap();
         let mut registry = CheckoutRegistry::new();
         registry.attach_launch(17, &identity).unwrap();
-        let prepared = registry
-            .selection_probe()
-            .prepare(&identity, &selected)
-            .unwrap();
+        WorkspaceIdentity::discover(Some(&selected), &selected).unwrap();
+        let common = launch.join(".git").canonicalize().unwrap();
+        let fixture_common = |checked: &WorkspaceIdentity| -> Result<PathBuf, SelectionError> {
+            assert!(checked.root == launch || checked.root == selected);
+            checked.verify_readonly().unwrap();
+            Ok(common.clone())
+        };
+        // Capacity owns this test; Git scheduling and membership have separate tests.
+        let prepared = PreparedSelection {
+            witness: CheckoutRegistry::capacity_witness_with_common_dirs(
+                &identity,
+                &selected,
+                fixture_common,
+            )
+            .unwrap(),
+            expected: None,
+        };
         for index in 0..MAX_ACTIVE_CHECKOUTS - 1 {
             let key = format!("fixture-{index}");
             let mut metadata = CheckoutMetadata::from_identity(&identity);
@@ -2852,11 +2908,44 @@ mod selection_tests {
         );
         assert_eq!(registry.entries.len(), MAX_ACTIVE_CHECKOUTS);
         assert_eq!(
-            registry
-                .capacity_witness(&identity, &selected)
-                .unwrap()
-                .root,
+            CheckoutRegistry::capacity_witness_with_common_dirs(
+                &identity,
+                &selected,
+                fixture_common
+            )
+            .unwrap()
+            .root,
             selected
+        );
+        let before: HashMap<_, _> = registry
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.sessions.clone()))
+            .collect();
+        // Expire the last Git lookup through its real deadline guard, without sleeping.
+        let mut lookups = 0;
+        let unavailable =
+            CheckoutRegistry::capacity_witness_with_common_dirs(&identity, &selected, |checked| {
+                lookups += 1;
+                if lookups == 4 {
+                    checked
+                        .git_common_dir_by(Some(Instant::now()))
+                        .map_err(|_| SelectionError::Unavailable)
+                } else {
+                    fixture_common(checked)
+                }
+            })
+            .unwrap_err();
+        assert_eq!(lookups, 4);
+        assert_eq!(unavailable, SelectionError::Unavailable);
+        assert_eq!(registry.active_count(), MAX_ACTIVE_CHECKOUTS);
+        assert_eq!(
+            registry
+                .entries
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.sessions.clone()))
+                .collect::<HashMap<_, _>>(),
+            before
         );
         assert!(
             registry

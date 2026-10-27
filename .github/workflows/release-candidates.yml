@@ -1,0 +1,190 @@
+name: Release candidates
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release-candidates.yml'
+      - 'tools/release/**'
+      - 'tools/release-smoke.py'
+      - 'tools/release-linux.Dockerfile'
+      - 'src/build_info.rs'
+      - 'tests/build_identity.rs'
+permissions:
+  contents: read
+# Never cancel publication midway through its draft/upload/publish sequence.
+concurrency:
+  group: release-candidates-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        with:
+          python-version: '3.12'
+      - name: Validate tag against Cargo version and full source commit
+        id: tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          python3 tools/release/release.py validate-tag --source-root . --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" > release-tag.json
+          python3 -c 'import json; r=json.load(open("release-tag.json")); print("version=" + r["version"]); print("commit=" + r["commit"])' >> "$GITHUB_OUTPUT"
+      - name: Nonpublishing candidate run
+        if: github.event_name != 'push'
+        run: echo 'Manual and pull-request candidates do not publish.'
+  candidate:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-nextest@0.9.150
+      - name: Confirm native target and read pinned inputs
+        shell: bash
+        run: |
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          echo "TRELLIS_BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          python3 -c 'import tomllib; print("RELEASE_VERSION=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])' >> "$GITHUB_ENV"
+      - name: Native suite
+        run: ./tools/verify
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
+          TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Build Metal candidate
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '14.0'
+        run: cargo build --locked --release --no-default-features --features metal --bin trellis --target ${{ matrix.target }}
+      - name: Metal feature tests
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '14.0'
+        run: |
+          cargo clippy --locked --all-targets --no-default-features --features metal -- -D warnings
+          cargo nextest run --locked --all-targets --no-fail-fast --no-default-features --features test-support,metal
+      - name: Build native glibc 2.31 candidate
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker build -f tools/release-linux.Dockerfile -t trellis-release-glibc231 .
+          docker run --rm -v "$PWD:/work" -e TRELLIS_BUILD_COMMIT -e CARGO_BUILD_JOBS=2 trellis-release-glibc231 cargo build --locked --release --no-default-features --bin trellis --target ${{ matrix.target }}
+      - name: Package candidate bytes
+        shell: bash
+        run: |
+          python3 tools/release/release.py package --binary 'target/${{ matrix.target }}/release/trellis' --license LICENSE --version "$RELEASE_VERSION" --target '${{ matrix.target }}' --source-date-epoch "$SOURCE_DATE_EPOCH" --output-dir dist
+          mkdir extracted
+          tar -xzf "dist/trellis-$RELEASE_VERSION-${{ matrix.target }}.tar.gz" -C extracted
+      - name: Smoke archived binary on native host
+        run: python3 tools/release-smoke.py --binary extracted/trellis --source . --output dist/smoke-${{ matrix.target }}.json
+      - name: Audit ELF and execute archived bytes on baseline userspace
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/work" trellis-release-glibc231 python3 tools/release/release.py audit-elf --binary extracted/trellis --target '${{ matrix.target }}' > 'dist/elf-${{ matrix.target }}.json'
+          docker run --rm -v "$PWD:/work" trellis-release-glibc231 python3 tools/release-smoke.py --binary extracted/trellis --source . --output 'dist/baseline-smoke-${{ matrix.target }}.json'
+      - name: Record checked candidate provenance
+        shell: bash
+        run: |
+          python3 tools/release/release.py provenance --archive "dist/trellis-$RELEASE_VERSION-${{ matrix.target }}.tar.gz" --source-root . --version "$RELEASE_VERSION" --target '${{ matrix.target }}' --commit "$TRELLIS_BUILD_COMMIT" --smoke-report 'dist/smoke-${{ matrix.target }}.json'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: candidate-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [validate, candidate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Recheck tag and full commit before publishing
+        run: python3 tools/release/release.py validate-tag --source-root . --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: candidate-*
+          path: release-artifacts
+      - name: Check all three same-run archives, checksums and provenance
+        run: python3 tools/release/release.py assets --artifact-dir release-artifacts --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT" > release-assets.txt
+      - name: Prepare release notes
+        run: |
+          cat > release-notes.md <<'NOTES'
+          Native builds from the tagged source: macOS 14+ arm64 with Metal and CPU fallback; Linux x86_64 and arm64 CPU with glibc 2.31 or newer.
+
+          Each target includes an archive, SHA-256 checksum and build provenance. Builds are rebuildable from the tagged source; bit-identical rebuilds are not claimed.
+
+          No model weights are bundled. Configure the model path separately; Trellis verifies the pinned model hash.
+
+          macOS binaries are not signed or notarized. After a browser download and extraction, remove quarantine with:
+          ```sh
+          xattr -d com.apple.quarantine trellis
+          ```
+          Downloads via `curl` or `gh release download`, and source builds, are not quarantined.
+          NOTES
+      - name: Create draft with all assets, then publish
+        shell: bash
+        run: |
+          # List includes authenticated drafts; API errors stop before any write.
+          # On failure, inspect/delete only the failed draft before rerunning.
+          gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name' > existing-release-tags.txt
+          python3 -c 'import os, pathlib; tags=pathlib.Path("existing-release-tags.txt").read_text().splitlines(); tag=os.environ["RELEASE_TAG"]; tag not in tags or exit("Release already exists; refusing to replace it.")'
+          mapfile -t assets < release-assets.txt
+          release_flags=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" --verify-tag --target "$RELEASE_COMMIT" --draft --title "$RELEASE_TAG" --notes-file release-notes.md "${release_flags[@]}" "${assets[@]}"
+          gh release edit "$RELEASE_TAG" --draft=false

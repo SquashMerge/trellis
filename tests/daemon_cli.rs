@@ -686,7 +686,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .root_key;
     for (method, path) in [
         (reqwest::Method::GET, "/api/status"),
-        (reqwest::Method::GET, "/api/jev/status"),
+        (reqwest::Method::GET, "/api/dependencies"),
         (reqwest::Method::POST, "/api/index"),
     ] {
         let response = client
@@ -1496,28 +1496,6 @@ fn cold_cli_reads_start_daemon_and_keep_data_envelopes() {
     assert!(serde_json::from_slice::<Value>(&gc.stdout).is_ok());
 }
 
-#[tokio::test]
-async fn serve_first_carries_jev_credential_to_new_daemon() {
-    let temp = short_temp();
-    let home = temp.path().join("home");
-    fs::create_dir(&home).unwrap();
-    let root = checkout(temp.path(), "serve-first");
-    let _daemon = AutoDaemonGuard::for_home(&home);
-    let token = home.join("token");
-    let bind = free_address();
-    let mut command = serve(&home, &root, bind, &token);
-    command
-        .env("JEV_KEY", "fixture-serve-first")
-        .arg("--jev-budget-dir")
-        .arg(home.join("budget"))
-        .arg("--jev-budget-cents")
-        .arg("10");
-    let mut child = detached(command);
-    ready(&reqwest::Client::new(), bind, &mut child.0, &home).await;
-    let indexed = run(&home, "index", &root);
-    assert!(indexed["status"]["catchingUp"].is_boolean());
-}
-
 /// A test-elected daemon outlives its electing CLI but not its owning test
 /// process (#130), so an unguarded or killed test cannot leak it. The owner
 /// has exited but is not yet reaped when the daemon must notice it is gone.
@@ -1582,6 +1560,7 @@ fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
     assert!(envelope["catchingUp"].is_boolean());
     assert_eq!(envelope["payload"]["metricsVersion"], "metrics:v1");
     assert_eq!(envelope["payload"]["scope"], "revision");
+    assert_eq!(envelope["payload"]["role"], "all");
     assert_eq!(envelope["payload"]["declarations"], serde_json::json!([]));
     assert!(!envelope["payload"]["files"].as_array().unwrap().is_empty());
     let generation = envelope["payload"]["indexGeneration"].as_str().unwrap();
@@ -1644,6 +1623,25 @@ fn metrics_cli_reports_pinned_envelope_and_typed_selectors() {
         .unwrap();
     assert!(!pin_error.status.success());
     assert!(String::from_utf8_lossy(&pin_error.stderr).contains("invalid_argument"));
+    for role in ["", "unknown", "Production"] {
+        let bad = cli(&home)
+            .args(["metrics", "--json", "--workspace"])
+            .arg(&root)
+            .args(["--role", role])
+            .output()
+            .unwrap();
+        assert!(!bad.status.success(), "{role}");
+        assert!(bad.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&bad.stderr).contains("invalid_argument"));
+    }
+    let duplicate = cli(&home)
+        .args(["metrics", "--workspace"])
+        .arg(&root)
+        .args(["--role", "all", "--role", "test"])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(duplicate.stdout.is_empty());
 }
 
 #[test]
@@ -1925,6 +1923,20 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "metricshttp");
+    fs::write(
+        root.join("roles.rs"),
+        r#"fn production() -> usize { 1 }
+#[cfg(feature = "test-support")] fn support() -> usize { 2 }
+#[cfg(test)] mod tests { fn check(x: bool) -> bool { if x { true } else { false } } }
+"#,
+    )
+    .unwrap();
+    fs::create_dir(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/only.js"),
+        "function only() { return 1; }\n",
+    )
+    .unwrap();
     fs::create_dir(root.join("src")).unwrap();
     let source = root.join("src/math.js");
     fs::write(
@@ -1960,7 +1972,40 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     );
     let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
     assert_eq!(initial["payload"], http["payload"]);
+    assert_eq!(initial["payload"]["role"], "all");
     assert!(initial["catchingUp"].is_boolean());
+    for (role, count, cyclomatic) in [("production", 2, 2), ("all", 3, 4), ("test", 1, 2)] {
+        let query = format!(
+            "?role={role}&aggregate=sum&indexGeneration={generation}&indexRevision={revision}"
+        );
+        let http_selected = http_metrics(&client, address, &key, token, &query).await;
+        let cli_selected = cli(&home)
+            .args(["metrics", "--json", "--workspace"])
+            .arg(&root)
+            .args(["--pin", &pin, "--role", role, "--aggregate", "sum"])
+            .output()
+            .unwrap();
+        assert!(
+            cli_selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cli_selected.stderr)
+        );
+        let cli_selected: Value = serde_json::from_slice(&cli_selected.stdout).unwrap();
+        assert_eq!(cli_selected["payload"], http_selected["payload"]);
+        assert_eq!(cli_selected["payload"]["role"], role);
+        let mixed = cli_selected["payload"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == "roles.rs")
+            .unwrap();
+        assert_eq!(mixed["declarationCount"], count);
+        assert_eq!(mixed["metrics"]["cyclomatic"], cyclomatic);
+        assert_eq!(
+            mixed["roleCounts"],
+            serde_json::json!({"production":2,"test":1})
+        );
+    }
     let file = http["payload"]["files"]
         .as_array()
         .unwrap()
@@ -1974,7 +2019,7 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     fs::write(&source, "function newer() { return 99; }\n").unwrap();
     run(&home, "index", &root);
     let file_query = format!(
-        "?scope=file&sourceSetId={source_set}&language=javascript&path=src/math.js&aggregate=mean&metrics=loc,cyclomatic,fanIn"
+        "?role=production&scope=file&sourceSetId={source_set}&language=javascript&path=src/math.js&aggregate=mean&metrics=loc,cyclomatic,fanIn"
     );
     let pinned_file_query =
         format!("{file_query}&indexGeneration={generation}&indexRevision={revision}");
@@ -1986,6 +2031,8 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "file",
             "--pin",
@@ -2048,13 +2095,15 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     assert!(sid.starts_with("sid:v1:"));
 
     let directory_query = format!(
-        "?scope=directory&sourceSetId={source_set}&path=src&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
+        "?role=production&scope=directory&sourceSetId={source_set}&path=src&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
     );
     let http_directory = http_metrics(&client, address, &key, token, &directory_query).await;
     let directory = cli(&home)
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "directory",
             "--pin",
@@ -2091,13 +2140,15 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
     assert_eq!(directory["payload"]["declarations"], serde_json::json!([]));
 
     let declaration_query = format!(
-        "?scope=declaration&sourceSetId={source_set}&path=src/math.js&sid={sid}&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
+        "?role=production&scope=declaration&sourceSetId={source_set}&path=src/math.js&sid={sid}&aggregate=mean&metrics=loc,cyclomatic,fanIn&indexGeneration={generation}&indexRevision={revision}"
     );
     let http_declaration = http_metrics(&client, address, &key, token, &declaration_query).await;
     let declaration = cli(&home)
         .args(["metrics", "--json", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "declaration",
             "--pin",
@@ -2137,6 +2188,8 @@ async fn metrics_cli_json_matches_authenticated_selected_http_envelope() {
         .args(["metrics", "--workspace"])
         .arg(&root)
         .args([
+            "--role",
+            "production",
             "--scope",
             "file",
             "--pin",
@@ -3124,4 +3177,128 @@ fn metrics_real_near_ingress_ack_and_late_multiframe_preserve_original_end() {
         began.elapsed() < Duration::from_millis(12_500),
         "transfer stall was unbounded"
     );
+}
+
+#[test]
+fn gc_report_counts_vectors_without_checkout_state_or_cache_mutation() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let roots = fixture_roots(&home);
+    roots.prepare_vectors().unwrap();
+    let path = roots.vectors_db();
+    {
+        let mut writer = trellis::search_vectors::VectorCacheWriter::open(&path).unwrap();
+        writer
+            .put(&"a".repeat(64), &"b".repeat(64), &[1, -2])
+            .unwrap();
+        writer.put(&"c".repeat(64), &"b".repeat(64), &[3]).unwrap();
+    }
+    // Close the fixture writer before raw reads; bytes include persisted LRU ages.
+    let before = fs::read(&path).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let cache_modified = fs::metadata(&roots.cache).unwrap().modified().unwrap();
+    assert!(!roots.data.exists());
+    let output = cli(&home)
+        .arg("gc")
+        .arg("--report")
+        .env("TRELLIS_SEARCH_BACKEND", "cpu")
+        .env_remove("TRELLIS_SEARCH_MODEL")
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["derived"].as_array().unwrap().is_empty());
+    assert_eq!(report["vectors"]["entries"], 2);
+    assert_eq!(report["vectors"]["bytes"], before.len() as u64);
+    assert_eq!(before, fs::read(&path).unwrap());
+    assert_eq!(modified, fs::metadata(&path).unwrap().modified().unwrap());
+    assert_eq!(
+        cache_modified,
+        fs::metadata(&roots.cache).unwrap().modified().unwrap()
+    );
+    let cache_entries: Vec<_> = fs::read_dir(&roots.cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(cache_entries, vec![path]);
+    assert!(!roots.cache.join("indexes").exists());
+    // Cold CLI startup may create only daemon control state outside the cache.
+    let data_entries: Vec<_> = fs::read_dir(&roots.data)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(data_entries, vec![roots.data.join("run")]);
+}
+
+#[test]
+fn gc_report_refuses_corrupt_vector_cache_without_partial_inventory() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let _daemon = AutoDaemonGuard::for_home(&home);
+    let roots = fixture_roots(&home);
+    roots.prepare_vectors().unwrap();
+    let path = roots.vectors_db();
+    drop(trellis::search_vectors::VectorCacheWriter::open(&path).unwrap());
+    let corrupt = b"not a SQLite database";
+    fs::write(&path, corrupt).unwrap();
+    let output = cli(&home)
+        .arg("gc")
+        .arg("--report")
+        .env("TRELLIS_SEARCH_BACKEND", "cpu")
+        .env_remove("TRELLIS_SEARCH_MODEL")
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "GC emitted partial inventory");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("store_unavailable: vector cache"),
+        "untyped vector-cache failure: {stderr}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
+    assert!(!roots.cache.join("indexes").exists());
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[test]
+fn explicit_metal_refuses_direct_daemon_without_metal_support() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let output = cli(&home)
+        .arg("daemon")
+        .env("TRELLIS_SEARCH_BACKEND", "metal")
+        .env_remove("TRELLIS_SEARCH_MODEL")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("model unavailable"), "{stderr}");
+    assert!(stderr.contains("Metal support is not enabled"), "{stderr}");
+    assert!(!fixture_roots(&home).cache.exists());
+}
+
+#[test]
+fn invalid_search_backend_refuses_direct_daemon_without_checkout_state() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let output = cli(&home)
+        .arg("daemon")
+        .env("TRELLIS_SEARCH_BACKEND", "not-a-backend")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid embedding input"));
+    assert!(!fixture_roots(&home).cache.exists());
 }

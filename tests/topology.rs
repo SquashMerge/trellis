@@ -131,14 +131,6 @@ fn fixed_paths_and_unsafe_components() {
             .join(&identity.root_key)
             .join("index.db")
     );
-    assert_eq!(
-        roots.record_db(&identity),
-        roots
-            .data
-            .join("workspaces")
-            .join(&identity.record_id)
-            .join("workspace.db")
-    );
     roots.prepare_index(&identity).unwrap();
     use std::os::unix::fs::symlink;
     fs::remove_dir(roots.index_dir(&identity)).unwrap();
@@ -180,6 +172,38 @@ fn git_marker_matrix() {
     assert_eq!(pointed.record_id, identity.record_id);
     fs::write(linked.join(".git"), "gitdir: ../work/.git\nextra\n").unwrap();
     assert!(WorkspaceIdentity::discover(Some(&linked), &linked).is_err());
+}
+
+#[test]
+fn git_marker_identity_survives_checkout_move_and_copy() {
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    common::private(&work.join(".git"));
+    let original = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let copied = temp.path().join("copy");
+    fs::create_dir(&copied).unwrap();
+    common::private(&copied.join(".git"));
+    common::private(&copied.join(".git/trellis"));
+    fs::copy(
+        work.join(".git/trellis/workspace-id"),
+        copied.join(".git/trellis/workspace-id"),
+    )
+    .unwrap();
+    let copy = WorkspaceIdentity::discover(Some(&copied), &copied).unwrap();
+    assert_eq!(copy.record_id, original.record_id);
+    assert_ne!(copy.root_key, original.root_key);
+    let moved = temp.path().join("moved");
+    fs::rename(&work, &moved).unwrap();
+    let moved_id = WorkspaceIdentity::discover(Some(&moved), &moved).unwrap();
+    assert_eq!(moved_id.record_id, original.record_id);
+    assert_ne!(moved_id.root_key, original.root_key);
+    assert!(original.verify().is_err());
+    copy.verify().unwrap();
+    moved_id.verify().unwrap();
+    assert!(
+        !roots.data.exists(),
+        "identity discovery created retired state"
+    );
 }
 
 #[test]
@@ -478,13 +502,6 @@ fn roots_overlapping_fixed_locations_are_refused_before_creation() {
                 .to_string()
                 .contains("overlaps")
         );
-        assert!(
-            roots
-                .prepare_records(&identity)
-                .unwrap_err()
-                .to_string()
-                .contains("overlaps")
-        );
         assert!(!roots.cache.join("indexes").exists());
         assert!(!roots.data.join("workspaces").exists());
     }
@@ -641,216 +658,14 @@ fn shared_holder_child() {
         guard.verify().unwrap();
     }
 }
-use std::os::unix::fs::PermissionsExt;
 
 #[test]
-fn durable_first_save_empty_record_and_payloads() {
-    use trellis::{
-        model::{Annotation, SavedView},
-        store::topology::DurableRecords,
-    };
+fn existing_use_lock_unlink_never_recreates() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &id);
-    assert!(records.views().unwrap().is_empty());
-    assert!(records.annotations().unwrap().is_empty());
-    assert!(!records.delete_view("missing").unwrap());
-    assert!(!roots.data.exists(), "read-only access created data root");
-    let view: SavedView = serde_json::from_str(r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{"symbol":{"x":12.5,"y":9.25}}}"#).unwrap();
-    records.put_view(&view).unwrap();
-    let annotation = Annotation {
-        id: "note1".into(),
-        node_id: "symbol".into(),
-        body: "Original text".into(),
-    };
-    records.put_annotation(&annotation).unwrap();
-    assert_eq!(records.view("view1").unwrap(), Some(view.clone()));
-    assert_eq!(records.annotations().unwrap(), vec![annotation.clone()]);
-    assert!(records.delete_view("view1").unwrap());
-    assert!(records.delete_annotation("note1").unwrap());
-    assert!(records.views().unwrap().is_empty());
-    assert!(roots.record_db(&id).exists());
-    let db = rusqlite::Connection::open(roots.record_db(&id)).unwrap();
-    assert_eq!(
-        db.query_row("SELECT record_id FROM record_metadata", [], |r| r
-            .get::<_, String>(0))
-            .unwrap(),
-        id.record_id
-    );
-    assert_eq!(
-        db.query_row("SELECT count(*) FROM known_roots", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-    let tables: Vec<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(
-        tables,
-        ["annotations", "known_roots", "record_metadata", "views"]
-    );
-    assert!(
-        !roots
-            .record_db(&id)
-            .with_file_name("workspace.db-wal")
-            .exists()
-    );
-}
-
-#[test]
-fn durable_git_move_and_copy_share_payload_without_rewriting() {
-    use trellis::{model::Annotation, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    common::private(&work.join(".git"));
-    let original = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let note = Annotation {
-        id: "note".into(),
-        node_id: "gone".into(),
-        body: "Persist verbatim".into(),
-    };
-    DurableRecords::new(&roots, &original)
-        .put_annotation(&note)
-        .unwrap();
-    let copied = temp.path().join("copy");
-    fs::create_dir(&copied).unwrap();
-    common::private(&copied.join(".git"));
-    fs::create_dir(copied.join(".git/trellis")).unwrap();
-    fs::set_permissions(
-        copied.join(".git/trellis"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
-    fs::copy(
-        work.join(".git/trellis/workspace-id"),
-        copied.join(".git/trellis/workspace-id"),
-    )
-    .unwrap();
-    let copy = WorkspaceIdentity::discover(Some(&copied), &copied).unwrap();
-    assert_eq!(copy.record_id, original.record_id);
-    assert_eq!(
-        DurableRecords::new(&roots, &copy).annotations().unwrap(),
-        vec![note.clone()]
-    );
-    let moved = temp.path().join("moved");
-    fs::rename(&work, &moved).unwrap();
-    let moved_id = WorkspaceIdentity::discover(Some(&moved), &moved).unwrap();
-    DurableRecords::new(&roots, &moved_id)
-        .put_annotation(&note)
-        .unwrap();
-    assert_eq!(
-        DurableRecords::new(&roots, &copy).annotations().unwrap(),
-        vec![note.clone()]
-    );
-    assert!(
-        DurableRecords::new(&roots, &original)
-            .annotations()
-            .is_err()
-    );
-    let db = rusqlite::Connection::open(roots.record_db(&copy)).unwrap();
-    let rows: Vec<(String, String, String)> = db
-        .prepare("SELECT path,device,inode FROM known_roots ORDER BY path")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    let mut expected = vec![
-        (
-            original.root.to_str().unwrap().to_owned(),
-            original.device.to_string(),
-            original.inode.to_string(),
-        ),
-        (
-            moved_id.root.to_str().unwrap().to_owned(),
-            moved_id.device.to_string(),
-            moved_id.inode.to_string(),
-        ),
-    ];
-    expected.sort();
-    assert_eq!(rows, expected);
-    let payload: String = db
-        .query_row("SELECT payload FROM annotations WHERE id='note'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(payload, serde_json::to_string(&note).unwrap());
-}
-
-#[test]
-fn durable_incomplete_and_incompatible_refused() {
-    use trellis::{model::Annotation, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    roots.prepare_records(&id).unwrap();
-    common::private(&roots.record_dir(&id));
-    let note = Annotation {
-        id: "note".into(),
-        node_id: "node".into(),
-        body: "Body".into(),
-    };
-    assert!(
-        DurableRecords::new(&roots, &id)
-            .put_annotation(&note)
-            .is_err()
-    );
-    assert!(!roots.record_db(&id).exists());
-    let _lock = roots.record_use(&id, true).unwrap();
-    let db = rusqlite::Connection::open(roots.record_db(&id)).unwrap();
-    db.pragma_update(None, "user_version", 99).unwrap();
-    drop(db);
-    drop(_lock);
-    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
-}
-
-#[test]
-fn durable_absent_parent_is_verified() {
-    use trellis::store::topology::DurableRecords;
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    fs::create_dir(&roots.data).unwrap();
-    fs::set_permissions(&roots.data, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(DurableRecords::new(&roots, &id).views().is_err());
-    fs::set_permissions(&roots.data, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::create_dir(roots.data.join("workspaces")).unwrap();
-    fs::set_permissions(
-        roots.data.join("workspaces"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    assert!(
-        DurableRecords::new(&roots, &id)
-            .delete_view("absent")
-            .is_err()
-    );
-    fs::remove_dir(roots.data.join("workspaces")).unwrap();
-    std::os::unix::fs::symlink(temp.path(), roots.data.join("workspaces")).unwrap();
-    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
-}
-
-#[test]
-fn durable_existing_lock_unlink_never_recreates() {
-    use trellis::store::topology::DurableRecords;
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let note = trellis::model::Annotation {
-        id: "n".into(),
-        node_id: "node".into(),
-        body: "body".into(),
-    };
-    DurableRecords::new(&roots, &id)
-        .put_annotation(&note)
-        .unwrap();
-    let lock = roots.record_use_lock(&id);
+    drop(roots.index_use(&id).unwrap());
+    let lock = roots.index_use_lock(&id);
     assert!(
         UseGuard::acquire_existing_with_hook(&lock, false, false, || {
             fs::remove_file(&lock)?;
@@ -859,30 +674,22 @@ fn durable_existing_lock_unlink_never_recreates() {
         .is_err()
     );
     assert!(!lock.exists(), "existing-only reopen created a lock");
-    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
-    assert!(!lock.exists(), "durable read created a lock");
-    assert!(
-        DurableRecords::new(&roots, &id)
-            .delete_annotation("n")
-            .is_err()
-    );
-    assert!(!lock.exists(), "durable delete created a lock");
 }
 
 #[test]
-fn durable_existing_lock_replacement_checks_new_inode_and_holder() {
+fn existing_use_lock_replacement_checks_new_inode_and_holder() {
     use std::io::{BufRead, BufReader};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    roots.prepare_records(&id).unwrap();
-    let lock = roots.record_use_lock(&id);
-    drop(roots.record_use(&id, true).unwrap());
+    roots.prepare_index(&id).unwrap();
+    let lock = roots.index_use_lock(&id);
+    drop(roots.index_use(&id).unwrap());
     let mut child = None;
     let mut reader = None;
     let result = UseGuard::acquire_existing_with_hook(&lock, false, true, || {
         fs::remove_file(&lock)?;
-        drop(roots.record_use(&id, true)?);
+        drop(roots.index_use(&id)?);
         let mut process = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("shared_holder_child")
@@ -915,227 +722,6 @@ fn durable_existing_lock_replacement_checks_new_inode_and_holder() {
     );
     process.stdin.take().unwrap().write_all(&[1]).unwrap();
     assert!(process.wait().unwrap().success());
-}
-
-#[test]
-fn durable_annotation_first_commit_fault_and_sync_fault() {
-    use trellis::{model::Annotation, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let note = Annotation {
-        id: "first".into(),
-        node_id: "node".into(),
-        body: "original".into(),
-    };
-    let records = DurableRecords::new(&roots, &id);
-    assert!(
-        records
-            .put_annotation_with_first_save_hook(&note, |phase| {
-                if phase == "before_commit" {
-                    anyhow::bail!("injected commit fault")
-                }
-                Ok(())
-            })
-            .unwrap_err()
-            .to_string()
-            .contains("injected commit fault")
-    );
-    assert!(
-        records
-            .annotations()
-            .unwrap_err()
-            .to_string()
-            .contains("incomplete_record")
-    );
-    assert!(
-        records.put_annotation(&note).is_err(),
-        "must not heal incomplete record"
-    );
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &id);
-    assert!(
-        records
-            .put_annotation_with_first_save_hook(&note, |phase| {
-                if phase == "before_sync" {
-                    anyhow::bail!("injected sync fault")
-                }
-                Ok(())
-            })
-            .unwrap_err()
-            .to_string()
-            .contains("injected sync fault")
-    );
-    // A committed record is not silently erased or described as incomplete after sync refusal.
-    assert_eq!(records.annotations().unwrap(), vec![note]);
-}
-
-#[test]
-fn durable_creator_child() {
-    if let Some(base) = std::env::var_os("TOPOLOGY_DURABLE_CHILD") {
-        use trellis::{model::Annotation, store::topology::DurableRecords};
-        let base = Path::new(&base);
-        let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
-            base.join("cache"),
-            base.join("data"),
-        );
-        let work = base.join("work");
-        let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-        let note = Annotation {
-            id: "loser".into(),
-            node_id: "node".into(),
-            body: "second".into(),
-        };
-        assert!(
-            DurableRecords::new(&roots, &id)
-                .put_annotation(&note)
-                .unwrap_err()
-                .to_string()
-                .contains("storage_busy")
-        );
-        println!("CREATOR_BUSY");
-        std::io::stdout().flush().unwrap();
-        let mut byte = [0];
-        std::io::stdin().read_exact(&mut byte).unwrap();
-        DurableRecords::new(&roots, &id)
-            .put_annotation(&note)
-            .unwrap();
-        println!("CREATOR_RETRIED");
-    }
-}
-
-#[test]
-fn durable_first_creator_process_contention_and_retry() {
-    use std::io::{BufRead, BufReader};
-    use trellis::{model::Annotation, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let lock = roots.record_use(&id, true).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("durable_creator_child")
-        .arg("--nocapture")
-        .env("TOPOLOGY_DURABLE_CHILD", temp.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    loop {
-        line.clear();
-        assert_ne!(output.read_line(&mut line).unwrap(), 0);
-        if line.contains("CREATOR_BUSY") {
-            break;
-        }
-    }
-    drop(lock);
-    let first = Annotation {
-        id: "winner".into(),
-        node_id: "node".into(),
-        body: "first".into(),
-    };
-    DurableRecords::new(&roots, &id)
-        .put_annotation(&first)
-        .unwrap();
-    child.stdin.take().unwrap().write_all(&[1]).unwrap();
-    assert!(child.wait().unwrap().success());
-    assert_eq!(
-        DurableRecords::new(&roots, &id)
-            .annotations()
-            .unwrap()
-            .len(),
-        2
-    );
-    let db = rusqlite::Connection::open(roots.record_db(&id)).unwrap();
-    assert_eq!(
-        db.query_row("SELECT count(*) FROM record_metadata", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-}
-
-#[test]
-fn durable_non_git_move_retains_old_record_and_root_row() {
-    use trellis::{model::Annotation, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let old = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let note = Annotation {
-        id: "n".into(),
-        node_id: "node".into(),
-        body: "unchanged".into(),
-    };
-    DurableRecords::new(&roots, &old)
-        .put_annotation(&note)
-        .unwrap();
-    let old_db = roots.record_db(&old);
-    fs::rename(&work, temp.path().join("moved")).unwrap();
-    let moved_path = temp.path().join("moved");
-    let moved = WorkspaceIdentity::discover(Some(&moved_path), &moved_path).unwrap();
-    assert_ne!(old.record_id, moved.record_id);
-    assert!(
-        DurableRecords::new(&roots, &moved)
-            .annotations()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(old_db.exists());
-    let db = rusqlite::Connection::open(&old_db).unwrap();
-    let saved: (String, String, String) = db
-        .query_row("SELECT path,device,inode FROM known_roots", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
-        .unwrap();
-    assert_eq!(
-        saved,
-        (
-            old.root.to_str().unwrap().into(),
-            old.device.to_string(),
-            old.inode.to_string()
-        )
-    );
-    let payload: String = db
-        .query_row("SELECT payload FROM annotations", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(serde_json::from_str::<Annotation>(&payload).unwrap(), note);
-}
-
-#[test]
-fn durable_marker_change_refuses_real_operation() {
-    use trellis::{model::Annotation, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    common::private(&work.join(".git"));
-    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let note = Annotation {
-        id: "n".into(),
-        node_id: "node".into(),
-        body: "body".into(),
-    };
-    DurableRecords::new(&roots, &id)
-        .put_annotation(&note)
-        .unwrap();
-    fs::write(
-        work.join(".git/trellis/workspace-id"),
-        uuid::Uuid::new_v4().to_string(),
-    )
-    .unwrap();
-    assert!(DurableRecords::new(&roots, &id).annotations().is_err());
-    assert!(
-        DurableRecords::new(&roots, &id)
-            .put_annotation(&note)
-            .is_err()
-    );
-    assert!(
-        DurableRecords::new(&roots, &id)
-            .delete_annotation("n")
-            .is_err()
-    );
 }
 
 #[test]
@@ -1180,7 +766,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        24
+        25
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -1315,10 +901,8 @@ fn gc_manifest(base: &Path) -> Vec<GcManifestEntry> {
 }
 
 #[test]
-fn gc_age_and_record_inventory_are_read_only() {
-    use std::os::unix::fs::MetadataExt;
-    use trellis::model::SavedView;
-    use trellis::store::topology::{DurableRecords, classify_index_age, valid_record_id};
+fn gc_age_and_derived_inventory_are_read_only() {
+    use trellis::store::topology::classify_index_age;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1338,18 +922,10 @@ fn gc_age_and_record_inventory_are_read_only() {
     for age in [None, Some(0), Some(-1), Some(now + 1), Some(i64::MAX)] {
         assert_eq!(classify_index_age(now, age), ("unknown", "age_unknown"));
     }
-    for invalid in [
-        "",
-        "../outside",
-        "path-0",
-        "00000000-0000-0000-0000-000000000000",
-        "PATH-0000000000000000000000000000000000000000000000000000000000000000",
-    ] {
-        assert!(!valid_record_id(invalid));
-        assert!(roots.record_by_id(invalid).is_err());
-    }
     let empty = roots.gc_report_at(now).unwrap();
-    assert!(empty.derived.is_empty() && empty.records.is_empty());
+    assert!(empty.derived.is_empty());
+    assert_eq!(empty.vectors.bytes, 0);
+    assert_eq!(empty.vectors.entries, 0);
     assert!(!roots.cache.exists() && !roots.data.exists());
     let store = common::open_store(temp.path(), &work).unwrap();
     drop(store);
@@ -1398,23 +974,6 @@ fn gc_age_and_record_inventory_are_read_only() {
         )
         .unwrap();
     }
-    let view: SavedView = serde_json::from_str(
-        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
-    )
-    .unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    records.put_view(&view).unwrap();
-    records.delete_view("view1").unwrap();
-    let record_db = roots.record_db(&identity);
-    let before = [db_path.as_path(), record_db.as_path()].map(|path| {
-        let stat = fs::metadata(path).unwrap();
-        (
-            fs::read(path).unwrap(),
-            stat.len(),
-            stat.mtime(),
-            stat.mtime_nsec(),
-        )
-    });
     let manifest_before = gc_manifest(temp.path());
     let report = roots.gc_report_at(now).unwrap();
     assert_eq!(manifest_before, gc_manifest(temp.path()));
@@ -1422,36 +981,12 @@ fn gc_age_and_record_inventory_are_read_only() {
         (report.derived[0].status, report.derived[0].reason),
         ("eligible", "age_30_days")
     );
-    assert_eq!(report.records.len(), 1);
-    assert_eq!(
-        (report.records[0].views, report.records[0].annotations),
-        (Some(0), Some(0))
-    );
-    assert_eq!(report.records[0].missing_known_paths, Some(vec![]));
-    assert_eq!(
-        roots.record_by_id(&identity.record_id).unwrap().unwrap().id,
-        identity.record_id
-    );
-    let after = [db_path.as_path(), record_db.as_path()].map(|path| {
-        let stat = fs::metadata(path).unwrap();
-        (
-            fs::read(path).unwrap(),
-            stat.len(),
-            stat.mtime(),
-            stat.mtime_nsec(),
-        )
-    });
-    assert_eq!(before, after);
     let held = UseGuard::acquire_existing(&roots.index_use_lock(&identity), false, false).unwrap();
     assert_eq!(roots.gc_report_at(now).unwrap().derived[0].status, "busy");
     drop(held);
     fs::rename(&work, temp.path().join("moved")).unwrap();
     let missing = roots.gc_report_at(now).unwrap();
     assert_eq!(missing.derived[0].reason, "root_missing");
-    assert_eq!(
-        missing.records[0].missing_known_paths,
-        Some(vec![identity.root.to_string_lossy().to_string()])
-    );
     fs::create_dir(&work).unwrap();
     assert_eq!(
         roots.gc_report_at(now).unwrap().derived[0].reason,
@@ -1479,115 +1014,34 @@ fn gc_age_and_record_inventory_are_read_only() {
 #[test]
 fn gc_rejects_dangling_recovery_sidecars_without_writes() {
     use std::os::unix::fs::symlink;
-    use trellis::model::Annotation;
-    use trellis::store::topology::DurableRecords;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     drop(common::open_store(temp.path(), &work).unwrap());
-    DurableRecords::new(&roots, &identity)
-        .put_annotation(&Annotation {
-            id: "note".into(),
-            node_id: "node".into(),
-            body: "saved".into(),
-        })
-        .unwrap();
-    for (db, is_record) in [
-        (roots.index_db(&identity), false),
-        (roots.record_db(&identity), true),
-    ] {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = db.with_file_name(format!(
-                "{}{suffix}",
-                db.file_name().unwrap().to_string_lossy()
-            ));
-            symlink(temp.path().join("absent"), &sidecar).unwrap();
-            assert!(fs::symlink_metadata(&sidecar).is_ok());
-            assert!(!sidecar.exists(), "fixture must be a dangling link");
-            let before = gc_manifest(temp.path());
-            if is_record {
-                assert!(roots.record_by_id(&identity.record_id).is_err(), "{suffix}");
-                let report = roots.gc_report_at(1_800_000_000).unwrap();
-                assert_eq!(report.records[0].id, identity.record_id);
-                assert_eq!(
-                    (report.records[0].status, report.records[0].reason),
-                    ("unknown", "recovery_sidecar"),
-                    "{suffix}"
-                );
-                assert_eq!(report.records[0].views, None);
-            } else {
-                let report = roots.gc_report_at(1_800_000_000).unwrap();
-                assert_eq!(
-                    (report.derived[0].status, report.derived[0].reason),
-                    ("unknown", "metadata_unreadable"),
-                    "{suffix}"
-                );
-            }
-            assert_eq!(
-                gc_manifest(temp.path()),
-                before,
-                "report wrote with {suffix}"
-            );
-            fs::remove_file(sidecar).unwrap();
-        }
-    }
-}
-
-#[test]
-fn gc_refuses_countable_records_with_missing_durable_columns() {
-    use trellis::model::Annotation;
-    use trellis::store::topology::DurableRecords;
-    let (temp, roots) = common::fixture();
-    for (n, table, column) in [
-        (0, "known_roots", "device"),
-        (1, "known_roots", "inode"),
-        (2, "views", "payload"),
-        (3, "annotations", "node_id"),
-        (4, "annotations", "payload"),
-    ] {
-        let work = temp.path().join(format!("record-{n}"));
-        fs::create_dir(&work).unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-        DurableRecords::new(&roots, &identity)
-            .put_annotation(&Annotation {
-                id: "note".into(),
-                node_id: "node".into(),
-                body: "saved".into(),
-            })
-            .unwrap();
-        let db = rusqlite::Connection::open(roots.record_db(&identity)).unwrap();
-        db.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
-            .unwrap();
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM annotations", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        drop(db);
-        assert!(
-            roots.record_by_id(&identity.record_id).is_err(),
-            "{table}.{column}"
-        );
+    let db = roots.index_db(&identity);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = db.with_file_name(format!("index.db{suffix}"));
+        symlink(temp.path().join("absent"), &sidecar).unwrap();
+        assert!(fs::symlink_metadata(&sidecar).is_ok());
+        assert!(!sidecar.exists(), "fixture must be a dangling link");
+        let before = gc_manifest(temp.path());
         let report = roots.gc_report_at(1_800_000_000).unwrap();
-        let entry = report
-            .records
-            .iter()
-            .find(|r| r.id == identity.record_id)
-            .unwrap();
         assert_eq!(
-            (entry.status, entry.reason),
-            ("unknown", "incompatible_record"),
-            "{table}.{column}"
+            (report.derived[0].status, report.derived[0].reason),
+            ("unknown", "metadata_unreadable"),
+            "{suffix}"
         );
-        assert_eq!(entry.views, None);
+        assert_eq!(
+            gc_manifest(temp.path()),
+            before,
+            "report wrote with {suffix}"
+        );
+        fs::remove_file(sidecar).unwrap();
     }
 }
 
 #[test]
-fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
-    use trellis::model::Annotation;
-    use trellis::store::topology::DurableRecords;
+fn gc_report_sorts_multiple_derived_indexes() {
     let (temp, roots) = common::fixture();
     let mut identities = (0..3)
         .map(|n| {
@@ -1597,35 +1051,12 @@ fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
         })
         .collect::<Vec<_>>();
     identities.sort_by(|a, b| b.root_key.cmp(&a.root_key));
-    let insertion_keys: Vec<_> = identities.iter().map(|id| id.root_key.clone()).collect();
-    let insertion_ids: Vec<_> = identities.iter().map(|id| id.record_id.clone()).collect();
+    let mut expected_keys: Vec<_> = identities.iter().map(|id| id.root_key.clone()).collect();
     for identity in &identities {
         drop(common::open_store(temp.path(), &identity.root).unwrap());
-        DurableRecords::new(&roots, identity)
-            .put_annotation(&Annotation {
-                id: "note".into(),
-                node_id: "node".into(),
-                body: "saved".into(),
-            })
-            .unwrap();
-        let db = rusqlite::Connection::open(roots.record_db(identity)).unwrap();
-        for name in ["z", "m", "a"] {
-            db.execute(
-                "INSERT INTO known_roots(path,device,inode) VALUES(?1,'1','1')",
-                [temp
-                    .path()
-                    .join(format!("missing-{}-{name}", identity.record_id))
-                    .to_str()
-                    .unwrap()],
-            )
-            .unwrap();
-        }
     }
     let report = roots.gc_report_at(1_800_000_000).unwrap();
-    let mut expected_keys = insertion_keys.clone();
     expected_keys.sort();
-    let mut expected_ids = insertion_ids.clone();
-    expected_ids.sort();
     assert_eq!(
         report
             .derived
@@ -1634,233 +1065,10 @@ fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
             .collect::<Vec<_>>(),
         expected_keys
     );
-    assert_eq!(
-        report
-            .records
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect::<Vec<_>>(),
-        expected_ids
-    );
-    for record in &report.records {
-        let paths = record.missing_known_paths.as_ref().unwrap();
-        let mut expected = paths.clone();
-        expected.sort();
-        assert_eq!(paths, &expected);
-        assert_eq!(paths.len(), 3);
-        assert!(paths[0].ends_with("-a"));
-    }
 }
 
 #[test]
-fn forget_requires_safe_exclusive_record_and_recreates_on_later_save() {
-    use trellis::{
-        model::SavedView,
-        store::topology::{DurableRecords, valid_record_id},
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    common::private(&work.join(".git"));
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let id = identity.record_id.clone();
-    let copy = temp.path().join("copy");
-    fs::create_dir(&copy).unwrap();
-    common::private(&copy.join(".git"));
-    common::private(&copy.join(".git/trellis"));
-    fs::copy(
-        work.join(".git/trellis/workspace-id"),
-        copy.join(".git/trellis/workspace-id"),
-    )
-    .unwrap();
-    let copied = WorkspaceIdentity::discover(Some(&copy), &copy).unwrap();
-    assert_eq!(copied.record_id, id);
-    assert!(valid_record_id(&id));
-    for bad in [
-        "",
-        "../bad",
-        "00000000-0000-0000-0000-000000000000",
-        "PATH-bad",
-        "path-ABC",
-        "ABCDEFAB-CDEF-4ABC-ABCD-ABCDEFABCDEF",
-    ] {
-        assert!(!valid_record_id(bad));
-        assert!(
-            roots
-                .forget_with_confirmation(bad, |_, _| Ok(true))
-                .is_err()
-        );
-    }
-    let records = DurableRecords::new(&roots, &identity);
-    let view: SavedView = serde_json::from_str(
-        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
-    )
-    .unwrap();
-    records.put_view(&view).unwrap();
-    let directory = roots.record_dir(&identity);
-    let lock = roots.record_use_lock(&identity);
-    let shared = UseGuard::acquire_existing(&lock, false, true).unwrap();
-    assert!(
-        roots
-            .forget_with_confirmation(&id, |_, _| Ok(true))
-            .is_err()
-    );
-    drop(shared);
-    assert!(
-        !roots
-            .forget_with_confirmation(&id, |report, paths| {
-                assert_eq!(report.views, 1);
-                assert_eq!(report.annotations, 0);
-                assert_eq!(paths, &[identity.root.to_str().unwrap().to_string()]);
-                Ok(false)
-            })
-            .unwrap()
-    );
-    assert!(directory.exists());
-    fs::write(directory.join("unknown"), "leave untouched").unwrap();
-    assert!(
-        roots
-            .forget_with_confirmation(&id, |_, _| Ok(true))
-            .is_err()
-    );
-    assert!(directory.join("unknown").exists());
-    fs::remove_file(directory.join("unknown")).unwrap();
-    assert!(
-        roots
-            .forget_with_confirmation(&id, |_, _| Ok(true))
-            .unwrap()
-    );
-    assert!(!directory.exists());
-    assert!(!lock.exists());
-    assert!(work.join(".git/trellis/workspace-id").exists());
-    assert!(copy.join(".git/trellis/workspace-id").exists());
-    assert!(
-        DurableRecords::new(&roots, &copied)
-            .views()
-            .unwrap()
-            .is_empty()
-    );
-    records.put_view(&view).unwrap();
-    assert_eq!(records.views().unwrap(), vec![view]);
-}
-
-#[test]
-fn forget_empty_record_and_recovery_sidecars_refuse() {
-    use trellis::{model::SavedView, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    let view: SavedView = serde_json::from_str(
-        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
-    )
-    .unwrap();
-    records.put_view(&view).unwrap();
-    records.delete_view("view1").unwrap();
-    let db = roots.record_db(&identity);
-    fs::write(db.with_file_name("workspace.db-wal"), "recovery").unwrap();
-    assert!(
-        roots
-            .forget_with_confirmation(&identity.record_id, |_, _| Ok(true))
-            .is_err()
-    );
-    assert!(db.exists());
-    fs::remove_file(db.with_file_name("workspace.db-wal")).unwrap();
-    assert!(
-        roots
-            .forget_with_confirmation(&identity.record_id, |report, _| {
-                assert_eq!(report.views, 0);
-                Ok(true)
-            })
-            .unwrap()
-    );
-}
-
-#[test]
-fn forget_refuses_countable_records_with_unknown_sqlite_schema() {
-    use trellis::{model::SavedView, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let view: SavedView = serde_json::from_str(
-        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
-    )
-    .unwrap();
-    for (n, change) in [
-        "CREATE TABLE unexpected (id INTEGER)",
-        "CREATE VIEW unexpected AS SELECT id FROM views",
-        "CREATE TRIGGER unexpected AFTER INSERT ON views BEGIN SELECT 1; END",
-        "CREATE INDEX unexpected ON views(payload)",
-        "ALTER TABLE views ADD COLUMN unexpected TEXT",
-        "UPDATE sqlite_master SET sql=replace(sql,'CHECK(schema_version=1)','CHECK(schema_version>0)') WHERE name='record_metadata'",
-    ].iter().enumerate() {
-        let work = temp.path().join(format!("unsafe-schema-{n}"));
-        fs::create_dir(&work).unwrap();
-        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-        DurableRecords::new(&roots, &identity).put_view(&view).unwrap();
-        let path = roots.record_db(&identity);
-        let lock = roots.record_use_lock(&identity);
-        let db = rusqlite::Connection::open(&path).unwrap();
-        if n == 5 {
-            db.pragma_update(None, "writable_schema", "ON").unwrap();
-        }
-        db.execute_batch(change).unwrap();
-        if n == 5 {
-            db.pragma_update(None, "writable_schema", "OFF").unwrap();
-            db.pragma_update(None, "schema_version", 100).unwrap();
-        }
-        assert_eq!(db.query_row("SELECT count(*) FROM views", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
-        drop(db);
-        let before_db = fs::read(&path).unwrap();
-        let before_lock = fs::read(&lock).unwrap();
-        let unrelated = temp.path().join(format!("unrelated-{n}"));
-        fs::write(&unrelated, "keep").unwrap();
-        let before_unrelated = fs::read(&unrelated).unwrap();
-        let mut asked = false;
-        let result = roots.forget_with_confirmation(&identity.record_id, |_, _| {
-            asked = true;
-            Ok(true)
-        });
-        assert!(result.is_err(), "{change}");
-        assert!(!asked, "must reject before confirmation: {change}");
-        assert_eq!(fs::read(&path).unwrap(), before_db, "{change}");
-        assert_eq!(fs::read(&lock).unwrap(), before_lock, "{change}");
-        assert_eq!(fs::read(&unrelated).unwrap(), before_unrelated, "{change}");
-    }
-}
-
-#[test]
-fn forget_rechecks_sqlite_schema_after_confirmation() {
-    use trellis::{model::SavedView, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let view: SavedView = serde_json::from_str(
-        r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
-    )
-    .unwrap();
-    DurableRecords::new(&roots, &identity)
-        .put_view(&view)
-        .unwrap();
-    let path = roots.record_db(&identity);
-    let lock = roots.record_use_lock(&identity);
-    assert!(
-        roots
-            .forget_with_confirmation(&identity.record_id, |_, _| {
-                let db = rusqlite::Connection::open(&path)?;
-                db.execute_batch("CREATE TABLE late_entry(id INTEGER)")?;
-                Ok(true)
-            })
-            .is_err()
-    );
-    assert!(path.exists() && lock.exists());
-    let db = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(
-        db.query_row("SELECT count(*) FROM views", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-}
-
-#[test]
-fn gc_classifies_current_schema24_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema25_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1906,15 +1114,15 @@ fn gc_classifies_current_schema24_but_refuses_spoofed_shapes() {
     db.execute_batch("DROP TRIGGER unapproved_trigger").unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     // Any earlier schema is collectable whatever its layout, root or age (#253).
-    for version in [1, 7, 9, 13, 14, 15, 17, 18, 19, 20] {
+    for version in [1, 7, 9, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24] {
         db.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(inspect(), ("eligible", "old_schema"), "v{version}");
     }
     db.pragma_update(None, "user_version", 0).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 25).unwrap();
+    db.pragma_update(None, "user_version", 26).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_schema"));
-    db.pragma_update(None, "user_version", 24).unwrap();
+    db.pragma_update(None, "user_version", 25).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -1922,7 +1130,7 @@ fn gc_classifies_current_schema24_but_refuses_spoofed_shapes() {
 }
 
 #[test]
-fn complete_schema24_index_remains_gc_eligible() {
+fn complete_schema25_index_remains_gc_eligible() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1931,7 +1139,7 @@ fn complete_schema24_index_remains_gc_eligible() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        24
+        25
     );
     let now = 1_800_000_000_i64;
     db.execute(
@@ -1944,677 +1152,9 @@ fn complete_schema24_index_remains_gc_eligible() {
     assert_eq!((entry.status, entry.reason), ("eligible", "age_30_days"));
 }
 
-#[test]
-fn saved_anchor_raw_bytes_survive_edits() {
-    use trellis::{
-        model::{Annotation, AnnotationRecord},
-        store::topology::DurableRecords,
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let raw = serde_json::value::RawValue::from_string(
-        r#"{ "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef", "document":{"sourceSetId":"set","language":"rust","path":"src/lib.rs"}, "capturedRevisionId":"rev", "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "siblingGroupHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "siblingCount":1, "identicalHeaderCount":1 }"#.into(),
-    ).unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    records
-        .put_annotation_record(
-            &AnnotationRecord::from_base(
-                Annotation {
-                    id: "note".into(),
-                    node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(),
-                    body: "first".into(),
-                },
-                Some("Title".into()),
-                Some(raw),
-            ),
-            false,
-        )
-        .unwrap();
-    let before = records
-        .annotation_record("note")
-        .unwrap()
-        .unwrap()
-        .anchor
-        .unwrap()
-        .get()
-        .to_owned();
-    let edited = AnnotationRecord::from_base(
-        Annotation {
-            id: "note".into(),
-            node_id: "sid:v1:0123456789abcdef0123456789abcdef".into(),
-            body: "edited body".into(),
-        },
-        Some("Edited title".into()),
-        None,
-    );
-    let response = records
-        .update_annotation_record(&edited, false, || {
-            panic!("existing edit must not recapture")
-        })
-        .unwrap();
-    assert_eq!(response.anchor.as_ref().unwrap().get(), before);
-    assert_eq!(response.title.as_deref(), Some("Edited title"));
-    assert_eq!(response.body, "edited body");
-    let after = records.annotation_record("note").unwrap().unwrap();
-    assert_eq!(after.anchor.unwrap().get(), before);
-    assert_eq!(after.title.as_deref(), Some("Edited title"));
-    assert_eq!(after.body, "edited body");
-}
-
-#[test]
-fn saved_anchor_rejects_target_replacement() {
-    use trellis::{model::Annotation, store::topology::DurableRecords};
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    records
-        .put_annotation(&Annotation {
-            id: "note".into(),
-            node_id: "old".into(),
-            body: "first".into(),
-        })
-        .unwrap();
-    let error = records
-        .put_annotation(&Annotation {
-            id: "note".into(),
-            node_id: "new".into(),
-            body: "second".into(),
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("target replacement"));
-    assert_eq!(records.annotation("note").unwrap().unwrap().node_id, "old");
-}
-
-fn assert_expected_storage_busy(error: &anyhow::Error) {
-    if error.to_string().starts_with("storage_busy") {
-        return;
-    }
-    match error.downcast_ref::<rusqlite::Error>() {
-        Some(rusqlite::Error::SqliteFailure(code, _))
-            if code.code == rusqlite::ErrorCode::DatabaseBusy => {}
-        _ => panic!("unexpected contention error: {error:#}"),
-    }
-}
-
-fn test_anchor_raw(target: &str, hash_byte: char) -> Box<serde_json::value::RawValue> {
-    let hash: String = std::iter::repeat_n(hash_byte, 64).collect();
-    serde_json::value::to_raw_value(&trellis::model::DurableAnchor {
-        syntax_id: target.into(),
-        document: trellis::native_evidence::DocumentKey {
-            source_set_id: "set".into(),
-            language: "rust".into(),
-            path: "src/lib.rs".into(),
-        },
-        captured_revision_id: "revision".into(),
-        header_hash: hash.clone(),
-        sibling_group_hash: hash,
-        sibling_count: 1,
-        identical_header_count: 1,
-    })
-    .unwrap()
-}
-
-#[test]
-fn malformed_anchor_documents_fail_before_persistence() {
-    use trellis::{
-        model::{Annotation, AnnotationRecord},
-        store::topology::DurableRecords,
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    for (language, path) in [
-        ("typescript", "src/lib.rs"),
-        ("rust", "/src/lib.rs"),
-        ("rust", "src\\lib.rs"),
-        ("rust", "src//lib.rs"),
-        ("rust", "src/./lib.rs"),
-        ("rust", "src/../lib.rs"),
-    ] {
-        let mut value: serde_json::Value = serde_json::from_str(
-            test_anchor_raw("sid:v1:0123456789abcdef0123456789abcdef", 'a').get(),
-        )
-        .unwrap();
-        value["document"]["language"] = language.into();
-        value["document"]["path"] = path.into();
-        let raw = serde_json::value::to_raw_value(&value).unwrap();
-        let record = AnnotationRecord::from_base(
-            Annotation {
-                id: "bad".into(),
-                node_id: "node".into(),
-                body: "body".into(),
-            },
-            None,
-            Some(raw),
-        );
-        assert!(
-            records.put_annotation_record(&record, false).is_err(),
-            "accepted {language}:{path}"
-        );
-    }
-    assert!(!roots.record_db(&identity).exists());
-}
-
-#[test]
-fn view_anchor_raw_bytes_survive_edits() {
-    use std::collections::BTreeMap;
-    use trellis::{
-        model::{SavedView, SavedViewRecord, ViewQuery},
-        store::topology::DurableRecords,
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let target = "sid:v1:0123456789abcdef0123456789abcdef";
-    let records = DurableRecords::new(&roots, &identity);
-    let view = SavedView {
-        id: "view".into(),
-        title: "First".into(),
-        query: ViewQuery {
-            seed: target.into(),
-            depth: 1,
-            max_nodes: 40,
-            max_calls: 200,
-            include_callbacks: false,
-            exclude_paths: vec![],
-        },
-        pins: BTreeMap::new(),
-        hidden: vec![],
-    };
-    let raw = serde_json::value::RawValue::from_string(
-        r#"{ "siblingCount":1, "syntaxId":"sid:v1:0123456789abcdef0123456789abcdef", "document": {"path":"src/lib.rs","language":"rust","sourceSetId":"set"}, "capturedRevisionId":"revision", "headerHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "siblingGroupHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "identicalHeaderCount":1 }"#.into(),
-    ).unwrap();
-    records
-        .put_view_record(&SavedViewRecord::from_base(view.clone(), Some(raw)))
-        .unwrap();
-    let before = records
-        .view_record("view")
-        .unwrap()
-        .unwrap()
-        .anchor
-        .unwrap()
-        .get()
-        .to_owned();
-    let mut edited = view;
-    edited.title = "Edited".into();
-    records.put_view(&edited).unwrap();
-    let after = records.view_record("view").unwrap().unwrap();
-    assert_eq!(after.anchor.unwrap().get(), before);
-    assert_eq!(after.title, "Edited");
-}
-
-#[test]
-fn existing_saved_writers_use_exclusive_lock_and_orphan_sidecars_refuse() {
-    use trellis::{
-        model::{SavedView, SavedViewRecord},
-        store::topology::{DurableRecords, UseGuard},
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    let target = "sid:v1:0123456789abcdef0123456789abcdef";
-    let view: SavedView = serde_json::from_value(serde_json::json!({
-        "id": "exclusive-record", "title": "initial", "query": {"seed": target}
-    }))
-    .unwrap();
-    let initial = SavedViewRecord::from_base(view, None);
-    let first = records
-        .update_view_record(&initial, || Ok(test_anchor_raw(target, 'a')))
-        .unwrap();
-    let first_anchor = first.anchor.as_ref().unwrap().get().to_owned();
-    let mut edited = initial.clone();
-    edited.title = "edited".into();
-    let db = roots.record_db(&identity);
-    let before = fs::read(&db).unwrap();
-    let lock = roots.record_use_lock(&identity);
-    let guard = UseGuard::acquire_existing(&lock, true, true).unwrap();
-    let save_error = records
-        .update_view_record(&edited, || panic!("busy writer must not capture an anchor"))
-        .unwrap_err();
-    assert_eq!(save_error.to_string(), "storage_busy");
-    let delete_error = records.delete_view("exclusive-record").unwrap_err();
-    assert_eq!(delete_error.to_string(), "storage_busy");
-    assert_eq!(
-        fs::read(&db).unwrap(),
-        before,
-        "busy writers must not touch record bytes"
-    );
-    drop(guard);
-    let preserved = records.view_record("exclusive-record").unwrap().unwrap();
-    assert_eq!(preserved.anchor.unwrap().get(), first_anchor);
-
-    let updated = records
-        .update_view_record(&edited, || panic!("existing edit must keep first anchor"))
-        .unwrap();
-    assert_eq!(updated.title, "edited");
-    assert_eq!(updated.anchor.unwrap().get(), first_anchor);
-    assert!(records.delete_view("exclusive-record").unwrap());
-    assert!(records.view_record("exclusive-record").unwrap().is_none());
-    let recreated = records
-        .update_view_record(&initial, || Ok(test_anchor_raw(target, 'b')))
-        .unwrap();
-    let second_anchor = recreated.anchor.unwrap().get().to_owned();
-    assert_ne!(
-        second_anchor, first_anchor,
-        "delete followed by save must recapture"
-    );
-
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let sidecar = db.with_file_name(format!("workspace.db{suffix}"));
-        fs::write(&sidecar, b"orphaned").unwrap();
-        let before = fs::read(&db).unwrap();
-        let save_error = records
-            .update_view_record(&edited, || panic!("orphan sidecar must not capture"))
-            .unwrap_err();
-        assert_eq!(
-            save_error.to_string(),
-            "incomplete_record: recovery required"
-        );
-        let delete_error = records.delete_view("exclusive-record").unwrap_err();
-        assert_eq!(
-            delete_error.to_string(),
-            "incomplete_record: recovery required"
-        );
-        assert_eq!(fs::read(&db).unwrap(), before);
-        assert_eq!(fs::read(&sidecar).unwrap().as_slice(), b"orphaned");
-        fs::remove_file(sidecar).unwrap();
-    }
-    let preserved = records.view_record("exclusive-record").unwrap().unwrap();
-    assert_eq!(preserved.anchor.unwrap().get(), second_anchor);
-}
-
-#[test]
-fn saved_anchor_atomic_first_save_and_delete_edit_races() {
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, Barrier},
-        thread,
-    };
-    use trellis::{
-        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
-        store::topology::DurableRecords,
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let target = "sid:v1:0123456789abcdef0123456789abcdef";
-    let make_view = |title: char| {
-        SavedViewRecord::from_base(
-            SavedView {
-                id: "view-race".into(),
-                title: title.to_string(),
-                query: ViewQuery {
-                    seed: target.into(),
-                    depth: 1,
-                    max_nodes: 40,
-                    max_calls: 200,
-                    include_callbacks: false,
-                    exclude_paths: vec![],
-                },
-                pins: BTreeMap::new(),
-                hidden: vec![],
-            },
-            None,
-        )
-    };
-
-    // Whole-record creation intentionally uses a nonblocking exclusive use lock.
-    // One contender wins; retry the typed busy loser only after the winner released it.
-    let barrier = Arc::new(Barrier::new(2));
-    let mut workers = vec![];
-    for hash in ['a', 'b'] {
-        let roots = roots.clone();
-        let work = work.clone();
-        let barrier = barrier.clone();
-        let record = make_view(hash);
-        workers.push(thread::spawn(move || {
-            let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-            barrier.wait();
-            let result = DurableRecords::new(&roots, &identity)
-                .update_view_record(&record, || Ok(test_anchor_raw(target, hash)));
-            (hash, result)
-        }));
-    }
-    let outcomes: Vec<_> = workers
-        .into_iter()
-        .map(|worker| worker.join().unwrap())
-        .collect();
-    let winner = outcomes
-        .iter()
-        .find_map(|(_, result)| result.as_ref().ok())
-        .expect("one creator must win");
-    let winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
-    let losers: Vec<_> = outcomes
-        .iter()
-        .filter(|(_, result)| result.is_err())
-        .collect();
-    assert!(losers.len() <= 1, "only the nonblocking creator may lose");
-    for (_, result) in outcomes.iter().filter(|(_, result)| result.is_ok()) {
-        assert_eq!(
-            result.as_ref().unwrap().anchor.as_ref().unwrap().get(),
-            winner_raw
-        );
-    }
-    if let Some((loser_hash, loser)) = losers.first() {
-        assert_expected_storage_busy(loser.as_ref().unwrap_err());
-        let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-        let retried = DurableRecords::new(&roots, &identity)
-            .update_view_record(&make_view(*loser_hash), || {
-                Ok(test_anchor_raw(target, *loser_hash))
-            })
-            .unwrap();
-        assert_eq!(retried.anchor.as_ref().unwrap().get(), winner_raw);
-    }
-
-    // Once the durable DB exists, same-ID note contenders either serialize in SQLite
-    // or report typed busy. Retry any loser after both contenders have completed.
-    let make_note = |body: char| {
-        AnnotationRecord::from_base(
-            Annotation {
-                id: "note-race".into(),
-                node_id: target.into(),
-                body: body.to_string(),
-            },
-            None,
-            None,
-        )
-    };
-    let barrier = Arc::new(Barrier::new(2));
-    let mut workers = vec![];
-    for hash in ['c', 'd'] {
-        let roots = roots.clone();
-        let work = work.clone();
-        let barrier = barrier.clone();
-        let record = make_note(hash);
-        workers.push(thread::spawn(move || {
-            let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-            barrier.wait();
-            let result = DurableRecords::new(&roots, &identity).update_annotation_record(
-                &record,
-                false,
-                || Ok(test_anchor_raw(target, hash)),
-            );
-            (hash, result)
-        }));
-    }
-    let outcomes: Vec<_> = workers
-        .into_iter()
-        .map(|worker| worker.join().unwrap())
-        .collect();
-    let winner = outcomes
-        .iter()
-        .find_map(|(_, result)| result.as_ref().ok())
-        .expect("one note writer must win");
-    let note_winner_raw = winner.anchor.as_ref().unwrap().get().to_owned();
-    for (hash, result) in outcomes {
-        match result {
-            Ok(record) => assert_eq!(record.anchor.unwrap().get(), note_winner_raw),
-            Err(error) => {
-                assert_expected_storage_busy(&error);
-                let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-                let retried = DurableRecords::new(&roots, &identity)
-                    .update_annotation_record(&make_note(hash), false, || {
-                        Ok(test_anchor_raw(target, hash))
-                    })
-                    .unwrap();
-                assert_eq!(retried.anchor.unwrap().get(), note_winner_raw);
-            }
-        }
-    }
-
-    // Delete/edit contention may expose the same documented typed busy result.
-    // Complete the loser only after the winner releases the transaction and prove
-    // that every successful edit response carries a real immutable anchor.
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    let existing = records.view_record("view-race").unwrap().unwrap();
-    let old_raw = existing.anchor.as_ref().unwrap().get().to_owned();
-    let edit = SavedViewRecord {
-        title: "edit".into(),
-        anchor: None,
-        ..existing
-    };
-    let barrier = Arc::new(Barrier::new(2));
-    let edit_roots = roots.clone();
-    let edit_work = work.clone();
-    let edit_barrier = barrier.clone();
-    let edit_copy = edit.clone();
-    let editor = thread::spawn(move || {
-        let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
-        edit_barrier.wait();
-        DurableRecords::new(&edit_roots, &identity)
-            .update_view_record(&edit_copy, || Ok(test_anchor_raw(target, 'e')))
-    });
-    let delete_roots = roots.clone();
-    let delete_work = work.clone();
-    let delete_barrier = barrier.clone();
-    let deleter = thread::spawn(move || {
-        let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
-        delete_barrier.wait();
-        DurableRecords::new(&delete_roots, &identity).delete_view("view-race")
-    });
-    let replacement_raw = test_anchor_raw(target, 'e').get().to_owned();
-    let edit_result = editor.join().unwrap();
-    let delete_result = deleter.join().unwrap();
-    let edit_was_busy = edit_result.is_err();
-    let edit_response = match edit_result {
-        Ok(record) => record,
-        Err(error) => {
-            assert_expected_storage_busy(&error);
-            records
-                .update_view_record(&edit, || Ok(test_anchor_raw(target, 'e')))
-                .unwrap()
-        }
-    };
-    let delete_was_busy = delete_result.is_err();
-    match delete_result {
-        Ok(deleted) => assert!(deleted),
-        Err(error) => {
-            assert_expected_storage_busy(&error);
-            assert!(records.delete_view("view-race").unwrap());
-        }
-    }
-    let response_raw = edit_response.anchor.as_ref().unwrap().get();
-    assert!(response_raw == old_raw || response_raw == replacement_raw);
-    assert!(edit_response.typed_anchor().unwrap().is_some());
-    let final_record = records.view_record("view-race").unwrap();
-    match (edit_was_busy, delete_was_busy, final_record) {
-        // The edit retry runs first; the delete retry then removes that exact row.
-        (_, true, None) => assert_eq!(response_raw, old_raw),
-        // The completed delete ran first; the edit retry is a fresh server capture.
-        (true, false, Some(final_record)) => {
-            assert_eq!(response_raw, replacement_raw);
-            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
-        }
-        // With no retry, final presence proves delete-before-edit.
-        (false, false, Some(final_record)) => {
-            assert_eq!(response_raw, replacement_raw);
-            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
-        }
-        // With no retry, final absence proves edit-before-delete.
-        (false, false, None) => assert_eq!(response_raw, old_raw),
-        chronology => panic!("impossible view contention chronology: {chronology:?}"),
-    }
-
-    let existing = records.annotation_record("note-race").unwrap().unwrap();
-    let old_raw = existing.anchor.as_ref().unwrap().get().to_owned();
-    let edit = AnnotationRecord {
-        body: "edit".into(),
-        anchor: None,
-        ..existing
-    };
-    let barrier = Arc::new(Barrier::new(2));
-    let edit_roots = roots.clone();
-    let edit_work = work.clone();
-    let edit_barrier = barrier.clone();
-    let edit_copy = edit.clone();
-    let editor = thread::spawn(move || {
-        let identity = WorkspaceIdentity::discover(Some(&edit_work), &edit_work).unwrap();
-        edit_barrier.wait();
-        DurableRecords::new(&edit_roots, &identity).update_annotation_record(
-            &edit_copy,
-            false,
-            || Ok(test_anchor_raw(target, 'f')),
-        )
-    });
-    let delete_roots = roots.clone();
-    let delete_work = work.clone();
-    let delete_barrier = barrier.clone();
-    let deleter = thread::spawn(move || {
-        let identity = WorkspaceIdentity::discover(Some(&delete_work), &delete_work).unwrap();
-        delete_barrier.wait();
-        DurableRecords::new(&delete_roots, &identity).delete_annotation("note-race")
-    });
-    let replacement_raw = test_anchor_raw(target, 'f').get().to_owned();
-    let edit_result = editor.join().unwrap();
-    let delete_result = deleter.join().unwrap();
-    let edit_was_busy = edit_result.is_err();
-    let edit_response = match edit_result {
-        Ok(record) => record,
-        Err(error) => {
-            assert_expected_storage_busy(&error);
-            records
-                .update_annotation_record(&edit, false, || Ok(test_anchor_raw(target, 'f')))
-                .unwrap()
-        }
-    };
-    let delete_was_busy = delete_result.is_err();
-    match delete_result {
-        Ok(deleted) => assert!(deleted),
-        Err(error) => {
-            assert_expected_storage_busy(&error);
-            assert!(records.delete_annotation("note-race").unwrap());
-        }
-    }
-    let response_raw = edit_response.anchor.as_ref().unwrap().get();
-    assert!(response_raw == old_raw || response_raw == replacement_raw);
-    assert!(edit_response.typed_anchor().unwrap().is_some());
-    let final_record = records.annotation_record("note-race").unwrap();
-    match (edit_was_busy, delete_was_busy, final_record) {
-        // The edit retry runs first; the delete retry then removes that exact row.
-        (_, true, None) => assert_eq!(response_raw, old_raw),
-        // The completed delete ran first; the edit retry is a fresh server capture.
-        (true, false, Some(final_record)) => {
-            assert_eq!(response_raw, replacement_raw);
-            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
-        }
-        // With no retry, final presence proves delete-before-edit.
-        (false, false, Some(final_record)) => {
-            assert_eq!(response_raw, replacement_raw);
-            assert_eq!(final_record.anchor.unwrap().get(), replacement_raw);
-        }
-        // With no retry, final absence proves edit-before-delete.
-        (false, false, None) => assert_eq!(response_raw, old_raw),
-        chronology => panic!("impossible view contention chronology: {chronology:?}"),
-    }
-}
-
-#[test]
-fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() {
-    use std::{
-        collections::BTreeMap,
-        sync::atomic::{AtomicBool, Ordering},
-    };
-    use trellis::{
-        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
-        store::topology::DurableRecords,
-    };
-    let (temp, roots) = common::fixture();
-    let work = root(temp.path());
-    let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let records = DurableRecords::new(&roots, &identity);
-    let target = "sid:v1:0123456789abcdef0123456789abcdef";
-
-    let stale_view = SavedViewRecord::from_base(
-        SavedView {
-            id: "view-recreate".into(),
-            title: "old".into(),
-            query: ViewQuery {
-                seed: target.into(),
-                depth: 1,
-                max_nodes: 40,
-                max_calls: 200,
-                include_callbacks: false,
-                exclude_paths: vec![],
-            },
-            pins: BTreeMap::new(),
-            hidden: vec![],
-        },
-        Some(test_anchor_raw(target, 'a')),
-    );
-    records.put_view_record(&stale_view).unwrap();
-    assert!(records.delete_view("view-recreate").unwrap());
-    assert!(records.view_record("view-recreate").unwrap().is_none());
-    let view_capture_called = AtomicBool::new(false);
-    let recreated_view = records
-        .update_view_record(&stale_view, || {
-            assert!(!view_capture_called.swap(true, Ordering::SeqCst));
-            Ok(test_anchor_raw(target, 'e'))
-        })
-        .unwrap();
-    assert!(view_capture_called.load(Ordering::SeqCst));
-    assert_eq!(
-        recreated_view.anchor.as_ref().unwrap().get(),
-        test_anchor_raw(target, 'e').get()
-    );
-    assert_eq!(
-        records
-            .view_record("view-recreate")
-            .unwrap()
-            .unwrap()
-            .anchor
-            .unwrap()
-            .get(),
-        test_anchor_raw(target, 'e').get()
-    );
-
-    let stale_note = AnnotationRecord::from_base(
-        Annotation {
-            id: "note-recreate".into(),
-            node_id: target.into(),
-            body: "old".into(),
-        },
-        Some("Title".into()),
-        Some(test_anchor_raw(target, 'b')),
-    );
-    records.put_annotation_record(&stale_note, false).unwrap();
-    assert!(records.delete_annotation("note-recreate").unwrap());
-    assert!(
-        records
-            .annotation_record("note-recreate")
-            .unwrap()
-            .is_none()
-    );
-    let note_capture_called = AtomicBool::new(false);
-    let recreated_note = records
-        .update_annotation_record(&stale_note, false, || {
-            assert!(!note_capture_called.swap(true, Ordering::SeqCst));
-            Ok(test_anchor_raw(target, 'f'))
-        })
-        .unwrap();
-    assert!(note_capture_called.load(Ordering::SeqCst));
-    assert_eq!(
-        recreated_note.anchor.as_ref().unwrap().get(),
-        test_anchor_raw(target, 'f').get()
-    );
-    assert_eq!(
-        records
-            .annotation_record("note-recreate")
-            .unwrap()
-            .unwrap()
-            .anchor
-            .unwrap()
-            .get(),
-        test_anchor_raw(target, 'f').get()
-    );
-}
-
 #[cfg(feature = "test-support")]
 #[test]
-fn gc_report_accepts_current_schema22_but_rejects_bad_inventory() {
+fn gc_report_accepts_current_schema25_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -3140,4 +1680,23 @@ fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
         roots.automatic_gc_at(&id, &writer, now + 86_399).unwrap(),
         0
     );
+}
+
+#[test]
+fn vector_report_is_machine_wide_and_does_not_create_checkout_state() {
+    let (temp, roots) = common::fixture();
+    roots.prepare_vectors().unwrap();
+    let mut cache = trellis::search_vectors::VectorCacheWriter::open(&roots.vectors_db()).unwrap();
+    cache
+        .put(&"a".repeat(64), &"b".repeat(64), &[1, -2, 3])
+        .unwrap();
+    drop(cache);
+    let before = gc_manifest(temp.path());
+    let report = roots.gc_report_at(1_800_000_000).unwrap();
+    assert_eq!(report.vectors.entries, 1);
+    assert!(report.vectors.bytes > 0);
+    assert!(report.derived.is_empty());
+    assert_eq!(before, gc_manifest(temp.path()));
+    assert!(!roots.cache.join("indexes").exists());
+    assert!(!roots.data.exists());
 }

@@ -1151,20 +1151,74 @@ fn selected_case(change_b: &str) {
         assert_eq!(store.selected_raw_inputs_at(baseline).unwrap().len(), 1);
         let prior_native = store.retained_native_snapshot_at(baseline).unwrap();
         let prior_selected = store.selected_raw_inputs_at(baseline).unwrap();
-        fs::write(root.join("src/B.js"), "function target(){ return 3; }\n").unwrap();
+        let search_snapshot = |db: &rusqlite::Connection| {
+            let cards = db.prepare(
+                "SELECT vid,syntax_id,card_text,card_hash,facts_json,terms FROM native_version_search_cards ORDER BY vid,syntax_id",
+            )?.query_map([], |row| Ok((
+                row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+            )))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let fts = db
+                .prepare("SELECT rowid,vid,syntax_id,terms FROM head_search_fts ORDER BY rowid")?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<_, anyhow::Error>((cards, fts))
+        };
+        let prior_search = (change_b == "cancel_after")
+            .then(|| store.with_index_sql_for_tests(search_snapshot).unwrap());
+        let changed_b = if change_b == "cancel_after" {
+            "function target(){ return \"rollback orchard\"; }\n"
+        } else {
+            "function target(){ return 3; }\n"
+        };
+        fs::write(root.join("src/B.js"), changed_b).unwrap();
         let cancelled = cancel.clone();
         if change_b == "cancel_before" {
             store.set_publication_before_semantic_hook_for_tests(move || {
                 cancelled.store(true, std::sync::atomic::Ordering::Release)
             });
         } else {
+            let audit = store.clone();
             store.set_publication_before_commit_hook_for_tests(move || {
+                let writes = audit.take_search_fts_writes_for_tests();
+                assert!(
+                    writes
+                        .iter()
+                        .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_DELETE)
+                );
+                assert!(
+                    writes
+                        .iter()
+                        .any(|(operation, _)| *operation == rusqlite::ffi::SQLITE_INSERT)
+                );
                 cancelled.store(true, std::sync::atomic::Ordering::Release)
             });
         }
         let (graph, native, capture) =
             trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
                 .unwrap();
+        if change_b == "cancel_after" {
+            let changed = native
+                .search_cards
+                .iter()
+                .find(|card| card.path == "src/B.js")
+                .unwrap();
+            let previous = prior_native
+                .0
+                .search_cards
+                .iter()
+                .find(|card| card.syntax_id == changed.syntax_id)
+                .unwrap();
+            assert_ne!(changed.card.text, previous.card.text);
+        }
         let leader = store.publication_for_tests().unwrap();
         let result =
             store.publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &cancel);
@@ -1182,6 +1236,12 @@ fn selected_case(change_b: &str) {
             format!("{prior_selected:?}")
         );
         assert_eq!(store.semantic_at(baseline).unwrap(), prior_semantic);
+        if let Some(prior_search) = prior_search {
+            assert_eq!(
+                store.with_index_sql_for_tests(search_snapshot).unwrap(),
+                prior_search
+            );
+        }
         store
             .with_index_sql_for_tests(|db| {
                 let revision: i64 = db.query_row(

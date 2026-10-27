@@ -7,7 +7,7 @@
 
   The number 0013 was last used by the closed, unmerged WAL draft (#215), which never became a record.
 - **Amends:** nothing in W2's output. [`../../mcp-readonly-pilot-contract.md`](../../mcp-readonly-pilot-contract.md) § W2 keeps its literal ASCII-`lower`/`instr` rule, ranking, limits and truncation. This record adds only how candidates are found.
-- **Not decided here:** the search-side table and the rest of D1–D13, which stay with [#211](https://github.com/SquashMerge/trellis/issues/211). Whether one table could serve both stays open.
+- **Search-side table:** [Decision 0018](0018-semantic-symbol-retrieval.md) specifies a separate head-only split-identifier ranking table. Both trigram prefilters and all literal matching/output rules in this decision remain unchanged. Neither trigram table serves semantic-search ranking.
 - **Compatibility:** none needed for disposable derived indexes. The new tables change the index format, so the index schema version changes and existing indexes are recreated, not migrated.
 
 ## Decision

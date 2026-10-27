@@ -21,7 +21,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - run: npm ci --prefix runtime/acp --ignore-scripts
+      - run: npm ci --prefix tests/mcp --ignore-scripts
       # Keep in step with rust-toolchain.toml, which every local build uses.
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -38,7 +38,7 @@ jobs:
       # verify runs the Rust tests with nextest (one process per test).
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-nextest@0.9.148
+          tool: cargo-nextest@0.9.150
       # verify builds two target directories: the default build (`target`: both
       # clippy runs and the browser suite's debug binary) and the test-support
       # build (`target-test-support`: the tests), which is the larger.

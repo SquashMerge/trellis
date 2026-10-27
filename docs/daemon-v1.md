@@ -19,8 +19,7 @@ cargo run --locked -- serve --workspace /path/to/repository \
 Open http://127.0.0.1:8877/. Read the private token file at the path printed by `serve`
 and paste its contents into the Connect form. The token itself is never printed by the
 daemon. `--token-file` is required and must be outside the selected checkout. The
-disposable path-keyed index and first-save durable record use fixed per-user cache/data
-locations. A Git workspace UUID marker is written inside the selected Git directory;
+disposable path-keyed index uses fixed per-user cache locations. A Git workspace UUID marker is written inside the selected Git directory;
 there are no other checkout topology writes.
 
 `serve` does **not** index at startup. Use **Index workspace** to refresh; **Refresh status
@@ -28,8 +27,9 @@ there are no other checkout topology writes.
 stops serving. A cancellation request cannot undo a revision already committed.
 
 `--state-dir` is removed; there is no placement override or automatic old-state migration.
-Keep the token and optional Jev/ACP ledgers at explicit private paths outside the selected
-checkout and fixed topology. Move old in-checkout token/ledger data manually with Trellis stopped.
+Keep the token at an explicit private path outside the selected checkout and fixed topology.
+Move old in-checkout token data manually with Trellis stopped. Retired saved records and
+Jev/ACP ledgers remain in place and ignored, not inspected, migrated or deleted.
 The example above creates a private parent; a new token file is created with private permissions.
 
 `--bind 127.0.0.1:0` selects a free port. Non-loopback addresses are rejected. The first
@@ -55,8 +55,8 @@ cargo run --locked -- serve \
   --token-file "$HOME/.trellis-private/token"
 ```
 
-Search for `transition`, select it, and inspect its immediate call sites. Read source
-from a call, save the query, and add a note. Deeper traversal and callback navigation are
+Browse to `transition`, select it, and inspect its immediate call sites. Read source
+from a call. Deeper traversal and callback navigation are
 explicit options. The client collapses detailed resolution evidence by default.
 
 To regenerate missing SCIP artifacts, use the **explicit** extraction-spike workflow in
@@ -97,8 +97,7 @@ Public JSON uses camelCase. `src/model.rs` is the canonical Rust contract.
 - Symbol kinds: `module`, `function`, `method`, `class`. Global resolved IDs retain SCIP
   strings. Local SCIP IDs are scoped by document **and source hash**. Parser-only IDs
   include the path, source hash, offset and syntax kind. Any file edit can therefore
-  orphan local/provisional annotations; that is safer than attaching them to a different
-  function at a reused offset. Automatic reconciliation is deferred.
+  change local/provisional IDs; never attach old evidence to a different function at a reused offset.
 - Call sites retain distinct identities, caller, callee text, source span, measured
   candidate symbols, callback references and control-region IDs. Resolutions are
   `internal`, `external`, `unresolved`, `ambiguous`. “External” means outside the indexed
@@ -116,7 +115,8 @@ Public JSON uses camelCase. `src/model.rs` is the canonical Rust contract.
 
 ## Query contract
 
-`POST /api/query` accepts:
+The retained CLI `trellis query` uses the shared query service with these fields.
+The former browser `POST /api/query` route is removed:
 
 ```json
 {
@@ -143,7 +143,7 @@ outside the displayed node budget; do not invent a connecting box/edge to hide t
 A result includes `revision` as the complete `{indexGeneration,indexRevision}` pair,
 the effective query, `nodes`, `calls`, `regions`, `truncated`, `omittedNodes` and `warnings`.
 The pair and all facts are read in one SQLite transaction. Forward both fields to pinned
-source/symbol lookups; a stale pair returns HTTP 409. A bare numeric pin is invalid.
+shared source/symbol lookups; a stale pair returns a typed conflict. A bare numeric pin is invalid.
 Only the current snapshot is stored server-side; this is not historical time travel.
 
 ## Storage and publication
@@ -161,23 +161,10 @@ publication keeps the generation and advances the numeric revision. Deleting and
 the index can reuse a revision number, but never its generation. There is no durable
 revision allocator in `workspace.db`.
 
-The first-save durable `<data>/workspaces/<record-id>/workspace.db` preserves saved queries,
-pins, hidden IDs and annotations. It deliberately
-has no foreign key to rebuildable symbol IDs. Reads report missing IDs as orphans. The
-inspector edits saved queries and notes; pin/hidden storage is ready for a future canvas,
-but it does not implement layout or hidden-node editing.
-
-The disposable index schema is version **4**; durable record schema is version **1**.
-Graph JSON schema version is **1**. Incompatible or incomplete durable records are refused,
-not silently reset or migrated. No downgrade or legacy-state migration is supplied.
-
-**Manual cleanup:** `trellis gc --report` only prints read-only JSON inventory; it does
-not delete indexes. `trellis forget <record-id>` removes one saved record only after
-verified exclusive use and exact-ID interactive confirmation (or explicit `--yes`).
-It refuses unsafe contents and SQLite recovery sidecars even with `--yes`; resolve those
-manually rather than deleting them. Never remove a durable `workspace.db` to refresh an
-index, and never unlink a live SQLite database. Back up durable data with SQLite's
-backup mechanism, or with all processes stopped.
+Saved views, notes and their persistence are retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295).
+Existing record databases, sidecars, locks and provider trees remain in place and ignored.
+`trellis forget` is removed. `trellis gc --report` prints a read-only derived-index inventory,
+without opening or enumerating saved records. Never unlink a live SQLite database.
 The tests demonstrate transactional failure/cancellation, not simulated power loss.
 
 Search is bounded literal substring search, prioritizing exact symbol names. It is **not
@@ -198,8 +185,7 @@ CSP and nosniff. JSON requests are capped at 1 MiB. No frontend dev-origin excep
 in this first pass; use the embedded client or same-origin proxying later.
 
 Only the configured workspace can be indexed. No API accepts another root or arbitrary
-file reads/executables. Optional Jev/ACP provider requests require explicit startup opt-in,
-allowances and user action. Discovery respects ignores, skips hidden/build/
+file reads/executables. Discovery respects ignores, skips hidden/build/
 dependency/state directories and does not traverse symlinks. Unix reads use no-follow
 and post-open checks. **This is not a capability-based sandbox against hostile concurrent
 ancestor-directory replacement**, nor a defense against another process with the same
@@ -218,19 +204,9 @@ without publishing. These are guardrails, not a proven hostile-input resource sa
 | GET | `/api/jobs/current` | Latest job or null |
 | GET | `/api/jobs/{id}` | Job, or 404 |
 | POST | `/api/jobs/{id}/cancel` | Request cancellation; completed jobs stay completed |
-| GET | `/api/symbols?q=...&limit=50` | `{revision, items}` with paired revision; limit 1–150 |
-| GET | `/api/symbol?id=...&indexGeneration=...&indexRevision=...` | `{revision, symbol}`; optional complete pair guard |
 | GET | `/api/source?path=...&indexGeneration=...&indexRevision=...` | `{revision, file}`; cached source only, optional complete pair guard |
-| POST | `/api/query` | Bounded `ViewResult` |
-| GET | `/api/views` | Saved views with `orphanedIds` |
-| GET/PUT/DELETE | `/api/views/{id}` | Read, upsert full definition, delete |
-| GET | `/api/annotations` | Notes with `orphaned` flags |
-| PUT/DELETE | `/api/annotations/{id}` | Upsert full note, delete |
 
-Record PUT body IDs must match route IDs. View titles contain 1–256 bytes; annotation
-bodies 1–65,536 bytes. IDs use 1–128 ASCII letters/digits/dot/underscore/hyphen. Symbol IDs
-are opaque strings up to 8,192 bytes. Pin coordinates must be finite and within ±10⁷;
-at most 150 pins and 150 hidden IDs are accepted. Unknown request fields are rejected.
+Unknown request fields are rejected. Retired Tools endpoints use the ordinary unknown-route response; there is no compatibility API for saved records or providers.
 
 Errors use `{error:{code,message}}`, without raw SQL or source-bearing diagnostics.
 Expect 401 for missing credentials, 403 for Host/Origin rejection, 404 for missing data,
@@ -243,10 +219,8 @@ For DTO details, see [the frontend handoff](daemon-v1-api-handoff.md).
 
 ## Current limits
 
-Question planning, optional budget-controlled Jev selection and opt-in ACP answers are
-implemented separately from this original daemon slice; live requests require explicit
-authorization. Java/Python native indexing, class diagrams and static sequence diagrams
-are also available. There is no watcher or #39 reconciliation/read fencing, automatic
+The Tools tab, question planning, Jev selection, ACP answers and saved records are retired.
+Java/Python native indexing, class diagrams and static sequence diagrams remain available. There is no watcher or #39 reconciliation/read fencing, automatic
 GC (#16), rich durable anchor model (#38), TypeScript grammar, LSP, terminal, Tauri
 shell, ORM or external database connection. See [local topology](local-topology.md)
 for the shipped-versus-future boundary.
