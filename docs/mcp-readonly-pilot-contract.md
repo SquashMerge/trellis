@@ -152,8 +152,9 @@ sets a 2 GiB aggregate matrix-allocation cap, including in-progress builds, repl
 staging buffers, using conservative estimated allocation capacity and bookkeeping before
 allocation. It is not an exact process-RSS cap and excludes model weights. Query use shares
 the owner's existing matrix charge, not a second copy. Normal work uses LRU eviction of
-eligible matrices. The
-600-second query/fill idle eviction also remains. Startup warming selects at most the four
+eligible matrices. Each matrix also expires 600 seconds after its last query use or publication;
+background fill does not reset its timer. A running head is excluded from idle eviction until
+its job ends. Startup warming selects at most the four
 most recently opened checkouts within seven days (newest first, root-key byte-order ties),
 using existing open-age metadata read-only without activation, metadata writes or a durable
 MRU catalog. It is low-priority background work that never blocks daemon socket acceptance,
@@ -188,8 +189,9 @@ including query inference and cold-load handling. Optional vector work has one a
 It covers model admission, verification/read, loading, embedding, cache access and scoring;
 it never resets on retry. Verified model weights are reused by the single owner with the
 [ten-minute idle timeout](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#model-identity-and-runtime),
-reset by query/fill use; resident matrices share that 600-second idle policy and loading
-remains lexical-only. On that budget alone, cooperatively stop query vector work, discard the
+reset by query/fill use. Each resident matrix instead expires 600 seconds after its last query
+use or publication, not background fill; a running head is excluded from idle eviction until
+its job ends. Loading remains lexical-only. On that budget alone, cooperatively stop query vector work, discard the
 whole vector arm and return the complete lexical result with the reason above. Query model
 inference is never detached. An independent matrix build remains with the single background
 fill owner and finishes/publishes after vector-budget fallback or query cancellation/drop;

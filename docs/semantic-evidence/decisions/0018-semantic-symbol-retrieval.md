@@ -156,8 +156,9 @@ just vector payload. This is a matrix-allocation budget, not an exact process-RS
 a limit on model weights. Query use shares the owner's existing matrix charge, not a
 second copy. Normal work evicts least-recently-used eligible matrices to admit a build. Startup warming
 does not evict matrices and stops on cap admission failure. A head that alone exceeds the
-cap stays lexical-only. Matrix residency also follows the model's 600-second query/fill
-idle eviction; the cap does not replace that idle rule.
+cap stays lexical-only. Each matrix also expires 600 seconds after its last query use or
+publication; background fill does not reset its timer. A running head is excluded from idle
+eviction until its job ends. The cap does not replace that idle rule.
 
 A checkout not already warmed returns complete lexical results on its first search while
 the independent background owner builds its matrix. No query waits for that build or embeds
@@ -193,8 +194,8 @@ discards its entire vector arm before completing lexical retrieval at the admitt
 Query model inference is never detached to satisfy a timeout. The independent matrix build
 belongs to the existing single background fill owner, not the query: it continues to completion
 and publishes after the query's 3,000ms fallback or cancellation/drop. Query cancellation
-does not cancel that shared build. Resident weights and matrices follow the 600-second idle
-rule above. The remaining 2,000ms is reserved
+does not cancel that shared build. Resident weights follow the query/fill idle rule above;
+matrices follow the separate query-use/publication idle rule above. The remaining 2,000ms is reserved
 for cleanup and mandatory lexical/projection/final checks, not a guarantee against an
 uninterruptible filesystem/device operation or mandatory-work overrun.
 

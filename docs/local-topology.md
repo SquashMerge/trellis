@@ -73,8 +73,10 @@ T04’s FIFO stream or adds durable queue state. After restart it recomputes cur
 Embedding uses its own low-priority thread, never holding locks needed by the checkout worker.
 Inputs are token-budget-bounded before tokenization, batch size is capped, and cancellation is
 honored between batches. The single owner reuses verified resident model weights and int8
-head matrices, dropping them after 600 seconds with no query or fill work. Each use resets
-the idle timer. Model readiness pre-warms active-checkout head matrices; daemon startup
+head matrices. Model weights expire after 600 seconds with no query or fill work; each use
+resets their idle timer. Each matrix expires 600 seconds after its last query use or publication.
+Background fill does not reset a matrix's timer, and a running head is excluded from idle
+eviction until its job ends. Model readiness pre-warms active-checkout head matrices; daemon startup
 pre-warms at most the four most recently opened checkouts with last-opened time within
 seven days, newest first with root-key byte-order ties. Existing index metadata is the
 approved recency proxy; discovery is read-only, creates no MRU catalog, does not activate

@@ -32,8 +32,10 @@ not the environment of a later caller.
 
 The [resident-model and matrix amendments](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#model-identity-and-runtime)
 supersede this slice's original per-operation model lifetime. The single embedding/fill owner
-reuses verified weights and resident int8 head matrices, evicting them after 600 seconds with
-no query or fill work. Model readiness pre-warms active-checkout heads. Under the
+reuses verified weights and resident int8 head matrices. Model weights expire after 600 seconds
+with no query or fill work. Each matrix expires 600 seconds after its last query use or
+publication; background fill does not reset its timer. A running head is excluded from idle
+eviction until its job ends. Model readiness pre-warms active-checkout heads. Under the
 [#358 owner policy](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6446057555),
 startup pre-warms at most four checkouts opened within the last seven days, most recent
 first with root-key byte-order ties. Existing index metadata is the approved open-recency
