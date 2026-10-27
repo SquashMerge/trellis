@@ -72,9 +72,19 @@ uses one active model. It runs after publication and never delays publication, e
 T04’s FIFO stream or adds durable queue state. After restart it recomputes current-head misses.
 Embedding uses its own low-priority thread, never holding locks needed by the checkout worker.
 Inputs are token-budget-bounded before tokenization, batch size is capped, and cancellation is
-honored between batches. The model loads lazily and the single owner reuses verified resident
-weights after query/fill work, dropping them after ten minutes with no query or fill work.
-Each use resets the idle timer. Verification is reused per file identity and repeated on
+honored between batches. The single owner reuses verified resident model weights and int8
+head matrices. Model weights expire after 600 seconds with no query or fill work; each use
+resets their idle timer. Each matrix expires 600 seconds after its last query use or publication.
+Background fill does not reset a matrix's timer, and a running head is excluded from idle
+eviction until its job ends. Model readiness pre-warms active-checkout head matrices; daemon startup
+pre-warms at most the four most recently opened checkouts with last-opened time within
+seven days, newest first with root-key byte-order ties. Existing index metadata is the
+approved recency proxy; discovery is read-only, creates no MRU catalog, does not activate
+checkouts or refresh open age, and never delays daemon socket acceptance. This startup
+work runs below normal work and stops when matrix-cap admission fails, without evicting
+matrices to warm another checkout. This is the
+[#358 startup policy](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6446057555).
+Verification is reused per file identity and repeated on
 change; loading remains lexical-only and explicit Metal errors do not fall back. This is the
 [2026-10-26 owner ruling](https://github.com/SquashMerge/trellis/issues/211#issuecomment-6427400386),
 which supersedes per-job weight drop. Catch embedder panics at the job boundary as typed search-coverage failure,
@@ -84,8 +94,30 @@ need not be deleted on publication. Index recreation preserves the cache. The ca
 1 GiB default cap and LRU eviction; entries use int8 vectors of at most 1024 dimensions, with
 no full-dimension mode.
 
-A missing, evicted or typed-decode-invalid vector row is a specified miss and is re-embedded
-by the background owner. A database-level failure, including integrity failure, schema
+The [2026-10-27 owner amendment](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819)
+adds a resident int8 matrix per head pin and active model under that same background fill
+owner. New heads patch only changed document-version IDs from vectors.db; fill completion
+tops up missing vectors. A query uses one immutable published matrix matching its admitted
+pin for vector ranks and counts, with the same mandatory index snapshot. The
+[#358 memory policy](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6446057555)
+caps aggregate resident and in-progress matrix allocations at 2 GiB, including replacement
+work and staging buffers. Conservative estimated allocation capacity and bookkeeping are
+charged before allocation, not only vector payload; this is not an exact process-RSS limit
+and excludes model weights. Query use shares the owner's existing matrix charge, not a
+second copy. Normal work uses LRU eviction of eligible matrices. The 600-second idle eviction also remains. A single head
+that cannot fit is lexical-only. A first search without a warmed matrix returns complete
+lexical results while the background owner builds. If no matching matrix is retained or
+acquisition races with a head change, search also returns lexical-only without query
+embedding or waiting for the owner, never streaming around the cap. These unavailable
+results have null model identity, embedded:0, selected backend and unavailableReason:null;
+mandatory declaration counts/lexical reads and typed observed storage faults are unchanged.
+This supersedes the earlier missing-matrix streaming fallback. A valid retained matrix
+survives backing-cache eviction; owner updates and residency changes may change retrieval between calls at one
+basis. Scoring uses NEON/SIMD with a scalar fallback and the stored-norm dot product,
+accepted by gold-set R@5/R@10/MRR non-regression, not bit parity. sqlite-vec is not adopted; existing bounds remain.
+
+When reading vectors.db, a missing, evicted or typed-decode-invalid vector row is a specified
+miss and is re-embedded by the background owner. A database-level failure, including integrity failure, schema
 mismatch, unsafe/unreadable storage or I/O failure, instead fails search store_unavailable
 with no hits; it never becomes a lexical-only success. Repair/recreation of this disposable
 cache occurs outside the read. BUSY/LOCKED remains typed retried contention, not corruption,
@@ -96,8 +128,10 @@ results with `searchIndex.state:"unavailable"` and reason `vector_budget_exceede
 vector results/counts are discarded. Optional-cache contention may consume that budget but
 BUSY alone never triggers fallback. Actual observed database faults and mandatory index/FTS
 contention retain their typed failures. No cancellation affects another query or background
-fill, and no model work is detached to make a timeout appear complete. There is no per-vector
-checksum, signing or same-user tamper-detection requirement.
+fill. Query model inference is never detached to make a timeout appear complete. The
+independent matrix build remains owned by the background fill owner and finishes/publishes
+even after a query's vector-budget fallback or cancellation/drop; it is not detached query
+inference. There is no per-vector checksum, signing or same-user tamper-detection requirement.
 
 The model is local, pinned and in-process via Candle. One model is active at a time. Supported
 models only: verify configured files against Trellis’s reviewed model pin; do not execute
@@ -154,7 +188,7 @@ A mismatched extractor/schema or invalid derived index must not be served or mig
 
 Only actual corruption or an index-file format failure preventing in-place replacement permits exceptional recreation. Ordinary busy, full-disk, permissions and I/O failures do not authorize deleting an index. Close old connections, take verified exclusive index use nonblocking, then recreate only index.db and its sidecars while retaining `requests.db`. If a reader holds shared use, defer recovery. No old and new file incarnations can coexist at the same pathname under live openers; partial recovery never signals success.
 
-The daemon records last-opened time when it activates a checkout and may refresh it while active; reads do not write open-age metadata. Automatic GC eligibility is unchanged: a derived index directory qualifies when its recorded root is **missing or replaced**, or it has **not been opened for 30 days**. An index whose schema version predates the current one also qualifies, whatever its layout, root or age (Decision 0006 §2). The worker runs GC in maintenance units under verified exclusive index use, rechecks eligibility, and skips busy or unknown/unreadable entries. A daemon registry lookup alone does not protect live SQLite handles; index use locks remain until a proven replacement admission gate meets Decision 0008 §2. This is not a timer guarantee. Requests die with a deleted directory. A returning or replaced root starts fresh under its new captured identity, without reviving prior requests. Optional facts may be evicted without changing evidence. Optional vectors may be evicted without changing evidence; eviction lowers search vector completeness and can change retrieval order. `trellis gc --report` additionally reports `vectors.db` size and entry count without changing the cache or open age. Never automatically delete durable records, UUID markers, configured token/ledger trees or legacy state.
+The daemon records last-opened time when it activates a checkout and may refresh it while active; reads do not write open-age metadata. Automatic GC eligibility is unchanged: a derived index directory qualifies when its recorded root is **missing or replaced**, or it has **not been opened for 30 days**. An index whose schema version predates the current one also qualifies, whatever its layout, root or age (Decision 0006 §2). The worker runs GC in maintenance units under verified exclusive index use, rechecks eligibility, and skips busy or unknown/unreadable entries. A daemon registry lookup alone does not protect live SQLite handles; index use locks remain until a proven replacement admission gate meets Decision 0008 §2. This is not a timer guarantee. Requests die with a deleted directory. A returning or replaced root starts fresh under its new captured identity, without reviving prior requests. Optional facts may be evicted without changing evidence. Optional vectors may be evicted without changing evidence; eviction can lower search vector completeness and change retrieval order, but does not invalidate a valid retained published matrix snapshot. `trellis gc --report` additionally reports `vectors.db` size and entry count without changing the cache or open age. Never automatically delete durable records, UUID markers, configured token/ledger trees or legacy state.
 
 **Revision retention ([Decision 0006](semantic-evidence/decisions/0006-revision-retention-and-index-gc.md)).** Within a live index, the daemon worker retains the current head plus every revision superseded less than 15 minutes ago. It releases older revisions and collects unreferenced versions outside publication. A pin to a released revision fails with a typed conflict and never moves to a newer revision. Readers write no retention state. Startup reconciliation, or an explicit request after its FIFO claim, whose capture shows no change takes the guarded unchanged path and publishes no new revision; the request completes `done` at the current head (Decision 0006, amended 2026-10-20).
 

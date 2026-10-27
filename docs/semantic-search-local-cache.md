@@ -30,11 +30,45 @@ surface a failed daemon startup as `daemon_unavailable`; this slice does not add
 error protocol or a new MCP failure code. A running daemon keeps its own startup configuration,
 not the environment of a later caller.
 
-The model is loaded only inside an operation and dropped on every exit. The status handle
-reports unavailable before loading, while loading, and after dropping weights. While a model
-job is active, its caller supplies one coherent declaration/vector-coverage snapshot and
-whether a background fill job is running; this distinguishes complete, building and partial.
-The later tool will emit that status. Existing CLI status/GC do not fabricate search coverage.
+The [resident-model and matrix amendments](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#model-identity-and-runtime)
+supersede this slice's original per-operation model lifetime. The single embedding/fill owner
+reuses verified weights and resident int8 head matrices. Model weights expire after 600 seconds
+with no query or fill work. Each matrix expires 600 seconds after its last query use or
+publication; background fill does not reset its timer. A running head is excluded from idle
+eviction until its job ends. Model readiness pre-warms active-checkout heads. Under the
+[#358 owner policy](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6446057555),
+startup pre-warms at most four checkouts opened within the last seven days, most recent
+first with root-key byte-order ties. Existing index metadata is the approved open-recency
+proxy; discovery uses it read-only without activating checkouts, refreshing open age or
+creating a durable MRU catalog. This low-priority background work yields to normal work,
+never delays daemon socket acceptance and stops at matrix-cap admission failure without
+evicting matrices for another startup checkout. Status remains unavailable while the model
+is not ready. Existing CLI status/GC do not fabricate search coverage.
+
+Under the [#358 owner ruling](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819),
+one immutable published matrix snapshot supplies vector ranks and embedded counts for the
+same admitted index pin and active model as the mandatory index snapshot. New head pins patch
+only changed document-version IDs from vectors.db, and the existing fill owner tops up missing
+vectors. The aggregate matrix allocation cap is 2 GiB, including in-progress builds,
+replacements and staging buffers. The owner conservatively accounts for estimated allocation
+capacity and bookkeeping before allocation rather than only vector payload. This is not an
+exact process-RSS cap and does not include model weights. Query use shares the owner's
+existing matrix charge, not a second copy. Normal work uses LRU eviction of eligible matrices. The 600-second
+idle rule remains in addition to the cap. A head that alone cannot fit stays lexical-only.
+A checkout not warmed at startup returns complete lexical results on first search while
+the independent background owner builds its matrix. No query waits for that build or
+embeds a query without an admitted resident matrix. A missing matching matrix after
+eviction or a head-change race also yields lexical-only results, not a streaming scorer
+that bypasses the cap. The unavailable status keeps null model identity, embedded:0,
+selected backend and unavailableReason:null. Mandatory declaration counts and lexical
+retrieval remain exact; observed storage faults remain typed failures. This supersedes
+the earlier missing-matrix streaming fallback. Backing-cache eviction need not invalidate
+an already published resident snapshot. Query fallback at the 3,000ms vector
+budget or cancellation/drop does not stop the independent owner build from finishing and
+publishing; query model inference is never detached. The 5,000ms call deadline is unchanged.
+Scoring uses NEON/SIMD with scalar fallback and the stored-norm dot product; gold-set
+R@5/R@10/MRR must not regress, with no bit-parity requirement. sqlite-vec is not adopted. Existing bounds and typed
+database-fault behavior remain unchanged.
 
 ## Vector cache
 
