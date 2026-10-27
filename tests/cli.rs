@@ -3771,19 +3771,13 @@ paths = ["src/low.rs"]
 
     let target = &violation["target"];
     let destination = &violation["destination"];
-    let exception = format!(
-        r#"
+    let exception = r#"
 [[exceptions]]
 rule = "$layers"
-target = {{ source_set = "{}", language = "rust", path = "src/low.rs", sid = "{}" }}
-destination = {{ source_set = "{}", language = "rust", path = "src/high.rs", sid = "{}" }}
+target = { language = "rust", path = "src/low.rs" }
+destination = { language = "rust", path = "src/high.rs" }
 reason = "Reviewed upward adapter"
-"#,
-        target["sourceSetId"].as_str().unwrap(),
-        target["sid"].as_str().unwrap(),
-        destination["sourceSetId"].as_str().unwrap(),
-        destination["sid"].as_str().unwrap()
-    );
+"#;
     fs::write(
         root.join(".trellis/rules.toml"),
         format!("{config}{exception}"),
@@ -3808,6 +3802,8 @@ reason = "Reviewed upward adapter"
     assert_eq!(excepted["counts"]["excepted"], 1);
     assert_eq!(excepted["instances"][0]["status"], "deviates");
     assert_eq!(excepted["instances"][0]["excepted"], true);
+    assert_eq!(excepted["instances"][0]["target"], *target);
+    assert_eq!(excepted["instances"][0]["destination"], *destination);
     assert_eq!(
         excepted["instances"][0]["exceptionReason"],
         "Reviewed upward adapter"

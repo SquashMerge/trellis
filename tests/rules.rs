@@ -542,11 +542,9 @@ fn rules_layer_exceptions_are_exact_edge_pairs_and_tests_stay_separate() {
     let destination = &row["destination"];
     let config_target = |v: &Value| {
         format!(
-            "{{source_set='{}',language='{}',path='{}',sid='{}'}}",
-            v["sourceSetId"].as_str().unwrap(),
+            "{{language='{}',path='{}'}}",
             v["language"].as_str().unwrap(),
-            v["path"].as_str().unwrap(),
-            v["sid"].as_str().unwrap()
+            v["path"].as_str().unwrap()
         )
     };
     let text = format!(
@@ -567,6 +565,11 @@ fn rules_layer_exceptions_are_exact_edge_pairs_and_tests_stay_separate() {
     assert_eq!(data["counts"]["deviates"], 1);
     assert_eq!(data["testOnly"].as_array().unwrap().len(), 1);
     assert_eq!(data["testOnly"][0]["status"], "deviates");
+    assert_eq!(data["testOnly"][0]["excepted"], true);
+    assert_eq!(
+        data["testOnly"][0]["exceptionReason"],
+        "Reviewed existing edge"
+    );
     assert_eq!(data["testOnly"][0]["unresolved"], json!(["test_only"]));
     let explained = rules::explain(
         data.clone(),
@@ -1059,4 +1062,389 @@ fn rules_external_layers_keep_order_shared_peer_and_source_filter_policies() {
         assert!(filtered["instances"].as_array().unwrap().is_empty());
         assert!(filtered["externalPackages"].as_array().unwrap().is_empty());
     }
+}
+
+const PORTABLE_LAYERS: &str = "version=1\n[layers.high]\norder=1\npaths=['web/b.js','web/c.js']\n[layers.low]\norder=2\npaths=['web/a.js','web/other.js','web/renamed.js']\n";
+const PORTABLE_PAIR: &str = "[[exceptions]]\nrule='$layers'\ntarget={language='javascript',path='web/a.js'}\ndestination={language='javascript',path='web/b.js'}\nreason='Reviewed literal pair'\n";
+
+#[test]
+fn rules_portable_exception_closed_context_grammar_and_literal_paths() {
+    let portable = "{language='javascript',path='web/a.js'}";
+    let full = "{source_set='set',language='javascript',path='web/a.js',sid='sid:v1:00000000000000000000000000000000'}";
+    for language in ["rust", "java", "python", "javascript"] {
+        assert!(rules::parse(&format!(
+            "version=1\n[[exceptions]]\nrule='$layers'\ntarget={{language='{language}',path='src/a'}}\ndestination={{language='{language}',path='src/b'}}\nreason='reviewed'"
+        )).is_ok());
+    }
+    let valid = format!("{PORTABLE_LAYERS}{PORTABLE_PAIR}");
+    let named = "version=1\n[roles.source]\nselect={name='Resource'}\n[[rules]]\nid='flow'\nfor_each='source'\nrequire=[{calls='source'}]\n";
+    let mut invalid = vec![
+        valid.replace("reason='Reviewed literal pair'", "reason='  '"),
+        format!(
+            "{valid}{}",
+            PORTABLE_PAIR.replace("Reviewed literal pair", "Different reason")
+        ),
+        valid.replace("rule='$layers'", "rule='$external'"),
+        valid.replace("rule='$layers'", "rule='missing'"),
+        valid.replace("destination={language='javascript',path='web/b.js'}\n", ""),
+        valid.replace(
+            "target={language='javascript',path='web/a.js'}",
+            &format!("target={full}"),
+        ),
+        valid.replace(
+            "destination={language='javascript',path='web/b.js'}",
+            &format!("destination={full}"),
+        ),
+        format!(
+            "version=1\n[[exceptions]]\nrule='$layers'\ntarget={full}\ndestination={full}\nreason='reviewed'"
+        ),
+        format!("{named}[[exceptions]]\nrule='flow'\ntarget={portable}\nreason='reviewed'"),
+        format!(
+            "{named}[[exceptions]]\nrule='flow'\ntarget={full}\ndestination={full}\nreason='reviewed'"
+        ),
+    ];
+    for endpoint in [
+        "{path='web/a.js'}",
+        "{language='javascript'}",
+        "{language='javascript',path='web/a.js',sid='sid:v1:00000000000000000000000000000000'}",
+        "{language='javascript',path='web/a.js',source_set='set'}",
+        "{language='javascript',path='web/a.js',kind='module'}",
+        "{language='javascript',package='pkg',stdlib=false}",
+        "{language='kotlin',path='web/a.js'}",
+        "{language=3,path='web/a.js'}",
+        "{language='javascript',path=3}",
+    ] {
+        invalid.push(valid.replace(portable, endpoint));
+    }
+    for path in [
+        "",
+        "*",
+        "web/**",
+        "web/a?.js",
+        "/web/a.js",
+        "web\\a.js",
+        "../a.js",
+        "web/./a.js",
+        "web//a.js",
+        "web/a:b.js",
+    ] {
+        for endpoint in ["web/a.js", "web/b.js"] {
+            invalid.push(valid.replace(endpoint, path));
+        }
+    }
+    for text in invalid {
+        let d = diagnostic(&text);
+        assert_eq!(d["code"], "invalid_rules", "{text}");
+        assert_eq!(d["path"], rules::RULES_PATH);
+        assert!(d["line"].as_u64().unwrap() > 0, "{d}");
+        assert!(d["range"]["end"].as_u64().unwrap() <= text.len() as u64);
+    }
+}
+
+#[test]
+fn rules_portable_scope_uses_full_snapshot_documents_and_absent_manifests_before_filters() {
+    let config = rules::parse(&format!("{PORTABLE_LAYERS}{PORTABLE_PAIR}")).unwrap();
+    for manifest_only in [false, true] {
+        let mut input = snapshot(&[
+            ("web/a.js", "import './b.js';"),
+            ("web/b.js", "export const b = 1;"),
+        ]);
+        let mut unrelated = snapshot(&[("unrelated.py", "class Unrelated:\n    pass\n")]);
+        let second_scope = unrelated.documents[0].key.source_set_id.clone();
+        assert_ne!(input.documents[0].key.source_set_id, second_scope);
+        if manifest_only {
+            input.manifests.push(references::external::ManifestInput {
+                source_set_id: second_scope,
+                native_revision_id: "retained-revision".into(),
+                dependency_hash: "retained-dependency".into(),
+                path: "Cargo.toml".into(),
+                content_hash: None,
+                bytes: None,
+            });
+        } else {
+            input.documents.append(&mut unrelated.documents);
+        }
+        for paths in [vec![], vec!["web/a.js".into()], vec!["absent.js".into()]] {
+            let refs = references::project(&input, &paths, 1, &mut || Ok(())).unwrap();
+            let error =
+                rules::evaluate(&config, &input, &refs, &paths, &mut || Ok(())).unwrap_err();
+            let d = rules::diagnostic(&error).unwrap();
+            assert_eq!(d["code"], "invalid_rules");
+            assert_eq!(d["kind"], "ambiguity");
+            assert!(
+                d["line"].as_u64().unwrap() >= 8,
+                "attribute scope error to exception: {d}"
+            );
+            assert!(d["range"]["end"].as_u64().unwrap() <= config.text.len() as u64);
+        }
+    }
+    // Two source sets with no observed reference edges are still ambiguous.
+    let mut empty = snapshot(&[("web/a.js", ""), ("web/b.js", "")]);
+    empty
+        .documents
+        .extend(snapshot(&[("unrelated.py", "")]).documents);
+    let refs = references::project(&empty, &[], 1, &mut || Ok(())).unwrap();
+    assert!(refs.data["production"].as_array().unwrap().is_empty());
+    let error = rules::evaluate(&config, &empty, &refs, &[], &mut || Ok(())).unwrap_err();
+    assert_eq!(rules::diagnostic(&error).unwrap()["kind"], "ambiguity");
+}
+
+#[test]
+fn rules_portable_pairs_are_literal_and_allow_many_languages_in_one_scope() {
+    let input = snapshot(&[
+        (
+            "web/a.js",
+            "import './b.js'; import './c.js'; import './b.js';",
+        ),
+        ("web/other.js", "import './b.js';"),
+        ("web/b.js", "export const b = 1;"),
+        ("web/c.js", "export const c = 1;"),
+        ("src/lib.rs", "pub fn run() {}"),
+        ("Example.java", "class Example {}"),
+        ("example.py", "class Example:\n    pass\n"),
+    ]);
+    let scopes: std::collections::BTreeSet<_> = input
+        .documents
+        .iter()
+        .map(|d| &d.key.source_set_id)
+        .collect();
+    assert_eq!(scopes.len(), 1);
+    let data = evaluate(&format!("{PORTABLE_LAYERS}{PORTABLE_PAIR}"), &input);
+    assert_eq!(pair(&data, "web/a.js", "web/b.js")["excepted"], true);
+    assert_eq!(pair(&data, "web/a.js", "web/b.js")["referenceCount"], 2);
+    for (source, destination) in [("web/a.js", "web/c.js"), ("web/other.js", "web/b.js")] {
+        assert_eq!(pair(&data, source, destination)["excepted"], false);
+    }
+    for wrong in [
+        PORTABLE_PAIR.replacen("language='javascript'", "language='rust'", 1),
+        PORTABLE_PAIR.replace(
+            "destination={language='javascript'",
+            "destination={language='python'",
+        ),
+        PORTABLE_PAIR.replace("web/b.js", "web/B.js"),
+        PORTABLE_PAIR.replace("web/a.js", "a.js"),
+        PORTABLE_PAIR.replace("web/b.js", "missing.js"),
+    ] {
+        let data = evaluate(&format!("{PORTABLE_LAYERS}{wrong}"), &input);
+        assert!(
+            data["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["excepted"] == false)
+        );
+    }
+}
+
+#[test]
+fn rules_portable_pair_does_not_except_the_reversed_pair() {
+    let input = snapshot(&[
+        ("web/a.js", "import './b.js';"),
+        ("web/b.js", "import './a.js';"),
+    ]);
+    let data = evaluate(&format!("{PORTABLE_LAYERS}{PORTABLE_PAIR}"), &input);
+    assert_eq!(pair(&data, "web/a.js", "web/b.js")["excepted"], true);
+    let reversed = pair(&data, "web/b.js", "web/a.js");
+    assert_eq!(reversed["excepted"], false);
+    assert!(reversed["exceptionReason"].is_null());
+    assert!(!reversed["evidence"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn rules_portable_pairs_cover_changed_native_sids_but_not_renamed_paths_or_missing_edges() {
+    let mut input = snapshot(&[
+        ("web/a.js", "import './b.js';"),
+        ("web/b.js", "export const b = 1;"),
+    ]);
+    let text = format!("{PORTABLE_LAYERS}{PORTABLE_PAIR}");
+    let before = evaluate(&text, &input);
+    // Policy fixture: replace only a native module SID, keeping the admitted scope/path.
+    let module = input
+        .documents
+        .iter_mut()
+        .find(|d| d.key.path == "web/a.js")
+        .unwrap()
+        .declarations
+        .iter_mut()
+        .find(|d| d.kind == "module" && d.ancestors.is_empty())
+        .unwrap();
+    assert_ne!(module.syntax_id, "sid:v1:00000000000000000000000000000000");
+    module.syntax_id = "sid:v1:00000000000000000000000000000000".into();
+    let after = evaluate(&text, &input);
+    assert_ne!(
+        pair(&before, "web/a.js", "web/b.js")["target"]["sid"],
+        pair(&after, "web/a.js", "web/b.js")["target"]["sid"]
+    );
+    assert_eq!(pair(&after, "web/a.js", "web/b.js")["excepted"], true);
+    for files in [
+        vec![
+            ("web/renamed.js", "import './b.js';"),
+            ("web/b.js", "export const b = 1;"),
+        ],
+        vec![
+            ("web/a.js", "import './c.js';"),
+            ("web/c.js", "export const c = 1;"),
+        ],
+        vec![("web/a.js", ""), ("web/b.js", "export const b = 1;")],
+    ] {
+        let data = evaluate(&text, &snapshot(&files));
+        assert!(
+            data["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["excepted"] == false)
+        );
+        assert_eq!(data["counts"]["excepted"], 0);
+    }
+}
+
+#[test]
+fn rules_named_declaration_exceptions_keep_exact_full_native_identity() {
+    let input = snapshot(&[("src/lib.rs", "fn Resource(){Service();} fn Service(){}")]);
+    let text = "version=1\n[roles.resource]\nselect={name='Resource'}\n[roles.service]\nselect={name='Service'}\n[[rules]]\nid='flow'\nfor_each='resource'\nrequire=[{calls='service'}]\n";
+    let before = evaluate(text, &input);
+    let row = &before["instances"][0];
+    let target = &row["target"];
+    let full = format!(
+        "{{source_set='{}',language='{}',path='{}',sid='{}'}}",
+        target["sourceSetId"].as_str().unwrap(),
+        target["language"].as_str().unwrap(),
+        target["path"].as_str().unwrap(),
+        target["sid"].as_str().unwrap()
+    );
+    let exception =
+        format!("[[exceptions]]\nrule='flow'\ntarget={full}\nreason='Reviewed declaration'\n");
+    let accepted = evaluate(&format!("{text}{exception}"), &input);
+    let mut expected = row.clone();
+    expected["excepted"] = json!(true);
+    expected["exceptionReason"] = json!("Reviewed declaration");
+    assert_eq!(accepted["instances"], json!([expected]));
+    assert_eq!(accepted["counts"]["unknown"], 0);
+    assert_eq!(accepted["counts"]["excepted"], 1);
+    let explained = rules::explain(accepted.clone(), "flow", target, None, &mut || Ok(())).unwrap();
+    assert_eq!(explained["instances"], accepted["instances"]);
+    for changed in [
+        exception.replace(
+            target["sourceSetId"].as_str().unwrap(),
+            "another-source-set",
+        ),
+        exception.replace(
+            target["sid"].as_str().unwrap(),
+            "sid:v1:00000000000000000000000000000000",
+        ),
+    ] {
+        let data = evaluate(&format!("{text}{changed}"), &input);
+        assert_eq!(data["instances"][0]["excepted"], false);
+        assert_eq!(data["counts"]["unknown"], 1);
+    }
+    let mut two_scopes = input;
+    two_scopes
+        .documents
+        .extend(snapshot(&[("other.py", "")]).documents);
+    assert_eq!(
+        evaluate(&format!("{text}{exception}"), &two_scopes)["counts"]["excepted"],
+        1,
+        "full declaration exceptions do not require portable scope resolution"
+    );
+}
+
+#[test]
+fn rules_portable_pairs_do_not_except_unknown_or_external_destinations() {
+    let input = snapshot(&[
+        ("src/lib.rs", "pub fn run(){ crate::missing::run(); }"),
+        ("src/other.rs", "pub fn other(){}"),
+    ]);
+    let text = "version=1\n[layers.source]\norder=2\npaths=['src/lib.rs']\n[layers.destination]\norder=1\npaths=['src/other.rs']\n[[exceptions]]\nrule='$layers'\ntarget={language='rust',path='src/lib.rs'}\ndestination={language='rust',path='src/other.rs'}\nreason='Reviewed native pair'";
+    let unknown = evaluate(text, &input);
+    assert!(
+        unknown["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["status"] == "unknown" && row["destination"].is_null())
+    );
+    assert!(
+        unknown["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["excepted"] == false)
+    );
+    let refs = projected_package(&input, "std", true);
+    let config = rules::parse(&format!("{text}\n[external_policy]\ndeny=[{{language='rust',package='std',stdlib=true}}]\n[layers.foundation]\norder=1\nexternal=[{{language='rust',package='std',stdlib=true}}]")).unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    for rule in ["$layers", "$external"] {
+        let row = data["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["rule"] == rule && row["destination"]["kind"] == "externalPackage")
+            .unwrap();
+        assert_eq!(row["status"], "deviates");
+        assert_eq!(row["excepted"], false);
+    }
+}
+
+#[test]
+fn rules_portable_scope_accepts_retained_manifest_without_source_documents() {
+    let mut input = snapshot(&[("web/a.js", "")]);
+    let scope = input.documents[0].key.source_set_id.clone();
+    input.documents.clear();
+    input.manifests.push(references::external::ManifestInput {
+        source_set_id: scope,
+        native_revision_id: "retained-revision".into(),
+        dependency_hash: "retained-dependency".into(),
+        path: "Cargo.toml".into(),
+        content_hash: None,
+        bytes: None,
+    });
+    let text = format!("{PORTABLE_LAYERS}{PORTABLE_PAIR}");
+    let data = evaluate(&text, &input);
+    assert!(data["instances"].as_array().unwrap().is_empty());
+    assert_eq!(data["counts"]["excepted"], 0);
+    input.manifests.clear();
+    let refs = references::project(&input, &[], 1, &mut || Ok(())).unwrap();
+    let config = rules::parse(&text).unwrap();
+    let error = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap_err();
+    let d = rules::diagnostic(&error).unwrap();
+    assert_eq!(d["code"], "invalid_rules");
+    assert_eq!(d["kind"], "reference");
+}
+
+#[test]
+fn rules_portable_module_pair_does_not_require_equal_endpoint_languages() {
+    let input = snapshot(&[
+        ("web/a.js", "import './b.js';"),
+        ("web/b.js", "export const b = 1;"),
+        ("target.py", "class Target:\n    pass\n"),
+    ]);
+    let mut refs = references::project(&input, &[], 1, &mut || Ok(())).unwrap();
+    let destination = input
+        .documents
+        .iter()
+        .find(|d| d.key.path == "target.py")
+        .unwrap();
+    let module = destination
+        .declarations
+        .iter()
+        .find(|d| d.kind == "module" && d.ancestors.is_empty())
+        .unwrap();
+    let native = json!({"sourceSetId":destination.key.source_set_id,"language":destination.key.language,"path":destination.key.path,"sid":module.syntax_id});
+    // Exercise policy for a structural cross-language pair without claiming a resolver emits it.
+    refs.data["production"][0]["target"] = native.clone();
+    let text = format!(
+        "{}{}",
+        PORTABLE_LAYERS.replace("'web/b.js'", "'target.py'"),
+        PORTABLE_PAIR.replace(
+            "destination={language='javascript',path='web/b.js'}",
+            "destination={language='python',path='target.py'}"
+        )
+    );
+    let config = rules::parse(&text).unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    let row = pair(&data, "web/a.js", "target.py");
+    assert_eq!(row["destination"], native);
+    assert_eq!(row["excepted"], true);
+    assert_eq!(row["status"], "deviates");
 }

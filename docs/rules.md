@@ -295,22 +295,70 @@ must not override Decision 0011.
 ## Reviewed exceptions, not count baselines
 
 An exception names an existing `rule`, an exact `target` and a nonblank `reason`.
-The TOML target fields are `source_set`, `language`, `path`, `sid`; use the actual
-emitted source-set ID and native SID, not a name or presentation label. For `$layers`,
-`target` identifies the source module and required `destination` identifies the
-exact native destination module in the same full identity shape. Ordinary
-declaration exceptions have no destination. The approved portable module-to-module
-form `{language,path}` is a **separate follow-up PR, not available in this Rust
-slice**. Until that PR lands, both module endpoints require `source_set`,
-`language`, `path` and `sid`; proposals must use only this parser-valid full form.
-The future portable form remains module-only, never a package selector. `$external` has no exceptions. JSON identities use `sourceSetId` in place of TOML `source_set`.
+For `$layers`, both `target` and required `destination` are **exactly**
+`{language,path}` and identify a native file-module pair:
 
-An exact exception keeps the underlying status and evidence, sets `excepted=true`
-and records its reason. It is excluded from deviation totals. An approved module
-pair allows additional sites on that same pair, **not** a new destination. There
-is no scalar-count ratchet, separate mining engine, historical-count import or
-automatic baseline write. A proposal may suggest exceptions for current positively
-witnessed deviations for human review; historical #163 counts are not current facts.
+```toml
+[[exceptions]]
+rule = "$layers"
+target = { language = "rust", path = "src/store.rs" }
+destination = { language = "rust", path = "src/navigation.rs" }
+reason = "Concrete reviewed justification for this observed pair"
+```
+
+Both fields are required at each endpoint. Language is `rust`, `java`, `python`
+or `javascript`. Paths are nonempty, literal, case-sensitive repository-relative
+paths, not globs, basenames or suffix matches. Wildcard markers `*` and `?` are
+invalid, as are absolute paths, backslashes, NUL, colons, empty components, `.` and
+`..` components. Existing path-length bounds apply. There is no case normalization
+or layer-specificity matching. Extra endpoint fields, including `source_set` and
+`sid`, are invalid for `$layers`; the old full-identity layer form is not accepted.
+No new version, syntax tag or compatibility mode is needed.
+
+Portable matching requires exactly one source-set ID in the **full admitted
+checkout snapshot**, including document and retained-manifest identities, before
+request-source filters. Multiple languages in one source set are valid. A second
+source set is a located `invalid_rules` / `ambiguity` error even if its paths,
+languages, roles or edges are unrelated to the exception or hidden by a filter.
+The error aborts evaluation without partial instances; filters cannot choose the
+scope. Within that unique scope, both native module endpoints must match their
+respective literal language/path pairs. An edit that changes a module's native SID
+but keeps its language/path is covered. A rename or move is not covered until the
+exception is reviewed and updated. An absent endpoint simply matches no pair.
+
+A named declaration-rule exception retains its **exactly four-field** target
+`{source_set,language,path,sid}` and forbids `destination`:
+
+```toml
+[[exceptions]]
+rule = "resource-service"
+target = { source_set = "ACTUAL_SOURCE_SET", language = "java", path = "src/Resource.java", sid = "sid:v1:00000000000000000000000000000000" }
+reason = "Concrete reviewed justification for this declaration"
+```
+
+The named rule must exist. Copy the actual emitted source-set ID and native
+declaration SID, not a name or presentation label. A changed declaration SID or
+source set does not match. Portable targets are invalid for declaration rules. Duplicate rule/endpoint tuples, blank reasons and other
+closed-schema violations are located `invalid_rules` errors, not partial results.
+Module exceptions never accept package destinations, and `$external` has no
+exceptions; narrow a ban through a reviewed policy edit.
+
+An exception keeps the underlying status, constraints, exact reference counts and
+evidence, sets `excepted=true` and records its original reason. It is excluded from
+deviation totals. An approved module pair allows additional sites on that same
+pair, **not** a new source, destination, language or path. Production and test rows
+remain separate; the role-neutral pair can decorate both, but test-only rows never
+fail production checks. A null-destination unknown is not a module pair. A config
+entry with no observed pair creates no instance and proves no absence.
+
+Portability changes only exception TOML and matching. JSON targets and module
+destinations retain their full native identities, including `sourceSetId` and actual SIDs, with
+unchanged evidence/provenance closure. Explain requests still use the actual full
+native identities from evaluated instances, never `{language,path}` in their place.
+There is no scalar-count ratchet, separate mining engine, historical-count import
+or automatic baseline write. A proposal may suggest exceptions only for current
+positively witnessed production deviations for human review; historical #163
+counts are not current facts.
 
 ## One code snapshot, separately identified configuration
 
