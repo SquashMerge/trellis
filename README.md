@@ -114,6 +114,9 @@ node --test tests/shell-ui.test.cjs
 cargo run --locked -- --help
 ```
 
+`./tools/verify` runs the full local gate (formatting, clippy, tests and the browser lanes)
+and is what automation runs. It bootstraps the pinned Node packages and Chromium and runs the lanes concurrently.
+
 The browser client is embedded in the executable. Rebuild after editing `web/`.
 Tests are offline and use temporary workspaces; no provider credentials or inference is used.
 The existing selection-experiment budget is closed and is not changed by this implementation.
