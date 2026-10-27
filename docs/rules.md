@@ -438,8 +438,10 @@ catalog builds may run concurrently; Rust name resolution remains ordered.
 Workers count local work against the phase's remaining allowance; one ordered
 owner admits their counts and rows into the request total. A batch may perform
 bounded speculative work, but workers never receive independent admitted
-request budgets. Serial and parallel plans use the same phases, charge units
-and output order. Failure discards the whole result.
+request budgets. Actual CPU work can reach about eight times the allowance
+before failure is reported, with the unchanged five-second deadline as backstop.
+Serial and parallel plans use the same phases, charge units and output order.
+Failure discards the whole result.
 
 A rule diagnostic is exactly
 `{code,kind,path,range,line,column,attribution,message}`. `code` is `invalid_rules`;

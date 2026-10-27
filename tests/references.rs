@@ -5981,6 +5981,23 @@ fn references_javascript_review_stars_into_commonjs_files_remain_unknown() {
 }
 
 #[test]
+fn references_javascript_star_export_fanout_exhausts_scaled_work_atomically() {
+    let provider = (0..256)
+        .map(|index| format!("export function value_{index:03}() {{}}\n"))
+        .collect::<String>();
+    let consumer = "export * from './provider.js';\n".repeat(512);
+    let input = snapshot(&[("provider.js", &provider), ("consumer.js", &consumer)]);
+    assert_eq!(input.documents.len(), 2);
+    assert!(provider.len() + consumer.len() < 32 * 1024);
+
+    // Repeated star clauses merge 256 real exported names 512 times. This
+    // exhausts the normally sized work allowance, not a byte/AST/site cap.
+    // An Err from the public projection API contains no partial projection.
+    let error = references::project(&input, &[], 1, &mut || Ok(())).unwrap_err();
+    assert_eq!(error.to_string(), "bounded_work: reference owner lookup");
+}
+
+#[test]
 fn references_javascript_review_500_consumers_share_a_200_name_barrel_within_budget() {
     let statements = (0..110)
         .map(|index| format!("    value += {index};\n"))
