@@ -1865,3 +1865,104 @@ fn incremental_local_matches_independent_full_oracle() {
         selected_case(scenario);
     }
 }
+
+#[test]
+fn runner_body_edit_reuses_captured_anchor_across_unrelated_ignore_inventory() {
+    let temp = Builder::new()
+        .prefix("semantic-runner-body-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let scratch = fs::canonicalize(temp.path()).unwrap();
+    let script = r#"
+import importlib.util, json, os, sqlite3, sys, time
+from pathlib import Path
+from contextlib import closing
+repo, scratch, binary = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+spec = importlib.util.spec_from_file_location('runner', repo / 'tools/verify-67-mixed-performance.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.EVIDENCE = scratch / 'evidence'
+m.EVIDENCE.mkdir()
+m.BINARY = binary
+m.DEADLINE = time.monotonic() + 300
+corpus = scratch / 'canonical'
+m.command(['node', str(m.GENERATOR), '--out', str(corpus)])
+assert (corpus / 'manifest.json').read_bytes() == m.PINNED.read_bytes()
+workspace, home = scratch / 'medium-workspace', scratch / 'home'
+home.mkdir()
+daemon = m.Daemon(binary, home, 'warm')
+try:
+    daemon.start()
+    prior, artifact, anchor, anchor_hash = m.seed_workspace(binary, corpus, workspace, daemon, 'medium')
+    with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
+        capture = db.execute('SELECT captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?', (prior,)).fetchone()[0]
+        r1 = db.execute('SELECT retained_config,config_hash FROM native_revisions WHERE id=?', (capture,)).fetchone()
+        r2 = db.execute('SELECT retained_config,config_hash FROM native_revisions WHERE id=?', (prior,)).fetchone()
+        original = json.loads(r1[0]); current = json.loads(r2[0])
+        extra = [entry for entry in current if entry not in original]
+        assert extra == [{'path': f'rust/g0{n}/{name}', 'type': 'absent'} for n in (1,2,3) for name in ('.gitignore','.ignore')], extra
+        assert r1[1] != r2[1]
+        links = db.execute('SELECT m.revision_id,d.id,d.extraction_context,d.content_hash FROM revision_documents m JOIN document_versions d ON d.vid=m.vid WHERE m.revision_id IN (?,?) AND m.path=? ORDER BY m.revision_id', (capture,prior,anchor.as_posix())).fetchall()
+        assert len(links)==2 and len({link[1:] for link in links}) == 1, links
+    language, relative, kind = m.planned_edit('medium', 'body', 0)
+    assert (language,relative.as_posix(),kind)==('java','java/Cmedium0000.java','grow')
+    before = m.request_rows(home)
+    generation, number = prior.rsplit(':', 1)
+    started = time.monotonic(); wall = time.time_ns() / 1_000_000
+    old, new = m.edit_leaf(workspace / relative, language, kind)
+    assert (old,new)==('40000','140000'), (old,new)
+    _, observed = m.index(binary, workspace, daemon, 'medium', sample={'before_requests': before, 'start':started,'start_wall_ms':wall,'expected_revision':f'{generation}:{int(number)+1}'})
+    assert observed['publication_mode']=='local', observed
+    with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
+        m.selected_proof(db, observed['revision'], anchor.as_posix(), artifact)
+        m.check_changed_source(db, observed['revision'],relative.as_posix(),(workspace / relative).read_bytes())
+    assert m.sha_file(workspace / anchor)==anchor_hash
+    work = json.loads((scratch / 'work-counts.json').read_text())
+    assert work['fullFallbacks']==0, work
+    assert work['originalNativeRows']==0 and work['originalSourceBytes']==0 and work['originalRawProofBytes']==0, work
+    assert work['destinationDocumentRows']==996, work
+    assert len(work['reusedDocuments'])==4 and work['destinationRoleParses']==0, work
+    with closing(sqlite3.connect(f'file:{m.db_for(home)}?mode=ro', uri=True)) as db:
+        local_digest = m.parity_digest(db, observed['revision'], workspace)
+        local_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
+finally:
+    daemon.stop()
+
+oracle_home, oracle_root = scratch / 'oracle-home', scratch / 'oracle-workspace'
+oracle_home.mkdir()
+oracle = m.Daemon(binary, oracle_home, 'oracle')
+try:
+    oracle.start()
+    oracle_pin, oracle_artifact, oracle_anchor, oracle_hash = m.seed_workspace(
+        binary, corpus, oracle_root, oracle, 'medium', edited={relative.as_posix(): workspace / relative})
+    assert oracle_hash == anchor_hash and oracle_anchor == anchor
+    with closing(sqlite3.connect(f'file:{m.db_for(oracle_home)}?mode=ro', uri=True)) as db:
+        m.selected_proof(db, oracle_pin, oracle_anchor.as_posix(), oracle_artifact)
+        oracle_digest = m.parity_digest(db, oracle_pin, oracle_root)
+        oracle_reports = db.execute('SELECT report_json FROM semantic_import_reports ORDER BY rowid').fetchall()
+    assert local_digest == oracle_digest, [name for name in local_digest if local_digest[name] != oracle_digest[name]]
+    assert local_digest['semantic_import_reports'] == oracle_digest['semantic_import_reports']
+    assert len(local_reports) == len(oracle_reports) == 1, (local_reports, oracle_reports)
+finally:
+    oracle.stop()
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&scratch)
+        .arg(env!("CARGO_BIN_EXE_trellis"))
+        .env(
+            "TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE",
+            scratch.join("work-counts.json"),
+        )
+        .env("TRELLIS_TEST_LOCAL_FULL_ORACLE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "runner-shaped local publication failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

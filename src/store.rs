@@ -6760,7 +6760,6 @@ fn witnessed_native_destination(
         if raw.producer_id != old.producer.id
             || native.producer != captured.producer
             || native.revision.toolchain_hash != captured.revision.toolchain_hash
-            || native.revision.config_hash != captured.revision.config_hash
             || native.revision.dependency_hash != captured.revision.dependency_hash
         {
             return Ok(None);
@@ -7001,7 +7000,6 @@ fn try_original_witness_rejoin(
     if reusable.is_empty()
         || destination.producer != original_native.producer
         || destination.revision.toolchain_hash != original_native.revision.toolchain_hash
-        || destination.revision.config_hash != original_native.revision.config_hash
         || destination.revision.dependency_hash != original_native.revision.dependency_hash
         || raw.captured_revision != original_native.revision.id
     {
