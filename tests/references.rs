@@ -5654,3 +5654,197 @@ fn references_javascript_unstable_writes_invalidate_only_the_owned_alias() {
         );
     }
 }
+
+#[test]
+fn references_javascript_review_local_alias_bindings_do_not_collapse_star_identity() {
+    for declaration in ["const", "let", "var"] {
+        for source in [
+            "export * from './a.js'; export * from './b.js';",
+            "export * from './b.js'; export * from './a.js';",
+        ] {
+            let facade = format!("import {{ f as g }} from './a.js'; export {declaration} f = g;");
+            let input = snapshot(&[
+                ("use.js", source),
+                ("a.js", "export function f() {}"),
+                ("b.js", &facade),
+            ]);
+            let a = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "a.js")
+                .unwrap()
+                .declarations
+                .iter()
+                .find(|row| row.name.as_deref() == Some("f"))
+                .unwrap();
+            let b = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "b.js")
+                .unwrap()
+                .declarations
+                .iter()
+                .find(|row| row.kind == "variable" && row.name.as_deref() == Some("f"))
+                .unwrap();
+            assert_ne!(a.syntax_id, b.syntax_id);
+            let data = project_javascript_source(&input, 20);
+            assert!(
+                data["production"].as_array().unwrap().is_empty(),
+                "{declaration}: {source}: {data}"
+            );
+            assert_eq!(data["counts"]["mappedSites"], 0);
+            assert_eq!(data["counts"]["unresolvedSites"], 2);
+        }
+    }
+    for declaration in ["const", "let", "var"] {
+        let facade = format!("import {{ f as g }} from './a.js'; export {declaration} f = g;");
+        let mut input = snapshot(&[
+            ("use.js", "export * from './b.js';"),
+            ("a.js", "export function f() {}"),
+            ("b.js", &facade),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(edge(&data, "production", "use.js", "b.js")["count"], 1);
+        assert!(!has_edge(&data, "use.js", "a.js"));
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        input
+            .documents
+            .iter_mut()
+            .find(|doc| doc.key.path == "b.js")
+            .unwrap()
+            .declarations
+            .retain(|row| !(row.kind == "variable" && row.name.as_deref() == Some("f")));
+        let missing = project_javascript_source(&input, 20);
+        assert!(
+            missing["production"].as_array().unwrap().is_empty(),
+            "{declaration}: {missing}"
+        );
+        assert_eq!(missing["counts"]["unresolvedSites"], 1);
+    }
+    for source in [
+        "export * from './a.js'; export * from './b.js';",
+        "export * from './b.js'; export * from './a.js';",
+    ] {
+        let input = snapshot(&[
+            ("use.js", source),
+            ("a.js", "export function f() {}"),
+            (
+                "b.js",
+                "import { f as g } from './a.js'; export { g as f };",
+            ),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(edge(&data, "production", "use.js", "a.js")["count"], 2);
+        assert!(!has_edge(&data, "use.js", "b.js"));
+        assert_eq!(data["counts"]["mappedSites"], 2);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+}
+
+#[test]
+fn references_javascript_review_trailing_slash_never_selects_sibling_file() {
+    let input = snapshot(&[
+        ("use.js", "export * from './lib/';"),
+        ("lib.js", "export function decoy() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert!(!has_edge(&data, "use.js", "lib.js"), "{data}");
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+
+    let input = snapshot(&[
+        ("use.js", "export * from './lib/';"),
+        ("lib.js", "export function decoy() {}"),
+        ("lib/index.js", "export function actual() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert!(!has_edge(&data, "use.js", "lib.js"), "{data}");
+    assert_eq!(
+        edge(&data, "production", "use.js", "lib/index.js")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_javascript_review_stars_into_commonjs_files_remain_unknown() {
+    let input = snapshot(&[
+        ("use.js", "export * from './provider.cjs';"),
+        ("provider.cjs", "export function value() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["mappedSites"], 0);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_javascript_review_500_consumers_share_a_200_name_barrel_within_budget() {
+    let statements = (0..110)
+        .map(|index| format!("    value += {index};\n"))
+        .collect::<String>();
+    let body = format!(
+        "function ordinary_work() {{\n    let value = 0;\n{statements}    return value;\n}}\n"
+    );
+    let mut files = Vec::new();
+    let mut barrel = String::new();
+    for provider in 0..20 {
+        let exports = (0..10)
+            .map(|name| format!("export function value_{provider:02}_{name:02}() {{}}\n"))
+            .collect::<String>();
+        files.push((
+            format!("provider_{provider:02}.js"),
+            format!("{exports}{body}"),
+        ));
+        barrel.push_str(&format!("export * from './provider_{provider:02}.js';\n"));
+    }
+    files.push(("barrel.js".to_owned(), format!("{barrel}{body}")));
+    for consumer in 0..500 {
+        files.push((
+            format!("consumer_{consumer:03}.js"),
+            format!("export * from './barrel.js';\n{body}"),
+        ));
+    }
+    assert_eq!(files.len(), 521);
+    assert!(
+        files
+            .iter()
+            .all(|(_, text)| (100..=200).contains(&text.lines().count()))
+    );
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let input = snapshot(&borrowed);
+    assert_eq!(input.documents.len(), 521);
+    let data = references::project(&input, &["**".into()], 1, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(data["counts"]["scannedDocuments"], 521);
+    assert_eq!(data["counts"]["mappedSites"], 520);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    assert_eq!(data["production"].as_array().unwrap().len(), 10020);
+    assert_eq!(module_paths(&data).len(), 521);
+    for provider in 0..20 {
+        let target = format!("provider_{provider:02}.js");
+        assert_eq!(edge(&data, "production", "barrel.js", &target)["count"], 1);
+        for consumer in 0..500 {
+            let source = format!("consumer_{consumer:03}.js");
+            let pair = edge(&data, "production", &source, &target);
+            assert_eq!(pair["count"], 1);
+            assert_eq!(pair["omittedSites"], 0);
+            assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+        }
+    }
+    for consumer in 0..500 {
+        assert!(!has_edge(
+            &data,
+            &format!("consumer_{consumer:03}.js"),
+            "barrel.js"
+        ));
+    }
+    assert!(data["tests"].as_array().unwrap().is_empty());
+    assert!(data["externalPackages"].as_array().unwrap().is_empty());
+}

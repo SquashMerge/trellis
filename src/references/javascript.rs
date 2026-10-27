@@ -28,7 +28,10 @@ struct Names {
 #[derive(Clone)]
 enum BindingKind {
     Direct(DeclarationId),
-    Alias(String),
+    Alias {
+        original: String,
+        declaration: DeclarationId,
+    },
     Imported {
         source: Option<String>,
         name: Option<String>,
@@ -137,14 +140,21 @@ impl Catalog {
             };
             resolver.hazards(document, work, check)?;
             let mut contributors = Vec::new();
-            let mut merged = Names::default();
             for source in unit.sources.iter().filter(|s| s.star) {
                 let names =
                     resolver.source_exports(document, source, 1, &Route::new(), work, check)?;
-                merge_names(&mut merged, &names, work, check)?;
                 owner_step(work, check)?;
                 contributors.push(names);
             }
+            let merged = if let [only] = contributors.as_slice() {
+                Arc::clone(only)
+            } else {
+                let mut merged = Names::default();
+                for names in &contributors {
+                    merge_names(&mut merged, names, work, check)?;
+                }
+                Arc::new(merged)
+            };
             let mut stars = contributors.into_iter();
             for source in &unit.sources {
                 owner_step(work, check)?;
@@ -282,7 +292,14 @@ impl Resolver<'_> {
         let Some(path) = relative_path(&self.docs[document].key.path, specifier) else {
             return Ok(Err("relative_import_outside_source"));
         };
-        let candidates = if path.rsplit('/').next().is_some_and(|p| p.contains('.')) {
+        let candidates = if specifier.ends_with('/') {
+            charge(path.len() + 1, work, check)?;
+            vec![if path.is_empty() {
+                "index.js".to_owned()
+            } else {
+                format!("{path}/index.js")
+            }]
+        } else if path.rsplit('/').next().is_some_and(|p| p.contains('.')) {
             vec![path]
         } else {
             charge(path.len() * 4 + 4, work, check)?;
@@ -329,7 +346,9 @@ impl Resolver<'_> {
         charge(route.len() + 1, work, check)?;
         if depth > FOLLOW
             || route.contains(&(document, "*".into()))
-            || (depth > 0 && self.units[&document].test_only)
+            || (depth > 0
+                && (self.units[&document].test_only
+                    || self.docs[document].key.path.ends_with(".cjs")))
         {
             return Ok(Arc::new(unknown_names()));
         }
@@ -385,7 +404,9 @@ impl Resolver<'_> {
         charge(route.len() + name.len() + 1, work, check)?;
         if depth > FOLLOW
             || route.contains(&(document, name.to_owned()))
-            || (depth > 0 && self.units[&document].test_only)
+            || (depth > 0
+                && (self.units[&document].test_only
+                    || self.docs[document].key.path.ends_with(".cjs")))
         {
             return Ok(Arc::new(unknown_bucket()));
         }
@@ -475,6 +496,7 @@ impl Resolver<'_> {
         let mut name = name.to_owned();
         let mut seen = BTreeSet::new();
         let mut before = usize::MAX;
+        let mut alias = None;
         loop {
             charge(name.len() + 1, work, check)?;
             if !seen.insert(name.clone()) || self.hazards[&document].writes.contains(&name) {
@@ -490,7 +512,7 @@ impl Resolver<'_> {
             match &binding.kind {
                 BindingKind::Direct(id) => {
                     charge(id.sid.len() + 2, work, check)?;
-                    return Ok(Bucket {
+                    let bucket = Bucket {
                         candidates: BTreeMap::from([(
                             id.clone(),
                             Candidate {
@@ -499,9 +521,17 @@ impl Resolver<'_> {
                             },
                         )]),
                         unknown: false,
-                    });
+                    };
+                    return local_alias(bucket, alias, work, check);
                 }
-                BindingKind::Alias(original) => {
+                BindingKind::Alias {
+                    original,
+                    declaration,
+                } => {
+                    if alias.is_none() {
+                        charge(declaration.sid.len() + 1, work, check)?;
+                        alias = Some(declaration.clone());
+                    }
                     before = binding.start;
                     name = original.clone();
                 }
@@ -514,7 +544,7 @@ impl Resolver<'_> {
                             let bucket =
                                 self.named(target, original, depth + 1, route, work, check)?;
                             charge_bucket(&bucket, work, check)?;
-                            Ok((*bucket).clone())
+                            local_alias((*bucket).clone(), alias, work, check)
                         }
                         Err(_) => Ok(unknown_bucket()),
                     };
@@ -591,6 +621,29 @@ fn charge_package(
         charge(size + 1, work, check)?;
     }
     Ok(())
+}
+fn local_alias(
+    mut bucket: Bucket,
+    alias: Option<DeclarationId>,
+    work: &mut usize,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Bucket> {
+    let Some(id) = alias else {
+        return Ok(bucket);
+    };
+    if bucket.unknown || bucket.candidates.len() != 1 {
+        return Ok(unknown_bucket());
+    }
+    // A local variable has its own binding. The RHS proof admits the initializer,
+    // but only an import binding re-export preserves the imported identity.
+    charge(id.sid.len() + 2, work, check)?;
+    let mut candidate = bucket.candidates.pop_first().expect("unique alias RHS").1;
+    candidate.proof.insert(id.document);
+    candidate.id = id.clone();
+    Ok(Bucket {
+        candidates: BTreeMap::from([(id, candidate)]),
+        unknown: false,
+    })
 }
 fn unknown_bucket() -> Bucket {
     Bucket {
@@ -1017,9 +1070,13 @@ fn record_declaration(
         && let Some(value) = node.child_by_field_name("value")
     {
         if value.kind() == "identifier" {
-            binding = name(doc, value)
-                .map(BindingKind::Alias)
-                .unwrap_or(BindingKind::Unknown);
+            binding = match (name(doc, value), binding) {
+                (Some(original), BindingKind::Direct(declaration)) => BindingKind::Alias {
+                    original,
+                    declaration,
+                },
+                _ => BindingKind::Unknown,
+            };
         } else if !matches!(
             value.kind(),
             "number"

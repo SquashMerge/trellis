@@ -190,12 +190,15 @@ Supported mapping is deliberately narrow:
   ambiguous ownership and depth beyond four remain unknown.
 - **JavaScript:** static relative imports/reexports/side-effect imports use a
   unique explicit indexed extension or `.js`/`.mjs`/`.cjs` and `index.js`
-  convention. `export * from` forwards proved named exports, never `default`.
+  convention. A trailing `/` selects only a directory's `index.js`, never a
+  sibling file. `export * from` forwards proved named exports, never `default`.
   Explicit exported names shadow star names; distinct surviving declarations
-  collide, while routes to the same native declaration deduplicate. Proved
-  direct/list/named exports and simple aliases retain final native owners through
-  at most four edges. Cycles, unsupported namespace/CommonJS/dynamic exports,
-  unproved bindings and over-depth forwarding retain unknowns. External stars
+  collide, while routes to the same native declaration deduplicate. Import-binding
+  reexports retain the original identity; a proved local variable alias keeps its
+  own native binding identity and owner, not its initializer's. Proved forwarding
+  follows at most four edges. Name expansion into `.cjs`, cycles, unsupported
+  namespace/CommonJS/dynamic exports, unproved bindings and over-depth forwarding
+  retain unknowns; ordinary static module edges remain available. External stars
   may label a package but provide no names and leave residual uncertainty;
   an explicit proved export settles only its matching name. Supported static
   literals use the resolver's documented decoding subset, not runtime execution.
