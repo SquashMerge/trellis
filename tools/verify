@@ -92,6 +92,12 @@ tests() {
     echo "verify: cargo-nextest is required (brew install cargo-nextest, or cargo install cargo-nextest --locked)" >&2
     exit 127
   fi
+  # GHSA-vc25-qg58-w57c: cargo-nextest 0.9.125–0.9.149 can execute code when rerunning a recording.
+  nextest_version=$(cargo nextest --version | awk 'NR == 1 { print $2 }')
+  if [ "$(printf '%s\n%s\n' 0.9.150 "$nextest_version" | sort -V | head -n 1)" != 0.9.150 ]; then
+    echo "verify: cargo-nextest $nextest_version is affected by GHSA-vc25-qg58-w57c; upgrade to 0.9.150 or newer" >&2
+    exit 127
+  fi
   CARGO_TARGET_DIR="$target_dir-test-support" cargo nextest run --locked --all-targets --no-fail-fast --features test-support
 }
 semantic() {
