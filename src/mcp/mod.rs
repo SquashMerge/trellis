@@ -1951,6 +1951,7 @@ fn coordinate(
             let result = if workspace.clock_now() >= call.deadline {
                 deadline_answer(&call)
             } else if let Some(gate) = gate {
+                phase_hook("selected_call_send")?;
                 match gate.witness.verify_at_send(&gate.dirs) {
                     Ok(()) => result,
                     Err(SelectionError::Unavailable) => {
