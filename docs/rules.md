@@ -44,9 +44,26 @@ without changing its underlying deviation status.
 
 An integer `order` is explicit: lower means higher, equal integers are peers.
 Table order has no meaning. A layer has either `order` or `shared = true`, never
-both. Assignment to two different layers is a located ambiguity error; overlapping
-patterns within one layer deduplicate. Unassigned files remain visible and unknown,
-not automatically placed.
+both. Path assignment uses the most specific matching patterns:
+
+- An exact file path beats every glob.
+- A glob is narrower only when its accepted valid path language is a proper subset
+  of another glob's language, not when it has a longer prefix or fewer wildcards.
+- Discard broader matches. If the remaining patterns all select one layer, use it.
+  Equivalent or overlapping incomparable patterns in different layers produce a
+  located ambiguity error. Repeated patterns within one layer deduplicate.
+
+For example, `src/store/search/**` beats `src/store/**`, `src/?.rs` beats
+`src/*.rs`, and `src/*??*` beats `src/*` on `src/ab`. By contrast,
+`src/a*/b.rs` and `src/ab/*.rs` are incomparable on `src/ab/b.rs` and are
+ambiguous across layers. A unique exact match wins even if broader globs tie.
+Table/array order, layer names and layer `order` never break assignment ties.
+
+Containment considers all valid paths, not only indexed files. Comparisons are
+lazy, reused within a request, cancellable and charged to the existing bounded
+work budget. Exhaustion fails atomically with `bounded_work`, never a guessed
+winner or ambiguity. Unassigned files remain visible and unknown, not
+automatically placed.
 
 For an observed production structural reference pair:
 

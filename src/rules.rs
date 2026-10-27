@@ -12,6 +12,9 @@ use std::{
 };
 use toml::Spanned;
 
+mod glob_language;
+
+const WORK_LIMIT: usize = 5_000_000;
 pub const RULES_PATH: &str = ".trellis/rules.toml";
 const CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const COLLECTION_LIMIT: usize = 1024;
@@ -173,9 +176,13 @@ struct RawException {
     destination: Option<Spanned<ConfigTarget>>,
     reason: Spanned<String>,
 }
+struct LayerPattern {
+    text: String,
+    matcher: GlobSet,
+}
 struct Layer {
     order: Option<i64>,
-    patterns: Vec<GlobSet>,
+    patterns: Vec<LayerPattern>,
     external: BTreeSet<ExternalSelector>,
     span: std::ops::Range<usize>,
 }
@@ -419,11 +426,18 @@ pub fn parse(text: &str) -> Result<Config> {
                 "layer requires nonempty paths or external and exactly one integer order or shared=true",
             ));
         }
-        let globs = layer
+        let mut globs = layer
             .paths
             .iter()
-            .map(|v| pattern(text, v, true, &mut patterns))
+            .map(|v| {
+                Ok(LayerPattern {
+                    text: v.get_ref().clone(),
+                    matcher: pattern(text, v, true, &mut patterns)?,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
+        globs.sort_by(|a, b| a.text.cmp(&b.text));
+        globs.dedup_by(|a, b| a.text == b.text);
         let external = external_selectors(text, &layer.external, &mut patterns)?;
         for selector in &external {
             if let Some(previous) = external_owners.insert(selector.clone(), name.clone()) {
@@ -703,24 +717,107 @@ pub fn view_layers(config: &Config) -> Vec<Value> {
     }).collect()
 }
 
-pub(crate) fn layer_for<'a>(config: &'a Config, path: &str) -> Result<Option<&'a str>> {
-    let mut selected = None;
-    for (name, layer) in &config.layers {
-        if layer.patterns.iter().any(|p| p.is_match(path)) {
-            if selected.is_some() {
-                return Err(error(
-                    &config.text,
-                    layer.span.clone(),
-                    "ambiguity",
-                    "token",
-                    format!("path {path} matches multiple layers"),
-                ));
-            }
-            selected = Some(name.as_str());
+struct LayerMatcher<'a> {
+    config: &'a Config,
+    relations: BTreeMap<(&'a str, &'a str), glob_language::Relation>,
+}
+impl<'a> LayerMatcher<'a> {
+    fn new(config: &'a Config) -> Self {
+        Self {
+            config,
+            relations: BTreeMap::new(),
         }
     }
-    Ok(selected)
+
+    fn select(
+        &mut self,
+        path: &str,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Option<&'a str>> {
+        let mut matching = Vec::new();
+        for (name, layer) in &self.config.layers {
+            for pattern in &layer.patterns {
+                check()?;
+                if pattern.matcher.is_match(path) {
+                    matching.push((name.as_str(), layer, pattern));
+                }
+            }
+        }
+        let exact = matching
+            .iter()
+            .any(|(_, _, p)| !p.text.contains(['*', '?']));
+        if exact {
+            matching.retain(|(_, _, p)| !p.text.contains(['*', '?']));
+        }
+        let Some(first) = matching.first() else {
+            return Ok(None);
+        };
+        if matching.iter().all(|(name, _, _)| *name == first.0) {
+            return Ok(Some(first.0));
+        }
+        let mut dominated = vec![false; matching.len()];
+        for i in 0..matching.len() {
+            if exact {
+                break;
+            }
+            for j in i + 1..matching.len() {
+                check()?;
+                *work = work.saturating_add(1);
+                ensure!(
+                    *work <= WORK_LIMIT,
+                    "bounded_work: layer specificity comparison"
+                );
+                let (a, b) = (matching[i].2.text.as_str(), matching[j].2.text.as_str());
+                let (key, reverse) = if a <= b {
+                    ((a, b), false)
+                } else {
+                    ((b, a), true)
+                };
+                let relation = if a == b {
+                    glob_language::Relation::Equivalent
+                } else if let Some(relation) = self.relations.get(&key) {
+                    *relation
+                } else {
+                    let relation = glob_language::relation(key.0, key.1, work, check)?;
+                    self.relations.insert(key, relation);
+                    relation
+                };
+                use glob_language::Relation::*;
+                match (relation, reverse) {
+                    (StrictSubset, false) | (StrictSuperset, true) => dominated[j] = true,
+                    (StrictSuperset, false) | (StrictSubset, true) => dominated[i] = true,
+                    _ => {}
+                }
+            }
+        }
+        let mut remaining: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for ((name, _, pattern), dominated) in matching.iter().zip(dominated) {
+            if !dominated {
+                remaining.entry(name).or_default().push(&pattern.text);
+            }
+        }
+        let (name, _) = remaining
+            .first_key_value()
+            .expect("strict inclusion has a minimum");
+        if remaining.len() == 1 {
+            return Ok(Some(name));
+        }
+        let tied = remaining
+            .iter()
+            .map(|(name, patterns)| format!("{name} ({})", patterns.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(error(
+            &self.config.text,
+            self.config.layers[*name].span.clone(),
+            "ambiguity",
+            "token",
+            format!("path {path} matches equally specific layers: {tied}"),
+        ))
+    }
 }
+
 fn layer_status(
     config: &Config,
     source: Option<&str>,
@@ -985,7 +1082,7 @@ fn package_closure(
         check()?;
         *work = work.saturating_add(1);
         ensure!(
-            *work <= 5_000_000,
+            *work <= WORK_LIMIT,
             "bounded_work: rules external package closure budget"
         );
         if identity["kind"] == "externalPackage" {
@@ -997,7 +1094,7 @@ fn package_closure(
         check()?;
         *work = work.saturating_add(1);
         ensure!(
-            *work <= 5_000_000,
+            *work <= WORK_LIMIT,
             "bounded_work: rules external package closure budget"
         );
         if needed.remove(&package["identity"].to_string()) {
@@ -1017,6 +1114,21 @@ pub fn evaluate(
     paths: &[String],
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Value> {
+    Ok(evaluate_with_layers(config, snapshot, refs, paths, check)?.data)
+}
+
+pub(crate) struct Evaluation<'a> {
+    pub data: Value,
+    pub layers: BTreeMap<&'a str, Option<&'a str>>,
+}
+
+pub(crate) fn evaluate_with_layers<'a>(
+    config: &'a Config,
+    snapshot: &Snapshot,
+    refs: &'a Projection,
+    paths: &[String],
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<Evaluation<'a>> {
     let path_values: Vec<_> = paths
         .iter()
         .map(|p| Spanned::new(0..0, p.clone()))
@@ -1034,9 +1146,11 @@ pub fn evaluate(
         .map(|layer| layer.patterns.len())
         .sum();
     ensure!(
-        modules.len().saturating_mul(layer_patterns) <= 5_000_000,
+        modules.len().saturating_mul(layer_patterns) <= WORK_LIMIT,
         "bounded_work: layer assignment pattern budget"
     );
+    let mut work = modules.len().saturating_mul(layer_patterns);
+    let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
     let mut assignments = BTreeMap::new();
     let mut module_by_id = BTreeMap::new();
@@ -1045,14 +1159,13 @@ pub fn evaluate(
         let path = module["identity"]["path"]
             .as_str()
             .context("store_unavailable: module path absent")?;
-        let layer = layer_for(config, path)?;
+        let layer = matcher.select(path, &mut work, check)?;
         assignments.insert(path, layer);
         module_by_id.insert(module["identity"].to_string(), module);
         if layer.is_none() {
             unassigned.push(module["identity"].clone());
         }
     }
-    let mut work = modules.len().saturating_mul(layer_patterns);
     let mut external_assignments = BTreeMap::new();
     let external_packages = refs.data["externalPackages"]
         .as_array()
@@ -1064,7 +1177,7 @@ pub fn evaluate(
             .context("store_unavailable: external package identity absent")?;
         work = work.saturating_add(config.layers.len());
         ensure!(
-            work <= 5_000_000,
+            work <= WORK_LIMIT,
             "bounded_work: external layer assignment budget"
         );
         let layer = config
@@ -1124,7 +1237,7 @@ pub fn evaluate(
                 .context("store_unavailable: edge sites absent")?;
             work = work.saturating_add(1 + sites.len());
             ensure!(
-                work <= 5_000_000,
+                work <= WORK_LIMIT,
                 "bounded_work: rules reference evidence budget"
             );
             let mut evidence = Vec::new();
@@ -1141,7 +1254,7 @@ pub fn evaluate(
                 let mut row = json!({"rule":"$layers","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":status,
                     "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]});
                 work = work.saturating_add(config.exceptions.len());
-                ensure!(work <= 5_000_000, "bounded_work: exception match budget");
+                ensure!(work <= WORK_LIMIT, "bounded_work: exception match budget");
                 decorate(config, &mut row);
                 rows.push(row);
             }
@@ -1230,7 +1343,7 @@ pub fn evaluate(
             check()?;
             for rule in &config.rules {
                 work = work.saturating_add(1 + config.roles[&rule.role].paths.len());
-                ensure!(work <= 5_000_000, "bounded_work: rules selection budget");
+                ensure!(work <= WORK_LIMIT, "bounded_work: rules selection budget");
                 check()?;
                 let selected = selection(&config.roles[&rule.role], d, bases.get(&d.syntax_id));
                 if selected == Some(false) {
@@ -1249,7 +1362,7 @@ pub fn evaluate(
                             0
                         },
                     );
-                    ensure!(work <= 5_000_000, "bounded_work: rule constraint budget");
+                    ensure!(work <= WORK_LIMIT, "bounded_work: rule constraint budget");
                     check()?;
                     let reason = if c.kind == "calls" {
                         "call_binding_unavailable"
@@ -1264,7 +1377,7 @@ pub fn evaluate(
                             .filter(|call| call.owner_syntax_id == d.syntax_id)
                         {
                             work = work.saturating_add(1);
-                            ensure!(work <= 5_000_000, "bounded_work: rule evidence budget");
+                            ensure!(work <= WORK_LIMIT, "bounded_work: rule evidence budget");
                             check()?;
                             evidence.push(json!({"document":call.document,"revisionId":call.revision_id,"range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,"callId":call.id,"provenanceId":call.provenance_id}));
                         }
@@ -1281,7 +1394,7 @@ pub fn evaluate(
                 let mut row = json!({"rule":rule.id,"target":identity(d),"destination":null,"sourceLayer":null,"destinationLayer":null,"status":"unknown","excepted":false,"exceptionReason":null,
                     "constraints":constraints,"evidence":[native_evidence(d)],"unresolved":unresolved,"referenceCount":0});
                 work = work.saturating_add(config.exceptions.len());
-                ensure!(work <= 5_000_000, "bounded_work: exception match budget");
+                ensure!(work <= WORK_LIMIT, "bounded_work: exception match budget");
                 decorate(config, &mut row);
                 if test {
                     test_only.push(row)
@@ -1312,11 +1425,12 @@ pub fn evaluate(
         check,
     )?;
     check()?;
-    Ok(
-        json!({"rulesVersion":"rules:v2","indexGeneration":snapshot.pin.index_generation.to_string(),"indexRevision":snapshot.pin.index_revision,"rulesFile":descriptor(config),
+    Ok(Evaluation {
+        data: json!({"rulesVersion":"rules:v2","indexGeneration":snapshot.pin.index_generation.to_string(),"indexRevision":snapshot.pin.index_revision,"rulesFile":descriptor(config),
         "counts":counts(&instances),"testCounts":counts(&test_only),"instances":instances,"testOnly":test_only,"unassigned":unassigned,"externalPackages":external_packages,
         "limitations":["Layer results describe observed structurally mapped syntax references, not absence of semantic dependencies.","Calls and type relationships have no admitted bindings and remain unknown.","testOnly policy statuses are hypothetical and never production violations.","Structural reference provenance attests captured source bytes, not a semantic target association."]}),
-    )
+        layers: assignments,
+    })
 }
 pub fn explain(
     mut payload: Value,
@@ -1369,4 +1483,45 @@ pub fn explain(
         check,
     )?);
     Ok(payload)
+}
+
+#[cfg(test)]
+mod specificity_tests {
+    use super::*;
+
+    #[test]
+    fn global_minima_and_cached_comparisons_share_work_and_cancellation() {
+        let config = parse("version=1\n[layers.alpha]\norder=1\npaths=['src/a*.rs']\n[layers.beta]\norder=2\npaths=['src/*a.rs']\n[layers.winner]\norder=3\npaths=['src/a*a.rs']\n").unwrap();
+        let mut matcher = LayerMatcher::new(&config);
+        let mut work = 0;
+        assert_eq!(
+            matcher
+                .select("src/aa.rs", &mut work, &mut || Ok(()))
+                .unwrap(),
+            Some("winner")
+        );
+        assert_eq!(matcher.relations.len(), 3);
+        let compiled_work = work;
+        assert_eq!(
+            matcher
+                .select("src/aaa.rs", &mut work, &mut || Ok(()))
+                .unwrap(),
+            Some("winner")
+        );
+        assert_eq!(work - compiled_work, 3);
+        // The first three checks inspect matches; the fourth visits a cached pair.
+        let mut checks = 0;
+        let error = matcher
+            .select("src/aa.rs", &mut work, &mut || {
+                checks += 1;
+                ensure!(checks < 4, "cancelled");
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled");
+        let error = matcher
+            .select("src/aa.rs", &mut { WORK_LIMIT }, &mut || Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("bounded_work"));
+    }
 }

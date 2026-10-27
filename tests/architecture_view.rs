@@ -401,3 +401,34 @@ fn architecture_metric_roles_leave_reference_roles_and_physical_lines_unchanged(
     }
     response.finish(()).unwrap();
 }
+
+#[test]
+fn architecture_specificity_assignments_match_evaluated_layer_verdicts() {
+    let (_state, root, store, pin) = fixture();
+    rules(
+        root.path(),
+        "version=1\n[layers.broad]\norder=9\npaths=['src/**']\n[layers.narrow]\norder=3\npaths=['src/s*.rs']\n[layers.exact]\norder=1\npaths=['src/entry.rs']",
+    );
+    let data = view(&store, pin);
+    let assignments: std::collections::BTreeMap<_, _> = data["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["identity"]["path"].as_str().unwrap(), &m["layer"]))
+        .collect();
+    assert_eq!(*assignments["src/store.rs"], "narrow");
+    assert_eq!(*assignments["src/entry.rs"], "exact");
+    assert_eq!(*assignments["src/lib.rs"], "broad");
+    for field in ["instances", "testOnly"] {
+        for row in data["rules"][field].as_array().unwrap() {
+            assert_eq!(
+                &row["sourceLayer"],
+                assignments[row["target"]["path"].as_str().unwrap()]
+            );
+            assert_eq!(
+                &row["destinationLayer"],
+                assignments[row["destination"]["path"].as_str().unwrap()]
+            );
+        }
+    }
+}

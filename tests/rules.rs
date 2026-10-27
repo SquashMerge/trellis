@@ -89,6 +89,250 @@ fn diagnostic(text: &str) -> Value {
     rules::diagnostic(&error).unwrap()
 }
 
+// Exercise assignment through the admitted snapshot and public rules evaluator.
+fn specificity_snapshot(path: &str) -> Snapshot {
+    let mut module = format!(
+        "pub mod {};",
+        path.rsplit('/').next().unwrap().trim_end_matches(".rs")
+    );
+    let parts: Vec<_> = path.strip_prefix("src/").unwrap().split('/').collect();
+    for directory in parts[..parts.len() - 1].iter().rev() {
+        module = format!("pub mod {directory} {{ {module} }}");
+    }
+    let root = format!("mod destination; {module}");
+    snapshot(&[
+        ("src/lib.rs", &root),
+        ("src/destination.rs", "pub fn run() {}"),
+        (path, "pub fn run() { crate::destination::run(); }"),
+        ("other/unassigned.rs", "pub fn unused() {}"),
+    ])
+}
+
+fn specificity_config(layers: &[(&str, &[&str])], reverse: bool) -> String {
+    let mut text = String::from(
+        "version=1\n[layers.destination]\norder=9\npaths=['src/lib.rs','src/destination.rs']\n",
+    );
+    let mut layers = layers.to_vec();
+    if reverse {
+        layers.reverse();
+    }
+    for (name, patterns) in layers {
+        let mut patterns = patterns.to_vec();
+        if reverse {
+            patterns.reverse();
+        }
+        let patterns = patterns
+            .iter()
+            .map(|pattern| format!("'{pattern}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        text.push_str(&format!("[layers.{name}]\norder=1\npaths=[{patterns}]\n"));
+    }
+    text
+}
+
+#[test]
+fn rules_layer_specificity_selects_exact_and_proper_glob_subsets_independent_of_order() {
+    for (path, alpha, beta, winner) in [
+        (
+            "src/store.rs",
+            vec!["src/store.rs"],
+            vec!["src/*.rs"],
+            "alpha",
+        ),
+        (
+            "src/store/search/item.rs",
+            vec!["src/store/search/**"],
+            vec!["src/store/**"],
+            "alpha",
+        ),
+        ("src/a.rs", vec!["src/?.rs"], vec!["src/*.rs"], "alpha"),
+        ("src/ab.rs", vec!["src/*??*"], vec!["src/*"], "alpha"),
+        (
+            "src/ab/b.rs",
+            vec!["src/*/*.rs"],
+            vec!["src/**/*.rs"],
+            "alpha",
+        ),
+        // ** also accepts zero directories; it must not defeat the narrower glob.
+        ("src/a.rs", vec!["src/*.rs"], vec!["src/**/*.rs"], "alpha"),
+        (
+            "src/store.rs",
+            vec!["src/store.rs", "src/*.rs", "src/store.rs"],
+            vec!["src/**"],
+            "alpha",
+        ),
+        // An unmatched exact pattern cannot promote its layer's broad match.
+        (
+            "src/a.rs",
+            vec!["src/absent.rs", "src/*"],
+            vec!["src/?.rs"],
+            "beta",
+        ),
+        ("src/é.rs", vec!["src/é*.rs"], vec!["src/*.rs"], "alpha"),
+    ] {
+        let input = specificity_snapshot(path);
+        let layers = [("alpha", alpha.as_slice()), ("beta", beta.as_slice())];
+        let data = evaluate(&specificity_config(&layers, false), &input);
+        let row = pair(&data, path, "src/destination.rs");
+        assert_eq!(row["sourceLayer"], winner, "{path}");
+        assert_eq!(row["destinationLayer"], "destination", "{path}");
+        assert_eq!(row["status"], "conforms", "{path}");
+        let reversed = evaluate(&specificity_config(&layers, true), &input);
+        assert_eq!(data["instances"], reversed["instances"], "{path}");
+        assert_eq!(data["unassigned"], reversed["unassigned"], "{path}");
+    }
+}
+
+#[test]
+fn rules_layer_specificity_ignores_lower_rank_ties_under_one_exact_winner() {
+    let input = specificity_snapshot("src/store.rs");
+    let layers: &[(&str, &[&str])] = &[
+        ("alpha", &["src/*.rs", "src/*"]),
+        ("beta", &["src/*", "src/*.rs"]),
+        ("winner", &["src/store.rs", "src/absent.rs"]),
+    ];
+    for reverse in [false, true] {
+        let data = evaluate(&specificity_config(layers, reverse), &input);
+        assert_eq!(
+            pair(&data, "src/store.rs", "src/destination.rs")["sourceLayer"],
+            "winner"
+        );
+    }
+}
+
+#[test]
+fn rules_layer_specificity_equal_and_incomparable_matches_are_located_sorted_ambiguities() {
+    for (path, alpha, zeta) in [
+        ("src/store.rs", vec!["src/store.rs"], vec!["src/store.rs"]),
+        ("src/a.rs", vec!["src/*.rs"], vec!["src/*.rs"]),
+        ("src/a.rs", vec!["src/*?*"], vec!["src/?*"]),
+        ("src/ab/b.rs", vec!["src/a*/b.rs"], vec!["src/ab/*.rs"]),
+        (
+            "src/a.rs",
+            vec!["src/?*", "src/*?*", "src/absent.rs"],
+            vec!["src/*?*", "src/?*", "src/missing.rs"],
+        ),
+    ] {
+        let input = specificity_snapshot(path);
+        let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+        let layers = [("zeta", zeta.as_slice()), ("alpha", alpha.as_slice())];
+        let mut messages = Vec::new();
+        for reverse in [false, true] {
+            let text = specificity_config(&layers, reverse);
+            let config = rules::parse(&text).unwrap();
+            let error = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap_err();
+            let diagnostic = rules::diagnostic(&error).unwrap();
+            assert_eq!(diagnostic["code"], "invalid_rules");
+            assert_eq!(diagnostic["kind"], "ambiguity");
+            assert_eq!(diagnostic["path"], rules::RULES_PATH);
+            assert_eq!(diagnostic["attribution"], "token");
+            let start = diagnostic["range"]["start"].as_u64().unwrap() as usize;
+            let end = diagnostic["range"]["end"].as_u64().unwrap() as usize;
+            let table = text.find("[layers.alpha]").unwrap();
+            let body = table + "[layers.alpha]\n".len();
+            let next = text[body..]
+                .find("[layers.")
+                .map_or(text.len(), |i| body + i);
+            assert!(
+                start >= table && start < next && end <= next,
+                "{diagnostic}"
+            );
+            assert_eq!(
+                diagnostic["line"],
+                text[..start].bytes().filter(|b| *b == b'\n').count() + 1
+            );
+            let message = diagnostic["message"].as_str().unwrap();
+            assert!(message.contains(path), "{diagnostic}");
+            assert!(
+                message.find("alpha").unwrap() < message.find("zeta").unwrap(),
+                "{diagnostic}"
+            );
+            let mut patterns = alpha
+                .iter()
+                .chain(&zeta)
+                .copied()
+                .filter(|p| !p.contains("absent") && !p.contains("missing"))
+                .collect::<Vec<_>>();
+            patterns.sort_unstable();
+            patterns.dedup();
+            for pattern in &patterns {
+                assert!(message.contains(pattern), "{diagnostic}");
+            }
+            messages.push(message.to_owned());
+        }
+        assert_eq!(messages[0], messages[1], "{path}");
+    }
+}
+
+#[test]
+fn rules_layer_specificity_preserves_modes_roles_filters_and_unassigned_paths() {
+    let input = snapshot(&[
+        ("src/lib.rs", "mod store; mod destination;"),
+        (
+            "src/store.rs",
+            "pub fn run() { crate::destination::run(); } #[cfg(test)] mod tests { fn check() { crate::destination::run(); } }",
+        ),
+        ("src/destination.rs", "pub fn run() {}"),
+        ("other/unassigned.rs", "pub fn unused() {}"),
+    ]);
+    for (mode, policy, status) in [
+        ("order=1", "", "conforms"),
+        ("shared=true", "", "deviates"),
+        (
+            "shared=true",
+            "[layer_policy]\nshared_outbound='allow'\n",
+            "conforms",
+        ),
+    ] {
+        let text = format!(
+            "version=1\n{policy}[layers.destination]\norder=9\npaths=['src/lib.rs','src/destination.rs']\n[layers.broad]\norder=99\npaths=['src/**']\n[layers.selected]\n{mode}\npaths=['src/store.rs']\n"
+        );
+        let config = rules::parse(&text).unwrap();
+        for paths in [
+            vec![],
+            vec!["src/store.rs".into()],
+            vec!["absent.rs".into()],
+        ] {
+            let refs = references::project(&input, &paths, 5, &mut || Ok(())).unwrap();
+            let data = rules::evaluate(&config, &input, &refs, &paths, &mut || Ok(())).unwrap();
+            assert_eq!(data["unassigned"].as_array().unwrap().len(), 1);
+            assert_eq!(data["unassigned"][0]["path"], "other/unassigned.rs");
+            if paths.first().is_some_and(|p| p == "absent.rs") {
+                assert!(data["instances"].as_array().unwrap().is_empty());
+                assert!(data["testOnly"].as_array().unwrap().is_empty());
+                continue;
+            }
+            let row = pair(&data, "src/store.rs", "src/destination.rs");
+            assert_eq!(row["sourceLayer"], "selected");
+            assert_eq!(row["status"], status);
+            assert_eq!(row["referenceCount"], 1);
+            let test = data["testOnly"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["target"]["path"] == "src/store.rs")
+                .unwrap();
+            assert_eq!(test["sourceLayer"], "selected");
+            assert_eq!(test["status"], status);
+            assert_eq!(test["referenceCount"], 1);
+            assert_eq!(test["unresolved"], json!(["test_only"]));
+        }
+    }
+    // A directory glob must not match a same-stem file.
+    let data = evaluate(
+        "version=1\n[layers.directory]\norder=1\npaths=['src/store/**']",
+        &input,
+    );
+    assert!(
+        data["unassigned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["path"] == "src/store.rs")
+    );
+}
+
 #[test]
 fn rules_source_filter_keeps_full_snapshot_assignments_and_unassigned_catalog() {
     let input = snapshot(&[
@@ -348,7 +592,7 @@ fn rules_layer_exceptions_are_exact_edge_pairs_and_tests_stay_separate() {
 #[test]
 fn rules_overlapping_layers_fail_atomically_and_no_edges_does_not_prove_calls() {
     let input = snapshot(&[("src/lib.rs", "fn Resource(){}")]);
-    let text = "version=1\n[layers.a]\norder=1\npaths=['src/**']\n[layers.b]\norder=2\npaths=['src/lib.rs']";
+    let text = "version=1\n[layers.a]\norder=1\npaths=['src/lib.rs']\n[layers.b]\norder=2\npaths=['src/lib.rs']";
     let config = rules::parse(text).unwrap();
     let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
     let error = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap_err();
