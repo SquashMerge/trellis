@@ -587,6 +587,401 @@ fn npm_part(value: &str) -> bool {
         })
 }
 
+// Exact public bare roots at Node v22.0.0. Exclusion only, not label coverage.
+// Source pin and deliberate subpath false negatives: docs/node-standard-library-catalog.md.
+const NODE_BARE_ROOTS: &[&str] = &[
+    "_http_agent",
+    "_http_client",
+    "_http_common",
+    "_http_incoming",
+    "_http_outgoing",
+    "_http_server",
+    "_stream_duplex",
+    "_stream_passthrough",
+    "_stream_readable",
+    "_stream_transform",
+    "_stream_wrap",
+    "_stream_writable",
+    "_tls_common",
+    "_tls_wrap",
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// Exact reviewed labels only. The caller charges lookup and descriptor allocation.
+pub fn node_standard_library(source_set_id: &str, specifier: &str) -> Option<ExternalPackage> {
+    let root = node_root(specifier)?;
+    Some(ExternalPackage {
+        identity: ExternalIdentity {
+            kind: ExternalKind::ExternalPackage,
+            source_set_id: source_set_id.into(),
+            language: "javascript".into(),
+            package: root.into(),
+            standard_library: true,
+        },
+        ecosystem: "node",
+        evidence: vec![ExternalEvidence::StandardLibraryCatalog {
+            catalog: "node-standard-library:v1",
+            entry: root.into(),
+        }],
+    })
+}
+
+fn node_root(specifier: &str) -> Option<&'static str> {
+    match specifier {
+        "fs" | "node:fs" | "fs/promises" | "node:fs/promises" => Some("fs"),
+        "path" | "node:path" => Some("path"),
+        _ => None,
+    }
+}
+
+const NPM_SECTIONS: &[&str] = &[
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+];
+
+// Only relevant objects are retained. Their duplicate keys must not become last-wins maps.
+#[derive(Default)]
+struct NpmManifest {
+    name: Option<String>,
+    workspaces: bool,
+    sections: BTreeMap<String, NpmSection>,
+}
+struct NpmSection(BTreeMap<String, serde_json::Value>);
+impl<'de> Deserialize<'de> for NpmSection {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct SectionVisitor;
+        impl<'de> serde::de::Visitor<'de> for SectionVisitor {
+            type Value = NpmSection;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a dependency object with unique keys")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut entries = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if entries.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate dependency key"));
+                    }
+                }
+                Ok(NpmSection(entries))
+            }
+        }
+        deserializer.deserialize_map(SectionVisitor)
+    }
+}
+impl<'de> Deserialize<'de> for NpmManifest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct ManifestVisitor;
+        impl<'de> serde::de::Visitor<'de> for ManifestVisitor {
+            type Value = NpmManifest;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a package manifest with unique relevant fields")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut result = NpmManifest::default();
+                let mut seen = std::collections::BTreeSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if NPM_SECTIONS.contains(&key.as_str())
+                        || matches!(key.as_str(), "name" | "workspaces")
+                    {
+                        if !seen.insert(key.clone()) {
+                            return Err(serde::de::Error::custom(
+                                "duplicate relevant manifest field",
+                            ));
+                        }
+                        match key.as_str() {
+                            "name" => result.name = Some(map.next_value()?),
+                            "workspaces" => {
+                                map.next_value::<serde::de::IgnoredAny>()?;
+                                result.workspaces = true;
+                            }
+                            _ => {
+                                result.sections.insert(key, map.next_value()?);
+                            }
+                        }
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(result)
+            }
+        }
+        deserializer.deserialize_map(ManifestVisitor)
+    }
+}
+
+#[derive(Default)]
+pub struct JavascriptPackages {
+    bindings: BTreeMap<String, BTreeMap<String, Option<ExternalPackage>>>,
+}
+impl JavascriptPackages {
+    pub fn new(
+        manifests: &[ManifestInput],
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        let mut result = Self::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for manifest in manifests {
+            super::owner_step(work, check)?;
+            if manifest.path != "package.json" {
+                continue;
+            }
+            ensure!(
+                seen.insert(&manifest.source_set_id),
+                "store_unavailable: duplicate architecture package manifest"
+            );
+            ensure!(
+                manifest.bytes.is_some() == manifest.content_hash.is_some(),
+                "store_unavailable: architecture manifest content"
+            );
+            let Some(bytes) = &manifest.bytes else {
+                continue;
+            };
+            *work = work.saturating_add(bytes.len());
+            ensure!(
+                *work <= super::OWNER_WORK,
+                "bounded_work: reference manifest parsing"
+            );
+            check()?;
+            let parsed = serde_json::from_slice::<NpmManifest>(bytes);
+            check()?;
+            let Ok(parsed) = parsed else {
+                continue;
+            };
+            if parsed.workspaces {
+                continue;
+            }
+            let mut bindings = BTreeMap::<String, Option<ExternalPackage>>::new();
+            for (section, entries) in parsed.sections {
+                for (key, value) in entries.0 {
+                    super::owner_step(work, check)?;
+                    if !valid_package("javascript", &key, false) {
+                        continue;
+                    }
+                    let version = value.as_str().filter(|value| npm_constraint(value));
+                    let version = version.filter(|_| parsed.name.as_deref() != Some(key.as_str()));
+                    if let Some(version) = version {
+                        let allocation = manifest
+                            .source_set_id
+                            .len()
+                            .saturating_mul(2)
+                            .saturating_add(manifest.native_revision_id.len())
+                            .saturating_add(manifest.dependency_hash.len())
+                            .saturating_add(manifest.path.len())
+                            .saturating_add(manifest.content_hash.as_ref().map_or(0, String::len))
+                            .saturating_add(key.len().saturating_mul(3))
+                            .saturating_add(section.len())
+                            .saturating_add(version.len())
+                            .saturating_add("javascript".len());
+                        *work = work.saturating_add(allocation);
+                        ensure!(
+                            *work <= super::OWNER_WORK,
+                            "bounded_work: reference package evidence"
+                        );
+                        check()?;
+                    }
+                    let descriptor = version.map(|version| ExternalPackage {
+                        identity: ExternalIdentity {
+                            kind: ExternalKind::ExternalPackage,
+                            source_set_id: manifest.source_set_id.clone(),
+                            language: "javascript".into(),
+                            package: key.clone(),
+                            standard_library: false,
+                        },
+                        ecosystem: "npm",
+                        evidence: vec![ExternalEvidence::Manifest {
+                            source_set_id: manifest.source_set_id.clone(),
+                            native_revision_id: manifest.native_revision_id.clone(),
+                            dependency_hash: manifest.dependency_hash.clone(),
+                            path: manifest.path.clone(),
+                            content_hash: manifest
+                                .content_hash
+                                .clone()
+                                .expect("present manifest hash"),
+                            import_root: key.clone(),
+                            section: section.clone(),
+                            key: key.clone(),
+                            version_constraint: Some(version.into()),
+                        }],
+                    });
+                    match bindings.entry(key) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(descriptor);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            match (entry.get_mut().as_mut(), descriptor) {
+                                (Some(existing), Some(additional)) => {
+                                    existing.evidence.extend(additional.evidence);
+                                    existing.evidence.sort();
+                                    existing.evidence.dedup();
+                                }
+                                _ => {
+                                    *entry.get_mut() = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            result
+                .bindings
+                .insert(manifest.source_set_id.clone(), bindings);
+        }
+        Ok(result)
+    }
+
+    /// A captured root declaration relation, not node_modules/member/export-map resolution.
+    /// Call only for supported static syntax after local/context checks and work charging.
+    pub fn resolve(&self, source_set_id: &str, specifier: &str) -> Option<ExternalPackage> {
+        if let Some(package) = node_standard_library(source_set_id, specifier) {
+            return Some(package);
+        }
+        self.binding(source_set_id, specifier).cloned()
+    }
+
+    /// Borrow-only size of owned evidence copied by resolve, including misses.
+    /// The caller charges this to the shared budget and checks cancellation first.
+    pub fn resolution_work(&self, source_set_id: &str, specifier: &str) -> usize {
+        if let Some(root) = node_root(specifier) {
+            return 1usize
+                .saturating_add(source_set_id.len())
+                .saturating_add("javascript".len())
+                .saturating_add(root.len().saturating_mul(2));
+        }
+        let Some(package) = self.binding(source_set_id, specifier) else {
+            return 1;
+        };
+        let mut size = 1usize
+            .saturating_add(package.identity.source_set_id.len())
+            .saturating_add(package.identity.language.len())
+            .saturating_add(package.identity.package.len());
+        for evidence in &package.evidence {
+            if let ExternalEvidence::Manifest {
+                source_set_id,
+                native_revision_id,
+                dependency_hash,
+                path,
+                content_hash,
+                import_root,
+                section,
+                key,
+                version_constraint,
+            } = evidence
+            {
+                for value in [
+                    source_set_id,
+                    native_revision_id,
+                    dependency_hash,
+                    path,
+                    content_hash,
+                    import_root,
+                    section,
+                    key,
+                ] {
+                    size = size.saturating_add(value.len());
+                }
+                size = size.saturating_add(version_constraint.as_ref().map_or(0, String::len));
+            }
+        }
+        size
+    }
+
+    fn binding(&self, source_set_id: &str, specifier: &str) -> Option<&ExternalPackage> {
+        if specifier.starts_with("node:") {
+            return None;
+        }
+        let root = npm_root(specifier)?;
+        if NODE_BARE_ROOTS.binary_search(&root).is_ok() {
+            return None;
+        }
+        self.bindings.get(source_set_id)?.get(root)?.as_ref()
+    }
+}
+fn npm_constraint(value: &str) -> bool {
+    let value = value.strip_prefix(['^', '~']).unwrap_or(value);
+    let mut parts = value.split('.');
+    (0..3).all(|_| {
+        parts.next().is_some_and(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
+    }) && parts.next().is_none()
+}
+fn npm_root(specifier: &str) -> Option<&str> {
+    let mut parts = specifier.split('/');
+    let first = parts.next()?;
+    let root_len = if first.starts_with('@') {
+        first.len() + 1 + parts.next()?.len()
+    } else {
+        first.len()
+    };
+    if parts.any(|part| {
+        part.is_empty()
+            || matches!(part, "." | "..")
+            || !part
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+    }) {
+        return None;
+    }
+    let root = &specifier[..root_len];
+    valid_package("javascript", root, false).then_some(root)
+}
+
 #[derive(Default)]
 pub struct RustPackages {
     bindings: BTreeMap<(String, String), (String, Option<ExternalPackage>)>,
@@ -860,5 +1255,180 @@ mod python_catalog_tests {
         ] {
             assert!(python_standard_library("fixture", root).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod javascript_package_tests {
+    use super::*;
+
+    fn packages(text: &str) -> JavascriptPackages {
+        JavascriptPackages::new(&[input(text)], &mut 0, &mut || Ok(())).unwrap()
+    }
+    fn input(text: &str) -> ManifestInput {
+        ManifestInput {
+            source_set_id: "fixture".into(),
+            native_revision_id: "revision".into(),
+            dependency_hash: "dependencies".into(),
+            path: "package.json".into(),
+            content_hash: Some("hash".into()),
+            bytes: Some(text.as_bytes().to_vec()),
+        }
+    }
+    #[test]
+    fn node_labels_and_reserved_roots_are_exact_and_conservative() {
+        assert_eq!(NODE_BARE_ROOTS.len(), 56);
+        assert!(NODE_BARE_ROOTS.windows(2).all(|pair| pair[0] < pair[1]));
+        for (specifier, root) in [
+            ("fs", "fs"),
+            ("node:fs", "fs"),
+            ("fs/promises", "fs"),
+            ("node:fs/promises", "fs"),
+            ("path", "path"),
+            ("node:path", "path"),
+        ] {
+            let package = node_standard_library("fixture", specifier).unwrap();
+            assert_eq!(package.identity.package, root);
+            assert!(package.identity.standard_library);
+            assert_eq!(package.ecosystem, "node");
+            assert_eq!(
+                package.evidence,
+                vec![ExternalEvidence::StandardLibraryCatalog {
+                    catalog: "node-standard-library:v1",
+                    entry: root.into(),
+                }]
+            );
+        }
+        let dependencies: BTreeMap<_, _> = NODE_BARE_ROOTS
+            .iter()
+            .map(|root| (*root, "1.2.3"))
+            .collect();
+        let packages = packages(&serde_json::json!({"dependencies":dependencies}).to_string());
+        for root in NODE_BARE_ROOTS {
+            if !matches!(*root, "fs" | "path") {
+                assert!(packages.resolve("fixture", root).is_none());
+            }
+            assert!(
+                packages
+                    .resolve("fixture", &format!("{root}/fake"))
+                    .is_none()
+            );
+        }
+        for specifier in [
+            "node:unknown",
+            "node:test",
+            "node:sea",
+            "node:node:fs",
+            "path/posix",
+            "node:path/win32",
+            "./fs.js",
+            "../path.js",
+        ] {
+            assert!(packages.resolve("fixture", specifier).is_none());
+        }
+    }
+    #[test]
+    fn captured_bindings_merge_sections_but_never_infer_installation_or_members() {
+        let packages = packages(
+            r#"{"dependencies":{"widget":"^1.2.3","@scope/tool":"2.3.4","test":"1.0.0","sea":"1.0.0"},"devDependencies":{"widget":"~2.3.4"},"optionalDependencies":{"widget":"3.4.5"},"peerDependencies":{"widget":"4.5.6"}}"#,
+        );
+        assert!(packages.resolution_work("fixture", "widget/sub/path") > 4);
+        assert_eq!(packages.resolution_work("fixture", "absent"), 1);
+        assert!(packages.resolution_work("fixture", "node:fs") > 1);
+        let widget = packages.resolve("fixture", "widget/sub/path").unwrap();
+        assert_eq!(widget.identity.package, "widget");
+        assert!(!widget.identity.standard_library);
+        assert_eq!(widget.ecosystem, "npm");
+        assert_eq!(widget.evidence.len(), 4);
+        for evidence in widget.evidence {
+            let ExternalEvidence::Manifest {
+                import_root,
+                key,
+                version_constraint,
+                ..
+            } = evidence
+            else {
+                panic!("manifest evidence");
+            };
+            assert_eq!(import_root, "widget");
+            assert_eq!(key, "widget");
+            assert!(version_constraint.is_some());
+        }
+        for specifier in ["@scope/tool", "@scope/tool/sub", "test/reporters", "sea"] {
+            assert!(packages.resolve("fixture", specifier).is_some());
+        }
+        for specifier in [
+            "absent",
+            "widget/",
+            "widget//x",
+            "widget/../x",
+            "widget/x?query",
+            "widget/x#hash",
+            "widget/x\\y",
+            "@scope",
+            "@scope//x",
+            "https://widget",
+            "#widget",
+        ] {
+            assert!(packages.resolve("fixture", specifier).is_none());
+        }
+        assert!(packages.resolve("other-source-set", "widget").is_none());
+    }
+    #[test]
+    fn unsupported_competitors_duplicates_and_contexts_never_last_win() {
+        for constraint in [
+            "npm:other@1.2.3",
+            "workspace:*",
+            "file:../x",
+            "latest",
+            "*",
+            ">=1.2.3",
+            "1.2",
+            "1.2.3-beta",
+            "1.2.3+build",
+            " 1.2.3",
+            "01.2.3",
+        ] {
+            let text = serde_json::json!({"dependencies":{"widget":"1.2.3"}, "peerDependencies":{"widget":constraint}}).to_string();
+            assert!(
+                packages(&text).resolve("fixture", "widget").is_none(),
+                "{constraint}"
+            );
+        }
+        for text in [
+            r#"{"dependencies":{"widget":"1.2.3","widget":"2.3.4"}}"#,
+            r#"{"dependencies":{"widget":"1.2.3"},"dependencies":{"widget":"2.3.4"}}"#,
+            r#"{"dependencies":{"widget":"1.2.3"},"devDependencies":{"widget":42}}"#,
+            r#"{"name":"widget","dependencies":{"widget":"1.2.3"}}"#,
+            r#"{"workspaces":["packages/*"],"dependencies":{"widget":"1.2.3"}}"#,
+            r#"{"dependencies":{"widget":"1.2.3"},"peerDependencies":[]}"#,
+            "invalid json",
+        ] {
+            assert!(
+                packages(text).resolve("fixture", "widget").is_none(),
+                "{text}"
+            );
+        }
+    }
+    #[test]
+    fn parsing_shares_work_budget_and_checks_cancellation() {
+        let input = input(r#"{"dependencies":{"widget":"1.2.3"}}"#);
+        let mut work = super::super::OWNER_WORK;
+        let error =
+            JavascriptPackages::new(std::slice::from_ref(&input), &mut work, &mut || Ok(()))
+                .err()
+                .unwrap();
+        assert!(error.to_string().starts_with("bounded_work:"));
+        let mut visits = 0;
+        let error = JavascriptPackages::new(&[input], &mut 0, &mut || {
+            visits += 1;
+            if visits >= 2 {
+                anyhow::bail!("cancelled");
+            }
+            Ok(())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "cancelled");
     }
 }

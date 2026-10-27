@@ -9629,6 +9629,29 @@
                 "entry"
               ],
               "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "node-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "fs",
+                    "path"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -9644,7 +9667,9 @@
                 "cargo",
                 "rust",
                 "java",
-                "python"
+                "python",
+                "npm",
+                "node"
               ]
             },
             "evidence": {
@@ -11609,6 +11634,29 @@
                 "entry"
               ],
               "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "node-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "fs",
+                    "path"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -11624,7 +11672,9 @@
                 "cargo",
                 "rust",
                 "java",
-                "python"
+                "python",
+                "npm",
+                "node"
               ]
             },
             "evidence": {
@@ -13836,6 +13886,29 @@
                 "entry"
               ],
               "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "catalog": {
+                  "const": "node-standard-library:v1"
+                },
+                "entry": {
+                  "enum": [
+                    "fs",
+                    "path"
+                  ]
+                },
+                "kind": {
+                  "const": "standardLibraryCatalog"
+                }
+              },
+              "required": [
+                "kind",
+                "catalog",
+                "entry"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -13851,7 +13924,9 @@
                 "cargo",
                 "rust",
                 "java",
-                "python"
+                "python",
+                "npm",
+                "node"
               ]
             },
             "evidence": {

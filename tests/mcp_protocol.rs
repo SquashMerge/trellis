@@ -11114,6 +11114,109 @@ external = [{ language = "python", package = "json", stdlib = true }]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn javascript_architecture_external_descriptors_validate_in_structured_tool_results() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let (identity, topology) = published_inactive_checkout(
+        temp.path(),
+        &[
+            ("package.json", r#"{"dependencies":{"widget":"^1.2.3"}}"#),
+            (
+                "app.js",
+                "import { send } from 'widget/sub';\nimport 'fs';\nimport 'node:fs/promises';\nimport 'path';\n",
+            ),
+        ],
+    );
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        r#"version = 1
+[external_policy]
+deny = [{ language = "javascript", package = "widget", stdlib = false }]
+[layers.source]
+order = 1
+paths = ["app.js"]
+[layers.standard]
+order = 2
+external = [{ language = "javascript", package = "widget", stdlib = false }]
+"#,
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(163, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 163, None);
+    let mut ask = |id, params| {
+        writeln!(client, "{}", modern(json!(id), "tools/call", params)).unwrap();
+        next_reply(&mut reader)
+    };
+    let refs = ask(
+        1,
+        json!({"name":"trellis_references","arguments":{"schemaVersion":1}}),
+    );
+    tool(&refs, None, true);
+    let refs_env = &refs["result"]["structuredContent"];
+    let descriptor = refs_env["data"]["externalPackages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["identity"]["package"] == "widget")
+        .unwrap();
+    assert_eq!(descriptor["ecosystem"], "npm");
+    assert_eq!(descriptor["evidence"][0]["path"], "package.json");
+    assert_eq!(descriptor["evidence"][0]["importRoot"], "widget");
+    assert_eq!(descriptor["evidence"][0]["versionConstraint"], "^1.2.3");
+    for name in ["fs", "path"] {
+        let item = refs_env["data"]["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["identity"]["package"] == name)
+            .unwrap();
+        assert_eq!(item["ecosystem"], "node");
+        assert_eq!(
+            item["evidence"],
+            json!([{
+                "kind":"standardLibraryCatalog", "catalog":"node-standard-library:v1", "entry":name
+            }])
+        );
+    }
+    let basis = refs_env["evidenceBasis"].clone();
+    let checked = ask(
+        2,
+        json!({"name":"trellis_rules_check","arguments":{
+            "schemaVersion":1,"expectedBasis":basis
+        }}),
+    );
+    tool(&checked, None, true);
+    let checked_env = &checked["result"]["structuredContent"];
+    let instance = checked_env["data"]["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["rule"] == "$external")
+        .unwrap();
+    assert_eq!(instance["destination"], descriptor["identity"]);
+    let explanation = ask(
+        3,
+        json!({"name":"trellis_rules_explain","arguments":{
+            "schemaVersion":1,"expectedBasis":basis,"rule":"$external",
+            "target":instance["target"],"destination":instance["destination"]
+        }}),
+    );
+    tool(&explanation, None, true);
+    validate_structured_content(&[
+        json!({"name":"trellis_references","structuredContent":refs_env}),
+        json!({"name":"trellis_rules_check","structuredContent":checked_env}),
+        json!({"name":"trellis_rules_explain","structuredContent":explanation["result"]["structuredContent"]}),
+    ]);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn architecture_prompt_cancellation_deadline_and_final_root_are_not_tool_results() {
     for legacy in [false, true] {
         for scenario in ["cancel", "deadline", "root"] {

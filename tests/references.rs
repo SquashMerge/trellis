@@ -101,6 +101,30 @@ fn module_paths(data: &Value) -> Vec<&str> {
 }
 
 #[test]
+fn references_javascript_export_star_forwards_to_native_declaration_owner() {
+    let source = "export * from './facade.js';\n";
+    let input = snapshot(&[
+        ("use.js", source),
+        ("facade.js", "export { value } from './provider.js';\n"),
+        ("provider.js", "export function value() {}\n"),
+    ]);
+    let data = references::project(&input, &["use.js".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert!(has_edge(&data, "use.js", "provider.js"), "{data}");
+    assert!(!has_edge(&data, "use.js", "facade.js"), "{data}");
+    let pair = edge(&data, "production", "use.js", "provider.js");
+    assert_eq!(pair["count"], 1);
+    assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+    let site = &pair["sites"][0];
+    assert_eq!(site["range"]["start"], 0);
+    assert_eq!(site["range"]["end"], source.trim_end().len());
+    assert_eq!(site["spelling"], source.trim_end());
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
 fn references_python_direct_root_wildcard_expands_public_declaration_owner() {
     let input = snapshot(&[
         ("use.py", "from provider import *\n"),
@@ -4536,5 +4560,1097 @@ fn references_python_declared_distributions_do_not_prove_import_names() {
         assert!(data["production"].as_array().unwrap().is_empty());
         assert_eq!(data["counts"]["mappedSites"], 0);
         assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+}
+
+fn project_javascript_source(input: &Snapshot, limit: usize) -> Value {
+    references::project(input, &["use.js".into()], limit, &mut || Ok(()))
+        .unwrap()
+        .data
+}
+
+fn assert_javascript_native_modules(input: &Snapshot, data: &Value) {
+    for module in data["modules"].as_array().unwrap() {
+        let document = input
+            .documents
+            .iter()
+            .find(|document| module["identity"]["path"] == document.key.path)
+            .unwrap();
+        let native = document
+            .declarations
+            .iter()
+            .find(|row| row.kind == "module" && row.ancestors.is_empty())
+            .unwrap();
+        assert_eq!(module["identity"]["sid"], native.syntax_id);
+        assert_eq!(
+            module["identity"]["sourceSetId"],
+            document.key.source_set_id
+        );
+        assert_eq!(module["revisionId"], native.revision_id);
+        assert_eq!(module["contentHash"], document.file.hash);
+        assert_eq!(module["provenanceId"], native.provenance_id);
+    }
+}
+
+#[test]
+fn references_javascript_native_declarations_join_inner_ranges_and_export_lists() {
+    let declarations = [
+        ("function", "value", "function value() {}"),
+        ("function", "generator", "function* generator() {}"),
+        ("type", "Thing", "class Thing { #private; method() {} }"),
+        ("variable", "first", "first = 1"),
+        ("variable", "second", "second = 2"),
+        ("variable", "uninitialized", "uninitialized"),
+    ];
+    for (kind, name, inner) in declarations {
+        let provider = match name {
+            "first" | "second" => "export const first = 1, second = 2;".to_owned(),
+            "uninitialized" => "export let uninitialized;".to_owned(),
+            _ => format!("export {inner}"),
+        };
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", &provider),
+        ]);
+        let document = input
+            .documents
+            .iter()
+            .find(|doc| doc.key.path == "provider.js")
+            .unwrap();
+        let row = document
+            .declarations
+            .iter()
+            .find(|row| row.name.as_deref() == Some(name))
+            .unwrap();
+        assert_eq!(row.kind, kind);
+        assert_eq!(&document.file.text[row.range.start..row.range.end], inner);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.js", "provider.js")["count"],
+            1
+        );
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        assert_javascript_native_modules(&input, &data);
+        let mut missing = input;
+        missing
+            .documents
+            .iter_mut()
+            .find(|doc| doc.key.path == "provider.js")
+            .unwrap()
+            .declarations
+            .retain(|row| row.kind == "module");
+        let unknown = project_javascript_source(&missing, 20);
+        assert!(
+            unknown["production"].as_array().unwrap().is_empty(),
+            "{kind}: {unknown}"
+        );
+        assert_eq!(unknown["counts"]["unresolvedSites"], 1);
+    }
+    for provider in [
+        "const original = 1; export { original as visible };",
+        "export { later as visible }; function later() {}",
+    ] {
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.js", "provider.js")["count"],
+            1
+        );
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+}
+
+#[test]
+fn references_javascript_default_and_private_bindings_do_not_leak_through_stars() {
+    for provider in [
+        "export default function Hidden() {}",
+        "function privateLocal() { const inner = 1; } class Private { #secret; method() {} }",
+    ] {
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["mappedSites"], 0);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        assert_eq!(
+            data["unresolved"][0]["site"]["spelling"],
+            "export * from './provider.js';"
+        );
+    }
+    let input = snapshot(&[
+        ("use.js", "export * from './facade.js';"),
+        (
+            "facade.js",
+            "export { default as visible } from './provider.js';",
+        ),
+        ("provider.js", "export default function Original() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.js", "provider.js")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "use.js", "facade.js"));
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    for provider in ["export default function () {}", "export default 1;"] {
+        let input = snapshot(&[
+            ("use.js", "export * from './facade.js';"),
+            (
+                "facade.js",
+                "export { default as visible } from './provider.js';",
+            ),
+            ("provider.js", provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+    let input = snapshot(&[
+        ("use.js", "export * from './facade.js';"),
+        (
+            "facade.js",
+            "export * from './hidden.js'; export * from './visible.js';",
+        ),
+        ("hidden.js", "export default function Hidden() {}"),
+        ("visible.js", "export function visible() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert!(has_edge(&data, "use.js", "visible.js"));
+    assert!(!has_edge(&data, "use.js", "hidden.js"));
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+}
+
+#[test]
+fn references_javascript_aliases_keep_original_identity_and_require_stable_bindings() {
+    for facade in [
+        "export { original as visible } from './origin.js';",
+        "import { original as local } from './origin.js'; export { local as visible };",
+        "import Original from './origin.js'; export { Original as visible };",
+    ] {
+        let mut input = snapshot(&[
+            ("use.js", "export * from './facade.js';"),
+            ("facade.js", facade),
+            (
+                "origin.js",
+                "export default function original() {} export { original };",
+            ),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(edge(&data, "production", "use.js", "origin.js")["count"], 1);
+        assert!(!has_edge(&data, "use.js", "facade.js"));
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        if facade.contains("as local") {
+            let document = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "facade.js")
+                .unwrap();
+            assert!(
+                document
+                    .declarations
+                    .iter()
+                    .any(|row| row.kind == "alias" && row.name.as_deref() == Some("local"))
+            );
+        }
+        input
+            .documents
+            .iter_mut()
+            .find(|doc| doc.key.path == "origin.js")
+            .unwrap()
+            .declarations
+            .retain(|row| row.name.as_deref() != Some("original"));
+        let missing = project_javascript_source(&input, 20);
+        assert!(
+            missing["production"].as_array().unwrap().is_empty(),
+            "{facade}: {missing}"
+        );
+        assert_eq!(missing["counts"]["unresolvedSites"], 1);
+    }
+    for (provider, resolves) in [
+        (
+            "function original() {} const alias = original; export { alias };",
+            true,
+        ),
+        (
+            "function original() {} const alias = original; function inner() { let alias = 0; alias = 1; } export { alias };",
+            true,
+        ),
+        (
+            "const alias = original; function original() {} export { alias };",
+            false,
+        ),
+        (
+            "function original() {} let alias = original; alias = replacement; export { alias };",
+            false,
+        ),
+        ("const alias = object.member; export { alias };", false),
+        ("const { alias } = object; export { alias };", false),
+    ] {
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "use.js", "provider.js"),
+            resolves,
+            "{provider}: {data}"
+        );
+        assert_eq!(data["counts"]["mappedSites"], usize::from(resolves));
+        assert_eq!(data["counts"]["unresolvedSites"], usize::from(!resolves));
+    }
+    let mut input = snapshot(&[
+        ("use.js", "export * from './provider.js';"),
+        (
+            "provider.js",
+            r"function \u006friginal() {} const alias = original; export { alias as visible };",
+        ),
+    ]);
+    let provider = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "provider.js")
+        .unwrap();
+    let original = provider
+        .declarations
+        .iter()
+        .find(|row| row.kind == "function")
+        .unwrap();
+    assert_eq!(
+        &provider.file.text[original.range.start..original.range.end],
+        r"function \u006friginal() {}"
+    );
+    let data = project_javascript_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.js", "provider.js")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    input
+        .documents
+        .iter_mut()
+        .find(|doc| doc.key.path == "provider.js")
+        .unwrap()
+        .declarations
+        .retain(|row| row.kind != "function");
+    let missing = project_javascript_source(&input, 20);
+    assert!(
+        missing["production"].as_array().unwrap().is_empty(),
+        "{missing}"
+    );
+    assert_eq!(missing["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_javascript_explicit_exports_shadow_but_unexported_locals_do_not() {
+    for (prefix, shadows) in [
+        ("export function same() {}", true),
+        ("function same() {} export { same };", true),
+        ("function same() {}", false),
+        ("const same = 1;", false),
+    ] {
+        for source in [
+            format!("{prefix}\nexport * from './provider.js';"),
+            format!("export * from './provider.js';\n{prefix}"),
+        ] {
+            let input = snapshot(&[
+                ("use.js", &source),
+                ("provider.js", "export function same() {}"),
+            ]);
+            let data = project_javascript_source(&input, 20);
+            assert_eq!(
+                has_edge(&data, "use.js", "provider.js"),
+                !shadows,
+                "{source}: {data}"
+            );
+            assert_eq!(data["counts"]["mappedSites"], usize::from(!shadows));
+        }
+    }
+    let input = snapshot(&[
+        ("use.js", "export * from './facade.js';"),
+        (
+            "facade.js",
+            "const same = object.member; export { same }; export * from './provider.js';",
+        ),
+        (
+            "provider.js",
+            "export function same() {} export function good() {}",
+        ),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.js", "provider.js")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "use.js", "facade.js"));
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_javascript_star_collisions_compare_declaration_identity_not_owner_file() {
+    for right in [
+        "export { first as same } from './origin.js';",
+        "export { second as same } from './origin.js';",
+    ] {
+        for source in [
+            "export * from './left.js'; export * from './right.js';",
+            "export * from './right.js'; export * from './left.js';",
+        ] {
+            let input = snapshot(&[
+                ("use.js", source),
+                ("left.js", "export { first as same } from './origin.js';"),
+                ("right.js", right),
+                (
+                    "origin.js",
+                    "export function first() {} export function second() {}",
+                ),
+            ]);
+            let rows: Vec<_> = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == "origin.js")
+                .unwrap()
+                .declarations
+                .iter()
+                .filter(|row| row.kind == "function")
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_ne!(rows[0].syntax_id, rows[1].syntax_id);
+            let same = right.contains("first");
+            let data = project_javascript_source(&input, 20);
+            assert_eq!(
+                has_edge(&data, "use.js", "origin.js"),
+                same,
+                "{right}: {data}"
+            );
+            assert_eq!(data["counts"]["mappedSites"], if same { 2 } else { 0 });
+            assert_eq!(data["counts"]["unresolvedSites"], if same { 0 } else { 2 });
+            if same {
+                assert_eq!(edge(&data, "production", "use.js", "origin.js")["count"], 2);
+            }
+        }
+    }
+    for source in [
+        "export * from './left.js'; export * from './right.js';",
+        "export * from './right.js'; export * from './left.js';",
+    ] {
+        let input = snapshot(&[
+            ("use.js", source),
+            (
+                "left.js",
+                "export function same() {} export function good() {}",
+            ),
+            ("right.js", "export function same() {}"),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(edge(&data, "production", "use.js", "left.js")["count"], 1);
+        assert!(!has_edge(&data, "use.js", "right.js"));
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 2);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn references_javascript_missing_and_duplicate_native_rows_leave_partial_unknowns() {
+    for duplicate in [false, true] {
+        let mut input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            (
+                "provider.js",
+                "export function good() {} export function uncertain() {}",
+            ),
+        ]);
+        let provider = input
+            .documents
+            .iter_mut()
+            .find(|doc| doc.key.path == "provider.js")
+            .unwrap();
+        let row = provider
+            .declarations
+            .iter()
+            .find(|row| row.name.as_deref() == Some("uncertain"))
+            .unwrap()
+            .clone();
+        if duplicate {
+            provider.declarations.push(row);
+        } else {
+            provider
+                .declarations
+                .retain(|row| row.name.as_deref() != Some("uncertain"));
+        }
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.js", "provider.js")["count"],
+            1
+        );
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        assert_eq!(data["unresolved"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn references_javascript_source_filter_preserves_module_competitors_and_source_sets() {
+    for competitor in ["provider.mjs", "provider.cjs", "provider/index.js"] {
+        let input = snapshot(&[
+            ("use.js", "export * from './provider';"),
+            ("provider.js", "export function original() {}"),
+            (competitor, "export function competitor() {}"),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert!(
+            data["production"].as_array().unwrap().is_empty(),
+            "{competitor}: {data}"
+        );
+        assert_eq!(data["counts"]["scannedDocuments"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+    let input = snapshot(&[
+        ("use.js", "export * from './provider.js';"),
+        ("provider.js", "export function original() {}"),
+        ("provider.mjs", "export function competitor() {}"),
+        ("provider.cjs", "export function competitor() {}"),
+        ("provider/index.js", "export function competitor() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.js", "provider.js")["count"],
+        1
+    );
+    assert_eq!(data["counts"]["unresolvedSites"], 0);
+    for specifier in ["./missing.js", "../provider.js", ".not-relative"] {
+        let source = format!("export * from '{specifier}';");
+        let input = snapshot(&[
+            ("use.js", &source),
+            ("provider.js", "export function original() {}"),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert!(
+            data["production"].as_array().unwrap().is_empty(),
+            "{specifier}: {data}"
+        );
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+    }
+    let mut input = snapshot(&[("use.js", "export * from './provider.js';")]);
+    let separate = snapshot(&[("provider.js", "export function original() {}")]);
+    assert_ne!(
+        input.documents[0].key.source_set_id,
+        separate.documents[0].key.source_set_id
+    );
+    input.documents.extend(separate.documents);
+    let data = project_javascript_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_javascript_forwarding_counts_initial_edge_and_detects_short_cycles() {
+    for (m2, m4, extra, resolves) in [
+        (
+            "export { forwarded } from './m3.js';",
+            "export function forwarded() {}",
+            None,
+            true,
+        ),
+        (
+            "export { forwarded } from './m3.js';",
+            "export { forwarded } from './m5.js';",
+            Some(("m5.js", "export function forwarded() {}")),
+            false,
+        ),
+        ("export { forwarded } from './m1.js';", "", None, false),
+    ] {
+        let mut files = vec![
+            ("use.js", "export * from './m1.js';"),
+            (
+                "m1.js",
+                "export function good() {} export { forwarded } from './m2.js';",
+            ),
+            ("m2.js", m2),
+            ("m3.js", "export { forwarded } from './m4.js';"),
+            ("m4.js", m4),
+        ];
+        if let Some(extra) = extra {
+            files.push(extra);
+        }
+        let input = snapshot(&files);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(edge(&data, "production", "use.js", "m1.js")["count"], 1);
+        assert_eq!(has_edge(&data, "use.js", "m4.js"), resolves, "{data}");
+        for intermediate in ["m2.js", "m3.js", "m5.js"] {
+            assert!(!has_edge(&data, "use.js", intermediate));
+        }
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], usize::from(!resolves));
+    }
+}
+
+#[test]
+fn references_javascript_followed_hazards_do_not_poison_unrelated_modules() {
+    for hazard in [
+        "module.exports = object;",
+        "exports[name] = object;",
+        "Object.assign(exports, object);",
+    ] {
+        let provider = format!("export function good() {{}} {hazard}");
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", &provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert!(
+            data["production"].as_array().unwrap().is_empty(),
+            "{hazard}: {data}"
+        );
+        assert_eq!(data["counts"]["unresolvedSites"], 1);
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", "export function good() {}"),
+            ("unrelated.js", &provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.js", "provider.js")["count"],
+            1
+        );
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        assert!(!module_paths(&data).contains(&"unrelated.js"));
+    }
+    let input = snapshot(&[
+        ("use.js", "export * from './facade.js';"),
+        (
+            "facade.js",
+            "export * as ns from './other.js'; export * from './provider.js';",
+        ),
+        (
+            "provider.js",
+            "export function ns() {} export function good() {}",
+        ),
+        ("other.js", "export function member() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert_eq!(
+        edge(&data, "production", "use.js", "provider.js")["count"],
+        1
+    );
+    assert!(!has_edge(&data, "use.js", "other.js"));
+    assert!(!has_edge(&data, "use.js", "facade.js"));
+    assert_eq!(data["counts"]["mappedSites"], 1);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+    let input = snapshot(&[
+        (
+            "use.js",
+            "// export * from './decoy.js';\nconst text = \"export * from './decoy.js';\";\nrequire('./decoy.js'); import('./decoy.js');",
+        ),
+        ("decoy.js", "export function hidden() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["unresolvedSites"], 2);
+    let spellings: Vec<_> = data["unresolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["site"]["spelling"].as_str().unwrap())
+        .collect();
+    assert!(
+        spellings
+            .iter()
+            .any(|spelling| spelling.starts_with("require("))
+    );
+    assert!(
+        spellings
+            .iter()
+            .any(|spelling| spelling.starts_with("import("))
+    );
+}
+
+#[test]
+fn references_javascript_explicit_module_sites_survive_missing_members() {
+    let input = snapshot(&[
+        (
+            "use.js",
+            "import { missing as alias } from './provider.js'; export { missing as named } from './provider.js'; export * from './facade.js';",
+        ),
+        (
+            "facade.js",
+            "import { missing as alias } from './provider.js'; export { alias };",
+        ),
+        ("provider.js", "export function other() {}"),
+    ]);
+    let data = project_javascript_source(&input, 20);
+    let pair = edge(&data, "production", "use.js", "provider.js");
+    assert_eq!(pair["count"], 2);
+    assert!(
+        pair["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|site| site["spelling"] == "'./provider.js'")
+    );
+    assert!(!has_edge(&data, "use.js", "facade.js"));
+    assert_eq!(data["counts"]["mappedSites"], 2);
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+#[test]
+fn references_javascript_fanout_clipping_preserves_native_proof_roles_and_order() {
+    let source = "export * from './facade.js';\nexport * from './facade.js';\n";
+    let mut input = snapshot(&[
+        ("use.js", source),
+        ("tests/use.js", "export * from '../facade.js';"),
+        (
+            "facade.js",
+            "export { a } from './left.js'; export { b } from './right.js';",
+        ),
+        ("left.js", "export function a() {}"),
+        ("right.js", "export function b() {}"),
+        ("unrelated.js", "export * from './missing.js';"),
+    ]);
+    let paths = ["use.js".into(), "tests/use.js".into()];
+    let complete = references::project(&input, &paths, 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    let clipped = references::project(&input, &paths, 1, &mut || Ok(()))
+        .unwrap()
+        .data;
+    for data in [&complete, &clipped] {
+        assert_eq!(data["counts"]["scannedDocuments"], 2);
+        assert_eq!(data["counts"]["mappedSites"], 3);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+        assert_eq!(data["production"].as_array().unwrap().len(), 2);
+        assert_eq!(data["tests"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            module_paths(data),
+            ["facade.js", "left.js", "right.js", "tests/use.js", "use.js"]
+        );
+        assert_javascript_native_modules(&input, data);
+        for (section, role, path, count) in [
+            ("production", "production", "use.js", 2),
+            ("tests", "test", "tests/use.js", 1),
+        ] {
+            let document = input
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == path)
+                .unwrap();
+            let owner = document
+                .declarations
+                .iter()
+                .find(|row| row.kind == "module" && row.ancestors.is_empty())
+                .unwrap();
+            assert_eq!(serde_json::to_value(owner.role).unwrap(), role);
+            for target in ["left.js", "right.js"] {
+                let pair = edge(data, section, path, target);
+                assert_eq!(pair["count"], count);
+                for site in pair["sites"].as_array().unwrap() {
+                    let start = site["range"]["start"].as_u64().unwrap() as usize;
+                    let end = site["range"]["end"].as_u64().unwrap() as usize;
+                    assert_eq!(
+                        &document.file.text[start..end],
+                        site["spelling"].as_str().unwrap()
+                    );
+                    assert_eq!(site["ownerSyntaxId"], owner.syntax_id);
+                    assert_eq!(site["role"], role);
+                    assert_eq!(site["relationKind"], "import");
+                    assert!(site["callId"].is_null());
+                    assert_eq!(
+                        site["lines"]["start"],
+                        document.file.text[..start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(complete["modules"], clipped["modules"]);
+    for target in ["left.js", "right.js"] {
+        let pair = edge(&clipped, "production", "use.js", target);
+        assert_eq!(pair["omittedSites"], 1);
+        assert_eq!(pair["sites"].as_array().unwrap().len(), 1);
+        assert_eq!(pair["sites"][0]["range"]["start"], 0);
+        assert_eq!(
+            pair["sites"][0]["range"]["end"],
+            source.lines().next().unwrap().len()
+        );
+    }
+    input.documents.reverse();
+    for document in &mut input.documents {
+        document.declarations.reverse();
+    }
+    assert_eq!(
+        references::project(&input, &paths, 1, &mut || Ok(()))
+            .unwrap()
+            .data,
+        clipped
+    );
+}
+
+#[test]
+fn references_javascript_test_only_export_is_not_unconditional_production_proof() {
+    let input = snapshot(&[
+        ("use.js", "export * from './tests/provider.js';"),
+        ("tests/provider.js", "export function testOnly() {}"),
+    ]);
+    let native = input
+        .documents
+        .iter()
+        .find(|doc| doc.key.path == "tests/provider.js")
+        .unwrap()
+        .declarations
+        .iter()
+        .find(|row| row.name.as_deref() == Some("testOnly"))
+        .unwrap();
+    assert_eq!(serde_json::to_value(native.role).unwrap(), "test");
+    let data = project_javascript_source(&input, 20);
+    assert!(data["production"].as_array().unwrap().is_empty(), "{data}");
+    assert_eq!(data["counts"]["unresolvedSites"], 1);
+}
+
+fn snapshot_javascript_manifest(files: &[(&str, &str)], manifest: &str) -> Snapshot {
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in files
+        .iter()
+        .copied()
+        .chain(std::iter::once(("package.json", manifest)))
+    {
+        let path = root.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
+        &IndexOptions::new(root.path().to_owned()),
+        &identity.record_id,
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let manifest_path = std::fs::canonicalize(root.path())
+        .unwrap()
+        .join("package.json");
+    let bytes = capture.bytes(&manifest_path).unwrap().to_vec();
+    assert_eq!(bytes, manifest.as_bytes());
+    let manifest = references::external::ManifestInput {
+        source_set_id: native.revision.source_set_id.clone(),
+        native_revision_id: native.revision.id.clone(),
+        dependency_hash: native.revision.dependency_hash.clone(),
+        path: "package.json".into(),
+        content_hash: Some(hex::encode(Sha256::digest(&bytes))),
+        bytes: Some(bytes),
+    };
+    let documents = graph
+        .files
+        .into_iter()
+        .map(|file| {
+            let key = native
+                .revision
+                .documents
+                .iter()
+                .find(|doc| doc.key.path == file.path)
+                .unwrap()
+                .key
+                .clone();
+            DocumentInput {
+                declarations: native
+                    .declarations
+                    .iter()
+                    .filter(|row| row.document == key)
+                    .cloned()
+                    .collect(),
+                calls: native
+                    .calls
+                    .iter()
+                    .filter(|row| row.document == key)
+                    .cloned()
+                    .collect(),
+                key,
+                file,
+            }
+        })
+        .collect();
+    Snapshot {
+        pin: IndexPin {
+            index_generation: uuid::Uuid::new_v4(),
+            index_revision: 7,
+        },
+        documents,
+        manifests: vec![manifest],
+    }
+}
+
+#[test]
+fn references_javascript_external_stars_veto_native_names_in_both_orders_but_explicit_settles() {
+    for (specifier, package, stdlib) in [
+        ("fixture-package", Some("fixture-package"), false),
+        ("node:fs", Some("fs"), true),
+        ("unknown-package", None, false),
+    ] {
+        for external_first in [false, true] {
+            let local = "export * from './provider.js';";
+            let external = format!("export * from '{specifier}';");
+            let source = if external_first {
+                format!("{external}\n{local}")
+            } else {
+                format!("{local}\n{external}")
+            };
+            let settled = format!("{source}\nexport {{ value }} from './provider.js';");
+            let input = snapshot_javascript_manifest(
+                &[
+                    ("use.js", &source),
+                    ("probe.js", "export * from './settled.js';"),
+                    ("settled.js", &settled),
+                    ("provider.js", "export function value() {}"),
+                ],
+                r#"{"dependencies":{"fixture-package":"^1.2.3"}}"#,
+            );
+            let paths = ["use.js".into(), "probe.js".into()];
+            let data = references::project(&input, &paths, 20, &mut || Ok(()))
+                .unwrap()
+                .data;
+            assert!(
+                !has_edge(&data, "use.js", "provider.js"),
+                "{source}: {data}"
+            );
+            assert_eq!(
+                edge(&data, "production", "probe.js", "provider.js")["count"],
+                1
+            );
+            assert!(!has_edge(&data, "probe.js", "settled.js"));
+            assert_eq!(
+                data["counts"]["mappedSites"],
+                1 + usize::from(package.is_some())
+            );
+            assert_eq!(data["counts"]["unresolvedSites"], 3);
+            assert_eq!(
+                data["unresolved"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["source"]["path"] == "use.js")
+                    .count(),
+                2
+            );
+            let packages = data["externalPackages"].as_array().unwrap();
+            assert_eq!(packages.len(), usize::from(package.is_some()));
+            if let Some(package) = package {
+                let pairs: Vec<_> = data["production"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|pair| pair["target"]["kind"] == "externalPackage")
+                    .collect();
+                assert_eq!(pairs.len(), 1);
+                let pair = pairs[0];
+                assert_eq!(pair["source"]["path"], "use.js");
+                assert_eq!(pair["target"]["package"], package);
+                assert_eq!(pair["target"]["standardLibrary"], stdlib);
+                assert!(pair["target"].get("sid").is_none());
+                assert!(pair["target"].get("path").is_none());
+                assert_eq!(pair["count"], 1);
+                assert_eq!(pair["sites"][0]["spelling"], external);
+                assert_eq!(packages[0]["identity"], pair["target"]);
+                if !stdlib {
+                    let retained = &input.manifests[0];
+                    let evidence = &packages[0]["evidence"][0];
+                    assert_eq!(evidence["nativeRevisionId"], retained.native_revision_id);
+                    assert_eq!(evidence["dependencyHash"], retained.dependency_hash);
+                    assert_eq!(
+                        evidence["contentHash"],
+                        retained.content_hash.as_deref().unwrap()
+                    );
+                    assert_eq!(evidence["path"], retained.path);
+                }
+            }
+            assert!(!module_paths(&data).contains(&"package.json"));
+            assert_javascript_native_modules(&input, &data);
+        }
+    }
+}
+
+#[test]
+fn references_javascript_normal_checkout_selected_and_all_sources_share_unchanged_budget() {
+    let statements = (0..110)
+        .map(|index| format!("    value += {index};\n"))
+        .collect::<String>();
+    let body = format!(
+        "function ordinary_work() {{\n    let value = 0;\n{statements}    return value;\n}}\n"
+    );
+    let mut files = vec![
+        (
+            "provider.js".to_owned(),
+            format!("export function f() {{}}\n{body}"),
+        ),
+        (
+            "facade.js".to_owned(),
+            format!("export {{ f }} from './provider.js';\n{body}"),
+        ),
+        (
+            "bridge.js".to_owned(),
+            format!("export * from './facade.js';\n{body}"),
+        ),
+    ];
+    for index in 0..497 {
+        files.push((format!("consumer_{index:03}.js"), format!("import './provider.js';\nexport {{ f as alias }} from './facade.js';\nexport * from './bridge.js';\n{body}")));
+    }
+    assert_eq!(files.len(), 500);
+    assert!(
+        files
+            .iter()
+            .all(|(_, text)| (100..=200).contains(&text.lines().count()))
+    );
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let input = snapshot(&borrowed);
+    assert_eq!(input.documents.len(), 500);
+    let selected = references::project(&input, &["consumer_000.js".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(selected["counts"]["scannedDocuments"], 1);
+    assert_eq!(selected["counts"]["mappedSites"], 3);
+    assert_eq!(selected["counts"]["unresolvedSites"], 0);
+    assert_eq!(selected["production"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        edge(&selected, "production", "consumer_000.js", "provider.js")["count"],
+        2
+    );
+    assert_eq!(
+        edge(&selected, "production", "consumer_000.js", "facade.js")["count"],
+        1
+    );
+    assert!(!has_edge(&selected, "consumer_000.js", "bridge.js"));
+    assert_eq!(
+        module_paths(&selected),
+        ["bridge.js", "consumer_000.js", "facade.js", "provider.js"]
+    );
+    assert_javascript_native_modules(&input, &selected);
+    let complete = references::project(&input, &["**".into()], 20, &mut || Ok(()))
+        .unwrap()
+        .data;
+    assert_eq!(complete["counts"]["scannedDocuments"], 500);
+    assert_eq!(complete["counts"]["mappedSites"], 1493);
+    assert_eq!(complete["counts"]["unresolvedSites"], 0);
+    assert_eq!(complete["production"].as_array().unwrap().len(), 996);
+    assert_eq!(module_paths(&complete).len(), 500);
+    for index in 0..497 {
+        let source = format!("consumer_{index:03}.js");
+        assert_eq!(
+            edge(&complete, "production", &source, "provider.js")["count"],
+            2
+        );
+        assert_eq!(
+            edge(&complete, "production", &source, "facade.js")["count"],
+            1
+        );
+        assert!(!has_edge(&complete, &source, "bridge.js"));
+    }
+    assert_eq!(
+        edge(&complete, "production", "facade.js", "provider.js")["count"],
+        1
+    );
+    assert_eq!(
+        edge(&complete, "production", "bridge.js", "provider.js")["count"],
+        1
+    );
+    for data in [&selected, &complete] {
+        assert!(data["tests"].as_array().unwrap().is_empty());
+        assert!(data["externalPackages"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn references_javascript_module_and_exports_spellings_are_lexical_not_commonjs_hazards() {
+    for name in ["module", "exports"] {
+        for facade in [
+            format!(
+                "import {{ original as {name} }} from './origin.js'; export {{ {name} as visible }};"
+            ),
+            format!("export {{ original as {name} }} from './origin.js';"),
+        ] {
+            let input = snapshot(&[
+                ("use.js", "export * from './facade.js';"),
+                ("facade.js", &facade),
+                ("origin.js", "export function original() {}"),
+            ]);
+            let data = project_javascript_source(&input, 20);
+            assert_eq!(
+                edge(&data, "production", "use.js", "origin.js")["count"],
+                1,
+                "{facade}: {data}"
+            );
+            assert!(!has_edge(&data, "use.js", "facade.js"));
+            assert_eq!(data["counts"]["mappedSites"], 1);
+            assert_eq!(data["counts"]["unresolvedSites"], 0);
+            assert_javascript_native_modules(&input, &data);
+        }
+        let provider = format!("const {name} = 1; export {{ {name} as visible }};");
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", &provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(
+            edge(&data, "production", "use.js", "provider.js")["count"],
+            1,
+            "{provider}: {data}"
+        );
+        assert_eq!(data["counts"]["mappedSites"], 1);
+        assert_eq!(data["counts"]["unresolvedSites"], 0);
+    }
+}
+
+#[test]
+fn references_javascript_unstable_writes_invalidate_only_the_owned_alias() {
+    let mut cases = Vec::new();
+    for operator in ["of", "in"] {
+        for (target, resolves) in [("alias", false), ("let alias", true)] {
+            cases.push((
+                format!("for ({target} {operator} replacements) {{}}"),
+                resolves,
+            ));
+        }
+    }
+    cases.extend([
+        ("const text = `${alias = replacement}`;".into(), false),
+        ("const text = `alias = replacement`;".into(), true),
+    ]);
+    for (write, resolves) in cases {
+        let provider =
+            format!("function original() {{}} let alias = original; {write} export {{ alias }};");
+        let input = snapshot(&[
+            ("use.js", "export * from './provider.js';"),
+            ("provider.js", &provider),
+        ]);
+        let data = project_javascript_source(&input, 20);
+        assert_eq!(
+            has_edge(&data, "use.js", "provider.js"),
+            resolves,
+            "{provider}: {data}"
+        );
+        assert_eq!(data["counts"]["mappedSites"], usize::from(resolves));
+        assert_eq!(data["counts"]["unresolvedSites"], usize::from(!resolves));
+        assert_eq!(
+            data["production"].as_array().unwrap().len(),
+            usize::from(resolves)
+        );
+        assert_eq!(
+            data["unresolved"].as_array().unwrap().len(),
+            usize::from(!resolves)
+        );
     }
 }

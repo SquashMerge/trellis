@@ -188,9 +188,19 @@ Supported mapping is deliberately narrow:
   Captured Cargo declarations and reviewed `std/core/alloc` roots prove package
   targets, never semantic calls. Custom roots/`#[path]`, macro/cfg uncertainty,
   ambiguous ownership and depth beyond four remain unknown.
-- **JavaScript:** static relative imports/reexports/side-effect imports; unique
-  explicit indexed extension or `.js`/`.mjs`/`.cjs` and `index.js` convention.
-  Bare, dynamic and ambiguous imports remain unresolved.
+- **JavaScript:** static relative imports/reexports/side-effect imports use a
+  unique explicit indexed extension or `.js`/`.mjs`/`.cjs` and `index.js`
+  convention. `export * from` forwards proved named exports, never `default`.
+  Explicit exported names shadow star names; distinct surviving declarations
+  collide, while routes to the same native declaration deduplicate. Proved
+  direct/list/named exports and simple aliases retain final native owners through
+  at most four edges. Cycles, unsupported namespace/CommonJS/dynamic exports,
+  unproved bindings and over-depth forwarding retain unknowns. External stars
+  may label a package but provide no names and leave residual uncertainty;
+  an explicit proved export settles only its matching name. Supported static
+  literals use the resolver's documented decoding subset, not runtime execution.
+  Bare imports can label captured npm dependencies or the exact reviewed Node
+  catalog below. Relative misses never fall back to builtin or npm labels.
 - **Python:** captured checkout-root `m.py` or `m/__init__.py` layouts require
   unique module ownership and proved `__init__.py` package prefixes. Relative
   imports follow captured package membership; absolute imports use only that
@@ -367,7 +377,7 @@ is invented for a package. A config descriptor is exactly
  counts:{scannedDocuments:UInt,mappedSites:UInt,unresolvedSites:UInt},
  limitations:string[]}
 Module = {identity:Target,revisionId,contentHash,provenanceId}
-ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust"|"java"|"python",evidence:PackageEvidence[]}
+ExternalPackage = {identity:ExternalIdentity,ecosystem:"cargo"|"rust"|"java"|"python"|"npm"|"node",evidence:PackageEvidence[]}
 ExternalIdentity = {kind:"externalPackage",sourceSetId,language,package,standardLibrary:boolean}
 PackageEvidence = ManifestEvidence | CatalogEvidence
 ManifestEvidence = {kind:"manifest",sourceSetId,nativeRevisionId,dependencyHash,
@@ -378,6 +388,8 @@ CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:
                    entry:"java"|"javax"}
                 | {kind:"standardLibraryCatalog",catalog:"python-standard-library:v2",
                    entry:<one of the pinned CPython v3.12.0 stdlib roots>}
+                | {kind:"standardLibraryCatalog",catalog:"node-standard-library:v1",
+                   entry:"fs"|"path"}
 Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
         omittedSites:UInt,mapping:"structural"}
 Unresolved = {source:Target,site:Site,reason:string}
@@ -415,7 +427,7 @@ detected installed runtime. No precise source range is invented. Package evidenc
 is capture/catalog evidence, not native measured syntax provenance; actual source
 sites and native intermediate-module proof remain separate.
 
-Captured root Cargo bytes come from the selected revision's retained dependencies
+Captured root Cargo and package.json bytes come from the selected revision's retained dependencies
 through the same admitted read and transaction as source. There are no live
 manifest reads, Cargo invocations, installed-library reads or parallel caches.
 Malformed repository manifests stay unproved, not empty dependencies. Malformed
@@ -438,10 +450,43 @@ not member/API inventories. Java's `java`/`javax` labels share this external
 identity shape; the javax package gate does not change that identity. Non-JDK javax
 packages require independent captured mapping evidence or remain unknown; no
 third-party Maven/Gradle prefix mapping is inferred. Python
-third-party distribution mappings and JavaScript package adapters are later work.
+third-party distribution mappings remain unsupported.
 Maven groups and Python distribution names alone do not prove import prefixes.
 No Python third-party mapping table, installed-distribution lookup or additional
 mapping-metadata capture is part of this slice.
+
+
+JavaScript uses `ecosystem:"npm"` only for supported declarations in the captured
+root `package.json`: `dependencies`, `devDependencies`, `optionalDependencies`
+and `peerDependencies`. Constraints are literal decimal `M.m.p`, `^M.m.p` or
+`~M.m.p`, without leading-zero components, whitespace, suffixes or compound ranges.
+The original constraint is evidence, not an installed or resolved version.
+Identical keys across sections merge their evidence; unsupported competing values
+block that root. Duplicate relevant sections/keys or malformed JSON make manifest
+proof unknown, never last-wins. Aliases/protocols, workspace/link/file/Git/URL
+values, non-string constraints and unproved declarations cannot supply npm targets.
+A root `workspaces` field blocks npm inference; the root package's own `name`
+never proves a dependency/self-reference. Nested/workspace manifests, import maps,
+package exports and installed node_modules are not discovered or resolved.
+
+`pkg/sub/path` proves only declared key `pkg`; `@scope/pkg/sub` proves only
+`@scope/pkg`. Empty/traversal/query/hash/backslash/scheme forms stay unknown.
+No subpath/export/member existence is asserted. Dependency section names never
+change native source-site production/test roles. JavaScript constructor work is
+request-local, once when selected JS sources need it, charged to the existing
+work budget with cancellation. There is no new capture/table/cache/live read.
+
+Node uses `ecosystem:"node"` and `node-standard-library:v1`, exactly
+`fs`, `node:fs`, `fs/promises`, `node:fs/promises` → `fs`, and
+`path`, `node:path` → `path`. These labels take precedence over npm declarations.
+All other `node:` forms remain unknown. The separately reviewed 56 pinned bare
+builtin roots block npm labels, including their subpaths, without adding catalog
+labels. This intentionally leaves false negatives such as `http/fake` and
+`path/posix`; it is not Node execution semantics. Bare `test`/`sea` are not
+reserved (their builtins require `node:`). The
+[Node catalog record](node-standard-library-catalog.md) gives the fixed source
+pin, exact spellings, root exclusion inventory and provenance. No host runtime,
+`module.builtinModules`, compiler or package-manager command is consulted.
 
 The Rust name inventory does not register foreign function-signature bindings or
 expand procedural derives. Names introduced by those forms are not a complete
