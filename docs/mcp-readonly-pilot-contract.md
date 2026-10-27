@@ -263,6 +263,22 @@ equals the outer `evidenceBasis`; there is no second head sample. The preceding
 outgoing calls and incoming calls, not these new structural DTOs. The new DTOs
 instead carry explicit native document-key/revision/hash/provenance links; these
 identify the captured syntax and never prove the derived target mapping.
+JavaScript output adds `npm`/`node` ecosystems within the existing closed v2
+architecture payloads. npm descriptors use captured root package.json evidence;
+Node descriptors use exactly `{kind:"standardLibraryCatalog",
+catalog:"node-standard-library:v1",entry:"fs"|"path"}`. The
+[Node source catalog](node-standard-library-catalog.md) pins the six accepted
+specifier spellings and 56-root conservative npm exclusion. Other `node:` forms
+stay unknown. Subpath labels do not prove members or export maps. Supported root
+dependency sections/constraints, duplicate handling, workspace/self-reference
+unknowns and intentional false negatives are specified in [rules.md](rules.md).
+All retained manifest bytes come from the same selected admitted read as source;
+no live filesystem, runtime inventory or installed package lookup is added.
+JavaScript named/star export proofs use real final-owner native identities under
+the shared four-edge limit; star collisions and external-name uncertainty retain
+unknowns. These changes add no tools or protocol versions and do not alter search
+or the seven non-architecture tool objects.
+
 External descriptors instead carry identity, ecosystem and nonempty captured
 manifest or reviewed standard-library catalog evidence, with the exact closed
 shapes in rules.md. Java's `java-standard-library:v2` catalog pairs only with

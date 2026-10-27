@@ -9,6 +9,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 pub mod external;
 mod java;
+mod javascript;
 mod python;
 mod rust;
 
@@ -202,6 +203,24 @@ pub fn project(
         &mut rust.work,
         check,
     )?;
+    let javascript = if selected
+        .iter()
+        .any(|&i| docs[i].key.language == "javascript")
+    {
+        let packages =
+            external::JavascriptPackages::new(&snapshot.manifests, &mut rust.work, check)?;
+        Some(javascript::Catalog::new(
+            &docs,
+            &trees,
+            &document_map,
+            &selected,
+            &packages,
+            &mut rust.work,
+            check,
+        )?)
+    } else {
+        None
+    };
     let mut external_packages = BTreeMap::new();
     let mut edges: BTreeMap<(usize, Target, bool), (usize, Vec<Site>)> = BTreeMap::new();
     let mut emitted_modules = BTreeSet::new();
@@ -279,14 +298,13 @@ pub fn project(
                 java.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
             } else if doc.key.language == "python" {
                 python.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
+            } else if doc.key.language == "javascript" {
+                javascript
+                    .as_ref()
+                    .expect("selected JavaScript catalog")
+                    .resolve(source, &item, &mut external_packages, &mut rust.work, check)?
             } else {
-                match map_target(doc, &item, &document_map) {
-                    Ok(target) => SiteResolution {
-                        targets: BTreeSet::from([Target::Native(target)]),
-                        ..SiteResolution::default()
-                    },
-                    Err(reason) => SiteResolution::unknown(reason),
-                }
+                SiteResolution::unknown("module_mapping_unavailable")
             };
             if !resolution.targets.is_empty() {
                 mapped += 1;
@@ -338,7 +356,7 @@ pub fn project(
             "limitations":[
                 "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
                 "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
-                "JavaScript maps static relative imports/reexports using explicit files or .js/.mjs/.cjs/index.js; dynamic and bare imports remain unresolved.",
+                "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
                 "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
                 "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability."
             ]
@@ -558,75 +576,10 @@ fn extract(
     if doc.key.language == "python" {
         return python::extract(doc, tree, work, check);
     }
-    let mut result = Vec::new();
-    walk(tree.root_node(), check, &mut |node, _check| {
-        ensure!(result.len() < SITES, "bounded_work: reference site count");
-        match doc.key.language.as_str() {
-            "rust" => unreachable!("Rust has a lexical extractor"),
-            "javascript" => {
-                if matches!(node.kind(), "import_statement" | "export_statement")
-                    && let Some(source) = node.child_by_field_name("source")
-                {
-                    let value = text(doc, source);
-                    let specifier = value.get(1..value.len().saturating_sub(1)).unwrap_or("");
-                    let destination = if specifier.contains('\\') {
-                        Err("import_escape_unsupported")
-                    } else if specifier.starts_with('.') {
-                        Ok(vec![specifier.into()])
-                    } else {
-                        Err("absolute_or_bare_import")
-                    };
-                    result.push(raw(doc, source, "import", destination));
-                    return Ok(true);
-                }
-                if node.kind() == "call_expression"
-                    && node
-                        .child_by_field_name("function")
-                        .is_some_and(|n| matches!(text(doc, n), "import" | "require"))
-                {
-                    result.push(raw(doc, node, "import", Err("dynamic_import_unsupported")));
-                    return Ok(true);
-                }
-            }
-            _ => {}
-        }
-        ensure!(result.len() <= SITES, "bounded_work: reference site count");
-        Ok(false)
-    })?;
-    result.sort_by(|a, b| {
-        (a.start, a.end, a.kind, &a.spelling).cmp(&(b.start, b.end, b.kind, &b.spelling))
-    });
-    Ok(result)
-}
-fn map_target(
-    doc: &DocumentInput,
-    site: &RawSite,
-    documents: &BTreeMap<DocumentKey, usize>,
-) -> std::result::Result<usize, &'static str> {
-    let parts = site.destination.as_ref().map_err(|e| *e)?;
-    let candidates = match doc.key.language.as_str() {
-        "javascript" => {
-            let path =
-                relative_path(&doc.key.path, &parts[0]).ok_or("relative_import_outside_source")?;
-            if path.rsplit('/').next().is_some_and(|p| p.contains('.')) {
-                vec![path]
-            } else {
-                vec![
-                    format!("{path}.js"),
-                    format!("{path}.mjs"),
-                    format!("{path}.cjs"),
-                    format!("{path}/index.js"),
-                ]
-            }
-        }
-        _ => return Err("module_mapping_unavailable"),
-    };
-    let found = find(doc, &candidates, documents);
-    match found.as_slice() {
-        [target] => Ok(*target),
-        [] => Err("module_path_not_indexed"),
-        _ => Err("module_path_ambiguous"),
+    if doc.key.language == "javascript" {
+        return javascript::extract(doc, tree, work, check);
     }
+    Ok(Vec::new())
 }
 fn find(
     doc: &DocumentInput,

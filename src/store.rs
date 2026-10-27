@@ -1698,18 +1698,24 @@ impl EvidenceResponse {
             SelectedIntegrity("incompatible_index: corrupt retained dependencies".into()),
         )?;
         check()?;
-        let mut cargo = None;
+        let mut manifests = BTreeMap::new();
         for input in inputs {
             check()?;
             let path = match &input {
                 RetainedInput::Present { path, .. } | RetainedInput::Absent { path } => *path,
             };
-            if path != "Cargo.toml" {
+            if !matches!(path, "Cargo.toml" | "package.json") {
                 continue;
             }
+            let label = if path == "Cargo.toml" {
+                "Cargo"
+            } else {
+                "package.json"
+            };
             selected_ensure!(
-                cargo.is_none(),
-                "incompatible_index: duplicate retained Cargo manifest"
+                !manifests.contains_key(path),
+                "incompatible_index: duplicate retained {} manifest",
+                label
             );
             let (bytes, content_hash) = match input {
                 RetainedInput::Absent { .. } => (None, None),
@@ -1723,34 +1729,47 @@ impl EvidenceResponse {
                     );
                     selected_ensure!(
                         byte_length.checked_mul(2) == Some(bytes.len() as u64),
-                        "incompatible_index: corrupt retained Cargo length"
+                        "incompatible_index: corrupt retained {} length",
+                        label
                     );
                     check()?;
-                    let bytes = hex::decode(bytes).context(SelectedIntegrity(
-                        "incompatible_index: corrupt retained Cargo bytes".into(),
-                    ))?;
+                    let bytes = hex::decode(bytes).context(SelectedIntegrity(format!(
+                        "incompatible_index: corrupt retained {label} bytes"
+                    )))?;
                     use sha2::{Digest, Sha256};
                     let hash = hex::encode(Sha256::digest(&bytes));
                     (Some(bytes), Some(hash))
                 }
             };
-            cargo = Some(crate::references::external::ManifestInput {
-                source_set_id: source_set_id.clone(),
-                native_revision_id: native_revision_id.clone(),
-                dependency_hash: dependency_hash.clone(),
-                path: path.into(),
-                bytes,
-                content_hash,
-            });
+            manifests.insert(
+                path.to_owned(),
+                crate::references::external::ManifestInput {
+                    source_set_id: source_set_id.clone(),
+                    native_revision_id: native_revision_id.clone(),
+                    dependency_hash: dependency_hash.clone(),
+                    path: path.into(),
+                    bytes,
+                    content_hash,
+                },
+            );
         }
-        let cargo = cargo.ok_or_else(|| {
-            SelectedIntegrity("incompatible_index: missing retained Cargo entry".into())
-        })?;
+        for path in ["Cargo.toml", "package.json"] {
+            let label = if path == "Cargo.toml" {
+                "Cargo"
+            } else {
+                "package.json"
+            };
+            selected_ensure!(
+                manifests.contains_key(path),
+                "incompatible_index: missing retained {} entry",
+                label
+            );
+        }
         check()?;
         Ok(crate::references::Snapshot {
             pin: selected.pin,
             documents,
-            manifests: vec![cargo],
+            manifests: manifests.into_values().collect(),
         })
     }
 
@@ -18133,6 +18152,53 @@ fn immutable_reference_slot_rejects_changed_payload() {
             .unwrap(),
         original
     );
+}
+
+#[cfg(test)]
+#[test]
+fn architecture_retained_package_components_fail_atomically_with_typed_integrity() {
+    for fault in ["missing", "duplicate", "length", "hex"] {
+        let (_state, _root, store) = selected_read_once_tests::published_store(1);
+        let db = store.cache_write().unwrap();
+        let (id, retained): (String, String) = db
+            .query_row(
+                "SELECT id,retained_dependencies FROM native_revisions LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut inputs: Vec<serde_json::Value> = serde_json::from_str(&retained).unwrap();
+        let index = inputs
+            .iter()
+            .position(|input| input["path"] == "package.json")
+            .unwrap();
+        match fault {
+            "missing" => {
+                inputs.remove(index);
+            }
+            "duplicate" => {
+                inputs.push(inputs[index].clone());
+            }
+            "length" => {
+                inputs[index] = serde_json::json!({"type":"present", "path":"package.json", "bytes":"7b", "byteLength":2});
+            }
+            "hex" => {
+                inputs[index] = serde_json::json!({"type":"present", "path":"package.json", "bytes":"zz", "byteLength":1});
+            }
+            _ => unreachable!(),
+        }
+        db.execute(
+            "UPDATE native_revisions SET retained_dependencies=?1 WHERE id=?2",
+            params![serde_json::to_string(&inputs).unwrap(), id],
+        )
+        .unwrap();
+        drop(db);
+        let response = store.evidence_response().unwrap();
+        let error = response
+            .architecture_response("references", &serde_json::json!({}), &mut || Ok(()))
+            .unwrap_err();
+        assert!(error.is::<SelectedIntegrity>(), "{fault}: {error:#}");
+    }
 }
 
 #[cfg(test)]

@@ -938,3 +938,253 @@ fn python_external_rules_explain_and_browser_keep_native_metrics_separate() {
     );
     response.finish(()).unwrap();
 }
+
+const JS_MANIFEST: &str = r#"{
+  "name":"fixture",
+  "dependencies":{"widget":"^1.2.3","@scope/tool":"2.3.4","http":"1.2.3","blocked":"1.2.3","alias":"npm:elsewhere@1.2.3"},
+  "devDependencies":{"widget":"~2.3.4","blocked":"workspace:*"}
+}"#;
+const JS_RULES: &str = r#"version = 1
+[external_policy]
+deny = [
+  { language = "javascript", package = "widget", stdlib = false },
+  { language = "javascript", package = "fs", stdlib = true },
+  { language = "javascript", package = "absent", stdlib = false },
+]
+[layers.source]
+order = 2
+paths = ["app.js", "tests/**"]
+[layers.packages]
+order = 1
+external = [{ language = "javascript", package = "widget", stdlib = false }]
+[layers.standard]
+shared = true
+external = [{ language = "javascript", package = "fs", stdlib = true }]
+"#;
+fn javascript_fixture(manifest: &str) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for (path, text) in [
+        ("package.json", manifest),
+        (
+            "app.js",
+            "import { send } from 'widget/sub/path';\nexport { tool } from '@scope/tool/sub';\nimport 'fs';\nimport 'node:fs';\nimport 'fs/promises';\nimport 'node:fs/promises';\nimport 'path';\nimport 'node:path';\nimport 'http';\nimport 'http/fake';\nimport 'node:invented';\nimport 'blocked';\nimport 'alias';\nimport 'absent';\n",
+        ),
+        ("other.js", "import 'widget';\n"),
+        ("tests/external.test.js", "import 'widget';\nimport 'fs';\n"),
+        (".trellis/rules.toml", JS_RULES),
+    ] {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let baseline = store.index_baseline().unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let (graph, native, capture) = index_workspace_bundle(
+        &IndexOptions::new(root.path().into()),
+        store.root_id(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let pin = store
+        .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+        .unwrap();
+    drop(leader);
+    (state, root, store, pin)
+}
+
+#[test]
+fn selected_javascript_packages_and_builtin_aliases_keep_captured_evidence_after_live_edits() {
+    let (_state, root, store, pin) = javascript_fixture(JS_MANIFEST);
+    let before = read(&store, "references", pin);
+    assert_eq!(before["externalPackages"].as_array().unwrap().len(), 4);
+    let widget = package(&before, "widget");
+    assert_eq!(widget["identity"]["language"], "javascript");
+    assert_eq!(widget["ecosystem"], "npm");
+    let evidence = widget["evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 2);
+    use sha2::{Digest, Sha256};
+    let manifest_hash = hex::encode(Sha256::digest(JS_MANIFEST.as_bytes()));
+    for entry in evidence {
+        assert_eq!(entry["path"], "package.json");
+        assert_eq!(entry["importRoot"], "widget");
+        assert_eq!(entry["key"], "widget");
+        assert_eq!(entry["sourceSetId"], widget["identity"]["sourceSetId"]);
+        assert!(entry["nativeRevisionId"].is_string());
+        assert_eq!(entry["dependencyHash"].as_str().unwrap().len(), 64);
+        assert_eq!(entry["contentHash"], manifest_hash);
+    }
+    assert!(
+        evidence
+            .iter()
+            .any(|entry| entry["section"] == "dependencies"
+                && entry["versionConstraint"] == "^1.2.3")
+    );
+    assert!(evidence.iter().any(
+        |entry| entry["section"] == "devDependencies" && entry["versionConstraint"] == "~2.3.4"
+    ));
+    let scoped = package(&before, "@scope/tool");
+    assert_eq!(scoped["evidence"][0]["importRoot"], "@scope/tool");
+    for name in ["fs", "path"] {
+        let builtin = package(&before, name);
+        assert_eq!(builtin["ecosystem"], "node");
+        assert_eq!(builtin["identity"]["standardLibrary"], true);
+        assert_eq!(
+            builtin["evidence"],
+            json!([{"kind":"standardLibraryCatalog", "catalog":"node-standard-library:v1", "entry":name}])
+        );
+    }
+    let fs_edge = before["production"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| {
+            edge["source"]["path"] == "app.js"
+                && edge["target"] == package(&before, "fs")["identity"]
+        })
+        .unwrap();
+    assert_eq!(fs_edge["count"], 4);
+    for unknown in ["http", "blocked", "alias", "absent", "node:invented"] {
+        assert!(
+            before["unresolved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["site"]["spelling"].as_str().unwrap().contains(unknown))
+        );
+        assert!(
+            !before["externalPackages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["identity"]["package"] == unknown)
+        );
+    }
+    assert!(
+        before["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["source"]["path"] == "tests/external.test.js"
+                && edge["target"] == widget["identity"])
+    );
+    let checked = read(&store, "check", pin);
+    let ban = checked["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "$external" && row["target"]["path"] == "other.js")
+        .unwrap();
+    let arguments = json!({"expectedBasis":pin,"rule":"$external","target":ban["target"],"destination":ban["destination"]});
+    let response = store.evidence_response().unwrap();
+    let explained = response
+        .architecture_response("explain", &arguments, &mut || Ok(()))
+        .unwrap();
+    response.finish(()).unwrap();
+    fs::write(root.path().join("package.json"), "invalid live manifest").unwrap();
+    fs::write(root.path().join("app.js"), "invalid live source").unwrap();
+    fs::remove_file(root.path().join("other.js")).unwrap();
+    assert_eq!(read(&store, "references", pin), before);
+    assert_eq!(read(&store, "check", pin), checked);
+    fs::remove_file(root.path().join("package.json")).unwrap();
+    assert_eq!(read(&store, "references", pin), before);
+    assert_eq!(read(&store, "check", pin), checked);
+    let response = store.evidence_response().unwrap();
+    assert_eq!(
+        response
+            .architecture_response("explain", &arguments, &mut || Ok(()))
+            .unwrap(),
+        explained
+    );
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn javascript_external_policy_layers_explain_and_metrics_retain_only_native_modules() {
+    let (_state, _root, store, pin) = javascript_fixture(JS_MANIFEST);
+    let refs = read(&store, "references", pin);
+    let checked = read(&store, "check", pin);
+    let rows = checked["instances"].as_array().unwrap();
+    let ban = rows
+        .iter()
+        .find(|row| row["rule"] == "$external" && row["target"]["path"] == "other.js")
+        .unwrap();
+    assert_eq!(ban["status"], "deviates");
+    assert!(ban["sourceLayer"].is_null());
+    assert_eq!(ban["destination"], package(&checked, "widget")["identity"]);
+    assert!(rows.iter().any(|row| row["rule"] == "$layers"
+        && row["target"]["path"] == "app.js"
+        && row["destination"] == package(&checked, "widget")["identity"]
+        && row["status"] == "deviates"));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["target"]["path"] == "tests/external.test.js"
+                || row["destination"]["package"] == "absent")
+    );
+    assert!(
+        checked["testOnly"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["rule"] == "$external"
+                && row["destination"] == package(&checked, "fs")["identity"])
+    );
+    let response = store.evidence_response().unwrap();
+    let explanation = response.architecture_response("explain", &json!({"expectedBasis":pin,"rule":"$external","target":ban["target"],"destination":ban["destination"]}), &mut || Ok(())).unwrap();
+    assert_eq!(
+        package(&explanation, "widget")["identity"],
+        ban["destination"]
+    );
+    let options = MetricsOptions {
+        pin: Some(pin),
+        ..Default::default()
+    };
+    let view = response
+        .architecture_view(&options, &mut || Ok(()))
+        .unwrap();
+    let metrics = response.metrics_at(&options, &mut || Ok(())).unwrap();
+    for module in view["modules"].as_array().unwrap() {
+        let identity = &module["identity"];
+        assert!(identity.get("package").is_none());
+        let metric = metrics
+            .files
+            .iter()
+            .find(|file| {
+                identity["sourceSetId"] == file.source_set_id
+                    && identity["language"] == file.language
+                    && identity["path"] == file.path
+            })
+            .unwrap();
+        assert_eq!(module["metrics"], metric.metrics);
+    }
+    assert_eq!(
+        view["references"]["externalPackages"],
+        refs["externalPackages"]
+    );
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn malformed_captured_package_json_is_unknown_not_empty_dependency_proof() {
+    let (_state, _root, store, pin) = javascript_fixture("{ invalid json");
+    let refs = read(&store, "references", pin);
+    assert!(
+        !refs["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["ecosystem"] == "npm")
+    );
+    assert!(
+        refs["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["site"]["spelling"].as_str().unwrap().contains("widget"))
+    );
+    assert_eq!(package(&refs, "fs")["ecosystem"], "node");
+}
