@@ -1209,6 +1209,18 @@ impl CheckoutRegistry {
         launch: &WorkspaceIdentity,
         selected: &Path,
     ) -> Result<SelectedCheckout, SelectionError> {
+        Self::capacity_witness_with_common_dirs(launch, selected, |identity| {
+            identity
+                .git_common_dir()
+                .map_err(|_| SelectionError::Unavailable)
+        })
+    }
+
+    fn capacity_witness_with_common_dirs(
+        launch: &WorkspaceIdentity,
+        selected: &Path,
+        mut common_dir: impl FnMut(&WorkspaceIdentity) -> Result<PathBuf, SelectionError>,
+    ) -> Result<SelectedCheckout, SelectionError> {
         launch
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
@@ -1216,8 +1228,13 @@ impl CheckoutRegistry {
         let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)
             .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
             .map_err(|_| SelectionError::IdentityChanged)?;
-        let launch_common = common_identity(launch)?;
-        let selected_common = common_identity(&identity)?;
+        let inode = |path| {
+            fs::metadata(path)
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .map_err(|_| SelectionError::Unavailable)
+        };
+        let launch_common = inode(common_dir(launch)?)?;
+        let selected_common = inode(common_dir(&identity)?)?;
         if launch_common != selected_common {
             return Err(SelectionError::IdentityChanged);
         }
@@ -1235,7 +1252,13 @@ impl CheckoutRegistry {
             launch_common,
             selected_common,
         };
-        witness.before_answer()?;
+        witness.launch.verify_readonly().map_err(identity_fault)?;
+        witness.identity.verify_readonly().map_err(identity_fault)?;
+        let dirs = CommonDirs {
+            launch: common_dir(&witness.launch)?,
+            selected: common_dir(&witness.identity)?,
+        };
+        witness.verify_at_send(&dirs)?;
         Ok(witness)
     }
 
@@ -2841,10 +2864,23 @@ mod selection_tests {
         let identity = WorkspaceIdentity::discover(Some(&launch), &launch).unwrap();
         let mut registry = CheckoutRegistry::new();
         registry.attach_launch(17, &identity).unwrap();
-        let prepared = registry
-            .selection_probe()
-            .prepare(&identity, &selected)
-            .unwrap();
+        WorkspaceIdentity::discover(Some(&selected), &selected).unwrap();
+        let common = launch.join(".git").canonicalize().unwrap();
+        let fixture_common = |checked: &WorkspaceIdentity| -> Result<PathBuf, SelectionError> {
+            assert!(checked.root == launch || checked.root == selected);
+            checked.verify_readonly().unwrap();
+            Ok(common.clone())
+        };
+        // Capacity owns this test; Git scheduling and membership have separate tests.
+        let prepared = PreparedSelection {
+            witness: CheckoutRegistry::capacity_witness_with_common_dirs(
+                &identity,
+                &selected,
+                fixture_common,
+            )
+            .unwrap(),
+            expected: None,
+        };
         for index in 0..MAX_ACTIVE_CHECKOUTS - 1 {
             let key = format!("fixture-{index}");
             let mut metadata = CheckoutMetadata::from_identity(&identity);
@@ -2872,11 +2908,44 @@ mod selection_tests {
         );
         assert_eq!(registry.entries.len(), MAX_ACTIVE_CHECKOUTS);
         assert_eq!(
-            registry
-                .capacity_witness(&identity, &selected)
-                .unwrap()
-                .root,
+            CheckoutRegistry::capacity_witness_with_common_dirs(
+                &identity,
+                &selected,
+                fixture_common
+            )
+            .unwrap()
+            .root,
             selected
+        );
+        let before: HashMap<_, _> = registry
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.sessions.clone()))
+            .collect();
+        // Expire the last Git lookup through its real deadline guard, without sleeping.
+        let mut lookups = 0;
+        let unavailable =
+            CheckoutRegistry::capacity_witness_with_common_dirs(&identity, &selected, |checked| {
+                lookups += 1;
+                if lookups == 4 {
+                    checked
+                        .git_common_dir_by(Some(Instant::now()))
+                        .map_err(|_| SelectionError::Unavailable)
+                } else {
+                    fixture_common(checked)
+                }
+            })
+            .unwrap_err();
+        assert_eq!(lookups, 4);
+        assert_eq!(unavailable, SelectionError::Unavailable);
+        assert_eq!(registry.active_count(), MAX_ACTIVE_CHECKOUTS);
+        assert_eq!(
+            registry
+                .entries
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.sessions.clone()))
+                .collect::<HashMap<_, _>>(),
+            before
         );
         assert!(
             registry
