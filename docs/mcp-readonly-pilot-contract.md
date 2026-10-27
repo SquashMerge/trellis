@@ -273,12 +273,15 @@ These remain package-family labels, not host-JDK discovery or proof that a class
 qualified-type paths can also map uniquely proved captured public top-level
 types by declared package. Static/nested/member types and third-party prefixes
 without authoritative captured mapping stay unknown; Maven/Gradle coordinates
-alone are not prefix evidence. Python pairs `python-standard-library:v1` with
-exactly `json`/`pathlib`/`sys` and ecosystem `python`. This code-shipped minimal
-root-label catalog covers CPython 3.12 on Windows, macOS and Linux; it is not a
-complete catalog, host-runtime discovery, installation check or member proof.
-Unlisted roots and unproved third-party distribution/import mappings stay
-unknown. Local precedence and ambiguous or unproved roots cannot fall through
+alone are not prefix evidence. Python pairs `python-standard-library:v2` with
+the exact 300 roots of the pinned CPython v3.12.0 `sys.stdlib_module_names`
+source list and ecosystem `python`. The
+[Python catalog record](python-standard-library-catalog.md) records its tag,
+commit and source hashes. Upstream's cross-platform list includes unavailable
+platform-specific and build-disabled modules, excludes test modules and lists
+only main package names. These root labels are not host-runtime discovery,
+installation, submodule or member proof. Unlisted roots and unproved third-party
+distribution/import mappings stay unknown. Local precedence and ambiguous or unproved roots cannot fall through
 to external labels. Python local expansion requires unique checkout-root modules
 and proved package prefixes; literal `__all__` selects proved names, otherwise
 proved public top-level names are used only when `__all__` is absent. Dynamic or
@@ -286,7 +289,12 @@ mutated exports, unsupported string decoding, ambiguous layouts and cycles stay
 unknown. Simple proved forwarding follows at most four edges to real native
 final owners; independent positives retain residual unknowns. External stars do
 not provide a Python member inventory or settle wildcard-only names. No runtime
-execution or third-party import-name guessing is performed.
+execution or third-party import-name guessing is performed. Tuple `__all__` is
+unknown under the literal-list-only contract. Child-module imports such as
+`from . import x` or `from pkg import sub` can still map only to the initializer;
+missing child edges are a follow-up. Dynamic writes via module `setattr`,
+`vars()[...]` or `__dict__.update` are not fully tracked, so no complete dynamic
+namespace-mutation detection is claimed.
 Captured manifests are selected through the same
 admitted transaction and revision as source, never read live. Package evidence is not
 native measured syntax provenance or library member/API resolution. Browser source

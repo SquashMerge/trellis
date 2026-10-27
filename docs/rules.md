@@ -237,6 +237,14 @@ deterministic sample sites and exact omitted-sample counts. Sampling does not
 truncate counts or verdicts. Parse failures, cancellation and work bounds fail
 atomically, not as a healthy-looking partial projection.
 
+Python coverage follow-ups from [PR361 review](https://github.com/SquashMerge/trellis/pull/361#issuecomment-6431615903):
+`from . import x` and `from pkg import sub` can map to the package initializer
+instead of the child module, so child-module edges can be missed. Dynamic writes
+through `setattr(sys.modules[__name__], ...)`, `vars()[...] = ...` and
+`__dict__.update(...)` are not fully tracked; this projection does not claim
+complete detection of dynamic namespace mutation. Tuple `__all__` remains
+unknown under the ratified literal-list-only rule.
+
 ## Production and test evidence
 
 A site's role comes from its innermost enclosing **stored** native declaration,
@@ -368,8 +376,8 @@ CatalogEvidence = {kind:"standardLibraryCatalog",catalog:"rust-standard-library:
                    entry:"std"|"core"|"alloc"}
                 | {kind:"standardLibraryCatalog",catalog:"java-standard-library:v2",
                    entry:"java"|"javax"}
-                | {kind:"standardLibraryCatalog",catalog:"python-standard-library:v1",
-                   entry:"json"|"pathlib"|"sys"}
+                | {kind:"standardLibraryCatalog",catalog:"python-standard-library:v2",
+                   entry:<one of the pinned CPython v3.12.0 stdlib roots>}
 Edge = {source:Target,target:Destination,count:UInt,sites:Site[],
         omittedSites:UInt,mapping:"structural"}
 Unresolved = {source:Target,site:Site,reason:string}
@@ -386,12 +394,15 @@ The `java` root policy is unchanged. The `javax` label requires exact containing
 membership in the pinned OpenJDK 25 public-export catalog; parent packages and
 invented descendants are not implied. These entries label package families, not
 member existence or selected-JDK availability. Python uses `ecosystem:"python"` and the
-`python-standard-library:v1` catalog, with exactly `json`, `pathlib` and `sys`.
-This is a deliberately partial, code-shipped catalog of CPython 3.12 root labels
-for Windows, macOS and Linux, not a complete stdlib inventory or proof of the
-checkout runtime, installation, submodules or members. It does not discover or
-check the host Python version. Unlisted roots remain unknown, including genuine
-stdlib roots. Local module precedence and ambiguity are resolved before catalog
+`python-standard-library:v2` catalog: the exact 300 roots of the pinned CPython
+v3.12.0 `sys.stdlib_module_names` source list. The
+[Python catalog record](python-standard-library-catalog.md) gives its tag, commit,
+source hashes and coverage. Upstream defines the same list on every platform,
+including unavailable platform-specific and build-disabled modules; test modules
+are excluded and only main package names are listed. This labels roots, not the
+checkout runtime, installation, submodules or members. It never discovers or
+checks the host Python version. Unlisted roots remain unknown. Local module
+precedence and ambiguity are resolved before catalog
 lookup; an unproved or ambiguous local root never falls back to an external
 label. Python external star imports supply package edges, not member inventories;
 their unknown names keep wildcard-only bindings uncertain unless a proved

@@ -75,6 +75,8 @@ pub(super) struct Catalog {
     source_sets: BTreeMap<usize, String>,
     modules: BTreeMap<ModuleKey, Vec<(usize, bool)>>,
     membership: BTreeMap<usize, Vec<String>>,
+    module_proofs: BTreeMap<usize, BTreeSet<usize>>,
+    child_names: BTreeMap<usize, BTreeSet<String>>,
     roots: BTreeSet<(String, String)>,
     file_declarations: BTreeMap<usize, DeclarationId>,
     test_modules: BTreeSet<usize>,
@@ -96,6 +98,8 @@ impl Catalog {
             source_sets: BTreeMap::new(),
             modules: BTreeMap::new(),
             membership: BTreeMap::new(),
+            module_proofs: BTreeMap::new(),
+            child_names: BTreeMap::new(),
             roots: BTreeSet::new(),
             file_declarations: BTreeMap::new(),
             test_modules: BTreeSet::new(),
@@ -158,14 +162,28 @@ impl Catalog {
             owner_step(work, check)?;
             let input = docs[doc.document];
             if let Some((mut path, package)) = module_path(&input.key.path)
-                && result
-                    .layout(&input.key.source_set_id, &path, work, check)?
-                    .is_ok()
+                && let Ok(layout) = result.layout(&input.key.source_set_id, &path, work, check)?
             {
+                result.module_proofs.insert(document, layout.proof);
                 if !package {
                     path.pop();
                 }
                 result.membership.insert(document, path);
+            }
+        }
+        for (source_set, path) in result.modules.keys() {
+            owner_step(work, check)?;
+            if path.len() > 1
+                && let Ok(parent) =
+                    result.layout(source_set, &path[..path.len() - 1], work, check)?
+                && parent.package
+            {
+                owner_step(work, check)?;
+                result
+                    .child_names
+                    .entry(parent.document)
+                    .or_default()
+                    .insert(path.last().expect("child module name").clone());
             }
         }
         // Catalog work happens before request-source filters. Each unit merges its stars once;
@@ -190,10 +208,10 @@ impl Catalog {
                         check,
                     )?);
                 } else if import.star {
-                    contributors.push(Names {
+                    contributors.push(std::sync::Arc::new(Names {
                         unknown_set: true,
                         ..Names::default()
-                    });
+                    }));
                 }
             }
             let mut merged = Names::default();
@@ -514,6 +532,19 @@ impl Catalog {
                 }
                 entered.push(key);
                 let unit = &self.units[&document];
+                if let Some(rows) = unit.bindings.get(&current).filter(|rows| rows.len() == 1)
+                    && self.later_star_may_bind(
+                        document,
+                        &current,
+                        rows[0].start,
+                        depth,
+                        route,
+                        work,
+                        check,
+                    )?
+                {
+                    return Ok(unknown_bucket());
+                }
                 let alias = unit
                     .bindings
                     .get(&current)
@@ -544,6 +575,57 @@ impl Catalog {
             route.remove(&key);
         }
         resolved
+    }
+    #[allow(clippy::too_many_arguments)] // One ordered name check keeps route and shared budget explicit.
+    fn later_star_may_bind(
+        &self,
+        document: usize,
+        name: &str,
+        start: usize,
+        depth: usize,
+        route: &mut Route,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        for import in &self.units[&document].imports {
+            owner_step(work, check)?;
+            if !import.star || !import.module_scope || import.start <= start {
+                continue;
+            }
+            let bucket =
+                self.star_binding(document, import, name, depth + 1, route, work, check)?;
+            if bucket.unknown || !bucket.candidates.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    fn export_policy_uncertain(
+        &self,
+        document: usize,
+        depth: usize,
+        route: &mut Route,
+        work: &mut usize,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let unit = &self.units[&document];
+        if unit.dynamic || matches!(unit.all, All::Unknown) {
+            return Ok(true);
+        }
+        let key = (document, "__all__ policy".to_owned());
+        owner_step(work, check)?;
+        if !route.insert(key.clone()) {
+            return Ok(true);
+        }
+        let start = unit
+            .bindings
+            .get("__all__")
+            .and_then(|rows| rows.first())
+            .map_or(0, |row| row.start);
+        let uncertain =
+            self.later_star_may_bind(document, "__all__", start, depth, route, work, check);
+        route.remove(&key);
+        uncertain
     }
     fn compute_binding(
         &self,
@@ -624,8 +706,7 @@ impl Catalog {
             return Ok(unknown_bucket());
         };
         let unit = &self.units[&layout.document];
-        if unit.dynamic
-            || matches!(unit.all, All::Unknown)
+        if self.export_policy_uncertain(layout.document, depth, route, work, check)?
             || layout.proof.iter().any(|d| self.test_modules.contains(d))
         {
             return Ok(unknown_bucket());
@@ -637,6 +718,14 @@ impl Catalog {
         };
         if !selected {
             return Ok(Bucket::default());
+        }
+        if matches!(unit.all, All::Absent)
+            && self
+                .child_names
+                .get(&layout.document)
+                .is_some_and(|names| names.contains(name))
+        {
+            return Ok(unknown_bucket());
         }
         let mut bucket = self.binding(layout.document, name, depth, route, work, check)?;
         if matches!(unit.all, All::Literal(_)) && bucket.candidates.is_empty() {
@@ -723,37 +812,33 @@ impl Catalog {
         route: &mut Route,
         work: &mut usize,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Names> {
+    ) -> Result<std::sync::Arc<Names>> {
         owner_step(work, check)?;
         if import.uncertain || !import.module_scope || depth > FOLLOW {
-            return Ok(Names {
+            return Ok(std::sync::Arc::new(Names {
                 unknown_set: true,
                 ..Names::default()
-            });
+            }));
         }
         let Some(path) = self.path(document, import, work, check)? else {
-            return Ok(Names {
+            return Ok(std::sync::Arc::new(Names {
                 unknown_set: true,
                 ..Names::default()
-            });
+            }));
         };
         let Ok(layout) = self.layout(&self.source_sets[&document], &path, work, check)? else {
-            return Ok(Names {
+            return Ok(std::sync::Arc::new(Names {
                 unknown_set: true,
                 ..Names::default()
-            });
+            }));
         };
         if layout.proof.iter().any(|d| self.test_modules.contains(d)) {
-            return Ok(Names {
+            return Ok(std::sync::Arc::new(Names {
                 unknown_set: true,
                 ..Names::default()
-            });
+            }));
         }
-        let mut names = self.exports(layout.document, depth, route, work, check)?;
-        for bucket in names.names.values_mut() {
-            extend_proof(bucket, &layout.proof, work, check)?;
-        }
-        Ok(names)
+        self.exports(layout.document, depth, route, work, check)
     }
     fn exports(
         &self,
@@ -762,31 +847,37 @@ impl Catalog {
         route: &mut Route,
         work: &mut usize,
         check: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Names> {
+    ) -> Result<std::sync::Arc<Names>> {
         owner_step(work, check)?;
         let key = (document, "*".to_owned());
         if depth > FOLLOW || route.contains(&key) {
-            return Ok(Names {
+            return Ok(std::sync::Arc::new(Names {
                 unknown_set: true,
                 ..Names::default()
-            });
+            }));
         }
         // The active route is part of this small request-local memo key. A cyclic
         // caller's unknown result must never poison an independent export route.
         charge(route.len() + 1, work, check)?;
         let memo_key = (document, depth, route.clone());
         if let Some(names) = self.export_memo.borrow().get(&memo_key).cloned() {
-            charge_names(&names, work, check)?;
-            return Ok((*names).clone());
+            return Ok(names);
         }
         route.insert(key.clone());
         let resolved = self.compute_exports(document, depth, route, work, check);
         route.remove(&key);
-        let names = resolved?;
+        let mut names = resolved?;
+        if let Some(proof) = self.module_proofs.get(&document) {
+            for bucket in names.names.values_mut() {
+                extend_proof(bucket, proof, work, check)?;
+            }
+        }
         charge_names(&names, work, check)?;
+        owner_step(work, check)?;
+        let names = std::sync::Arc::new(names);
         self.export_memo
             .borrow_mut()
-            .insert(memo_key, std::sync::Arc::new(names.clone()));
+            .insert(memo_key, names.clone());
         Ok(names)
     }
     fn compute_exports(
@@ -798,7 +889,7 @@ impl Catalog {
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Names> {
         let unit = &self.units[&document];
-        if unit.dynamic || matches!(unit.all, All::Unknown) {
+        if self.export_policy_uncertain(document, depth, route, work, check)? {
             return Ok(Names {
                 unknown_set: true,
                 ..Names::default()
@@ -812,6 +903,14 @@ impl Catalog {
                 spellings.extend(names.iter().cloned());
             }
             All::Absent => {
+                if let Some(names) = self.child_names.get(&document) {
+                    for name in names {
+                        owner_step(work, check)?;
+                        if !name.starts_with('_') {
+                            spellings.insert(name.clone());
+                        }
+                    }
+                }
                 for name in unit.bindings.keys() {
                     owner_step(work, check)?;
                     if !name.starts_with('_') {
@@ -838,7 +937,16 @@ impl Catalog {
         }
         for name in spellings {
             owner_step(work, check)?;
-            let mut bucket = self.binding(document, &name, depth, route, work, check)?;
+            let mut bucket = if matches!(unit.all, All::Absent)
+                && self
+                    .child_names
+                    .get(&document)
+                    .is_some_and(|names| names.contains(&name))
+            {
+                unknown_bucket()
+            } else {
+                self.binding(document, &name, depth, route, work, check)?
+            };
             if bucket.candidates.is_empty() {
                 bucket.unknown = true;
             }
@@ -1243,6 +1351,26 @@ fn scan(
             continue;
         }
         if kind == "future_import_statement" {
+            continue;
+        }
+        if kind == "type_alias_statement"
+            && module_scope
+            && let Some(mut left) = node.child_by_field_name("left")
+        {
+            while left.kind() != "identifier" && left.named_child_count() > 0 {
+                check()?;
+                left = left.named_child(0).expect("type alias name child");
+            }
+            if left.kind() == "identifier" {
+                record(
+                    unit,
+                    text(doc, left).to_owned(),
+                    node.start_byte(),
+                    BindingKind::Unknown,
+                    work,
+                    check,
+                )?;
+            }
             continue;
         }
         if matches!(kind, "function_definition" | "class_definition")
@@ -1669,6 +1797,28 @@ mod tests {
             &catalog.units[&source].imports[0],
             &mut work,
         );
+    }
+    #[test]
+    fn export_memo_hit_shares_the_immutable_result() {
+        expansion(|catalog, source, import, work| {
+            let path = catalog
+                .path(source, import, work, &mut || Ok(()))
+                .unwrap()
+                .unwrap();
+            let layout = catalog
+                .layout(&catalog.source_sets[&source], &path, work, &mut || Ok(()))
+                .unwrap()
+                .unwrap();
+            let first = catalog
+                .exports(layout.document, 1, &mut Route::new(), work, &mut || Ok(()))
+                .unwrap();
+            let before = *work;
+            let hit = catalog
+                .exports(layout.document, 1, &mut Route::new(), work, &mut || Ok(()))
+                .unwrap();
+            assert!(std::sync::Arc::ptr_eq(&first, &hit));
+            assert_eq!(*work - before, 2);
+        });
     }
     #[test]
     fn wildcard_expansion_uses_accumulated_work_limit() {

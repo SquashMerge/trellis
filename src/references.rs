@@ -339,7 +339,7 @@ pub fn project(
                 "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
                 "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
                 "JavaScript maps static relative imports/reexports using explicit files or .js/.mjs/.cjs/index.js; dynamic and bare imports remain unresolved.",
-                "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The limited shipped stdlib catalog labels packages only; third-party distribution mappings remain unknown.",
+                "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
                 "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability."
             ]
         }),

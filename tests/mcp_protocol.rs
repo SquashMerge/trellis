@@ -11023,7 +11023,10 @@ async fn python_architecture_external_descriptors_validate_in_structured_tool_re
     let temp = tempfile::tempdir().unwrap();
     let (identity, topology) = published_inactive_checkout(
         temp.path(),
-        &[("app.py", "import json as j\nfrom pathlib import Path\n")],
+        &[(
+            "app.py",
+            "import json as j\nfrom pathlib import Path\nimport os\nimport collections\nimport http.client\nimport winreg\n",
+        )],
     );
     fs::create_dir(identity.root.join(".trellis")).unwrap();
     fs::write(
@@ -11060,13 +11063,21 @@ external = [{ language = "python", package = "json", stdlib = true }]
         .iter()
         .find(|item| item["identity"]["package"] == "json")
         .unwrap();
-    assert_eq!(descriptor["ecosystem"], "python");
-    assert_eq!(
-        descriptor["evidence"],
-        json!([{
-            "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v1", "entry":"json"
-        }])
-    );
+    for name in ["json", "pathlib", "os", "collections", "http", "winreg"] {
+        let item = refs_env["data"]["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["identity"]["package"] == name)
+            .unwrap();
+        assert_eq!(item["ecosystem"], "python");
+        assert_eq!(
+            item["evidence"],
+            json!([{
+                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v2", "entry":name
+            }])
+        );
+    }
     let basis = refs_env["evidenceBasis"].clone();
     let checked = ask(
         2,

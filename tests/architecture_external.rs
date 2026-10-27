@@ -602,6 +602,12 @@ fn selected_javax_jdk_maven_coordinates_do_not_prove_non_jdk_namespaces() {
 }
 
 fn python_fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+    python_fixture_with_files(&[])
+}
+
+fn python_fixture_with_files(
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     for (path, text) in [
@@ -612,7 +618,7 @@ fn python_fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
         ("requirements.txt", "requests>=2\n"),
         (
             "app.py",
-            "import json as j\nfrom pathlib import Path\nimport requests\nimport email\n",
+            "import json as j\nfrom pathlib import Path\nimport requests\nimport flask\n",
         ),
         ("other.py", "import json\n"),
         (
@@ -627,7 +633,7 @@ deny = [
   { language = "python", package = "json", stdlib = true },
   { language = "python", package = "sys", stdlib = true },
   { language = "python", package = "requests", stdlib = false },
-  { language = "python", package = "email", stdlib = true },
+  { language = "python", package = "flask", stdlib = true },
 ]
 [layers.source]
 order = 2
@@ -642,6 +648,11 @@ external = [
 "#,
         ),
     ] {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    for (path, text) in files {
         let path = root.path().join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
@@ -665,9 +676,82 @@ external = [
 }
 
 #[test]
+fn selected_python_catalog_roots_are_cross_platform_labels_not_installation_proof() {
+    let (_state, _root, store, pin) = python_fixture_with_files(&[(
+        "app.py",
+        "import os\nimport collections\nimport http.client\nimport winreg\nimport flask\n",
+    )]);
+    let data = read(&store, "references", pin);
+    for name in ["os", "collections", "http", "winreg"] {
+        let descriptor = package(&data, name);
+        assert_eq!(descriptor["identity"]["standardLibrary"], true);
+        assert_eq!(
+            descriptor["evidence"],
+            json!([{
+                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v2", "entry":name
+            }])
+        );
+        assert!(data["production"].as_array().unwrap().iter().any(|edge| {
+            edge["source"]["path"] == "app.py" && edge["target"] == descriptor["identity"]
+        }));
+    }
+    assert!(
+        data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["source"]["path"] == "app.py" && row["site"]["spelling"] == "flask" })
+    );
+    assert!(
+        !data["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|descriptor| descriptor["identity"]["package"] == "flask")
+    );
+}
+
+#[test]
+fn selected_python_local_module_keeps_precedence_over_catalog_root() {
+    let (_state, _root, store, pin) = python_fixture_with_files(&[
+        ("app.py", "import os\n"),
+        ("os.py", "def local_only(): pass\n"),
+    ]);
+    let data = read(&store, "references", pin);
+    assert!(
+        data["production"].as_array().unwrap().iter().any(|edge| {
+            edge["source"]["path"] == "app.py" && edge["target"]["path"] == "os.py"
+        })
+    );
+    assert!(
+        !data["externalPackages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|descriptor| descriptor["identity"]["package"] == "os")
+    );
+    assert!(
+        !data["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["source"]["path"] == "app.py" && row["site"]["spelling"] == "os" })
+    );
+}
+
+#[test]
 fn python_catalog_labels_are_exact_and_selectors_do_not_prove_membership() {
     use trellis::references::external::{python_standard_library, valid_package};
-    for name in ["json", "pathlib", "sys"] {
+    for name in [
+        "json",
+        "pathlib",
+        "sys",
+        "email",
+        "os",
+        "collections",
+        "http",
+        "winreg",
+    ] {
         let descriptor =
             serde_json::to_value(python_standard_library("fixture", name).unwrap()).unwrap();
         assert_eq!(
@@ -681,11 +765,11 @@ fn python_catalog_labels_are_exact_and_selectors_do_not_prove_membership() {
         assert_eq!(
             descriptor["evidence"],
             json!([{
-                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v1", "entry":name
+                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v2", "entry":name
             }])
         );
     }
-    for name in ["jsonish", "JSON", "json.tool", "email"] {
+    for name in ["jsonish", "JSON", "json.tool", "requests", "flask"] {
         assert!(python_standard_library("fixture", name).is_none());
     }
     assert!(valid_package("python", "email", true));
@@ -705,11 +789,11 @@ fn selected_python_catalog_edges_and_unknowns_survive_live_source_and_manifest_e
         assert_eq!(
             descriptor["evidence"],
             json!([{
-                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v1", "entry":name
+                "kind":"standardLibraryCatalog", "catalog":"python-standard-library:v2", "entry":name
             }])
         );
     }
-    for spelling in ["requests", "email"] {
+    for spelling in ["requests", "flask"] {
         assert!(
             before["unresolved"]
                 .as_array()
@@ -809,7 +893,7 @@ fn python_external_rules_explain_and_browser_keep_native_metrics_separate() {
         row["target"]["path"] == "tests/test_external.py"
             || matches!(
                 row["destination"]["package"].as_str(),
-                Some("requests" | "email")
+                Some("requests" | "flask")
             )
     }));
     assert!(checked["testOnly"].as_array().unwrap().iter().any(|row| {
