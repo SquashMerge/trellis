@@ -698,6 +698,176 @@ pub(crate) fn validate_evidence_with_witnessed_raw(
     )
 }
 
+/// Validates one coverage row against the producers and the native revision. Returns the
+/// row's language string, which keys the coverage tuple.
+fn validate_coverage_row(
+    row: &Coverage,
+    producers: &BTreeMap<&str, &Producer>,
+    native: &native::Artifact,
+) -> Result<String> {
+    let revision = &native.revision;
+    text(&row.producer_id)?;
+    path(&row.document_path)?;
+    let producer = producers
+        .get(row.producer_id.as_str())
+        .context("dangling coverage producer")?;
+    ensure!(
+        row.revision_id == revision.id && row.source_set_id == revision.source_set_id,
+        "foreign coverage tuple"
+    );
+    let lang = serde_json::to_value(row.language)?
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ensure!(
+        producer.languages.contains(&row.language)
+            && native.source_set.languages.contains(&lang)
+            && revision
+                .documents
+                .iter()
+                .any(|d| d.key.source_set_id == row.source_set_id
+                    && d.key.language == lang
+                    && d.key.path == row.document_path),
+        "unsupported coverage document"
+    );
+    ordered(&row.supported_roles)?;
+    ordered(&row.observed_roles)?;
+    ensure!(
+        row.observed_roles
+            .iter()
+            .all(|r| row.supported_roles.contains(r)),
+        "observed role not supported"
+    );
+    if row.language == Language::Java {
+        ensure!(
+            !row.supported_roles.contains(&Role::Alias)
+                && !row.observed_roles.contains(&Role::Alias),
+            "Java alias not applicable"
+        );
+    }
+    ensure!(
+        match row.state {
+            CoverageState::NotRequested => !row.requested && !row.selected,
+            CoverageState::Omitted | CoverageState::Unsupported => row.requested && !row.selected,
+            CoverageState::Failed | CoverageState::Partial | CoverageState::Complete =>
+                row.requested && row.selected,
+        },
+        "invalid coverage request/selection state"
+    );
+    if let Some(diagnostic) = &row.diagnostic {
+        text(diagnostic)?;
+    }
+    ensure!(
+        row.diagnostic.is_some()
+            == !matches!(
+                row.state,
+                CoverageState::NotRequested | CoverageState::Complete
+            ),
+        "coverage diagnostic mismatch"
+    );
+    if !matches!(row.state, CoverageState::Complete | CoverageState::Partial) {
+        ensure!(
+            row.observed_roles.is_empty(),
+            "unselected coverage observed roles"
+        );
+    }
+    Ok(lang)
+}
+
+/// Validates a provenance row's derivation: a derived proof resolves through the raw inventory
+/// to exactly one claim with the same kind and digest; any other proof belongs to the captured
+/// revision.
+fn validate_provenance_row(
+    p: &Provenance,
+    raw: Option<&ValidatedRaw<'_>>,
+    captured: &CapturedComponents,
+    revision: &native::Revision,
+) -> Result<()> {
+    if let Some(derived) = &p.derived_from {
+        ensure!(
+            p.revision_id == revision.id,
+            "derived proof revision mismatch"
+        );
+        let raw = raw
+            .as_ref()
+            .context("derived provenance requires authenticated raw inventory")?;
+        let kind = serde_json::to_value(derived.record_kind)?;
+        let claim = raw.inventory.lookup(
+            &derived.provenance_id,
+            kind.as_str().context("invalid raw record kind")?,
+            &derived.fact_digest,
+        )?;
+        ensure!(
+            p.producer_id == raw.producer_id
+                && p.document.source_set_id == raw.source_set_id
+                && p.document.language == claim.language
+                && p.document.path == claim.path
+                && raw.captured_revision == captured.captured_revision.id,
+            "derived provenance raw capture identity mismatch"
+        );
+    } else {
+        ensure!(
+            p.revision_id == captured.captured_revision.id,
+            "captured proof revision mismatch"
+        );
+    }
+    Ok(())
+}
+
+/// Validates a proof's captured basis. `expected_artifact_hash` is the digest of the artifact
+/// this row's producer was captured from; `raw_binding` is the raw inventory's
+/// `(artifact_hash, source_manifest_hash)` when it must also match the basis.
+fn validate_basis(
+    p: &Provenance,
+    basis: &SemanticBasis,
+    producer: &Producer,
+    captured: &CapturedComponents,
+    expected_artifact_hash: Option<&String>,
+    raw_binding: Option<(&str, &str)>,
+    manifest_hash: &str,
+) -> Result<()> {
+    for field in [
+        &basis.producer_hash,
+        &basis.artifact_hash,
+        &basis.source_manifest_hash,
+        &basis.toolchain_hash,
+        &basis.config_hash,
+        &basis.dependency_hash,
+    ] {
+        hash(field)?;
+    }
+    ensure!(
+        basis.producer_id == p.producer_id
+            && basis.producer_version == producer.version
+            && basis.producer_hash == producer.executable_hash
+            && basis.revision_id == captured.captured_revision.id
+            && basis.source_set_id == captured.captured_revision.source_set_id
+            && basis.language == serde_json::from_value::<Language>(json!(p.document.language))?,
+        "captured basis identity mismatch"
+    );
+    ensure!(
+        basis.artifact_hash
+            == *expected_artifact_hash.context("missing captured semantic artifact")?
+            && raw_binding.is_none_or(|(artifact_hash, source_manifest_hash)| {
+                basis.artifact_hash == artifact_hash && source_manifest_hash == manifest_hash
+            })
+            && basis.source_manifest_hash == manifest_hash
+            && basis.toolchain_hash == captured.captured_revision.toolchain_hash
+            && basis.config_hash == captured.captured_revision.config_hash
+            && basis.dependency_hash == captured.captured_revision.dependency_hash,
+        "captured basis digest mismatch"
+    );
+    ordered(&basis.lookup_dependencies)?;
+    for lookup in &basis.lookup_dependencies {
+        text(lookup)?;
+        ensure!(
+            id_codec::encode_sid(lookup).is_none() && id_codec::encode_occ(lookup).is_none(),
+            "syntax ID is not a lookup key"
+        );
+    }
+    Ok(())
+}
+
 fn validate_evidence_inner(
     semantic: &SemanticPublication,
     native: &native::Artifact,
@@ -909,72 +1079,7 @@ fn validate_evidence_inner(
     }
     let mut coverage = BTreeMap::new();
     for row in &semantic.coverage {
-        text(&row.producer_id)?;
-        path(&row.document_path)?;
-        let producer = producers
-            .get(row.producer_id.as_str())
-            .context("dangling coverage producer")?;
-        ensure!(
-            row.revision_id == revision.id && row.source_set_id == revision.source_set_id,
-            "foreign coverage tuple"
-        );
-        let lang = serde_json::to_value(row.language)?
-            .as_str()
-            .unwrap()
-            .to_owned();
-        ensure!(
-            producer.languages.contains(&row.language)
-                && native.source_set.languages.contains(&lang)
-                && revision
-                    .documents
-                    .iter()
-                    .any(|d| d.key.source_set_id == row.source_set_id
-                        && d.key.language == lang
-                        && d.key.path == row.document_path),
-            "unsupported coverage document"
-        );
-        ordered(&row.supported_roles)?;
-        ordered(&row.observed_roles)?;
-        ensure!(
-            row.observed_roles
-                .iter()
-                .all(|r| row.supported_roles.contains(r)),
-            "observed role not supported"
-        );
-        if row.language == Language::Java {
-            ensure!(
-                !row.supported_roles.contains(&Role::Alias)
-                    && !row.observed_roles.contains(&Role::Alias),
-                "Java alias not applicable"
-            );
-        }
-        ensure!(
-            match row.state {
-                CoverageState::NotRequested => !row.requested && !row.selected,
-                CoverageState::Omitted | CoverageState::Unsupported =>
-                    row.requested && !row.selected,
-                CoverageState::Failed | CoverageState::Partial | CoverageState::Complete =>
-                    row.requested && row.selected,
-            },
-            "invalid coverage request/selection state"
-        );
-        if let Some(diagnostic) = &row.diagnostic {
-            text(diagnostic)?;
-        }
-        ensure!(
-            row.diagnostic.is_some()
-                == !matches!(
-                    row.state,
-                    CoverageState::NotRequested | CoverageState::Complete
-                ),
-            "coverage diagnostic mismatch"
-        );
-        if !matches!(row.state, CoverageState::Complete | CoverageState::Partial) {
-            ensure!(
-                row.observed_roles.is_empty(),
-                "unselected coverage observed roles"
-            );
-        }
+        let lang = validate_coverage_row(row, &producers, native)?;
         ensure!(
             coverage
                 .insert(
@@ -1097,34 +1202,7 @@ fn validate_evidence_inner(
             ensure!(p.derived_from.is_some(), "unwitnessed captured proof");
             admitted_proof(witness, p)?;
         }
-        if let Some(derived) = &p.derived_from {
-            ensure!(
-                p.revision_id == revision.id,
-                "derived proof revision mismatch"
-            );
-            let raw = raw
-                .as_ref()
-                .context("derived provenance requires authenticated raw inventory")?;
-            let kind = serde_json::to_value(derived.record_kind)?;
-            let claim = raw.inventory.lookup(
-                &derived.provenance_id,
-                kind.as_str().context("invalid raw record kind")?,
-                &derived.fact_digest,
-            )?;
-            ensure!(
-                p.producer_id == raw.producer_id
-                    && p.document.source_set_id == raw.source_set_id
-                    && p.document.language == claim.language
-                    && p.document.path == claim.path
-                    && raw.captured_revision == captured.captured_revision.id,
-                "derived provenance raw capture identity mismatch"
-            );
-        } else {
-            ensure!(
-                p.revision_id == captured.captured_revision.id,
-                "captured proof revision mismatch"
-            );
-        }
+        validate_provenance_row(p, raw.as_ref(), captured, revision)?;
         let row = coverage
             .get(&(
                 p.producer_id.as_str(),
@@ -1143,48 +1221,20 @@ fn validate_evidence_inner(
         let producer = producers
             .get(p.producer_id.as_str())
             .context("unknown proof producer")?;
-        for field in [
-            &basis.producer_hash,
-            &basis.artifact_hash,
-            &basis.source_manifest_hash,
-            &basis.toolchain_hash,
-            &basis.config_hash,
-            &basis.dependency_hash,
-        ] {
-            hash(field)?;
-        }
-        ensure!(
-            basis.producer_id == p.producer_id
-                && basis.producer_version == producer.version
-                && basis.producer_hash == producer.executable_hash
-                && basis.revision_id == captured.captured_revision.id
-                && basis.source_set_id == captured.captured_revision.source_set_id
-                && basis.language
-                    == serde_json::from_value::<Language>(json!(p.document.language))?,
-            "captured basis identity mismatch"
-        );
-        ensure!(
-            basis.artifact_hash
-                == *artifact_hashes
-                    .get(&p.producer_id)
-                    .context("missing captured semantic artifact")?
-                && raw.as_ref().is_none_or(|raw| witnessed.is_none()
-                    || (basis.artifact_hash == raw.inventory.artifact_hash
-                        && raw.inventory.source_manifest_hash == manifest_hash))
-                && basis.source_manifest_hash == manifest_hash
-                && basis.toolchain_hash == captured.captured_revision.toolchain_hash
-                && basis.config_hash == captured.captured_revision.config_hash
-                && basis.dependency_hash == captured.captured_revision.dependency_hash,
-            "captured basis digest mismatch"
-        );
-        ordered(&basis.lookup_dependencies)?;
-        for lookup in &basis.lookup_dependencies {
-            text(lookup)?;
-            ensure!(
-                id_codec::encode_sid(lookup).is_none() && id_codec::encode_occ(lookup).is_none(),
-                "syntax ID is not a lookup key"
-            );
-        }
+        validate_basis(
+            p,
+            basis,
+            producer,
+            captured,
+            artifact_hashes.get(&p.producer_id),
+            raw.as_ref().filter(|_| witnessed.is_some()).map(|raw| {
+                (
+                    raw.inventory.artifact_hash.as_str(),
+                    raw.inventory.source_manifest_hash.as_str(),
+                )
+            }),
+            &manifest_hash,
+        )?;
         let document = captured
             .captured_revision
             .documents

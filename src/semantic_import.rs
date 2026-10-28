@@ -7,6 +7,11 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod join_store;
+mod memory;
+use join_store::{JoinStore, NativeFacts};
+use memory::MemoryJoinStore;
+
 type AnchorKey = (native::DocumentKey, usize, usize, semantic::JoinKind);
 type ScopedKey = (String, Option<native::DocumentKey>);
 type LocalDeclarations = BTreeMap<ScopedKey, BTreeSet<(native::DocumentKey, String)>>;
@@ -755,25 +760,16 @@ pub fn join_inventory(
     let raw_index = InventoryIndex::new(inventory)?;
     let coordinates = CoordinateMaps::new(inventory, native, sources, admitted_encoding)?;
     let measured = MeasuredFacts::new(native, sources)?;
-    join_inventory_indexed(
-        inventory,
-        native,
-        sources,
-        admitted_encoding,
-        &raw_index,
-        &coordinates,
-        &measured,
-    )
+    let store = MemoryJoinStore::new(&raw_index, &coordinates, &measured);
+    join_inventory_indexed(inventory, native, sources, admitted_encoding, &store)
 }
 
-fn join_inventory_indexed(
+fn join_inventory_indexed<S: JoinStore>(
     inventory: &CapturedScipInventory,
     native: &native::Artifact,
     sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
     admitted_encoding: u8,
-    raw_index: &InventoryIndex<'_>,
-    coordinates: &CoordinateMaps,
-    measured: &MeasuredFacts<'_>,
+    store: &S,
 ) -> Result<JoinedFacts> {
     let mut out = JoinedFacts::default();
     let mut declarations: LocalDeclarations = BTreeMap::new();
@@ -781,7 +777,8 @@ fn join_inventory_indexed(
         BTreeMap::new();
     let mut occurrences = Vec::new();
     for claim in &inventory.claims {
-        raw_index.lookup(
+        store.charge(1)?;
+        store.lookup_proof(
             &claim.captured_proof_id,
             &claim.envelope.record_kind,
             &claim.fact_digest,
@@ -799,7 +796,7 @@ fn join_inventory_indexed(
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .context("missing occurrence symbol")?;
-            let range = coordinates.range(claim, admitted_encoding)?;
+            let range = store.occurrence_range(claim, admitted_encoding)?;
             #[cfg(feature = "test-support")]
             count_publication_work(|work| {
                 if work.destination_revision == native.revision.id {
@@ -815,18 +812,14 @@ fn join_inventory_indexed(
                 .as_i64()
                 .context("invalid syntax kind")?;
             let declaration = roles & 1 != 0;
-            let binding =
-                measured.join(&doc, range.clone(), semantic::JoinKind::DeclarationName)?;
-            let reference = measured.join(&doc, range.clone(), semantic::JoinKind::Reference)?;
-            let call = measured.join(&doc, range.clone(), semantic::JoinKind::Callee)?;
+            let binding = store.join(&doc, range.clone(), semantic::JoinKind::DeclarationName)?;
+            let reference = store.join(&doc, range.clone(), semantic::JoinKind::Reference)?;
+            let call = store.join(&doc, range.clone(), semantic::JoinKind::Callee)?;
             if declaration && binding.status == semantic::JoinStatus::Exact {
-                let candidate = measured
+                let candidate = store
                     .declaration(&binding.candidate_ids[0])
                     .context("missing exact native declaration")?;
-                let symbol_info = raw_index
-                    .symbol_info
-                    .get(&(doc.language.clone(), doc.path.clone(), symbol.to_owned()))
-                    .copied();
+                let symbol_info = store.symbol_info(&doc.language, &doc.path, symbol);
                 let compatible = symbol_info
                     .and_then(|c| c.envelope.raw["kind"].as_i64())
                     .is_some_and(|kind| match candidate.kind.as_str() {
@@ -901,14 +894,7 @@ fn join_inventory_indexed(
     let mut reference_claims: BTreeMap<String, Vec<(String, semantic::Target)>> = BTreeMap::new();
     let role_sites: BTreeMap<_, _> = sources
         .iter()
-        .map(|(doc, bytes)| {
-            #[cfg(feature = "test-support")]
-            note_parsed_role_site_document(doc);
-            Ok((
-                doc.clone(),
-                source_role_sites(doc.language.as_str(), bytes)?,
-            ))
-        })
+        .map(|(doc, bytes)| Ok((doc.clone(), store.role_sites(doc, bytes)?)))
         .collect::<Result<_>>()?;
     let mut call_reference_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut reference_indices: BTreeMap<String, usize> = BTreeMap::new();
@@ -917,8 +903,8 @@ fn join_inventory_indexed(
         let mut asserted = targets(&doc, &symbol);
         if asserted.is_empty()
             && key.scope == semantic::SymbolScope::Global
-            && !raw_index.declared_symbols.contains(&symbol)
-            && !raw_index.information_symbols.contains(&symbol)
+            && !store.is_declared_symbol(&symbol)
+            && !store.is_information_symbol(&symbol)
         {
             asserted.push(semantic::Target::External {
                 symbol: key.clone(),
@@ -961,42 +947,32 @@ fn join_inventory_indexed(
         let invocation = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
             let mut enclosing_claim = claim.clone();
             enclosing_claim.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
-            let span = coordinates.range(&enclosing_claim, admitted_encoding)?;
-            Some(measured.join(&doc, span, semantic::JoinKind::Invocation)?)
+            let span = store.occurrence_range(&enclosing_claim, admitted_encoding)?;
+            Some(store.join(&doc, span, semantic::JoinKind::Invocation)?)
         } else {
             None
         };
         if reference.status == semantic::JoinStatus::Exact {
-            let r = measured
+            let r = store
                 .reference(&reference.candidate_ids[0])
                 .context("missing indexed native reference")?;
             let declaration_site = roles & 1 != 0
-                && measured.declaration_names.contains_key(&(
-                    doc.clone(),
-                    r.range.start,
-                    r.range.end,
-                    r.spelling.clone(),
-                ));
+                && store.has_declaration_name(&doc, r.range.start, r.range.end, &r.spelling);
             let is_call = invocation.as_ref().is_some_and(|j| {
                 j.status == semantic::JoinStatus::Exact
-                    && measured
-                        .calls
-                        .get(&j.candidate_ids[0])
-                        .into_iter()
-                        .flatten()
-                        .any(|c| {
-                            c.id == j.candidate_ids[0]
-                                && c.document == doc
-                                && c.owner_syntax_id == r.owner_syntax_id
-                                && c.range.start <= r.range.start
-                                && r.range.end <= c.range.end
-                                && c.spelling.as_deref() == Some(&r.spelling)
-                                && c.callee_range
-                                    .as_ref()
-                                    .is_none_or(|callee| callee == &r.range)
-                                && (call.status != semantic::JoinStatus::Exact
-                                    || call.candidate_ids == j.candidate_ids)
-                        })
+                    && store.calls_by_id(&j.candidate_ids[0]).iter().any(|c| {
+                        c.id == j.candidate_ids[0]
+                            && c.document == doc
+                            && c.owner_syntax_id == r.owner_syntax_id
+                            && c.range.start <= r.range.start
+                            && r.range.end <= c.range.end
+                            && c.spelling.as_deref() == Some(&r.spelling)
+                            && c.callee_range
+                                .as_ref()
+                                .is_none_or(|callee| callee == &r.range)
+                            && (call.status != semantic::JoinStatus::Exact
+                                || call.candidate_ids == j.candidate_ids)
+                    })
             });
             let mut assigned = BTreeSet::new();
             if declaration_site {
@@ -1037,11 +1013,9 @@ fn join_inventory_indexed(
                 && roles & 2 != 0
                 && matches!(doc.language.as_str(), "javascript" | "rust")
                 && binding.status == semantic::JoinStatus::Exact
-                && measured
-                    .declarations
-                    .get(&binding.candidate_ids[0])
-                    .into_iter()
-                    .flatten()
+                && store
+                    .declarations_by_id(&binding.candidate_ids[0])
+                    .iter()
                     .any(|d| {
                         d.syntax_id == binding.candidate_ids[0]
                             && d.document == doc
@@ -1121,7 +1095,7 @@ fn join_inventory_indexed(
                         && j.candidate_ids == candidate.candidate_ids
                 })
             {
-                let actual = measured.call(&candidate.candidate_ids[0]);
+                let actual = store.call(&candidate.candidate_ids[0]);
                 if actual.is_some_and(|c| {
                     let primary = &reference.anchor.range;
                     c.document == doc
@@ -1132,11 +1106,9 @@ fn join_inventory_indexed(
                             == source
                                 .get(primary.start..primary.end)
                                 .and_then(|b| std::str::from_utf8(b).ok())
-                        && measured
-                            .references
-                            .get(&reference.candidate_ids[0])
-                            .into_iter()
-                            .flatten()
+                        && store
+                            .references_by_id(&reference.candidate_ids[0])
+                            .iter()
                             .any(|r| {
                                 r.id == reference.candidate_ids[0]
                                     && r.owner_syntax_id == c.owner_syntax_id
@@ -1318,7 +1290,7 @@ fn join_inventory_indexed(
             if target_candidates.is_empty()
                 && symbol_key(target_symbol, doc).scope == semantic::SymbolScope::Global
                 && !declarations.contains_key(&scoped_key(target_symbol, doc))
-                && !raw_index.information_symbols.contains(target_symbol)
+                && !store.is_information_symbol(target_symbol)
             {
                 target_candidates.push(semantic::Target::External {
                     symbol: symbol_key(target_symbol, doc),
@@ -1397,7 +1369,7 @@ fn join_inventory_indexed(
                 let owner_rows = source_owner
                     .and_then(|key| serde_json::to_value(key).ok())
                     .map(|key| native_ids::canonical(&key))
-                    .and_then(|key| measured.declaration_keys.get(&(doc.clone(), key)));
+                    .map(|key| store.declarations_by_key(doc, &key));
                 let owner_declarations: Vec<_> = owner_rows
                     .into_iter()
                     .flatten()
@@ -1435,11 +1407,7 @@ fn join_inventory_indexed(
                             .last()
                             .and_then(|key| serde_json::to_value(key).ok())
                             .map(|key| native_ids::canonical(&key))
-                            .and_then(|key| {
-                                measured
-                                    .declaration_keys
-                                    .get(&(method.document.clone(), key))
-                            })
+                            .map(|key| store.declarations_by_key(&method.document, &key))
                             .into_iter()
                             .flatten()
                             .copied()
@@ -2192,14 +2160,43 @@ pub(crate) fn rejoin_inventory_with_reuse(
         captured_sources,
         admitted_encoding,
     )?;
+    let captured_store = MemoryJoinStore::new(&raw_index, &coordinates, &r1);
+    let destination_store = MemoryJoinStore::new(&raw_index, &coordinates, r2);
+    rejoin_with_stores(
+        inventory,
+        captured_native,
+        captured_sources,
+        destination_native,
+        destination_sources,
+        producer,
+        basis,
+        admitted_encoding,
+        &captured_store,
+        &destination_store,
+        reusable,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rejoin_with_stores<S: JoinStore>(
+    inventory: &CapturedScipInventory,
+    captured_native: &native::Artifact,
+    captured_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    destination_native: &native::Artifact,
+    destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    producer: semantic::Producer,
+    basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
+    admitted_encoding: u8,
+    captured_store: &S,
+    destination_store: &S,
+    reusable: Option<&BTreeSet<native::DocumentKey>>,
+) -> Result<RejoinResult> {
     let captured = join_inventory_indexed(
         inventory,
         captured_native,
         captured_sources,
         admitted_encoding,
-        &raw_index,
-        &coordinates,
-        &r1,
+        captured_store,
     )?;
     let captured_declaration_proofs: BTreeSet<_> = captured
         .declaration_bindings
@@ -2265,7 +2262,8 @@ pub(crate) fn rejoin_inventory_with_reuse(
         }
     }
     for claim in &inventory.claims {
-        raw_index.lookup(
+        captured_store.charge(1)?;
+        captured_store.lookup_proof(
             &claim.captured_proof_id,
             &claim.envelope.record_kind,
             &claim.fact_digest,
@@ -2276,8 +2274,8 @@ pub(crate) fn rejoin_inventory_with_reuse(
             path: claim.envelope.relative_path.clone(),
         };
         requested.insert(doc.clone());
-        r1.documents
-            .get(&doc)
+        captured_store
+            .document(&doc)
             .context("captured claim outside source manifest")?;
         // MeasuredFacts::new authenticated each document once, not once per claim.
         captured_sources
@@ -2288,7 +2286,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             continue;
         }
         if claim.envelope.record_kind == "occurrence" {
-            let range = coordinates.range(claim, admitted_encoding)?;
+            let range = captured_store.occurrence_range(claim, admitted_encoding)?;
             #[cfg(feature = "test-support")]
             count_publication_work(|work| work.original_role_parses += 1);
             let roles = claim.envelope.raw["symbolRoles"]
@@ -2311,11 +2309,11 @@ pub(crate) fn rejoin_inventory_with_reuse(
             let measured = if reused_source {
                 // The authenticated selected version witnesses the same measured
                 // source association; only targets still consult the current r2.
-                &r1
+                captured_store
             } else {
-                r2
+                destination_store
             };
-            let first = r1.join(&doc, range.clone(), required)?;
+            let first = captured_store.join(&doc, range.clone(), required)?;
             let second = if reused_source {
                 first.clone()
             } else {
@@ -2344,7 +2342,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             let mut exact = first.status == semantic::JoinStatus::Exact
                 && second.status == semantic::JoinStatus::Exact;
             if captured_reference && required != semantic::JoinKind::Reference {
-                let first_reference = r1.join(
+                let first_reference = captured_store.join(
                     &doc,
                     first.anchor.range.clone(),
                     semantic::JoinKind::Reference,
@@ -2373,7 +2371,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
                 let first_call = if reused_source {
                     call.clone()
                 } else {
-                    r1.join(
+                    captured_store.join(
                         &doc,
                         binding.join.anchor.range.clone(),
                         binding.join.anchor.kind,
@@ -2385,30 +2383,24 @@ pub(crate) fn rejoin_inventory_with_reuse(
                 // The selected reference and invocation must belong to that same
                 // measured call, not merely be independent exact spans.
                 exact &= second.candidate_ids.first().is_some_and(|id| {
-                    measured
-                        .references
-                        .get(id)
-                        .into_iter()
-                        .flatten()
-                        .any(|reference| {
-                            &reference.id == id
-                                && call
-                                    .candidate_ids
-                                    .first()
-                                    .into_iter()
-                                    .flat_map(|id| measured.calls.get(id).into_iter().flatten())
-                                    .any(|candidate| {
-                                        call.candidate_ids == vec![candidate.id.clone()]
-                                            && candidate.owner_syntax_id
-                                                == reference.owner_syntax_id
-                                            && candidate.range.start <= reference.range.start
-                                            && reference.range.end <= candidate.range.end
-                                            && candidate
-                                                .callee_range
-                                                .as_ref()
-                                                .is_none_or(|callee| callee == &reference.range)
-                                    })
-                        })
+                    measured.references_by_id(id).iter().any(|reference| {
+                        &reference.id == id
+                            && call
+                                .candidate_ids
+                                .first()
+                                .into_iter()
+                                .flat_map(|id| measured.calls_by_id(id).iter())
+                                .any(|candidate| {
+                                    call.candidate_ids == vec![candidate.id.clone()]
+                                        && candidate.owner_syntax_id == reference.owner_syntax_id
+                                        && candidate.range.start <= reference.range.start
+                                        && reference.range.end <= candidate.range.end
+                                        && candidate
+                                            .callee_range
+                                            .as_ref()
+                                            .is_none_or(|callee| callee == &reference.range)
+                                })
+                    })
                 });
             }
             if exact {
@@ -2427,7 +2419,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             .iter()
             .any(|doc| doc.language == claim.language && doc.path == claim.envelope.relative_path)
     });
-    let filtered_index = InventoryIndex::new(&filtered)?;
+    let filtered_store = destination_store.restrict(&filtered)?;
     let destination = if let Some(reusable) = reusable {
         let metadata = inventory.proof_identities();
         let mut facts = reuse_captured_source_associations(
@@ -2444,15 +2436,13 @@ pub(crate) fn rejoin_inventory_with_reuse(
             })
         });
         if !delta.claims.is_empty() {
-            let delta_index = InventoryIndex::new(&delta)?;
+            let delta_store = destination_store.restrict(&delta)?;
             let joined = join_inventory_indexed(
                 &delta,
                 destination_native,
                 destination_sources,
                 admitted_encoding,
-                &delta_index,
-                &coordinates,
-                r2,
+                &delta_store,
             )?;
             facts.symbols.extend(joined.symbols);
             facts
@@ -2490,9 +2480,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
             destination_native,
             destination_sources,
             admitted_encoding,
-            &filtered_index,
-            &coordinates,
-            r2,
+            &filtered_store,
         )?
     };
     let metadata = inventory.proof_identities();
@@ -2506,8 +2494,8 @@ pub(crate) fn rejoin_inventory_with_reuse(
         destination_sources,
         producer,
         basis,
-        Some(&r1),
-        r2,
+        Some(captured_store),
+        destination_store,
         None,
         &proofs,
         &filtered_proofs,
@@ -2551,15 +2539,15 @@ impl<'a> ProofIdentityIndex<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_rejoin(
+fn finish_rejoin<F: NativeFacts>(
     inventory: &crate::scip_raw::ProofInventory,
     captured_native: &native::Artifact,
     destination_native: &native::Artifact,
     destination_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
     producer: semantic::Producer,
     basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
-    r1: Option<&MeasuredFacts<'_>>,
-    r2: &MeasuredFacts<'_>,
+    r1: Option<&F>,
+    r2: &F,
     target_projection: Option<
         &BTreeMap<(native::DocumentKey, String), semantic::TargetDeclaration>,
     >,
@@ -2633,15 +2621,11 @@ fn finish_rejoin(
                 revision_id,
             } => {
                 let original = if let Some(r1) = r1 {
-                    r1.declarations
-                        .get(syntax_id)
-                        .into_iter()
-                        .flatten()
-                        .any(|d| {
-                            d.syntax_id == *syntax_id
-                                && d.document == *document
-                                && d.name_range.is_some()
-                        })
+                    r1.declarations_by_id(syntax_id).iter().any(|d| {
+                        d.syntax_id == *syntax_id
+                            && d.document == *document
+                            && d.name_range.is_some()
+                    })
                 } else {
                     prior_declarations.contains(&(document.clone(), syntax_id.clone()))
                 };
@@ -2653,7 +2637,7 @@ fn finish_rejoin(
                         if decl.name_range.end <= decl.name_range.start || decl.name.is_empty() {
                             return false;
                         }
-                        if let Some(source) = r2.sources.get(document)
+                        if let Some(source) = r2.source(document)
                             && source.get(decl.name_range.start..decl.name_range.end)
                                 != Some(decl.name.as_str())
                         {
@@ -2664,10 +2648,8 @@ fn finish_rejoin(
                     }
                 } else {
                     let candidates: Vec<_> = r2
-                        .declarations
-                        .get(syntax_id)
-                        .into_iter()
-                        .flatten()
+                        .declarations_by_id(syntax_id)
+                        .iter()
                         .copied()
                         .filter(|d| {
                             d.syntax_id == *syntax_id
@@ -2683,8 +2665,7 @@ fn finish_rejoin(
                         return false;
                     };
                     if r2
-                        .sources
-                        .get(document)
+                        .source(document)
                         .and_then(|s| s.get(name.start..name.end))
                         != declaration.name.as_deref()
                     {
@@ -2952,10 +2933,7 @@ fn finish_rejoin(
                     ))?,
             "captured semantic basis differs from authenticated inventory"
         );
-        let dst = r2
-            .documents
-            .get(&doc)
-            .context("missing destination document")?;
+        let dst = r2.document(&doc).context("missing destination document")?;
         let freshness = if captured_native
             .revision
             .documents
