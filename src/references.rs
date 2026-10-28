@@ -181,7 +181,6 @@ fn project_inner(
     docs.sort_by(|a, b| a.key.cmp(&b.key));
     let mut identities = Vec::new();
     let mut modules = Vec::new();
-    let mut trees = Vec::new();
     let mut total_bytes = 0usize;
     let mut document_map = BTreeMap::new();
     for manifest in &snapshot.manifests {
@@ -229,11 +228,10 @@ fn project_inner(
             "bounded_work: reference source bytes"
         );
     }
-    for batch in docs.chunks(workers) {
-        trees.extend(map_batch(batch, workers, request, |doc| {
-            parse(doc, &mut request.worker())
-        })?);
-    }
+    // Parsing is unbudgeted, so one pass over every document keeps all workers busy.
+    let trees = map_all(&docs, workers, request, |doc| {
+        parse(doc, &mut request.worker())
+    })?;
     let selected: Vec<_> = docs
         .iter()
         .enumerate()
@@ -279,7 +277,8 @@ fn project_inner(
                         &selected,
                         &packages,
                         &mut work,
-                        &mut check,
+                        request,
+                        workers,
                     )?)
                 } else {
                     None
@@ -390,6 +389,17 @@ fn project_inner(
             }
         }
     }
+    // Freeing every syntax tree is serial native work; spread it across workers.
+    let trees: Vec<_> = trees
+        .into_iter()
+        .map(|tree| std::sync::Mutex::new(Some(tree)))
+        .collect();
+    crate::parallel::map_ordered(
+        &trees,
+        workers,
+        &std::sync::atomic::AtomicBool::new(false),
+        |_, tree| drop(tree.lock().unwrap_or_else(|e| e.into_inner()).take()),
+    );
     let mut production = Vec::new();
     let mut tests = Vec::new();
     for ((source, target, test), (count, sites)) in edges {
@@ -526,6 +536,33 @@ fn map_batch<T: Sync, R: Send>(
     results
         .into_iter()
         .map(|slot| slot.context("reference request stopped")?)
+        .collect()
+}
+
+/// Map every item in one parallel pass. After a failure no later item
+/// starts; items are claimed in input order, so every earlier item has already
+/// started and completes, and the error returned is the first in input order.
+fn map_all<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    request: &parallel_check::RequestCheck<'_>,
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    request.check()?;
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let results = crate::parallel::map_ordered(items, workers, &request.stopped, |_, item| {
+        if failed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let result = f(item);
+        if result.is_err() {
+            failed.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Some(result)
+    });
+    results
+        .into_iter()
+        .map(|slot| slot.flatten().context("reference request stopped")?)
         .collect()
 }
 
@@ -1022,6 +1059,39 @@ mod parallel_tests {
         .unwrap();
         assert!(matches!(&catalogs[0], CatalogJob::Rust(_)));
         assert!(matches!(&catalogs[1], CatalogJob::Java(_)));
+    }
+
+    /// One pass over every item: after a failure no later item starts, and the
+    /// reported error is the first in input order, not the first in time.
+    #[test]
+    fn single_pass_reports_first_failure_in_input_order_and_starts_nothing_later() {
+        let mut check = || Ok(());
+        let request = parallel_check::RequestCheck::new(&mut check);
+        let (failed_tx, failed_rx) = std::sync::mpsc::channel();
+        let failed_rx = Mutex::new(failed_rx);
+        let started = Mutex::new(Vec::new());
+        let result = map_all(&[0usize, 1, 2, 3], 2, &request, |&index| -> Result<usize> {
+            started.lock().unwrap().push(index);
+            match index {
+                // Fails only after item 1 has failed, and after every later item
+                // had the chance to start on the other worker.
+                0 => {
+                    failed_rx.lock().unwrap().recv().unwrap();
+                    anyhow::bail!("first source failure")
+                }
+                1 => {
+                    failed_tx.send(()).unwrap();
+                    anyhow::bail!("later source failure")
+                }
+                _ => Ok(index),
+            }
+        });
+        assert_eq!(result.unwrap_err().to_string(), "first source failure");
+        let mut started = started.into_inner().unwrap();
+        started.sort();
+        assert_eq!(started, vec![0, 1]);
+        let all = map_all(&[0usize, 1, 2, 3], 2, &request, |&index| Ok(index * 10));
+        assert_eq!(all.unwrap(), vec![0, 10, 20, 30]);
     }
 
     #[test]
