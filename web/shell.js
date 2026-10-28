@@ -31,6 +31,7 @@
       hide("inspector-empty", !get("inspector-content")?.hidden || !get("metric-inspector")?.hidden || !get("architecture-inspector")?.hidden || !get("treemap-inspector")?.hidden);
       get(`view-${activeView}`)?.focus();
     }
+    syncInspector();
   }
   function setSectionCallback(callback) { sectionCallback = callback; }
   function showFiles() {
@@ -50,6 +51,7 @@
     for (const id of ["metric-inspector-title", "metric-inspector-scope", "metric-inspector-values", "metric-inspector-top", "metric-inspector-state"]) get(id)?.replaceChildren();
     hide("inspector-empty", document.body.classList.contains("files-section") || !get("inspector-content")?.hidden);
     if (get("inspector-clear")) get("inspector-clear").disabled = !!get("inspector-content")?.hidden;
+    syncInspector();
   }
   function showMetricInspector() {
     clearTreemapInspector();
@@ -73,6 +75,7 @@
     get("architecture-inspector-title")?.replaceChildren();
     get("architecture-inspector-content")?.replaceChildren();
     document.body.classList.remove("architecture-inspector-active");
+    syncInspector();
   }
   function showArchitectureInspector() {
     resetInspector();
@@ -91,6 +94,7 @@
     }
     get("treemap-inspector-title")?.replaceChildren();
     get("treemap-inspector-content")?.replaceChildren();
+    syncInspector();
   }
   function showTreemapInspector() {
     resetInspector();
@@ -102,10 +106,26 @@
   function setInspectorClearCallback(callback) {
     inspectorClearCallback = typeof callback === "function" ? callback : null;
   }
+  // Desktop shows the inspector column only for a selection; the viewer may hide it.
+  let inspectorCollapsed = false;
+  const desktop = () => !window.matchMedia?.("(max-width: 900px)").matches;
+  function syncInspector() {
+    const selected = ["inspector-content", "metric-inspector", "architecture-inspector", "treemap-inspector"].some(id => get(id) && !get(id).hidden);
+    if (!selected) inspectorCollapsed = false;
+    document.body.classList.toggle("inspector-idle", !selected);
+    document.body.classList.toggle("inspector-collapsed", selected && inspectorCollapsed);
+    if (desktop() && !document.body.classList.contains("files-section")) get("inspector-toggle")?.setAttribute("aria-expanded", String(selected && !inspectorCollapsed));
+  }
+  function collapseInspector(collapsed) {
+    inspectorCollapsed = collapsed; syncInspector();
+    (collapsed ? get("inspector-toggle") : get("inspector-heading"))?.focus?.();
+  }
   function drawer(name, open) {
     if (open && window.matchMedia?.("(max-width: 900px)").matches) drawer(name === "explorer" ? "inspector" : "explorer", false);
     document.body.classList.toggle(`${name}-open`, open);
     get(`${name}-toggle`)?.setAttribute("aria-expanded", String(open));
+    if (name === "inspector" && open) inspectorCollapsed = false;
+    syncInspector();
   }
   function showView(name) {
     if (!Object.hasOwn(views, name)) return;
@@ -175,6 +195,7 @@
     if (get("inspector-open-source")) get("inspector-open-source").disabled = true;
     if (get("inspector-clear")) get("inspector-clear").disabled = true;
     if (get("inspector-title")) get("inspector-title").title = "";
+    syncInspector();
   }
   function targetText() { return "Terminal syntax only · no verified target"; }
   function sourceWitness(item) {
@@ -273,7 +294,11 @@
   get("section-diagrams")?.addEventListener("click", showDiagrams);
   get("section-files")?.addEventListener("click", showFiles);
   get("source-dock-close")?.addEventListener("click", closeSource);
-  for (const name of ["explorer", "inspector"]) get(`${name}-toggle`)?.addEventListener("click", () => drawer(name, !document.body.classList.contains(`${name}-open`)));
+  for (const name of ["explorer", "inspector"]) get(`${name}-toggle`)?.addEventListener("click", () => {
+    if (name === "inspector" && desktop() && !document.body.classList.contains("files-section")) return collapseInspector(!inspectorCollapsed);
+    drawer(name, !document.body.classList.contains(`${name}-open`));
+  });
+  get("inspector-collapse")?.addEventListener("click", () => collapseInspector(true));
   document.addEventListener("keydown", event => {
     if (event.key !== "Escape") return;
     const mobile = window.matchMedia?.("(max-width: 900px)").matches;

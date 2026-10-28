@@ -292,3 +292,15 @@ test("queued indexing can stop local waiting without cancelling the durable requ
  assert.deepEqual(requests,[["/api/index","POST"]]);
  assert.equal([...h.timers.values()].filter(t=>t.delay===700).length,0);
 });
+
+test("finished indexing states the indexed revision and file count instead of idle progress",()=>{
+ const h=harness();
+ h.run('status={revision:{indexGeneration:"97f5a37d-1234-4123-8123-123456789abc",indexRevision:3},stats:{files:352}};waitingForJob=false;job={id:"done",state:"done",progress:{phase:"",completed:0,total:0}};showJob()');
+ assert.equal(h.get("job").textContent,"Indexed · rev 97f5a37d:3 · 352 files");
+ h.run('job={id:"run",state:"running",progress:{phase:"parse",completed:0,total:0}};waitingForJob=true;showJob()');
+ assert.equal(h.get("job").textContent,"Indexing · parse");
+ h.run('job={id:"run",state:"running",progress:{phase:"parse",completed:5,total:9}};showJob()');
+ assert.equal(h.get("job").textContent,"Indexing · parse · 5/9");
+ h.run('job={id:"bad",state:"failed",error:"disk full"};waitingForJob=false;showJob()');
+ assert.match(h.get("job").textContent,/^Index failed · /);
+});

@@ -15,12 +15,16 @@
     const nodes = new Map(), edges = new Map(), layers = new Map(), native = new Set();
     const measure = options.measureText || (text => Array.from(text).length * 14);
     let serial = 0;
-    function label(kind, record, text) {
+    function label(kind, record, text, pad = false) {
       const id = kind + (serial++).toString(36), value = String(text).replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ");
       // Uniform safe placeholders reserve width before repository text is inserted.
       // A line is clipped, never shrunk; the accessible name keeps the full label.
-      const lineWidth = kind === "L" ? 380 : 150;
-      const full = value.split("\n"), display = full.map(line => {
+      const lineWidth = kind === "L" || kind === "U" ? (pad ? 460 : 380) : kind === "M" ? 150 : kind === "E" ? (pad ? 240 : 150) : kind === "N" ? 260 : 200;
+      // A padded summary band is blank at its top, middle and bottom, where
+      // edge counts that meet or cross it are drawn; padded edge counts use one line.
+      const lines = value.split("\n");
+      // A shared side box adds trailing blanks so its text sits above the rows' edge counts.
+      const full = !pad ? lines : kind === "E" ? [lines.join(" ")] : ["", lines[0], "", ...lines.slice(1), "", ...(record?.shared ? Array(6).fill("") : [])], display = full.map(line => {
         let result = "";
         for (const c of line) { if (measure(result + c + "…") > lineWidth) return result + "…"; result += c; }
         return result || " ";
@@ -28,57 +32,98 @@
       const reserve = "W".repeat(Math.ceil(lineWidth / measure("W")));
       const firstReserve = "W".repeat(Math.max(1,Math.ceil((lineWidth - measure(id + "_")) / measure("W"))));
       const placeholders = display.map((_, i) => i === 0 ? id + "_" + firstReserve : reserve);
-      return {id,kind,record,display,full:value,placeholder:placeholders.join("<br/>"),expected:placeholders.join("")};
+      return {id,kind,record,display,lineWidth,full:value,placeholder:placeholders.join("<br/>"),expected:placeholders.join("")};
     }
-    function addNode(kind, record, text) { const item = label(kind,record,text); nodes.set(item.id,item); return item; }
+    function addNode(kind, record, text, pad) { const item = label(kind,record,text,pad); nodes.set(item.id,item); return item; }
     const source = ["block-beta","columns 1"];
     function open(item, columns, span = 1) { item.composite = true; source.push(`block:${item.id}["${item.placeholder}"]:${span}`, `columns ${columns}`); }
-    const outer = addNode("B",null,"Architecture · structural references");
+    const outer = options.display ? null : addNode("B",null,"Architecture · structural references");
     const orderedStack = addNode("B",null,"Ordered layers");
-    const ordered = view.layers.filter(l => !l.shared).sort((a,b) => a.order-b.order || a.name.localeCompare(b.name));
-    const shared = view.layers.filter(l => l.shared).sort((a,b) => a.name.localeCompare(b.name));
+    // Optional summary display: the caller chooses drawn layers, expansion and
+    // directory entries. Without it every layer is expanded to file chips.
+    const display = options.display || null;
+    const names = new Set();
     for (const layer of view.layers) {
-      if (typeof layer.name !== "string" || layers.has(layer.name) || typeof layer.shared !== "boolean" || (!layer.shared && !Number.isSafeInteger(layer.order))) unsupported("Invalid or duplicate Architecture layer");
-      layers.set(layer.name,addNode("L",layer,options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${layer.order}`}`));
+      if (typeof layer.name !== "string" || names.has(layer.name) || typeof layer.shared !== "boolean" || (!layer.shared && !Number.isSafeInteger(layer.order))) unsupported("Invalid or duplicate Architecture layer");
+      names.add(layer.name);
     }
+    const drawn = view.layers.filter(l => !display || display.layers.has(l.name));
+    const ordered = drawn.filter(l => !l.shared).sort((a,b) => a.order-b.order || a.name.localeCompare(b.name));
+    const shared = drawn.filter(l => l.shared).sort((a,b) => a.name.localeCompare(b.name));
+    for (const layer of drawn) layers.set(layer.name,addNode("L",layer,options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${layer.order}`}`,!!display && !display.expanded(layer.name)));
     const moduleRows = new Map(view.layers.map(l => [l.name,[]])); moduleRows.set(null,[]);
     for (const module of view.modules) {
       if (!module.identity || !["sourceSetId","language","path","sid"].every(k => typeof module.identity[k] === "string") || native.has(identity(module)) || !moduleRows.has(module.layer)) unsupported("Invalid or duplicate Architecture module");
-      native.add(identity(module));
+      native.add(identity(module)); moduleRows.get(module.layer).push(module);
+    }
+    const heat = band => Number.isInteger(band) && band >= 0 && band < 4 ? band : null;
+    function leaf(item, span = 1) { source.push(`${item.id}["${item.placeholder}"]${span > 1 ? `:${span}` : ""}`); }
+    function moduleNode(module) {
       const value = options.metric === "layer" ? undefined : options.moduleValue?.(module);
       const item = addNode("M",module,`${module.identity.path}${value === null ? "\nUnavailable" : value === undefined ? "" : `\n${value}`}`);
-      const band = options.moduleBand?.(module);
-      item.band = Number.isInteger(band) && band >= 0 && band < 4 ? band : null;
-      moduleRows.get(module.layer).push(item);
+      item.band = heat(options.moduleBand?.(module)); leaf(item);
     }
-    function emitLayer(layer) {
-      const item = layers.get(layer.name); open(item,layer.shared ? 1 : 4);
-      const members = moduleRows.get(layer.name).sort((a,b) => identity(a.record).localeCompare(identity(b.record)));
-      if (!members.length) { const empty = addNode("B",null,"No indexed modules"); source.push(`${empty.id}["${empty.placeholder}"]`); }
-      for (const m of members) source.push(`${m.id}["${m.placeholder}"]`);
+    function emitEntries(entries, span) {
+      if (!entries.length) leaf(addNode("B",null,"No files shown"));
+      for (const entry of entries) {
+        if (entry.type === "module") moduleNode(entry.module);
+        else if (entry.type === "directory") {
+          const item = addNode("D",entry,entry.label); item.band = entry.open ? null : heat(entry.band);
+          if (entry.open) { open(item,4,span); emitEntries(entry.entries,4); source.push("end"); } else leaf(item);
+        } else if (entry.type === "note") leaf(addNode("N",entry,entry.label));
+        else unsupported("Invalid Architecture display entry");
+      }
+    }
+    function emitLayer(layer, span = 1) {
+      const item = layers.get(layer.name), columns = layer.shared ? 1 : 4;
+      const members = moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)));
+      if (display) {
+        item.expanded = !!display.expanded(layer.name);
+        if (!item.expanded) { leaf(item,span); return; }
+        open(item,columns,span); emitEntries(display.entries(layer.name,members),columns); source.push("end"); return;
+      }
+      open(item,columns);
+      if (!members.length) leaf(addNode("B",null,"No indexed modules"));
+      for (const m of members) moduleNode(m);
       source.push("end");
     }
-    open(outer,4 + shared.length); open(orderedStack,1,4);
-    if (!ordered.length) { const empty = addNode("B",null,"No ordered layers"); source.push(`${empty.id}["${empty.placeholder}"]`); }
-    for (const order of [...new Set(ordered.map(l => l.order))]) {
+    // Summary bands need no chip-width columns. Pele sizes a composite's children
+    // uniformly, so peers share the stack's grid instead of a taller wrapper block.
+    const stackSpan = display ? 1 : 4, orders = [...new Set(ordered.map(l => l.order))];
+    const width = display ? Math.max(1, ...orders.map(order => ordered.filter(l => l.order === order).length)) : 1;
+    if (display) source[1] = `columns ${stackSpan + shared.length}`; else open(outer,stackSpan + shared.length);
+    open(orderedStack,width,stackSpan);
+    if (!ordered.length) leaf(addNode("B",null,display ? "No ordered layers shown" : "No ordered layers"));
+    for (const order of orders) {
       const peers = ordered.filter(l => l.order === order);
+      if (display) {
+        const span = Math.floor(width / peers.length);
+        peers.forEach(layer => emitLayer(layer,span));
+        if (width > span * peers.length) source.push(`space:${width - span * peers.length}`);
+        continue;
+      }
       if (peers.length > 1) open(addNode("B",null,`Peer layers · order ${order}`),peers.length);
-      peers.forEach(emitLayer); if (peers.length > 1) source.push("end");
+      peers.forEach(layer => emitLayer(layer)); if (peers.length > 1) source.push("end");
     }
-    source.push("end"); shared.forEach(emitLayer); source.push("end");
-    if (moduleRows.get(null).length) {
+    source.push("end"); shared.forEach(layer => emitLayer(layer)); if (!display) source.push("end");
+    const unassigned = moduleRows.get(null);
+    if (display?.unassigned && unassigned.length) {
+      const item = addNode("U",display.unassigned,display.unassigned.label); item.expanded = !!display.unassigned.expanded;
+      if (item.expanded) { open(item,4,1 + shared.length); emitEntries(display.entries(null,unassigned),4); source.push("end"); } else { source.push(`${item.id}["${item.placeholder}"]:${1 + shared.length}`); }
+    } else if (!display && unassigned.length) {
       open(addNode("B",null,"Unassigned / unknown"),4);
-      for (const m of moduleRows.get(null)) source.push(`${m.id}["${m.placeholder}"]`);
+      for (const m of unassigned) moduleNode(m);
       source.push("end");
     }
     const seenEdges = new Set();
     for (const edge of view.edges) {
-      if (!layers.has(edge.sourceLayer) || !layers.has(edge.destinationLayer) || edge.sourceLayer === edge.destinationLayer || !["production","test"].includes(edge.role) || !["conforms","deviates","unknown"].includes(edge.status) || !Number.isSafeInteger(edge.count) || edge.count <= 0 || typeof edge.excepted !== "boolean" || seenEdges.has(edgeKey(edge))) unsupported("Invalid or duplicate Architecture edge");
+      if (!names.has(edge.sourceLayer) || !names.has(edge.destinationLayer) || edge.sourceLayer === edge.destinationLayer || !["production","test"].includes(edge.role) || !["conforms","deviates","unknown"].includes(edge.status) || !Number.isSafeInteger(edge.count) || edge.count <= 0 || typeof edge.excepted !== "boolean" || seenEdges.has(edgeKey(edge))) unsupported("Invalid or duplicate Architecture edge");
       seenEdges.add(edgeKey(edge));
       if (edge.role === "test" && !options.showTests) continue;
+      if (!layers.has(edge.sourceLayer) || !layers.has(edge.destinationLayer) || (display && !display.edge(edge))) continue;
       const from = layers.get(edge.sourceLayer).id, to = layers.get(edge.destinationLayer).id;
       const state = edge.status === "deviates" ? "deviation" : edge.status;
-      const item = label("E",edge,`${edge.count} ${edge.role} sites\n${state}${edge.excepted ? " · exception" : ""}`);
+      const item = label("E",edge,`${edge.count} ${edge.role} sites\n${state}${edge.excepted ? " · exception" : ""}`,!!display);
       Object.assign(item,{from,to}); edges.set(item.id,item);
       source.push(`${from} ${edge.role === "test" ? "-." : "--"} "${item.placeholder}" ${edge.role === "test" ? ".->" : "-->"} ${to}`);
     }
@@ -167,13 +212,18 @@
       }
       for (const {node,label,item,path} of controls.values()) {
         replaceLabel(label,item);
-        let callback;
-        if (item.kind === "M") {
+        let callback, expanded = null;
+        if (item.kind === "M" || (item.kind === "D" && !item.composite)) {
           const fill = item.band === null ? "#14151D" : colors[item.band];
           node.querySelector("rect")?.setAttribute("fill",fill); label.setAttribute("fill",item.band > 0 ? "#0B0C10" : "#F7F7FB");
-          callback = options.onSelectModule;
-        } else if (item.kind === "L") {
-          callback = options.onSelectLayer;
+          callback = item.kind === "M" ? options.onSelectModule : options.onToggleDirectory;
+          if (item.kind === "D") expanded = false;
+        } else if (item.kind === "D") { callback = options.onToggleDirectory; expanded = true; }
+        else if (item.kind === "U") { callback = options.onToggleUnassigned; expanded = item.expanded; }
+        else if (item.kind === "N") callback = options.onSelectNote;
+        else if (item.kind === "L") {
+          callback = options.display ? options.onToggleLayer : options.onSelectLayer;
+          if (options.display) expanded = item.expanded;
           const headerLines = [...label.querySelectorAll("tspan")];
           for (const line of headerLines) {
             if (!/^Up deviation: [1-9]/.test(line.textContent)) continue;
@@ -181,7 +231,8 @@
             const x = Number(line.getAttribute("x")), y = Number(line.getAttribute("y"));
             if (!Number.isFinite(x) || !Number.isFinite(y)) unsupported("Invalid Architecture header geometry");
             const badge = document.createElementNS(NS,"rect");
-            for (const [name,value] of Object.entries({x:x-192,y:y-15,width:384,height:20,fill:"#14151D",stroke:"#FF8E9A",rx:3})) badge.setAttribute(name,String(value));
+            const width = item.lineWidth + 4;
+            for (const [name,value] of Object.entries({x:x-width/2,y:y-15,width,height:20,fill:"#14151D",stroke:"#FF8E9A",rx:3})) badge.setAttribute(name,String(value));
             node.insertBefore(badge,label);
           }
         } else if (item.kind === "E") {
@@ -192,14 +243,18 @@
           callback = options.onSelectEdge;
         }
         if (!callback) continue;
-        node.setAttribute("role","button"); node.setAttribute("tabindex","0"); node.setAttribute("aria-label",item.full); node.setAttribute("aria-pressed","false"); node.setAttribute("data-trellis-architecture-id",item.id);
+        node.setAttribute("role","button"); node.setAttribute("tabindex","0"); node.setAttribute("aria-label",item.full); node.setAttribute("data-trellis-architecture-id",item.id);
+        // Disclosure nodes report expansion; selectable evidence reports selection.
+        if (expanded === null) node.setAttribute("aria-pressed","false"); else node.setAttribute("aria-expanded",String(expanded));
         if (item.kind === "M") node.setAttribute("data-trellis-module-id",identity(item.record));
         if (item.kind === "L") node.setAttribute("data-trellis-layer-id",item.record.name);
+        if (item.kind === "D") node.setAttribute("data-trellis-directory-id",item.record.key);
+        if (item.kind === "U") node.setAttribute("data-trellis-unassigned","true");
         if (item.kind === "E") node.setAttribute("data-trellis-edge-id",edgeKey(item.record));
         const select = event => {
           event?.stopPropagation();
           if (!current()) return;
-          for (const control of controls.values()) if (control.node.hasAttribute("aria-pressed")) control.node.setAttribute("aria-pressed",String(control.node === node));
+          if (expanded === null) for (const control of controls.values()) if (control.node.hasAttribute("aria-pressed")) control.node.setAttribute("aria-pressed",String(control.node === node));
           callback(item.record);
         };
         node.addEventListener("click",select); node.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); } });

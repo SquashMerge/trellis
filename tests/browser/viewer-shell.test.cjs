@@ -67,6 +67,11 @@ async function published(callback, signal) {
   mkdirSync(join(paths.workspace, "roles"));
   writeFileSync(join(paths.workspace, "roles", "mixed.rs"), mixedSource);
   writeFileSync(join(paths.workspace, "roles", "only.rs"), testOnlySource);
+  // Noise the explorer hides by default: a dot-directory and a folder with no indexed files.
+  mkdirSync(join(paths.workspace, ".tool-cache"));
+  writeFileSync(join(paths.workspace, ".tool-cache", "state.txt"), "cache\n");
+  mkdirSync(join(paths.workspace, "assets"));
+  writeFileSync(join(paths.workspace, "assets", "notes.txt"), "not source\n");
   let server, browser, context;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
@@ -568,3 +573,33 @@ test("retained Files and diagram evidence names the newer head until explicit ke
   await capture(page, "viewer-reloaded-head-mobile");
   return head;
 }, t.signal));
+
+test("explorer hides dot and unindexed folders, status says what was indexed, and the inspector appears only for a selection", {timeout:240000}, async () => published(async ({page}) => {
+  await page.waitForFunction(() => document.querySelector('.directory-pick[title="roles/"]') && !document.querySelector('.directory-pick[title="assets/"]'));
+  assert.equal(await page.locator('.directory-pick[title=".tool-cache/"]').count(), 0, "dot-directories are hidden by default");
+  assert.equal(await page.locator('.directory-pick[title="assets/"]').count(), 0, "a folder without indexed files is hidden by default");
+  assert.match(await page.locator("#files-state").textContent(), /2 hidden or unindexed entries not shown/);
+  const toggle = page.getByRole("checkbox", {name:"Show hidden/ignored", exact:true});
+  await toggle.focus(); await page.keyboard.press("Space");
+  await page.locator('.directory-pick[title=".tool-cache/"]').waitFor();
+  await page.locator('.directory-pick[title="assets/"]').waitFor();
+  assert.equal(await page.evaluate(key => localStorage.getItem(key), `trellis.files.showHidden.v1:${await page.locator("#checkout-select").inputValue()}`), "true", "the choice is remembered per checkout");
+  assert.doesNotMatch(await page.locator("#job").textContent(), /0\/0|· ·/, "idle status never shows empty progress");
+
+  // Desktop inspector: no placeholder column until something is selected.
+  await page.setViewportSize({width:1440, height:900});
+  assert.equal(await page.locator("#call-inspector").isVisible(), false, "no selection, no inspector column");
+  assert.equal(await page.locator("#inspector-toggle").isVisible(), false);
+  assert.match(await page.locator("footer details").textContent(), /Only measured source opens.*does not prove a path or runtime behavior/s, "standing caveats live in the evidence-limits footer");
+  await page.locator('.directory-pick[title="src/"]').click();
+  await page.locator("#call-inspector").waitFor({state:"visible"});
+  await page.locator("#inspector-collapse").click();
+  assert.equal(await page.locator("#call-inspector").isVisible(), false, "the inspector can be hidden without clearing the selection");
+  assert.equal(await page.locator("#inspector-toggle").getAttribute("aria-expanded"), "false");
+  assert.equal(await page.locator("#inspector-toggle").evaluate(node => document.activeElement === node), true);
+  await page.keyboard.press("Enter");
+  await page.locator("#call-inspector").waitFor({state:"visible"});
+  assert.equal(await page.locator("#inspector-toggle").getAttribute("aria-expanded"), "true");
+  await page.locator("#inspector-clear").click();
+  await page.locator("#call-inspector").waitFor({state:"hidden"});
+}));

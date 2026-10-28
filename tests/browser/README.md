@@ -122,6 +122,12 @@ Separate pre-start fixtures cover missing, empty and malformed configuration wit
 
 The UI checks cover hostile layer text under the real CSP, mouse/Enter/Space selection,
 production/test visibility, pinned cached-source actions and narrow-screen containment.
+The summary-first display (#391) is covered too: bands start collapsed, "Deviations only" starts
+on when a production deviation exists, layers without production edges sit in the quiet footer,
+authored `display` hints (`expanded`, `collapsed`, `hidden`) apply, and bands, directories and
+footers expand by keyboard with the choice remembered per checkout. Tests that need file chips
+expand every band and directory first. `viewer-shell.test.cjs` covers the hidden/ignored file-tree
+toggle, the idle status text and the inspector appearing only for a selection.
 Module Flow (#324) and the treemap action (#121) remain deferred; no placeholder claims
 that navigation works. `architecture-pele.test.cjs` checks pinned-renderer mapping, DOM-order independence,
 negative SVG admission and atomic render failure in real Chromium; timing-sensitive pin/rules races use deterministic unit/HTTP

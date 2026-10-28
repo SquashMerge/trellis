@@ -83,6 +83,32 @@ For an observed production structural reference pair:
 Conformance describes **that observed structural pair**, not the absence of hidden
 semantic dependencies in a module. A stricter no-skipping rule is not implicit.
 
+### Layer display hint
+
+By the [owner's #391 ruling](https://github.com/SquashMerge/trellis/issues/391), a
+layer may set an optional presentation hint for the browser Architecture view:
+
+```toml
+[layers.fixture-inputs]
+order = 9
+paths = ["tests/fixtures/**"]
+display = "hidden" # "expanded" | "collapsed" | "hidden"
+```
+
+- `"expanded"` draws the band with its directory chips open on first view.
+- `"collapsed"` draws a one-line summary band until the viewer expands it.
+- `"hidden"` leaves the band out of the diagram and lists it in a footer line
+  (`N hidden layers · M files · E edges`) from which the viewer can show it.
+
+Any other value, or a non-string, is a located `invalid_rules` schema error.
+Without the field the browser chooses: bands start collapsed, and a layer with no
+cross-layer production references is collapsed into the "quiet layers" footer.
+That automatic collapsing never applies to a layer with an explicit `display`.
+The hint is presentation only. Assignment, verdicts, counts, exceptions and every
+check, explain, references and MCP result are unchanged; only the browser
+Architecture layer inventory (`layers[].display`, `null` when absent) carries it.
+Rules edits preserve the field like any other authored text.
+
 ## External package policy
 
 A layer needs a nonempty `paths` or `external` collection; either selects that

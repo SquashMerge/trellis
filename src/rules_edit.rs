@@ -545,6 +545,32 @@ mod tests {
         );
     }
     #[test]
+    fn edits_preserve_layer_display_hints() {
+        let hinted = CONFIG.replace(
+            "[layers.b]\norder = 2\n",
+            "[layers.b]\norder = 2\ndisplay = 'hidden' # keep hint\n",
+        );
+        let config = rules::parse(&hinted).unwrap();
+        let request = |operations: Value| -> Request {
+            serde_json::from_value(json!({"indexGeneration":"f64aac54-3da7-4a00-8c9b-4ec2efdeff32","indexRevision":1,"baseHash":hash(&hinted),"operations":operations})).unwrap()
+        };
+        for operations in [
+            json!([{"type":"editException","index":0,"reason":"new"}]),
+            json!([{"type":"removeException","index":0}]),
+            json!([{"type":"assignFile","path":"src/new.rs","layer":"b"}]),
+            json!([{"type":"addExceptions","reason":"why","pairs":[{"source":{"language":"rust","path":"src/b.rs"},"destination":{"language":"rust","path":"src/a.rs"}}]}]),
+        ] {
+            let proposal = propose(&config, &request(operations), &mut || Ok(())).unwrap();
+            assert!(
+                proposal
+                    .config
+                    .text
+                    .contains("display = 'hidden' # keep hint")
+            );
+            assert_eq!(rules::view_layers(&proposal.config)[1]["display"], "hidden");
+        }
+    }
+    #[test]
     fn inline_exception_arrays_are_editable() {
         let inline = "version=1\nexceptions=[{rule='$layers',target={language='rust',path='a.rs'},destination={language='rust',path='b.rs'},reason='old'}] # keep\n[layers.a]\norder=1\npaths=['**']\n";
         let config = rules::parse(inline).unwrap();

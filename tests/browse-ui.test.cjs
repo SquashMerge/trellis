@@ -390,7 +390,7 @@ test("compact directory rendering and expansion stop at the depth bound", async 
 });
 
 test("nonindexed files and symlinks expose metadata without clickable source or methods", async () => {
-  const h=harness(); h.context.fetch=async()=>response(treePage('',[treeFile('.env'),{...treeFile('link'),kind:'symlink'}]));
+  const h=harness(); h.context.fetch=async()=>response(treePage('',[treeFile('notes.env'),{...treeFile('link'),kind:'symlink'}]));
   await h.run('loadTreeRoot()');
   assert.match(text(h.get('file-tree')), /Not indexed in current workspace/);
   assert.match(text(h.get('file-tree')), /Symbolic link · not followed/);
@@ -1226,4 +1226,28 @@ test("a pinned read queued at comparison completion starts the next head observa
   h.run("observePinnedHead()"); await settleHead();
   assert.deepEqual(requests,["/api/status","/api/status"]);
   assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
+});
+
+test("dot entries and indexed-snapshot folders without files stay hidden until Show hidden/ignored", async () => {
+  let known = path => path === 'src';
+  const metrics = {indexedDirectory:path => known(path), decorate(){}, renderLegend(){}, clearInspection(){}, inspect(){}, refresh(){}, reset(){}};
+  const h = harness({TrellisMetrics:{create:() => metrics}});
+  h.context.fetch = async () => response({...treePage('', [
+    {path:'.git',name:'.git',kind:'directory'}, {path:'build',name:'build',kind:'directory'}, {path:'src',name:'src',kind:'directory'},
+    treeFile('.env'), treeFile('README.md')]), indexedWorkspace:'/cwd'});
+  await h.run('loadTreeRoot()');
+  let rendered = text(h.get('file-tree'));
+  assert.match(rendered, /src\//); assert.match(rendered, /README\.md/);
+  assert.doesNotMatch(rendered, /\.git|\.env|build/);
+  assert.match(h.get('files-state').textContent, /3 hidden or unindexed entries not shown/);
+  const toggle = h.get('show-hidden-files');
+  toggle.checked = true; toggle.listeners.change({target:toggle});
+  rendered = text(h.get('file-tree'));
+  assert.match(rendered, /\.git\//); assert.match(rendered, /\.env/); assert.match(rendered, /build\//);
+  assert.equal(toggle.checked, true);
+  known = () => null;
+  toggle.checked = false; toggle.listeners.change({target:toggle});
+  rendered = text(h.get('file-tree'));
+  assert.match(rendered, /build\//, "folders stay visible while the indexed snapshot is unknown");
+  assert.doesNotMatch(rendered, /\.git/);
 });

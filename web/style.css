@@ -249,6 +249,7 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .browse-scope, .browse-options { flex: none; font-size: 12px; padding: 0 6px; margin: 4px 0; }
 .browse-options > label { display: block; margin-top: 8px; }
 #file-filter { width: 100%; margin-top: 6px; }
+.file-hidden-toggle { display: block; padding: 4px 6px 0; font-size: 12px; color: var(--secondary); }
 #files-state { flex: none; font-size: 12px; color: var(--secondary); padding: 0 6px; }
 #file-tree { flex: 1 0 150px; min-height: 150px; overflow: auto; overscroll-behavior: contain; }
 .file-tree ul { list-style: none; margin: 0; padding-left: 12px; }
@@ -354,7 +355,6 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .inspector-fields dd { margin: 0; color: var(--secondary); font: 12px/1.7 var(--mono); overflow-wrap: anywhere; white-space: pre-wrap; }
 #inspector-detail { font-size: 12px; line-height: 1.7; color: var(--secondary); overflow-wrap: anywhere; white-space: pre-wrap; }
 #inspector-open-source { width: 100%; margin-top: 20px; color: var(--link); border-color: var(--line-strong); }
-.inspector-footnote { margin: auto 0 0; padding-top: 28px; color: var(--muted); font-size: 11px; line-height: 1.7; }
 #metric-inspector { padding-top: 12px; }
 #metric-inspector-title { margin-top: 0; font: 13px/1.6 var(--mono); overflow-wrap: anywhere; }
 #metric-inspector-scope, #metric-inspector-state { font-size: 12px; }
@@ -363,7 +363,6 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .metric-inspector-values dd { text-align: right; font-family: var(--mono); }
 #metric-inspector-top li { padding: 6px 0; font-size: 12px; }
 #metric-inspector-top button { width: 100%; margin: 0; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); }
-.metric-inspector-active .inspector-footnote { display: none; }
 /* The read-only dock never replaces method selection. */
 #source-dock { display: flex; flex-direction: column; flex: 0 1 38%; min-height: 170px; max-height: 55%; border-top: 1px solid var(--line-strong); background: var(--rail); }
 .source-dock-bar { display: flex; justify-content: space-between; flex: none; gap: 6px; border-bottom: 1px solid var(--line-strong); background: var(--surface); padding: 0 10px; }
@@ -517,3 +516,19 @@ button:is(.selected, [aria-pressed="true"]):hover {
 }
 button:is(.selected, [aria-pressed="true"]) :is(span, strong, small, code, .detail, .muted) { color: inherit; }
 button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); color: inherit; border-color: currentColor; }
+
+/* Desktop: the inspector column appears only for a selection and can be hidden (#391). */
+#inspector-collapse { display: none; padding: 3px 6px; font-size: 11px; }
+@media (min-width: 901px) {
+  body:not(.files-section) #inspector-collapse { display: inline-block; }
+  body:not(.files-section).inspector-idle .call-inspector, body:not(.files-section).inspector-collapsed .call-inspector { display: none; }
+  body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 244px minmax(0, 1fr); }
+  body:not(.files-section):not(.inspector-idle) #inspector-toggle { display: inline-block; font-size: 12px; padding: 5px 8px; }
+  body:not(.files-section):not(.inspector-idle) #inspector-toggle[aria-expanded=true] { color: var(--on-selected); border-color: var(--selected); background: var(--selected); }
+}
+@media (min-width: 1600px) {
+  body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 268px minmax(0, 1fr); }
+}
+@media (min-width: 901px) and (max-width: 1200px) {
+  body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 214px minmax(0, 1fr); }
+}

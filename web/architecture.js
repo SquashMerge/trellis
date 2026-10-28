@@ -59,6 +59,7 @@
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
       get("architecture-notices").open = false;
+      get("architecture-quiet").hidden = true; get("architecture-hidden").hidden = true; get("architecture-focus-state").textContent = "";
       state(message, "empty");
     }
     function payloadOf(data, c) {
@@ -103,7 +104,6 @@
     function layerLabel(layer) {
       const modules = view.modules.filter(module => module.layer === layer.name);
       const values = modules.map(module => metricValue(module.metrics, metric)).filter(finite);
-      const prefix = layer.shared ? "Shared · any layer may use" : `Order ${layer.order}`;
       const outgoing = view.edges.filter(edge => edge.sourceLayer === layer.name && edge.role === "production");
       const byName = new Map(view.layers.map(item => [item.name, item]));
       let down = 0, up = 0, upDeviation = 0, other = 0, exceptions = 0;
@@ -118,10 +118,118 @@
         else if (edge.status === "deviates" && !edge.excepted) other += edge.count;
       }
       const packages = (view.references?.externalPackages || []).filter(item => layerOf(item.identity) === layer.name);
-      return [layer.name, `${prefix} · ${modules.length} files${packages.length ? ` · ${packages.length} external packages` : ""}`,
-        ...(metric === "layer" ? [] : [`Max module ${metric} (${aggregate})`, values.length ? String(values.reduce((max, value) => Math.max(max, value), -Infinity)) : "—"]),
-        `Prod refs down: ${down}`, `Prod refs up: ${up}`, `Up deviation: ${upDeviation}`, `Peer/shared deviation: ${other}`, `Excepted refs: ${exceptions}`].join("\n");
+      const max = values.length ? String(values.reduce((most, value) => Math.max(most, value), -Infinity)) : "—";
+      // Compact summary: a collapsed band is one short block, not a poster.
+      return [`${layer.shared ? "Shared" : layer.order} · ${layer.name} · ${modules.length} files${packages.length ? ` · ${packages.length} external packages` : ""}${metric === "layer" ? "" : ` · max ${metric} (${aggregate}) ${max}`}`,
+        `Up deviation: ${upDeviation} · peer/shared: ${other} · prod ↓${down} ↑${up} · excepted ${exceptions}`].join("\n");
     }
+    // Summary-first display (#391): presentation state only, remembered per checkout.
+    let shown = null, shownRoot = null;
+    const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+    const strings = value => Array.isArray(value) ? value.filter(item => typeof item === "string") : [];
+    const storageKey = rootKey => `trellis.architecture.display.v1:${rootKey}`;
+    function loadDisplay(rootKey) {
+      if (shown && rootKey === shownRoot) return;
+      shownRoot = rootKey; shown = {open:new Map(), drilled:new Set(), unassigned:false, quiet:false, hidden:false, deviationsOnly:null};
+      try {
+        const saved = JSON.parse(window.localStorage.getItem(storageKey(rootKey)) || "null");
+        if (saved && typeof saved === "object") shown = {
+          open:new Map((Array.isArray(saved.open) ? saved.open : []).filter(pair => Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "boolean")),
+          drilled:new Set(strings(saved.drilled)), unassigned:saved.unassigned === true, quiet:saved.quiet === true, hidden:saved.hidden === true,
+          deviationsOnly:typeof saved.deviationsOnly === "boolean" ? saved.deviationsOnly : null};
+      } catch { /* Browser storage is a convenience; the defaults stay usable. */ }
+    }
+    function saveDisplay() {
+      try {
+        window.localStorage.setItem(storageKey(shownRoot), JSON.stringify({open:[...shown.open], drilled:[...shown.drilled],
+          unassigned:shown.unassigned, quiet:shown.quiet, hidden:shown.hidden, deviationsOnly:shown.deviationsOnly}));
+      } catch { /* Not remembered; the current page still applies it. */ }
+    }
+    // Authored rules.toml presentation hint (#391 ruling); absent leaves the choice to the browser.
+    const hint = layer => ["expanded", "collapsed", "hidden"].includes(layer.display) ? layer.display : null;
+    const expanded = layer => shown.open.has(layer.name) ? shown.open.get(layer.name) : hint(layer) === "expanded";
+    const flagged = edge => (edge.status === "deviates" && !edge.excepted) || edge.status === "unknown";
+    function summary(payload) {
+      const production = payload.edges.filter(edge => edge.role === "production"), focusEdges = production.filter(flagged);
+      const active = new Set(production.flatMap(edge => [edge.sourceLayer, edge.destinationLayer]));
+      const focusLayers = new Set(focusEdges.flatMap(edge => [edge.sourceLayer, edge.destinationLayer]));
+      const involved = new Set(focusEdges.flatMap(edge => edge.pairs || []).flatMap(pair => [pair.source, pair.target])
+        .filter(identity => identity && !external(identity)).map(moduleKey));
+      const deviates = production.some(edge => edge.status === "deviates" && !edge.excepted);
+      const focus = focusEdges.length > 0 && (shown.deviationsOnly ?? deviates);
+      // Automatic quiet collapse applies only to layers without an authored display hint.
+      const quiet = payload.layers.filter(layer => hint(layer) === null && !active.has(layer.name));
+      const hidden = payload.layers.filter(layer => hint(layer) === "hidden");
+      const layers = new Set(payload.layers.filter(layer => hint(layer) === "hidden" ? shown.hidden : quiet.includes(layer) ? shown.quiet :
+        !focus || focusLayers.has(layer.name)).map(layer => layer.name));
+      const hiddenEdges = production.filter(edge => hidden.some(layer => layer.name === edge.sourceLayer || layer.name === edge.destinationLayer)).length;
+      return {focusEdges, focus, quiet, hidden, hiddenEdges, layers, involved};
+    }
+    function directoryOf(path, depth) {
+      const parts = path.split("/").slice(0, -1);
+      return parts.length ? parts.slice(0, depth).join("/") + "/" : "./";
+    }
+    function worst(modules) {
+      if (metric === "layer") return undefined;
+      const values = modules.map(module => metricValue(module.metrics, metric)).filter(finite);
+      if (!values.length) return null;
+      return metric === "maintainabilityIndex" ? Math.min(...values) : Math.max(...values);
+    }
+    // Directory chips first; files appear only when a directory is drilled into.
+    function entries(layerKey, modules, layout, cuts) {
+      const involved = module => layout.involved.has(moduleKey(module.identity));
+      const visible = layout.focus ? modules.filter(involved) : modules;
+      const measured = visible.filter(module => module.declarationCount > 0 || involved(module));
+      let depth = Math.max(1, ...measured.map(module => module.identity.path.split("/").length - 1)), groups;
+      do {
+        groups = new Map();
+        for (const module of measured) {
+          const directory = directoryOf(module.identity.path, depth);
+          if (!groups.has(directory)) groups.set(directory, []);
+          groups.get(directory).push(module);
+        }
+      } while (groups.size > 12 && --depth >= 1);
+      const result = [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([directory, members]) => {
+        members.sort((a, b) => a.identity.path.localeCompare(b.identity.path));
+        if (members.length === 1) return {type:"module", module:members[0]};
+        const key = JSON.stringify([layerKey, directory]), open = shown.drilled.has(key), value = worst(members);
+        const label = `${directory}\n${members.length} files${value === undefined ? "" : ` · ${metric === "maintainabilityIndex" ? "min" : "max"} ${display(value)}`}`;
+        return {type:"directory", key, label, open, band:band(value, cuts, metric), entries:open ? members.map(module => ({type:"module", module})) : []};
+      });
+      const lines = [], unmeasured = visible.length - measured.length, hidden = modules.length - visible.length;
+      if (unmeasured) lines.push(`${plural(unmeasured, "file")} · metrics unavailable`, `no ${callables()}`);
+      if (hidden) lines.push(`${plural(hidden, "file")} outside deviations`);
+      if (lines.length) result.push({type:"note", layerKey, label:lines.join("\n")});
+      return result;
+    }
+    function footer(id, layers, open, text) {
+      get(`architecture-${id}`).hidden = !layers.length;
+      const toggle = get(`architecture-${id}-toggle`);
+      toggle.textContent = `${open ? "▾" : "▸"} ${text}`; toggle.setAttribute("aria-expanded", String(open));
+      get(`architecture-${id}-names`).textContent = layers.map(layer => layer.name).join(", ");
+    }
+    function displayState(payload, layout) {
+      const files = layers => payload.modules.filter(module => layers.some(layer => layer.name === module.layer)).length;
+      footer("quiet", layout.quiet, shown.quiet, `${plural(layout.quiet.length, "quiet layer")} · ${plural(files(layout.quiet), "file")} · 0 production edges`);
+      footer("hidden", layout.hidden, shown.hidden, `${plural(layout.hidden.length, "hidden layer")} · ${plural(files(layout.hidden), "file")} · ${plural(layout.hiddenEdges, "production edge")}`);
+      const box = get("architecture-deviations-only");
+      box.disabled = !layout.focusEdges.length; box.checked = layout.focus;
+      get("architecture-focus-state").textContent = !layout.focusEdges.length ? "No deviating or unknown production references." :
+        layout.focus ? `Showing ${plural(layout.layers.size, "layer")} and ${plural(layout.involved.size, "file")} in deviating or unknown production references.` : "";
+    }
+    function refocus(target) {
+      for (const node of get("architecture-diagram").querySelectorAll?.("[role=button]") || []) {
+        if ((target.layer !== undefined && node.getAttribute("data-trellis-layer-id") === target.layer) ||
+            (target.directory !== undefined && node.getAttribute("data-trellis-directory-id") === target.directory) ||
+            (target.unassigned && node.hasAttribute("data-trellis-unassigned"))) { node.focus(); return; }
+      }
+    }
+    async function rerender(target, after) {
+      const c = basis;
+      if (!await render() || !usable() || !current(c)) return;
+      after?.(); refocus(target);
+    }
+    const flip = (set, key) => { if (set.has(key)) set.delete(key); else set.add(key); };
     function legend(cuts) {
       const target = get("architecture-legend"); target.replaceChildren();
       if (metric === "layer") { paragraph(target, "Layer membership · neutral chips; no metric heat."); return; }
@@ -135,12 +243,15 @@
       target.append(make("span", "Low heat → high heat · ties stay together · — unavailable"));
     }
     async function render() {
-      if (!usable() || view.state !== "ready") return;
+      if (!usable() || view.state !== "ready") return false;
       const c = basis, payload = view, ticket = ++renderSerial;
       const active = () => current(c) && view === payload && ticket === renderSerial && payload.rulesFile.contentHash === c.rulesHash;
       clearInspection(); get("architecture-diagram").replaceChildren();
       const cuts = metric === "layer" ? [] : quartiles(payload.modules.map(module => metricValue(module.metrics, metric)));
       legend(cuts);
+      const layout = summary(payload);
+      displayState(payload, layout);
+      const unassigned = payload.modules.filter(module => module.layer === null).length;
       try {
         if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
         const outcome = await window.TrellisArchitecturePele.render(get("architecture-diagram"), payload, {
@@ -148,25 +259,46 @@
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
           moduleBand:module => metric === "layer" ? null : band(metricValue(module.metrics, metric), cuts, metric),
           layerLabel,
+          display:{layers:layout.layers, expanded:name => expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, cuts),
+            edge:edge => !layout.focus || flagged(edge),
+            unassigned:layout.focus ? null : {label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, expanded:shown.unassigned}},
           onSelectModule:module => { if (active() && payload.modules.includes(module)) inspect("module", module); },
           onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) inspect("edge", edge); },
           onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },
+          onToggleLayer:layer => {
+            if (!active() || !payload.layers.includes(layer)) return;
+            shown.open.set(layer.name, !expanded(layer)); saveDisplay();
+            return rerender({layer:layer.name}, () => inspect("layer", layer));
+          },
+          onToggleDirectory:entry => {
+            if (!active() || typeof entry?.key !== "string") return;
+            flip(shown.drilled, entry.key); saveDisplay(); return rerender({directory:entry.key});
+          },
+          onToggleUnassigned:() => { if (!active()) return; shown.unassigned = !shown.unassigned; saveDisplay(); return rerender({unassigned:true}); },
+          onSelectNote:entry => {
+            if (!active()) return;
+            const layer = payload.layers.find(item => item.name === entry?.layerKey);
+            if (layer) inspect("layer", layer); else inspect("unknown", null);
+          },
         });
-        if (!active()) return;
+        if (!active()) return false;
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
-        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}. Metrics: ${aggregate}, ${population()}.`, "ready");
+        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}${layout.focus ? " · deviations only" : ""}. Metrics: ${aggregate}, ${population()}.`, "ready");
+        return true;
       } catch (error) {
-        if (!active()) return;
+        if (!active()) return false;
         get("architecture-diagram").replaceChildren(); get("architecture-legend").replaceChildren(); clearInspection();
         state(error.message || "Architecture rendering failed. Nothing displayed.", "error");
+        return false;
       }
     }
     async function refresh(options = {}) {
       reset(undefined, options.keepDraft === true);
       const c = capture();
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Architecture.", "empty"); return; }
+      loadDisplay(c.rootKey);
       state("Reading indexed architecture and reviewed rules…", "loading"); get("architecture-diagram").setAttribute("aria-busy", "true");
       try {
         const query = new URLSearchParams({aggregate:c.aggregate, role:c.role, indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
@@ -556,6 +688,14 @@
       role = next; return refresh();
     });
     get("architecture-refresh").addEventListener("click", refresh);
+    get("architecture-deviations-only").addEventListener("change", event => {
+      if (!usable()) return;
+      shown.deviationsOnly = event.target.checked; saveDisplay(); return render();
+    });
+    for (const id of ["quiet", "hidden"]) get(`architecture-${id}-toggle`).addEventListener("click", () => {
+      if (!usable()) return;
+      shown[id] = !shown[id]; saveDisplay(); return rerender({});
+    });
     get("architecture-color").addEventListener("change", event => { metric = event.target.value; return render(); });
     get("architecture-tests").addEventListener("change", event => { showTests = event.target.checked; return render(); });
     get("architecture-aggregate").addEventListener("change", event => {
