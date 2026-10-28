@@ -256,6 +256,38 @@ fn config_and_pin_failures_are_atomic_and_cancelled_reads_do_not_publish_results
     );
 }
 
+/// Snapshot admission decodes documents in parallel. A deadline at any poll,
+/// including one inside a decode worker, fails the whole check with that error.
+#[test]
+fn deadline_at_every_poll_fails_the_check_atomically() {
+    let (_state, root, store, _pin) = fixture();
+    config(root.path(), RULES);
+    let response = store.evidence_response().unwrap();
+    let mut polls = 0usize;
+    let complete = response
+        .architecture_response("check", &json!({}), &mut || {
+            polls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert!(polls > 3);
+    for fail_at in 1..=polls {
+        let mut seen = 0usize;
+        let error = response
+            .architecture_response("check", &json!({}), &mut || {
+                seen += 1;
+                anyhow::ensure!(seen < fail_at, "deadline_exceeded");
+                Ok(())
+            })
+            .expect_err("a failed poll returns no partial result");
+        assert_eq!(error.to_string(), "deadline_exceeded", "poll {fail_at}");
+    }
+    let again = response
+        .architecture_response("check", &json!({}), &mut || Ok(()))
+        .unwrap();
+    assert_eq!(again, complete);
+}
+
 #[test]
 fn portable_exception_matches_two_real_clones_without_replacing_native_identities() {
     let (_state_a, root_a, store_a, pin_a) = fixture();

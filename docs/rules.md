@@ -435,14 +435,19 @@ not enlarge a pathological document's local traversal allowance or evidence
 memory bound. The five-second MCP request deadline and cancellation checks are
 unchanged and independent of work accounting.
 
-Per-file parsing, source extraction/owner-call binding and rule declaration
-work run in bounded batches of at most eight workers. Independent language
-catalog builds may run concurrently; Rust name resolution remains ordered.
-Workers count local work against the phase's remaining allowance; one ordered
-owner admits their counts and rows into the request total. A batch may perform
+Snapshot admission reads every selected document's rows on one connection, then
+decodes them on at most eight workers. Per-file parsing is unbudgeted and runs as
+one pass over all documents; after a failure no later document starts. Source
+extraction/owner-call binding and rule declaration work run in bounded batches
+of at most eight workers. Independent language catalog builds may run
+concurrently, and the JavaScript catalog computes selected documents' write and
+CommonJS hazards in parallel; Rust name resolution remains ordered. Workers
+count local work against the phase's remaining allowance; one ordered owner
+admits their counts and rows into the request total. A batch may perform
 bounded speculative work, but workers never receive independent admitted
-request budgets. Actual CPU work can reach about eight times the allowance
-before failure is reported, with the unchanged five-second deadline as backstop.
+request budgets. Actual CPU work can reach about eleven times the allowance
+(three catalog jobs beside eight JavaScript hazard workers) before failure is
+reported, with the unchanged five-second deadline as backstop.
 Serial and parallel plans use the same phases, charge units and output order.
 Failure discards the whole result.
 

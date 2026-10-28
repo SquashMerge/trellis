@@ -181,7 +181,6 @@ fn project_inner(
     docs.sort_by(|a, b| a.key.cmp(&b.key));
     let mut identities = Vec::new();
     let mut modules = Vec::new();
-    let mut trees = Vec::new();
     let mut total_bytes = 0usize;
     let mut document_map = BTreeMap::new();
     for manifest in &snapshot.manifests {
@@ -229,11 +228,10 @@ fn project_inner(
             "bounded_work: reference source bytes"
         );
     }
-    for batch in docs.chunks(workers) {
-        trees.extend(map_batch(batch, workers, request, |doc| {
-            parse(doc, &mut request.worker())
-        })?);
-    }
+    // Parsing is unbudgeted, so one pass over every document keeps all workers busy.
+    let trees = map_all(&docs, workers, request, |doc| {
+        parse(doc, &mut request.worker())
+    })?;
     let selected: Vec<_> = docs
         .iter()
         .enumerate()
@@ -279,7 +277,8 @@ fn project_inner(
                         &selected,
                         &packages,
                         &mut work,
-                        &mut check,
+                        request,
+                        workers,
                     )?)
                 } else {
                     None
@@ -390,6 +389,17 @@ fn project_inner(
             }
         }
     }
+    // Freeing every syntax tree is serial native work; spread it across workers.
+    let trees: Vec<_> = trees
+        .into_iter()
+        .map(|tree| std::sync::Mutex::new(Some(tree)))
+        .collect();
+    crate::parallel::map_ordered(
+        &trees,
+        workers,
+        &std::sync::atomic::AtomicBool::new(false),
+        |_, tree| drop(tree.lock().unwrap_or_else(|e| e.into_inner()).take()),
+    );
     let mut production = Vec::new();
     let mut tests = Vec::new();
     for ((source, target, test), (count, sites)) in edges {
@@ -526,6 +536,51 @@ fn map_batch<T: Sync, R: Send>(
     results
         .into_iter()
         .map(|slot| slot.context("reference request stopped")?)
+        .collect()
+}
+
+/// Map every item in one parallel pass. After a failure no later item starts;
+/// every earlier item still runs, so the error returned is the first in input
+/// order whatever the schedule.
+fn map_all<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    request: &parallel_check::RequestCheck<'_>,
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    map_all_hooked(items, workers, request, &|_| {}, &|_| {}, f)
+}
+
+/// `map_all` with test hooks: `entered` runs after an index is claimed and
+/// before it may be skipped; `failed` runs after a failure is recorded.
+fn map_all_hooked<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    request: &parallel_check::RequestCheck<'_>,
+    entered: &(dyn Fn(usize) + Sync),
+    failed: &(dyn Fn(usize) + Sync),
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    request.check()?;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Lowest failed index so far. Only items after it are skipped, so a skipped
+    // slot always follows an actual error in input order.
+    let first_failure = AtomicUsize::new(usize::MAX);
+    let results = crate::parallel::map_ordered(items, workers, &request.stopped, |index, item| {
+        entered(index);
+        if index > first_failure.load(Ordering::Acquire) {
+            return None;
+        }
+        let result = f(item);
+        if result.is_err() {
+            first_failure.fetch_min(index, Ordering::AcqRel);
+            failed(index);
+        }
+        Some(result)
+    });
+    results
+        .into_iter()
+        .map(|slot| slot.flatten().context("reference request stopped")?)
         .collect()
 }
 
@@ -1022,6 +1077,82 @@ mod parallel_tests {
         .unwrap();
         assert!(matches!(&catalogs[0], CatalogJob::Rust(_)));
         assert!(matches!(&catalogs[1], CatalogJob::Java(_)));
+    }
+
+    /// One pass over every item: after a failure no later item starts, and the
+    /// reported error is the first in input order, not the first in time.
+    #[test]
+    fn single_pass_reports_first_failure_in_input_order_and_starts_nothing_later() {
+        let mut check = || Ok(());
+        let request = parallel_check::RequestCheck::new(&mut check);
+        let (failed_tx, failed_rx) = std::sync::mpsc::channel();
+        let failed_rx = Mutex::new(failed_rx);
+        let started = Mutex::new(Vec::new());
+        let result = map_all(&[0usize, 1, 2, 3], 2, &request, |&index| -> Result<usize> {
+            started.lock().unwrap().push(index);
+            match index {
+                // Fails only after item 1 has failed, and after every later item
+                // had the chance to start on the other worker.
+                0 => {
+                    failed_rx.lock().unwrap().recv().unwrap();
+                    anyhow::bail!("first source failure")
+                }
+                1 => {
+                    failed_tx.send(()).unwrap();
+                    anyhow::bail!("later source failure")
+                }
+                _ => Ok(index),
+            }
+        });
+        assert_eq!(result.unwrap_err().to_string(), "first source failure");
+        let mut started = started.into_inner().unwrap();
+        started.sort();
+        assert_eq!(started, vec![0, 1]);
+        let all = map_all(&[0usize, 1, 2, 3], 2, &request, |&index| Ok(index * 10));
+        assert_eq!(all.unwrap(), vec![0, 10, 20, 30]);
+    }
+
+    /// An earlier index claimed before a later failure, but not yet past the
+    /// skip check, still runs: the later typed failure is never masked.
+    #[test]
+    fn a_claimed_earlier_item_runs_after_a_later_typed_failure() {
+        for message in [
+            "invalid_source_syntax",
+            "bounded_work: reference owner lookup",
+        ] {
+            let mut check = || Ok(());
+            let request = parallel_check::RequestCheck::new(&mut check);
+            let (failed_tx, failed_rx) = std::sync::mpsc::channel();
+            let failed_rx = Mutex::new(failed_rx);
+            let entered = |index: usize| {
+                if index == 0 {
+                    failed_rx.lock().unwrap().recv().unwrap();
+                }
+            };
+            let failed = |index: usize| {
+                if index == 1 {
+                    failed_tx.send(()).unwrap();
+                }
+            };
+            let ran = Mutex::new(Vec::new());
+            let result = map_all_hooked(
+                &[0usize, 1, 2],
+                2,
+                &request,
+                &entered,
+                &failed,
+                |&index| -> Result<usize> {
+                    ran.lock().unwrap().push(index);
+                    anyhow::ensure!(index != 1, "{message}");
+                    Ok(index)
+                },
+            );
+            assert_eq!(result.unwrap_err().to_string(), message);
+            let mut ran = ran.into_inner().unwrap();
+            ran.sort();
+            assert_eq!(ran, vec![0, 1]);
+            assert!(request.result(Ok(())).is_ok());
+        }
     }
 
     #[test]

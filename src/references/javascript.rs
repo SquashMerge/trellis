@@ -81,6 +81,7 @@ struct Resolver<'a> {
     named_memo: BTreeMap<(usize, String, usize, Route), Arc<Bucket>>,
 }
 impl Catalog {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         docs: &[&DocumentInput],
         trees: &[Tree],
@@ -88,8 +89,10 @@ impl Catalog {
         selected: &[usize],
         packages: &external::JavascriptPackages,
         work: &mut Work,
-        check: &mut impl FnMut() -> Result<()>,
+        request: &parallel_check::RequestCheck<'_>,
+        workers: usize,
     ) -> Result<Self> {
+        let check = &mut request.worker();
         let mut resolver = Resolver {
             docs,
             trees,
@@ -129,6 +132,32 @@ impl Catalog {
             unit.test_only = test_only;
             owner_step(work, check)?;
             resolver.units.insert(document, Arc::new(unit));
+        }
+        // Selected hazards are independent per document: compute them in batches
+        // of `workers`, each against the allowance remaining before its batch, and
+        // admit their counts in document order.
+        let pending: Vec<usize> = selected
+            .iter()
+            .copied()
+            .filter(|document| resolver.units.contains_key(document))
+            .collect();
+        for batch in pending.chunks(workers.max(1)) {
+            let remaining = work.remaining();
+            let computed = map_all(batch, workers, request, |&document| {
+                let mut local = Work::new(remaining);
+                let hazards = body_hazards(
+                    docs[document],
+                    trees[document].root_node(),
+                    &mut local,
+                    &mut request.worker(),
+                )?;
+                Ok((hazards, local.used))
+            })?;
+            for (&document, (hazards, used)) in batch.iter().zip(computed) {
+                merge_work(work, used, check)?;
+                owner_step(work, check)?;
+                resolver.hazards.insert(document, hazards);
+            }
         }
         let mut catalog = Self {
             results: BTreeMap::new(),
@@ -811,7 +840,7 @@ fn insert_export(
 fn imported_name(doc: &DocumentInput, node: Node<'_>) -> Option<(String, Option<String>)> {
     match node.kind() {
         "identifier" if node.parent().is_some_and(|p| p.kind() == "import_clause") => {
-            name(doc, node).map(|local| (local, Some("default".into())))
+            imported_name_in_clause(doc, node)
         }
         "import_specifier" => node.child_by_field_name("name").and_then(|original| {
             name(doc, node.child_by_field_name("alias").unwrap_or(original))
@@ -823,6 +852,16 @@ fn imported_name(doc: &DocumentInput, node: Node<'_>) -> Option<(String, Option<
                 .find_map(|n| name(doc, n))
                 .map(|local| (local, None))
         }
+        _ => None,
+    }
+}
+/// `imported_name` for a node already known to be a direct child of an import clause.
+fn imported_name_in_clause(
+    doc: &DocumentInput,
+    node: Node<'_>,
+) -> Option<(String, Option<String>)> {
+    match node.kind() {
+        "identifier" => name(doc, node).map(|local| (local, Some("default".into()))),
         _ => None,
     }
 }
@@ -1260,7 +1299,21 @@ fn body_hazards(
     let mut hazards = Hazards::default();
     // Collect whole lexical scopes first: a later inner let/parameter shadows an outer write too.
     walk(root, check, &mut |node, check| {
-        if let Some((local, _)) = imported_name(doc, node) {
+        // A default import is an identifier child of its import clause. Record it
+        // from the clause: `Node::parent` on every identifier is a walk from the root.
+        if node.kind() == "import_clause" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some((local, _)) = imported_name_in_clause(doc, child) {
+                    charge(local.len() + 1, work, check)?;
+                    scopes.entry(root.id()).or_default().insert(local);
+                }
+            }
+            return Ok(false);
+        }
+        if node.kind() != "identifier"
+            && let Some((local, _)) = imported_name(doc, node)
+        {
             charge(local.len() + 1, work, check)?;
             scopes.entry(root.id()).or_default().insert(local);
             return Ok(true);
@@ -1616,5 +1669,46 @@ mod tests {
             assert!(resolver.memo.is_empty());
             assert!(resolver.named_memo.is_empty());
         });
+    }
+
+    fn hazards_for(text: &str) -> (Hazards, usize) {
+        let doc = DocumentInput {
+            key: DocumentKey {
+                source_set_id: "source".into(),
+                language: "javascript".into(),
+                path: "use.js".into(),
+            },
+            file: crate::model::SourceFile {
+                path: "use.js".into(),
+                hash: "hash".into(),
+                language: "javascript".into(),
+                text: text.into(),
+            },
+            declarations: Vec::new(),
+            calls: Vec::new(),
+        };
+        let tree = parse(&doc, &mut || Ok(())).unwrap();
+        let mut work = Work::new(5_000_000);
+        let hazards = body_hazards(&doc, tree.root_node(), &mut work, &mut || Ok(())).unwrap();
+        (hazards, work.used)
+    }
+
+    /// Default imports are recorded from their clause, not by asking each
+    /// identifier for its parent; bindings and charges match named imports.
+    #[test]
+    fn default_import_bindings_shadow_commonjs_names_and_charge_like_named_imports() {
+        let (unbound, _) = hazards_for("module.exports = 1;");
+        assert!(unbound.dynamic);
+        let (default, default_used) =
+            hazards_for("import module from './m.js'; module.exports = 1;");
+        assert!(!default.dynamic);
+        let (named, named_used) =
+            hazards_for("import { module } from './m.js'; module.exports = 1;");
+        assert!(!named.dynamic);
+        assert_eq!(default_used, named_used);
+        let (nested, _) = hazards_for("function f() { const module = 1; } module.exports = 1;");
+        assert!(nested.dynamic);
+        let (write, _) = hazards_for("import value from './m.js'; value = 2;");
+        assert_eq!(write.writes, BTreeSet::from(["value".to_string()]));
     }
 }

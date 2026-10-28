@@ -1655,12 +1655,13 @@ impl EvidenceResponse {
         )?;
         let mut cursor = statement.query([&selected.key])?;
         let mut documents = Vec::new();
+        let mut pending = Vec::new();
         let mut source_bytes = 0u64;
         let mut stored_bytes = 0u64;
         while let Some(row) = cursor.next()? {
             check()?;
             ensure!(
-                documents.len() < 100_000,
+                pending.len() < 100_000,
                 "bounded_work: architecture documents"
             );
             let key = DocumentKey {
@@ -1698,22 +1699,73 @@ impl EvidenceResponse {
                 );
                 let fetched =
                     self.store
-                        .fetch_selected_rows(&self.db, header, &selected, Some(&expired));
+                        .fetch_selected_raw(&self.db, header, &selected, Some(&expired));
                 if let Some(error) = progress_failure.lock().unwrap().take() {
                     return Err(error);
                 }
                 fetched?
             };
-            selected_ensure!(
-                fetched.file.language == key.language,
-                "incompatible_index: architecture language mismatch"
+            pending.push((key, std::sync::Mutex::new(Some(fetched))));
+        }
+        // SQLite reads stay on this connection; decoding needs no connection, so
+        // it runs in parallel. The first decode failure in document order is reported.
+        {
+            let stopped = std::sync::atomic::AtomicBool::new(false);
+            let progress_failure = Mutex::new(None);
+            let check = Mutex::new(&mut *check);
+            let expired = || {
+                if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    return true;
+                }
+                match (*check.lock().unwrap())() {
+                    Ok(()) => false,
+                    Err(error) => {
+                        *progress_failure.lock().unwrap() = Some(error);
+                        stopped.store(true, std::sync::atomic::Ordering::Release);
+                        true
+                    }
+                }
+            };
+            let decoded = crate::parallel::map_ordered(
+                &pending,
+                crate::parallel::default_workers(),
+                &stopped,
+                |_, (_, decode)| {
+                    let decode = decode
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .expect("each fetched document is decoded once");
+                    // Poll the shared request callback once per 256 rows per worker.
+                    let polls = std::cell::Cell::new(0usize);
+                    let poll = || {
+                        let due = polls.get() == 0;
+                        polls.set((polls.get() + 1) % 256);
+                        if due {
+                            expired()
+                        } else {
+                            stopped.load(std::sync::atomic::Ordering::Acquire)
+                        }
+                    };
+                    decode(Some(&poll))
+                },
             );
-            documents.push(crate::references::DocumentInput {
-                key,
-                file: fetched.file,
-                declarations: fetched.declarations,
-                calls: fetched.calls,
-            });
+            if let Some(error) = progress_failure.lock().unwrap().take() {
+                return Err(error);
+            }
+            for ((key, _), fetched) in pending.into_iter().zip(decoded) {
+                let fetched = fetched.context("cancelled: architecture decode not started")??;
+                selected_ensure!(
+                    fetched.file.language == key.language,
+                    "incompatible_index: architecture language mismatch"
+                );
+                documents.push(crate::references::DocumentInput {
+                    key,
+                    file: fetched.file,
+                    declarations: fetched.declarations,
+                    calls: fetched.calls,
+                });
+            }
         }
         // Retained manifests belong to this selected row and this admitted transaction.
         // Charge stored bytes before fetching JSON, and source bytes before hex decoding.
@@ -10935,7 +10987,7 @@ fn v8_native_scope_for(
     key: &crate::native_evidence::DocumentKey,
     selected: &ReadRevision,
 ) -> Result<Option<V8NativeScope>> {
-    let mut stmt = db.prepare(
+    let mut stmt = db.prepare_cached(
         "SELECT rd.revision_id,d.id,d.vid,r.native_revision_id,d.producer_id
         FROM native_revisions r JOIN revision_documents rd ON rd.revision_id=r.id
         JOIN document_versions d ON d.vid=rd.vid
@@ -10978,7 +11030,7 @@ fn v8_owner_scope_for(
     selected: &ReadRevision,
 ) -> Result<Option<V8NativeScope>> {
     use crate::native_evidence::DocumentKey;
-    let mut stmt = db.prepare(
+    let mut stmt = db.prepare_cached(
         "SELECT r.source_set_id,m.language,m.path
         FROM native_version_declarations d JOIN revision_documents m
           ON m.revision_id=?2 AND m.vid=d.vid
@@ -11008,6 +11060,16 @@ fn v8_owner_scope_for(
             })
         })
         .transpose()
+}
+/// Decode rows already read from one snapshot, polling `progress`; it needs no connection.
+trait Decode<T>: FnOnce(Option<&dyn Fn() -> bool>) -> Result<T> + Send {}
+impl<T, F: FnOnce(Option<&dyn Fn() -> bool>) -> Result<T> + Send> Decode<T> for F {}
+/// Pin a decoder's argument lifetime: any `progress` borrow, not one inferred.
+fn decoder<T, F>(decode: F) -> F
+where
+    F: FnOnce(Option<&dyn Fn() -> bool>) -> Result<T>,
+{
+    decode
 }
 fn contiguous(ordinal: i64, expected: usize, what: &str) -> Result<()> {
     selected_ensure!(
@@ -11062,6 +11124,309 @@ fn read_native_declarations_v8_optional(
     read_native_declarations_v8_inner(db, scope, lookup_key, all_lookup_keys, Some(expired))
 }
 
+/// Read every row of one selected version; the returned decoder checks and
+/// assembles them without the connection, so callers may decode in parallel.
+fn fetch_native_declarations_v8(
+    db: &Connection,
+    scope: &V8NativeScope,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<impl Decode<Vec<crate::native_evidence::Declaration>> + use<>> {
+    optional_hint_check(progress)?;
+    let v = &scope.vid;
+    let rows0 = db.prepare_cached("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE vid=?1 ORDER BY syntax_id,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows1 = db.prepare_cached("SELECT syntax_id,ancestor_ordinal,ordinal,type_name FROM native_version_ancestor_signature_types WHERE vid=?1 ORDER BY syntax_id,ancestor_ordinal,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows2 = db.prepare_cached("SELECT syntax_id,ordinal,kind,name,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_version_declaration_ancestors WHERE vid=?1 ORDER BY syntax_id,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows3 = db.prepare_cached("SELECT syntax_id,kind,name,result_type FROM native_version_headers WHERE vid=?1 ORDER BY syntax_id")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows4 = db.prepare_cached("SELECT syntax_id,item_kind,ordinal,value FROM native_version_header_items WHERE vid=?1 ORDER BY syntax_id,item_kind,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows5 = db.prepare_cached("SELECT syntax_id,ordinal,name,type_name,variadic FROM native_version_parameters WHERE vid=?1 ORDER BY syntax_id,ordinal")?
+        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows6 = db.prepare_cached("SELECT syntax_id,owner_syntax_id,kind,role,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE vid=?1 ORDER BY syntax_id")?
+      .query_map([v],|r|Ok((stored_id_row(r,0,false)?,optional_stored_id_row(r,1,false)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<bool>>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,i64>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let scope = scope.clone();
+    Ok(decoder(move |progress| {
+        use crate::native_evidence::{Declaration, Header, Key, Parameter, Range};
+        optional_hint_check(progress)?;
+        let mut own_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in rows0 {
+            optional_hint_check(progress)?;
+            let (id, ord, value) = row;
+            let entry = own_types.entry(id).or_default();
+            contiguous(ord, entry.len(), "own signature")?;
+            entry.push(value);
+        }
+        let mut ancestor_types: BTreeMap<(String, i64), Vec<String>> = BTreeMap::new();
+        for row in rows1 {
+            optional_hint_check(progress)?;
+            let (id, ancestor, ord, value) = row;
+            let entry = ancestor_types.entry((id, ancestor)).or_default();
+            contiguous(ord, entry.len(), "ancestor signature")?;
+            entry.push(value);
+        }
+        type Ancestor = (
+            i64,
+            String,
+            Option<String>,
+            i64,
+            bool,
+            Option<i64>,
+            Option<bool>,
+        );
+        let mut ancestors: BTreeMap<String, Vec<Ancestor>> = BTreeMap::new();
+        for row in rows2 {
+            optional_hint_check(progress)?;
+            let (id, ord, kind, name, sibling, present, count, variadic) = row;
+            let entry = ancestors.entry(id).or_default();
+            contiguous(ord, entry.len(), "ancestor")?;
+            entry.push((ord, kind, name, sibling, present, count, variadic));
+        }
+        let mut headers: BTreeMap<String, Header> = BTreeMap::new();
+        for row in rows3 {
+            optional_hint_check(progress)?;
+            let (id, kind, name, result_type) = row;
+            selected_ensure!(
+                headers
+                    .insert(
+                        id,
+                        Header {
+                            kind,
+                            name,
+                            modifiers: vec![],
+                            type_parameters: vec![],
+                            parameters: vec![],
+                            result_type,
+                            bases: vec![]
+                        }
+                    )
+                    .is_none(),
+                "duplicate native header"
+            );
+        }
+        // Separate ordinal spaces for each (syntax_id,item_kind); don't collapse them.
+        let mut item_ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for row in rows4 {
+            optional_hint_check(progress)?;
+            let (id, kind, ordinal, value) = row;
+            let n = item_ordinals.entry((id.clone(), kind.clone())).or_default();
+            contiguous(ordinal, *n, "header item")?;
+            *n += 1;
+            let h = headers
+                .get_mut(&id)
+                .ok_or_else(|| SelectedIntegrity("orphan native header item".into()))?;
+            match kind.as_str() {
+                "modifier" => h.modifiers.push(value),
+                "typeParameter" => h.type_parameters.push(value),
+                "base" => h.bases.push(value),
+                _ => return Err(SelectedIntegrity("unknown header item".into()).into()),
+            }
+        }
+        let mut param_ordinals: BTreeMap<String, usize> = BTreeMap::new();
+        for row in rows5 {
+            optional_hint_check(progress)?;
+            let (id, ordinal, name, type_name, variadic) = row;
+            let n = param_ordinals.entry(id.clone()).or_default();
+            contiguous(ordinal, *n, "header parameter")?;
+            *n += 1;
+            headers
+                .get_mut(&id)
+                .ok_or_else(|| SelectedIntegrity("orphan native header parameter".into()))?
+                .parameters
+                .push(Parameter {
+                    name,
+                    type_name,
+                    variadic,
+                });
+        }
+        let proof = scope.proof_id();
+        let mut result = Vec::new();
+        let mut recorded_owners: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for row in rows6 {
+            optional_hint_check(progress)?;
+            let (
+                id,
+                owner,
+                kind,
+                role,
+                name,
+                lookup,
+                present,
+                count,
+                variadic,
+                ordinal,
+                start,
+                end,
+                name_start,
+                name_end,
+            ) = row;
+            let role = crate::native_evidence::DeclarationRole::from_stored(&role)
+                .map_err(|error| SelectedIntegrity(error.to_string()))?;
+            selected_ensure!(
+                recorded_owners.insert(id.clone(), owner).is_none(),
+                "duplicate native declaration"
+            );
+            let key = Key {
+                kind: kind.clone(),
+                name: name.clone(),
+                signature: decode_signature(&mut own_types, &id, present, count, variadic)?,
+                ordinal: usize::try_from(ordinal)
+                    .map_err(|error| SelectedIntegrity(error.to_string()))?,
+            };
+            let mut a = Vec::new();
+            for (ancestor_ord, kind, name, sibling, present, count, variadic) in
+                ancestors.remove(&id).unwrap_or_default()
+            {
+                contiguous(ancestor_ord, a.len(), "ancestor")?;
+                let sig_types = ancestor_types
+                    .remove(&(id.clone(), ancestor_ord))
+                    .unwrap_or_default();
+                if !present {
+                    selected_ensure!(sig_types.is_empty(), "orphan ancestor signature types");
+                }
+                let signature = if present {
+                    Some(crate::native_evidence::Signature {
+                        parameter_types: sig_types,
+                        type_parameter_count: usize::try_from(count.ok_or_else(|| {
+                            SelectedIntegrity("missing ancestor signature count".into())
+                        })?)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                        variadic: variadic.ok_or_else(|| {
+                            SelectedIntegrity("missing ancestor signature variadic".into())
+                        })?,
+                    })
+                } else {
+                    None
+                };
+                a.push(Key {
+                    kind,
+                    name,
+                    signature,
+                    ordinal: usize::try_from(sibling)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                });
+            }
+            let name_range = name_start
+                .zip(name_end)
+                .map(|(start, end)| -> Result<Range> {
+                    Ok(Range {
+                        start: usize::try_from(start)
+                            .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                        end: usize::try_from(end)
+                            .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                    })
+                })
+                .transpose()?;
+            selected_ensure!(
+                name_start.is_some() == name_end.is_some(),
+                "half native name range"
+            );
+            result.push(Declaration {
+                role,
+                syntax_id: id.clone(),
+                document: scope.key.clone(),
+                revision_id: scope.native_revision_id.clone(),
+                kind,
+                name,
+                lookup_key: lookup,
+                ancestors: a,
+                key,
+                range: Range {
+                    start: usize::try_from(start)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                    end: usize::try_from(end)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                },
+                name_range,
+                header: headers
+                    .remove(&id)
+                    .ok_or_else(|| SelectedIntegrity("missing native header".into()))?,
+                provenance_id: proof.clone(),
+            });
+        }
+        selected_ensure!(
+            own_types.is_empty()
+                && ancestor_types.is_empty()
+                && ancestors.is_empty()
+                && headers.is_empty(),
+            "orphan native declaration children"
+        );
+        // Verify stored owner_syntax_id, a column absent from the public DTO. Writer maps parent
+        // from serialized ancestor prefix and final Key; compare against complete decoded tree.
+        let mut by_key: BTreeMap<(String, String), String> = BTreeMap::new();
+        for d in &result {
+            optional_hint_check(progress)?;
+            let identity = (
+                serde_json::to_string(&d.ancestors)?,
+                serde_json::to_string(&d.key)?,
+            );
+            selected_ensure!(
+                by_key.insert(identity, d.syntax_id.clone()).is_none(),
+                "duplicate native owner key"
+            );
+        }
+        for d in &result {
+            optional_hint_check(progress)?;
+            let expected = d
+                .ancestors
+                .last()
+                .map(|last| -> Result<String> {
+                    by_key
+                        .get(&(
+                            serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?,
+                            serde_json::to_string(last)?,
+                        ))
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::Error::from(SelectedIntegrity("missing native parent".into()))
+                        })
+                })
+                .transpose()?;
+            selected_ensure!(
+                recorded_owners.get(&d.syntax_id) == Some(&expected),
+                "native parent differs from ancestor key"
+            );
+        }
+        Ok(result)
+    }))
+}
 fn read_native_declarations_v8_inner(
     db: &Connection,
     scope: &V8NativeScope,
@@ -11069,131 +11434,7 @@ fn read_native_declarations_v8_inner(
     all_lookup_keys: bool,
     progress: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<crate::native_evidence::Declaration>> {
-    use crate::native_evidence::{Declaration, Header, Key, Parameter, Range};
-    optional_hint_check(progress)?;
-    let v = &scope.vid;
-    let mut own_types: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ordinal,type_name FROM native_version_own_signature_types WHERE vid=?1 ORDER BY syntax_id,ordinal")?
-        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))? {
-        optional_hint_check(progress)?;
-        let (id,ord,value)=row?;let entry=own_types.entry(id).or_default();
-        contiguous(ord,entry.len(),"own signature")?;entry.push(value);
-    }
-    let mut ancestor_types: BTreeMap<(String, i64), Vec<String>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ancestor_ordinal,ordinal,type_name FROM native_version_ancestor_signature_types WHERE vid=?1 ORDER BY syntax_id,ancestor_ordinal,ordinal")?
-        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
-        optional_hint_check(progress)?;
-        let (id,ancestor,ord,value)=row?;let entry=ancestor_types.entry((id,ancestor)).or_default();
-        contiguous(ord,entry.len(),"ancestor signature")?;entry.push(value);
-    }
-    type Ancestor = (
-        i64,
-        String,
-        Option<String>,
-        i64,
-        bool,
-        Option<i64>,
-        Option<bool>,
-    );
-    let mut ancestors: BTreeMap<String, Vec<Ancestor>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ordinal,kind,name,sibling_ordinal,signature_present,type_parameter_count,variadic FROM native_version_declaration_ancestors WHERE vid=?1 ORDER BY syntax_id,ordinal")?
-        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,i64>(4)?,r.get::<_,bool>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<bool>>(7)?)))? {
-        optional_hint_check(progress)?;
-        let (id,ord,kind,name,sibling,present,count,variadic)=row?;
-        let entry=ancestors.entry(id).or_default();contiguous(ord,entry.len(),"ancestor")?;
-        entry.push((ord,kind,name,sibling,present,count,variadic));
-    }
-    let mut headers: BTreeMap<String, Header> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,kind,name,result_type FROM native_version_headers WHERE vid=?1 ORDER BY syntax_id")?
-        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))? {
-        optional_hint_check(progress)?;
-        let (id,kind,name,result_type)=row?;
-        selected_ensure!(headers.insert(id,Header{kind,name,modifiers:vec![],type_parameters:vec![],parameters:vec![],result_type,bases:vec![]}).is_none(),"duplicate native header");
-    }
-    // Separate ordinal spaces for each (syntax_id,item_kind); don't collapse them.
-    let mut item_ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,item_kind,ordinal,value FROM native_version_header_items WHERE vid=?1 ORDER BY syntax_id,item_kind,ordinal")?
-        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?)))? {
-        optional_hint_check(progress)?;
-        let (id,kind,ordinal,value)=row?;
-        let n=item_ordinals.entry((id.clone(),kind.clone())).or_default();contiguous(ordinal,*n,"header item")?;*n+=1;
-        let h=headers.get_mut(&id).ok_or_else(|| SelectedIntegrity("orphan native header item".into()))?;
-        match kind.as_str(){"modifier"=>h.modifiers.push(value),"typeParameter"=>h.type_parameters.push(value),"base"=>h.bases.push(value),_=>return Err(SelectedIntegrity("unknown header item".into()).into())}
-    }
-    let mut param_ordinals: BTreeMap<String, usize> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,ordinal,name,type_name,variadic FROM native_version_parameters WHERE vid=?1 ORDER BY syntax_id,ordinal")?
-        .query_map([v],|r|Ok((stored_id_row(r,0,false)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,bool>(4)?)))? {
-        optional_hint_check(progress)?;
-        let (id,ordinal,name,type_name,variadic)=row?;
-        let n=param_ordinals.entry(id.clone()).or_default();contiguous(ordinal,*n,"header parameter")?;*n+=1;
-        headers.get_mut(&id).ok_or_else(|| SelectedIntegrity("orphan native header parameter".into()))?.parameters.push(Parameter{name,type_name,variadic});
-    }
-    let proof = scope.proof_id();
-    let mut result = Vec::new();
-    let mut recorded_owners: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for row in db.prepare("SELECT syntax_id,owner_syntax_id,kind,role,name,lookup_key,key_signature_present,key_type_parameter_count,key_variadic,key_ordinal,start_byte,end_byte,name_start,name_end FROM native_version_declarations WHERE vid=?1 ORDER BY syntax_id")?
-      .query_map([v],|r|Ok((stored_id_row(r,0,false)?,optional_stored_id_row(r,1,false)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<bool>>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,i64>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?)))? {
-        optional_hint_check(progress)?;
-        let (id,owner,kind,role,name,lookup,present,count,variadic,ordinal,start,end,name_start,name_end)=row?;
-        let role = crate::native_evidence::DeclarationRole::from_stored(&role).map_err(|error| SelectedIntegrity(error.to_string()))?;
-        selected_ensure!(recorded_owners.insert(id.clone(),owner).is_none(),"duplicate native declaration");
-        let key=Key{kind:kind.clone(),name:name.clone(),signature:decode_signature(&mut own_types,&id,present,count,variadic)?,ordinal:usize::try_from(ordinal).map_err(|error| SelectedIntegrity(error.to_string()))?};
-        let mut a=Vec::new();
-        for (ancestor_ord,kind,name,sibling,present,count,variadic) in ancestors.remove(&id).unwrap_or_default() {
-            contiguous(ancestor_ord,a.len(),"ancestor")?;
-            let sig_types=ancestor_types.remove(&(id.clone(),ancestor_ord)).unwrap_or_default();
-            if !present {selected_ensure!(sig_types.is_empty(),"orphan ancestor signature types");}
-            let signature=if present {Some(crate::native_evidence::Signature{parameter_types:sig_types,type_parameter_count:usize::try_from(count.ok_or_else(|| SelectedIntegrity("missing ancestor signature count".into()))?).map_err(|error| SelectedIntegrity(error.to_string()))?,variadic:variadic.ok_or_else(|| SelectedIntegrity("missing ancestor signature variadic".into()))?})}else{None};
-            a.push(Key{kind,name,signature,ordinal:usize::try_from(sibling).map_err(|error| SelectedIntegrity(error.to_string()))?});
-        }
-        let name_range=name_start.zip(name_end).map(|(start,end)|->Result<Range>{Ok(Range{start:usize::try_from(start).map_err(|error| SelectedIntegrity(error.to_string()))?,end:usize::try_from(end).map_err(|error| SelectedIntegrity(error.to_string()))?})}).transpose()?;
-        selected_ensure!(name_start.is_some()==name_end.is_some(),"half native name range");
-        result.push(Declaration{role,syntax_id:id.clone(),document:scope.key.clone(),revision_id:scope.native_revision_id.clone(),kind,name,lookup_key:lookup,ancestors:a,key,
-            range:Range{start:usize::try_from(start).map_err(|error| SelectedIntegrity(error.to_string()))?,end:usize::try_from(end).map_err(|error| SelectedIntegrity(error.to_string()))?},name_range,header:headers.remove(&id).ok_or_else(|| SelectedIntegrity("missing native header".into()))?,provenance_id:proof.clone()});
-    }
-    selected_ensure!(
-        own_types.is_empty()
-            && ancestor_types.is_empty()
-            && ancestors.is_empty()
-            && headers.is_empty(),
-        "orphan native declaration children"
-    );
-    // Verify stored owner_syntax_id, a column absent from the public DTO. Writer maps parent
-    // from serialized ancestor prefix and final Key; compare against complete decoded tree.
-    let mut by_key: BTreeMap<(String, String), String> = BTreeMap::new();
-    for d in &result {
-        optional_hint_check(progress)?;
-        let identity = (
-            serde_json::to_string(&d.ancestors)?,
-            serde_json::to_string(&d.key)?,
-        );
-        selected_ensure!(
-            by_key.insert(identity, d.syntax_id.clone()).is_none(),
-            "duplicate native owner key"
-        );
-    }
-    for d in &result {
-        optional_hint_check(progress)?;
-        let expected = d
-            .ancestors
-            .last()
-            .map(|last| -> Result<String> {
-                by_key
-                    .get(&(
-                        serde_json::to_string(&d.ancestors[..d.ancestors.len() - 1])?,
-                        serde_json::to_string(last)?,
-                    ))
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow::Error::from(SelectedIntegrity("missing native parent".into()))
-                    })
-            })
-            .transpose()?;
-        selected_ensure!(
-            recorded_owners.get(&d.syntax_id) == Some(&expected),
-            "native parent differs from ancestor key"
-        );
-    }
+    let mut result = fetch_native_declarations_v8(db, scope, progress)?(progress)?;
     if !all_lookup_keys {
         result.retain(|d| d.lookup_key.as_deref() == lookup_key);
     }
@@ -11210,7 +11451,7 @@ fn read_native_coverage_v8(
             params![scope.revision_key,scope.key.language,scope.key.path,scope.vid],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     let (mut supported_roles, mut observed_roles) = (vec![], vec![]);
-    for row in db.prepare("SELECT role_kind,role,ordinal FROM native_version_coverage_roles WHERE vid=?1 ORDER BY role_kind,ordinal")?
+    for row in db.prepare_cached("SELECT role_kind,role,ordinal FROM native_version_coverage_roles WHERE vid=?1 ORDER BY role_kind,ordinal")?
         .query_map([&scope.vid],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))? {
         let (kind,role,ordinal)=row?;
         let out=match kind.as_str(){"supported"=>&mut supported_roles,"observed"=>&mut observed_roles,_=>return Err(SelectedIntegrity("invalid native coverage role kind".into()).into())};
@@ -11238,64 +11479,155 @@ fn read_native_calls_v8(
 ) -> Result<Vec<crate::native_evidence::Call>> {
     read_native_calls_v8_inner(db, scope, owner, None)
 }
+/// Read every row of one selected version; the returned decoder checks and
+/// assembles them without the connection, so callers may decode in parallel.
+fn fetch_native_calls_v8(
+    db: &Connection,
+    scope: &V8NativeScope,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<impl Decode<Vec<crate::native_evidence::Call>> + use<>> {
+    optional_hint_check(progress)?;
+    let version = &scope.vid;
+    let rows0 = db
+        .prepare_cached("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
+        .query_map([version], |r| stored_id_row(r, 0, false))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows1 = db
+        .prepare_cached(
+            "SELECT id,owner_syntax_id FROM native_version_control_regions WHERE vid=?1",
+        )?
+        .query_map([version], |r| {
+            Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?))
+        })?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows2 = db.prepare_cached("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,callee_start,callee_end,spelling,language,callee_lookup_key FROM native_version_calls WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
+        .query_map([version],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,false)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?,r.get::<_,Option<String>>(9)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows3 = db.prepare_cached("SELECT call_id,region_id,ordinal FROM native_version_call_regions WHERE vid=?1 ORDER BY call_id,ordinal")?
+        .query_map([version],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,true)?,r.get::<_,i64>(2)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let scope = scope.clone();
+    Ok(decoder(move |progress| {
+        optional_hint_check(progress)?;
+        use crate::native_evidence::{Call, Range};
+        let mut known = BTreeSet::new();
+        for row in rows0 {
+            optional_hint_check(progress)?;
+            known.insert(row);
+        }
+        let mut region_owner = BTreeMap::new();
+        for row in rows1 {
+            optional_hint_check(progress)?;
+            let (id, owner) = row;
+            region_owner.insert(id, owner);
+        }
+        let proof = scope.proof_id();
+        let mut calls: Vec<Call> = vec![];
+        let mut indexes: BTreeMap<String, usize> = BTreeMap::new();
+        let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
+        for row in rows2 {
+            optional_hint_check(progress)?;
+            let (
+                id,
+                call_owner,
+                ordinal,
+                start,
+                end,
+                callee_start,
+                callee_end,
+                spelling,
+                language,
+                callee_lookup_key,
+            ) = row;
+            selected_ensure!(
+                language == scope.key.language,
+                "native call document mismatch"
+            );
+            selected_ensure!(
+                callee_lookup_key.is_none() || callee_start.is_some() && spelling.is_some(),
+                "invalid native call lookup key"
+            );
+            selected_ensure!(known.contains(&call_owner), "orphan native call owner");
+            let n = ordinals.entry(call_owner.clone()).or_default();
+            contiguous(ordinal, *n, "call")?;
+            *n += 1;
+            selected_ensure!(
+                callee_start.is_some() == callee_end.is_some(),
+                "half callee range"
+            );
+            let callee_range = callee_start
+                .zip(callee_end)
+                .map(|(start, end)| -> Result<Range> {
+                    Ok(Range {
+                        start: usize::try_from(start)
+                            .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                        end: usize::try_from(end)
+                            .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                    })
+                })
+                .transpose()?;
+            selected_ensure!(
+                indexes.insert(id.clone(), calls.len()).is_none(),
+                "duplicate native call ID"
+            );
+            calls.push(Call {
+                id,
+                owner_syntax_id: call_owner,
+                ordinal: usize::try_from(ordinal)
+                    .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                document: scope.key.clone(),
+                revision_id: scope.native_revision_id.clone(),
+                range: Range {
+                    start: usize::try_from(start)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                    end: usize::try_from(end)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                },
+                callee_range,
+                spelling,
+                region_ids: vec![],
+                provenance_id: proof.clone(),
+            });
+        }
+        for row in rows3 {
+            optional_hint_check(progress)?;
+            let (call_id, region_id, ordinal) = row;
+            let call = &mut calls[*indexes
+                .get(&call_id)
+                .ok_or_else(|| SelectedIntegrity("orphan native call region".into()))?];
+            selected_ensure!(
+                region_owner.get(&region_id) == Some(&call.owner_syntax_id),
+                "cross-owner native call region"
+            );
+            contiguous(ordinal, call.region_ids.len(), "call region")?;
+            call.region_ids.push(region_id);
+        }
+        Ok(calls)
+    }))
+}
 fn read_native_calls_v8_inner(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
     progress: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<crate::native_evidence::Call>> {
-    optional_hint_check(progress)?;
-    use crate::native_evidence::{Call, Range};
-    let version = &scope.vid;
-    let mut known = BTreeSet::new();
-    for row in db
-        .prepare("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
-        .query_map([version], |r| stored_id_row(r, 0, false))?
-    {
-        optional_hint_check(progress)?;
-        known.insert(row?);
-    }
-    let mut region_owner = BTreeMap::new();
-    for row in db
-        .prepare("SELECT id,owner_syntax_id FROM native_version_control_regions WHERE vid=?1")?
-        .query_map([version], |r| {
-            Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?))
-        })?
-    {
-        optional_hint_check(progress)?;
-        let (id, owner) = row?;
-        region_owner.insert(id, owner);
-    }
-    let proof = scope.proof_id();
-    let mut calls: Vec<Call> = vec![];
-    let mut indexes: BTreeMap<String, usize> = BTreeMap::new();
-    let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
-    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,callee_start,callee_end,spelling,language,callee_lookup_key FROM native_version_calls WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
-        .query_map([version],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,false)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?,r.get::<_,Option<String>>(9)?)))? {
-        optional_hint_check(progress)?;
-        let (id,call_owner,ordinal,start,end,callee_start,callee_end,spelling,language,callee_lookup_key)=row?;
-        selected_ensure!(language == scope.key.language, "native call document mismatch");
-        selected_ensure!(callee_lookup_key.is_none() || callee_start.is_some() && spelling.is_some(), "invalid native call lookup key");
-        selected_ensure!(known.contains(&call_owner),"orphan native call owner");
-        let n=ordinals.entry(call_owner.clone()).or_default();contiguous(ordinal,*n,"call")?;*n+=1;
-        selected_ensure!(callee_start.is_some()==callee_end.is_some(),"half callee range");
-        let callee_range=callee_start.zip(callee_end).map(|(start,end)|->Result<Range>{
-            Ok(Range{start:usize::try_from(start).map_err(|error| SelectedIntegrity(error.to_string()))?,end:usize::try_from(end).map_err(|error| SelectedIntegrity(error.to_string()))?})
-        }).transpose()?;
-        selected_ensure!(indexes.insert(id.clone(),calls.len()).is_none(),"duplicate native call ID");
-        calls.push(Call{id,owner_syntax_id:call_owner,ordinal:usize::try_from(ordinal).map_err(|error| SelectedIntegrity(error.to_string()))?,document:scope.key.clone(),
-            revision_id:scope.native_revision_id.clone(),range:Range{start:usize::try_from(start).map_err(|error| SelectedIntegrity(error.to_string()))?,end:usize::try_from(end).map_err(|error| SelectedIntegrity(error.to_string()))?},
-            callee_range,spelling,region_ids:vec![],provenance_id:proof.clone()});
-    }
-    for row in db.prepare("SELECT call_id,region_id,ordinal FROM native_version_call_regions WHERE vid=?1 ORDER BY call_id,ordinal")?
-        .query_map([version],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,true)?,r.get::<_,i64>(2)?)))? {
-        optional_hint_check(progress)?;
-        let (call_id,region_id,ordinal)=row?;
-        let call=&mut calls[*indexes.get(&call_id).ok_or_else(|| SelectedIntegrity("orphan native call region".into()))?];
-        selected_ensure!(region_owner.get(&region_id)==Some(&call.owner_syntax_id),"cross-owner native call region");
-        contiguous(ordinal,call.region_ids.len(),"call region")?;
-        call.region_ids.push(region_id);
-    }
+    let calls = fetch_native_calls_v8(db, scope, progress)?(progress)?;
     if owner.is_none() {
         optional_hint_check(progress)?;
         return Ok(calls);
@@ -11316,52 +11648,96 @@ fn read_native_control_regions_v8(
 ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
     read_native_control_regions_v8_inner(db, scope, owner, None)
 }
+/// Read every row of one selected version; the returned decoder checks and
+/// assembles them without the connection, so callers may decode in parallel.
+fn fetch_native_control_regions_v8(
+    db: &Connection,
+    scope: &V8NativeScope,
+    progress: Option<&dyn Fn() -> bool>,
+) -> Result<impl Decode<Vec<crate::native_evidence::ControlRegion>> + use<>> {
+    optional_hint_check(progress)?;
+    let rows0 = db
+        .prepare_cached("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
+        .query_map([&scope.vid], |r| stored_id_row(r, 0, false))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows1 = db.prepare_cached("SELECT id,owner_syntax_id,ordinal,kind,start_byte,end_byte,parent_id,arm FROM native_version_control_regions WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
+        .query_map([&scope.vid],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,false)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,optional_stored_id_row(r,6,true)?,r.get::<_,Option<String>>(7)?)))?
+        .map(|row| -> Result<_> {
+            optional_hint_check(progress)?;
+            Ok(row?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let scope = scope.clone();
+    Ok(decoder(move |progress| {
+        optional_hint_check(progress)?;
+        use crate::native_evidence::{ControlRegion, Range};
+        let mut known = BTreeSet::new();
+        for row in rows0 {
+            optional_hint_check(progress)?;
+            known.insert(row);
+        }
+        let proof = scope.proof_id();
+        let mut regions = Vec::<ControlRegion>::new();
+        let mut indexes = BTreeMap::<String, usize>::new();
+        let mut ordinals = BTreeMap::<String, usize>::new();
+        for row in rows1 {
+            optional_hint_check(progress)?;
+            let (id, region_owner, ordinal, kind, start, end, parent_id, arm) = row;
+            selected_ensure!(known.contains(&region_owner), "orphan native region owner");
+            let n = ordinals.entry(region_owner.clone()).or_default();
+            contiguous(ordinal, *n, "region")?;
+            *n += 1;
+            selected_ensure!(
+                indexes.insert(id.clone(), regions.len()).is_none(),
+                "duplicate native region ID"
+            );
+            regions.push(ControlRegion {
+                id,
+                owner_syntax_id: region_owner,
+                ordinal: usize::try_from(ordinal)
+                    .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                document: scope.key.clone(),
+                revision_id: scope.native_revision_id.clone(),
+                kind,
+                range: Range {
+                    start: usize::try_from(start)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                    end: usize::try_from(end)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?,
+                },
+                parent_id,
+                arm,
+                provenance_id: proof.clone(),
+            });
+        }
+        for region in &regions {
+            optional_hint_check(progress)?;
+            if let Some(parent_id) = &region.parent_id {
+                let parent = &regions[*indexes
+                    .get(parent_id)
+                    .ok_or_else(|| SelectedIntegrity("missing native parent region".into()))?];
+                selected_ensure!(
+                    region.owner_syntax_id == parent.owner_syntax_id
+                        && parent.range.start <= region.range.start
+                        && region.range.end <= parent.range.end,
+                    "invalid native parent region"
+                );
+            }
+        }
+        Ok(regions)
+    }))
+}
 fn read_native_control_regions_v8_inner(
     db: &Connection,
     scope: &V8NativeScope,
     owner: Option<&str>,
     progress: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<crate::native_evidence::ControlRegion>> {
-    optional_hint_check(progress)?;
-    use crate::native_evidence::{ControlRegion, Range};
-    let mut known = BTreeSet::new();
-    for row in db
-        .prepare("SELECT syntax_id FROM native_version_declarations WHERE vid=?1")?
-        .query_map([&scope.vid], |r| stored_id_row(r, 0, false))?
-    {
-        optional_hint_check(progress)?;
-        known.insert(row?);
-    }
-    let proof = scope.proof_id();
-    let mut regions = Vec::<ControlRegion>::new();
-    let mut indexes = BTreeMap::<String, usize>::new();
-    let mut ordinals = BTreeMap::<String, usize>::new();
-    for row in db.prepare("SELECT id,owner_syntax_id,ordinal,kind,start_byte,end_byte,parent_id,arm FROM native_version_control_regions WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
-        .query_map([&scope.vid],|r|Ok((stored_id_row(r,0,true)?,stored_id_row(r,1,false)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,optional_stored_id_row(r,6,true)?,r.get::<_,Option<String>>(7)?)))? {
-        optional_hint_check(progress)?;
-        let (id,region_owner,ordinal,kind,start,end,parent_id,arm)=row?;
-        selected_ensure!(known.contains(&region_owner),"orphan native region owner");
-        let n=ordinals.entry(region_owner.clone()).or_default();contiguous(ordinal,*n,"region")?;*n+=1;
-        selected_ensure!(indexes.insert(id.clone(),regions.len()).is_none(),"duplicate native region ID");
-        regions.push(ControlRegion{id,owner_syntax_id:region_owner,ordinal:usize::try_from(ordinal).map_err(|error| SelectedIntegrity(error.to_string()))?,
-            document:scope.key.clone(),revision_id:scope.native_revision_id.clone(),kind,
-            range:Range{start:usize::try_from(start).map_err(|error| SelectedIntegrity(error.to_string()))?,end:usize::try_from(end).map_err(|error| SelectedIntegrity(error.to_string()))?},parent_id,arm,
-            provenance_id:proof.clone()});
-    }
-    for region in &regions {
-        optional_hint_check(progress)?;
-        if let Some(parent_id) = &region.parent_id {
-            let parent = &regions[*indexes
-                .get(parent_id)
-                .ok_or_else(|| SelectedIntegrity("missing native parent region".into()))?];
-            selected_ensure!(
-                region.owner_syntax_id == parent.owner_syntax_id
-                    && parent.range.start <= region.range.start
-                    && region.range.end <= parent.range.end,
-                "invalid native parent region"
-            );
-        }
-    }
+    let regions = fetch_native_control_regions_v8(db, scope, progress)?(progress)?;
     if owner.is_none() {
         optional_hint_check(progress)?;
         return Ok(regions);
@@ -18509,8 +18885,7 @@ impl Store {
         version_id: &str,
         source_set_id: &str,
     ) -> Result<(i64, i64)> {
-        Ok(db.query_row(
-            SELECTED_ANCILLARY_BYTE_SQL,
+        Ok(db.prepare_cached(SELECTED_ANCILLARY_BYTE_SQL)?.query_row(
             params![
                 vid,
                 cid,
@@ -18559,7 +18934,7 @@ impl Store {
               AND g.vid=d.vid AND g.language=d.language
             LEFT JOIN class_projections c ON c.cid=m.cid AND c.gid=g.gid
             WHERE m.path=?1 AND m.revision_id=?2 LIMIT 2";
-        let mut stmt = db.prepare(sql)?;
+        let mut stmt = db.prepare_cached(sql)?;
         optional_hint_check(progress)?;
         let rows = stmt
             .query_map(params![path, selected.key], |r| {
@@ -18686,11 +19061,13 @@ impl Store {
             (SELECT count(*) FROM native_version_references WHERE vid=?3),
             (SELECT count(*) FROM native_version_capability_families WHERE vid=?3),
             (SELECT count(*) FROM native_version_capability_gaps WHERE vid=?3)";
-        let counts: Vec<i64> = db.query_row(counts_sql, params![gid, cid, vid], |r| {
-            (0..18)
-                .map(|i| r.get(i))
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })?;
+        let counts: Vec<i64> =
+            db.prepare_cached(counts_sql)?
+                .query_row(params![gid, cid, vid], |r| {
+                    (0..18)
+                        .map(|i| r.get(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })?;
         selected_ensure!(
             counts.iter().all(|&n| n >= 0 && n <= row_limit),
             "incompatible_index: selected evidence row budget exceeded"
@@ -18736,6 +19113,18 @@ impl Store {
         selected: &ReadRevision,
         progress: Option<&dyn Fn() -> bool>,
     ) -> Result<FetchedDocument> {
+        self.fetch_selected_raw(db, header, selected, progress)?(progress)
+    }
+
+    /// `fetch_selected_rows` without decoding: read the source and every
+    /// native row, and return the decoder that checks and assembles them.
+    fn fetch_selected_raw(
+        &self,
+        db: &Connection,
+        header: SelectedHeader,
+        selected: &ReadRevision,
+        progress: Option<&dyn Fn() -> bool>,
+    ) -> Result<impl Decode<FetchedDocument> + use<>> {
         let SelectedHeader {
             path,
             language,
@@ -18759,18 +19148,24 @@ impl Store {
             file.hash == hash && file.language == language && file.text.len() == bytes as usize,
             "incompatible_index: selected source identity mismatch"
         );
-        let declarations = read_native_declarations_v8_inner(db, &scope, None, true, progress)?;
+        let declarations = fetch_native_declarations_v8(db, &scope, progress)?;
         optional_hint_check(progress)?;
-        let calls = read_native_calls_v8_inner(db, &scope, None, progress)?;
+        let calls = fetch_native_calls_v8(db, &scope, progress)?;
         optional_hint_check(progress)?;
-        let regions = read_native_control_regions_v8_inner(db, &scope, None, progress)?;
-        Ok(FetchedDocument {
-            file,
-            declarations,
-            calls,
-            regions,
-            stored_bytes,
-        })
+        let regions = fetch_native_control_regions_v8(db, &scope, progress)?;
+        Ok(decoder(move |progress| {
+            let declarations = declarations(progress)?;
+            optional_hint_check(progress)?;
+            let calls = calls(progress)?;
+            optional_hint_check(progress)?;
+            Ok(FetchedDocument {
+                file,
+                declarations,
+                calls,
+                regions: regions(progress)?,
+                stored_bytes,
+            })
+        }))
     }
 
     /// Project one fetched document's graph from its stored native rows with
