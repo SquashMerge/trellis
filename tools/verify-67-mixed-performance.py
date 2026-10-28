@@ -25,6 +25,7 @@ import tempfile
 import time
 
 REPO = Path(__file__).resolve().parents[1]
+DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
@@ -868,7 +869,7 @@ def import_fixture(binary, root, daemon, size, r1):
     profile = json.loads((REPO / "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json").read_text())
     producer = next(p for p in profile["semanticProducers"] if p["name"] == "scip-typescript")
     manifest = {"formatVersion": 1, "trustOrigin": "referenceProfile", "completion": "complete",
-                "decoderVersion": "scip-0.10.0/CapturedScipFactV1/1", "profileId": profile["profileId"],
+                "decoderVersion": DECODER_VERSION, "profileId": profile["profileId"],
                 "producer": {"name": producer["name"], "version": producer["version"],
                              "executableHash": producer["executableHash"], "positionEncoding": 2},
                 "sourceSet": captured["source_set"], "sourceRevision": captured["native_id"],

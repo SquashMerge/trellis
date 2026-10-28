@@ -2142,7 +2142,7 @@ fn admitted_raw_fixture() -> (
         .unwrap();
     let bytes = hex::decode(WIRE).unwrap();
     let uri = format!("file://{}", physical.display());
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
         "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
         "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
         "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,
@@ -2242,7 +2242,7 @@ fn conflicting_plain_reference_fixture() -> (
         .unwrap();
     let bytes = wire;
     let uri = format!("file://{}", physical.display());
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
         "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
         "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
         "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,

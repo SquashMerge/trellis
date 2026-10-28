@@ -300,7 +300,7 @@ fn selected_case(change_b: &str) {
             vec![json!({"language":"javascript","relativePath":if change_b == "caller_failed" { "src/A.js" } else { "src/B.js" },"reason":reason})]
         })
         .unwrap_or_default();
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":if partial {"partial"} else {"complete"},"decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":if partial {"partial"} else {"complete"},"decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
       "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
       "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
       "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
@@ -360,7 +360,7 @@ fn selected_case(change_b: &str) {
             .filter(|d| d["language"] == "python")
             .cloned()
             .collect();
-        let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+        let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
           "producer":{"name":python["name"],"version":python["version"],"executableHash":python["executableHash"],"positionEncoding":2},
           "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
           "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},

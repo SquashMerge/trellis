@@ -58,7 +58,7 @@ fn fixture() -> (
         .unwrap();
     let bytes = hex::decode(WIRE).unwrap();
     let uri = format!("file://{}", physical.display());
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
         "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
         "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
         "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,
@@ -470,7 +470,7 @@ fn admitted_case_with_calls(
         .iter()
         .find(|p| p["name"] == producer_name)
         .unwrap();
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
         "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":encoding},
         "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
         "sourceRevision":rev.id,"sourceManifestHash":manifest_hash,

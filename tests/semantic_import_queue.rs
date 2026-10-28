@@ -301,7 +301,7 @@ fn two_document_case(change_b: &str) {
             vec![json!({"language":"javascript","relativePath":"src/B.js","reason":reason})]
         })
         .unwrap_or_default();
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":if partial {"partial"} else {"complete"},"decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":if partial {"partial"} else {"complete"},"decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
       "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
       "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
       "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
@@ -1228,7 +1228,7 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
         b"",
         &native_ids::canonical(&json!([{"document":source.key,"contentHash":source.content_hash}])),
     );
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
         "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
         "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
         "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
@@ -1856,7 +1856,7 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                         .collect::<Vec<_>>()
                 )),
             );
-            let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+            let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
             "producer":{"name":producer_record["name"],"version":producer_record["version"],"executableHash":producer_record["executableHash"],"positionEncoding":encoding},
             "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
             "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
@@ -2386,7 +2386,7 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
                 .collect::<Vec<_>>()
         )),
     );
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
         "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":1},
         "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
         "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
@@ -2545,7 +2545,7 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
             .filter(|d| d["relativePath"] == path)
             .cloned()
             .collect();
-        let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+        let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
             "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
             "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":source_manifest_hash,
             "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
