@@ -1,4 +1,5 @@
 //! Package-level evidence only. This does not inspect installed libraries or bind members.
+use super::work::Work;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -767,9 +768,9 @@ pub struct JavascriptPackages {
     bindings: BTreeMap<String, BTreeMap<String, Option<ExternalPackage>>>,
 }
 impl JavascriptPackages {
-    pub fn new(
+    pub(crate) fn new(
         manifests: &[ManifestInput],
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         let mut result = Self::default();
@@ -790,9 +791,8 @@ impl JavascriptPackages {
             let Some(bytes) = &manifest.bytes else {
                 continue;
             };
-            *work = work.saturating_add(bytes.len());
             ensure!(
-                *work <= super::OWNER_WORK,
+                work.charge(bytes.len()),
                 "bounded_work: reference manifest parsing"
             );
             check()?;
@@ -826,9 +826,8 @@ impl JavascriptPackages {
                             .saturating_add(section.len())
                             .saturating_add(version.len())
                             .saturating_add("javascript".len());
-                        *work = work.saturating_add(allocation);
                         ensure!(
-                            *work <= super::OWNER_WORK,
+                            work.charge(allocation),
                             "bounded_work: reference package evidence"
                         );
                         check()?;
@@ -988,9 +987,9 @@ pub struct RustPackages {
     roots: BTreeMap<String, (bool, bool)>,
 }
 impl RustPackages {
-    pub fn new(
+    pub(crate) fn new(
         manifests: &[ManifestInput],
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         let mut result = Self::default();
@@ -1012,9 +1011,8 @@ impl RustPackages {
                 continue;
             };
             // Parsing cost and all subsequent fan-out share the existing request work budget.
-            *work = work.saturating_add(bytes.len());
             ensure!(
-                *work <= super::OWNER_WORK,
+                work.charge(bytes.len()),
                 "bounded_work: reference manifest parsing"
             );
             check()?;
@@ -1065,7 +1063,7 @@ impl RustPackages {
         manifest: &ManifestInput,
         section: &str,
         dependencies: &toml::map::Map<String, toml::Value>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         for (key, value) in dependencies {
@@ -1263,7 +1261,12 @@ mod javascript_package_tests {
     use super::*;
 
     fn packages(text: &str) -> JavascriptPackages {
-        JavascriptPackages::new(&[input(text)], &mut 0, &mut || Ok(())).unwrap()
+        JavascriptPackages::new(
+            &[input(text)],
+            &mut Work::new(super::super::work::reference_limit(0, 0)),
+            &mut || Ok(()),
+        )
+        .unwrap()
     }
     fn input(text: &str) -> ManifestInput {
         ManifestInput {
@@ -1413,22 +1416,122 @@ mod javascript_package_tests {
     #[test]
     fn parsing_shares_work_budget_and_checks_cancellation() {
         let input = input(r#"{"dependencies":{"widget":"1.2.3"}}"#);
-        let mut work = super::super::OWNER_WORK;
+        let mut work = Work::new(0);
         let error =
             JavascriptPackages::new(std::slice::from_ref(&input), &mut work, &mut || Ok(()))
                 .err()
                 .unwrap();
         assert!(error.to_string().starts_with("bounded_work:"));
         let mut visits = 0;
-        let error = JavascriptPackages::new(&[input], &mut 0, &mut || {
-            visits += 1;
-            if visits >= 2 {
-                anyhow::bail!("cancelled");
-            }
-            Ok(())
+        let error = JavascriptPackages::new(
+            &[input],
+            &mut Work::new(super::super::work::reference_limit(0, 0)),
+            &mut || {
+                visits += 1;
+                if visits >= 2 {
+                    anyhow::bail!("cancelled");
+                }
+                Ok(())
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "cancelled");
+    }
+}
+
+#[cfg(test)]
+mod rust_package_tests {
+    use super::*;
+
+    const MANIFEST: &str = r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+wire = { package = "upstream-wire", version = "^2" }
+local = { path = "vendor/local", version = "1" }
+[dev-dependencies]
+test_wire = { package = "upstream-wire", version = "^3" }
+"#;
+
+    fn manifest(text: &str) -> ManifestInput {
+        ManifestInput {
+            source_set_id: "source-set:test".into(),
+            native_revision_id: "revision:test".into(),
+            dependency_hash: "dependency-hash".into(),
+            path: "Cargo.toml".into(),
+            content_hash: Some("content-hash".into()),
+            bytes: Some(text.as_bytes().to_vec()),
+        }
+    }
+    #[test]
+    fn normalized_import_collisions_and_unproved_ownership_never_guess_packages() {
+        let input = manifest(
+            "[package]
+name='fixture'
+version='1.0.0'
+[dependencies]
+wire-core='1'
+wire_core='1'
+plain={package='literal-upstream',version='2'}
+local={path='vendor/local',version='1'}
+[build-dependencies]
+build_wire={package='build-upstream',version='3'}
+[target.'cfg(unix)'.dependencies]
+target_wire={package='target-upstream',version='4'}",
+        );
+        let limit =
+            crate::references::work::reference_limit(1, input.bytes.as_ref().map_or(0, Vec::len));
+        let packages = RustPackages::new(&[input], &mut Work::new(limit), &mut || Ok(())).unwrap();
+        assert!(
+            packages
+                .resolve("source-set:test", "wire_core", true)
+                .is_none()
+        );
+        assert!(
+            packages
+                .resolve("source-set:test", "plain", false)
+                .is_none()
+        );
+        assert!(packages.resolve("source-set:test", "local", true).is_none());
+        for (root, name) in [
+            ("plain", "literal-upstream"),
+            ("build_wire", "build-upstream"),
+            ("target_wire", "target-upstream"),
+        ] {
+            let package = packages.resolve("source-set:test", root, true).unwrap();
+            assert_eq!(package.identity.package, name);
+            assert!(!package.identity.standard_library);
+        }
+        let limit = crate::references::work::reference_limit(1, MANIFEST.len());
+        let error = RustPackages::new(&[manifest(MANIFEST)], &mut Work::new(limit), &mut || {
+            anyhow::bail!("cancelled")
         })
         .err()
         .unwrap();
         assert_eq!(error.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn repeated_identical_binding_merges_evidence_and_cargo_roots_are_checked_separately() {
+        let input = manifest(
+            "[package]\nname='fixture'\nversion='1.0.0'\nautobins=false\n[dependencies]\nwire={package='upstream-wire',version='1'}\n[dev-dependencies]\nwire={package='upstream-wire',version='2'}\n[target.'cfg(unix)'.dependencies]\nwire={package='upstream-wire',version='3'}",
+        );
+        let limit =
+            crate::references::work::reference_limit(1, input.bytes.as_ref().map_or(0, Vec::len));
+        let packages = RustPackages::new(&[input], &mut Work::new(limit), &mut || Ok(())).unwrap();
+        assert!(packages.root_allowed("source-set:test", "src/lib.rs"));
+        assert!(!packages.root_allowed("source-set:test", "src/main.rs"));
+        let package = packages.resolve("source-set:test", "wire", true).unwrap();
+        assert_eq!(package.evidence.len(), 3);
+        assert_eq!(package.identity.package, "upstream-wire");
+        let input = manifest(
+            "[package]\nname='fixture'\nversion='1.0.0'\n[dependencies]\nwire={package='one',version='1'}\n[dev-dependencies]\nwire={package='two',version='1'}",
+        );
+        let limit =
+            crate::references::work::reference_limit(1, input.bytes.as_ref().map_or(0, Vec::len));
+        let packages = RustPackages::new(&[input], &mut Work::new(limit), &mut || Ok(())).unwrap();
+        assert!(packages.resolve("source-set:test", "wire", true).is_none());
     }
 }

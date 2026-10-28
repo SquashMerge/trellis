@@ -68,6 +68,36 @@ fn view(store: &Store, pin: IndexPin) -> Value {
         .unwrap();
     response.finish(value).unwrap()
 }
+// One absolute deadline covers snapshot admission, references, rules, metrics,
+// final publication fence and serialization; indexing stays outside it.
+#[test]
+fn architecture_full_view_shares_one_deadline_across_parallel_preparation() {
+    let (_state, root, store, pin) = fixture();
+    rules(
+        root.path(),
+        &format!(
+            "{RULES}\n[roles.inherited]\nselect={{extends='Base'}}\n[roles.any]\nselect={{paths=['**']}}\n[[rules]]\nid='inheritance'\nfor_each='inherited'\nrequire=[{{calls='any'}}]"
+        ),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut check = || {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "deadline_exceeded");
+        Ok(())
+    };
+    let response = store.evidence_response().unwrap();
+    let data = response
+        .architecture_view(&options(pin, "max"), &mut check)
+        .unwrap();
+    let data = response.finish(data).unwrap();
+    let bytes = serde_json::to_vec(&data).unwrap();
+    check().unwrap();
+    assert!(!bytes.is_empty());
+    assert_eq!(data["state"], "ready");
+    assert_eq!(data["references"]["counts"]["scannedDocuments"], 8);
+    assert_eq!(data["modules"].as_array().unwrap().len(), 8);
+    assert!(data["rules"]["rulesFile"]["contentHash"].is_string());
+}
+
 #[test]
 fn architecture_exact_counts_roles_policy_samples_and_full_identity_metrics() {
     let (_state, root, store, pin) = fixture();

@@ -31,7 +31,7 @@ struct Blockers {
     max_ends: Vec<usize>,
 }
 impl Blockers {
-    fn finish(&mut self, work: &mut usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
+    fn finish(&mut self, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
         self.ranges.sort_unstable();
         charge(self.ranges.len(), work, check)?;
         self.max_ends.resize(self.ranges.len(), 0);
@@ -42,7 +42,7 @@ impl Blockers {
         &mut self,
         left: usize,
         right: usize,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<usize> {
         if left == right {
@@ -61,7 +61,7 @@ impl Blockers {
         &self,
         start: usize,
         end: usize,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<bool> {
         owner_step(work, check)?;
@@ -106,7 +106,7 @@ impl Catalog {
         docs: &[&DocumentInput],
         trees: &[Tree],
         selected: &[usize],
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         let mut result = Self {
@@ -274,7 +274,7 @@ impl Catalog {
         document: usize,
         site: &RawSite,
         external_packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         owner_step(work, check)?;
@@ -339,7 +339,7 @@ impl Catalog {
         source_set: &str,
         path: &[String],
         external_packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         let Some((name, package_path)) =
@@ -372,7 +372,7 @@ impl Catalog {
         &self,
         source_set: &str,
         path: &[String],
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<bool> {
         // A captured top-level type in a prefix makes this a member path, not a package.
@@ -395,7 +395,7 @@ impl Catalog {
         source_set: &str,
         path: &[String],
         external_packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         charge(path.len(), work, check)?;
@@ -455,7 +455,7 @@ impl Catalog {
 
 fn bucket_resolution(
     bucket: &Bucket,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SiteResolution> {
     owner_step(work, check)?;
@@ -476,7 +476,7 @@ fn standard_library(
     source_set: &str,
     path: &[String],
     packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Option<SiteResolution>> {
     let Some(root) = path.first() else {
@@ -502,7 +502,7 @@ fn standard_library(
         ..SiteResolution::default()
     }))
 }
-fn charge(count: usize, work: &mut usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
+fn charge(count: usize, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
     for _ in 0..count {
         owner_step(work, check)?;
     }
@@ -518,11 +518,7 @@ fn type_declaration(node: Node<'_>) -> bool {
             | "annotation_type_declaration"
     )
 }
-fn public(
-    node: Node<'_>,
-    work: &mut usize,
-    check: &mut impl FnMut() -> Result<()>,
-) -> Result<bool> {
+fn public(node: Node<'_>, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<bool> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         owner_step(work, check)?;
@@ -541,7 +537,7 @@ fn public(
 fn package_path(
     doc: &DocumentInput,
     root: Node<'_>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<String>> {
     let mut cursor = root.walk();
@@ -556,7 +552,7 @@ fn package_path(
 fn declaration_path(
     doc: &DocumentInput,
     node: Node<'_>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Option<Vec<String>>> {
     let mut cursor = node.walk();
@@ -571,7 +567,7 @@ fn declaration_path(
 fn path(
     doc: &DocumentInput,
     node: Node<'_>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Option<Vec<String>>> {
     let mut parts = Vec::new();
@@ -617,7 +613,7 @@ fn path(
 fn import(
     doc: &DocumentInput,
     node: Node<'_>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Option<Import>> {
     let mut static_ = false;
@@ -641,7 +637,7 @@ fn add_blocker(
     name: String,
     start: usize,
     end: usize,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     owner_step(work, check)?;
@@ -656,7 +652,7 @@ fn scan_blockers(
     doc: &DocumentInput,
     root: Node<'_>,
     unit: &mut Unit,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     super::walk(root, check, &mut |node, check| {
@@ -713,7 +709,7 @@ fn scan_blockers(
 pub(super) fn extract(
     doc: &DocumentInput,
     tree: &Tree,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<RawSite>> {
     let mut result = Vec::new();
@@ -796,14 +792,14 @@ mod tests {
             .collect()
     }
 
-    fn expansion(test: impl FnOnce(&Catalog, &Unit, &str, &mut usize)) {
+    fn expansion(test: impl FnOnce(&Catalog, &Unit, &str, &mut Work)) {
         let documents = documents();
         let docs: Vec<_> = documents.iter().collect();
         let trees: Vec<_> = docs
             .iter()
             .map(|doc| parse(doc, &mut || Ok(())).unwrap())
             .collect();
-        let mut work = 0;
+        let mut work = Work::new(work::reference_limit(docs.len(), 0));
         let selected: Vec<_> = (0..docs.len()).collect();
         let catalog = Catalog::new(&docs, &trees, &selected, &mut work, &mut || Ok(())).unwrap();
         let document = docs
@@ -821,8 +817,8 @@ mod tests {
     #[test]
     fn wildcard_expansion_uses_the_accumulated_work_limit() {
         expansion(|catalog, unit, source_set, work| {
-            assert!(*work > 0);
-            *work = OWNER_WORK - 2;
+            assert!(work.used > 0);
+            work.limit = work.used + 2;
             let result = catalog.wildcard(
                 unit,
                 source_set,
@@ -835,7 +831,7 @@ mod tests {
                 .err()
                 .expect("expansion must exhaust the shared budget");
             assert!(error.to_string().starts_with("bounded_work:"));
-            assert!(*work > OWNER_WORK);
+            assert!(work.used > work.limit);
         });
     }
 

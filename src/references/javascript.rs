@@ -87,7 +87,7 @@ impl Catalog {
         documents: &BTreeMap<DocumentKey, usize>,
         selected: &[usize],
         packages: &external::JavascriptPackages,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         let mut resolver = Resolver {
@@ -242,7 +242,7 @@ impl Catalog {
         document: usize,
         site: &RawSite,
         packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         owner_step(work, check)?;
@@ -274,7 +274,7 @@ impl Resolver<'_> {
         &self,
         document: usize,
         specifier: Option<&str>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<std::result::Result<usize, &'static str>> {
         owner_step(work, check)?;
@@ -324,7 +324,7 @@ impl Resolver<'_> {
         source: &Source,
         depth: usize,
         route: &Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Arc<Names>> {
         if !source.supported || depth > FOLLOW {
@@ -340,7 +340,7 @@ impl Resolver<'_> {
         document: usize,
         depth: usize,
         route: &Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Arc<Names>> {
         charge(route.len() + 1, work, check)?;
@@ -398,7 +398,7 @@ impl Resolver<'_> {
         name: &str,
         depth: usize,
         route: &Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Arc<Bucket>> {
         charge(route.len() + name.len() + 1, work, check)?;
@@ -452,7 +452,7 @@ impl Resolver<'_> {
         name: &str,
         depth: usize,
         route: &Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Bucket> {
         owner_step(work, check)?;
@@ -489,7 +489,7 @@ impl Resolver<'_> {
         name: &str,
         depth: usize,
         route: &Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Bucket> {
         let unit = Arc::clone(&self.units[&document]);
@@ -556,7 +556,7 @@ impl Resolver<'_> {
     fn hazards(
         &mut self,
         document: usize,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         if self.hazards.contains_key(&document) {
@@ -575,7 +575,7 @@ impl Resolver<'_> {
     }
 }
 
-fn charge(count: usize, work: &mut usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
+fn charge(count: usize, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
     for _ in 0..count {
         owner_step(work, check)?;
     }
@@ -583,7 +583,7 @@ fn charge(count: usize, work: &mut usize, check: &mut impl FnMut() -> Result<()>
 }
 fn charge_package(
     package: &external::ExternalPackage,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     charge(
@@ -625,7 +625,7 @@ fn charge_package(
 fn local_alias(
     mut bucket: Bucket,
     alias: Option<DeclarationId>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Bucket> {
     let Some(id) = alias else {
@@ -659,7 +659,7 @@ fn unknown_names() -> Names {
 }
 fn charge_bucket(
     bucket: &Bucket,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     owner_step(work, check)?;
@@ -675,7 +675,7 @@ fn charge_bucket(
 fn merge_bucket(
     into: &mut Bucket,
     other: &Bucket,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     into.unknown |= other.unknown;
@@ -692,7 +692,7 @@ fn merge_bucket(
 fn merge_names(
     into: &mut Names,
     other: &Names,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     // Unknown sets compete only for spellings they do not themselves settle.
@@ -718,7 +718,7 @@ fn merge_names(
 fn extend_proof(
     bucket: &mut Bucket,
     document: usize,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     for candidate in bucket.candidates.values_mut() {
@@ -730,7 +730,7 @@ fn extend_proof(
 fn add_bucket(
     result: &mut SiteResolution,
     bucket: &Bucket,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     for candidate in bucket.candidates.values() {
@@ -787,7 +787,7 @@ fn insert_binding(
     name: String,
     start: usize,
     kind: BindingKind,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     charge(name.len() + 1, work, check)?;
@@ -801,7 +801,7 @@ fn insert_export(
     unit: &mut Unit,
     name: String,
     export: Export,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     charge(name.len() + 1, work, check)?;
@@ -831,7 +831,7 @@ fn inventory(
     root: Node<'_>,
     document: usize,
     native: &BTreeMap<(usize, usize, &str), Vec<&Declaration>>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Unit> {
     let mut unit = Unit::default();
@@ -973,7 +973,7 @@ fn declarations(
     unit: &mut Unit,
     exported: bool,
     default: bool,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     if matches!(
@@ -1021,7 +1021,7 @@ fn record_declaration(
     unit: &mut Unit,
     exported: bool,
     default: bool,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let Some(local) = node.child_by_field_name("name").and_then(|n| name(doc, n)) else {
@@ -1118,7 +1118,7 @@ fn record_declaration(
 fn pattern_names(
     doc: &DocumentInput,
     pattern: Node<'_>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<String>> {
     let mut names = Vec::new();
@@ -1206,7 +1206,7 @@ fn shadowed(
     node: Node<'_>,
     spelling: &str,
     scopes: &BTreeMap<usize, BTreeSet<String>>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<bool> {
     let mut parent = node.parent();
@@ -1239,7 +1239,7 @@ fn record_write(
     target: Node<'_>,
     scopes: &BTreeMap<usize, BTreeSet<String>>,
     hazards: &mut Hazards,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     for name in pattern_names(doc, target, work, check)? {
@@ -1253,7 +1253,7 @@ fn record_write(
 fn body_hazards(
     doc: &DocumentInput,
     root: Node<'_>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Hazards> {
     let mut scopes = BTreeMap::<usize, BTreeSet<String>>::new();
@@ -1394,7 +1394,7 @@ fn body_hazards(
 pub(super) fn extract(
     doc: &DocumentInput,
     tree: &Tree,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<RawSite>> {
     let mut result = Vec::new();
@@ -1430,7 +1430,7 @@ pub(super) fn extract(
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
-    fn expansion(test: impl FnOnce(&mut Resolver<'_>, usize, &mut usize)) {
+    fn expansion(test: impl FnOnce(&mut Resolver<'_>, usize, &mut Work)) {
         let root = tempfile::tempdir().unwrap();
         for (path, text) in [
             ("use.js", "export * from './provider.js';"),
@@ -1499,7 +1499,7 @@ mod tests {
             memo: BTreeMap::new(),
             named_memo: BTreeMap::new(),
         };
-        let mut work = 0;
+        let mut work = Work::new(work::reference_limit(docs.len(), 0));
         for (document, doc) in docs.iter().enumerate() {
             let mut native = BTreeMap::<_, Vec<&Declaration>>::new();
             for row in &doc.declarations {
@@ -1550,7 +1550,7 @@ mod tests {
     fn first_export_prefix(
         resolver: &mut Resolver<'_>,
         provider: usize,
-        work: &mut usize,
+        work: &mut Work,
     ) -> (usize, usize) {
         resolver.hazards(provider, work, &mut || Ok(())).unwrap();
         // The same helpers measure one successful native candidate before the next
@@ -1563,7 +1563,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(resolver.units[&provider].explicit.len(), 2);
-        let before = *work;
+        let before = work.used;
         let mut checks = 0;
         let mut check = || {
             checks += 1;
@@ -1578,30 +1578,30 @@ mod tests {
         charge_bucket(&first, work, &mut check).unwrap();
         assert!(resolver.memo.is_empty());
         assert!(resolver.named_memo.is_empty());
-        (*work - before, checks)
+        (work.used - before, checks)
     }
     #[test]
     fn actual_expansion_uses_accumulated_budget_and_cancellation() {
         expansion(|resolver, provider, work| {
-            assert!(*work > 0);
+            assert!(work.used > 0);
             let (prefix_work, _) = first_export_prefix(resolver, provider, work);
             assert!(prefix_work > 0);
-            *work = OWNER_WORK - prefix_work;
-            let before = *work;
+            work.limit = work.used + prefix_work;
+            let before = work.used;
             let error = resolver
                 .exports(provider, 1, &Route::new(), work, &mut || Ok(()))
                 .err()
                 .unwrap();
             assert!(error.to_string().starts_with("bounded_work:"));
-            assert!(*work - before > prefix_work);
-            assert!(*work > OWNER_WORK);
+            assert!(work.used - before > prefix_work);
+            assert!(work.used > work.limit);
             assert!(resolver.memo.is_empty());
             assert!(resolver.named_memo.is_empty());
         });
         expansion(|resolver, provider, work| {
             let (_, prefix_checks) = first_export_prefix(resolver, provider, work);
             let mut checks = 0;
-            let before = *work;
+            let before = work.used;
             let error = resolver
                 .exports(provider, 1, &Route::new(), work, &mut || {
                     checks += 1;
@@ -1612,7 +1612,7 @@ mod tests {
                 .unwrap();
             assert_eq!(error.to_string(), "cancelled");
             assert_eq!(checks, prefix_checks + 1);
-            assert!(*work > before);
+            assert!(work.used > before);
             assert!(resolver.memo.is_empty());
             assert!(resolver.named_memo.is_empty());
         });

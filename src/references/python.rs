@@ -90,7 +90,7 @@ impl Catalog {
         trees: &[Tree],
         _documents: &BTreeMap<DocumentKey, usize>,
         selected: &[usize],
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         let mut result = Self {
@@ -293,7 +293,7 @@ impl Catalog {
         docs: &[&DocumentInput],
         trees: &[Tree],
         selected: &[usize],
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
         charge(selected.len(), work, check)?;
@@ -405,7 +405,7 @@ impl Catalog {
         &self,
         source_set: &str,
         path: &[String],
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<std::result::Result<Layout, &'static str>> {
         let mut proof = BTreeSet::new();
@@ -442,7 +442,7 @@ impl Catalog {
         &self,
         document: usize,
         import: &Import,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<Vec<String>>> {
         charge(import.path.len(), work, check)?;
@@ -464,7 +464,7 @@ impl Catalog {
         &self,
         document: usize,
         import: &Import,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<external::ExternalPackage>> {
         owner_step(work, check)?;
@@ -484,7 +484,7 @@ impl Catalog {
     fn module_candidate(
         &self,
         layout: Layout,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Bucket> {
         owner_step(work, check)?;
@@ -512,7 +512,7 @@ impl Catalog {
         name: &str,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Bucket> {
         owner_step(work, check)?;
@@ -584,7 +584,7 @@ impl Catalog {
         start: usize,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<bool> {
         for import in &self.units[&document].imports {
@@ -605,7 +605,7 @@ impl Catalog {
         document: usize,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<bool> {
         let unit = &self.units[&document];
@@ -633,7 +633,7 @@ impl Catalog {
         name: &str,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Bucket> {
         let unit = &self.units[&document];
@@ -692,7 +692,7 @@ impl Catalog {
         name: &str,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Bucket> {
         owner_step(work, check)?;
@@ -740,7 +740,7 @@ impl Catalog {
         import: &Import,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Bucket> {
         owner_step(work, check)?;
@@ -810,7 +810,7 @@ impl Catalog {
         import: &Import,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<std::sync::Arc<Names>> {
         owner_step(work, check)?;
@@ -845,7 +845,7 @@ impl Catalog {
         document: usize,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<std::sync::Arc<Names>> {
         owner_step(work, check)?;
@@ -885,7 +885,7 @@ impl Catalog {
         document: usize,
         depth: usize,
         route: &mut Route,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Names> {
         let unit = &self.units[&document];
@@ -958,7 +958,7 @@ impl Catalog {
         &self,
         document: usize,
         import: &Import,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         if import.uncertain {
@@ -996,7 +996,7 @@ impl Catalog {
         document: usize,
         site: &RawSite,
         packages: &mut BTreeMap<external::ExternalIdentity, external::ExternalPackage>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<SiteResolution> {
         owner_step(work, check)?;
@@ -1044,7 +1044,7 @@ fn unknown_bucket() -> Bucket {
         ..Bucket::default()
     }
 }
-fn charge(count: usize, work: &mut usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
+fn charge(count: usize, work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
     for _ in 0..count {
         owner_step(work, check)?;
     }
@@ -1052,7 +1052,7 @@ fn charge(count: usize, work: &mut usize, check: &mut impl FnMut() -> Result<()>
 }
 fn charge_names(
     names: &Names,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     for (name, bucket) in &names.names {
@@ -1070,7 +1070,7 @@ fn charge_names(
 fn merge_bucket(
     into: &mut Bucket,
     other: &Bucket,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     into.unknown |= other.unknown;
@@ -1087,7 +1087,7 @@ fn merge_bucket(
 fn merge_names(
     into: &mut Names,
     other: &Names,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     into.unknown_set |= other.unknown_set;
@@ -1105,7 +1105,7 @@ fn merge_names(
 fn extend_proof(
     bucket: &mut Bucket,
     proof: &BTreeSet<usize>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     for candidate in bucket.candidates.values_mut() {
@@ -1117,7 +1117,7 @@ fn extend_proof(
 fn add_bucket(
     result: &mut SiteResolution,
     bucket: &Bucket,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     for candidate in bucket.candidates.values() {
@@ -1156,7 +1156,7 @@ fn import_nodes(
     node: Node<'_>,
     module_scope: bool,
     uncertain: bool,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Import>> {
     let from = node.kind() == "import_from_statement";
@@ -1261,7 +1261,7 @@ fn record(
     name: String,
     start: usize,
     kind: BindingKind,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     charge(name.len() + 1, work, check)?;
@@ -1302,7 +1302,7 @@ fn scan(
     native: &BTreeMap<(usize, usize), Vec<&Declaration>>,
     unit: &mut Unit,
     selected: bool,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let mut pending = vec![(root, true, false, false, 0usize)];
@@ -1528,7 +1528,7 @@ fn block_pattern(
     root: Node<'_>,
     unit: &mut Unit,
     start: usize,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let mut pending = vec![root];
@@ -1568,7 +1568,7 @@ fn block_pattern(
 fn literal_all(
     doc: &DocumentInput,
     node: Node<'_>,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Option<BTreeSet<String>>> {
     if node.kind() != "list" {
@@ -1595,7 +1595,7 @@ fn literal_all(
 // Named Unicode escapes, bytes/f strings and implicit concatenation remain unknown.
 fn literal_string(
     value: &str,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Option<String>> {
     charge(value.len(), work, check)?;
@@ -1685,7 +1685,7 @@ fn literal_string(
 pub(super) fn extract(
     doc: &DocumentInput,
     tree: &Tree,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<RawSite>> {
     let mut result = Vec::new();
@@ -1769,7 +1769,7 @@ mod tests {
             })
             .collect()
     }
-    fn expansion(test: impl FnOnce(&Catalog, usize, &Import, &mut usize)) {
+    fn expansion(test: impl FnOnce(&Catalog, usize, &Import, &mut Work)) {
         let documents = documents();
         let docs: Vec<_> = documents.iter().collect();
         let trees: Vec<_> = docs
@@ -1780,7 +1780,7 @@ mod tests {
             .iter()
             .position(|doc| doc.key.path == "use.py")
             .unwrap();
-        let mut work = 0;
+        let mut work = Work::new(work::reference_limit(docs.len(), 0));
         let catalog = Catalog::new(
             &docs,
             &trees,
@@ -1812,19 +1812,19 @@ mod tests {
             let first = catalog
                 .exports(layout.document, 1, &mut Route::new(), work, &mut || Ok(()))
                 .unwrap();
-            let before = *work;
+            let before = work.used;
             let hit = catalog
                 .exports(layout.document, 1, &mut Route::new(), work, &mut || Ok(()))
                 .unwrap();
             assert!(std::sync::Arc::ptr_eq(&first, &hit));
-            assert_eq!(*work - before, 2);
+            assert_eq!(work.used - before, 2);
         });
     }
     #[test]
     fn wildcard_expansion_uses_accumulated_work_limit() {
         expansion(|catalog, source, import, work| {
-            assert!(*work > 0);
-            *work = OWNER_WORK - 2;
+            assert!(work.used > 0);
+            work.limit = work.used + 2;
             let result =
                 catalog.import_exports(source, import, 1, &mut Route::new(), work, &mut || Ok(()));
             assert!(
@@ -1834,7 +1834,7 @@ mod tests {
                     .to_string()
                     .starts_with("bounded_work:")
             );
-            assert!(*work > OWNER_WORK);
+            assert!(work.used > work.limit);
         });
     }
     #[test]

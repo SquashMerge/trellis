@@ -6,12 +6,15 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser, Tree};
+use work::Work;
 
 pub mod external;
 mod java;
 mod javascript;
+pub(crate) mod parallel_check;
 mod python;
 mod rust;
+pub(crate) mod work;
 
 const FOLLOW: usize = 4;
 
@@ -20,7 +23,6 @@ const TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const VISITS: usize = 1_000_000;
 const DEPTH: usize = 128;
 const SITES: usize = 250_000;
-const OWNER_WORK: usize = 5_000_000;
 
 pub struct DocumentInput {
     pub key: DocumentKey,
@@ -112,6 +114,49 @@ pub fn project(
     sample_limit: usize,
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Projection> {
+    project_configured(
+        snapshot,
+        paths,
+        sample_limit,
+        crate::parallel::default_workers(),
+        check,
+    )
+    .map(|(projection, _)| projection)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn project_with_workers(
+    snapshot: &Snapshot,
+    paths: &[String],
+    sample_limit: usize,
+    workers: usize,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<Projection> {
+    project_configured(snapshot, paths, sample_limit, workers, check)
+        .map(|(projection, _)| projection)
+}
+
+fn project_configured(
+    snapshot: &Snapshot,
+    paths: &[String],
+    sample_limit: usize,
+    workers: usize,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<(Projection, usize)> {
+    let request = parallel_check::RequestCheck::new(check);
+    let workers = workers.clamp(1, crate::parallel::MAX_WORKERS);
+    let result = project_inner(snapshot, paths, sample_limit, workers, &request);
+    request.result(result)
+}
+
+fn project_inner(
+    snapshot: &Snapshot,
+    paths: &[String],
+    sample_limit: usize,
+    workers: usize,
+    request: &parallel_check::RequestCheck<'_>,
+) -> Result<(Projection, usize)> {
+    let check = &mut request.worker();
     ensure!(
         (1..=50).contains(&sample_limit),
         "invalid_request: reference sample limit"
@@ -183,44 +228,90 @@ pub fn project(
             doc.file.text.len() <= SOURCE_BYTES && total_bytes <= TOTAL_BYTES,
             "bounded_work: reference source bytes"
         );
-        let tree = parse(doc, check)?;
-        trees.push(tree);
+    }
+    for batch in docs.chunks(workers) {
+        trees.extend(map_batch(batch, workers, request, |doc| {
+            parse(doc, &mut request.worker())
+        })?);
     }
     let selected: Vec<_> = docs
         .iter()
         .enumerate()
         .filter_map(|(i, doc)| (paths.is_empty() || globs.is_match(&doc.key.path)).then_some(i))
         .collect();
-    let mut external_work = 0;
-    let packages = external::RustPackages::new(&snapshot.manifests, &mut external_work, check)?;
-    let mut rust = rust::Catalog::new(&docs, &trees, &document_map, external_work, check)?;
-    let java = java::Catalog::new(&docs, &trees, &selected, &mut rust.work, check)?;
-    let python = python::Catalog::new(
-        &docs,
-        &trees,
-        &document_map,
-        &selected,
-        &mut rust.work,
-        check,
-    )?;
-    let javascript = if selected
-        .iter()
-        .any(|&i| docs[i].key.language == "javascript")
-    {
-        let packages =
-            external::JavascriptPackages::new(&snapshot.manifests, &mut rust.work, check)?;
-        Some(javascript::Catalog::new(
-            &docs,
-            &trees,
-            &document_map,
-            &selected,
-            &packages,
-            &mut rust.work,
-            check,
-        )?)
-    } else {
-        None
+    let limit = work::reference_limit(docs.len(), total_bytes);
+    let catalogs = map_batch(&[0u8, 1, 2, 3], workers, request, |language| {
+        let mut check = request.worker();
+        let mut work = Work::new(limit);
+        let catalog = match language {
+            0 => {
+                let packages =
+                    external::RustPackages::new(&snapshot.manifests, &mut work, &mut check)?;
+                let catalog = rust::Catalog::new(&docs, &trees, &document_map, work, &mut check)?;
+                let used = catalog.work.used;
+                return Ok((CatalogJob::Rust(Box::new((catalog, packages))), used));
+            }
+            1 => CatalogJob::Java(Box::new(java::Catalog::new(
+                &docs, &trees, &selected, &mut work, &mut check,
+            )?)),
+            2 => CatalogJob::Python(Box::new(python::Catalog::new(
+                &docs,
+                &trees,
+                &document_map,
+                &selected,
+                &mut work,
+                &mut check,
+            )?)),
+            3 => {
+                let catalog = if selected
+                    .iter()
+                    .any(|&i| docs[i].key.language == "javascript")
+                {
+                    let packages = external::JavascriptPackages::new(
+                        &snapshot.manifests,
+                        &mut work,
+                        &mut check,
+                    )?;
+                    Some(javascript::Catalog::new(
+                        &docs,
+                        &trees,
+                        &document_map,
+                        &selected,
+                        &packages,
+                        &mut work,
+                        &mut check,
+                    )?)
+                } else {
+                    None
+                };
+                CatalogJob::Javascript(Box::new(catalog))
+            }
+            _ => unreachable!(),
+        };
+        Ok((catalog, work.used))
+    })?;
+    let mut work = Work::new(limit);
+    let mut catalogs = catalogs.into_iter();
+    let mut admit = |(catalog, used)| -> Result<CatalogJob> {
+        merge_work(&mut work, used, check)?;
+        Ok(catalog)
     };
+    let CatalogJob::Rust(rust_job) = admit(catalogs.next().expect("Rust catalog"))? else {
+        unreachable!()
+    };
+    let (mut rust, packages) = *rust_job;
+    let CatalogJob::Java(java) = admit(catalogs.next().expect("Java catalog"))? else {
+        unreachable!()
+    };
+    let CatalogJob::Python(python) = admit(catalogs.next().expect("Python catalog"))? else {
+        unreachable!()
+    };
+    let CatalogJob::Javascript(javascript) = admit(catalogs.next().expect("JavaScript catalog"))?
+    else {
+        unreachable!()
+    };
+    let javascript = *javascript;
+    rust.work = work;
     let mut external_packages = BTreeMap::new();
     let mut edges: BTreeMap<(usize, Target, bool), (usize, Vec<Site>)> = BTreeMap::new();
     let mut emitted_modules = BTreeSet::new();
@@ -228,100 +319,74 @@ pub fn project(
     let mut site_count = 0usize;
     let mut scanned = 0usize;
     let mut mapped = 0usize;
-    for source in selected {
-        let doc = docs[source];
-        let tree = &trees[source];
-        check()?;
-        emitted_modules.insert(source);
-        scanned += 1;
-        let raw = extract(doc, tree, &mut rust.work, check)?;
-        let declarations = RangeIndex::new(
-            doc.declarations.iter().map(|d| &d.range),
-            &mut rust.work,
-            check,
-        )?;
-        let calls = RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut rust.work, check)?;
-        let newlines: Vec<_> = doc
-            .file
-            .text
-            .bytes()
-            .enumerate()
-            .filter_map(|(i, b)| (b == b'\n').then_some(i))
-            .collect();
-        let mut seen = BTreeSet::new();
-        for item in raw {
-            check()?;
-            if !seen.insert((item.start, item.end, item.kind, item.spelling.clone())) {
-                continue;
-            }
-            site_count += 1;
+    for batch in selected.chunks(workers) {
+        let remaining = rust.work.remaining();
+        let prepared = map_batch(batch, workers, request, |&source| {
+            prepare_file(
+                source,
+                docs[source],
+                &trees[source],
+                remaining,
+                &mut request.worker(),
+            )
+        })?;
+        for prepared in prepared {
+            let PreparedFile {
+                source,
+                work,
+                sites,
+            } = prepared;
+            let doc = docs[source];
+            request.check()?;
+            merge_work(&mut rust.work, work.used, check)?;
+            site_count = site_count.saturating_add(sites.len());
             ensure!(site_count <= SITES, "bounded_work: reference site count");
-            let owner = owner(
-                doc,
-                declarations.enclosing(item.start, item.end, &mut rust.work, check)?,
-            );
-            let role = owner.map(|d| match d.role {
-                DeclarationRole::Test => "test",
-                DeclarationRole::Production => "production",
-            });
-            let site = Site {
-                owner_syntax_id: owner.map(|d| d.syntax_id.clone()),
-                role,
-                range: crate::native_evidence::Range {
-                    start: item.start,
-                    end: item.end,
-                },
-                lines: (!doc.file.text.is_empty()).then(|| Lines {
-                    start: newlines.partition_point(|&p| p < item.start) + 1,
-                    end: newlines.partition_point(|&p| p < item.end.saturating_sub(1)) + 1,
-                }),
-                relation_kind: item.kind,
-                spelling: item.spelling.clone(),
-                call_id: calls
-                    .enclosing(item.start, item.end, &mut rust.work, check)?
-                    .into_iter()
-                    .min()
-                    .map(|index| doc.calls[index].id.clone()),
-            };
-            let resolution = if owner.is_none() {
-                SiteResolution::unknown("reference_owner_ambiguous")
-            } else if doc.key.language == "rust" {
-                rust.resolve(
-                    source,
-                    &item,
-                    &packages,
-                    &mut external_packages,
-                    &docs,
-                    check,
-                )?
-            } else if doc.key.language == "java" {
-                java.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
-            } else if doc.key.language == "python" {
-                python.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
-            } else if doc.key.language == "javascript" {
-                javascript
-                    .as_ref()
-                    .expect("selected JavaScript catalog")
-                    .resolve(source, &item, &mut external_packages, &mut rust.work, check)?
-            } else {
-                SiteResolution::unknown("module_mapping_unavailable")
-            };
-            if !resolution.targets.is_empty() {
-                mapped += 1;
-                emitted_modules.extend(resolution.proof);
-            }
-            for target in resolution.targets {
-                owner_step(&mut rust.work, check)?;
-                let edge = edges
-                    .entry((source, target, role == Some("test")))
-                    .or_default();
-                edge.0 += 1;
-                if edge.1.len() < sample_limit {
-                    edge.1.push(site.clone());
+            emitted_modules.insert(source);
+            scanned += 1;
+            for (item, site) in sites {
+                check()?;
+                let role = site.role;
+                let resolution = if site.owner_syntax_id.is_none() {
+                    SiteResolution::unknown("reference_owner_ambiguous")
+                } else if doc.key.language == "rust" {
+                    rust.resolve(
+                        source,
+                        &item,
+                        &packages,
+                        &mut external_packages,
+                        &docs,
+                        check,
+                    )?
+                } else if doc.key.language == "java" {
+                    java.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
+                } else if doc.key.language == "python" {
+                    python.resolve(source, &item, &mut external_packages, &mut rust.work, check)?
+                } else if doc.key.language == "javascript" {
+                    javascript
+                        .as_ref()
+                        .expect("selected JavaScript catalog")
+                        .resolve(source, &item, &mut external_packages, &mut rust.work, check)?
+                } else {
+                    SiteResolution::unknown("module_mapping_unavailable")
+                };
+                if !resolution.targets.is_empty() {
+                    mapped += 1;
+                    emitted_modules.extend(resolution.proof);
                 }
-            }
-            if let Some(reason) = resolution.residual {
-                unresolved.push(json!({"source":identities[source],"site":site,"reason":reason}));
+                for target in resolution.targets {
+                    owner_step(&mut rust.work, check)?;
+                    let edge = edges
+                        .entry((source, target, role == Some("test")))
+                        .or_default();
+                    edge.0 += 1;
+                    if edge.1.len() < sample_limit {
+                        edge.1.push(site.clone());
+                    }
+                }
+                if let Some(reason) = resolution.residual {
+                    unresolved
+                        .push(json!({"source":identities[source],"site":site,"reason":reason}));
+                }
             }
         }
     }
@@ -346,23 +411,122 @@ pub fn project(
         }
     }
     let emitted_modules: Vec<_> = emitted_modules.into_iter().map(|i| &modules[i]).collect();
+    request.check()?;
+    Ok((
+        Projection {
+            data: json!({
+                "referencesVersion":"references:v2","indexGeneration":snapshot.pin.index_generation.to_string(),
+                "indexRevision":snapshot.pin.index_revision,"evidenceTier":"syntax","semanticComplete":false,
+                "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
+                "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len()},
+                "limitations":[
+                    "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
+                    "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
+                    "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
+                    "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
+                    "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability."
+                ]
+            }),
+            modules,
+        },
+        rust.work.used,
+    ))
+}
+
+enum CatalogJob {
+    Rust(Box<(rust::Catalog, external::RustPackages)>),
+    Java(Box<java::Catalog>),
+    Python(Box<python::Catalog>),
+    Javascript(Box<Option<javascript::Catalog>>),
+}
+
+struct PreparedFile {
+    source: usize,
+    work: Work,
+    sites: Vec<(RawSite, Site)>,
+}
+
+fn merge_work(work: &mut Work, used: usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
     check()?;
-    Ok(Projection {
-        data: json!({
-            "referencesVersion":"references:v2","indexGeneration":snapshot.pin.index_generation.to_string(),
-            "indexRevision":snapshot.pin.index_revision,"evidenceTier":"syntax","semanticComplete":false,
-            "modules":emitted_modules,"externalPackages":external_packages.into_values().collect::<Vec<_>>(),"production":production,"tests":tests,"unresolved":unresolved,
-            "counts":{"scannedDocuments":scanned,"mappedSites":mapped,"unresolvedSites":unresolved.len()},
-            "limitations":[
-                "Structural file conventions are not compiler, package, type or call resolution; missing sites do not prove absence.",
-                "Rust expands captured public names through proved lexical modules and bounded import/reexport chains; cfg, macros, unproved ownership and unknown in-repo names remain uncertain. Declared external roots identify packages only.",
-                "JavaScript expands captured named ESM exports through bounded relative forwarding; stars exclude default. Ambiguous names, dynamic namespaces and unproved bindings remain uncertain. Static sources retain module evidence; declared npm roots and the partial pinned Node catalog identify packages only.",
-                "Python expands proved checkout-root modules and package exports with bounded import forwarding and literal-list __all__; dynamic namespaces, ambiguous bindings and unproved package layouts remain uncertain. The pinned CPython 3.12 stdlib catalog labels roots only; third-party distribution mappings remain unknown.",
-                "Java expands captured public top-level types from declared packages, with explicit and lexical shadowing; static/member types and unproved third-party prefixes remain unresolved. Java labels identify package families only; javax requires an exact package in the pinned OpenJDK 25 catalog, not proof of members or installed-JDK availability."
-            ]
-        }),
-        modules,
+    ensure!(work.charge(used), "bounded_work: reference owner lookup");
+    Ok(())
+}
+
+fn prepare_file(
+    source: usize,
+    doc: &DocumentInput,
+    tree: &Tree,
+    limit: usize,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<PreparedFile> {
+    let mut work = Work::new(limit);
+    let raw = extract(doc, tree, &mut work, check)?;
+    let declarations =
+        RangeIndex::new(doc.declarations.iter().map(|d| &d.range), &mut work, check)?;
+    let calls = RangeIndex::new(doc.calls.iter().map(|c| &c.range), &mut work, check)?;
+    let newlines: Vec<_> = doc
+        .file
+        .text
+        .bytes()
+        .enumerate()
+        .filter_map(|(i, b)| (b == b'\n').then_some(i))
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut sites = Vec::new();
+    for item in raw {
+        check()?;
+        if !seen.insert((item.start, item.end, item.kind, item.spelling.clone())) {
+            continue;
+        }
+        let owner = owner(
+            doc,
+            declarations.enclosing(item.start, item.end, &mut work, check)?,
+        );
+        let role = owner.map(|d| match d.role {
+            DeclarationRole::Test => "test",
+            DeclarationRole::Production => "production",
+        });
+        let site = Site {
+            owner_syntax_id: owner.map(|d| d.syntax_id.clone()),
+            role,
+            range: crate::native_evidence::Range {
+                start: item.start,
+                end: item.end,
+            },
+            lines: (!doc.file.text.is_empty()).then(|| Lines {
+                start: newlines.partition_point(|&p| p < item.start) + 1,
+                end: newlines.partition_point(|&p| p < item.end.saturating_sub(1)) + 1,
+            }),
+            relation_kind: item.kind,
+            spelling: item.spelling.clone(),
+            call_id: calls
+                .enclosing(item.start, item.end, &mut work, check)?
+                .into_iter()
+                .min()
+                .map(|index| doc.calls[index].id.clone()),
+        };
+        sites.push((item, site));
+    }
+    Ok(PreparedFile {
+        source,
+        work,
+        sites,
     })
+}
+
+fn map_batch<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    request: &parallel_check::RequestCheck<'_>,
+    prepare: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    request.check()?;
+    let results =
+        crate::parallel::map_ordered(items, workers, &request.stopped, |_, item| prepare(item));
+    results
+        .into_iter()
+        .map(|slot| slot.context("reference request stopped")?)
+        .collect()
 }
 
 fn grammar(language: &str) -> Result<tree_sitter::Language> {
@@ -440,7 +604,7 @@ struct RangeIndex<'a> {
 impl<'a> RangeIndex<'a> {
     fn new(
         ranges: impl Iterator<Item = &'a crate::native_evidence::Range>,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Self> {
         let mut indexed = Vec::new();
@@ -462,7 +626,7 @@ impl<'a> RangeIndex<'a> {
         &mut self,
         left: usize,
         right: usize,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<usize> {
         if left == right {
@@ -483,7 +647,7 @@ impl<'a> RangeIndex<'a> {
         &self,
         start: usize,
         end: usize,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<usize>> {
         let mut found = Vec::new();
@@ -509,10 +673,9 @@ impl<'a> RangeIndex<'a> {
     }
 }
 
-fn owner_step(work: &mut usize, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
+fn owner_step(work: &mut Work, check: &mut impl FnMut() -> Result<()>) -> Result<()> {
     check()?;
-    *work = work.saturating_add(1);
-    ensure!(*work <= OWNER_WORK, "bounded_work: reference owner lookup");
+    ensure!(work.charge(1), "bounded_work: reference owner lookup");
     Ok(())
 }
 
@@ -564,7 +727,7 @@ fn raw(
 fn extract(
     doc: &DocumentInput,
     tree: &Tree,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<RawSite>> {
     if doc.key.language == "rust" {
@@ -629,7 +792,7 @@ mod range_index_tests {
             Range { start: 40, end: 40 },
             Range { start: 60, end: 80 },
         ];
-        let mut work = 0;
+        let mut work = Work::new(5_000_000);
         let index = RangeIndex::new(ranges.iter(), &mut work, &mut || Ok(())).unwrap();
         for start in 0..=101 {
             for end in start..=101 {
@@ -653,15 +816,15 @@ mod range_index_tests {
     #[test]
     fn range_index_work_is_bounded_and_cancellable() {
         let ranges = [Range { start: 0, end: 100 }];
-        let mut work = 0;
+        let mut work = Work::new(5_000_000);
         let index = RangeIndex::new(ranges.iter(), &mut work, &mut || Ok(())).unwrap();
-        work = OWNER_WORK;
+        work.used = work.limit;
         let error = index
             .enclosing(5, 10, &mut work, &mut || Ok(()))
             .unwrap_err();
         assert_eq!(error.to_string(), "bounded_work: reference owner lookup");
         let mut checks = 0;
-        let error = RangeIndex::new(ranges.iter(), &mut 0, &mut || {
+        let error = RangeIndex::new(ranges.iter(), &mut Work::new(5_000_000), &mut || {
             checks += 1;
             ensure!(checks < 3, "cancelled");
             Ok(())
@@ -670,8 +833,226 @@ mod range_index_tests {
         .unwrap();
         assert_eq!(error.to_string(), "cancelled");
         let error = index
-            .enclosing(5, 10, &mut 0, &mut || anyhow::bail!("cancelled"))
+            .enclosing(5, 10, &mut Work::new(5_000_000), &mut || {
+                anyhow::bail!("cancelled")
+            })
             .unwrap_err();
         assert_eq!(error.to_string(), "cancelled");
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    fn snapshot() -> Snapshot {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in [
+            (
+                "src/lib.rs",
+                "mod provider; pub use provider::value; pub fn run() { value(); }",
+            ),
+            ("src/provider.rs", "pub fn value() {}"),
+            (
+                "Use.java",
+                "package app; import app.Provider; public class Use { Provider value; }",
+            ),
+            ("Provider.java", "package app; public class Provider {}"),
+            ("use.py", "from provider import value\nvalue()\n"),
+            ("provider.py", "def value():\n    return 1\n"),
+            ("use.js", "import { value } from './provider.js'; value();"),
+            ("provider.js", "export function value() {}"),
+        ] {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        let identity =
+            crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap();
+        let (graph, native) = crate::indexer::index_workspace_with_native(
+            &crate::indexer::IndexOptions::new(root.path().to_owned()),
+            &identity.record_id,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let documents = graph
+            .files
+            .into_iter()
+            .map(|file| {
+                let key = native
+                    .revision
+                    .documents
+                    .iter()
+                    .find(|doc| doc.key.path == file.path)
+                    .unwrap()
+                    .key
+                    .clone();
+                let declarations = native
+                    .declarations
+                    .iter()
+                    .filter(|declaration| declaration.document == key)
+                    .cloned()
+                    .collect();
+                let calls = native
+                    .calls
+                    .iter()
+                    .filter(|call| call.document == key)
+                    .cloned()
+                    .collect();
+                DocumentInput {
+                    key,
+                    file,
+                    declarations,
+                    calls,
+                }
+            })
+            .collect();
+        Snapshot {
+            pin: IndexPin {
+                index_generation: uuid::Uuid::new_v4(),
+                index_revision: 1,
+            },
+            documents,
+            manifests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn serial_and_parallel_keep_payload_and_exact_work_counts() {
+        let snapshot = snapshot();
+        for paths in [vec![], vec!["src/lib.rs".into(), "use.*".into()]] {
+            let (serial, used) =
+                project_configured(&snapshot, &paths, 1, 1, &mut || Ok(())).unwrap();
+            assert!(used > 0);
+            for workers in [2, 8] {
+                let (parallel, parallel_used) =
+                    project_configured(&snapshot, &paths, 1, workers, &mut || Ok(())).unwrap();
+                assert_eq!(parallel_used, used);
+                assert_eq!(
+                    serde_json::to_vec(&parallel.data).unwrap(),
+                    serde_json::to_vec(&serial.data).unwrap()
+                );
+                assert_eq!(parallel.modules, serial.modules);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_parse_and_preparation_overlap_and_return_in_source_order() {
+        let snapshot = snapshot();
+        let docs = &snapshot.documents[..2];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx = Mutex::new(rx);
+        let mut check = || Ok(());
+        let request = parallel_check::RequestCheck::new(&mut check);
+        let trees = map_batch(&[0usize, 1], 2, &request, |&index| {
+            if index == 0 {
+                rx.lock().unwrap().recv().unwrap();
+            }
+            let tree = parse(&docs[index], &mut request.worker())?;
+            if index == 1 {
+                tx.send(()).unwrap();
+            }
+            Ok(tree)
+        })
+        .unwrap();
+        assert_eq!(trees[0].root_node().end_byte(), docs[0].file.text.len());
+        assert_eq!(trees[1].root_node().end_byte(), docs[1].file.text.len());
+        let prepared = map_batch(&[0usize, 1], 2, &request, |&index| {
+            if index == 0 {
+                rx.lock().unwrap().recv().unwrap();
+            }
+            let prepared = prepare_file(
+                index,
+                &docs[index],
+                &trees[index],
+                5_000_000,
+                &mut request.worker(),
+            )?;
+            if index == 1 {
+                tx.send(()).unwrap();
+            }
+            Ok(prepared)
+        })
+        .unwrap();
+        assert_eq!(prepared[0].source, 0);
+        assert_eq!(prepared[1].source, 1);
+        assert!(prepared.iter().all(|file| file.work.used > 0));
+    }
+
+    #[test]
+    fn independent_catalog_jobs_overlap() {
+        let snapshot = snapshot();
+        let mut docs: Vec<_> = snapshot.documents.iter().collect();
+        docs.sort_by(|a, b| a.key.cmp(&b.key));
+        let trees: Vec<_> = docs
+            .iter()
+            .map(|doc| parse(doc, &mut || Ok(())).unwrap())
+            .collect();
+        let documents = docs
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| (doc.key.clone(), i))
+            .collect();
+        let selected: Vec<_> = (0..docs.len()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx = Mutex::new(rx);
+        let mut check = || Ok(());
+        let request = parallel_check::RequestCheck::new(&mut check);
+        let catalogs = map_batch(&[0usize, 1], 2, &request, |&language| {
+            let mut check = request.worker();
+            let mut work = Work::new(5_000_000);
+            if language == 0 {
+                rx.lock().unwrap().recv().unwrap();
+                let packages = external::RustPackages::new(&[], &mut work, &mut check)?;
+                let catalog = rust::Catalog::new(&docs, &trees, &documents, work, &mut check)?;
+                Ok(CatalogJob::Rust(Box::new((catalog, packages))))
+            } else {
+                let catalog = java::Catalog::new(&docs, &trees, &selected, &mut work, &mut check)?;
+                tx.send(()).unwrap();
+                Ok(CatalogJob::Java(Box::new(catalog)))
+            }
+        })
+        .unwrap();
+        assert!(matches!(&catalogs[0], CatalogJob::Rust(_)));
+        assert!(matches!(&catalogs[1], CatalogJob::Java(_)));
+    }
+
+    #[test]
+    fn ordered_failure_stops_before_next_batch_and_work_is_bounded() {
+        let visited = AtomicUsize::new(0);
+        let mut check = || Ok(());
+        let request = parallel_check::RequestCheck::new(&mut check);
+        let result: Result<()> = (|| {
+            for batch in [0usize, 1, 2].chunks(2) {
+                map_batch(batch, 2, &request, |&index| -> Result<()> {
+                    visited.fetch_add(1, Ordering::Relaxed);
+                    if index == 0 {
+                        anyhow::bail!("first source failure")
+                    }
+                    anyhow::bail!("later source failure")
+                })?;
+            }
+            Ok(())
+        })();
+        assert_eq!(result.unwrap_err().to_string(), "first source failure");
+        assert_eq!(visited.load(Ordering::Relaxed), 2);
+        let snapshot = snapshot();
+        let doc = &snapshot.documents[0];
+        let tree = parse(doc, &mut || Ok(())).unwrap();
+        let error = prepare_file(0, doc, &tree, 0, &mut || Ok(()))
+            .err()
+            .unwrap();
+        assert!(error.to_string().starts_with("bounded_work:"));
+        let mut total = Work::new(3);
+        merge_work(&mut total, 2, &mut || Ok(())).unwrap();
+        assert!(merge_work(&mut total, 2, &mut || Ok(())).is_err());
+        assert_eq!(total.used, 4);
     }
 }

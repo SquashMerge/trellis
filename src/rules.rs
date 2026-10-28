@@ -1,5 +1,7 @@
 //! Bounded, read-only architecture rules over one admitted source snapshot.
 use crate::native_evidence::{Declaration, DeclarationRole, Range};
+use crate::references::parallel_check::RequestCheck;
+use crate::references::work::{self, Work};
 use crate::references::{Projection, Snapshot};
 use anyhow::{Context, Result, ensure};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -14,7 +16,6 @@ use toml::Spanned;
 
 mod glob_language;
 
-const WORK_LIMIT: usize = 5_000_000;
 pub const RULES_PATH: &str = ".trellis/rules.toml";
 const CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const COLLECTION_LIMIT: usize = 1024;
@@ -770,7 +771,7 @@ impl<'a> LayerMatcher<'a> {
     fn select(
         &mut self,
         path: &str,
-        work: &mut usize,
+        work: &mut Work,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<&'a str>> {
         let mut matching = Vec::new();
@@ -801,11 +802,7 @@ impl<'a> LayerMatcher<'a> {
             }
             for j in i + 1..matching.len() {
                 check()?;
-                *work = work.saturating_add(1);
-                ensure!(
-                    *work <= WORK_LIMIT,
-                    "bounded_work: layer specificity comparison"
-                );
+                ensure!(work.charge(1), "bounded_work: layer specificity comparison");
                 let (a, b) = (matching[i].2.text.as_str(), matching[j].2.text.as_str());
                 let (key, reverse) = if a <= b {
                     ((a, b), false)
@@ -884,7 +881,7 @@ fn layer_status(
 fn portable_source_set<'a>(
     config: &Config,
     snapshot: &'a Snapshot,
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Option<&'a str>> {
     let Some(span) = config
@@ -910,9 +907,8 @@ fn portable_source_set<'a>(
         )
     {
         check()?;
-        *work = work.saturating_add(1);
         ensure!(
-            *work <= WORK_LIMIT,
+            work.charge(1),
             "bounded_work: portable exception scope budget"
         );
         if scope.is_some_and(|current| current != source_set) {
@@ -1171,7 +1167,7 @@ fn package_closure(
     instances: &[Value],
     test_only: &[Value],
     unassigned: &[Value],
-    work: &mut usize,
+    work: &mut Work,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Value>> {
     let mut needed = BTreeSet::new();
@@ -1182,9 +1178,8 @@ fn package_closure(
         .chain(unassigned)
     {
         check()?;
-        *work = work.saturating_add(1);
         ensure!(
-            *work <= WORK_LIMIT,
+            work.charge(1),
             "bounded_work: rules external package closure budget"
         );
         if identity["kind"] == "externalPackage" {
@@ -1194,9 +1189,8 @@ fn package_closure(
     let mut retained = Vec::new();
     for package in packages {
         check()?;
-        *work = work.saturating_add(1);
         ensure!(
-            *work <= WORK_LIMIT,
+            work.charge(1),
             "bounded_work: rules external package closure budget"
         );
         if needed.remove(&package["identity"].to_string()) {
@@ -1209,6 +1203,158 @@ fn package_closure(
     );
     Ok(retained)
 }
+struct DocumentEvaluation<'a> {
+    config: &'a Config,
+    inheritance: bool,
+    source_set: Option<&'a str>,
+    #[cfg(test)]
+    before_document: Option<&'a (dyn Fn(&crate::references::DocumentInput) + Sync)>,
+}
+impl DocumentEvaluation<'_> {
+    fn run(
+        &self,
+        documents: &[&crate::references::DocumentInput],
+        work: &mut Work,
+        workers: usize,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let workers = workers.clamp(1, crate::parallel::MAX_WORKERS);
+        let request = RequestCheck::new(check);
+        let mut instances = Vec::new();
+        let mut test_only = Vec::new();
+        for batch in documents.chunks(workers) {
+            request.result(request.check())?;
+            let remaining = work.remaining();
+            let outcomes =
+                crate::parallel::map_ordered(batch, workers, &request.stopped, |_, doc| {
+                    #[cfg(test)]
+                    if let Some(before) = self.before_document {
+                        before(doc);
+                    }
+                    evaluate_document(
+                        self.config,
+                        doc,
+                        self.inheritance,
+                        self.source_set,
+                        remaining,
+                        &mut request.worker(),
+                    )
+                });
+            request.result(Ok(()))?;
+            for outcome in outcomes {
+                let rows =
+                    request.result(outcome.context("cancelled: rules worker not started")?)?;
+                ensure!(
+                    work.charge(rows.work.used),
+                    "bounded_work: rules document budget"
+                );
+                instances.extend(rows.instances);
+                test_only.extend(rows.test_only);
+                request.result(request.check())?;
+            }
+        }
+        Ok((instances, test_only))
+    }
+}
+
+struct DocumentRows {
+    instances: Vec<Value>,
+    test_only: Vec<Value>,
+    work: Work,
+}
+
+fn evaluate_document(
+    config: &Config,
+    doc: &crate::references::DocumentInput,
+    inheritance: bool,
+    source_set: Option<&str>,
+    limit: usize,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<DocumentRows> {
+    let mut work = Work::new(limit);
+    let mut instances = Vec::new();
+    let mut test_only = Vec::new();
+    let bases = if inheritance {
+        parse_bases(doc, check)?
+    } else {
+        BTreeMap::new()
+    };
+    for d in &doc.declarations {
+        check()?;
+        for rule in &config.rules {
+            ensure!(
+                work.charge(1 + config.roles[&rule.role].paths.len()),
+                "bounded_work: rules selection budget"
+            );
+            check()?;
+            let selected = selection(&config.roles[&rule.role], d, bases.get(&d.syntax_id));
+            if selected == Some(false) {
+                continue;
+            }
+            let mut unresolved = Vec::new();
+            if selected.is_none() {
+                unresolved.push("selector_relationship_unavailable".to_owned());
+            }
+            let mut constraints = Vec::new();
+            for c in &rule.constraints {
+                ensure!(
+                    work.charge(
+                        1 + if c.kind == "calls" {
+                            doc.calls.len()
+                        } else {
+                            0
+                        },
+                    ),
+                    "bounded_work: rule constraint budget"
+                );
+                check()?;
+                let reason = if c.kind == "calls" {
+                    "call_binding_unavailable"
+                } else {
+                    "type_relationship_unavailable"
+                };
+                let mut evidence = vec![native_evidence(d)];
+                if c.kind == "calls" {
+                    for call in doc
+                        .calls
+                        .iter()
+                        .filter(|call| call.owner_syntax_id == d.syntax_id)
+                    {
+                        ensure!(work.charge(1), "bounded_work: rule evidence budget");
+                        check()?;
+                        evidence.push(json!({"document":call.document,"revisionId":call.revision_id,"range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,"callId":call.id,"provenanceId":call.provenance_id}));
+                    }
+                }
+                constraints.push(json!({"mode":c.mode,"kind":c.kind,"targetRole":c.role,"status":"unknown","evidence":evidence,"unresolved":[reason]}));
+                if !unresolved.iter().any(|r| r == reason) {
+                    unresolved.push(reason.to_owned());
+                }
+            }
+            let test = d.role == DeclarationRole::Test;
+            if test {
+                unresolved.push("test_only".into());
+            }
+            let mut row = json!({"rule":rule.id,"target":identity(d),"destination":null,"sourceLayer":null,"destinationLayer":null,"status":"unknown","excepted":false,"exceptionReason":null,
+                    "constraints":constraints,"evidence":[native_evidence(d)],"unresolved":unresolved,"referenceCount":0});
+            ensure!(
+                work.charge(config.exceptions.len()),
+                "bounded_work: exception match budget"
+            );
+            decorate(config, source_set, &mut row);
+            if test {
+                test_only.push(row)
+            } else {
+                instances.push(row)
+            }
+        }
+    }
+    Ok(DocumentRows {
+        instances,
+        test_only,
+        work,
+    })
+}
+
 pub fn evaluate(
     config: &Config,
     snapshot: &Snapshot,
@@ -1231,6 +1377,40 @@ pub(crate) fn evaluate_with_layers<'a>(
     paths: &[String],
     check: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<Evaluation<'a>> {
+    evaluate_with_layers_workers(
+        config,
+        snapshot,
+        refs,
+        paths,
+        check,
+        crate::parallel::default_workers(),
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub fn evaluate_with_workers(
+    config: &Config,
+    snapshot: &Snapshot,
+    refs: &Projection,
+    paths: &[String],
+    workers: usize,
+    check: &mut (impl FnMut() -> Result<()> + Send),
+) -> Result<Value> {
+    Ok(evaluate_with_layers_workers(config, snapshot, refs, paths, check, workers)?.data)
+}
+
+fn evaluate_with_layers_workers<'a>(
+    config: &'a Config,
+    snapshot: &Snapshot,
+    refs: &'a Projection,
+    paths: &[String],
+    check: &mut (impl FnMut() -> Result<()> + Send),
+    workers: usize,
+) -> Result<Evaluation<'a>> {
+    let limit = work::rules_limit(
+        snapshot.documents.len(),
+        work::snapshot_bytes(snapshot, check)?,
+    );
     let path_values: Vec<_> = paths
         .iter()
         .map(|p| Spanned::new(0..0, p.clone()))
@@ -1247,11 +1427,11 @@ pub(crate) fn evaluate_with_layers<'a>(
         .values()
         .map(|layer| layer.patterns.len())
         .sum();
+    let mut work = Work::new(limit);
     ensure!(
-        modules.len().saturating_mul(layer_patterns) <= WORK_LIMIT,
+        work.charge(modules.len().saturating_mul(layer_patterns)),
         "bounded_work: layer assignment pattern budget"
     );
-    let mut work = modules.len().saturating_mul(layer_patterns);
     let source_set = portable_source_set(config, snapshot, &mut work, check)?;
     let mut matcher = LayerMatcher::new(config);
     let mut unassigned = Vec::new();
@@ -1278,9 +1458,8 @@ pub(crate) fn evaluate_with_layers<'a>(
         let identity = &package["identity"];
         let selector = ExternalSelector::from_identity(identity)
             .context("store_unavailable: external package identity absent")?;
-        work = work.saturating_add(config.layers.len());
         ensure!(
-            work <= WORK_LIMIT,
+            work.charge(config.layers.len()),
             "bounded_work: external layer assignment budget"
         );
         let layer = config
@@ -1338,9 +1517,8 @@ pub(crate) fn evaluate_with_layers<'a>(
             let sites = edge["sites"]
                 .as_array()
                 .context("store_unavailable: edge sites absent")?;
-            work = work.saturating_add(1 + sites.len());
             ensure!(
-                work <= WORK_LIMIT,
+                work.charge(1 + sites.len()),
                 "bounded_work: rules reference evidence budget"
             );
             let mut evidence = Vec::new();
@@ -1356,8 +1534,10 @@ pub(crate) fn evaluate_with_layers<'a>(
                 }
                 let mut row = json!({"rule":"$layers","target":source,"destination":target,"sourceLayer":source_layer,"destinationLayer":target_layer,"status":status,
                     "excepted":false,"exceptionReason":null,"constraints":[],"evidence":evidence,"unresolved":unresolved,"referenceCount":edge["count"]});
-                work = work.saturating_add(config.exceptions.len());
-                ensure!(work <= WORK_LIMIT, "bounded_work: exception match budget");
+                ensure!(
+                    work.charge(config.exceptions.len()),
+                    "bounded_work: exception match budget"
+                );
                 decorate(config, source_set, &mut row);
                 rows.push(row);
             }
@@ -1427,6 +1607,7 @@ pub(crate) fn evaluate_with_layers<'a>(
         .values()
         .any(|s| s.extends.is_some() || s.implements.is_some());
     let mut source_bytes = 0usize;
+    let mut documents = Vec::new();
     for doc in &snapshot.documents {
         check()?;
         if !glob_matches(&filter, &doc.key.path) {
@@ -1437,76 +1618,18 @@ pub(crate) fn evaluate_with_layers<'a>(
             source_bytes <= 256 * 1024 * 1024,
             "bounded_work: selector total source bound"
         );
-        let bases = if inheritance {
-            parse_bases(doc, check)?
-        } else {
-            BTreeMap::new()
-        };
-        for d in &doc.declarations {
-            check()?;
-            for rule in &config.rules {
-                work = work.saturating_add(1 + config.roles[&rule.role].paths.len());
-                ensure!(work <= WORK_LIMIT, "bounded_work: rules selection budget");
-                check()?;
-                let selected = selection(&config.roles[&rule.role], d, bases.get(&d.syntax_id));
-                if selected == Some(false) {
-                    continue;
-                }
-                let mut unresolved = Vec::new();
-                if selected.is_none() {
-                    unresolved.push("selector_relationship_unavailable".to_owned());
-                }
-                let mut constraints = Vec::new();
-                for c in &rule.constraints {
-                    work = work.saturating_add(
-                        1 + if c.kind == "calls" {
-                            doc.calls.len()
-                        } else {
-                            0
-                        },
-                    );
-                    ensure!(work <= WORK_LIMIT, "bounded_work: rule constraint budget");
-                    check()?;
-                    let reason = if c.kind == "calls" {
-                        "call_binding_unavailable"
-                    } else {
-                        "type_relationship_unavailable"
-                    };
-                    let mut evidence = vec![native_evidence(d)];
-                    if c.kind == "calls" {
-                        for call in doc
-                            .calls
-                            .iter()
-                            .filter(|call| call.owner_syntax_id == d.syntax_id)
-                        {
-                            work = work.saturating_add(1);
-                            ensure!(work <= WORK_LIMIT, "bounded_work: rule evidence budget");
-                            check()?;
-                            evidence.push(json!({"document":call.document,"revisionId":call.revision_id,"range":call.range,"kind":"call","syntaxId":call.owner_syntax_id,"callId":call.id,"provenanceId":call.provenance_id}));
-                        }
-                    }
-                    constraints.push(json!({"mode":c.mode,"kind":c.kind,"targetRole":c.role,"status":"unknown","evidence":evidence,"unresolved":[reason]}));
-                    if !unresolved.iter().any(|r| r == reason) {
-                        unresolved.push(reason.to_owned());
-                    }
-                }
-                let test = d.role == DeclarationRole::Test;
-                if test {
-                    unresolved.push("test_only".into());
-                }
-                let mut row = json!({"rule":rule.id,"target":identity(d),"destination":null,"sourceLayer":null,"destinationLayer":null,"status":"unknown","excepted":false,"exceptionReason":null,
-                    "constraints":constraints,"evidence":[native_evidence(d)],"unresolved":unresolved,"referenceCount":0});
-                work = work.saturating_add(config.exceptions.len());
-                ensure!(work <= WORK_LIMIT, "bounded_work: exception match budget");
-                decorate(config, source_set, &mut row);
-                if test {
-                    test_only.push(row)
-                } else {
-                    instances.push(row)
-                }
-            }
-        }
+        documents.push(doc);
     }
+    let (declarations, test_declarations) = DocumentEvaluation {
+        config,
+        inheritance,
+        source_set,
+        #[cfg(test)]
+        before_document: None,
+    }
+    .run(&documents, &mut work, workers, check)?;
+    instances.extend(declarations);
+    test_only.extend(test_declarations);
     let sort_rows = |rows: &mut Vec<Value>| {
         rows.sort_by_cached_key(|row| {
             (
@@ -1582,7 +1705,8 @@ pub fn explain(
         payload["unassigned"]
             .as_array()
             .context("store_unavailable: unassigned catalog absent")?,
-        &mut 0,
+        // This is a subset of an admitted evaluation, whose request limit was <= this ceiling.
+        &mut Work::new(work::RULES_CEILING),
         check,
     )?);
     Ok(payload)
@@ -1596,7 +1720,7 @@ mod specificity_tests {
     fn global_minima_and_cached_comparisons_share_work_and_cancellation() {
         let config = parse("version=1\n[layers.alpha]\norder=1\npaths=['src/a*.rs']\n[layers.beta]\norder=2\npaths=['src/*a.rs']\n[layers.winner]\norder=3\npaths=['src/a*a.rs']\n").unwrap();
         let mut matcher = LayerMatcher::new(&config);
-        let mut work = 0;
+        let mut work = Work::new(work::rules_limit(0, 0));
         assert_eq!(
             matcher
                 .select("src/aa.rs", &mut work, &mut || Ok(()))
@@ -1604,14 +1728,14 @@ mod specificity_tests {
             Some("winner")
         );
         assert_eq!(matcher.relations.len(), 3);
-        let compiled_work = work;
+        let compiled_work = work.used;
         assert_eq!(
             matcher
                 .select("src/aaa.rs", &mut work, &mut || Ok(()))
                 .unwrap(),
             Some("winner")
         );
-        assert_eq!(work - compiled_work, 3);
+        assert_eq!(work.used - compiled_work, 3);
         // The first three checks inspect matches; the fourth visits a cached pair.
         let mut checks = 0;
         let error = matcher
@@ -1623,7 +1747,7 @@ mod specificity_tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "cancelled");
         let error = matcher
-            .select("src/aa.rs", &mut { WORK_LIMIT }, &mut || Ok(()))
+            .select("src/aa.rs", &mut Work::new(0), &mut || Ok(()))
             .unwrap_err();
         assert!(error.to_string().contains("bounded_work"));
     }
@@ -1651,20 +1775,26 @@ mod portable_exception_tests {
                 bytes: None,
             }],
         };
-        let error = portable_source_set(&config, &snapshot, &mut 0, &mut || {
-            anyhow::bail!("cancelled")
-        })
+        let error = portable_source_set(
+            &config,
+            &snapshot,
+            &mut Work::new(work::rules_limit(0, 0)),
+            &mut || anyhow::bail!("cancelled"),
+        )
         .unwrap_err();
         assert_eq!(error.to_string(), "cancelled");
-        let error = portable_source_set(&config, &snapshot, &mut { WORK_LIMIT }, &mut || Ok(()))
-            .unwrap_err();
+        let error =
+            portable_source_set(&config, &snapshot, &mut Work::new(0), &mut || Ok(())).unwrap_err();
         assert!(error.to_string().contains("bounded_work"));
-        let mut work = 17;
+        let mut work = Work {
+            used: 17,
+            limit: work::rules_limit(0, 0),
+        };
         assert_eq!(
             portable_source_set(&config, &snapshot, &mut work, &mut || Ok(())).unwrap(),
             Some("one")
         );
-        assert_eq!(work, 18);
+        assert_eq!(work.used, 18);
         let declarations_only = parse("version=1").unwrap();
         assert_eq!(
             portable_source_set(
@@ -1676,6 +1806,185 @@ mod portable_exception_tests {
             .unwrap(),
             None
         );
-        assert_eq!(work, 18);
+        assert_eq!(work.used, 18);
+    }
+}
+
+#[cfg(test)]
+mod document_parallel_tests {
+    use super::*;
+    use crate::references::DocumentInput;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    fn snapshot(files: &[(&str, &str)]) -> Snapshot {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in files {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let identity =
+            crate::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap();
+        let (graph, native) = crate::indexer::index_workspace_with_native(
+            &crate::indexer::IndexOptions::new(root.path().to_owned()),
+            &identity.record_id,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        let documents = graph
+            .files
+            .into_iter()
+            .map(|file| {
+                let key = native
+                    .revision
+                    .documents
+                    .iter()
+                    .find(|d| d.key.path == file.path)
+                    .unwrap()
+                    .key
+                    .clone();
+                let declarations = native
+                    .declarations
+                    .iter()
+                    .filter(|d| d.document == key)
+                    .cloned()
+                    .collect();
+                let calls = native
+                    .calls
+                    .iter()
+                    .filter(|c| c.document == key)
+                    .cloned()
+                    .collect();
+                DocumentInput {
+                    key,
+                    file,
+                    declarations,
+                    calls,
+                }
+            })
+            .collect();
+        Snapshot {
+            pin: crate::model::IndexPin {
+                index_generation: uuid::Uuid::new_v4(),
+                index_revision: 4,
+            },
+            documents,
+            manifests: vec![],
+        }
+    }
+
+    fn fixture() -> (Config, Snapshot) {
+        let config = parse("version=1\n[roles.child]\nselect={name='Child',extends='Base'}\n[[rules]]\nid='inheritance'\nfor_each='child'\nrequire=[{calls='child'}]\n").unwrap();
+        let snapshot = snapshot(&[
+            ("A.java", "class Child extends Base { void run() {} }"),
+            ("B.java", "class Child extends Base { void run() {} }"),
+        ]);
+        assert_eq!(snapshot.documents.len(), 2);
+        (config, snapshot)
+    }
+
+    #[test]
+    fn document_work_overlaps_but_rows_and_counts_are_admitted_in_order() {
+        let (config, snapshot) = fixture();
+        let documents: Vec<_> = snapshot.documents.iter().collect();
+        let evaluation = DocumentEvaluation {
+            config: &config,
+            inheritance: true,
+            source_set: None,
+            before_document: None,
+        };
+        let mut serial_work = Work::new(work::rules_limit(2, 0));
+        let serial = evaluation
+            .run(&documents, &mut serial_work, 1, &mut || Ok(()))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx = Mutex::new(rx);
+        let first = &documents[0].key.path;
+        let mut parallel_work = Work::new(serial_work.limit);
+        let hook = |doc: &DocumentInput| {
+            if &doc.key.path == first {
+                rx.lock().unwrap().recv().unwrap();
+            } else {
+                tx.send(()).unwrap();
+            }
+        };
+        let parallel = DocumentEvaluation {
+            before_document: Some(&hook),
+            ..evaluation
+        }
+        .run(&documents, &mut parallel_work, 4, &mut || Ok(()))
+        .unwrap();
+        assert!(!serial.0.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&serial).unwrap(),
+            serde_json::to_vec(&parallel).unwrap()
+        );
+        assert_eq!(serial_work.used, parallel_work.used);
+        assert!(serial_work.used > 0);
+
+        // Each file fits locally, but the sum exceeds the single request allowance.
+        let per_file = evaluate_document(
+            &config,
+            documents[0],
+            true,
+            None,
+            serial_work.limit,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(per_file.work.used > 0 && per_file.work.used < serial_work.used);
+        for workers in [1, 4] {
+            let mut work = Work::new(serial_work.used - 1);
+            let error = evaluation
+                .run(&documents, &mut work, workers, &mut || Ok(()))
+                .unwrap_err();
+            assert!(error.to_string().starts_with("bounded_work:"));
+        }
+    }
+
+    #[derive(Debug)]
+    struct Deadline;
+    impl std::fmt::Display for Deadline {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("deadline_exceeded")
+        }
+    }
+    impl std::error::Error for Deadline {}
+
+    #[test]
+    fn worker_callback_error_is_preserved_without_rows() {
+        let (config, snapshot) = fixture();
+        let documents: Vec<_> = snapshot.documents.iter().collect();
+        let evaluation = DocumentEvaluation {
+            config: &config,
+            inheritance: true,
+            source_set: None,
+            before_document: None,
+        };
+        let stopped = AtomicBool::new(false);
+        let mut callback = || {
+            if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                Err(Deadline.into())
+            } else {
+                Ok(())
+            }
+        };
+        let hook = |_: &DocumentInput| {
+            stopped.store(true, std::sync::atomic::Ordering::Release);
+        };
+        let error = DocumentEvaluation {
+            before_document: Some(&hook),
+            ..evaluation
+        }
+        .run(
+            &documents,
+            &mut Work::new(work::rules_limit(2, 0)),
+            2,
+            &mut callback,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<Deadline>().is_some());
     }
 }

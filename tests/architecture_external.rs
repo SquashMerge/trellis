@@ -7,7 +7,6 @@ use std::{
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
     model::{CancelFlag, IndexPin},
-    references::external::{ManifestInput, RustPackages},
     store::{MetricsOptions, Store},
 };
 
@@ -264,79 +263,6 @@ wire = '2'",
             .as_str()
             .is_some_and(|text| text.contains("wire::"))
     }));
-}
-
-fn manifest(text: &str) -> ManifestInput {
-    ManifestInput {
-        source_set_id: "source-set:test".into(),
-        native_revision_id: "revision:test".into(),
-        dependency_hash: "dependency-hash".into(),
-        path: "Cargo.toml".into(),
-        content_hash: Some("content-hash".into()),
-        bytes: Some(text.as_bytes().to_vec()),
-    }
-}
-#[test]
-fn normalized_import_collisions_and_unproved_ownership_never_guess_packages() {
-    let input = manifest(
-        "[package]
-name='fixture'
-version='1.0.0'
-[dependencies]
-wire-core='1'
-wire_core='1'
-plain={package='literal-upstream',version='2'}
-local={path='vendor/local',version='1'}
-[build-dependencies]
-build_wire={package='build-upstream',version='3'}
-[target.'cfg(unix)'.dependencies]
-target_wire={package='target-upstream',version='4'}",
-    );
-    let packages = RustPackages::new(&[input], &mut 0, &mut || Ok(())).unwrap();
-    assert!(
-        packages
-            .resolve("source-set:test", "wire_core", true)
-            .is_none()
-    );
-    assert!(
-        packages
-            .resolve("source-set:test", "plain", false)
-            .is_none()
-    );
-    assert!(packages.resolve("source-set:test", "local", true).is_none());
-    for (root, name) in [
-        ("plain", "literal-upstream"),
-        ("build_wire", "build-upstream"),
-        ("target_wire", "target-upstream"),
-    ] {
-        let package = packages.resolve("source-set:test", root, true).unwrap();
-        assert_eq!(package.identity.package, name);
-        assert!(!package.identity.standard_library);
-    }
-    let error = RustPackages::new(&[manifest(MANIFEST)], &mut 0, &mut || {
-        anyhow::bail!("cancelled")
-    })
-    .err()
-    .unwrap();
-    assert_eq!(error.to_string(), "cancelled");
-}
-
-#[test]
-fn repeated_identical_binding_merges_evidence_and_cargo_roots_are_checked_separately() {
-    let input = manifest(
-        "[package]\nname='fixture'\nversion='1.0.0'\nautobins=false\n[dependencies]\nwire={package='upstream-wire',version='1'}\n[dev-dependencies]\nwire={package='upstream-wire',version='2'}\n[target.'cfg(unix)'.dependencies]\nwire={package='upstream-wire',version='3'}",
-    );
-    let packages = RustPackages::new(&[input], &mut 0, &mut || Ok(())).unwrap();
-    assert!(packages.root_allowed("source-set:test", "src/lib.rs"));
-    assert!(!packages.root_allowed("source-set:test", "src/main.rs"));
-    let package = packages.resolve("source-set:test", "wire", true).unwrap();
-    assert_eq!(package.evidence.len(), 3);
-    assert_eq!(package.identity.package, "upstream-wire");
-    let input = manifest(
-        "[package]\nname='fixture'\nversion='1.0.0'\n[dependencies]\nwire={package='one',version='1'}\n[dev-dependencies]\nwire={package='two',version='1'}",
-    );
-    let packages = RustPackages::new(&[input], &mut 0, &mut || Ok(())).unwrap();
-    assert!(packages.resolve("source-set:test", "wire", true).is_none());
 }
 
 fn java_fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
