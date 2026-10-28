@@ -4,6 +4,14 @@ This slice provides index-independent model/cache infrastructure. It does not ca
 add an FTS table, enable `trellis_search_symbols`, or change `index.db`. Those changes wait for
 the `feature-scip` merge. The card format is a separate [review draft](semantic-search-card-format-draft.md).
 
+## Release and source builds
+
+Official macOS ARM64 releases include Metal; Linux releases are CPU-only. The release
+helper selects these features explicitly (see [Release builds](releases.md)). Ordinary
+Cargo builds still default to CPU-only; use `cargo install --path . --locked --features metal`
+for a Metal-enabled macOS source install. Automatic backend selection may fall back to
+CPU; explicitly selecting `TRELLIS_SEARCH_BACKEND=metal` never silently falls back.
+
 ## Configuration
 
 Set these environment variables when starting the per-user daemon (including automatic startup):

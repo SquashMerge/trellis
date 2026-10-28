@@ -23,6 +23,21 @@ ALLOWED_NEEDED = {
 PELE_ASSET = "web/vendor/pele-1.10.0-trellis.2.js"
 
 
+def shipping_features(target):
+    if target not in TARGETS:
+        raise ValueError("unsupported release target: " + target)
+    return ["metal"] if target == "aarch64-apple-darwin" else []
+
+
+def build(target):
+    features = shipping_features(target)
+    command = ["cargo", "build", "--locked", "--release", "--no-default-features",
+               "--bin", "trellis", "--target", target]
+    if features:
+        command += ["--features", ",".join(features)]
+    subprocess.check_call(command)
+
+
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -87,7 +102,7 @@ def provenance(archive, source_root, version, target, commit, smoke_report):
     for key, expected in (("version", version), ("target", target), ("commit", commit)):
         if build[key] != expected:
             raise ValueError("binary build {} differs from release: {} != {}".format(key, build[key], expected))
-    expected_features = ["metal"] if target.endswith("apple-darwin") else []
+    expected_features = shipping_features(target)
     if build["features"] != expected_features:
         raise ValueError("shipping features must be " + repr(expected_features))
     expected_capabilities = ["cpu", "metal"] if expected_features else ["cpu"]
@@ -222,6 +237,8 @@ def audit_elf(binary, target):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    compile_binary = commands.add_parser("build")
+    compile_binary.add_argument("--target", choices=TARGETS, required=True)
     pack = commands.add_parser("package")
     pack.add_argument("--binary", type=Path, required=True)
     pack.add_argument("--license", dest="license_path", type=Path, required=True)
@@ -250,10 +267,12 @@ def main():
     args = vars(parser.parse_args())
     command = args.pop("command")
     try:
-        result = {"package": package, "provenance": provenance, "audit-elf": audit_elf,
+        result = {"build": build, "package": package, "provenance": provenance, "audit-elf": audit_elf,
                   "validate-tag": validate_tag, "assets": release_assets}[command](**args)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError, tarfile.TarError) as error:
         parser.exit(1, "release: {}\n".format(error))
+    if result is None:
+        return
     if isinstance(result, list):
         print("\n".join(str(path) for path in result))
     else:

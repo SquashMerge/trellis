@@ -8,6 +8,9 @@ open source-linked static sequence diagrams. These are possible paths, not runti
 
 Requires stable Rust/Cargo and a native C toolchain (tree-sitter and bundled SQLite).
 The authenticated daemon currently requires Unix private-file permissions.
+Official macOS ARM64 releases include Metal acceleration; Linux releases are CPU-only.
+Ordinary Cargo builds keep CPU-only defaults. For a Metal-enabled macOS source install,
+use `cargo install --path . --locked --features metal`. See [Release builds](docs/releases.md).
 
 ```sh
 cargo test --locked --all-targets

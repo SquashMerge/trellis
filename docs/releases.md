@@ -4,6 +4,12 @@ Release targets under #338 are ARM64 macOS with Metal support, and x86-64/ARM64
 Linux GNU with CPU support and a glibc 2.31 baseline. Intel macOS, musl, signing
 and notarization are not included. Model weights are never bundled.
 
+The owner-directed release default is Metal enabled on macOS and CPU-only on Linux.
+`tools/release/release.py build --target <target>` selects these features explicitly;
+`Cargo.toml` defaults and ordinary `cargo build` / `cargo build --release` remain CPU-only.
+This release policy does not change runtime backend selection: `auto` may fall back to
+CPU, while an explicit `TRELLIS_SEARCH_BACKEND=metal` request never silently falls back.
+
 A compiled `metal` capability is not proof that a model selected Metal. The
 runtime's automatic backend selection and selected-backend status belong to
 #211. Explicit Metal parity runs must fail if Metal is unavailable; CPU fallback
@@ -43,7 +49,7 @@ checkout's `rust-toolchain.toml`. It does not use a host glibc SDK.
 ```sh
 docker build -f tools/release-linux.Dockerfile -t trellis-release-glibc231 .
 docker run --rm -v "$PWD:/work" trellis-release-glibc231 \
-  cargo build --locked --release --no-default-features --bin trellis --target aarch64-unknown-linux-gnu
+  python3 tools/release/release.py build --target aarch64-unknown-linux-gnu
 ```
 
 Use `x86_64-unknown-linux-gnu` on the x86-64 runner. Set `TRELLIS_BUILD_COMMIT`
@@ -64,8 +70,8 @@ itself. Build-image provenance does not establish a Linux kernel baseline.
 Build on an ARM64 Mac, using the pinned toolchain:
 
 ```sh
-cargo build --locked --release --no-default-features --bin trellis \
-  --target aarch64-apple-darwin --features metal
+MACOSX_DEPLOYMENT_TARGET=14.0 python3 tools/release/release.py build \
+  --target aarch64-apple-darwin
 ```
 
 Run Metal feature tests on the native Mac. Full-model CPU/Metal parity is a
