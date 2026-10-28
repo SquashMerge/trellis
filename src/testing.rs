@@ -26,8 +26,15 @@ pub const OWNER_PID_ENV: &str = "TRELLIS_TEST_OWNER_PID";
 /// once this process has ended, however it ends (#130). The owner is set here,
 /// at launch, so a test that dies before the CLI runs cannot hand ownership to
 /// whatever process adopts the CLI.
+///
+/// Ignore developer search configuration and index diagnostics. Apply any
+/// intentional test-specific environment overrides after calling this helper.
 pub fn owned(mut command: std::process::Command) -> std::process::Command {
-    command.env(OWNER_PID_ENV, std::process::id().to_string());
+    command
+        .env_remove("TRELLIS_SEARCH_MODEL")
+        .env_remove("TRELLIS_SEARCH_BACKEND")
+        .env_remove("TRELLIS_INDEX_DIAGNOSTICS")
+        .env(OWNER_PID_ENV, std::process::id().to_string());
     command
 }
 
@@ -62,4 +69,64 @@ fn zombie(pid: libc::pid_t) -> bool {
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
     // A process that vanished between the two checks is not running either.
     read != size || info.pbi_status == SZOMB
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owned;
+    use std::{ffi::OsStr, process::Command};
+
+    #[test]
+    fn owned_clears_user_configuration_but_preserves_fixture_environment() {
+        let mut command = Command::new("trellis");
+        for key in [
+            "TRELLIS_SEARCH_MODEL",
+            "TRELLIS_SEARCH_BACKEND",
+            "TRELLIS_INDEX_DIAGNOSTICS",
+        ] {
+            command.env(key, "developer-value");
+        }
+        command
+            .env("HOME", "/fixture/home")
+            .env("TRELLIS_TEST_EXTRACTOR_HASH", "fixture-hash");
+        let command = owned(command);
+        for key in [
+            "TRELLIS_SEARCH_MODEL",
+            "TRELLIS_SEARCH_BACKEND",
+            "TRELLIS_INDEX_DIAGNOSTICS",
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == key && value.is_none())
+            );
+        }
+        for (key, expected) in [
+            ("HOME", "/fixture/home"),
+            ("TRELLIS_TEST_EXTRACTOR_HASH", "fixture-hash"),
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == key && value == Some(OsStr::new(expected)))
+            );
+        }
+    }
+
+    #[test]
+    fn owned_allows_explicit_test_configuration() {
+        let mut command = owned(Command::new("trellis"));
+        for (key, value) in [
+            ("TRELLIS_SEARCH_MODEL", "/fixture/model"),
+            ("TRELLIS_SEARCH_BACKEND", "cpu"),
+            ("TRELLIS_INDEX_DIAGNOSTICS", "1"),
+        ] {
+            command.env(key, value);
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, configured)| name == key && configured == Some(OsStr::new(value)))
+            );
+        }
+    }
 }
