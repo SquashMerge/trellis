@@ -30,7 +30,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, VecDeque},
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::atomic::Ordering,
 };
 
@@ -128,7 +128,9 @@ impl JoinCtx<'_> {
         Ok(())
     }
 
-    /// Accounts the bytes of one output row.
+    /// Accounts the JSON body bytes of one `out_*` row. This meters the validated rows the join
+    /// publishes, not the stage file's page growth: the index, work and fact tables are bounded
+    /// by `staged_rows`, and the stage directory by the staging budget.
     fn output(&self, bytes: usize) -> Result<()> {
         let total = self.output_bytes.get().saturating_add(bytes as u64);
         self.output_bytes.set(total);
@@ -141,13 +143,16 @@ impl JoinCtx<'_> {
 
 type GroupKey = (u8, i64);
 
-/// Document groups: one active, the rest in an LRU bounded by `document_cache_bytes`.
+/// Document groups: one active, the rest in an LRU bounded by `document_cache_bytes`. The
+/// LRU bound is on estimated bytes (`DocGroup::bytes`), not measured heap size. A group evicted
+/// while a caller still holds it stays pinned until the caller drops it.
 #[derive(Default)]
 struct DocCache {
     budget: u64,
     active: Option<(GroupKey, Rc<DocGroup>)>,
     lru: VecDeque<(GroupKey, Rc<DocGroup>)>,
     bytes: u64,
+    evicted: Vec<Weak<DocGroup>>,
 }
 
 impl DocCache {
@@ -173,11 +178,16 @@ impl DocCache {
                     break;
                 };
                 self.bytes -= evicted.bytes;
+                if Rc::strong_count(&evicted) > 1 {
+                    self.evicted.push(Rc::downgrade(&evicted));
+                }
             }
         }
         self.active = Some((key, group));
-        counters.active_document_groups_high_water =
-            counters.active_document_groups_high_water.max(1);
+        self.evicted.retain(|held| held.strong_count() > 0);
+        counters.active_document_groups_high_water = counters
+            .active_document_groups_high_water
+            .max(1 + self.evicted.len() as u64);
         counters.document_cache_high_water_bytes =
             counters.document_cache_high_water_bytes.max(self.bytes);
         counters.document_cache_high_water_entries = counters
@@ -191,9 +201,7 @@ struct DocGroup {
     document: native::Document,
     source_ord: Option<i64>,
     text: Rc<str>,
-    declarations: Vec<native::Declaration>,
-    calls: Vec<native::Call>,
-    references: Vec<native::Reference>,
+    native: native::Artifact,
     declaration_ids: BTreeMap<String, Vec<usize>>,
     declaration_keys: BTreeMap<Vec<u8>, Vec<usize>>,
     declaration_names: BTreeSet<(usize, usize, String)>,
@@ -215,7 +223,7 @@ impl DocGroup {
     ) -> Result<Self> {
         let key = document.key.clone();
         let sources = BTreeMap::from([(key.clone(), rows.source)]);
-        let mut mini = native::Artifact {
+        let mini = native::Artifact {
             producer: header.producer.clone(),
             source_set: header.source_set.clone(),
             revision: native::Revision {
@@ -237,11 +245,7 @@ impl DocGroup {
         };
         let bytes = sources.into_values().next().expect("one source");
         let text: Rc<str> = Rc::from(String::from_utf8(bytes).context("non-UTF8 native source")?);
-        let (declarations, calls, references) = (
-            std::mem::take(&mut mini.declarations),
-            std::mem::take(&mut mini.calls),
-            std::mem::take(&mut mini.references),
-        );
+        let (declarations, calls, references) = (&mini.declarations, &mini.calls, &mini.references);
         let mut declaration_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut declaration_keys: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
@@ -275,9 +279,7 @@ impl DocGroup {
             document,
             source_ord,
             text,
-            declarations,
-            calls,
-            references,
+            native: mini,
             declaration_ids,
             declaration_keys,
             declaration_names,
@@ -506,6 +508,7 @@ impl<'a> StagedSide<'a> {
     }
 
     fn document_claims(&self, group: &DocGroup) -> Result<Vec<CapturedClaim>> {
+        self.ctx.charge(1)?;
         let Some(ord) = group.source_ord else {
             return Ok(vec![]);
         };
@@ -517,6 +520,7 @@ impl<'a> StagedSide<'a> {
         let rows = statement
             .query_map([ord], claim_of_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.ctx.charge(rows.len())?;
         rows.into_iter()
             .map(|(_, _, parts)| build_claim(parts))
             .collect()
@@ -588,7 +592,13 @@ impl JoinFacts for StagedSide<'_> {
         document: &native::DocumentKey,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
         Ok(match self.group(document)? {
-            Some(group) => group.declarations.iter().cloned().map(Cow::Owned).collect(),
+            Some(group) => group
+                .native
+                .declarations
+                .iter()
+                .cloned()
+                .map(Cow::Owned)
+                .collect(),
             None => vec![],
         })
     }
@@ -607,7 +617,9 @@ impl JoinFacts for StagedSide<'_> {
         id: &str,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
         Ok(match self.group(document)? {
-            Some(group) => DocGroup::pick(&group.declarations, group.declaration_ids.get(id)),
+            Some(group) => {
+                DocGroup::pick(&group.native.declarations, group.declaration_ids.get(id))
+            }
             None => vec![],
         })
     }
@@ -618,7 +630,9 @@ impl JoinFacts for StagedSide<'_> {
         key: &[u8],
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
         Ok(match self.group(document)? {
-            Some(group) => DocGroup::pick(&group.declarations, group.declaration_keys.get(key)),
+            Some(group) => {
+                DocGroup::pick(&group.native.declarations, group.declaration_keys.get(key))
+            }
             None => vec![],
         })
     }
@@ -652,7 +666,7 @@ impl JoinFacts for StagedSide<'_> {
         id: &str,
     ) -> Result<Vec<Cow<'_, native::Call>>> {
         Ok(match self.group(document)? {
-            Some(group) => DocGroup::pick(&group.calls, group.call_ids.get(id)),
+            Some(group) => DocGroup::pick(&group.native.calls, group.call_ids.get(id)),
             None => vec![],
         })
     }
@@ -671,7 +685,7 @@ impl JoinFacts for StagedSide<'_> {
         id: &str,
     ) -> Result<Vec<Cow<'_, native::Reference>>> {
         Ok(match self.group(document)? {
-            Some(group) => DocGroup::pick(&group.references, group.reference_ids.get(id)),
+            Some(group) => DocGroup::pick(&group.native.references, group.reference_ids.get(id)),
             None => vec![],
         })
     }
@@ -1553,6 +1567,18 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<()>
     Ok(())
 }
 
+/// The native rows an earlier attempt left in the stage. They count against `staged_rows`
+/// together with the rows this attempt writes.
+fn retained_rows(conn: &Connection) -> Result<u64> {
+    let mut total = 0i64;
+    for table in ["nat_docs", "nat_declarations"] {
+        total += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    }
+    Ok(total as u64)
+}
+
 /// One staged join: the sides, the captured basis and the emission validator.
 struct StagedJoin<'a> {
     ctx: &'a JoinCtx<'a>,
@@ -1635,6 +1661,7 @@ impl StagedJoin<'_> {
         document: &native::DocumentKey,
         syntax_id: &str,
     ) -> Result<Vec<(bool, bool)>> {
+        self.ctx.charge(1)?;
         let mut statement = self.conn().prepare_cached(
             "SELECT n.name_start IS NOT NULL, n.name_ok FROM nat_declarations n JOIN nat_docs d \
              ON d.rev=n.rev AND d.ord=n.doc_ord WHERE n.rev=?1 AND d.language=?2 AND d.path=?3 AND n.syntax_id=?4",
@@ -1879,6 +1906,7 @@ impl StagedJoin<'_> {
         document: &native::DocumentKey,
         symbol: &str,
     ) -> Result<Vec<semantic::Target>> {
+        self.ctx.charge(1)?;
         let mut statement = self.conn().prepare_cached(
             "SELECT target FROM w_cap_targets WHERE language=?1 AND path=?2 AND symbol=?3 ORDER BY target",
         )?;
@@ -1887,6 +1915,7 @@ impl StagedJoin<'_> {
                 row.get::<_, Vec<u8>>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.ctx.charge(rows.len())?;
         rows.iter()
             .map(|bytes| Ok(serde_json::from_slice(bytes)?))
             .collect()
@@ -1934,21 +1963,72 @@ impl StagedJoin<'_> {
         }
     }
 
-    fn check_internal(&self, targets: &[&semantic::Target]) -> Result<()> {
-        for target in targets {
-            if let semantic::Target::Internal {
-                syntax_id,
-                document,
-                ..
-            } = target
-                && self
-                    .declaration_status(self.destination.rev, document, syntax_id)?
-                    .is_empty()
-            {
-                anyhow::bail!("unmeasured internal target");
-            }
-        }
-        Ok(())
+    /// Runs the emission validator's row-local checks for the row stemming from raw proof
+    /// `raw`: the proof is the captured claim's document and the facts are that document's
+    /// destination group. `anchor` is the document the row itself names.
+    fn check_row(
+        &self,
+        raw: &str,
+        kind: semantic::EvidenceKind,
+        anchor: Option<&native::DocumentKey>,
+        check: impl for<'a> FnOnce(
+            &'a EmissionValidator<'_>,
+            &semantic::Provenance,
+            &semantic::DocumentFacts<'a>,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        let claim = self
+            .captured
+            .proof(raw)?
+            .context("dangling semantic fact provenance")?;
+        let document = self.key(&claim.language, &claim.path);
+        anyhow::ensure!(
+            anchor.is_none_or(|anchor| anchor == &document),
+            "semantic fact/provenance tuple mismatch"
+        );
+        let group = self
+            .destination
+            .group(&document)?
+            .context("missing destination document")?;
+        let proof = self.validator.fact_proof(
+            &self.id_for(raw, kind),
+            document,
+            kind,
+            &group.document.content_hash,
+        );
+        let source = group.text.as_bytes();
+        let key = &group.document.key;
+        let sources = |candidate: &native::DocumentKey| (candidate == key).then_some(source);
+        let declaration = |id: &str| {
+            group
+                .declaration_ids
+                .get(id)
+                .and_then(|found| found.first())
+                .map(|index| &group.native.declarations[*index])
+        };
+        let reference = |id: &str| {
+            group
+                .reference_ids
+                .get(id)
+                .and_then(|found| found.first())
+                .map(|index| &group.native.references[*index])
+        };
+        let known = |id: &str, document: &native::DocumentKey| -> Result<bool> {
+            Ok(!self
+                .declaration_status(self.destination.rev, document, id)?
+                .is_empty())
+        };
+        check(
+            &self.validator,
+            &proof,
+            &semantic::DocumentFacts {
+                native: &group.native,
+                sources: &sources,
+                declaration: &declaration,
+                reference: &reference,
+                known: &known,
+            },
+        )
     }
 
     fn id_for(&self, raw: &str, kind: semantic::EvidenceKind) -> String {
@@ -1992,14 +2072,7 @@ impl StagedJoin<'_> {
             .map(|claim| self.key(&claim.language, &claim.path)))
     }
 
-    fn emit(
-        &self,
-        table: usize,
-        sql: &str,
-        values: &[&dyn rusqlite::ToSql],
-        bytes: usize,
-    ) -> Result<()> {
-        let _ = table;
+    fn emit(&self, sql: &str, values: &[&dyn rusqlite::ToSql], bytes: usize) -> Result<()> {
         self.ctx.row()?;
         self.ctx.output(bytes)?;
         self.conn().prepare_cached(sql)?.execute(values)?;
@@ -2032,12 +2105,16 @@ impl StagedJoin<'_> {
                 self.source(&raw, semantic::EvidenceKind::DeclarationBinding)?;
                 symbol.provenance_id =
                     self.id_for(&raw, semantic::EvidenceKind::DeclarationBinding);
-                self.validator.symbol(&symbol)?;
-                let declarations: Vec<_> = symbol.declarations.iter().collect();
-                self.check_internal(&declarations)?;
+                #[cfg(feature = "test-support")]
+                crate::semantic_batch::testing::edit_row("symbol", &mut symbol)?;
+                self.check_row(
+                    &raw,
+                    semantic::EvidenceKind::DeclarationBinding,
+                    None,
+                    |v, p, f| v.symbol(&symbol, p, f),
+                )?;
                 let body = to_json(&symbol)?;
                 self.emit(
-                    SYMBOLS,
                     "INSERT INTO out_symbols VALUES(?1,?2,?3)",
                     &[&self.next_ord(SYMBOLS), &symbol.provenance_id, &body],
                     body.len(),
@@ -2072,10 +2149,16 @@ impl StagedJoin<'_> {
             self.outcome(&raw, 1)?;
             self.observe(&binding.join.anchor.document, semantic::Role::Definition)?;
             binding.provenance_id = self.id_for(&raw, semantic::EvidenceKind::DeclarationBinding);
-            self.validator.declaration_binding(&binding)?;
+            #[cfg(feature = "test-support")]
+            crate::semantic_batch::testing::edit_row("declarationBinding", &mut binding)?;
+            self.check_row(
+                &raw,
+                semantic::EvidenceKind::DeclarationBinding,
+                Some(&binding.join.anchor.document),
+                |v, p, f| v.declaration_binding(&binding, p, f),
+            )?;
             let body = to_json(&binding)?;
             self.emit(
-                BINDINGS,
                 "INSERT INTO out_declaration_bindings VALUES(?1,?2,?3)",
                 &[&self.next_ord(BINDINGS), &binding.provenance_id, &body],
                 body.len(),
@@ -2215,11 +2298,13 @@ impl StagedJoin<'_> {
             let id: String = row.get(0)?;
             let mut reference: semantic::Reference = from_json(&row.get::<_, String>(1)?)?;
             let mut targets: Vec<semantic::Target> = {
+                self.ctx.charge(1)?;
                 let mut statement =
                     conn.prepare_cached("SELECT target FROM w_reftargets WHERE ref_id=?1")?;
                 let found = statement
                     .query_map([&id], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
+                self.ctx.charge(found.len())?;
                 found
                     .iter()
                     .map(|target| from_json(target))
@@ -2252,11 +2337,14 @@ impl StagedJoin<'_> {
                 1
             };
             let proofs = {
+                self.ctx.charge(1)?;
                 let mut statement =
                     conn.prepare_cached("SELECT raw_id FROM w_refproofs WHERE ref_id=?1")?;
-                statement
+                let found = statement
                     .query_map([&id], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                self.ctx.charge(found.len())?;
+                found
             };
             self.outcome(&reference.provenance_id, outcome)?;
             for proof in proofs {
@@ -2267,16 +2355,16 @@ impl StagedJoin<'_> {
             }
             let raw = reference.provenance_id.clone();
             reference.provenance_id = self.id_for(&raw, semantic::EvidenceKind::SemanticReference);
-            self.validator.reference(&reference)?;
-            let targets: Vec<_> = reference
-                .declared_target
-                .iter()
-                .chain(&reference.candidates)
-                .collect();
-            self.check_internal(&targets)?;
+            #[cfg(feature = "test-support")]
+            crate::semantic_batch::testing::edit_row("reference", &mut reference)?;
+            self.check_row(
+                &raw,
+                semantic::EvidenceKind::SemanticReference,
+                Some(&reference.document),
+                |v, p, f| v.reference(&reference, p, f),
+            )?;
             let body = to_json(&reference)?;
             self.emit(
-                REFERENCES,
                 "INSERT INTO out_references VALUES(?1,?2,?3,?4)",
                 &[
                     &self.next_ord(REFERENCES),
@@ -2323,16 +2411,16 @@ impl StagedJoin<'_> {
             )?;
             self.observe(&call.join.anchor.document, semantic::Role::Call)?;
             call.provenance_id = self.id_for(&raw, semantic::EvidenceKind::SemanticReference);
-            self.validator.call_binding(&call)?;
-            let targets: Vec<_> = call
-                .declared_target
-                .iter()
-                .chain(&call.candidates)
-                .collect();
-            self.check_internal(&targets)?;
+            #[cfg(feature = "test-support")]
+            crate::semantic_batch::testing::edit_row("callBinding", &mut call)?;
+            self.check_row(
+                &raw,
+                semantic::EvidenceKind::SemanticReference,
+                Some(&call.join.anchor.document),
+                |v, p, f| v.call_binding(&call, p, f),
+            )?;
             let body = to_json(&call)?;
             self.emit(
-                CALLS,
                 "INSERT INTO out_call_bindings VALUES(?1,?2,?3)",
                 &[&self.next_ord(CALLS), &call.provenance_id, &body],
                 body.len(),
@@ -2360,11 +2448,16 @@ impl StagedJoin<'_> {
                 self.observe(&document, semantic::Role::Type)?;
                 relationship.provenance_id =
                     self.id_for(&raw, semantic::EvidenceKind::TypeRelationship);
-                self.validator.type_relationship(&relationship)?;
-                self.check_internal(&[&relationship.source, &relationship.target])?;
+                #[cfg(feature = "test-support")]
+                crate::semantic_batch::testing::edit_row("typeRelationship", &mut relationship)?;
+                self.check_row(
+                    &raw,
+                    semantic::EvidenceKind::TypeRelationship,
+                    None,
+                    |v, p, f| v.type_relationship(&relationship, p, f),
+                )?;
                 let body = to_json(&relationship)?;
                 self.emit(
-                    RELATIONSHIPS,
                     "INSERT INTO out_type_relationships VALUES(?1,?2,?3)",
                     &[
                         &self.next_ord(RELATIONSHIPS),
@@ -2497,7 +2590,6 @@ impl StagedJoin<'_> {
                 .query_row([&raw], |row| row.get(0))?;
             let body = to_json(&provenance)?;
             self.emit(
-                PROVENANCE,
                 "INSERT INTO out_provenance VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 &[
                     &self.next_ord(PROVENANCE),
@@ -2573,6 +2665,7 @@ impl StagedJoin<'_> {
                 semantic::CoverageState::Complete
             };
             let observed: BTreeSet<semantic::Role> = {
+                self.ctx.charge(1)?;
                 let mut statement = conn
                     .prepare_cached("SELECT role FROM w_observed WHERE language=?1 AND path=?2")?;
                 let names = statement
@@ -2625,7 +2718,6 @@ impl StagedJoin<'_> {
             })?;
             let body = to_json(&row)?;
             self.emit(
-                COVERAGE,
                 "INSERT INTO out_coverage VALUES(?1,?2,?3,?4)",
                 &[&self.next_ord(COVERAGE), &doc.language, &doc.path, &body],
                 body.len(),
@@ -2696,6 +2788,39 @@ impl StagedJoin<'_> {
             )? == 0,
             "derived provenance without staged claim"
         );
+        for (sql, message) in [
+            (
+                "SELECT COUNT(*) FROM (SELECT 1 FROM out_declaration_bindings \
+                 GROUP BY provenance_id, json_extract(body,'$.join.anchor') HAVING COUNT(*)>1)",
+                "duplicate declaration binding fact",
+            ),
+            (
+                "SELECT COUNT(*) FROM (SELECT 1 FROM out_call_bindings \
+                 GROUP BY provenance_id, json_extract(body,'$.join.anchor') HAVING COUNT(*)>1)",
+                "duplicate call binding fact",
+            ),
+            (
+                "SELECT COUNT(*) FROM (SELECT 1 FROM out_type_relationships GROUP BY provenance_id, \
+                 json_extract(body,'$.kind'), json_extract(body,'$.source'), json_extract(body,'$.target') HAVING COUNT(*)>1)",
+                "duplicate relationship fact",
+            ),
+            (
+                "SELECT COUNT(*) FROM out_provenance p WHERE NOT EXISTS (SELECT 1 FROM out_coverage c \
+                 WHERE c.language=json_extract(p.body,'$.document.language') \
+                 AND c.path=json_extract(p.body,'$.document.path') \
+                 AND json_extract(c.body,'$.state') IN ('complete','partial'))",
+                "proof on non-fact-bearing coverage",
+            ),
+            (
+                "SELECT COUNT(*) FROM out_provenance p WHERE NOT EXISTS (SELECT 1 FROM nat_docs d \
+                 WHERE d.rev=0 AND d.language=json_extract(p.body,'$.document.language') \
+                 AND d.path=json_extract(p.body,'$.document.path') \
+                 AND d.content_hash=json_extract(p.body,'$.contentHash'))",
+                "captured proof document hash mismatch",
+            ),
+        ] {
+            anyhow::ensure!(count(sql)? == 0, message);
+        }
         let languages = self
             .producer
             .languages
@@ -2926,6 +3051,7 @@ pub fn join_staged(
         ))
     };
     let result = reset_for_destination(ctx.conn, destination).and_then(|()| {
+        ctx.rows.set(retained_rows(ctx.conn)?);
         if shared {
             store.with_native_reader(captured_pin, |reader| body(reader, reader))
         } else {

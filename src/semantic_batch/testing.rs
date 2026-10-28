@@ -29,7 +29,10 @@ use std::{
 
 type ClosureHook = Box<dyn FnOnce(&Connection)>;
 
+type RowHook = Box<dyn FnMut(&str, &mut serde_json::Value)>;
+
 thread_local! {
+    static BEFORE_ROW: std::cell::RefCell<Option<RowHook>> = const { std::cell::RefCell::new(None) };
     static WHOLE_SNAPSHOT_READS: Cell<u64> = const { Cell::new(0) };
     static BEFORE_CLOSURE: std::cell::RefCell<Option<ClosureHook>> = const { std::cell::RefCell::new(None) };
 }
@@ -38,6 +41,33 @@ thread_local! {
 /// emitted its rows and before its closure checks.
 pub fn before_join_closure(hook: impl FnOnce(&Connection) + 'static) {
     BEFORE_CLOSURE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Runs `hook` on every row of the next staged join just before its row-local validation,
+/// with the row kind (`symbol`, `declarationBinding`, `reference`, `callBinding`,
+/// `typeRelationship`) and the row as JSON. The hook stays until `clear_row_hook`.
+pub fn before_row_validation(hook: impl FnMut(&str, &mut serde_json::Value) + 'static) {
+    BEFORE_ROW.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub fn clear_row_hook() {
+    BEFORE_ROW.with(|slot| *slot.borrow_mut() = None);
+}
+
+pub(crate) fn edit_row<T: serde::Serialize + serde::de::DeserializeOwned>(
+    kind: &str,
+    row: &mut T,
+) -> Result<()> {
+    BEFORE_ROW.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(hook) = slot.as_mut() else {
+            return Ok(());
+        };
+        let mut value = serde_json::to_value(&*row)?;
+        hook(kind, &mut value);
+        *row = serde_json::from_value(value)?;
+        Ok(())
+    })
 }
 
 pub(crate) fn run_before_closure_hook(conn: &Connection) {

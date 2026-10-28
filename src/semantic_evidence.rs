@@ -182,12 +182,10 @@ fn symbol_key(key_: &SymbolKey, revision: &native::Revision) -> Result<()> {
     }
     Ok(())
 }
-fn target(
-    t: &Target,
-    native: &native::Artifact,
-    declarations: &BTreeMap<String, &native::Declaration>,
-    selected: Option<&BTreeMap<String, &TargetDeclaration>>,
-) -> Result<()> {
+/// Whether an internal target names a measured declaration of its document.
+type KnownTarget<'a> = &'a dyn Fn(&str, &native::DocumentKey) -> Result<bool>;
+
+fn target(t: &Target, revision: &native::Revision, known: KnownTarget<'_>) -> Result<()> {
     match t {
         Target::Internal {
             syntax_id,
@@ -196,39 +194,24 @@ fn target(
         } => {
             sid(syntax_id)?;
             ensure!(
-                revision_id == &native.revision.id,
+                revision_id == &revision.id,
                 "foreign internal target revision"
             );
-            ensure!(
-                selected.map_or_else(
-                    || declarations
-                        .get(syntax_id)
-                        .is_some_and(|d| &d.document == document),
-                    |items| items
-                        .get(syntax_id)
-                        .is_some_and(|d| &d.document == document)
-                        || (items.get(syntax_id).is_none()
-                            && declarations
-                                .get(syntax_id)
-                                .is_some_and(|d| &d.document == document)),
-                ),
-                "unmeasured internal target"
-            );
+            ensure!(known(syntax_id, document)?, "unmeasured internal target");
         }
-        Target::External { symbol } => symbol_key(symbol, &native.revision)?,
+        Target::External { symbol } => symbol_key(symbol, revision)?,
     }
     Ok(())
 }
 fn targets(
     items: &[Target],
-    native: &native::Artifact,
-    decls: &BTreeMap<String, &native::Declaration>,
+    revision: &native::Revision,
+    known: KnownTarget<'_>,
     sorted: bool,
-    selected: Option<&BTreeMap<String, &TargetDeclaration>>,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     for item in items {
-        target(item, native, decls, selected)?;
+        target(item, revision, known)?;
         let bytes = native_ids::canonical(&serde_json::to_value(item)?);
         ensure!(seen.insert(bytes), "duplicate semantic target");
     }
@@ -283,7 +266,7 @@ fn validate_join(
     join: &Join,
     family: JoinKind,
     native: &native::Artifact,
-    sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    sources: Sources<'_>,
     original: Option<&Join>,
 ) -> Result<()> {
     let a = &join.anchor;
@@ -313,7 +296,7 @@ fn validate_join(
             }
         }
     } else {
-        let source = sources.get(&a.document).context("missing join source")?;
+        let source = sources(&a.document).context("missing join source")?;
         let slice = span(source, &a.range)?;
         let doc = native
             .revision
@@ -901,15 +884,22 @@ fn validate_basis(
     Ok(())
 }
 
-/// Read-only inputs shared by the per-row association validators.
+/// The source bytes of a document, when the validator holds them.
+type Sources<'a> = &'a dyn Fn(&native::DocumentKey) -> Option<&'a [u8]>;
+
+/// Read-only inputs shared by the per-row association validators. A row needs only its own
+/// document's measured facts: `native` carries the document's declarations, calls, references
+/// and capability report (the whole artifact for the whole-publication validator), and the
+/// lookups answer by syntax or occurrence ID.
 #[derive(Clone, Copy)]
 struct RowEnv<'a> {
     native: &'a native::Artifact,
     captured: &'a CapturedComponents,
     revision: &'a native::Revision,
-    sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
-    decls: &'a BTreeMap<String, &'a native::Declaration>,
-    selected: Option<&'a BTreeMap<String, &'a TargetDeclaration>>,
+    sources: Sources<'a>,
+    declaration: &'a dyn Fn(&str) -> Option<&'a native::Declaration>,
+    reference: &'a dyn Fn(&str) -> Option<&'a native::Reference>,
+    known: KnownTarget<'a>,
     witnesses: Option<&'a BTreeMap<native::DocumentKey, WitnessedDocument>>,
 }
 
@@ -927,9 +917,8 @@ fn validate_declaration_binding_row<'a>(
         captured,
         revision,
         sources,
-        decls: _,
-        selected: _,
         witnesses,
+        ..
     } = *env;
     ensure!(
         binding_facts.insert((
@@ -1004,7 +993,6 @@ fn validate_reference_row<'a>(
     r: &'a Reference,
     p: &'a Provenance,
     env: &RowEnv<'_>,
-    native_references: &BTreeMap<&str, &native::Reference>,
     references: &mut BTreeSet<(&'a str, &'a str)>,
 ) -> Result<()> {
     let RowEnv {
@@ -1012,8 +1000,9 @@ fn validate_reference_row<'a>(
         captured,
         revision,
         sources,
-        decls,
-        selected,
+        declaration,
+        reference,
+        known,
         witnesses,
     } = *env;
     ensure!(r.revision_id == revision.id, "foreign reference revision");
@@ -1044,32 +1033,26 @@ fn validate_reference_row<'a>(
     uint(r.ordinal)?;
     ensure!(
         admitted.is_some()
-            || native_references
-                .get(r.id.as_str())
-                .is_some_and(|candidate| {
-                    candidate.owner_syntax_id == r.owner_syntax_id
-                        && candidate.ordinal == r.ordinal
-                        && candidate.document == r.document
-                        && candidate.revision_id == r.revision_id
-                        && candidate.range == r.range
-                        && candidate.spelling == r.spelling
-                        && candidate.lookup_key == r.lookup_key
-                }),
+            || reference(r.id.as_str()).is_some_and(|candidate| {
+                candidate.owner_syntax_id == r.owner_syntax_id
+                    && candidate.ordinal == r.ordinal
+                    && candidate.document == r.document
+                    && candidate.revision_id == r.revision_id
+                    && candidate.range == r.range
+                    && candidate.spelling == r.spelling
+                    && candidate.lookup_key == r.lookup_key
+            }),
         "reference differs from native reference candidate"
     );
     ensure!(
         admitted.is_some()
-            || decls
-                .get(&r.owner_syntax_id)
-                .is_some_and(|d| d.document == r.document
-                    && d.range.start <= r.range.start
-                    && r.range.end <= d.range.end),
+            || declaration(&r.owner_syntax_id).is_some_and(|d| d.document == r.document
+                && d.range.start <= r.range.start
+                && r.range.end <= d.range.end),
         "unmeasured reference owner"
     );
     if admitted.is_none() {
-        let bytes = sources
-            .get(&r.document)
-            .context("missing reference source")?;
+        let bytes = sources(&r.document).context("missing reference source")?;
         ensure!(
             span(bytes, &r.range)? == r.spelling,
             "reference spelling mismatch"
@@ -1120,9 +1103,9 @@ fn validate_reference_row<'a>(
     }
     resolution(r.resolution, &r.declared_target, &r.candidates)?;
     if let Some(t) = &r.declared_target {
-        target(t, native, decls, selected)?;
+        target(t, revision, known)?;
     }
-    targets(&r.candidates, native, decls, true, selected)?;
+    targets(&r.candidates, revision, known, true)?;
     ensure!(
         references.insert((p.producer_id.as_str(), r.id.as_str())),
         "duplicate reference ID"
@@ -1143,11 +1126,11 @@ fn validate_call_binding_row(
     let RowEnv {
         native,
         captured,
-        revision: _,
+        revision,
         sources,
-        decls,
-        selected,
+        known,
         witnesses,
+        ..
     } = *env;
     ensure!(
         call_facts.insert((
@@ -1227,10 +1210,10 @@ fn validate_call_binding_row(
             .push((b.resolution, target, candidates));
     }
     if let Some(t) = &b.declared_target {
-        target(t, native, decls, selected)?;
+        target(t, revision, known)?;
     }
-    targets(&b.candidates, native, decls, true, selected)?;
-    targets(&b.possible_dispatch, native, decls, true, selected)?;
+    targets(&b.candidates, revision, known, true)?;
+    targets(&b.possible_dispatch, revision, known, true)?;
     ensure!(
         !b.possible_dispatch_complete && b.stale_target != Some(true),
         "unsupported dispatch completeness/stale target"
@@ -1255,9 +1238,8 @@ fn validate_type_relationship_row(
     relationships: &mut BTreeSet<(String, native::DocumentKey, String, Vec<u8>)>,
 ) -> Result<()> {
     let RowEnv {
-        native,
-        decls,
-        selected,
+        revision,
+        known,
         witnesses,
         ..
     } = *env;
@@ -1288,8 +1270,66 @@ fn validate_type_relationship_row(
         )),
         "duplicate relationship fact"
     );
-    target(&r.source, native, decls, selected)?;
-    target(&r.target, native, decls, selected)?;
+    target(&r.source, revision, known)?;
+    target(&r.target, revision, known)?;
+    Ok(())
+}
+
+/// Validates one symbol against its resolved provenance row.
+fn validate_symbol_row(
+    s: &Symbol,
+    p: &Provenance,
+    env: &RowEnv<'_>,
+    symbols: &mut BTreeSet<(String, Vec<u8>)>,
+) -> Result<()> {
+    let RowEnv {
+        revision,
+        known,
+        witnesses,
+        ..
+    } = *env;
+    symbol_key(&s.key, revision)?;
+    if let Some(name) = &s.display_name {
+        text(name)?;
+    }
+    if let Some(doc) = &s.key.document {
+        ensure!(doc == &p.document, "symbol evidence document mismatch");
+    }
+    targets(&s.declarations, revision, known, false)?;
+    if let Some(witness) = witnesses.and_then(|items| items.get(&p.document)) {
+        let id = admitted_proof(witness, p)?;
+        ensure!(
+            witness
+                .original
+                .symbols
+                .iter()
+                .any(|old| old.provenance_id == id
+                    && old.key == s.key
+                    && old.display_name == s.display_name
+                    && old.declarations.len() == s.declarations.len()
+                    && old
+                        .declarations
+                        .iter()
+                        .zip(&s.declarations)
+                        .all(|(before, after)| match (before, after) {
+                            (
+                                Target::Internal { document: a, .. },
+                                Target::Internal { document: b, .. },
+                            ) => a == b,
+                            (Target::External { symbol: a }, Target::External { symbol: b }) =>
+                                a == b,
+                            _ => false,
+                        })),
+            "symbol differs from admitted association"
+        );
+    }
+    ensure!(
+        symbols.insert((
+            p.producer_id.clone(),
+            native_ids::canonical(&serde_json::to_value(&s.key)?)
+        )),
+        "duplicate semantic symbol key"
+    );
     Ok(())
 }
 
@@ -1847,60 +1887,42 @@ fn validate_evidence_inner(
             "incomplete witnessed document proof inventory"
         );
     }
+    let native_references: BTreeMap<_, _> = native
+        .references
+        .iter()
+        .map(|r| (r.id.as_str(), r))
+        .collect();
+    ensure!(
+        native_references.len() == native.references.len(),
+        "duplicate native reference ID"
+    );
+    let known = |syntax_id: &str, document: &native::DocumentKey| -> Result<bool> {
+        let measured = || {
+            decls
+                .get(syntax_id)
+                .is_some_and(|d| &d.document == document)
+        };
+        Ok(
+            match selected.as_ref().and_then(|items| items.get(syntax_id)) {
+                Some(d) => &d.document == document,
+                None => measured(),
+            },
+        )
+    };
     let env = RowEnv {
         native,
         captured,
         revision,
-        sources: &sources,
-        decls: &decls,
-        selected: selected.as_ref(),
+        sources: &|key| sources.get(key).map(Vec::as_slice),
+        declaration: &|id| decls.get(id).copied(),
+        reference: &|id| native_references.get(id).copied(),
+        known: &known,
         witnesses,
     };
     let mut symbols = BTreeSet::new();
     for s in &semantic.symbols {
         let p = fact(&s.provenance_id, None, EvidenceKind::DeclarationBinding)?;
-        symbol_key(&s.key, revision)?;
-        if let Some(name) = &s.display_name {
-            text(name)?;
-        }
-        if let Some(doc) = &s.key.document {
-            ensure!(doc == &p.document, "symbol evidence document mismatch");
-        }
-        targets(&s.declarations, native, &decls, false, selected.as_ref())?;
-        if let Some(witness) = witnesses.and_then(|items| items.get(&p.document)) {
-            let id = admitted_proof(witness, p)?;
-            ensure!(
-                witness
-                    .original
-                    .symbols
-                    .iter()
-                    .any(|old| old.provenance_id == id
-                        && old.key == s.key
-                        && old.display_name == s.display_name
-                        && old.declarations.len() == s.declarations.len()
-                        && old.declarations.iter().zip(&s.declarations).all(
-                            |(before, after)| match (before, after) {
-                                (
-                                    Target::Internal { document: a, .. },
-                                    Target::Internal { document: b, .. },
-                                ) => a == b,
-                                (
-                                    Target::External { symbol: a },
-                                    Target::External { symbol: b },
-                                ) => a == b,
-                                _ => false,
-                            }
-                        )),
-                "symbol differs from admitted association"
-            );
-        }
-        ensure!(
-            symbols.insert((
-                p.producer_id.clone(),
-                native_ids::canonical(&serde_json::to_value(&s.key)?)
-            )),
-            "duplicate semantic symbol key"
-        );
+        validate_symbol_row(s, p, &env, &mut symbols)?;
     }
     let mut binding_facts = BTreeSet::new();
     for b in &semantic.declaration_bindings {
@@ -1912,22 +1934,13 @@ fn validate_evidence_inner(
         validate_declaration_binding_row(b, p, &env, &mut binding_facts)?;
     }
     let mut references = BTreeSet::new();
-    let native_references: BTreeMap<_, _> = native
-        .references
-        .iter()
-        .map(|r| (r.id.as_str(), r))
-        .collect();
-    ensure!(
-        native_references.len() == native.references.len(),
-        "duplicate native reference ID"
-    );
     for r in &semantic.references {
         let p = fact(
             &r.provenance_id,
             Some(&r.document),
             EvidenceKind::SemanticReference,
         )?;
-        validate_reference_row(r, p, &env, &native_references, &mut references)?;
+        validate_reference_row(r, p, &env, &mut references)?;
     }
     let mut call_facts = BTreeSet::new();
     let mut call_resolutions: BTreeMap<(String, String), Vec<TargetClaim>> = BTreeMap::new();
@@ -2019,10 +2032,10 @@ fn validate_evidence_inner(
     Ok(())
 }
 
-/// Per-row validation for rows a streaming join emits. It runs the same row validators as the
-/// whole-publication validator, against the batch header instead of a materialized revision.
-/// Rules that need the measured native facts of other documents are the join's own
-/// construction (it reads those facts) plus the caller's target lookups.
+/// Per-row validation for rows a streaming join emits. Every row runs the row-local validators
+/// the whole-publication validator calls, against the measured facts of its own document and
+/// the batch header instead of a materialized revision. Checks that compare rows with each
+/// other are the join's closure queries.
 pub(crate) struct EmissionValidator<'a> {
     producer: &'a Producer,
     captured: CapturedComponents,
@@ -2043,8 +2056,8 @@ pub(crate) struct EmissionHeader<'a> {
     pub source_manifest_hash: String,
 }
 
-impl<'a> EmissionValidator<'a> {
-    pub(crate) fn new(header: EmissionHeader<'a>) -> Self {
+impl<'h> EmissionValidator<'h> {
+    pub(crate) fn new(header: EmissionHeader<'h>) -> Self {
         let captured = CapturedComponents {
             producer_executables: BTreeMap::new(),
             artifacts: BTreeMap::new(),
@@ -2119,141 +2132,118 @@ impl<'a> EmissionValidator<'a> {
         )
     }
 
-    fn check_target(&self, t: &Target) -> Result<()> {
-        match t {
-            Target::Internal {
-                syntax_id,
-                revision_id,
-                ..
-            } => {
-                sid(syntax_id)?;
-                ensure!(
-                    revision_id == &self.revision.id,
-                    "foreign internal target revision"
-                );
-                Ok(())
-            }
-            Target::External { symbol } => symbol_key(symbol, &self.revision),
+    /// Runs `check` over the same row-local validators the whole-publication validator uses,
+    /// with `facts` standing for the one document the row belongs to.
+    fn with_env<'a, T>(
+        &'a self,
+        facts: &DocumentFacts<'a>,
+        check: impl FnOnce(&RowEnv<'a>) -> Result<T>,
+    ) -> Result<T> {
+        check(&RowEnv {
+            native: facts.native,
+            captured: &self.captured,
+            revision: &self.revision,
+            sources: facts.sources,
+            declaration: facts.declaration,
+            reference: facts.reference,
+            known: facts.known,
+            witnesses: None,
+        })
+    }
+
+    /// The proof a staged fact row stands on: the measured identity of its derivation, which is
+    /// all the row-local validators read from it.
+    pub(crate) fn fact_proof(
+        &self,
+        id: &str,
+        document: native::DocumentKey,
+        evidence_kind: EvidenceKind,
+        content_hash: &str,
+    ) -> Provenance {
+        Provenance {
+            id: id.to_owned(),
+            producer_id: self.producer.id.clone(),
+            document,
+            revision_id: self.revision.id.clone(),
+            content_hash: content_hash.to_owned(),
+            evidence_kind,
+            basis: None,
+            freshness: Freshness::Fresh,
+            derived_from: None,
         }
     }
 
-    fn check_targets(&self, items: &[Target]) -> Result<()> {
-        let mut seen = BTreeSet::new();
-        let mut last: Option<Vec<u8>> = None;
-        for item in items {
-            self.check_target(item)?;
-            let bytes = native_ids::canonical(&serde_json::to_value(item)?);
-            ensure!(seen.insert(bytes.clone()), "duplicate semantic target");
-            ensure!(
-                last.as_ref().is_none_or(|previous| previous < &bytes),
-                "unsorted or duplicate semantic set"
-            );
-            last = Some(bytes);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn symbol(&self, row: &Symbol) -> Result<()> {
+    pub(crate) fn symbol<'a>(
+        &'a self,
+        row: &Symbol,
+        proof: &Provenance,
+        facts: &DocumentFacts<'a>,
+    ) -> Result<()> {
         text(&row.provenance_id)?;
-        symbol_key(&row.key, &self.revision)?;
-        for item in &row.declarations {
-            self.check_target(item)?;
-        }
-        Ok(())
+        self.with_env(facts, |env| {
+            validate_symbol_row(row, proof, env, &mut BTreeSet::new())
+        })
     }
 
-    pub(crate) fn declaration_binding(&self, b: &DeclarationBinding) -> Result<()> {
-        ensure!(
-            b.syntax_id.as_ref()
-                == (b.join.status == JoinStatus::Exact).then(|| &b.join.candidate_ids[0]),
-            "declaration binding ID mismatch"
-        );
-        ensure!(
-            b.join.status != JoinStatus::Exact || !b.symbols.is_empty(),
-            "exact binding without symbol"
-        );
-        let mut seen = BTreeSet::new();
-        for key_ in &b.symbols {
-            symbol_key(key_, &self.revision)?;
-            ensure!(
-                seen.insert(native_ids::canonical(&serde_json::to_value(key_)?)),
-                "duplicate binding symbol"
-            );
-        }
-        ensure!(
-            b.join.anchor.revision_id == self.captured.captured_revision.id
-                || b.join.anchor.revision_id == self.revision.id,
-            "foreign declaration anchor revision"
-        );
-        Ok(())
+    pub(crate) fn declaration_binding<'a>(
+        &'a self,
+        row: &DeclarationBinding,
+        proof: &Provenance,
+        facts: &DocumentFacts<'a>,
+    ) -> Result<()> {
+        self.with_env(facts, |env| {
+            validate_declaration_binding_row(row, proof, env, &mut BTreeSet::new())
+        })
     }
 
-    pub(crate) fn reference(&self, r: &Reference) -> Result<()> {
-        ensure!(
-            r.revision_id == self.revision.id,
-            "foreign reference revision"
-        );
-        sid(&r.owner_syntax_id)?;
-        occ(&r.id)?;
-        uint(r.ordinal)?;
-        ensure!(!r.spelling.is_empty(), "empty reference spelling");
-        ensure!(
-            native::lookup(&r.document.language, &r.spelling)? == r.lookup_key,
-            "reference lookup mismatch"
-        );
-        ordered(&r.roles)?;
-        ensure!(
-            !r.roles.is_empty()
-                && (r.document.language != "java" || !r.roles.contains(&Role::Alias)),
-            "invalid reference roles"
-        );
-        ensure!(
-            !r.roles.contains(&Role::Alias) || r.roles.contains(&Role::Definition),
-            "alias without definition"
-        );
-        ensure!(
-            (r.site == ReferenceSite::Declaration) == r.roles.contains(&Role::Definition),
-            "reference site/role mismatch"
-        );
-        resolution(r.resolution, &r.declared_target, &r.candidates)?;
-        if let Some(t) = &r.declared_target {
-            self.check_target(t)?;
-        }
-        self.check_targets(&r.candidates)
+    pub(crate) fn reference<'a>(
+        &'a self,
+        row: &Reference,
+        proof: &Provenance,
+        facts: &DocumentFacts<'a>,
+    ) -> Result<()> {
+        self.with_env(facts, |env| {
+            validate_reference_row(row, proof, env, &mut BTreeSet::new())
+        })
     }
 
-    pub(crate) fn call_binding(&self, b: &CallBinding) -> Result<()> {
-        ensure!(
-            b.call_id.as_ref()
-                == (b.join.status == JoinStatus::Exact).then(|| &b.join.candidate_ids[0]),
-            "call binding ID mismatch"
-        );
-        resolution(b.resolution, &b.declared_target, &b.candidates)?;
-        if let Some(t) = &b.declared_target {
-            self.check_target(t)?;
-        }
-        self.check_targets(&b.candidates)?;
-        self.check_targets(&b.possible_dispatch)?;
-        ensure!(
-            !b.possible_dispatch_complete && b.stale_target != Some(true),
-            "unsupported dispatch completeness/stale target"
-        );
-        ensure!(
-            b.stale_target
-                == if matches!(b.declared_target, Some(Target::Internal { .. })) {
-                    Some(false)
-                } else {
-                    None
-                },
-            "stale target mismatch"
-        );
-        Ok(())
+    pub(crate) fn call_binding<'a>(
+        &'a self,
+        row: &CallBinding,
+        proof: &Provenance,
+        facts: &DocumentFacts<'a>,
+    ) -> Result<()> {
+        self.with_env(facts, |env| {
+            validate_call_binding_row(
+                row,
+                proof,
+                &[],
+                env,
+                &mut BTreeSet::new(),
+                &mut BTreeMap::new(),
+            )
+        })
     }
 
-    pub(crate) fn type_relationship(&self, r: &TypeRelationship) -> Result<()> {
-        self.check_target(&r.source)?;
-        self.check_target(&r.target)
+    pub(crate) fn type_relationship<'a>(
+        &'a self,
+        row: &TypeRelationship,
+        proof: &Provenance,
+        facts: &DocumentFacts<'a>,
+    ) -> Result<()> {
+        self.with_env(facts, |env| {
+            validate_type_relationship_row(row, proof, env, &mut BTreeSet::new())
+        })
     }
+}
+
+/// One document's measured facts, as the row-local validators read them.
+pub(crate) struct DocumentFacts<'a> {
+    pub native: &'a native::Artifact,
+    pub sources: &'a dyn Fn(&native::DocumentKey) -> Option<&'a [u8]>,
+    pub declaration: &'a dyn Fn(&str) -> Option<&'a native::Declaration>,
+    pub reference: &'a dyn Fn(&str) -> Option<&'a native::Reference>,
+    pub known: &'a dyn Fn(&str, &native::DocumentKey) -> Result<bool>,
 }
 
 #[cfg(test)]

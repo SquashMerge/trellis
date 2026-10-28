@@ -915,6 +915,281 @@ fn staged_and_memory_join_stores_produce_identical_publications() {
     assert_eq!(staged.type_relationships.len(), 1);
 }
 
+/// Adds an occurrence of the `nth` `needle` in `source`. `enclosing` is the byte length of the
+/// enclosing call expression starting at the same position.
+fn occ_at(
+    doc: DocSpec,
+    source: &str,
+    (needle, nth): (&str, usize),
+    enclosing: Option<usize>,
+    symbol: &str,
+    roles: i32,
+) -> DocSpec {
+    let (line, column) = positions(source, needle)[nth];
+    let width = needle.len() as i32;
+    let enclosing = enclosing
+        .map(|length| vec![line, column, column + length as i32])
+        .unwrap_or_default();
+    doc.occurrence(&[line, column, column + width], &enclosing, symbol, roles)
+}
+
+const OVERRIDE_JAVA: &str =
+    "class Base { void f(int x) {} } class Child extends Base { void f(int x) {} }";
+
+/// Base and Child with an overridden `f`, symbols named by `suffix`.
+fn override_doc(path: &str, source: &str, suffix: &str) -> DocSpec {
+    let base = format!("pkg Base{suffix}#");
+    let child = format!("pkg Child{suffix}#");
+    let base_f = format!("pkg Base{suffix}#f(I).");
+    let child_f = format!("pkg Child{suffix}#f(I).");
+    let mut doc = DocSpec::new(path);
+    for (needle, nth, symbol, roles) in [
+        (format!("Base{suffix}"), 0, &base, 1),
+        (format!("Child{suffix}"), 0, &child, 1),
+        (format!("Base{suffix}"), 1, &base, 8),
+        ("f(int".to_owned(), 0, &base_f, 1),
+        ("f(int".to_owned(), 1, &child_f, 1),
+    ] {
+        let width = if needle == "f(int" { 1 } else { needle.len() };
+        let (line, column) = positions(source, &needle)[nth];
+        doc = doc.occurrence(&[line, column, column + width as i32], &[], symbol, roles);
+    }
+    doc.symbol(&base, 7, &[])
+        .symbol(&child, 7, &[&base])
+        .symbol(&base_f, 26, &[])
+        .symbol(&child_f, 26, &[&base_f])
+}
+
+struct Fixture {
+    name: &'static str,
+    files: Vec<(String, String)>,
+    artifacts: Vec<(&'static str, Vec<DocSpec>)>,
+}
+
+/// The complexity fixtures of `src/semantic_import_complexity_tests.rs`, as batches: Java
+/// override endpoints, a local method in another document, method multiplicity (several
+/// documents and a duplicate native method), enum checks, nested invocation ranges and a
+/// native gap that makes anchors unsupported.
+fn complexity_fixtures() -> Vec<Fixture> {
+    let mut fixtures = Vec::new();
+    fixtures.push(Fixture {
+        name: "java override endpoints",
+        files: vec![("O.java".into(), OVERRIDE_JAVA.into())],
+        artifacts: vec![("java", vec![override_doc("O.java", OVERRIDE_JAVA, "")])],
+    });
+
+    let other = "class Other { void f() {} }";
+    let local_a = occ_at(
+        DocSpec::new("A.java"),
+        OVERRIDE_JAVA,
+        ("f(int", 0),
+        None,
+        "local 7",
+        1,
+    );
+    let local_a = occ_at(
+        local_a,
+        OVERRIDE_JAVA,
+        ("f(int", 1),
+        None,
+        "pkg Child#f().",
+        1,
+    )
+    .symbol("pkg Child#f().", 26, &["local 7"])
+    .symbol("local 7", 26, &[]);
+    let local_b = occ_at(
+        DocSpec::new("B.java"),
+        other,
+        ("f()", 0),
+        None,
+        "local 7",
+        1,
+    )
+    .symbol("local 7", 26, &[]);
+    fixtures.push(Fixture {
+        name: "local method in another document",
+        files: vec![
+            ("A.java".into(), OVERRIDE_JAVA.into()),
+            ("B.java".into(), other.into()),
+        ],
+        artifacts: vec![("java", vec![local_a, local_b])],
+    });
+
+    let mut files = Vec::new();
+    let mut docs = Vec::new();
+    for ordinal in 0..3 {
+        let source = OVERRIDE_JAVA
+            .replace("Base", &format!("Base{ordinal}"))
+            .replace("Child", &format!("Child{ordinal}"));
+        let path = format!("M{ordinal}.java");
+        docs.push(override_doc(&path, &source, &ordinal.to_string()));
+        files.push((path, source));
+    }
+    let duplicate = "class Base9 { void f(int x) {} void f(int x) {} } class Child9 extends Base9 { void f(int x) {} }";
+    let mut doc = DocSpec::new("D.java");
+    for (needle, nth, symbol, roles) in [
+        ("Base9", 0, "pkg Base9#", 1),
+        ("Child9", 0, "pkg Child9#", 1),
+        ("f(int", 0, "pkg Base9#f(I).", 1),
+        ("f(int", 1, "pkg Base9#f(I).", 1),
+        ("f(int", 2, "pkg Child9#f(I).", 1),
+    ] {
+        let (line, column) = positions(duplicate, needle)[nth];
+        let width = if needle == "f(int" { 1 } else { needle.len() } as i32;
+        doc = doc.occurrence(&[line, column, column + width], &[], symbol, roles);
+    }
+    docs.push(
+        doc.symbol("pkg Base9#", 7, &[])
+            .symbol("pkg Child9#", 7, &["pkg Base9#"])
+            .symbol("pkg Base9#f(I).", 26, &[])
+            .symbol("pkg Child9#f(I).", 26, &["pkg Base9#f(I)."]),
+    );
+    files.push(("D.java".into(), duplicate.into()));
+    fixtures.push(Fixture {
+        name: "method multiplicity and duplicate native method",
+        files,
+        artifacts: vec![("java", docs)],
+    });
+
+    let color = "enum Color { RED, GREEN }\nclass Use extends Color {}\n";
+    let mut doc = DocSpec::new("E.java");
+    for (needle, nth, symbol, roles) in [
+        ("Color", 0, "pkg Color#", 1),
+        ("RED", 0, "pkg Color#RED.", 1),
+        ("Use", 0, "pkg Use#", 1),
+        ("Color", 1, "pkg Color#", 8),
+    ] {
+        doc = occ_at(doc, color, (needle, nth), None, symbol, roles);
+    }
+    fixtures.push(Fixture {
+        name: "enum checks",
+        files: vec![("E.java".into(), color.into())],
+        artifacts: vec![(
+            "java",
+            vec![
+                doc.symbol("pkg Color#", 11, &[])
+                    .symbol("pkg Color#RED.", 12, &[])
+                    .symbol("pkg Use#", 7, &["pkg Color#"]),
+            ],
+        )],
+    });
+
+    let nested = "function f(){} function g(){} function h(){} function run(){ f(g(h())); }\n";
+    let mut doc = DocSpec::new("N.js");
+    for (needle, nth, symbol, roles, enclosing) in [
+        ("f", 0, "pkg f.", 1, None),
+        ("g", 0, "pkg g.", 1, None),
+        ("h", 0, "pkg h.", 1, None),
+        ("run", 0, "pkg run.", 1, None),
+        ("f(g", 0, "pkg f.", 0, Some("f(g(h()))".len())),
+        ("g(h", 0, "pkg g.", 0, Some("g(h())".len())),
+        ("h()", 1, "pkg h.", 0, Some("h()".len())),
+    ] {
+        let (line, column) = positions(nested, needle)[nth];
+        let width = if needle.len() > 1 && needle != "run" {
+            1
+        } else {
+            needle.len()
+        } as i32;
+        let enclosing = enclosing
+            .map(|length| vec![line, column, column + length as i32])
+            .unwrap_or_default();
+        doc = doc.occurrence(&[line, column, column + width], &enclosing, symbol, roles);
+    }
+    fixtures.push(Fixture {
+        name: "nested invocation ranges",
+        files: vec![("N.js".into(), nested.into())],
+        artifacts: vec![(
+            "javascript",
+            vec![
+                doc.symbol("pkg f.", 17, &[])
+                    .symbol("pkg g.", 17, &[])
+                    .symbol("pkg h.", 17, &[])
+                    .symbol("pkg run.", 17, &[]),
+            ],
+        )],
+    });
+
+    let gap = "fn helper() {}\nfn run() { helper(); println!(\"{}\", helper()); }\n";
+    let mut doc = DocSpec::new("G.rs");
+    for (needle, nth, symbol, roles, enclosing) in [
+        ("helper", 0, "pkg helper().", 1, None),
+        ("run", 0, "pkg run().", 1, None),
+        ("helper", 1, "pkg helper().", 0, Some("helper()".len())),
+        ("helper", 2, "pkg helper().", 0, Some("helper()".len())),
+    ] {
+        doc = occ_at(doc, gap, (needle, nth), enclosing, symbol, roles);
+    }
+    fixtures.push(Fixture {
+        name: "raw gap and unsupported family",
+        files: vec![("G.rs".into(), gap.into())],
+        artifacts: vec![(
+            "rust",
+            vec![
+                doc.symbol("pkg helper().", 12, &[])
+                    .symbol("pkg run().", 12, &[]),
+            ],
+        )],
+    });
+    fixtures
+}
+
+#[test]
+fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
+    for fixture in complexity_fixtures() {
+        for changed in [false, true] {
+            let case = format!(
+                "{}, {}",
+                fixture.name,
+                if changed {
+                    "changed destination"
+                } else {
+                    "same revision"
+                }
+            );
+            let world = world(|root| {
+                let files: Vec<_> = fixture
+                    .files
+                    .iter()
+                    .map(|(path, text)| (path.as_str(), text.as_str()))
+                    .collect();
+                write_files(root, &files)
+            });
+            let mut batch = world.fixture();
+            for (language, docs) in &fixture.artifacts {
+                batch.artifact(language, docs.clone());
+            }
+            let descriptor = world.write(&batch);
+            if changed {
+                write_files(&world.root, &[("Unrelated.js", "function other(){ }\n")]);
+                world.republish();
+            }
+            let mutations = DestinationMutations::default();
+            let (mut admitted, _, _) = world
+                .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
+                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            let staged = testing::staged_publication(&mut admitted).unwrap();
+            let memory = world.memory_publication(&descriptor, mutations);
+            assert_same_publication(&staged, &memory, &case);
+            if fixture.name.starts_with("local method") {
+                assert!(staged.type_relationships.is_empty(), "{case}");
+            } else {
+                assert!(!staged.declaration_bindings.is_empty(), "{case}");
+                assert!(!staged.references.is_empty(), "{case}");
+            }
+            if fixture.name.starts_with("java override") {
+                assert!(
+                    staged
+                        .type_relationships
+                        .iter()
+                        .any(|r| r.kind == trellis::semantic_evidence::RelationshipKind::Overrides),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn batch_memory_high_water_is_one_unit_not_the_corpus() {
     // 50 rows per page keeps every page ordinal one digit at both sizes, so page lengths match.
@@ -1075,6 +1350,174 @@ fn forged_derived_from_is_rejected_before_publication() {
         format!("{error:#}").contains("derived provenance without staged claim"),
         "{error:#}"
     );
+}
+
+type RowEdit = fn(&mut Value);
+
+/// Runs a staged join whose rows of `kind` are edited just before their row-local validation.
+fn join_with_row_edit(
+    world: &World,
+    descriptor: &(PathBuf, String),
+    kind: &'static str,
+    edit: RowEdit,
+) -> anyhow::Error {
+    testing::before_row_validation(move |row_kind, row| {
+        if row_kind == kind {
+            edit(row);
+        }
+    });
+    let result = world.join_with(
+        descriptor,
+        &BatchLimits::PRODUCTION,
+        DestinationMutations::default(),
+    );
+    testing::clear_row_hook();
+    result.map(|_| ()).unwrap_err()
+}
+
+#[test]
+fn staged_rows_run_the_row_local_validators() {
+    let js = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&js, vec![("javascript", vec![a, b])]);
+    let cases: [(&str, &str, RowEdit, &str); 9] = [
+        (
+            "reference spelling against the native reference candidate",
+            "reference",
+            |row| {
+                if row["spelling"] == "target" {
+                    row["spelling"] = json!("targex");
+                }
+            },
+            "reference differs from native reference candidate",
+        ),
+        (
+            "call role needs a measured invocation",
+            "reference",
+            |row| {
+                if row["spelling"] == "run" {
+                    row["roles"] = json!(["definition", "call"]);
+                }
+            },
+            "call role without measured invocation",
+        ),
+        (
+            "declaration-site reference must be a measured declaration name",
+            "reference",
+            |row| {
+                if row["spelling"] == "target" {
+                    row["site"] = json!("declaration");
+                    row["roles"] = json!(["definition"]);
+                }
+            },
+            "declaration reference site not measured",
+        ),
+        (
+            "declaration binding join against measured candidates",
+            "declarationBinding",
+            |row| row["join"]["status"] = json!("unmatched"),
+            "join differs from measured candidates",
+        ),
+        (
+            "declaration binding document against its provenance",
+            "declarationBinding",
+            |row| {
+                if row["join"]["anchor"]["document"]["path"] == "src/A.js" {
+                    row["join"]["anchor"]["document"]["path"] = json!("src/B.js");
+                }
+            },
+            "semantic fact/provenance tuple mismatch",
+        ),
+        (
+            "call binding join against measured candidates",
+            "callBinding",
+            |row| row["join"]["status"] = json!("unmatched"),
+            "join differs from measured candidates",
+        ),
+        (
+            "symbol display-name text",
+            "symbol",
+            |row| row["displayName"] = json!(""),
+            "empty semantic text",
+        ),
+        (
+            "duplicate symbol targets",
+            "symbol",
+            |row| {
+                let first = row["declarations"][0].clone();
+                row["declarations"].as_array_mut().unwrap().push(first);
+            },
+            "duplicate semantic target",
+        ),
+        (
+            "symbol document against its provenance",
+            "symbol",
+            |row| {
+                row["key"]["scope"] = json!("document");
+                row["key"]["document"] = json!({
+                    "sourceSetId": row["declarations"][0]["document"]["sourceSetId"],
+                    "language": "javascript",
+                    "path": "src/Z.js",
+                });
+            },
+            "symbol evidence document mismatch",
+        ),
+    ];
+    for (name, kind, edit, message) in cases {
+        let error = join_with_row_edit(&js, &descriptor, kind, edit);
+        assert!(format!("{error:#}").contains(message), "{name}: {error:#}");
+    }
+
+    let java = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
+    let descriptor = one_artifact_per_language(&java, vec![("java", vec![java_doc()])]);
+    let error = join_with_row_edit(&java, &descriptor, "typeRelationship", |row| {
+        row["source"]["document"]["path"] = json!("Z.java");
+    });
+    assert!(
+        format!("{error:#}").contains("relationship source/evidence document mismatch"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn staged_closure_rejects_cross_row_defects() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let cases: [(&str, &str, &str); 3] = [
+        (
+            "INSERT INTO out_declaration_bindings SELECT (SELECT MAX(ord)+1 FROM out_declaration_bindings), provenance_id, body \
+             FROM out_declaration_bindings WHERE ord=(SELECT MIN(ord) FROM out_declaration_bindings)",
+            "duplicate declaration binding fact",
+            "duplicate binding",
+        ),
+        (
+            "UPDATE out_coverage SET body=json_set(body,'$.state','failed')",
+            "proof on non-fact-bearing coverage",
+            "proof on failed coverage",
+        ),
+        (
+            "UPDATE out_provenance SET body=json_set(body,'$.contentHash',?1)",
+            "captured proof document hash mismatch",
+            "hash mismatch",
+        ),
+    ];
+    for (sql, message, name) in cases {
+        testing::before_join_closure(move |conn| {
+            let hash = "0".repeat(64);
+            let params: &[&dyn rusqlite::ToSql] = if sql.contains("?1") { &[&hash] } else { &[] };
+            conn.execute(sql, params).unwrap();
+        });
+        let error = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{name}: {error:#}");
+    }
 }
 
 #[test]
