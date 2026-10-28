@@ -189,7 +189,8 @@ export function expectedGraph(loaded, records, checked, request) {
       byId.has(target.syntaxId) && documentKey(byId.get(target.syntaxId).document) === documentKey(target.document);
     if (reason === "none" && !exactInternal) reason = "stale";
     const external = binding?.resolution === "external";
-    const test = owner.role === "test" || (exactInternal && byId.get(target.syntaxId).role === "test");
+    const test = (owner.syntaxId !== effective.rootSyntaxId && owner.role === "test") ||
+      (exactInternal && byId.get(target.syntaxId).role === "test");
     return { call, binding, proof, target, reason, exactInternal, external, test,
       rank: reason === "none" ? 0 : external ? 1 : 2 };
   };

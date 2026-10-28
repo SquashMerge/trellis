@@ -1228,12 +1228,31 @@ pub fn call_graph(
             "result":super::tools::result("trellis_call_graph", envelope.clone(), modern)});
         serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() < super::wire::RESPONSE_BYTES)
     };
+    fit_call_graph(
+        build(full, false)?,
+        edges,
+        |edge_count| {
+            let result = answer
+                .prefix(edge_count)
+                .map_err(|_| "store_unavailable: call graph prefix")?;
+            build(&result, true)
+        },
+        fits,
+    )
+}
+
+fn fit_call_graph(
+    complete: Value,
+    edges: usize,
+    mut prefix: impl FnMut(usize) -> Result<Value, &'static str>,
+    mut fits: impl FnMut(&Value) -> bool,
+) -> Result<Option<Value>, &'static str> {
+    if fits(&complete) {
+        return Ok(Some(complete));
+    }
     let mut retained = None;
-    for edge_count in 0..=edges {
-        let result = answer
-            .prefix(edge_count)
-            .map_err(|_| "store_unavailable: call graph prefix")?;
-        let envelope = build(&result, edge_count < edges)?;
+    for edge_count in 0..edges {
+        let envelope = prefix(edge_count)?;
         if !fits(&envelope) {
             break;
         }
@@ -2239,6 +2258,64 @@ mod call_graph_tests {
             assert_eq!(envelope["truncationReason"], Value::Null);
             assert_eq!(envelope["warnings"], result["warnings"]);
         }
+    }
+
+    #[test]
+    fn complete_frame_is_checked_once_without_building_prefixes() {
+        for edges in [0, 1, 300, 500] {
+            let complete = json!({"complete": edges});
+            let mut checks = 0;
+            let result = fit_call_graph(
+                complete.clone(),
+                edges,
+                |_| panic!("a fitting complete answer must not build prefixes"),
+                |frame| {
+                    checks += 1;
+                    frame == &complete
+                },
+            )
+            .unwrap();
+            assert_eq!(result, Some(complete));
+            assert_eq!(checks, 1);
+        }
+    }
+
+    #[test]
+    fn a_nonfitting_intermediate_prefix_cannot_hide_a_fitting_complete_frame() {
+        let complete = json!({"jsonrpc":"2.0","id":"graph","result":"fits"});
+        let intermediate = json!({"jsonrpc":"2.0","id":"graph",
+            "result":{"disclosure":"x".repeat(crate::mcp::wire::RESPONSE_BYTES)}});
+        let fits = |frame: &Value| {
+            serde_json::to_vec(frame).unwrap().len() < crate::mcp::wire::RESPONSE_BYTES
+        };
+        assert!(fits(&complete));
+        assert!(!fits(&intermediate));
+        assert_eq!(
+            fit_call_graph(complete.clone(), 3, |_| Ok(intermediate.clone()), fits).unwrap(),
+            Some(complete)
+        );
+    }
+
+    #[test]
+    fn overflow_checks_complete_then_visits_each_prefix_once_until_first_refusal() {
+        let mut prefixes = Vec::new();
+        let mut checks = 0;
+        let result = fit_call_graph(
+            json!(500),
+            500,
+            |count| {
+                prefixes.push(count);
+                Ok(json!(count))
+            },
+            |frame| {
+                checks += 1;
+                frame.as_u64().unwrap() < 3
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Some(json!(2)));
+        assert_eq!(prefixes, [0, 1, 2, 3]);
+        assert_eq!(checks, 5);
     }
 
     #[test]

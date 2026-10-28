@@ -143,15 +143,58 @@ fn child() {}
 }
 
 #[test]
-fn explicit_test_root_is_retained_and_test_external_sites_require_both_flags() {
+fn skipped_target_roles_do_not_load_target_document_facts() {
+    for (target, max_nodes, reason) in [
+        ("#[test]\nfn target() {}\n", 150, FrontierReason::Filtered),
+        ("fn target() {}\n", 1, FrontierReason::NodeLimit),
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let mut spec = Spec::new(&[("a.rs", "fn root() { target(); }\n"), ("b.rs", target)]);
+        spec.bindings = vec![bind("root", 0, "target")];
+        publisher.publish(&spec);
+        let root_id = syntax_id(publisher.native(), "root");
+        let mut query = query(&root_id, true, false, false);
+        query.max_nodes = max_nodes;
+        let answer = publisher
+            .store
+            .evidence_response()
+            .unwrap()
+            .graph_query(&query, None, &mut || Ok(()))
+            .unwrap();
+        let result = answer.outcome.as_ref().unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.frontier[0].reason, reason);
+        assert_eq!(answer.facts.documents.len(), 1);
+        assert_eq!(answer.facts.documents.keys().next().unwrap().path, "a.rs");
+        // Byte projection needs only evaluated facts, not the skipped target document.
+        let prefix = answer.prefix(0).unwrap();
+        assert_eq!(prefix.nodes.len(), 1);
+        assert_eq!(
+            prefix.hints,
+            if reason == FrontierReason::Filtered {
+                vec!["includeTests"]
+            } else {
+                // The node-limit edge is byte-pruned, so its frontier and hint disappear.
+                vec!["rootSyntaxId"]
+            }
+        );
+    }
+}
+
+#[test]
+fn explicit_test_root_keeps_production_calls_and_filters_test_callees() {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let mut publisher = Publisher::open(state.path(), root.path());
     let mut spec = Spec::new(&[(
         "a.rs",
         "#[test]
-fn root() { production(); outside(); }
+fn root() { production(); outside(); unit(); }
 fn production() {}
+#[test]
+fn unit() {}
 ",
     )]);
     spec.bindings = vec![
@@ -161,14 +204,15 @@ fn production() {}
             target: None,
             ..bind("root", 1, "unused")
         },
+        bind("root", 2, "unit"),
     ];
     publisher.publish(&spec);
     let root_id = syntax_id(publisher.native(), "root");
     for (external, tests, edges, omitted) in [
-        (false, false, 0, 2),
-        (true, false, 0, 2),
-        (false, true, 1, 1),
-        (true, true, 2, 0),
+        (false, false, 1, 2),
+        (true, false, 2, 1),
+        (false, true, 2, 1),
+        (true, true, 3, 0),
     ] {
         let result = run(&publisher, &query(&root_id, true, external, tests));
         assert_eq!(result.nodes[0].declaration.syntax_id, root_id);

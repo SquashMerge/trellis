@@ -1093,12 +1093,17 @@ fn stale_evidence_and_history_warnings() {
 struct Recorder<'a> {
     from: &'a mut GraphFacts,
     memo: GraphFacts,
+    work_checks: usize,
 }
 
 impl<'a> Recorder<'a> {
     fn new(from: &'a mut GraphFacts) -> Self {
         let memo = GraphFacts::memo(from.snapshot().clone());
-        Self { from, memo }
+        Self {
+            from,
+            memo,
+            work_checks: 0,
+        }
     }
 }
 
@@ -1133,6 +1138,10 @@ impl GraphSource for Recorder<'_> {
         Ok(found)
     }
     fn check(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn check_work(&mut self) -> Result<()> {
+        self.work_checks += 1;
         Ok(())
     }
 }
@@ -1700,7 +1709,7 @@ fn trimmed_groups_exact_targets_and_proofs_not_occurrence_anchors() {
 }
 
 #[test]
-fn trimmed_overlap_filters_count_once_keep_root_and_unknown_calls() {
+fn trimmed_external_filter_keeps_test_root_and_unknown_calls() {
     let mut w = world(true);
     w.decl(A, "src/lib.rs");
     w.doc("src/lib.rs")
@@ -1726,7 +1735,7 @@ fn trimmed_overlap_filters_count_once_keep_root_and_unknown_calls() {
     let r = run(&mut facts, &req);
     assert_eq!(r.nodes.len(), 1);
     assert_eq!(r.omitted.filtered, 1);
-    assert_eq!(r.hints, ["includeExternal", "includeTests"]);
+    assert_eq!(r.hints, ["includeExternal"]);
     assert!(r.partial && !r.truncated);
     assert!(r.warnings.is_empty());
     assert_eq!(r.frontier[0].call_id, None);
@@ -1848,4 +1857,230 @@ fn trimmed_distinct_binding_outcome_and_freshness_do_not_group() {
     let r = run(&mut facts, &request(A, true));
     assert_eq!(r.edges.len(), 3);
     assert!(r.edges.iter().all(|e| e.call_site_count == 1));
+}
+
+#[test]
+fn trimmed_missing_or_mismatched_internal_locations_do_not_group_identical_proofs() {
+    for location in [None, Some(dkey("src/other.rs"))] {
+        let mut w = world(true);
+        w.decl(A, "src/lib.rs");
+        w.decl(B, "src/target.rs");
+        for n in [10, 11] {
+            w.call(A, n, n as usize);
+            w.bind(
+                n,
+                Bind {
+                    prov: Some("shared".into()),
+                    ..direct(B)
+                },
+            );
+        }
+        let mut facts = w.build();
+        facts.locations.insert(sid(B), location);
+        let r = run(&mut facts, &request(A, true));
+        assert_eq!(r.edges.len(), 2);
+        assert!(r.edges.iter().all(|edge| {
+            edge.call_site_count == 1
+                && edge.visit == Visit::Boundary
+                && edge.boundary_reason == Stale
+        }));
+    }
+}
+
+#[test]
+fn trimmed_located_stale_targets_group_when_proof_and_disposition_match() {
+    let mut w = world(true);
+    w.decl(A, "src/lib.rs");
+    w.decl(B, "src/target.rs");
+    for n in [10, 11] {
+        w.call(A, n, n as usize);
+        w.bind(
+            n,
+            Bind {
+                prov: Some("shared".into()),
+                freshness: Freshness::Stale,
+                ..direct(B)
+            },
+        );
+    }
+    let mut facts = w.build();
+    let r = run(&mut facts, &request(A, true));
+    assert_eq!(r.edges.len(), 1);
+    assert_eq!(r.edges[0].call_site_count, 2);
+    assert_eq!(r.edges[0].boundary_reason, Stale);
+    assert_eq!(r.edges[0].visit, Visit::Boundary);
+}
+
+#[test]
+fn trimmed_filter_hints_are_captured_once_and_follow_prefix_owners() {
+    let mut w = world(true);
+    for (n, path) in [(A, "src/root.rs"), (B, "src/owner.rs"), (C, "src/test.rs")] {
+        w.decl(n, path);
+    }
+    w.doc("src/test.rs")
+        .declarations
+        .get_mut(&sid(C))
+        .unwrap()
+        .role = native::DeclarationRole::Test;
+    w.call(A, 10, 10);
+    w.bind(
+        10,
+        Bind {
+            target: Tgt::External,
+            resolution: Resolution::External,
+            ..direct(B)
+        },
+    );
+    w.call(A, 11, 20);
+    w.bind(11, direct(B));
+    w.call(B, 20, 10);
+    w.bind(20, direct(C));
+    let mut facts = w.build();
+    let req = GraphRequest {
+        include_external: false,
+        include_tests: false,
+        ..request(A, true)
+    };
+    let mut recorder = Recorder::new(&mut facts);
+    let result = evaluate(&req, &mut recorder).unwrap().unwrap();
+    assert_eq!(recorder.work_checks, 3, "each call is classified only once");
+    assert_eq!(result.hints, ["includeExternal", "includeTests"]);
+    assert!(
+        serde_json::to_value(&result)
+            .unwrap()
+            .get("filteredHints")
+            .is_none()
+    );
+    let mut memo = recorder.memo;
+    for doc in memo.documents.values_mut() {
+        Arc::make_mut(doc).calls.clear();
+    }
+    let answer = graph_answer(req, result, memo);
+    let prefix = answer.prefix(0).unwrap();
+    assert_eq!(nodes(&prefix), [(A, 0)]);
+    assert_eq!(prefix.hints, ["includeExternal", "rootSyntaxId"]);
+    assert_eq!(prefix.omitted.filtered, 1);
+    assert_eq!(prefix.filtered_hints.len(), 1);
+    assert!(prefix.filtered_hints.contains_key(&sid(A)));
+}
+
+#[test]
+fn trimmed_test_root_keeps_production_and_unknown_calls_but_filters_test_callees() {
+    let mut w = world(true);
+    for n in [A, B, C] {
+        w.decl(n, "src/lib.rs");
+    }
+    for n in [A, C] {
+        w.doc("src/lib.rs")
+            .declarations
+            .get_mut(&sid(n))
+            .unwrap()
+            .role = native::DeclarationRole::Test;
+    }
+    w.call(A, 10, 10);
+    w.bind(10, direct(B));
+    w.call(A, 11, 20);
+    w.bind(11, direct(C));
+    w.call(A, 12, 30);
+    let mut facts = w.build();
+    let req = GraphRequest {
+        include_tests: false,
+        ..request(A, true)
+    };
+    let r = run(&mut facts, &req);
+    assert_eq!(nodes(&r), [(A, 0), (B, 1)]);
+    assert_eq!(
+        edges(&r),
+        [
+            (10, A, Some(B), Visit::New, NONE),
+            (12, A, None, Visit::Boundary, MissingEvidence),
+        ]
+    );
+    assert_eq!(r.omitted.filtered, 1);
+    assert_eq!(r.hints, ["includeTests"]);
+    assert!(r.partial && !r.truncated);
+    let included = run(
+        &mut facts,
+        &GraphRequest {
+            include_tests: true,
+            ..req
+        },
+    );
+    assert_eq!(included.edges.len(), 3);
+    assert_eq!(included.omitted.filtered, 0);
+}
+
+#[test]
+fn trimmed_nonroot_test_owner_remains_excluded_and_is_not_expanded() {
+    let mut w = graph(&[(A, 10, B), (B, 20, C)], true);
+    w.doc("src/lib.rs")
+        .declarations
+        .get_mut(&sid(B))
+        .unwrap()
+        .role = native::DeclarationRole::Test;
+    let mut facts = w.build();
+    let req = GraphRequest {
+        include_tests: false,
+        ..request(A, true)
+    };
+    let r = run(&mut facts, &req);
+    assert_eq!(nodes(&r), [(A, 0)]);
+    assert!(r.edges.is_empty());
+    assert_eq!(
+        r.omitted.filtered, 1,
+        "unexpanded descendants are not counted"
+    );
+    assert_eq!(r.hints, ["includeTests"]);
+    let included = run(
+        &mut facts,
+        &GraphRequest {
+            include_tests: true,
+            ..req
+        },
+    );
+    assert_eq!(nodes(&included), [(A, 0), (B, 1), (C, 2)]);
+    assert_eq!(included.edges.len(), 2);
+    assert_eq!(included.omitted.filtered, 0);
+}
+
+#[test]
+fn trimmed_stale_external_bindings_are_still_filtered_as_external() {
+    let mut w = world(true);
+    w.decl(A, "src/lib.rs");
+    w.call(A, 10, 10);
+    w.bind(
+        10,
+        Bind {
+            target: Tgt::External,
+            resolution: Resolution::External,
+            freshness: Freshness::Stale,
+            ..direct(B)
+        },
+    );
+    let mut facts = w.build();
+    let req = GraphRequest {
+        include_external: false,
+        ..request(A, true)
+    };
+    let r = run(&mut facts, &req);
+    assert!(r.edges.is_empty());
+    assert_eq!(r.omitted.filtered, 1);
+    assert_eq!(r.hints, ["includeExternal"]);
+    assert!(
+        r.warnings.is_empty(),
+        "filtered proof does not produce warnings"
+    );
+    let included = run(
+        &mut facts,
+        &GraphRequest {
+            include_external: true,
+            ..req
+        },
+    );
+    assert_eq!(edges(&included), [(10, A, None, Visit::Boundary, Stale)]);
+    assert_eq!(included.omitted.filtered, 0);
+    assert_eq!(
+        keys(&included.warnings),
+        [(WarningCode::StaleEvidence, Some("pv:10".into()))]
+    );
 }

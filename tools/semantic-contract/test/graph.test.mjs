@@ -2130,28 +2130,24 @@ test("graph assembly controls reject old occurrence, promoted and foreign facts,
 });
 
 
-test("#379 filters use published role/resolution, retain test root and unknown, and count overlap once", () => {
+test("#379 test root caller role is exempt, while test callees and external calls stay filtered", () => {
   const s = specimen();
   s.records.declarations[0].role = "test";
-  const external = s.add(1, 2, { resolution: "external", staleTarget: null });
-  s.add(1, 2);
-  let entry = s.authored({ partial: true });
+  s.records.declarations[2].role = "test";
+  const external = s.add(1, 2, { resolution: "external", staleTarget: null, freshness: "stale" });
+  const internal = s.add(1, 2);
+  s.add(1, 3);
+  const entry = s.authored({ names: ["A", "B"], depths: [0, 1],
+    edges: [s.edge(internal, 1)], proofIds: [internal.binding.provenanceId], partial: true });
   entry.answer.result.frontier = [s.front("filtered", 1, null, null, null, 2)];
   entry.answer.result.omitted.filtered = 2;
   entry.answer.result.hints = ["includeExternal", "includeTests"];
   assert.equal(verify(s, entry), true);
   assert.equal(entry.answer.result.truncated, false);
-  s.request.includeTests = true;
-  const internal = { call: s.records.calls[1], binding: s.records.callBindings[1] };
-  entry = s.authored({ names: ["A", "B"], depths: [0, 1], edges: [s.edge(internal, 1)],
-    proofIds: [internal.binding.provenanceId], partial: true });
-  entry.answer.result.frontier = [s.front("filtered", 1, null, null, null, 1)];
-  entry.answer.result.omitted.filtered = 1;
-  entry.answer.result.hints = ["includeExternal"];
-  assert.equal(verify(s, entry), true);
   assert.equal(entry.answer.result.provenance.some((p) => p.id === external.binding.provenanceId), false);
 
   const unknown = specimen();
+  unknown.records.declarations[0].role = "test";
   const call = unknown.add(1, 2);
   unknown.records.callBindings = [];
   const visible = unknown.authored({ edges: [unknown.edge(call, 1,

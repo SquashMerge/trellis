@@ -262,6 +262,9 @@ pub struct GraphResult {
     pub warnings: Vec<Warning>,
     pub omitted: GraphOmitted,
     pub hints: Vec<String>,
+    /// Evaluation-only filter hints by owner, retained for frozen prefix projection.
+    #[serde(skip)]
+    pub filtered_hints: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +310,18 @@ pub trait GraphSource {
     fn producer_languages(&mut self, producer_id: &str) -> Result<Option<BTreeSet<String>>>;
     fn locate(&mut self, syntax_id: &str) -> Result<Option<DocumentKey>>;
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>>;
+    /// The role of an exactly located declaration, without requiring its whole document.
+    fn declaration_role(
+        &mut self,
+        key: &DocumentKey,
+        syntax_id: &str,
+    ) -> Result<native::DeclarationRole> {
+        self.document(key)?
+            .declarations
+            .get(syntax_id)
+            .map(|declaration| declaration.role)
+            .ok_or_else(|| integrity("target declaration missing from document"))
+    }
     fn history(&mut self, key: &DocumentKey, syntax_id: &str) -> Result<Option<Arc<HistoryFacts>>>;
     /// Called once per expanded node; an error aborts without a result.
     fn check(&mut self) -> Result<()>;
@@ -480,6 +495,11 @@ impl GraphAnswer {
             nodes,
             edges,
             frontier,
+            full.filtered_hints
+                .iter()
+                .filter(|(owner, _)| retained.contains(*owner))
+                .map(|(owner, hints)| (owner.clone(), hints.clone()))
+                .collect(),
         )
     }
 }
@@ -632,6 +652,7 @@ pub fn evaluate(
     let mut admitted = BTreeSet::from([request.root_syntax_id.clone()]);
     let mut edges = Vec::new();
     let mut frontier = Vec::new();
+    let mut filtered_hints: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut pending: Vec<Candidate> = Vec::new();
     let mut head = 0;
     loop {
@@ -689,29 +710,31 @@ pub fn evaluate(
                         _ => None,
                     }
                 });
-                let target_decl = match target {
-                    Some((id, key)) if source.locate(id)?.as_ref() == Some(key) => Some(
-                        source
-                            .document(key)?
-                            .declarations
-                            .get(id)
-                            .cloned()
-                            .ok_or_else(|| integrity("target declaration missing from document"))?,
-                    ),
+                let exact_target = match target {
+                    Some((id, key)) if source.locate(id)?.as_ref() == Some(key) => Some((id, key)),
                     _ => None,
                 };
-                if reason == BoundaryReason::None && target_decl.is_none() {
+                if reason == BoundaryReason::None && exact_target.is_none() {
                     reason = BoundaryReason::Stale;
                 }
-                let test = node.declaration.role == native::DeclarationRole::Test
-                    || target_decl
-                        .as_ref()
-                        .is_some_and(|d| d.role == native::DeclarationRole::Test);
+                let target_role = exact_target
+                    .map(|(id, key)| source.declaration_role(key, id))
+                    .transpose()?;
+                let test = (node_id != request.root_syntax_id
+                    && node.declaration.role == native::DeclarationRole::Test)
+                    || target_role == Some(native::DeclarationRole::Test);
                 if (external && !request.include_external) || (test && !request.include_tests) {
                     add_omission(&mut frontier, &node_id, FrontierReason::Filtered, 1);
+                    let hints = filtered_hints.entry(node_id.clone()).or_default();
+                    if external && !request.include_external {
+                        hints.insert("includeExternal".to_string());
+                    }
+                    if test && !request.include_tests {
+                        hints.insert("includeTests".to_string());
+                    }
                     continue;
                 }
-                let group = if target.is_some() {
+                let group = if exact_target.is_some() {
                     selected
                         .map(|(b, proof)| {
                             serde_json::to_string(&(
@@ -726,6 +749,7 @@ pub fn evaluate(
                                 &b.join.status,
                                 &b.join.diagnostic,
                                 proof,
+                                reason,
                                 external,
                                 test,
                             ))
@@ -753,8 +777,9 @@ pub fn evaluate(
                     owner_document: doc.key.clone(),
                     group,
                     target: (reason == BoundaryReason::None)
-                        .then_some(target_decl)
-                        .flatten(),
+                        .then_some(exact_target)
+                        .flatten()
+                        .map(|(id, key)| (id.clone(), key.clone())),
                     edge: GraphEdge {
                         call_site_count: 1,
                         call: call.clone(),
@@ -781,8 +806,7 @@ pub fn evaluate(
             break;
         }
         let mut candidate = pending.remove(0);
-        if let Some(target) = candidate.target {
-            let id = target.syntax_id.clone();
+        if let Some((id, key)) = candidate.target {
             if admitted.contains(&id) {
                 candidate.edge.to = Some(id);
                 candidate.edge.visit = Visit::Seen;
@@ -797,9 +821,15 @@ pub fn evaluate(
                     omitted_calls: 0,
                 });
             } else {
+                let declaration = source
+                    .document(&key)?
+                    .declarations
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| integrity("target declaration missing from document"))?;
                 admitted.insert(id.clone());
                 nodes.push(GraphNode {
-                    declaration: target,
+                    declaration,
                     depth: candidate.owner_depth + 1,
                 });
                 candidate.edge.to = Some(id);
@@ -809,7 +839,15 @@ pub fn evaluate(
         edges.push(candidate.edge);
     }
     shortest_depths(&mut nodes, &edges);
-    Ok(Ok(finish(request, source, scope, nodes, edges, frontier)?))
+    Ok(Ok(finish(
+        request,
+        source,
+        scope,
+        nodes,
+        edges,
+        frontier,
+        filtered_hints,
+    )?))
 }
 
 struct Candidate {
@@ -817,7 +855,7 @@ struct Candidate {
     owner_depth: u64,
     owner_document: DocumentKey,
     group: Option<String>,
-    target: Option<native::Declaration>,
+    target: Option<(String, DocumentKey)>,
     edge: GraphEdge,
 }
 
@@ -885,6 +923,7 @@ fn finish(
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     mut frontier: Vec<Frontier>,
+    filtered_hints: BTreeMap<String, BTreeSet<String>>,
 ) -> Result<GraphResult> {
     let order: BTreeMap<_, _> = nodes
         .iter()
@@ -935,52 +974,8 @@ fn finish(
     {
         hints.insert("maxNodes".to_string());
     }
-    // Filtered sites are inspected only for returned owners, using the same frozen facts.
-    if omitted.filtered > 0 {
-        for node in &nodes {
-            if !frontier.iter().any(|f| {
-                f.node_id == node.declaration.syntax_id && f.reason == FrontierReason::Filtered
-            }) {
-                continue;
-            }
-            let doc = source.document(&node.declaration.document)?;
-            let semantic = semantic(scope, &doc)?;
-            for call in doc
-                .calls
-                .get(&node.declaration.syntax_id)
-                .into_iter()
-                .flatten()
-            {
-                source.check_work()?;
-                let selected = select_binding(semantic, call)?;
-                if !request.include_external
-                    && selected.is_some_and(|(b, _)| b.resolution == Resolution::External)
-                {
-                    hints.insert("includeExternal".to_string());
-                }
-                if !request.include_tests {
-                    let mut test = node.declaration.role == native::DeclarationRole::Test;
-                    if let Some((b, _)) = selected
-                        && b.resolution == Resolution::Resolved
-                        && let Some(Target::Internal {
-                            syntax_id,
-                            document,
-                            ..
-                        }) = &b.declared_target
-                        && source.locate(syntax_id)?.as_ref() == Some(document)
-                    {
-                        test |= source
-                            .document(document)?
-                            .declarations
-                            .get(syntax_id)
-                            .is_some_and(|d| d.role == native::DeclarationRole::Test);
-                    }
-                    if test {
-                        hints.insert("includeTests".to_string());
-                    }
-                }
-            }
-        }
+    for owner_hints in filtered_hints.values() {
+        hints.extend(owner_hints.iter().cloned());
     }
     if frontier
         .iter()
@@ -1010,6 +1005,7 @@ fn finish(
         warnings,
         omitted,
         hints: hints.into_iter().collect(),
+        filtered_hints,
     })
 }
 

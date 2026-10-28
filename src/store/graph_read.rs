@@ -32,6 +32,7 @@ struct SnapshotGraphSource<'a> {
     producer: Option<String>,
     snapshot: GraphSnapshot,
     scopes: BTreeMap<DocumentKey, V8NativeScope>,
+    declaration_roles: BTreeMap<(DocumentKey, String), crate::native_evidence::DeclarationRole>,
     facts: GraphFacts,
     check: &'a mut dyn FnMut() -> Result<()>,
 }
@@ -174,6 +175,36 @@ impl GraphSource for SnapshotGraphSource<'_> {
         Ok(key)
     }
 
+    fn declaration_role(
+        &mut self,
+        key: &DocumentKey,
+        syntax_id: &str,
+    ) -> Result<crate::native_evidence::DeclarationRole> {
+        let cache_key = (key.clone(), syntax_id.to_string());
+        if let Some(role) = self.declaration_roles.get(&cache_key) {
+            return Ok(*role);
+        }
+        let scope = self.scope(key)?;
+        let id = id_codec::encode_sid(syntax_id).ok_or_else(|| {
+            SelectedIntegrity("store_unavailable: invalid graph declaration identity".into())
+        })?;
+        let stored: String = self
+            .db
+            .query_row(
+                "SELECT role FROM native_version_declarations WHERE vid=?1 AND syntax_id=?2",
+                params![scope.vid, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                SelectedIntegrity("store_unavailable: graph declaration role missing".into())
+            })?;
+        let role = crate::native_evidence::DeclarationRole::from_stored(&stored)
+            .map_err(|error| SelectedIntegrity(error.to_string()))?;
+        self.declaration_roles.insert(cache_key, role);
+        Ok(role)
+    }
+
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>> {
         if let Some(document) = self.facts.documents.get(key) {
             return Ok(document.clone());
@@ -270,6 +301,7 @@ impl EvidenceResponse {
             producer: query.semantic_producer_id.clone(),
             snapshot: snapshot.clone(),
             scopes: BTreeMap::new(),
+            declaration_roles: BTreeMap::new(),
             facts: GraphFacts::memo(snapshot),
             check,
         };
@@ -286,6 +318,74 @@ impl EvidenceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_role_reads_only_the_pinned_row_and_rejects_corruption() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,role TEXT);",
+        )
+        .unwrap();
+        let id = format!("sid:v1:{}", "1".repeat(32));
+        let encoded = id_codec::encode_sid(&id).unwrap();
+        db.execute(
+            "INSERT INTO native_version_declarations VALUES(1,?1,'production'),(2,?1,'test')",
+            [&encoded],
+        )
+        .unwrap();
+        let key = DocumentKey {
+            source_set_id: "source-set:v1:test".into(),
+            language: "rust".into(),
+            path: "target.rs".into(),
+        };
+        let selected = ReadRevision::new(
+            IndexPin {
+                index_generation: uuid::Uuid::nil(),
+                index_revision: 1,
+            },
+            "selected".into(),
+        );
+        let snapshot = GraphSnapshot {
+            source_set_id: key.source_set_id.clone(),
+            revision_id: "revision".into(),
+        };
+        let scope = V8NativeScope {
+            revision_key: selected.key.clone(),
+            version_id: "version".into(),
+            vid: 2,
+            key: key.clone(),
+            native_revision_id: snapshot.revision_id.clone(),
+            producer_id: "native".into(),
+        };
+        let mut check = || Ok(());
+        let mut source = SnapshotGraphSource {
+            db: &db,
+            selected: &selected,
+            producer: None,
+            snapshot: snapshot.clone(),
+            scopes: BTreeMap::from([(key.clone(), scope)]),
+            declaration_roles: BTreeMap::new(),
+            facts: GraphFacts::memo(snapshot),
+            check: &mut check,
+        };
+        assert_eq!(
+            source.declaration_role(&key, &id).unwrap(),
+            crate::native_evidence::DeclarationRole::Test
+        );
+        assert!(source.facts.documents.is_empty());
+        source.declaration_roles.clear();
+        db.execute(
+            "UPDATE native_version_declarations SET role='invalid' WHERE vid=2",
+            [],
+        )
+        .unwrap();
+        let invalid = source.declaration_role(&key, &id).unwrap_err();
+        assert!(invalid.downcast_ref::<SelectedIntegrity>().is_some());
+        db.execute("DELETE FROM native_version_declarations WHERE vid=2", [])
+            .unwrap();
+        let missing = source.declaration_role(&key, &id).unwrap_err();
+        assert!(missing.downcast_ref::<SelectedIntegrity>().is_some());
+    }
 
     #[test]
     fn graph_integrity_maps_to_selected_integrity() {
