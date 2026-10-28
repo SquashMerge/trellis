@@ -82,7 +82,7 @@ impl SearchConfig {
             }
         };
         Ok(Self {
-            model_path,
+            model_path: model_path.filter(|path| !path.as_os_str().is_empty()),
             backend,
         })
     }

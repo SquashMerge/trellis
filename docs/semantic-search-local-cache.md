@@ -49,7 +49,7 @@ installation remains `cargo install --path . --locked`.
 Set these environment variables before starting the per-user daemon, including a CLI or
 MCP client that may start it automatically:
 
-- `TRELLIS_SEARCH_MODEL`: absolute path to the downloaded snapshot directory. Unset means no model.
+- `TRELLIS_SEARCH_MODEL`: absolute path to the downloaded snapshot directory. Unset or empty means no model.
 - `TRELLIS_SEARCH_BACKEND`: `auto` (default), `cpu`, or `metal`.
 
 ```sh
@@ -92,7 +92,7 @@ daemon startup as `daemon_unavailable`.
 `trellis_search_symbols`, `trellis_workspace_describe` and `trellis status` report
 `searchIndex.unavailableReason`:
 
-- `model_not_configured`: `TRELLIS_SEARCH_MODEL` was unset when the daemon started.
+- `model_not_configured`: `TRELLIS_SEARCH_MODEL` was unset or empty when the daemon started.
 - `model_load_failed`: the configured snapshot could not be verified or loaded, for example
   because files are missing or do not match the pinned hashes.
 - `null`: no model configuration/load failure is known. Temporary model loading or a missing

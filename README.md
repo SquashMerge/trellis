@@ -88,7 +88,7 @@ CLI restart command. See the [model and daemon setup guide](docs/semantic-search
 for PID discovery and restart details.
 
 Search, workspace describe and CLI status report `searchIndex.unavailableReason` as
-`model_not_configured` when the model variable was unset, or `model_load_failed` when the
+`model_not_configured` when the model variable was unset or empty, or `model_load_failed` when the
 configured files could not be verified or loaded. Both preserve lexical retrieval. Describe
 and CLI status expose only `{backend, unavailableReason}`, not search readiness or coverage.
 An untried/loading model or missing resident matrix still has a `null` reason; this is not
