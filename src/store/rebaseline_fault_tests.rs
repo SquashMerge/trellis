@@ -820,6 +820,15 @@ fn exceptional_corrupt_recreate_refuses_busy_use_without_unlinking_index() {
 
 #[test]
 fn obsolete_metadata_marker_recreates_new_file_and_preserves_requests() {
+    assert_obsolete_index_recreates_and_preserves_requests(false);
+}
+
+#[test]
+fn earlier_schema_without_metadata_recreates_new_file_and_preserves_requests() {
+    assert_obsolete_index_recreates_and_preserves_requests(true);
+}
+
+fn assert_obsolete_index_recreates_and_preserves_requests(earlier_schema: bool) {
     use std::os::unix::fs::MetadataExt;
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
@@ -845,11 +854,19 @@ fn obsolete_metadata_marker_recreates_new_file_and_preserves_requests() {
     let index = store.roots.index_db(&store.identity);
     drop(store);
     let db = Connection::open(&index).unwrap();
-    db.execute_batch(
-        "PRAGMA ignore_check_constraints=ON;
-            UPDATE index_metadata SET schema_version=7;",
-    )
-    .unwrap();
+    if earlier_schema {
+        db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION - 1)
+            .unwrap();
+        db.execute_batch("DROP TABLE index_metadata;").unwrap();
+    } else {
+        db.execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        db.execute(
+            "UPDATE index_metadata SET schema_version=?1",
+            [DATABASE_SCHEMA_VERSION - 1],
+        )
+        .unwrap();
+    }
     drop(db);
     let inode = fs::metadata(&index).unwrap().ino();
     let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
@@ -880,6 +897,129 @@ fn obsolete_metadata_marker_recreates_new_file_and_preserves_requests() {
             .contains("revision conflict")
     );
     drop(session);
+}
+
+#[test]
+fn earlier_schema_changed_before_rename_refuses_replacement_and_preserves_requests() {
+    use std::os::unix::fs::MetadataExt;
+    for replacement_version in [DATABASE_SCHEMA_VERSION, DATABASE_SCHEMA_VERSION + 1] {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let request = store.enqueue_request(&options, None).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        drop(store);
+        let db = Connection::open(&index).unwrap();
+        db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(db);
+        let inode = fs::metadata(&index).unwrap().ino();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        let exclusive = recovering
+            .roots
+            .index_use_exclusive_existing(&recovering.identity)
+            .unwrap();
+        let mut leader = recovering
+            .roots
+            .writer_under_exclusive(recovering.identity.clone(), exclusive)
+            .unwrap();
+        let mut changed_live = None;
+        let error = recovering
+            .recreate_index_exclusive_with_hook(&options, &mut leader, &cancel, |phase| {
+                if phase == ActivationStage::BeforeRename {
+                    let db = Connection::open(&index)?;
+                    db.pragma_update(None, "user_version", replacement_version)?;
+                    drop(db);
+                    changed_live = Some(fs::read(&index)?);
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("recovery_required"), "{error:#}");
+        assert_eq!(fs::metadata(&index).unwrap().ino(), inode);
+        assert_eq!(fs::read(&index).unwrap(), changed_live.unwrap());
+        let db = Connection::open(&index).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            replacement_version
+        );
+        drop(db);
+        drop(leader);
+        let queued = recovering.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(queued.expected, None);
+        assert_eq!(queued.state, "queued");
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+    }
+}
+
+#[test]
+fn current_schema_obsolete_markers_still_refuse_root_spelling_mismatch() {
+    use std::os::unix::fs::MetadataExt;
+    for obsolete_extractor in [false, true] {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        store
+            .enqueue_request(&IndexOptions::new(work.path().to_owned()), None)
+            .unwrap();
+        let index = store.roots.index_db(&store.identity);
+        drop(store);
+        let db = Connection::open(&index).unwrap();
+        db.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE index_metadata SET root_spelling='/different-root';",
+        )
+        .unwrap();
+        if obsolete_extractor {
+            db.execute(
+                "UPDATE index_metadata SET extractor_version='obsolete-extractor'",
+                [],
+            )
+            .unwrap();
+        } else {
+            db.execute(
+                "UPDATE index_metadata SET schema_version=?1",
+                [DATABASE_SCHEMA_VERSION - 1],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
+        drop(db);
+        let inode = fs::metadata(&index).unwrap().ino();
+        let before = fs::read(&index).unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        let error = recovering
+            .recreate_pending_writer_session(
+                &IndexOptions::new(work.path().to_owned()),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("obsolete metadata does not authorize a different root spelling");
+        assert!(
+            error.to_string().contains("root_key_collision"),
+            "{error:#}"
+        );
+        assert_eq!(fs::metadata(&index).unwrap().ino(), inode);
+        assert_eq!(fs::read(&index).unwrap(), before);
+    }
 }
 
 #[test]
