@@ -60,26 +60,19 @@ pub(super) fn can_match_an_id(query: &str) -> bool {
 
 /// One search's candidate rows and how to find them.
 struct Search<'a> {
-    /// The selected `a, b, rank` columns; rank orders exact name (0), name
-    /// prefix (1), then any other name or ID substring (2).
     columns: &'a str,
-    /// The source table and its alias, as `table alias`.
     source: &'a str,
-    /// The FTS5 table over its names.
     names: &'a str,
-    /// The covering ID scan of the answering revision, selecting `rowid`.
     ids: &'a str,
-    /// Everything after the FROM clause's candidate source: the revision
-    /// join, `WHERE {candidates}` with the literal rule, ORDER BY and LIMIT.
-    rest: &'a str,
-    /// The positional parameter the MATCH expression binds to.
+    joins: &'a str,
+    name: &'a str,
+    id: &'a str,
+    query_parameter: usize,
+    limit_parameter: usize,
     match_parameter: usize,
 }
 
 impl Search<'_> {
-    /// The ranked `(a, b)` hits. Literal scan for an unrepresentable query.
-    /// Otherwise the name candidates, plus the ID scan's rows when the query
-    /// can match an ID, unless the shortcut below proves they can't matter.
     fn hits(
         &self,
         db: &Connection,
@@ -90,11 +83,25 @@ impl Search<'_> {
         let Some(expression) = match_expression(query) else {
             return ranked(db, &self.sql(self.source), values).map(unranked);
         };
-        // Decision 0013: whether the query can occur in an ID is decided from the
-        // query alone, before FTS5 runs.
         let id_shaped = can_match_an_id(query);
         let mut values = values.to_vec();
         values.push(&expression);
+        // Open FTS even on misses, so corruption never becomes an empty answer.
+        // Probe only one row beyond the requested result count, not all matches.
+        let probe_limit = limit.saturating_add(1);
+        let count: i64 = storage_result(db.query_row(
+            &format!(
+                "SELECT count(*) FROM (SELECT rowid FROM {names} WHERE {names} MATCH ?1 LIMIT ?2)",
+                names = self.names,
+            ),
+            rusqlite::params![expression, probe_limit],
+            |row| row.get(0),
+        ))?;
+        if limit > 0 && count > limit {
+            return self
+                .ordered_hits(db, query, limit, id_shaped, &values)
+                .map(unranked);
+        }
         let alias = self.source.rsplit(' ').next().unwrap_or_default();
         let table = self.source.split(' ').next().unwrap_or_default();
         let names = format!(
@@ -119,9 +126,146 @@ impl Search<'_> {
         ranked(db, &self.sql(&both), &values).map(unranked)
     }
 
-    fn sql(&self, from: &str) -> String {
-        format!("SELECT {} FROM {from} {}", self.columns, self.rest)
+    fn literal(&self) -> String {
+        format!(
+            "instr(lower({name}),lower(?{q}))>0 OR {id}",
+            name = self.name,
+            q = self.query_parameter,
+            id = self.id_match(),
+        )
     }
+
+    fn id_match(&self) -> String {
+        format!(
+            "instr('sid:v1:'||lower(hex({id})),lower(?{q}))>0",
+            id = self.id,
+            q = self.query_parameter,
+        )
+    }
+
+    fn sql(&self, from: &str) -> String {
+        format!(
+            "SELECT {columns} FROM {from} {joins} WHERE {literal}
+                ORDER BY 3,{name} COLLATE BINARY,{id} LIMIT ?{limit}",
+            columns = self.columns,
+            joins = self.joins,
+            literal = self.literal(),
+            name = self.name,
+            id = self.id,
+            limit = self.limit_parameter,
+        )
+    }
+
+    fn ordered_sql(&self, tier: i64, upper: bool, id_shaped: bool) -> String {
+        let table = self.source.split(' ').next().unwrap_or_default();
+        let alias = self.source.rsplit(' ').next().unwrap_or_default();
+        let name = self.name;
+        let q = self.query_parameter;
+        let membership = format!(
+            "EXISTS(SELECT 1 FROM {names} WHERE rowid={alias}.rowid AND {names} MATCH ?{p})",
+            names = self.names,
+            p = self.match_parameter,
+        );
+        let (index, predicate) = match tier {
+            0 => (
+                "folded",
+                format!("lower({name})=lower(?{q}) AND {membership}"),
+            ),
+            1 => {
+                let end = if upper {
+                    format!("AND lower({name}) < ?{}", self.match_parameter + 1)
+                } else {
+                    String::new()
+                };
+                (
+                    "folded",
+                    format!(
+                        "lower({name})>=lower(?{q}) {end}
+                     AND lower({name})<>lower(?{q}) AND instr(lower({name}),lower(?{q}))=1
+                     AND {membership}"
+                    ),
+                )
+            }
+            _ => {
+                // CASE, unlike NOT(prefix), also keeps unnamed ID-only hits.
+                let candidate = if id_shaped {
+                    format!(
+                        "((instr(lower({name}),lower(?{q}))>0 AND {membership}) OR {})",
+                        self.id_match()
+                    )
+                } else {
+                    format!("instr(lower({name}),lower(?{q}))>0 AND {membership}")
+                };
+                (
+                    "name",
+                    format!(
+                        "CASE WHEN lower({name})=lower(?{q}) THEN 0
+                     WHEN instr(lower({name}),lower(?{q}))=1 THEN 1 ELSE 2 END=2 AND {candidate}"
+                    ),
+                )
+            }
+        };
+        format!(
+            "SELECT {columns} FROM {source} INDEXED BY {table}_search_{index} {joins}
+             WHERE {predicate} ORDER BY {name} COLLATE BINARY,{id} LIMIT ?{limit}",
+            columns = self.columns,
+            source = self.source,
+            // Keep the ordered source outermost; sparse/literal queries retain
+            // their ordinary joins and SQLite's original planning freedom.
+            joins = self.joins.replace("JOIN ", "CROSS JOIN "),
+            id = self.id,
+            limit = self.limit_parameter,
+        )
+    }
+
+    fn ordered_hits(
+        &self,
+        db: &Connection,
+        query: &str,
+        limit: i64,
+        id_shaped: bool,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<(String, String, i64)>> {
+        let upper = prefix_end(&query.to_ascii_lowercase());
+        let mut hits = Vec::new();
+        for tier in 0..=2 {
+            let remaining = limit - hits.len() as i64;
+            if remaining <= 0 {
+                break;
+            }
+            #[cfg(test)]
+            if tier == 2 && id_shaped {
+                ID_SCANS.set(ID_SCANS.get() + 1);
+            }
+            let mut values = values.to_vec();
+            values[self.limit_parameter - 1] = &remaining;
+            if tier == 1 && upper.is_some() {
+                values.push(&upper);
+            }
+            hits.extend(ranked(
+                db,
+                &self.ordered_sql(tier, upper.is_some(), id_shaped),
+                &values,
+            )?);
+        }
+        Ok(hits)
+    }
+}
+
+/// Exclusive BINARY bound for valid UTF-8 strings starting with `prefix`.
+fn prefix_end(prefix: &str) -> Option<String> {
+    for (at, ch) in prefix.char_indices().rev() {
+        let mut next = u32::from(ch) + 1;
+        if next == 0xd800 {
+            next = 0xe000;
+        }
+        if let Some(ch) = char::from_u32(next) {
+            let mut end = prefix[..at].to_owned();
+            end.push(ch);
+            return Some(end);
+        }
+    }
+    None
 }
 
 /// The ID-scan shortcut. Not a fallback: it runs after the names query has
@@ -148,6 +292,10 @@ pub(super) fn w2_hits(
     query: &str,
     lookahead: i64,
 ) -> Result<Vec<(String, String)>> {
+    w2_search().hits(db, query, lookahead, &[&revision, &query, &lookahead])
+}
+
+fn w2_search() -> Search<'static> {
     Search {
         columns: "v.id,d.syntax_id,CASE WHEN lower(d.name)=lower(?2) THEN 0
             WHEN instr(lower(d.name),lower(?2))=1 THEN 1 ELSE 2 END",
@@ -156,13 +304,14 @@ pub(super) fn w2_hits(
         ids: "SELECT d.rowid FROM revision_documents m
             JOIN native_version_declarations d ON d.vid=m.vid
             WHERE m.revision_id=?1 AND instr('sid:v1:'||lower(hex(d.syntax_id)),lower(?2))>0",
-        rest: "JOIN revision_documents m ON m.vid=d.vid AND m.revision_id=?1
-            JOIN document_versions v ON v.vid=d.vid
-            WHERE instr(lower(d.name),lower(?2))>0 OR instr('sid:v1:'||lower(hex(d.syntax_id)),lower(?2))>0
-            ORDER BY 3, d.name COLLATE BINARY ASC, d.syntax_id ASC LIMIT ?3",
+        joins: "JOIN revision_documents m ON m.vid=d.vid AND m.revision_id=?1
+            JOIN document_versions v ON v.vid=d.vid",
+        name: "d.name",
+        id: "d.syntax_id",
+        query_parameter: 2,
+        limit_parameter: 3,
         match_parameter: 4,
     }
-    .hits(db, query, lookahead, &[&revision, &query, &lookahead])
 }
 
 /// The browser and CLI search's ranked `(path, id)` graph-node hits in
@@ -172,6 +321,10 @@ pub(super) fn graph_hits(
     query: &str,
     limit: i64,
 ) -> Result<Vec<(String, String)>> {
+    graph_search().hits(db, query, limit, &[&query, &limit])
+}
+
+fn graph_search() -> Search<'static> {
     Search {
         columns: "m.path,n.id,CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END",
         source: "graph_nodes n",
@@ -180,10 +333,13 @@ pub(super) fn graph_hits(
             JOIN graph_nodes n ON n.gid=m.gid
             WHERE m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1)
             AND instr('sid:v1:'||lower(hex(n.id)),lower(?1))>0",
-        rest: "JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.gid=n.gid WHERE instr(lower(n.name),lower(?1)) > 0 OR instr('sid:v1:'||lower(hex(n.id)),lower(?1)) > 0 ORDER BY 3,n.name,n.id LIMIT ?2",
+        joins: "JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.gid=n.gid",
+        name: "n.name",
+        id: "n.id",
+        query_parameter: 1,
+        limit_parameter: 2,
         match_parameter: 3,
     }
-    .hits(db, query, limit, &[&query, &limit])
 }
 
 /// Reconfirm FTS corruption only during exceptional recovery under exclusive
@@ -266,6 +422,206 @@ impl super::Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ranking_fixture() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE native_version_declarations(vid INTEGER,syntax_id BLOB,name TEXT);
+             CREATE INDEX native_version_declarations_search_name ON native_version_declarations(name COLLATE BINARY,syntax_id,vid);
+             CREATE INDEX native_version_declarations_search_folded ON native_version_declarations(lower(name),name COLLATE BINARY,syntax_id,vid);
+             CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT);
+             CREATE TABLE revision_documents(revision_id TEXT,vid INTEGER,gid INTEGER,path TEXT);
+             CREATE INDEX revision_documents_version ON revision_documents(vid,revision_id);
+             CREATE INDEX revision_documents_graph ON revision_documents(gid,revision_id);
+             CREATE TABLE index_metadata(singleton INTEGER,index_generation TEXT,index_revision INTEGER);
+             INSERT INTO index_metadata VALUES(1,'test',1);
+             INSERT INTO document_versions VALUES(1,'selected'),(2,'retained');
+             INSERT INTO revision_documents VALUES('pin:v1:test:1',1,1,'a.js');
+             CREATE TABLE graph_nodes(gid INTEGER,id BLOB,name TEXT);
+             CREATE INDEX graph_nodes_search_name ON graph_nodes(name COLLATE BINARY,id,gid);
+             CREATE INDEX graph_nodes_search_folded ON graph_nodes(lower(name),name COLLATE BINARY,id,gid);
+             CREATE VIRTUAL TABLE native_declaration_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
+             CREATE VIRTUAL TABLE graph_node_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');"
+        ).unwrap();
+        db
+    }
+
+    fn insert_ranked(db: &Connection, rowid: i64, owner: i64, name: Option<&str>) {
+        let id = super::super::id_codec::encode_sid(&format!("sid:v1:{rowid:032x}")).unwrap();
+        db.execute(
+            "INSERT INTO native_version_declarations(rowid,vid,syntax_id,name) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![rowid, owner, id, name],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO native_declaration_trigrams(rowid,name) VALUES(?1,lower(?2))",
+            rusqlite::params![rowid, name],
+        )
+        .unwrap();
+        if let Some(name) = name {
+            db.execute(
+                "INSERT INTO graph_nodes(rowid,gid,id,name) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![rowid, owner, id, name],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO graph_node_trigrams(rowid,name) VALUES(?1,lower(?2))",
+                rusqlite::params![rowid, name],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn ordered_tiers_equal_the_literal_rule_including_retained_and_unnamed_id_hits() {
+        let db = ranking_fixture();
+        for (at, name) in [
+            Some("OCA"),
+            Some("oca"),
+            Some("OCAz"),
+            Some("ocaa"),
+            Some("a_oca"),
+            Some("a_oca"),
+            Some("abc"),
+            Some("abcTail"),
+            Some("a_abc"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert_ranked(&db, at as i64 + 1, 1, name);
+        }
+        for at in 20..40 {
+            insert_ranked(&db, at, 2, Some("000_oca_abc"));
+        }
+        for query in [
+            "oca", "OCA", "abc", "sid:v1:", "000", "absent", "éab", "a\0b",
+        ] {
+            for limit in [0, 1, 2, 3, 5, 20] {
+                let actual = w2_hits(&db, "pin:v1:test:1", query, limit).unwrap();
+                let literal =
+                    with_literal_scan(|| w2_hits(&db, "pin:v1:test:1", query, limit)).unwrap();
+                assert_eq!(actual, literal, "W2 {query:?} {limit}");
+                if let Some(expression) = match_expression(query) {
+                    let values: Vec<&dyn rusqlite::ToSql> =
+                        vec![&"pin:v1:test:1", &query, &limit, &expression];
+                    let ordered = w2_search()
+                        .ordered_hits(&db, query, limit, can_match_an_id(query), &values)
+                        .unwrap();
+                    assert_eq!(unranked(ordered), literal, "ordered W2 {query:?} {limit}");
+                    let old_names = "(SELECT rowid AS r FROM native_declaration_trigrams
+                        WHERE native_declaration_trigrams MATCH ?4 UNION SELECT d.rowid
+                        FROM native_version_declarations d JOIN revision_documents m ON m.vid=d.vid
+                        WHERE m.revision_id=?1 AND instr('sid:v1:'||lower(hex(d.syntax_id)),lower(?2))>0) c
+                        CROSS JOIN native_version_declarations d ON d.rowid=c.r";
+                    let previous = ranked(&db, &w2_search().sql(old_names), &values).unwrap();
+                    assert_eq!(unranked(previous), literal, "old FTS W2 {query:?} {limit}");
+                }
+                let actual = graph_hits(&db, query, limit).unwrap();
+                let literal = with_literal_scan(|| graph_hits(&db, query, limit)).unwrap();
+                assert_eq!(actual, literal, "graph {query:?} {limit}");
+            }
+        }
+        for prefix in ["abc", "éab", "a\u{d7ff}", "a\u{10ffff}", "\u{10ffff}"] {
+            if let Some(end) = prefix_end(prefix) {
+                assert!(end.as_str() > prefix);
+                assert!(format!("{prefix}tail") < end);
+            } else {
+                assert_eq!(prefix, "\u{10ffff}");
+            }
+        }
+    }
+
+    #[test]
+    fn common_interior_rank_two_walk_stops_before_the_candidate_suffix() {
+        use rusqlite::StatementStatus;
+        let db = ranking_fixture();
+        for at in 1..=5 {
+            insert_ranked(&db, at, 2, Some(&format!("0_oca_{at}")));
+        }
+        // Raw-name winners deliberately have reverse rowids, not FTS order.
+        for at in 0..32 {
+            insert_ranked(&db, 100 - at, 1, Some(&format!("a_oca_{at:03}")));
+        }
+        let measure = |search: Search<'_>| {
+            let sql = search.ordered_sql(2, false, false);
+            let expression = match_expression("oca").unwrap();
+            let limit = 5_i64;
+            let revision = "pin:v1:test:1";
+            let mut values: Vec<&dyn rusqlite::ToSql> = vec![&"oca", &limit, &expression];
+            if search.query_parameter == 2 {
+                values.insert(0, &revision);
+            }
+            let plan: Vec<String> = db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(values.as_slice(), |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|p| p.contains("USING COVERING INDEX") && p.contains("_search_name")),
+                "{plan:?}"
+            );
+            // SQLite can flatten correlated EXISTS into a bounded FTS semi-join.
+            assert!(
+                plan.iter().any(|p| p.contains("CORRELATED SCALAR SUBQUERY")
+                    || p.contains("EXISTS VIRTUAL TABLE INDEX")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().any(|p| p.starts_with("SEARCH m USING ")
+                    && p.contains("INDEX revision_documents_")
+                    && p.contains("revision_id=?")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().any(|p| p.contains("VIRTUAL TABLE INDEX")
+                    && p.contains('=')
+                    && p.contains('M')),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|p| p.contains("TEMP B-TREE")
+                    || p.contains("MATERIALIZE")
+                    || p.contains("LIST SUBQUERY")),
+                "{plan:?}"
+            );
+            let mut statement = db.prepare(&sql).unwrap();
+            let rows: Vec<(String, Vec<u8>, i64)> = statement
+                .query_map(values.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(rows.len(), 5);
+            let ids: Vec<_> = rows
+                .iter()
+                .map(|(_, id, _)| super::super::id_codec::decode_sid(id).unwrap())
+                .collect();
+            assert_eq!(
+                ids,
+                (96..=100)
+                    .rev()
+                    .map(|id| format!("sid:v1:{id:032x}"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(rows.iter().all(|(_, _, rank)| *rank == 2));
+            assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+            let scans = statement.get_status(StatementStatus::FullscanStep);
+            assert!(scans < 20, "visited {scans} source rows: {plan:?}");
+            eprintln!("rank2 plan {plan:?}; source fullscan steps={scans}");
+            (rows, scans)
+        };
+        let native = measure(w2_search());
+        let graph = measure(graph_search());
+        for at in 1000..1500 {
+            insert_ranked(&db, at, 1, Some(&format!("z_oca_{at}")));
+        }
+        assert_eq!(measure(w2_search()), native);
+        assert_eq!(measure(graph_search()), graph);
+    }
 
     #[test]
     fn short_and_nul_queries_take_the_literal_scan() {

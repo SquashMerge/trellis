@@ -26,7 +26,7 @@
 
      So all-hex queries such as `f0001` or `add` are ID-shaped. Queries with any other letter or punctuation are not, for example `parseConfig`, `peerValue` or `f0001x`. Neither is anything longer than 39 characters.
    - **Candidates.** An ID-shaped query's candidates are the name-table matches plus the rows a covering scan of the ID column finds in the answering revision (`UNION`, so a row that matches through both its name and its ID appears once). Any other query's candidates are the name-table matches alone. That set is exact for it, because no ID can contain the query.
-4. **Verification.** Every candidate is still checked with W2's literal ASCII-`lower`/`instr` rule on the name **or** the ID, and ranked, tie-broken and limited by the same SQL as before. A query that matches through both a name and an ID therefore gets the literal scan's hits, order and LIMIT.
+4. **Verification.** Every candidate is still checked with W2's literal ASCII-`lower`/`instr` rule on the name **or** the ID, and ranked, tie-broken and limited by SQL with the same literal ordering and limits as before (not necessarily identical SQL text). A query that matches through both a name and an ID therefore gets the literal scan's hits, order and LIMIT.
 5. **The ID-scan shortcut, which is not a fallback.**
    - **When it applies.** The scan is skipped when the name candidates alone already give `LIMIT` hits (W2's `limit+1` lookahead; the browser's `limit`) and every one of them is an exact-name or name-prefix hit.
    - **Why the answer is unchanged.** A row only the ID scan adds matches through its ID alone. Its name neither equals nor starts with the query, so it ranks 2, after every rank-0 or rank-1 hit. The output order is rank first, so every such row would fall beyond the LIMIT.
@@ -38,6 +38,11 @@
 8. **Output.** W2's output stays byte-identical for every valid 1–256-byte query: the same hits, order, truncation and limits. Its 256-byte query limit is unchanged. The browser and CLI output stays byte-identical in the same way.
 
 ## Implementation notes
+
+- **Common substrings (#382):** a bounded FTS probe reads at most one candidate beyond the requested SQL result count (W2's lookahead, or the browser/CLI limit). When the probe exhausts within that count, the existing FTS-driven query remains in use. Otherwise, separate exact-name and name-prefix tiers run first; any remaining rank-2 hits come from a binary name/ID-ordered source walk with rowid-constrained FTS membership. The answering-revision join filters retained versions before a hit can fill the limit. ID-only hits still participate in rank 2, and later errors discard the whole answer. This changes execution, not literal matching, ordering, limits or truncation.
+  - Each source table has two covering search indexes: `(lower(name),name,id,owner)` for exact/prefix ranges, and `(name,id,owner)` for the rank-2 walk (`syntax_id`/`vid` on native declarations, `id`/`gid` on graph nodes). Folded and original name order are distinct; prefix hits still sort in original binary name order.
+  - The bounded probe is a cost heuristic, not proof of density in the answering revision. Sparse late matches and retained history can still select an expensive ordered walk; performance gates remain required.
+  - The added indexes advance the disposable index schema to 26. Existing indexes are rebuilt, not migrated; there is no compatibility path.
 
 - **Storage and maintenance:**
   - Both tables are contentless (`content=''`, `columnsize=0`) and keyed by the source row's `rowid`.
