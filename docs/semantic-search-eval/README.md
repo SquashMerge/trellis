@@ -1,10 +1,11 @@
 # Semantic search evaluation set
 
-Status: **proposed, not ratified**. This is the step 2 evaluation set for semantic symbol search
-([#211](https://github.com/SquashMerge/trellis/issues/211)). It measures retrieval quality and
-defines no product behavior. See
-[`../semantic-search-contract-proposal.md`](../semantic-search-contract-proposal.md) for the
-contract proposal.
+This directory preserves the historical #214 development set used by
+[#211](https://github.com/SquashMerge/trellis/issues/211), plus a separately pinned #389
+exact-name supplement. The sets measure retrieval quality and define no product behavior.
+[Decision 0018](../semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) records the
+ratified ranking and role-filter contract; the historical evaluation's proposed labels are
+not a competing product contract.
 
 ## Format
 
@@ -55,8 +56,11 @@ when the set is resolved.
 **Size and correlation.** 50 queries, 82 answer slots (73 distinct declarations), 24 source files. Several declarations
 answer more than one query (for example `q27`/`e8`, `e5`/`q43` and `q11`/`q34`), so the queries are
 correlated, not 50 independent trials. The `named` and `error` strata are intentionally easy:
-`named` mirrors identifiers, and `error` uses verbatim message text, so they measure literal
-lookup, not semantic paraphrase. **Report metrics per category, and inspect per-query misses.** An
+`named` mirrors identifier words, and `error` uses verbatim message text, so they measure
+lexically assisted lookup, not semantic paraphrase. **None of the 50 query strings equals an
+answer's measured declaration name.** The six historical named queries are prose, not exact
+identifier queries; they do not cover #389's raw-name rank-1 requirement.
+**Report metrics per category, and inspect per-query misses.** An
 overall number is not evidence of semantic retrieval; the `concept` stratum is.
 
 ## How the queries were written, and how restatement was avoided
@@ -129,7 +133,48 @@ Each method returns a ranked list of declarations, cut at depth 100. For query `
   answer is in the top 100.
 
 Report every metric for all queries and per category. List the queries missed at 10 for each
-method, so misses can be inspected.
+method, so misses can be inspected. Keep the historical 50-query denominator, `queries.json`,
+resolved commit/IDs, saved vectors, input hashes and receipts unchanged. Do not merge the
+supplement into those historical metrics or silently re-resolve the historical answers.
+
+## Separately pinned exact-name supplement (#389)
+
+[`exact-name-queries.json`](exact-name-queries.json) is a six-query supplement, not a revision
+of the historical 50. Its SHA-256 is
+`e097a948b727bc84037dc82031b61ccf63855221d93a2a1a9d69c4c1ab6a9789`.
+It includes raw `read_status_for` and `enqueue_request` snake_case queries, `renderSequence`
+camelCase, and the real same-name production/test `compile` alternatives, with `any`,
+`production` and `test` role requests. The two `compile` declarations share a production file;
+this exercises stored roles rather than path guesses. No kind preference is implied.
+
+The file has format `trellis-semantic-search-exact-name-eval/v1`, its own `resolvedAt`, and
+queries with `id`, `category:"exact_name"`, `shape`, raw `query`, effective `role`, `answers`
+and `expectedFirstRole`. Answers add measured `name` and `role` to the historical answer
+fields. `qualifiedName` joins only named measured ancestors, omitting unnamed impls; it is a
+resolution hint, not an identity or ranking input. Use the measured declaration IDs.
+
+Resolution is from the stopped private #379 native snapshot used in the #389 investigation:
+index generation `7cec6dda-27a5-4682-9268-0f5e2fd74b24`, revision 1, and native revision
+`revision:v2:8375127b5ad1671bedc462032712e74575a954a1a9af6cbf6891b2afde0328f8`.
+The supplement pins captured-source hashes for each selected file. `baseCommit` is #379's
+`49ca2fcccf0a82b801ae0761de314bccbc0512f4`, **not a claim that captured bytes equal that commit**:
+the capture may include uncommitted work, so `sourceCommit` is null. It is neither the original
+issue dogfood pin nor a new #389 capture. Current checkout declarations must be re-resolved at
+their own pin before reporting current-head results; do not copy these IDs as unmeasured labels.
+
+Report the supplement separately: top-1 answer success **with the required role**, exact-name
+group order (production before test for `any`), role-filter purity, and per-query old/new ranks,
+names, kinds, stored roles and `matchedBy`. Any-answer R@10 alone cannot establish the rank-1
+or same-name-role requirement. Report old/new metrics per `shape` and role, including every
+regression; the repeated `compile` requests are correlated checks, not independent trials.
+The historical concept/named/error/JavaScript metrics keep their original categories.
+
+No supplemental ranking run or query/card embedding receipt is implied by these labels.
+Historical saved query vectors do not cover these new strings, and historical card vectors
+do not establish current native-card quality. Untimed functional replay or correctness fixtures
+must identify their real inputs and distinguish lexical-only from hybrid results. Do not
+substitute the old BM25 candidate list for the amended lexical rule. New inference or timed
+measurements need a separate explicit plan.
 
 ## Running it
 

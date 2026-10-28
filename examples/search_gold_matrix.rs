@@ -1,5 +1,7 @@
 //! Corrected #214 relevance replay using saved CPU or Metal raw F32 output.
 //! No model loading, inference, network, latency or publication-performance claims.
+//! Legacy BM25/RRF replay only: saved rows lack measured name/role metadata,
+//! so the empty ranking policy does not validate the #389 amendment.
 //!
 //! Run once per backend with --backend cpu|metal --docs DOCS.jsonl
 //! --queries QUERIES.jsonl --lexical LEXICAL.json --output NEW_DIRECTORY.
@@ -392,8 +394,20 @@ fn main() -> Result<()> {
             .collect();
         let values = &queries[&query.id];
         cold_rankings.push((
-            rank_matrix(&matrix, &[], Some(values), &mut || Ok(()))?,
-            rank_matrix(&matrix, &lexical_keys, Some(values), &mut || Ok(()))?,
+            rank_matrix(
+                &matrix,
+                &[],
+                Some(values),
+                &trellis::search_rank::SearchPolicy::default(),
+                &mut || Ok(()),
+            )?,
+            rank_matrix(
+                &matrix,
+                &lexical_keys,
+                Some(values),
+                &trellis::search_rank::SearchPolicy::default(),
+                &mut || Ok(()),
+            )?,
         ));
     }
     // Two existing VIDs return with identical keys and hashes. One temporarily
@@ -501,6 +515,7 @@ fn main() -> Result<()> {
             Some(&snapshot),
             Some(&model_id),
             Some(values),
+            &trellis::search_rank::SearchPolicy::default(),
             &mut || Ok(()),
         )?;
         let baseline_hybrid = rank_snapshot(
@@ -509,10 +524,23 @@ fn main() -> Result<()> {
             Some(&snapshot),
             Some(&model_id),
             Some(values),
+            &trellis::search_rank::SearchPolicy::default(),
             &mut || Ok(()),
         )?;
-        let resident = rank_matrix(&matrix, &[], Some(values), &mut || Ok(()))?;
-        let resident_hybrid = rank_matrix(&matrix, &lexical_keys, Some(values), &mut || Ok(()))?;
+        let resident = rank_matrix(
+            &matrix,
+            &[],
+            Some(values),
+            &trellis::search_rank::SearchPolicy::default(),
+            &mut || Ok(()),
+        )?;
+        let resident_hybrid = rank_matrix(
+            &matrix,
+            &lexical_keys,
+            Some(values),
+            &trellis::search_rank::SearchPolicy::default(),
+            &mut || Ok(()),
+        )?;
         let oracle = ranking_json(&baseline);
         let fused = ranking_json(&baseline_hybrid);
         for (name, vector, hybrid) in [

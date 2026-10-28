@@ -109,7 +109,13 @@ fn two_document_edits_and_deletion_patch_exactly_without_retained_candidates() {
         .unwrap();
     assert_eq!(count, edited.len());
     let lexical = response
-        .mcp_search_lexical("orchard", second, count, &mut || Ok(()))
+        .mcp_search_lexical(
+            "orchard",
+            second,
+            count,
+            crate::search_rank::SearchRole::Any,
+            &mut || Ok(()),
+        )
         .unwrap();
     assert!(!lexical.is_empty());
     assert!(
@@ -118,7 +124,12 @@ fn two_document_edits_and_deletion_patch_exactly_without_retained_candidates() {
             .all(|key| edited.iter().any(|card| &card.key == key))
     );
     let combined = response
-        .mcp_search_candidates("orchard", Some(second), &mut || Ok(()))
+        .mcp_search_candidates(
+            "orchard",
+            Some(second),
+            crate::search_rank::SearchRole::Any,
+            &mut || Ok(()),
+        )
         .unwrap();
     assert_eq!(combined.pin, second);
     assert_eq!(combined.cards, edited.as_ref());
@@ -209,7 +220,13 @@ fn split_reads_reject_wrong_head_and_invalid_previous_pins() {
             .mcp_search_head_count(wrong, &mut || Ok(()))
             .unwrap_err(),
         response
-            .mcp_search_lexical("orchard", wrong, 2, &mut || Ok(()))
+            .mcp_search_lexical(
+                "orchard",
+                wrong,
+                2,
+                crate::search_rank::SearchRole::Any,
+                &mut || Ok(()),
+            )
             .unwrap_err(),
         response
             .mcp_search_head_delta(pin, wrong, &mut || Ok(()))
@@ -314,7 +331,13 @@ fn cancellation_preserves_original_type_and_discards_work_in_every_read() {
             .mcp_search_head_count(second, &mut stop_after(2))
             .unwrap_err(),
         response
-            .mcp_search_lexical("orchard", second, 3, &mut stop_after(2))
+            .mcp_search_lexical(
+                "orchard",
+                second,
+                3,
+                crate::search_rank::SearchRole::Any,
+                &mut stop_after(2),
+            )
             .unwrap_err(),
     ] {
         assert!(error.is::<Stopped>(), "{error:#}");
@@ -455,12 +478,24 @@ fn canonical_head_count_matches_eligible_cards_not_all_native_declarations() {
     let count = response.mcp_search_head_count(pin, &mut || Ok(())).unwrap();
     assert_eq!(count, cards.len());
     let lexical = response
-        .mcp_search_lexical("orchard", pin, count, &mut || Ok(()))
+        .mcp_search_lexical(
+            "orchard",
+            pin,
+            count,
+            crate::search_rank::SearchRole::Any,
+            &mut || Ok(()),
+        )
         .unwrap();
     assert!(!lexical.is_empty());
     assert!(
         response
-            .mcp_search_lexical("a", pin, count, &mut || Ok(()))
+            .mcp_search_lexical(
+                "a",
+                pin,
+                count,
+                crate::search_rank::SearchRole::Any,
+                &mut || Ok(())
+            )
             .unwrap()
             .is_empty()
     );
@@ -494,7 +529,13 @@ fn cold_count_detects_missing_and_extra_fts_rows_even_without_query_terms() {
         assert_eq!(count, expected, "the canonical count must not trust FTS");
         for query in ["orchard", "a"] {
             let error = response
-                .mcp_search_lexical(query, pin, count, &mut || Ok(()))
+                .mcp_search_lexical(
+                    query,
+                    pin,
+                    count,
+                    crate::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
                 .unwrap_err();
             assert!(error.is::<SelectedIntegrity>(), "{error:#}");
             assert!(!error.is::<SearchDeltaColdRebuild>());
@@ -528,7 +569,13 @@ fn lexical_required_corpus_faults_fail_even_without_query_terms() {
             }
         };
         let error = response
-            .mcp_search_lexical("a", pin, 2, &mut || Ok(()))
+            .mcp_search_lexical(
+                "a",
+                pin,
+                2,
+                crate::search_rank::SearchRole::Any,
+                &mut || Ok(()),
+            )
             .unwrap_err();
         if drop_table {
             assert!(error.is::<rusqlite::Error>(), "{error:#}");

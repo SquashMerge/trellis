@@ -7,6 +7,7 @@ pub struct SearchResult {
     pub symbols: crate::store::mcp_read::McpFindWithLines,
     pub matched_by: Vec<Vec<String>>,
     pub search_index: SearchIndexStatus,
+    pub role: crate::search_rank::SearchRole,
 }
 
 /// Search has a separate public default from the unchanged find-symbols tool.

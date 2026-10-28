@@ -17,6 +17,38 @@ pub struct SearchCandidateKey {
     pub syntax_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchRole {
+    #[default]
+    Any,
+    Production,
+    Test,
+}
+
+/// Measured declaration metadata selected from the same admitted index head.
+#[derive(Clone, Debug, Default)]
+pub struct SearchPolicy {
+    pub exact: BTreeMap<SearchCandidateKey, crate::native_evidence::DeclarationRole>,
+    pub allowed: Option<BTreeSet<SearchCandidateKey>>,
+}
+
+impl SearchPolicy {
+    pub fn accepts(&self, key: &SearchCandidateKey) -> bool {
+        self.allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(key))
+    }
+
+    pub fn exact_priority(&self, key: &SearchCandidateKey) -> u8 {
+        match self.exact.get(key) {
+            Some(crate::native_evidence::DeclarationRole::Production) => 0,
+            Some(crate::native_evidence::DeclarationRole::Test) => 1,
+            None => 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchCandidate {
     pub key: SearchCandidateKey,
@@ -120,6 +152,7 @@ impl Ord for VectorScore<'_> {
 
 struct RankingState<'a> {
     candidates: &'a [SearchCandidate],
+    policy: &'a SearchPolicy,
     fused: BTreeMap<SearchCandidateKey, RankedHit>,
     query_direction: Option<Vec<f32>>,
     vector_scores: BinaryHeap<VectorScore<'a>>,
@@ -131,6 +164,7 @@ impl<'a> RankingState<'a> {
         candidates: &'a [SearchCandidate],
         lexical: &[SearchCandidateKey],
         query: Option<&[i8]>,
+        policy: &'a SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<(Self, Vec<usize>)> {
         check()?;
@@ -146,7 +180,12 @@ impl<'a> RankingState<'a> {
             crate::store::SelectedIntegrity("store_unavailable: duplicate search candidate".into())
         );
         let mut fused = BTreeMap::new();
-        for (index, key) in lexical.iter().take(CANDIDATE_DEPTH).enumerate() {
+        for (index, key) in lexical
+            .iter()
+            .filter(|key| policy.accepts(key))
+            .take(CANDIDATE_DEPTH)
+            .enumerate()
+        {
             check()?;
             ensure!(
                 ordinals
@@ -175,6 +214,7 @@ impl<'a> RankingState<'a> {
         Ok((
             Self {
                 candidates,
+                policy,
                 fused,
                 query_direction: query.map(direction),
                 vector_scores: BinaryHeap::with_capacity(CANDIDATE_DEPTH),
@@ -192,6 +232,9 @@ impl<'a> RankingState<'a> {
     }
 
     fn offer_score(&mut self, ordinal: usize, cosine: f32) {
+        if !self.policy.accepts(&self.candidates[ordinal].key) {
+            return;
+        }
         let scored = VectorScore {
             key: &self.candidates[ordinal].key,
             cosine,
@@ -221,7 +264,12 @@ impl<'a> RankingState<'a> {
             hit.vector_rank = Some(index + 1);
         }
         let mut hits: Vec<_> = self.fused.into_values().collect();
-        hits.sort_by(compare_hits);
+        hits.sort_by(|a, b| {
+            self.policy
+                .exact_priority(&a.key)
+                .cmp(&self.policy.exact_priority(&b.key))
+                .then_with(|| compare_hits(a, b))
+        });
         check()?;
         Ok(SearchRanking {
             hits,
@@ -235,9 +283,10 @@ impl<'a> RankingState<'a> {
 pub(crate) fn rank_lexical(
     candidates: &[SearchCandidate],
     lexical: &[SearchCandidateKey],
+    policy: &SearchPolicy,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SearchRanking> {
-    let (state, _) = RankingState::new(candidates, lexical, None, check)?;
+    let (state, _) = RankingState::new(candidates, lexical, None, policy, check)?;
     state.finish(check)
 }
 
@@ -245,12 +294,18 @@ pub(crate) fn rank_lexical(
 /// read. Used when the optional vector arm exhausts its budget without a matrix.
 pub(crate) fn fuse_lexical(
     lexical: &[SearchCandidateKey],
+    policy: &SearchPolicy,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SearchRanking> {
     check()?;
     let mut seen = BTreeSet::new();
     let mut hits = Vec::with_capacity(lexical.len().min(CANDIDATE_DEPTH));
-    for (index, key) in lexical.iter().take(CANDIDATE_DEPTH).enumerate() {
+    for (index, key) in lexical
+        .iter()
+        .filter(|key| policy.accepts(key))
+        .take(CANDIDATE_DEPTH)
+        .enumerate()
+    {
         check()?;
         ensure!(
             seen.insert(key),
@@ -264,7 +319,12 @@ pub(crate) fn fuse_lexical(
             vector_rank: None,
         });
     }
-    hits.sort_by(compare_hits);
+    hits.sort_by(|a, b| {
+        policy
+            .exact_priority(&a.key)
+            .cmp(&policy.exact_priority(&b.key))
+            .then_with(|| compare_hits(a, b))
+    });
     check()?;
     Ok(SearchRanking { hits, embedded: 0 })
 }
@@ -277,10 +337,11 @@ pub fn rank_snapshot(
     snapshot: Option<&crate::search_vectors::VectorSnapshot<'_>>,
     model_id: Option<&str>,
     query: Option<&[i8]>,
+    policy: &SearchPolicy,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SearchRanking> {
     let _phase = crate::search_model::SearchPhaseTimer::start("ranking_total");
-    let (mut state, mut ordinals) = RankingState::new(candidates, lexical, query, check)?;
+    let (mut state, mut ordinals) = RankingState::new(candidates, lexical, query, policy, check)?;
     if let (Some(snapshot), Some(model_id)) = (snapshot, model_id) {
         ordinals.sort_unstable_by(|a, b| {
             candidates[*a]
@@ -1178,6 +1239,7 @@ pub fn rank_matrix(
     matrix: &SearchMatrix,
     lexical: &[SearchCandidateKey],
     query: Option<&[i8]>,
+    policy: &SearchPolicy,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<SearchRanking> {
     let _phase = crate::search_model::SearchPhaseTimer::start("ranking_total");
@@ -1187,7 +1249,12 @@ pub fn rank_matrix(
         crate::search_vectors::InvalidVector
     );
     let mut fused: Vec<MatrixFusedHit> = Vec::with_capacity(2 * CANDIDATE_DEPTH);
-    for (index, key) in lexical.iter().take(CANDIDATE_DEPTH).enumerate() {
+    for (index, key) in lexical
+        .iter()
+        .filter(|key| policy.accepts(key))
+        .take(CANDIDATE_DEPTH)
+        .enumerate()
+    {
         check()?;
         let row = matrix.ordinal(key).ok_or_else(|| {
             crate::store::SelectedIntegrity(
@@ -1206,11 +1273,36 @@ pub fn rank_matrix(
             vector_rank: None,
         });
     }
+    let allowed = if let Some(keys) = &policy.allowed {
+        let mut rows = BTreeSet::new();
+        for key in keys {
+            check()?;
+            if let Some(row) = matrix.ordinal(key) {
+                rows.insert(row);
+            }
+        }
+        Some(rows)
+    } else {
+        None
+    };
+    let mut exact = BTreeMap::new();
+    for key in policy.exact.keys() {
+        check()?;
+        if let Some(row) = matrix.ordinal(key) {
+            exact.insert(row, policy.exact_priority(key));
+        }
+    }
     let mut scores = BinaryHeap::with_capacity(CANDIDATE_DEPTH);
     if let Some(query) = query {
         let query = direction(query);
         let _scoring = crate::search_model::SearchPhaseTimer::start("vector_scoring");
         matrix.visit_direction(&query, check, &mut |ordinal, cosine| {
+            if allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&ordinal))
+            {
+                return Ok(());
+            }
             let scored = MatrixVectorScore {
                 row: ordinal as u32,
                 syntax_id: matrix.rows[ordinal].syntax_id,
@@ -1240,8 +1332,12 @@ pub fn rank_matrix(
         }
     }
     fused.sort_by(|a, b| {
-        b.score()
-            .total_cmp(&a.score())
+        exact
+            .get(&(a.row as usize))
+            .copied()
+            .unwrap_or(2)
+            .cmp(&exact.get(&(b.row as usize)).copied().unwrap_or(2))
+            .then_with(|| b.score().total_cmp(&a.score()))
             .then_with(|| {
                 a.lexical_rank
                     .into_iter()
@@ -1495,6 +1591,181 @@ mod tests {
     }
 
     #[test]
+    fn exact_names_precede_vector_winner_with_production_before_test() {
+        use crate::native_evidence::DeclarationRole;
+
+        let directory = tempfile::tempdir().unwrap();
+        let model = format!("{:064x}", 1);
+        let mut writer =
+            crate::search_vectors::VectorCacheWriter::open(&directory.path().join("vectors.db"))
+                .unwrap();
+        let cards: Vec<_> = (0..5).map(|index| candidate(index, index)).collect();
+        let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
+        writer
+            .put(&model, &cards[0].card_hash, &vector(1, 0))
+            .unwrap();
+        matrix.insert(0, &vector(1, 0)).unwrap();
+        let lexical = [2, 4, 1, 3].map(|ordinal| cards[ordinal].key.clone());
+        let policy = SearchPolicy {
+            exact: BTreeMap::from([
+                (cards[1].key.clone(), DeclarationRole::Test),
+                (cards[2].key.clone(), DeclarationRole::Production),
+                (cards[4].key.clone(), DeclarationRole::Production),
+            ]),
+            allowed: None,
+        };
+        let query = vector(1, 0);
+        let snapshot = writer.snapshot().unwrap();
+        let ranked = rank_snapshot(
+            &cards,
+            &lexical,
+            Some(&snapshot),
+            Some(&model),
+            Some(&query),
+            &policy,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let resident =
+            rank_matrix(&matrix, &lexical, Some(&query), &policy, &mut || Ok(())).unwrap();
+        assert_eq!(ranked.hits, resident.hits);
+        assert_eq!(ranked.embedded, 1);
+        assert_eq!(resident.embedded, ranked.embedded);
+        assert_eq!(
+            ranked
+                .hits
+                .iter()
+                .take(3)
+                .map(|hit| &hit.key)
+                .collect::<Vec<_>>(),
+            [&cards[2].key, &cards[4].key, &cards[1].key]
+        );
+        assert!(
+            ranked
+                .hits
+                .iter()
+                .take(3)
+                .all(|hit| hit.lexical_rank.is_some())
+        );
+        let baseline = rank_matrix(
+            &matrix,
+            &lexical,
+            Some(&query),
+            &SearchPolicy::default(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(baseline.hits[0].key, cards[0].key);
+        let nonexact = |ranking: SearchRanking| {
+            ranking
+                .hits
+                .into_iter()
+                .filter(|hit| policy.exact_priority(&hit.key) == 2)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(nonexact(ranked), nonexact(baseline));
+    }
+
+    #[test]
+    fn role_filter_refills_vector_depth_and_keeps_whole_head_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = format!("{:064x}", 1);
+        let mut writer =
+            crate::search_vectors::VectorCacheWriter::open(&directory.path().join("vectors.db"))
+                .unwrap();
+        let cards: Vec<_> = (0..2 * CANDIDATE_DEPTH + 1)
+            .map(|index| candidate(index, 0))
+            .collect();
+        let query = vector(1, 0);
+        writer.put(&model, &cards[0].card_hash, &query).unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
+        for ordinal in 0..cards.len() {
+            matrix.insert(ordinal, &query).unwrap();
+        }
+        let policy = SearchPolicy {
+            exact: BTreeMap::new(),
+            allowed: Some(
+                cards
+                    .iter()
+                    .skip(CANDIDATE_DEPTH)
+                    .map(|card| card.key.clone())
+                    .collect(),
+            ),
+        };
+        let ranked = rank_snapshot(
+            &cards,
+            &[],
+            Some(&snapshot),
+            Some(&model),
+            Some(&query),
+            &policy,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let resident = rank_matrix(&matrix, &[], Some(&query), &policy, &mut || Ok(())).unwrap();
+        assert_eq!(ranked.hits, resident.hits);
+        assert_eq!(ranked.hits.len(), CANDIDATE_DEPTH);
+        assert_eq!(ranked.embedded, cards.len() as u64);
+        assert_eq!(resident.embedded, ranked.embedded);
+        for (index, hit) in ranked.hits.iter().enumerate() {
+            assert_eq!(hit.key, cards[CANDIDATE_DEPTH + index].key);
+            assert_eq!(hit.vector_rank, Some(index + 1));
+            assert_eq!(hit.lexical_rank, None);
+        }
+        let empty_policy = SearchPolicy {
+            allowed: Some(BTreeSet::new()),
+            ..SearchPolicy::default()
+        };
+        let empty = rank_matrix(&matrix, &[], Some(&query), &empty_policy, &mut || Ok(())).unwrap();
+        assert!(empty.hits.is_empty());
+        assert_eq!(empty.embedded, cards.len() as u64);
+        let empty_snapshot = rank_snapshot(
+            &cards,
+            &[],
+            Some(&snapshot),
+            Some(&model),
+            Some(&query),
+            &empty_policy,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(empty_snapshot.hits.is_empty());
+        assert_eq!(empty_snapshot.embedded, empty.embedded);
+    }
+
+    #[test]
+    fn lexical_only_preserves_measured_role_order_and_filters_before_ranks() {
+        use crate::native_evidence::DeclarationRole;
+
+        let cards: Vec<_> = (0..3).map(|index| candidate(index, index)).collect();
+        // The store supplies exact production, other production, then test.
+        // SID order alone would put the test first.
+        let lexical = [2, 1, 0].map(|ordinal| cards[ordinal].key.clone());
+        let mut policy = SearchPolicy {
+            exact: BTreeMap::from([(cards[2].key.clone(), DeclarationRole::Production)]),
+            allowed: None,
+        };
+        let ranked = rank_lexical(&cards, &lexical, &policy, &mut || Ok(())).unwrap();
+        assert_eq!(
+            ranked.hits.iter().map(|hit| &hit.key).collect::<Vec<_>>(),
+            lexical.iter().collect::<Vec<_>>()
+        );
+        let fallback = fuse_lexical(&lexical, &policy, &mut || Ok(())).unwrap();
+        assert_eq!(fallback.hits, ranked.hits);
+        policy.allowed = Some([cards[2].key.clone(), cards[0].key.clone()].into());
+        let filtered = rank_lexical(&cards, &lexical, &policy, &mut || Ok(())).unwrap();
+        let fallback = fuse_lexical(&lexical, &policy, &mut || Ok(())).unwrap();
+        assert_eq!(fallback.hits, filtered.hits);
+        assert_eq!(filtered.hits.len(), 2);
+        assert_eq!(filtered.hits[0].key, cards[2].key);
+        assert_eq!(filtered.hits[0].lexical_rank, Some(1));
+        assert_eq!(filtered.hits[1].key, cards[0].key);
+        assert_eq!(filtered.hits[1].lexical_rank, Some(2));
+        assert_eq!(filtered.embedded, 0);
+    }
+
+    #[test]
     fn resident_capacity_matches_estimate_with_missing_and_complete_vectors() {
         assert_eq!(std::mem::size_of::<MatrixRow>(), 56);
         for count in [1, 16, 17, 257, 1024] {
@@ -1563,7 +1834,14 @@ mod tests {
             &mut || Ok(()),
         )
         .unwrap();
-        let actual = rank_matrix(&matrix, &lexical, Some(&values), &mut || Ok(())).unwrap();
+        let actual = rank_matrix(
+            &matrix,
+            &lexical,
+            Some(&values),
+            &SearchPolicy::default(),
+            &mut || Ok(()),
+        )
+        .unwrap();
         assert_eq!(actual.embedded, expected.embedded);
         assert_eq!(actual.hits, expected.hits);
     }
@@ -1692,7 +1970,7 @@ mod tests {
         let keys: Vec<_> = (0..CANDIDATE_DEPTH + 1)
             .map(|index| candidate(index, index).key)
             .collect();
-        let ranking = fuse_lexical(&keys, &mut || Ok(())).unwrap();
+        let ranking = fuse_lexical(&keys, &SearchPolicy::default(), &mut || Ok(())).unwrap();
         assert_eq!(ranking.embedded, 0);
         assert_eq!(ranking.hits.len(), CANDIDATE_DEPTH);
         for (index, hit) in ranking.hits.iter().enumerate() {
@@ -1701,11 +1979,20 @@ mod tests {
             assert_eq!(hit.vector_rank, None);
         }
         assert!(
-            fuse_lexical(&[keys[0].clone(), keys[0].clone()], &mut || Ok(()))
-                .unwrap_err()
-                .is::<crate::store::SelectedIntegrity>()
+            fuse_lexical(
+                &[keys[0].clone(), keys[0].clone()],
+                &SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .is::<crate::store::SelectedIntegrity>()
         );
-        assert!(fuse_lexical(&keys, &mut || anyhow::bail!("cancelled")).is_err());
+        assert!(
+            fuse_lexical(&keys, &SearchPolicy::default(), &mut || anyhow::bail!(
+                "cancelled"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1802,6 +2089,7 @@ mod tests {
             &matrix,
             std::slice::from_ref(&cards[2].key),
             Some(&vector(1, 1)),
+            &SearchPolicy::default(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -1892,19 +2180,37 @@ mod tests {
         let card = candidate(0, 0);
         let matrix = SearchMatrix::new([card.clone()].into(), &mut || Ok(())).unwrap();
         assert!(
-            rank_matrix(&matrix, &[], Some(&[1]), &mut || Ok(()))
-                .unwrap_err()
-                .is::<crate::search_vectors::InvalidVector>()
+            rank_matrix(
+                &matrix,
+                &[],
+                Some(&[1]),
+                &SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .is::<crate::search_vectors::InvalidVector>()
         );
         assert!(
-            rank_matrix(&matrix, &[candidate(1, 1).key], None, &mut || Ok(()))
-                .unwrap_err()
-                .is::<crate::store::SelectedIntegrity>()
+            rank_matrix(
+                &matrix,
+                &[candidate(1, 1).key],
+                None,
+                &SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .is::<crate::store::SelectedIntegrity>()
         );
         assert!(
-            rank_matrix(&matrix, &[card.key.clone(), card.key], None, &mut || Ok(()))
-                .unwrap_err()
-                .is::<crate::store::SelectedIntegrity>()
+            rank_matrix(
+                &matrix,
+                &[card.key.clone(), card.key],
+                None,
+                &SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .is::<crate::store::SelectedIntegrity>()
         );
     }
 
@@ -1917,7 +2223,14 @@ mod tests {
         for ordinal in 0..cards.len() {
             matrix.insert(ordinal, &vector(1, 2)).unwrap();
         }
-        let ranking = rank_matrix(&matrix, &[], Some(&vector(1, 2)), &mut || Ok(())).unwrap();
+        let ranking = rank_matrix(
+            &matrix,
+            &[],
+            Some(&vector(1, 2)),
+            &SearchPolicy::default(),
+            &mut || Ok(()),
+        )
+        .unwrap();
         assert_eq!(ranking.hits.len(), CANDIDATE_DEPTH);
         assert_eq!(ranking.embedded, cards.len() as u64);
         for (index, hit) in ranking.hits.iter().enumerate() {
@@ -1947,7 +2260,14 @@ mod tests {
                 }
             }
         }
-        let ranking = rank_matrix(&matrix, &[], Some(&vector(1, 3)), &mut || Ok(())).unwrap();
+        let ranking = rank_matrix(
+            &matrix,
+            &[],
+            Some(&vector(1, 3)),
+            &SearchPolicy::default(),
+            &mut || Ok(()),
+        )
+        .unwrap();
         assert_eq!(ranking.embedded, 19);
         assert_eq!(ranking.hits.len(), 19);
     }
@@ -1995,12 +2315,17 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             Some(&query),
+            &SearchPolicy::default(),
             &mut || Ok(()),
         )
         .unwrap();
         assert_eq!(actual.embedded, candidates.len() as u64);
         assert_eq!(actual.hits, expected.hits);
-        let lexical_only = rank_lexical(&candidates, &lexical, &mut || Ok(())).unwrap();
+        let lexical_only =
+            rank_lexical(&candidates, &lexical, &SearchPolicy::default(), &mut || {
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(lexical_only.embedded, 0);
         assert_eq!(lexical_only.hits.len(), lexical.len());
         assert!(
@@ -2015,6 +2340,7 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             None,
+            &SearchPolicy::default(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -2034,6 +2360,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &SearchPolicy::default(),
                 &mut || Ok(()),
             )
             .unwrap_err()
@@ -2043,24 +2370,44 @@ mod tests {
             rank_lexical(
                 std::slice::from_ref(&candidate),
                 &[candidate.key.clone(), candidate.key.clone()],
+                &SearchPolicy::default(),
                 &mut || Ok(()),
             )
             .unwrap_err()
             .is::<crate::store::SelectedIntegrity>()
         );
         assert!(
-            rank_lexical(&[], std::slice::from_ref(&candidate.key), &mut || Ok(()))
-                .unwrap_err()
-                .is::<crate::store::SelectedIntegrity>()
+            rank_lexical(
+                &[],
+                std::slice::from_ref(&candidate.key),
+                &SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .is::<crate::store::SelectedIntegrity>()
         );
         assert!(
-            rank_snapshot(&[], &[], None, None, Some(&[1]), &mut || Ok(()))
-                .unwrap_err()
-                .is::<crate::search_vectors::InvalidVector>()
+            rank_snapshot(
+                &[],
+                &[],
+                None,
+                None,
+                Some(&[1]),
+                &SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .is::<crate::search_vectors::InvalidVector>()
         );
-        let error = rank_snapshot(&[], &[], None, None, None, &mut || {
-            Err(crate::store::topology::StorageBusy.into())
-        })
+        let error = rank_snapshot(
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &SearchPolicy::default(),
+            &mut || Err(crate::store::topology::StorageBusy.into()),
+        )
         .unwrap_err();
         assert!(error.is::<crate::store::topology::StorageBusy>());
     }

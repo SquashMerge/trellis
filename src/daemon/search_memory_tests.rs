@@ -124,7 +124,15 @@ fn pressure_evicts_the_least_recently_queried_head_not_the_last_registered() {
     b.head.resident().unwrap();
     // Rank, rather than registration or vector filling, makes A most recent.
     a.head
-        .rank(pin(1), "model", 1, &[], None, &mut || Ok(()))
+        .rank(
+            pin(1),
+            "model",
+            1,
+            &[],
+            None,
+            &crate::search_rank::SearchPolicy::default(),
+            &mut || Ok(()),
+        )
         .unwrap();
     build(&c.head, 3, 1).unwrap();
     assert!(a.head.resident().unwrap());
@@ -366,6 +374,7 @@ fn exact_cold_limit_keeps_fill_allowance_and_completes_without_another_query() {
             service.cache_epoch(),
             &[],
             None,
+            &crate::search_rank::SearchPolicy::default(),
             &mut || Ok(()),
         )
         .unwrap()
@@ -585,6 +594,7 @@ fn local_delta_keeps_resident_matrix_without_full_head_enumeration() {
             service.cache_epoch(),
             &[],
             None,
+            &crate::search_rank::SearchPolicy::default(),
             &mut || Ok(()),
         )
         .unwrap()

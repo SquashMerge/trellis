@@ -716,6 +716,7 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             Some(&vector),
+            &crate::search_rank::SearchPolicy::default(),
             &mut || {
                 checks.set(checks.get() + 1);
                 Ok(())
@@ -741,6 +742,7 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             Some(&vector),
+            &crate::search_rank::SearchPolicy::default(),
             &mut || {
                 checks.set(checks.get() + 1);
                 if checks.get() == final_check {

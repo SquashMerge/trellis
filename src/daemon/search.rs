@@ -1648,6 +1648,7 @@ mod tests {
                     service.cache_epoch(),
                     &[],
                     Some(&[1; DIMENSIONS]),
+                    &crate::search_rank::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap()
@@ -1704,6 +1705,7 @@ mod tests {
                     service.cache_epoch(),
                     &[],
                     Some(&[1; DIMENSIONS]),
+                    &crate::search_rank::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap()

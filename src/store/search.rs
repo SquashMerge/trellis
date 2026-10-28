@@ -255,6 +255,15 @@ fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::Searc
     })
 }
 
+fn search_role_filter(role: crate::search_rank::SearchRole) -> Option<&'static str> {
+    use crate::search_rank::SearchRole;
+    match role {
+        SearchRole::Any => None,
+        SearchRole::Production => Some("production"),
+        SearchRole::Test => Some("test"),
+    }
+}
+
 fn search_head_count(db: &Connection) -> Result<usize> {
     let count: i64 = db.query_row("SELECT count(*) FROM head_search_fts", [], |row| row.get(0))?;
     usize::try_from(count).context(SelectedIntegrity(
@@ -570,43 +579,133 @@ impl EvidenceResponse {
         })
     }
 
-    /// Rank the lexical arm at the admitted pin without reloading candidates.
-    /// Even a termless query validates the required corpus against the caller's
-    /// complete head membership count. Errors never yield a partial arm.
+    /// Query-specific metadata from this admitted head, without loading source
+    /// or card text. The vector arm uses allowed keys before its depth cutoff.
+    pub fn mcp_search_policy(
+        &self,
+        query: &str,
+        expected: IndexPin,
+        role: crate::search_rank::SearchRole,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<crate::search_rank::SearchPolicy> {
+        self.search_read(check, |check| {
+            let selected = self.store.read_revision_for(&self.db, None, true)?;
+            ensure!(
+                selected.pin == expected,
+                "revision conflict: expected basis differs from admitted head"
+            );
+            let role = search_role_filter(role);
+            let mut policy = crate::search_rank::SearchPolicy {
+                exact: BTreeMap::new(),
+                allowed: role.map(|_| BTreeSet::new()),
+            };
+            let mut statement = self.db.prepare(
+                "SELECT c.vid,c.syntax_id,d.role,d.name=?2 COLLATE BINARY
+                 FROM native_version_search_cards c
+                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                 JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id
+                 WHERE (?3 IS NULL OR d.role=?3)
+                   AND (?3 IS NOT NULL OR d.name=?2 COLLATE BINARY)",
+            )?;
+            let mut rows = statement.query(params![selected.key, query, role])?;
+            while let Some(row) = rows.next()? {
+                check()?;
+                let key = crate::search_rank::SearchCandidateKey {
+                    version_id: row.get(0)?,
+                    syntax_id: stored_id_row(row, 1, false)?,
+                };
+                let stored_role: String = row.get(2)?;
+                let stored_role =
+                    crate::native_evidence::DeclarationRole::from_stored(&stored_role)
+                        .map_err(|error| SelectedIntegrity(error.to_string()))?;
+                if row.get::<_, Option<bool>>(3)?.unwrap_or(false) {
+                    policy.exact.insert(key.clone(), stored_role);
+                }
+                if let Some(allowed) = &mut policy.allowed {
+                    allowed.insert(key);
+                }
+            }
+            Ok(policy)
+        })
+    }
+
+    /// Rank lexical and additive exact-name candidates at the admitted pin.
+    /// The role filter and exact/production tiers precede the depth cutoff.
+    /// Even termless queries validate the complete required head corpus.
     pub fn mcp_search_lexical(
         &self,
         query: &str,
         expected: IndexPin,
         expected_cards: usize,
+        role: crate::search_rank::SearchRole,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<crate::search_rank::SearchCandidateKey>> {
         use crate::search_rank::{CANDIDATE_DEPTH, SearchCandidateKey};
         self.search_read(check, |check| {
             let selected = self.store.read_revision_for(&self.db, None, true)?;
-            ensure!(selected.pin == expected,
-                "revision conflict: expected basis differs from admitted head");
-            // Even a termless query must read the required head corpus. Schema,
-            // stepping and I/O errors never become lexical-only best effort.
-            ensure!(search_head_count(&self.db)? == expected_cards,
-                SelectedIntegrity("store_unavailable: head search corpus mismatch".into()));
+            ensure!(
+                selected.pin == expected,
+                "revision conflict: expected basis differs from admitted head"
+            );
+            ensure!(
+                search_head_count(&self.db)? == expected_cards,
+                SelectedIntegrity("store_unavailable: head search corpus mismatch".into())
+            );
             let _phase = crate::search_model::SearchPhaseTimer::start("lexical_search");
+            let expression = crate::search_lexical::query_expression(&self.db, query)?;
+            let matched = if expression.is_some() {
+                "SELECT vid,syntax_id,bm25(head_search_fts) AS score
+                 FROM head_search_fts WHERE head_search_fts MATCH ?4"
+            } else {
+                "SELECT vid,syntax_id,CAST(NULL AS REAL) AS score
+                 FROM head_search_fts WHERE 0 AND ?4 IS NULL"
+            };
+            let sql = format!(
+                "WITH matched AS MATERIALIZED ({matched}),
+                 candidates AS (
+                   SELECT vid,syntax_id,score FROM matched
+                   UNION ALL
+                   SELECT c.vid,c.syntax_id,NULL FROM native_version_search_cards c
+                   JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                   JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id
+                   WHERE d.name=?2 COLLATE BINARY AND NOT EXISTS
+                     (SELECT 1 FROM matched f WHERE f.vid=c.vid AND f.syntax_id=c.syntax_id)
+                 )
+                 SELECT f.vid,f.syntax_id,f.score,d.role
+                 FROM candidates f
+                 JOIN native_version_search_cards c ON c.vid=f.vid AND c.syntax_id=f.syntax_id
+                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
+                 JOIN native_version_declarations d ON d.vid=f.vid AND d.syntax_id=f.syntax_id
+                 WHERE ?3 IS NULL OR d.role=?3
+                 ORDER BY (d.name=?2 COLLATE BINARY) DESC,
+                          CASE d.role WHEN 'production' THEN 0 ELSE 1 END,
+                          f.score IS NULL,f.score,f.syntax_id
+                 LIMIT ?5"
+            );
+            let mut statement = self.db.prepare(&sql)?;
+            let mut rows = statement.query(params![
+                selected.key,
+                query,
+                search_role_filter(role),
+                expression,
+                CANDIDATE_DEPTH as i64
+            ])?;
             let mut lexical = Vec::new();
-            if let Some(expression) = crate::search_lexical::query_expression(&self.db, query)? {
-                let mut statement = self.db.prepare(
-                    "SELECT head_search_fts.vid,head_search_fts.syntax_id,bm25(head_search_fts)
-                     FROM head_search_fts
-                     CROSS JOIN native_version_search_cards c ON c.vid=head_search_fts.vid AND c.syntax_id=head_search_fts.syntax_id
-                     CROSS JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
-                     WHERE head_search_fts MATCH ?2
-                     ORDER BY bm25(head_search_fts),head_search_fts.syntax_id LIMIT ?3"
-                )?;
-                let mut rows = statement.query(params![selected.key, expression, CANDIDATE_DEPTH as i64])?;
-                while let Some(row) = rows.next()? {
-                    check()?;
-                    let score: f64 = row.get(2)?;
-                    ensure!(score.is_finite(), SelectedIntegrity("store_unavailable: invalid lexical score".into()));
-                    lexical.push(SearchCandidateKey { version_id: row.get(0)?, syntax_id: stored_id_row(row,1,false)? });
+            while let Some(row) = rows.next()? {
+                check()?;
+                if let Some(score) = row.get::<_, Option<f64>>(2)? {
+                    ensure!(
+                        score.is_finite(),
+                        SelectedIntegrity("store_unavailable: invalid lexical score".into())
+                    );
                 }
+                let stored_role: String = row.get(3)?;
+                crate::native_evidence::DeclarationRole::from_stored(&stored_role)
+                    .map_err(|error| SelectedIntegrity(error.to_string()))?;
+                lexical.push(SearchCandidateKey {
+                    version_id: row.get(0)?,
+                    syntax_id: stored_id_row(row, 1, false)?,
+                });
             }
             Ok(lexical)
         })
@@ -617,10 +716,11 @@ impl EvidenceResponse {
         &self,
         query: &str,
         expected: Option<IndexPin>,
+        role: crate::search_rank::SearchRole,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<McpSearchCandidates> {
         let (pin, cards) = self.mcp_search_head(expected, check)?;
-        let lexical = self.mcp_search_lexical(query, pin, cards.len(), check)?;
+        let lexical = self.mcp_search_lexical(query, pin, cards.len(), role, check)?;
         Ok(McpSearchCandidates {
             pin,
             cards: cards.to_vec(),
