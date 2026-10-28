@@ -36,7 +36,10 @@ content-addressed vectors remain useful. A prefetch read fault drains already
 submitted writes and stays typed. A changed-head read retains committed progress;
 a later existing hint reconciles the new head. Captured old-head work may finish
 if its final read preceded the head change. It cannot falsely complete the new
-pin.
+pin. Head-change notification is read-ahead bounded, not immediate: the owner
+may finish its current prepared window, the one queued window, and the reader's
+in-progress window before observing `SearchHeadChanged` (at most three 512-card
+windows of captured old-head work). Queries still run between forward slices.
 
 ## Query wait
 
@@ -92,8 +95,10 @@ Evidence directory: `~/projects/odin/trellis-evidence/issue-355/`.
   with early `workspace_selection_failed/unavailable` responses. No rerun.
   See local `full-verify-01-result.json` and the PR for current status.
 
-`semantic_search_parity --document-batch-shape bucketed` uses the production
-prepared-reference path, 512-input windows, and original-order output. Its shape
+`semantic_search_parity --document-batch-shape bucketed` calls the production
+`prepare_windows` and slice selector through a test-support adapter, then uses
+prepared-reference inference and restores original order. It admits 512-input
+windows without measuring pipeline overlap. Its shape
 receipts identify actual row/token counts. Default `serial` remains the old
 16-input control. The diagnostic does not measure pipeline overlap or prove
 query latency. Do not substitute historical saved-vector replay for inference

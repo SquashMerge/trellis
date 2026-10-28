@@ -45,13 +45,20 @@ fn pin() -> IndexPin {
 }
 fn tokenizer() -> DocumentTokenizer {
     use tokenizers::{Tokenizer, TruncationParams};
+    let mut vocab = serde_json::Map::from_iter([
+        ("[UNK]".into(), serde_json::json!(0)),
+        ("a".into(), serde_json::json!(1)),
+    ]);
+    for index in 0..256 {
+        vocab.insert(format!("card{index}"), serde_json::json!(index + 2));
+    }
     let mut tokenizer = Tokenizer::from_bytes(
         serde_json::to_vec(&serde_json::json!({
             "version": "1.0", "truncation": null, "padding": null,
             "added_tokens": [], "normalizer": null,
             "pre_tokenizer": {"type": "Whitespace"},
             "post_processor": null, "decoder": null,
-            "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "a": 1}, "unk_token": "[UNK]"}
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"}
         }))
         .unwrap(),
     )
@@ -63,6 +70,17 @@ fn tokenizer() -> DocumentTokenizer {
         }))
         .unwrap();
     DocumentTokenizer::from_tokenizer(&tokenizer)
+}
+fn document_vector(document: &PreparedDocument) -> Vec<i8> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for id in document.token_ids_for_tests() {
+        digest.update(id.to_le_bytes());
+    }
+    let digest = digest.finalize();
+    (0..DIMENSIONS)
+        .map(|index| (digest[index % digest.len()] % 127 + 1) as i8)
+        .collect()
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
@@ -121,8 +139,8 @@ impl SearchEmbedder for RecordingModel {
         control.check()?;
         Ok(documents
             .iter()
-            .map(|_| QuantizedVector {
-                values: vec![1; DIMENSIONS],
+            .map(|document| QuantizedVector {
+                values: document_vector(document),
             })
             .collect())
     }
@@ -245,10 +263,47 @@ fn query(service: Arc<SearchService>, text: &'static str) -> std::thread::JoinHa
 #[test]
 fn prepared_windows_sort_real_prompted_lengths_and_use_128_document_slices() {
     let harness = harness(None);
-    let source = Arc::new(pages(256, true));
-    let (worker, result) = run(harness.service, source, Arc::new(AtomicBool::new(false)));
+    let mut source = pages(256, true);
+    for (index, card) in source.cards.iter_mut().enumerate() {
+        card.card_text.push_str(&format!("card{index}"));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let expected = source
+        .cards
+        .iter()
+        .map(|card| {
+            let prepared = tokenizer()
+                .prepare(
+                    std::slice::from_ref(&card.card_text),
+                    &EmbeddingControl::new(&cancel),
+                )
+                .unwrap();
+            (card.card_hash.clone(), document_vector(&prepared[0]))
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(expected[0].1, expected[1].1);
+    assert_ne!(
+        expected[0].1, expected[2].1,
+        "same-length texts must differ too"
+    );
+    let (worker, result) = run(harness.service.clone(), Arc::new(source), cancel);
     receive(&result).unwrap();
     worker.join().unwrap();
+    harness
+        .service
+        .with_vector_snapshot(|snapshot| {
+            let snapshot = snapshot.expect("completed fill cache");
+            let model_id = model_id_for_card_format(CardFormat::V1.as_str());
+            for (hash, vector) in &expected {
+                assert_eq!(
+                    snapshot.get(&model_id, hash)?.as_ref(),
+                    Some(vector),
+                    "hash {hash}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
     let calls = harness.calls.lock().unwrap();
     let lengths = calls
         .iter()
@@ -271,6 +326,56 @@ fn prepared_windows_sort_real_prompted_lengths_and_use_128_document_slices() {
         assert!(lengths.len() <= DOCUMENT_BATCH_MAX);
         assert!(lengths.len() * lengths.iter().max().unwrap() <= DOCUMENT_BATCH_TOKEN_WORK_MAX);
     }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn parity_preparation_uses_production_hash_order_and_slice_bounds() {
+    let texts = (0..TOKEN_WINDOW + 1)
+        .map(|index| {
+            format!(
+                "{}card{}",
+                "a ".repeat(if index % 2 == 0 { 100 } else { 1 }),
+                index % 256
+            )
+        })
+        .collect::<Vec<_>>();
+    let cancel = AtomicBool::new(false);
+    let windows = prepare_document_windows_for_tests(&texts, tokenizer(), &cancel).unwrap();
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0].0.len(), TOKEN_WINDOW);
+    let expected = tokenizer()
+        .prepare(&texts, &EmbeddingControl::new(&cancel))
+        .unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for (ordinals, documents) in windows {
+        assert!(
+            documents
+                .windows(2)
+                .all(|pair| pair[0].token_len() <= pair[1].token_len())
+        );
+        for (&ordinal, document) in ordinals.iter().zip(&documents) {
+            assert!(seen.insert(ordinal));
+            assert_eq!(
+                document.token_ids_for_tests(),
+                expected[ordinal].token_ids_for_tests()
+            );
+        }
+        let mut start = 0;
+        while start < documents.len() {
+            let end = prepared_document_slice_end_for_tests(&documents, start);
+            assert!(end > start);
+            assert!(end - start <= DOCUMENT_BATCH_MAX);
+            assert!(
+                (end - start) * documents[end - 1].token_len() <= DOCUMENT_BATCH_TOKEN_WORK_MAX
+            );
+            start = end;
+        }
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        (0..texts.len()).collect::<Vec<_>>()
+    );
 }
 
 #[test]

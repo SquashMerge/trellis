@@ -387,6 +387,14 @@ enum PreparedDocumentInput {
 }
 
 impl PreparedDocument {
+    #[cfg(test)]
+    pub(crate) fn token_ids_for_tests(&self) -> &[u32] {
+        match &self.input {
+            PreparedDocumentInput::Tokens(ids) => ids,
+            PreparedDocumentInput::Text(_) => panic!("expected tokenized document"),
+        }
+    }
+
     /// Actual prompted token count in production; conservative for test models.
     pub fn token_len(&self) -> usize {
         match &self.input {

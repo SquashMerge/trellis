@@ -1,6 +1,6 @@
 //! Diagnostic-only 2048-dimensional reference output, not a product embedding mode.
-//! `--document-batch-shape bucketed` exercises prepared documents in bounded windows,
-//! logs actual forward shapes, and restores input order for check-parity.py.
+//! `--document-batch-shape bucketed` exercises the production window preparation
+//! and slice selection, logs actual forward shapes, and restores input order for check-parity.py.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -12,6 +12,9 @@ use std::time::Instant;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
+use trellis::daemon::search_fill::{
+    prepare_document_windows_for_tests, prepared_document_slice_end_for_tests,
+};
 use trellis::search_embed::{
     Backend, DOCUMENT_BATCH_MAX, DOCUMENT_BATCH_TOKEN_WORK_MAX, Embedder, EmbeddingControl,
     InputKind,
@@ -124,17 +127,6 @@ fn write_batch(
     Ok(())
 }
 
-fn slice_end(lengths: &[usize], start: usize) -> usize {
-    let mut end = start;
-    while end < lengths.len()
-        && end - start < DOCUMENT_BATCH_MAX
-        && (end - start + 1) * lengths[end] <= DOCUMENT_BATCH_TOKEN_WORK_MAX
-    {
-        end += 1;
-    }
-    end
-}
-
 fn bucketed_vectors(
     embedder: &Embedder,
     rows: &[Input],
@@ -144,53 +136,60 @@ fn bucketed_vectors(
     shape_counts: &mut BTreeMap<(usize, usize), usize>,
 ) -> Result<Vec<Vec<f32>>> {
     let control = EmbeddingControl::new(cancel);
-    let prepared = embedder.document_tokenizer().prepare(texts, &control)?;
-    ensure!(prepared.len() == rows.len(), "prepared row count mismatch");
-    let mut ordered: Vec<_> = prepared.into_iter().enumerate().collect();
-    ordered.sort_by_key(|(ordinal, document)| (document.token_len(), *ordinal));
-    let lengths: Vec<_> = ordered
-        .iter()
-        .map(|(_, document)| document.token_len())
-        .collect();
-    let mut restored = vec![None; rows.len()];
-    let mut start = 0;
-    while start < ordered.len() {
-        let end = slice_end(&lengths, start);
-        ensure!(end > start, "document exceeds prepared slice bounds");
-        let documents: Vec<_> = ordered[start..end]
+    let windows = prepare_document_windows_for_tests(texts, embedder.document_tokenizer(), cancel)?;
+    ensure!(
+        windows
             .iter()
-            .map(|(_, document)| document.clone())
-            .collect();
-        let vectors = embedder
-            .embed_prepared_reference(&documents, &control)
-            .with_context(|| {
-                format!("embedding prepared window {window_number} slice {start}..{end}")
-            })?;
+            .map(|(_, documents)| documents.len())
+            .sum::<usize>()
+            == rows.len(),
+        "prepared row count mismatch"
+    );
+    let mut restored = vec![None; rows.len()];
+    for (ordinals, documents) in windows {
         ensure!(
-            vectors.len() == documents.len(),
-            "prepared output row count mismatch"
+            ordinals.len() == documents.len(),
+            "prepared mapping mismatch"
         );
-        *shape_counts
-            .entry((end - start, lengths[end - 1]))
-            .or_default() += 1;
-        eprintln!(
-            "prepared_slice={}",
-            serde_json::json!({
-                "window": window_number,
-                "max_tokens": lengths[end - 1],
-                "padded_token_work": (end - start) * lengths[end - 1],
-                "members": ordered[start..end].iter().map(|(ordinal, document)|
-                    serde_json::json!({"ordinal": ordinal, "id": rows[*ordinal].id,
-                        "tokens": document.token_len()})).collect::<Vec<_>>()
-            })
-        );
-        for ((ordinal, _), vector) in ordered[start..end].iter().zip(vectors) {
+        let mut start = 0;
+        while start < documents.len() {
+            let end = prepared_document_slice_end_for_tests(&documents, start);
+            ensure!(end > start, "document exceeds prepared slice bounds");
+            let slice = &documents[start..end];
+            let vectors = embedder
+                .embed_prepared_reference(slice, &control)
+                .with_context(|| {
+                    format!("embedding prepared window {window_number} slice {start}..{end}")
+                })?;
             ensure!(
-                restored[*ordinal].replace(vector).is_none(),
-                "duplicate output ordinal"
+                vectors.len() == slice.len(),
+                "prepared output row count mismatch"
             );
+            let max_tokens = slice
+                .iter()
+                .map(|document| document.token_len())
+                .max()
+                .unwrap();
+            *shape_counts.entry((end - start, max_tokens)).or_default() += 1;
+            eprintln!(
+                "prepared_slice={}",
+                serde_json::json!({
+                    "window": window_number,
+                    "max_tokens": max_tokens,
+                    "padded_token_work": (end - start) * max_tokens,
+                    "members": ordinals[start..end].iter().zip(slice).map(|(ordinal, document)|
+                        serde_json::json!({"ordinal": ordinal, "id": rows[*ordinal].id,
+                            "tokens": document.token_len()})).collect::<Vec<_>>()
+                })
+            );
+            for (&ordinal, vector) in ordinals[start..end].iter().zip(vectors) {
+                ensure!(
+                    restored[ordinal].replace(vector).is_none(),
+                    "duplicate output ordinal"
+                );
+            }
+            start = end;
         }
-        start = end;
     }
     restored
         .into_iter()
@@ -329,27 +328,4 @@ fn main() -> Result<()> {
         started.elapsed().as_secs_f64()
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prepared_slices_obey_row_and_padded_token_work_bounds() {
-        assert_eq!(slice_end(&[64; 129], 0), 128);
-        assert_eq!(slice_end(&[512; 128], 0), 16);
-        let mixed: Vec<_> = (1..=128).map(|length| length * 4).collect();
-        let mut start = 0;
-        while start < mixed.len() {
-            let end = slice_end(&mixed, start);
-            assert!(end > start);
-            assert!(end - start <= DOCUMENT_BATCH_MAX);
-            assert!((end - start) * mixed[end - 1] <= DOCUMENT_BATCH_TOKEN_WORK_MAX);
-            if end < mixed.len() && end - start < DOCUMENT_BATCH_MAX {
-                assert!((end - start + 1) * mixed[end] > DOCUMENT_BATCH_TOKEN_WORK_MAX);
-            }
-            start = end;
-        }
-    }
 }

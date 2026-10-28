@@ -414,8 +414,13 @@ impl LocalBackend {
                         reader,
                         tokenizer,
                         pending_ref,
-                        &prepared_tx,
-                        &self.0,
+                        |window| {
+                            let sent = prepared_tx.send(Ok(Some(window))).is_ok();
+                            if sent {
+                                self.0.fill_progress();
+                            }
+                            sent
+                        },
                     )
                 });
                 let _ = prepared_tx.send(result.map(|()| None));
@@ -582,8 +587,7 @@ fn prepare_windows(
     mut reader: Option<&mut VectorCacheReader>,
     tokenizer: DocumentTokenizer,
     pending: &Mutex<std::collections::BTreeSet<String>>,
-    sender: &std::sync::mpsc::SyncSender<Result<Option<PreparedWindow>>>,
-    service: &SearchService,
+    mut publish: impl FnMut(PreparedWindow) -> bool,
 ) -> Result<()> {
     let (mut page, _) = first_page;
     let mut terminal = None;
@@ -649,11 +653,8 @@ fn prepare_windows(
             window.hashes.push(hash);
             window.documents.push(document);
         }
-        if !window.documents.is_empty() {
-            if sender.send(Ok(Some(window))).is_err() {
-                return Ok(());
-            }
-            service.fill_progress();
+        if !window.documents.is_empty() && !publish(window) {
+            return Ok(());
         }
         if let Some(error) = terminal {
             return Err(error);
@@ -667,6 +668,73 @@ fn prepare_windows(
         }
         page = source.page(Some(page.pin), Some(&after))?;
     }
+}
+
+/// Diagnostic admission through the production paging, tokenizing and sorting path.
+/// Ordinals travel as card hashes so callers can restore the original row order.
+#[cfg(feature = "test-support")]
+#[allow(clippy::type_complexity)]
+pub fn prepare_document_windows_for_tests(
+    texts: &[String],
+    tokenizer: DocumentTokenizer,
+    cancel: &AtomicBool,
+) -> Result<Vec<(Vec<usize>, Vec<PreparedDocument>)>> {
+    struct Documents<'a>(&'a [String]);
+    impl FillSource for Documents<'_> {
+        fn page(&self, _: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
+            let start = after.map_or(Ok(0), |cursor| cursor.parse::<usize>().map(|n| n + 1))?;
+            Ok(HeadSearchCards {
+                pin: IndexPin {
+                    index_generation: uuid::Uuid::nil(),
+                    index_revision: 1,
+                },
+                cards: self
+                    .0
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(BATCH)
+                    .map(|(ordinal, text)| crate::store::HeadSearchCard {
+                        syntax_id: ordinal.to_string(),
+                        card_hash: ordinal.to_string(),
+                        card_text: text.clone(),
+                    })
+                    .collect(),
+            })
+        }
+    }
+    let source = Documents(texts);
+    let first = source.page(None, None)?;
+    let missing = vec![true; first.cards.len()];
+    let mut windows = Vec::new();
+    prepare_windows(
+        &source,
+        cancel,
+        &AtomicBool::new(false),
+        &model_id_for_card_format(CardFormat::V1.as_str()),
+        (first, missing),
+        None,
+        tokenizer,
+        &Mutex::new(Default::default()),
+        |window| {
+            let ordinals = window
+                .hashes
+                .iter()
+                .map(|hash| hash.parse().unwrap())
+                .collect();
+            windows.push((ordinals, window.documents));
+            true
+        },
+    )?;
+    Ok(windows)
+}
+
+#[cfg(feature = "test-support")]
+pub fn prepared_document_slice_end_for_tests(
+    documents: &[PreparedDocument],
+    start: usize,
+) -> usize {
+    slice_end(documents, start)
 }
 
 fn next_cursor(page: &HeadSearchCards) -> Option<String> {
