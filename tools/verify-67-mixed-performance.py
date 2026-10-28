@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -644,7 +644,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema25 tables, immutable surrogate keys, and current pin normalization.
+# schema-26 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -667,7 +667,8 @@ semantic_symbol_targets semantic_declaration_bindings semantic_declaration_bindi
 semantic_declaration_join_candidates semantic_references semantic_reference_roles
 semantic_reference_candidates semantic_call_bindings semantic_call_candidates
 semantic_call_possible_dispatch semantic_call_join_candidates semantic_type_relationships
-semantic_raw_captures semantic_revision_raw_selections semantic_raw_proofs semantic_raw_documents semantic_import_reports
+semantic_raw_batches semantic_raw_captures semantic_raw_exclusions semantic_revision_raw_selections
+semantic_raw_proofs semantic_raw_documents semantic_import_reports
 """.split())
 CONTROL_TABLES = {"native_revision_supersessions", "native_binding_epoch", "revision_producer_bindings"}
 FTS_SHADOW_TABLES = {"head_search_fts_config", "head_search_fts_content", "head_search_fts_data",
@@ -686,6 +687,68 @@ def typed_cells(value):
     return value
 
 
+def selected_where(table):
+    """The per-table scope of the selected pin; every schema table must be classified."""
+    selected = "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?"
+    if table == "native_revisions":
+        return "id=?"
+    elif table == "head_search_fts":
+        # Read the entire corpus: filtering by selected vid would hide stale rows.
+        return "? IS NOT NULL"
+    elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
+                   "semantic_requested_producers", "semantic_requested_producer_languages",
+                   "semantic_coverage", "semantic_revision_raw_selections"}:
+        return "revision_id=?"
+    elif table == "native_source_sets":
+        return "id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
+    elif table in {"native_source_set_languages", "native_source_set_dependencies"}:
+        return "source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
+    elif table.startswith("native_producer"):
+        id_col, ver_col = (("id", "version") if table == "native_producers" else
+                           ("producer_id", "producer_version"))
+        return ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.vid=v.vid "
+                f"WHERE d.revision_id=? AND v.producer_id=selected.{id_col} AND "
+                f"v.producer_version=selected.{ver_col})")
+    elif table.startswith("semantic_producer"):
+        id_col, ver_col = (("id", "version") if table == "semantic_producers" else
+                           ("id", "version"))
+        return ("EXISTS(SELECT 1 FROM semantic_revision_producers r WHERE r.revision_id=? "
+                f"AND r.id=selected.{id_col} AND r.version=selected.{ver_col})")
+    elif table == "document_versions" or table.startswith("native_version_"):
+        return "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?)"
+    elif table in {"graph_projections", "graph_nodes", "graph_display_labels"}:
+        return "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?)"
+    elif table in {"class_projections", "classes", "class_relations"}:
+        return "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?)"
+    elif table in {"semantic_coverage_roles", "semantic_basis", "semantic_provenance",
+                   "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
+                   "semantic_call_bindings", "semantic_type_relationships"}:
+        return f"tuple_id IN ({selected})"
+    elif table in {"semantic_basis_lookup_dependencies"}:
+        return f"basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id IN ({selected}))"
+    elif table in {"semantic_symbol_targets"}:
+        return f"symbol_id IN (SELECT symbol_id FROM semantic_symbols WHERE tuple_id IN ({selected}))"
+    elif table in {"semantic_declaration_binding_symbols", "semantic_declaration_join_candidates"}:
+        return f"binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE tuple_id IN ({selected}))"
+    elif table in {"semantic_reference_roles", "semantic_reference_candidates"}:
+        return f"tuple_id IN ({selected})"
+    elif table in {"semantic_call_candidates", "semantic_call_possible_dispatch", "semantic_call_join_candidates"}:
+        return f"binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id IN ({selected}))"
+    elif table in {"semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions"}:
+        return "batch_id IN (SELECT batch_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
+    elif table in {"semantic_raw_documents", "semantic_raw_proofs"}:
+        return ("capture_id IN (SELECT c.capture_id FROM semantic_raw_captures c "
+                "JOIN semantic_revision_raw_selections s ON s.batch_id=c.batch_id WHERE s.revision_id=?)")
+    elif table == "semantic_import_reports":
+        return ("EXISTS(SELECT 1 FROM semantic_revision_raw_selections r "
+                "JOIN semantic_revision_raw_selections current ON current.batch_id=r.batch_id "
+                "AND current.producer_id=r.producer_id "
+                "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
+                "AND r.producer_id=selected.producer_id)")
+    else:
+        raise RuntimeError(f"unclassified schema-{SCHEMA_VERSION} selected table: {table}")
+
+
 def parity_digest(db, revision, physical_root):
     view = SelectedView(db, revision, physical_root)
     require(db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION,
@@ -698,68 +761,12 @@ def parity_digest(db, revision, physical_root):
         AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%'""")}
     expected_tables = REQUIRED_TABLES | CONTROL_TABLES | FTS_SHADOW_TABLES
     require(tables == expected_tables,
-            f"schema25 selected inventory mismatch: missing={expected_tables-tables}, "
+            f"schema{SCHEMA_VERSION} selected inventory mismatch: missing={expected_tables-tables}, "
             f"extra={tables-expected_tables}")
     output = {}
-    selected = "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?"
     # FTS shadow segment bytes depend on publication history, not selected output.
     for table in sorted(tables - CONTROL_TABLES - DEBT_TABLES - FTS_SHADOW_TABLES):
-        if table == "native_revisions":
-            where = "id=?"
-        elif table == "head_search_fts":
-            # Read the entire corpus: filtering by selected vid would hide stale rows.
-            where = "? IS NOT NULL"
-        elif table in {"revision_capture_inputs", "revision_documents", "semantic_revision_producers",
-                       "semantic_requested_producers", "semantic_requested_producer_languages",
-                       "semantic_coverage", "semantic_revision_raw_selections"}:
-            where = "revision_id=?"
-        elif table == "native_source_sets":
-            where = "id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
-        elif table in {"native_source_set_languages", "native_source_set_dependencies"}:
-            where = "source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?)"
-        elif table.startswith("native_producer"):
-            id_col, ver_col = (("id", "version") if table == "native_producers" else
-                               ("producer_id", "producer_version"))
-            where = ("EXISTS(SELECT 1 FROM document_versions v JOIN revision_documents d ON d.vid=v.vid "
-                     f"WHERE d.revision_id=? AND v.producer_id=selected.{id_col} AND "
-                     f"v.producer_version=selected.{ver_col})")
-        elif table.startswith("semantic_producer"):
-            id_col, ver_col = (("id", "version") if table == "semantic_producers" else
-                               ("id", "version"))
-            where = ("EXISTS(SELECT 1 FROM semantic_revision_producers r WHERE r.revision_id=? "
-                     f"AND r.id=selected.{id_col} AND r.version=selected.{ver_col})")
-        elif table == "document_versions" or table.startswith("native_version_"):
-            where = "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?)"
-        elif table in {"graph_projections", "graph_nodes", "graph_display_labels"}:
-            where = "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?)"
-        elif table in {"class_projections", "classes", "class_relations"}:
-            where = "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?)"
-        elif table in {"semantic_coverage_roles", "semantic_basis", "semantic_provenance",
-                       "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
-                       "semantic_call_bindings", "semantic_type_relationships"}:
-            where = f"tuple_id IN ({selected})"
-        elif table in {"semantic_basis_lookup_dependencies"}:
-            where = f"basis_id IN (SELECT basis_id FROM semantic_basis WHERE tuple_id IN ({selected}))"
-        elif table in {"semantic_symbol_targets"}:
-            where = f"symbol_id IN (SELECT symbol_id FROM semantic_symbols WHERE tuple_id IN ({selected}))"
-        elif table in {"semantic_declaration_binding_symbols", "semantic_declaration_join_candidates"}:
-            where = f"binding_id IN (SELECT binding_id FROM semantic_declaration_bindings WHERE tuple_id IN ({selected}))"
-        elif table in {"semantic_reference_roles", "semantic_reference_candidates"}:
-            where = f"tuple_id IN ({selected})"
-        elif table in {"semantic_call_candidates", "semantic_call_possible_dispatch", "semantic_call_join_candidates"}:
-            where = f"binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id IN ({selected}))"
-        elif table in {"semantic_raw_captures", "semantic_raw_documents"}:
-            where = "capture_id IN (SELECT capture_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
-        elif table == "semantic_raw_proofs":
-            where = "capture_id IN (SELECT capture_id FROM semantic_revision_raw_selections WHERE revision_id=?)"
-        elif table == "semantic_import_reports":
-            where = ("EXISTS(SELECT 1 FROM semantic_revision_raw_selections r "
-                     "JOIN semantic_revision_raw_selections current ON current.capture_id=r.capture_id "
-                     "AND current.producer_id=r.producer_id "
-                     "WHERE current.revision_id=? AND r.revision_id=selected.revision_id "
-                     "AND r.producer_id=selected.producer_id)")
-        else:
-            raise RuntimeError(f"unclassified schema25 selected table: {table}")
+        where = selected_where(table)
         columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
         require(columns, f"empty table schema: {table}")
         digest, count = hashlib.sha256(), 0
@@ -885,7 +892,7 @@ def selected_proof(db, revision, anchor_path, artifact_hash):
         v.derived_from_provenance_id,v.derived_from_fact_digest,b.artifact_hash,
         cov.state,cov.selected,cov.requested,b.captured_native_revision_id,r.native_revision_id
         FROM semantic_revision_raw_selections s
-        JOIN semantic_raw_captures c ON c.capture_id=s.capture_id
+        JOIN semantic_raw_captures c ON c.batch_id=s.batch_id
         JOIN semantic_raw_proofs p ON p.capture_id=c.capture_id AND p.path=?
         JOIN semantic_coverage cov ON cov.revision_id=s.revision_id AND cov.producer_id=s.producer_id
             AND cov.path=p.path AND cov.language=p.language
@@ -1072,7 +1079,7 @@ class SelectedView:
                     "pin": {revision: "<r2-pin>"},
                     "vid": {}, "gid": {}, "cid": {}, "syntax": {}, "occurrence": {},
                     "region": {}, "class": {}, "class-ref": {}, "graph-node": {},
-                    "tuple": {}, "basis": {}, "capture": {}, "proof": {},
+                    "tuple": {}, "basis": {}, "batch": {}, "capture": {}, "proof": {},
                     "provenance": {}, "symbol": {}, "binding": {}}
         self.r1 = None
         for language, path, vid, gid, cid in db.execute(
@@ -1129,13 +1136,19 @@ class SelectedView:
         for raw, producer, language, path in db.execute(
                 "SELECT tuple_id,producer_id,language,path FROM semantic_coverage WHERE revision_id=?", (revision,)):
             self.ids["tuple"][raw] = (producer, language, path, self.docs[(language, path)])
-        selections = db.execute("""SELECT c.capture_id,c.producer_id,c.artifact_hash,c.source_set_id,
-            c.captured_revision,s.captured_pin,c.manifest_bytes FROM semantic_revision_raw_selections s
-            JOIN semantic_raw_captures c ON c.capture_id=s.capture_id WHERE s.revision_id=?""",
+        selections = db.execute("""SELECT s.batch_id,b.producer_id,b.source_set_id,b.captured_revision,
+            s.captured_pin,b.descriptor_bytes,b.descriptor_sha256,b.source_manifest_hash
+            FROM semantic_revision_raw_selections s
+            JOIN semantic_raw_batches b ON b.batch_id=s.batch_id WHERE s.revision_id=?""",
             (revision,)).fetchall()
-        require(len(selections) == 1, f"expected exactly one selected capture: {selections}")
-        for capture, producer, artifact, source_set, captured_revision, captured_pin, manifest_bytes in selections:
-            manifest = json.loads(manifest_bytes)
+        require(len(selections) == 1, f"expected exactly one selected batch: {selections}")
+        for (batch, producer, source_set, captured_revision, captured_pin, descriptor_bytes,
+             descriptor_sha, batch_manifest_hash) in selections:
+            captures = db.execute("""SELECT capture_id,ordinal,artifact_hash,binary_bytes
+                FROM semantic_raw_captures WHERE batch_id=? ORDER BY ordinal""", (batch,)).fetchall()
+            require(len(captures) == 1, f"expected exactly one selected capture: {len(captures)}")
+            capture, ordinal, artifact, binary = captures[0]
+            descriptor = json.loads(descriptor_bytes)
             original = db.execute("SELECT source_inventory FROM native_revisions WHERE id=? "
                                   "AND native_revision_id=? AND source_set_id=?",
                                   (captured_pin, captured_revision, source_set)).fetchall()
@@ -1144,36 +1157,35 @@ class SelectedView:
             expected_rows = [{"document": {"sourceSetId": source_set,
                               "language": item["key"]["language"], "path": item["key"]["path"]},
                               "contentHash": item["contentHash"]} for item in retained]
-            binary = db.execute("SELECT binary_bytes FROM semantic_raw_captures WHERE capture_id=?",
-                                (capture,)).fetchone()[0]
-            require(source_set == self.source_set and manifest["sourceSet"]["id"] == source_set
-                    and manifest["sourceSet"]["rootId"] == self.root_id
+            expected_hash = hashlib.sha256(canonical(expected_rows)).hexdigest()
+            require(source_set == self.source_set and descriptor["sourceSet"]["id"] == source_set
+                    and descriptor["sourceSet"]["rootId"] == self.root_id
                     and source_set == "source-set:v1:" + self.root_id
-                    and manifest["metadata"]["projectRoot"] == self.physical_root.as_uri()
-                    and manifest["sourceRevision"] == captured_revision
-                    and manifest["sourceDocuments"] == [
-                        {"language": item["key"]["language"], "relativePath": item["key"]["path"],
-                         "contentHash": item["contentHash"]} for item in retained]
-                    and manifest["sourceManifestHash"] == hashlib.sha256(canonical(expected_rows)).hexdigest()
+                    and descriptor["metadata"]["projectRoot"] == self.physical_root.as_uri()
+                    and descriptor["sourceRevision"] == captured_revision
+                    and descriptor["sourceManifestHash"] == batch_manifest_hash == expected_hash
+                    and descriptor["totals"]["sourceDocuments"] == len(retained) == 4
+                    and hashlib.sha256(descriptor_bytes).hexdigest() == descriptor_sha
                     and hashlib.sha256(binary).hexdigest() == artifact
-                    and manifest["artifacts"][0]["hash"] == artifact,
-                    "selected raw manifest/source root/r1 inventory/binary digest mismatch")
-            r1_doc = [(d["language"], d["relativePath"], d["contentHash"])
-                      for d in manifest["sourceDocuments"]]
+                    == descriptor["artifacts"][0]["sha256"],
+                    "selected raw batch/source root/r1 inventory/binary digest mismatch")
+            r1_doc = [(item["key"]["language"], item["key"]["path"], item["contentHash"])
+                      for item in retained]
             require(len(r1_doc) == 4 and len(set(r1_doc)) == 4, "r1 document closure missing")
             self.r1 = captured_revision
             self.ids["pin"][captured_pin] = "<captured-r1-pin>"
             self.ids["native-revision"][captured_revision] = "<captured-r1>"
-            self.ids["capture"][capture] = (producer, artifact, tuple(r1_doc))
-            self.capture_manifest = manifest
+            self.ids["batch"][batch] = (producer, tuple(r1_doc))
+            self.ids["capture"][capture] = (producer, artifact, ordinal, tuple(r1_doc))
+            self.capture_descriptor = descriptor
             self.capture_pin = captured_pin
             imported = db.execute("""SELECT r.revision_id FROM semantic_revision_raw_selections r
                 JOIN semantic_import_reports i ON i.revision_id=r.revision_id AND i.producer_id=r.producer_id
-                WHERE r.capture_id=? AND r.producer_id=?""", (capture, producer)).fetchall()
+                WHERE r.batch_id=? AND r.producer_id=?""", (batch, producer)).fetchall()
             require(len(imported) == 1 and imported[0][0] != revision,
-                    "selected capture has no unique imported report pin")
+                    "selected batch has no unique imported report pin")
             self.ids["pin"][imported[0][0]] = "<import-pin>"
-            self.capture_bytes = manifest_bytes
+            self.capture_bytes = descriptor_bytes
             self.r1_docs = r1_doc
             for raw, kind, language, path, fact, canonical_bytes in db.execute(
                     "SELECT proof_id,record_kind,language,path,fact_digest,canonical_bytes "
@@ -1184,7 +1196,7 @@ class SelectedView:
                 "SELECT basis_id,tuple_id,producer_id,artifact_hash,language,"
                 "captured_native_revision_id,source_manifest_hash FROM semantic_basis "
                 "WHERE tuple_id IN (SELECT tuple_id FROM semantic_coverage WHERE revision_id=?)", (revision,)):
-            require(source_revision == self.r1 and source_hash == self.capture_manifest["sourceManifestHash"],
+            require(source_revision == self.r1 and source_hash == self.capture_descriptor["sourceManifestHash"],
                     "basis not bound to admitted r1")
             self.ids["basis"][raw] = (self.ids["tuple"][tuple_id], producer, artifact, language,
                                        tuple(self.r1_docs))
@@ -1225,20 +1237,18 @@ class SelectedView:
             return value
         return value
 
-    def manifest(self):
-        manifest = json.loads(self.capture_bytes)
-        require(set(manifest) == {"formatVersion", "trustOrigin", "completion", "decoderVersion",
-                                 "profileId", "producer", "sourceSet", "sourceRevision",
-                                 "sourceManifestHash", "components", "metadata", "sourceDocuments",
-                                 "documents", "exclusions", "artifacts"}, "unknown admitted manifest field")
-        manifest["sourceSet"]["id"] = self.map("source-set", manifest["sourceSet"]["id"])
-        manifest["sourceSet"]["rootId"] = "<physical-root>"
-        manifest["sourceRevision"] = self.map("native-revision", manifest["sourceRevision"])
-        manifest["metadata"]["projectRoot"] = "file://<physical-root>"
-        manifest["sourceManifestHash"] = hashlib.sha256(canonical([
+    def descriptor(self):
+        descriptor = json.loads(self.capture_bytes)
+        require(set(descriptor) == set(load_batch_module().DESCRIPTOR_KEYS),
+                "unknown admitted descriptor field")
+        descriptor["sourceSet"]["id"] = self.map("source-set", descriptor["sourceSet"]["id"])
+        descriptor["sourceSet"]["rootId"] = "<physical-root>"
+        descriptor["sourceRevision"] = self.map("native-revision", descriptor["sourceRevision"])
+        descriptor["metadata"]["projectRoot"] = "file://<physical-root>"
+        descriptor["sourceManifestHash"] = hashlib.sha256(canonical([
             {"document": {"sourceSetId": "<source-set>", "language": language, "path": path},
              "contentHash": content} for language, path, content in self.r1_docs])).hexdigest()
-        return manifest
+        return descriptor
 
     @staticmethod
     def stat(stat):
@@ -1289,7 +1299,13 @@ class SelectedView:
             require(cells["binary_bytes"] == (self.db.execute(
                 "SELECT binary_bytes FROM semantic_raw_captures WHERE capture_id=?",
                 (cells["capture_id"],)).fetchone()[0]), "selected raw bytes changed")
-            cells["manifest_bytes"] = self.manifest()
+        if table == "semantic_raw_batches":
+            descriptor = self.descriptor()
+            require(hashlib.sha256(cells["descriptor_bytes"]).hexdigest() == cells["descriptor_sha256"],
+                    "selected descriptor digest changed")
+            cells["descriptor_bytes"] = descriptor
+            cells["descriptor_sha256"] = "<descriptor-sha256>"
+            cells["source_manifest_hash"] = descriptor["sourceManifestHash"]
         if table == "semantic_import_reports":
             report = json.loads(cells["report_json"])
             require(set(report) == {"capturedRevision", "destinationRevision", "documents",
@@ -1300,7 +1316,7 @@ class SelectedView:
             report["sourceSetId"] = self.map("source-set", report["sourceSetId"])
             cells["report_json"] = report
         if table == "semantic_basis":
-            cells["source_manifest_hash"] = self.manifest()["sourceManifestHash"]
+            cells["source_manifest_hash"] = self.descriptor()["sourceManifestHash"]
         if table in {"graph_projections", "classes", "class_relations"}:
             for column in ("class_extraction_payload", "class_summary_payload", "payload"):
                 if column in cells and cells[column] is not None:
@@ -1320,7 +1336,8 @@ class SelectedView:
             if value is None:
                 continue
             family = None
-            if column in ("vid", "gid", "cid", "tuple_id", "basis_id", "capture_id", "symbol_id", "binding_id"):
+            if column in ("vid", "gid", "cid", "tuple_id", "basis_id", "batch_id", "capture_id", "symbol_id",
+                          "binding_id"):
                 family = column.removesuffix("_id") if column.endswith("_id") else column
             elif column == "source_set_id":
                 family = "source-set"

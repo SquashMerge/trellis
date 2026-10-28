@@ -2890,8 +2890,19 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     assert_eq!(selected_inputs.len(), 1);
     assert_eq!(selected_inputs[0].captured_pin, first);
     assert_eq!(selected_inputs[0].producer, semantic.producers[0]);
-    assert_eq!(selected_inputs[0].binary_bytes, raw.binary_bytes);
-    assert_eq!(selected_inputs[0].manifest_bytes, raw.manifest_bytes);
+    assert_eq!(selected_inputs[0].captures.len(), 1);
+    assert_eq!(
+        selected_inputs[0].captures[0].binary_bytes,
+        raw.binary_bytes
+    );
+    assert_eq!(
+        selected_inputs[0].source_manifest_hash,
+        raw.inventory.source_manifest_hash
+    );
+    assert_eq!(
+        selected_inputs[0].descriptor.source_manifest_hash,
+        raw.inventory.source_manifest_hash
+    );
     assert_eq!(selected_inputs[0].proofs.len(), raw.inventory.claims.len());
     assert_eq!(
         selected_inputs[0].requested_documents,

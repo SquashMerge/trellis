@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -134,6 +135,116 @@ class Rusage(unittest.TestCase):
         result = RUNNER.reap_with_rusage(proc)
         self.assertGreater(result["maxRssBytes"], 0)
         self.assertEqual(proc.returncode, 0)
+
+
+class SchemaParity(unittest.TestCase):
+    EXCLUDED = RUNNER.CONTROL_TABLES | RUNNER.DEBT_TABLES | RUNNER.FTS_SHADOW_TABLES
+
+    def schema_db(self):
+        source = (RUNNER.REPO / "src/store.rs").read_text()
+        match = re.search(r'const CACHE_SCHEMA_V(\d+): &str = r#"(.*?)"#;', source, re.S)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), RUNNER.SCHEMA_VERSION)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        try:
+            db.executescript(match.group(2))
+        except sqlite3.OperationalError as error:
+            self.fail(f"the schema needs FTS5 with the trigram tokenizer: {error}")
+        return db
+
+    @staticmethod
+    def tables(db):
+        return {row[0] for row in db.execute("""SELECT name FROM sqlite_master WHERE type='table'
+            AND name NOT LIKE 'sqlite_%' AND name!='index_metadata' AND name NOT LIKE '%trigrams%'""")}
+
+    def test_schema_text_table_set_matches_required_tables(self):
+        self.assertEqual(self.tables(self.schema_db()),
+                         RUNNER.REQUIRED_TABLES | RUNNER.CONTROL_TABLES | RUNNER.FTS_SHADOW_TABLES)
+
+    def test_every_schema_table_has_a_selected_scope(self):
+        for table in sorted(self.tables(self.schema_db()) - self.EXCLUDED):
+            self.assertTrue(RUNNER.selected_where(table), table)
+        with self.assertRaises(RuntimeError):
+            RUNNER.selected_where("not_a_table")
+
+    def populate(self, db, workspace):
+        root = Path(workspace).resolve(strict=True)
+        root_id = "path-" + RUNNER.hashlib.sha256(str(root).encode()).hexdigest()
+        source_set = "source-set:v1:" + root_id
+        paths = [("javascript", "js/a.js"), ("javascript", "js/b.js"),
+                 ("python", "py/a.py"), ("python", "py/b.py")]
+        hashes = {key: f"{index + 1:064x}" for index, key in enumerate(paths)}
+        for _language, path in paths:
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(b"x = 1\n")
+
+        def inventory(revision):
+            return json.dumps([{"key": {"sourceSetId": source_set, "language": language, "path": path},
+                                "contentHash": hashes[(language, path)], "revisionId": revision}
+                               for language, path in paths])
+        db.execute("INSERT INTO native_source_sets VALUES(?,?)", (source_set, root_id))
+        for ordinal, language in enumerate(("javascript", "python")):
+            db.execute("INSERT INTO native_source_set_languages VALUES(?,?,?)", (source_set, language, ordinal))
+        pins = {"r1": "pin:v1:gen:1", "import": "pin:v1:gen:2", "r2": "pin:v1:gen:3"}
+        natives = {"r1": "revision:v2:one", "import": "revision:v2:two", "r2": "revision:v2:two"}
+        for name, pin in pins.items():
+            db.execute("INSERT INTO native_revisions VALUES(?,?,?,?,?,?,?,'[]','{}','[]','[]',NULL,'[]',0,'{}','[]',?)",
+                       (pin, source_set, HEX, HEX, HEX, natives[name], inventory(natives[name]),
+                        int(pin[-1])))
+        for ordinal, (language, path) in enumerate(paths):
+            db.execute("INSERT INTO revision_documents VALUES(?,?,?,?,?,NULL,NULL,1,1,'complete',NULL,?,0)",
+                       (pins["r2"], language, path, ordinal + 1, ordinal + 1, ordinal))
+        header = RUNNER.capture_header(db, pins["r1"], 4)
+        covered = [row for row in header["source_rows"] if row["relativePath"] == "js/a.js"]
+        descriptor, sha = RUNNER.write_import_batch(root, header, b"\x01", covered)
+        descriptor_bytes = descriptor.read_bytes()
+        artifact = RUNNER.hashlib.sha256(b"\x01").hexdigest()
+        db.execute("INSERT INTO semantic_raw_batches VALUES(1,'scip-typescript','1','profile',?,?,?,?,?,?)",
+                   (source_set, natives["r1"], header["manifest_hash"], sha, descriptor_bytes,
+                    RUNNER.DECODER_VERSION))
+        db.execute("INSERT INTO semantic_raw_captures VALUES(1,1,0,'javascript','scip-typescript',?,?,?,x'01',?)",
+                   (artifact, source_set, natives["r1"], RUNNER.DECODER_VERSION))
+        db.execute("INSERT INTO semantic_raw_exclusions VALUES(1,'javascript','js/b.js','notRequested')")
+        db.execute("INSERT INTO semantic_raw_documents VALUES(1,'javascript','js/a.js',?,?)",
+                   (hashes[paths[0]], HEX))
+        db.execute("INSERT INTO semantic_raw_proofs VALUES(1,'proof','occurrence',?,'javascript','js/a.js',x'7b7d')",
+                   (HEX,))
+        for name in ("import", "r2"):
+            db.execute("INSERT INTO semantic_revision_raw_selections VALUES(?,'scip-typescript',1,?)",
+                       (pins[name], pins["r1"]))
+        db.execute("INSERT INTO semantic_coverage VALUES(1,?,'scip-typescript','1','javascript','js/a.js',1,1,'complete',NULL)",
+                   (pins["r2"],))
+        db.execute("INSERT INTO semantic_basis VALUES(1,1,'scip-typescript','1',?,?,'javascript',?,?,?,?,?,?)",
+                   (HEX, artifact, source_set, natives["r1"], header["manifest_hash"], HEX, HEX, HEX))
+        db.execute("INSERT INTO semantic_provenance VALUES(1,'prov',?,'semanticReference','fresh',1,1,'proof','occurrence',?)",
+                   (HEX, HEX))
+        report = {"capturedRevision": natives["r1"], "destinationRevision": natives["r2"],
+                  "documents": [], "languages": [], "producerId": "scip-typescript",
+                  "sourceSetId": source_set}
+        db.execute("INSERT INTO semantic_import_reports VALUES(?,?,?)",
+                   (pins["import"], "scip-typescript", json.dumps(report)))
+        return root, pins["r2"]
+
+    def normalized_rows(self, workspace):
+        db = self.schema_db()
+        root, revision = self.populate(db, workspace)
+        view = RUNNER.SelectedView(db, revision, root)
+        rows = {}
+        for table in ("semantic_raw_batches", "semantic_raw_captures", "semantic_raw_exclusions",
+                      "semantic_raw_documents", "semantic_raw_proofs", "semantic_revision_raw_selections",
+                      "semantic_coverage", "semantic_basis", "semantic_provenance",
+                      "semantic_import_reports"):
+            columns = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
+            query = f'SELECT * FROM "{table}" selected WHERE {RUNNER.selected_where(table)}'
+            rows[table] = [RUNNER.canonical(RUNNER.typed_cells(view.row(table, dict(zip(columns, row)))))
+                           for row in db.execute(query, (revision,))]
+            self.assertTrue(rows[table], table)
+        return rows
+
+    def test_selected_view_normalizes_a_schema_26_batch_selection_identically_across_roots(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
 
 
 class ImportBatch(unittest.TestCase):

@@ -395,7 +395,7 @@ fn selected_case(change_b: &str) {
     let mut prior: trellis::model::IndexPin =
         serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
     let mut prior_semantic = store.semantic_at(prior).unwrap();
-    let accepted_artifact_hash = store.selected_raw_inputs_at(prior).unwrap()[0]
+    let accepted_artifact_hash = store.selected_raw_inputs_at(prior).unwrap()[0].captures[0]
         .artifact_hash
         .clone();
     if !matches!(change_b, "zero_claims" | "partial_empty_covered") {
@@ -557,7 +557,7 @@ fn selected_case(change_b: &str) {
         prior_semantic = store.semantic_at(prior).unwrap();
         if change_b == "oracle_fork_raw_replacement" {
             assert_ne!(
-                store.selected_raw_inputs_at(prior).unwrap()[0].artifact_hash,
+                store.selected_raw_inputs_at(prior).unwrap()[0].captures[0].artifact_hash,
                 accepted_artifact_hash,
                 "the replacement must select a distinct authenticated raw artifact",
             );
@@ -599,7 +599,7 @@ fn selected_case(change_b: &str) {
         (None, store)
     };
     if change_b == "oracle_fork_missing_raw_key" {
-        let capture_id = store.selected_raw_inputs_at(prior).unwrap()[0].capture_id;
+        let capture_id = store.selected_raw_inputs_at(prior).unwrap()[0].captures[0].capture_id;
         store
             .with_index_sql_for_tests(|db| {
                 assert_eq!(db.execute(
@@ -1069,6 +1069,17 @@ fn selected_case(change_b: &str) {
                     |row| row.get(0),
                 )?;
                 assert_eq!(selections, 0);
+                for table in [
+                    "semantic_raw_batches",
+                    "semantic_raw_captures",
+                    "semantic_raw_exclusions",
+                ] {
+                    let rows: i64 =
+                        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })?;
+                    assert_eq!(rows, 0, "{table}");
+                }
                 Ok(())
             })
             .unwrap();

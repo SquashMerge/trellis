@@ -661,7 +661,7 @@ fn two_document_case(change_b: &str) {
             native.revision.id
         );
         assert!(selected[0].proofs.is_empty());
-        assert_eq!(selected[0].binary_bytes, bytes);
+        assert_eq!(selected[0].captures[0].binary_bytes, bytes);
         assert_eq!(selected[0].requested_documents.len(), 2);
         return;
     }
@@ -883,7 +883,7 @@ fn two_document_case(change_b: &str) {
             .id,
         native.revision.id
     );
-    assert_eq!(input.binary_bytes, bytes);
+    assert_eq!(input.captures[0].binary_bytes, bytes);
     assert!(!input.proofs.is_empty());
     assert!(
         input
@@ -2671,13 +2671,14 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
         .iter()
         .find(|row| row.producer_id == "scip-typescript")
         .unwrap();
-    assert_eq!(old_js.artifact_hash, pins[0].1);
-    assert_eq!(latest_js.artifact_hash, pins[2].1);
+    assert_eq!(old_js.captures[0].artifact_hash, pins[0].1);
+    assert_eq!(latest_js.captures[0].artifact_hash, pins[2].1);
     assert_ne!(pins[0].1, pins[2].1);
     assert_eq!(
         old.iter()
             .find(|row| row.producer_id == "scip-python")
             .unwrap()
+            .captures[0]
             .artifact_hash,
         pins[1].1
     );
@@ -2686,11 +2687,12 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
             .iter()
             .find(|row| row.producer_id == "scip-python")
             .unwrap()
+            .captures[0]
             .artifact_hash,
         pins[1].1
     );
     assert_eq!(
-        store.selected_raw_inputs_at(pins[1].0).unwrap()[0].artifact_hash,
-        old[0].artifact_hash
+        store.selected_raw_inputs_at(pins[1].0).unwrap()[0].captures[0].artifact_hash,
+        old[0].captures[0].artifact_hash
     );
 }
