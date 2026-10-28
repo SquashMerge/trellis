@@ -363,5 +363,99 @@ class Campaign(unittest.TestCase):
             with self.assertRaisesRegex(GATE.GateFault, "^preflight: small artifact hashes differ"):
                 GATE.prepare(Path(temp) / "c", ("small",), True)
 
+class FreshState(unittest.TestCase):
+    """AC11: every repetition gets its own HOME/XDG tree, daemon and workspace, removed afterwards."""
+
+    def run_rep(self, campaign, ordinal, homes):
+        class FakeDaemon:
+            def __init__(self, home, label):
+                self.home, self.label = home, label
+                self.path = home.parent / f"{label}-daemon.log"
+                self.rusage = {"maxRssBytes": 7}
+                self.started = 0
+
+            def start(self):
+                self.started += 1
+                homes.append((self.label, self.home, list(self.home.iterdir())))
+
+            def stop(self):
+                self.path.write_text("log")
+
+        class FakeAdapter:
+            def begin_repetition(self, rep_dir):
+                rep_dir.mkdir(parents=True, exist_ok=True)
+
+            def copy_cohort(self, source, destination):
+                destination.mkdir(parents=True)
+
+            def daemon(self, home, label, record_rusage=False):
+                return FakeDaemon(home, label)
+
+            command = staticmethod(lambda argv, env=None, **k: "out")
+            env_for = staticmethod(M.env_for)
+            db_for = staticmethod(lambda home: home / "index.db")
+            capture_header = staticmethod(lambda db, revision: {
+                "native_id": "n", "source_set": {"id": "s", "rootId": "r"}, "manifest_hash": "h",
+                "source_rows": []})
+            sha_file = staticmethod(lambda path: "0" * 64)
+
+        ctx = {"adapter": FakeAdapter(), "binary": Path("/bin/trellis"), "campaign_dir": campaign,
+               "cohort": campaign / "cohort", "synthetic_profile": {},
+               "prepared": {"small": {"inventory": [], "dir": campaign}},
+               "policy": {"cohorts": {"small": {}}}}
+        built = {"descriptorPath": campaign / "d.json", "descriptorSha256": "a" * 64, "pageCount": 1,
+                 "pageBytes": 1, "sourceBytes": 1, "artifactBytes": 1, "descriptorBytes": 1}
+
+        class Sampler:
+            stage_peak = 0
+            _thread = type("T", (), {"is_alive": staticmethod(lambda: False)})()
+
+            def __init__(self, root):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                return {}
+
+        rep = {"ordinal": ordinal}
+        with patch.object(GATE, "pin_revision", lambda out: ("pin", "rev")), \
+                patch.object(GATE, "build_batch", lambda *a, **k: built), \
+                patch.object(GATE, "StorageSampler", Sampler), \
+                patch.object(GATE, "timed_interval", lambda *a: ({"wallSeconds": 1}, "i", "m")), \
+                patch.object(GATE, "validate_run", lambda *a: {
+                    "pins": {}, "requests": {}, "nativeFacts": {}, "coverage": {}}), \
+                patch.object(GATE, "sqlite_steady", lambda path: ({}, None)), \
+                patch.object(GATE, "storage_block", lambda *a: {}), \
+                patch.object(GATE.sqlite3, "connect", lambda *a, real=sqlite3.connect, **k: real(":memory:")):
+            GATE.run_repetition(ctx, "small", ordinal, rep)
+        return rep
+
+    def test_each_repetition_starts_a_fresh_daemon_in_its_own_empty_home(self):
+        with tempfile.TemporaryDirectory() as temp:
+            campaign = Path(temp)
+            homes = []
+            reps = [self.run_rep(campaign, ordinal, homes) for ordinal in (1, 2, 3)]
+            # probe and timed daemons per repetition, each started on a home that held nothing.
+            self.assertEqual(len(homes), 6)
+            self.assertEqual(len({home for _label, home, _ in homes}), 6)
+            for label, home, content in homes:
+                self.assertEqual(content, [], f"{label} home {home} was not virgin")
+            for ordinal, rep in enumerate(reps, 1):
+                self.assertEqual(rep["status"], "completed")
+                self.assertTrue(all(home.parent.name == f"rep{ordinal}" for _l, home, _c in homes[(ordinal - 1) * 2:ordinal * 2]))
+                self.assertEqual([c["outcome"] for c in rep["cleanup"]], ["removed"] * 3)
+                self.assertEqual([c["path"] for c in rep["cleanup"]], ["probe-home", "home", "workspace"])
+                self.assertFalse((campaign / "small" / f"rep{ordinal}" / "home").exists())
+
+    def test_isolated_environment_points_home_and_xdg_at_the_repetition_home(self):
+        home = Path("/tmp/rep-home")
+        env = GATE.Gate90Adapter.env_for(home)
+        self.assertEqual(env["HOME"], str(home))
+        self.assertEqual(env["XDG_CACHE_HOME"], str(home / ".cache"))
+        self.assertEqual(env["XDG_DATA_HOME"], str(home / ".local/share"))
+
+
 if __name__ == "__main__":
     unittest.main()
