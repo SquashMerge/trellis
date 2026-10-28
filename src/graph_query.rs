@@ -437,26 +437,29 @@ fn semantic<'a>(
 fn select_binding<'a>(
     semantic: Option<&'a SemanticDocument>,
     call: &native::Call,
-) -> Option<(&'a CallBinding, &'a sem::Provenance)> {
-    let semantic = semantic?;
+) -> Result<Option<(&'a CallBinding, &'a sem::Provenance)>> {
+    let Some(semantic) = semantic else {
+        return Ok(None);
+    };
     if !semantic.coverage.selected
         || !matches!(
             semantic.coverage.state,
             CoverageState::Complete | CoverageState::Partial
         )
     {
-        return None;
+        return Ok(None);
     }
-    semantic
+    let mut matches = semantic
         .call_bindings
         .iter()
         .filter(|b| b.call_id.as_deref() == Some(call.id.as_str()))
         .filter(|b| b.join.anchor.document == call.document)
-        .filter_map(|b| {
-            let proof = semantic.provenance.get(&b.provenance_id)?;
-            (proof.content_hash == b.join.anchor.content_hash).then_some((b, proof))
-        })
-        .min_by(|a, b| a.0.provenance_id.cmp(&b.0.provenance_id))
+        .filter_map(|b| Some((b, semantic.provenance.get(&b.provenance_id)?)));
+    let selected = matches.next();
+    if matches.next().is_some() {
+        return Err(integrity("multiple call bindings match one call"));
+    }
+    Ok(selected)
 }
 
 fn boundary_reason(binding: &CallBinding, proof: &sem::Provenance) -> BoundaryReason {
@@ -588,7 +591,7 @@ pub fn evaluate(
                 call_cap = true;
                 break;
             }
-            let selected = select_binding(semantic, call);
+            let selected = select_binding(semantic, call)?;
             let mut reason = selected.map_or(BoundaryReason::MissingEvidence, |(b, p)| {
                 boundary_reason(b, p)
             });

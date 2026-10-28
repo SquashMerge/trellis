@@ -670,3 +670,193 @@ fn answer_facts_replay_every_reduced_max_calls_without_sql() {
     let unread = "sid:v1:ffffffffffffffffffffffffffffffff";
     assert!(answer.facts.locate(unread).is_err());
 }
+
+fn cli(home: &Path, args: &[&str]) -> serde_json::Value {
+    let mut cmd = trellis::testing::owned(Command::new(env!("CARGO_BIN_EXE_trellis")));
+    let output = cmd
+        .env("HOME", home)
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("daemon.pid"))
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .stdin(std::process::Stdio::null())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// A real SCIP capture of `run() -> target()` at r1, joined to a retained r1 native snapshot.
+fn import_scip_capture(home: &Path, root: &Path, native: &trellis::native_evidence::Artifact) {
+    use protobuf::{EnumOrUnknown, Message};
+    use trellis::native_ids;
+    let a = "function run(){ target(); }\n";
+    let b = "function target(){ return 1; }\n";
+    let mut binary = scip::types::Index::new();
+    for (path, text) in [("src/A.js", a), ("src/B.js", b)] {
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = path.into();
+        doc.language = "javascript".into();
+        doc.position_encoding = EnumOrUnknown::from_i32(2);
+        let start = text.find("target").unwrap();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, start as i32, (start + 6) as i32];
+        occurrence.symbol = "pkg target.".into();
+        occurrence.symbol_roles = if path.ends_with("A.js") { 0 } else { 1 };
+        occurrence.syntax_kind = EnumOrUnknown::from_i32(0);
+        if path.ends_with("A.js") {
+            occurrence.enclosing_range = vec![0, start as i32, (start + 8) as i32];
+            let start = text.find("run").unwrap();
+            let mut independent = scip::types::Occurrence::new();
+            independent.range = vec![0, start as i32, (start + 3) as i32];
+            independent.symbol = "pkg run.".into();
+            independent.symbol_roles = 1;
+            independent.syntax_kind = EnumOrUnknown::from_i32(0);
+            doc.occurrences.push(independent);
+            let mut info = scip::types::SymbolInformation::new();
+            info.symbol = "pkg run.".into();
+            info.kind = EnumOrUnknown::from_i32(26);
+            info.display_name = "run".into();
+            doc.symbols.push(info);
+        } else {
+            let mut info = scip::types::SymbolInformation::new();
+            info.symbol = "pkg target.".into();
+            info.kind = EnumOrUnknown::from_i32(26);
+            info.display_name = "target".into();
+            doc.symbols.push(info);
+        }
+        doc.occurrences.push(occurrence);
+        binary.documents.push(doc);
+    }
+    let bytes = binary.write_to_bytes().unwrap();
+    std::fs::write(root.join("artifact.scip"), &bytes).unwrap();
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .unwrap();
+    let producer = profile["semanticProducers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "scip-typescript")
+        .unwrap();
+    let documents: Vec<_> = native
+        .revision
+        .documents
+        .iter()
+        .map(|d| serde_json::json!({"language":d.key.language,"relativePath":d.key.path,"contentHash":d.content_hash}))
+        .collect();
+    let manifest_hash = native_ids::digest(
+        b"",
+        &native_ids::canonical(&serde_json::json!(
+            native
+                .revision
+                .documents
+                .iter()
+                .map(|d| serde_json::json!({"document":d.key,"contentHash":d.content_hash}))
+                .collect::<Vec<_>>()
+        )),
+    );
+    let manifest = serde_json::json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
+      "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
+      "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
+      "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
+      "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
+      "sourceDocuments":documents,"documents":documents,"exclusions":[],
+      "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":"javascript","documents":["src/A.js","src/B.js"]}]});
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    std::fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
+    cli(
+        home,
+        &[
+            "semantic",
+            "import",
+            "--workspace",
+            root.to_str().unwrap(),
+            "--scip",
+            root.join("artifact.scip").to_str().unwrap(),
+            "--manifest",
+            root.join("manifest.json").to_str().unwrap(),
+            "--profile",
+            "mac-mini-m5-pro-v1",
+            "--producer",
+            "scip-typescript",
+            "--manifest-sha256",
+            &native_ids::digest(b"", &manifest_bytes),
+        ],
+    );
+}
+
+#[test]
+fn rejoined_binding_on_edited_workspace_is_a_stale_boundary_with_its_binding() {
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let temp = tempfile::Builder::new()
+        .prefix("graph-rejoin-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let root = temp.path().join("checkout");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(".gitignore"), "artifact.scip\nmanifest.json\n").unwrap();
+    std::fs::write(root.join("src/A.js"), "function run(){ target(); }\n").unwrap();
+    std::fs::write(root.join("src/B.js"), "function target(){ return 1; }\n").unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
+    let root_string = root.to_str().unwrap();
+    let r1: trellis::model::IndexPin = serde_json::from_value(
+        cli(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
+    )
+    .unwrap();
+    let (cache, data) = if cfg!(target_os = "macos") {
+        (
+            home.join("Library/Caches/dev.squashmerge.trellis"),
+            home.join("Library/Application Support/dev.squashmerge.trellis"),
+        )
+    } else {
+        (
+            home.join(".cache/trellis"),
+            home.join(".local/share/trellis"),
+        )
+    };
+    let open = || {
+        Store::open(
+            TopologyRoots::isolated_for_tests(cache.clone(), data.clone()),
+            WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
+        )
+        .unwrap()
+    };
+    let (r1_native, _) = open().retained_native_snapshot_at(r1).unwrap();
+    import_scip_capture(&home, &root, &r1_native);
+
+    std::fs::write(root.join("src/B.js"), "function target(){ return 2; }\n").unwrap();
+    let r2: trellis::model::IndexPin = serde_json::from_value(
+        cli(&home, &["index", "--workspace", root_string])["publishedRevision"].clone(),
+    )
+    .unwrap();
+    let store = open();
+    let (r2_native, _) = store.retained_native_snapshot_at(r2).unwrap();
+    let run_id = syntax_id(&r2_native, "run");
+    let producer = store.semantic_at(r2).unwrap().producers[0].id.clone();
+    let mut q = query(&run_id, true);
+    q.semantic_producer_id = Some(producer);
+    let result = result(run(&store, &q).unwrap());
+
+    assert_eq!(result.edges.len(), 1);
+    let edge = &result.edges[0];
+    assert_eq!(edge.visit, Visit::Boundary);
+    assert_eq!(edge.boundary_reason, BoundaryReason::Stale);
+    let binding = edge.binding.as_ref().expect("rejoined binding is attached");
+    let proof = result
+        .provenance
+        .iter()
+        .find(|p| p.id == binding.provenance_id)
+        .expect("binding provenance is returned");
+    assert!(proof.derived_from.is_some());
+    assert_eq!(proof.freshness, s::Freshness::PossiblyStale);
+    assert!(warning_keys(&result).contains(&(WarningCode::StaleEvidence, None)));
+    assert!(result.partial);
+}

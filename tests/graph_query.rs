@@ -1581,3 +1581,63 @@ fn out_of_scope_document_is_missing_evidence_without_row() {
     assert!(r.warnings.is_empty());
     assert!(r.partial);
 }
+
+#[test]
+fn binding_with_anchor_hash_unlike_provenance_hash_is_still_classified_by_freshness() {
+    for (freshness, expect_pid) in [(Freshness::Stale, true), (Freshness::PossiblyStale, false)] {
+        let mut w = world(true);
+        w.decl(A, "src/lib.rs");
+        w.decl(B, "src/lib.rs");
+        w.call(A, 10, 10);
+        w.bind(
+            10,
+            Bind {
+                freshness,
+                prov: Some("pe".into()),
+                ..direct(B)
+            },
+        );
+        for binding in &mut w.doc("src/lib.rs").semantic.as_mut().unwrap().call_bindings {
+            binding.join.anchor.content_hash = "current".into();
+        }
+        let mut facts = w.build();
+        let req = request(A, true);
+        let r = run(&mut facts, &req);
+        assert_eq!(edges(&r), [(10, A, None, Visit::Boundary, Stale)]);
+        assert!(r.edges[0].binding.is_some());
+        assert!(r.partial);
+        assert_eq!(
+            keys(&r.warnings),
+            [(WarningCode::StaleEvidence, expect_pid.then(|| "pe".into()))]
+        );
+    }
+}
+
+#[test]
+fn two_bindings_for_one_call_are_typed_integrity_corruption() {
+    let mut w = world(true);
+    w.decl(A, "src/lib.rs");
+    w.decl(B, "src/lib.rs");
+    w.call(A, 10, 10);
+    w.bind(
+        10,
+        Bind {
+            prov: Some("p1".into()),
+            ..direct(B)
+        },
+    );
+    w.bind(
+        10,
+        Bind {
+            prov: Some("p2".into()),
+            ..direct(B)
+        },
+    );
+    let mut facts = w.build();
+    let error =
+        evaluate(&request(A, true), &mut facts).expect_err("no answer for ambiguous binding rows");
+    assert!(
+        error.downcast_ref::<GraphIntegrity>().is_some(),
+        "{error:#}"
+    );
+}
