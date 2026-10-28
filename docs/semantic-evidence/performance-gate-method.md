@@ -13,8 +13,9 @@ One contiguous interval per repetition, from the moment the full native
 `trellis semantic import --workspace W --batch <descriptor> --batch-sha256 <sha>`.
 It includes native capture and indexing, semantic admission, decode, join, import,
 SQLite publication and FIFO waits. `interval = t2.end - (t1.end - t1.duration)`
-from monotonic clocks; no runner work sits between the two commands and component
-times are never summed.
+from monotonic clocks; only #90 `command()` bookkeeping (output read-back and observation
+records, milliseconds) runs between the two commands, inside the interval, so it
+only lengthens it; component times are never summed.
 
 Excluded and recorded separately: cohort generation, artifact generation, the
 header probe, batch preparation, daemon start, post-run validation and daemon stop.

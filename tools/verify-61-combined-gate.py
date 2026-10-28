@@ -279,8 +279,8 @@ def preflight(args, campaign_dir, smoke, capture_fn=capture):
     inventory = None if smoke else host_inventory(campaign_dir, capture_fn)
     reference = False if smoke or profile["modelIdentifier"] is None else is_reference(profile, inventory)
     campaign = {
-        "argv": ["--campaign-dir", "<campaign-dir>", "--smoke"] if smoke
-        else [str(arg) for arg in sys.argv[1:]],
+        "argv": [sys.executable, str(Path(__file__).resolve())]
+        + (["--campaign-dir", "<campaign-dir>", "--smoke"] if smoke else [str(arg) for arg in sys.argv[1:]]),
         "source": {"head": head, "treeClean": tree_clean},
         "binary": binary, "toolchain": toolchain, "hashes": file_hashes(),
         "decoderVersion": m.DECODER_VERSION, "schemaVersion": m.SCHEMA_VERSION,
@@ -398,6 +398,9 @@ def write_batch_summary(workspace, descriptor_header, sources, coverage, artifac
 
 # ---------------------------------------------------------------------- sampler
 
+STAGE_PREFIX = "semantic-stage-"
+
+
 class StorageSampler:
     """Poll database, WAL, SHM and stage-directory bytes every 50 ms, plus one final stat."""
     NAMES = ("index.db", "index.db-wal", "index.db-shm")
@@ -412,7 +415,7 @@ class StorageSampler:
     def sample(self):
         sqlite_bytes = stage_bytes = 0
         for directory, _dirs, files in os.walk(self.root):
-            staged = any(part.startswith("stage") for part in Path(directory).relative_to(self.root).parts)
+            staged = any(part.startswith(STAGE_PREFIX) for part in Path(directory).relative_to(self.root).parts)
             for name in files:
                 try:
                     size = os.stat(os.path.join(directory, name)).st_size
@@ -553,10 +556,8 @@ def sqlite_steady(db_path):
         pages = db.execute("PRAGMA page_count").fetchone()[0]
         page_size = db.execute("PRAGMA page_size").fetchone()[0]
         free = db.execute("PRAGMA freelist_count").fetchone()[0]
-    sizes_after = {name: (db_path.parent / name).stat().st_size if (db_path.parent / name).exists() else 0
-                   for name in ("index.db", "index.db-wal", "index.db-shm")}
-    return {"db": sizes_after["index.db"], "wal": sizes_after["index.db-wal"],
-            "shm": sizes_after["index.db-shm"], "total": sum(sizes_after.values()),
+    return {"db": sizes["index.db"], "wal": sizes["index.db-wal"], "shm": sizes["index.db-shm"],
+            "total": sum(sizes.values()), "measuredBeforeRunnerOpen": True,
             "pageBytes": pages * page_size, "freelistCount": free}, sizes
 
 
@@ -745,7 +746,7 @@ def smoke_batch(campaign_dir, prepared, cohort, profile):
     inventory = prepared["small"]["inventory"]
     ordinals = {(d["language"], d["relativePath"]): d["artifact"] for d in inventory["documents"]}
     if {(r["language"], r["relativePath"]) for r in rows} != set(ordinals):
-        raise GateFault("smoke workspace differs from the artifact inventory documents")
+        raise GateFault("preflight: smoke workspace differs from the artifact inventory documents")
     sources = sorted(({"byteLength": (workspace / r["relativePath"]).stat().st_size, **r} for r in rows),
                      key=batch.sort_key)
     coverage = [{"artifact": ordinals[(r["language"], r["relativePath"])], "exclusion": None,
@@ -796,6 +797,8 @@ def run_campaign(args):
                     reasons.append(f"fault: {faulted}")
         except GateFault as fault:
             reasons.append(str(fault))
+        except Exception as error:
+            reasons.append(f"preflight: preparation failed: {error!r}")
     report = build_report(campaign, policy_read, policy_json, cohorts_json, preparation, sizes, reasons, smoke)
     write_report(campaign_dir, report)
     return report

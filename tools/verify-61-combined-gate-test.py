@@ -166,17 +166,20 @@ class Campaign(unittest.TestCase):
             self.assertEqual(daemon.proc.stdout.readline().strip(), "ready")
             with patch.object(M, "stop_home_processes"), patch.object(M, "election_free", return_value=True):
                 daemon.stop()
+            daemon.proc.stdout.close()
             self.assertGreaterEqual(daemon.rusage["maxRssBytes"], 96 * 2**20)
 
     def test_sqlite_peak_sampler_records_database_wal_shm_high_water(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "idx").mkdir()
+            (root / "idx/semantic-stage-req1-inc1").mkdir()
             (root / "idx/stage-1").mkdir()
             (root / "idx/index.db").write_bytes(b"x" * 100)
             (root / "idx/index.db-wal").write_bytes(b"x" * 50)
             (root / "idx/index.db-shm").write_bytes(b"x" * 10)
-            (root / "idx/stage-1/rows").write_bytes(b"x" * 70)
+            (root / "idx/semantic-stage-req1-inc1/rows").write_bytes(b"x" * 70)
+            (root / "idx/stage-1/rows").write_bytes(b"x" * 888)
             (root / "idx/other").write_bytes(b"x" * 999)
             sampler = GATE.StorageSampler(root, interval=0.01).start()
             (root / "idx/index.db-wal").write_bytes(b"x" * 500)
@@ -186,6 +189,21 @@ class Campaign(unittest.TestCase):
             self.assertEqual(peak["total"], 610)
             self.assertEqual(sampler.stage_peak, 70)
             self.assertEqual(peak["method"], "poll 50 ms plus final stat")
+
+    def test_sqlite_steady_reports_sizes_before_runner_opens_database(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "index.db"
+            db = sqlite3.connect(path)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE t(x)")
+            db.commit()
+            db.close()
+            for suffix in ("-wal", "-shm"):
+                Path(str(path) + suffix).unlink(missing_ok=True)
+            steady, _ = GATE.sqlite_steady(path)
+            self.assertEqual(steady["wal"], 0)
+            self.assertEqual(steady["shm"], 0)
+            self.assertEqual(steady["total"], steady["db"])
 
     def test_storage_ratio_is_not_measured_until_denominator_ratified(self):
         block = GATE.storage_block({"total": 10}, {"total": 15}, 0, {})
