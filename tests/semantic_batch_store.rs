@@ -1165,6 +1165,15 @@ fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
                 world.republish();
             }
             let mutations = DestinationMutations::default();
+            let codes = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let seen = codes.clone();
+            testing::before_join_closure(move |conn| {
+                let mut statement = conn.prepare("SELECT code FROM f_diag").unwrap();
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap();
+                seen.borrow_mut().extend(rows.map(Result::unwrap));
+            });
             let (mut admitted, _, _) = world
                 .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
                 .unwrap_or_else(|error| panic!("{case}: {error:#}"));
@@ -1176,6 +1185,26 @@ fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
             } else {
                 assert!(!staged.declaration_bindings.is_empty(), "{case}");
                 assert!(!staged.references.is_empty(), "{case}");
+            }
+            if fixture.name.starts_with("method multiplicity") {
+                for coverage in [&staged.coverage, &memory.coverage] {
+                    let doc = coverage
+                        .iter()
+                        .find(|c| c.document_path == "D.java")
+                        .unwrap();
+                    assert_eq!(
+                        doc.state,
+                        trellis::semantic_evidence::CoverageState::Partial
+                    );
+                }
+                assert!(
+                    codes
+                        .borrow()
+                        .iter()
+                        .any(|c| c == "unmeasurable_override_endpoint"),
+                    "{case}: {:?}",
+                    codes.borrow()
+                );
             }
             if fixture.name.starts_with("java override") {
                 assert!(
@@ -1324,6 +1353,26 @@ fn competing_definitions_across_artifacts_stay_ambiguous() {
     );
     assert_eq!(reference.candidates.len(), 2);
     assert!(reference.declared_target.is_none());
+}
+
+#[test]
+fn duplicate_symbol_key_within_one_artifact_is_rejected_typed() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let b = b.symbol("pkg target.", 12, &[]);
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let error = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("duplicate semantic symbol key"),
+        "{error:#}"
+    );
 }
 
 #[test]

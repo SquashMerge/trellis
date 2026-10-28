@@ -1280,7 +1280,7 @@ fn validate_symbol_row(
     s: &Symbol,
     p: &Provenance,
     env: &RowEnv<'_>,
-    symbols: &mut BTreeSet<(String, Vec<u8>)>,
+    symbols: &mut BTreeSet<(String, String, Vec<u8>)>,
 ) -> Result<()> {
     let RowEnv {
         revision,
@@ -1326,6 +1326,10 @@ fn validate_symbol_row(
     ensure!(
         symbols.insert((
             p.producer_id.clone(),
+            p.basis
+                .as_ref()
+                .map(|basis| basis.artifact_hash.clone())
+                .unwrap_or_default(),
             native_ids::canonical(&serde_json::to_value(&s.key)?)
         )),
         "duplicate semantic symbol key"

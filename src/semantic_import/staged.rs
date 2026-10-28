@@ -99,7 +99,8 @@ pub(super) struct JoinCtx<'a> {
     counters: RefCell<BatchCounters>,
     cache: RefCell<DocCache>,
     rows: Cell<u64>,
-    output_bytes: Cell<u64>,
+    /// The stage file size when the join started, the base of the output-bytes meter.
+    stage_base: u64,
     mutations: DestinationMutations,
     cancel: CancelFlag,
 }
@@ -125,20 +126,29 @@ impl JoinCtx<'_> {
         if rows > self.limits.staged_rows {
             return Err(ScipCaptureError::LimitExceeded("staged rows".into()).into());
         }
+        if rows.is_multiple_of(OUTPUT_CHECK_ROWS) {
+            self.check_output()?;
+        }
         Ok(())
     }
 
-    /// Accounts the JSON body bytes of one `out_*` row. This meters the validated rows the join
-    /// publishes, not the stage file's page growth: the index, work and fact tables are bounded
-    /// by `staged_rows`, and the stage directory by the staging budget.
-    fn output(&self, bytes: usize) -> Result<()> {
-        let total = self.output_bytes.get().saturating_add(bytes as u64);
-        self.output_bytes.set(total);
-        if total > self.limits.output_bytes {
+    /// Meters the stage file's growth since the join started (page count times page size, so
+    /// indexes and work tables count), against the encoded-output limit.
+    fn check_output(&self) -> Result<()> {
+        if stage_bytes(self.conn)?.saturating_sub(self.stage_base) > self.limits.output_bytes {
             return Err(ScipCaptureError::LimitExceeded("output bytes".into()).into());
         }
         Ok(())
     }
+}
+
+/// Rows between output-bytes checks.
+const OUTPUT_CHECK_ROWS: u64 = 10_000;
+
+fn stage_bytes(conn: &Connection) -> Result<u64> {
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    Ok(u64::try_from(pages)?.saturating_mul(u64::try_from(size)?))
 }
 
 type GroupKey = (u8, i64);
@@ -2072,9 +2082,8 @@ impl StagedJoin<'_> {
             .map(|claim| self.key(&claim.language, &claim.path)))
     }
 
-    fn emit(&self, sql: &str, values: &[&dyn rusqlite::ToSql], bytes: usize) -> Result<()> {
+    fn emit(&self, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<()> {
         self.ctx.row()?;
-        self.ctx.output(bytes)?;
         self.conn().prepare_cached(sql)?.execute(values)?;
         Ok(())
     }
@@ -2117,7 +2126,6 @@ impl StagedJoin<'_> {
                 self.emit(
                     "INSERT INTO out_symbols VALUES(?1,?2,?3)",
                     &[&self.next_ord(SYMBOLS), &symbol.provenance_id, &body],
-                    body.len(),
                 )?;
             } else if let Some(claim) = self.filtered.proof(&symbol.provenance_id)? {
                 self.omit(&claim.language, &claim.path)?;
@@ -2161,7 +2169,6 @@ impl StagedJoin<'_> {
             self.emit(
                 "INSERT INTO out_declaration_bindings VALUES(?1,?2,?3)",
                 &[&self.next_ord(BINDINGS), &binding.provenance_id, &body],
-                body.len(),
             )?;
         }
         Ok(())
@@ -2372,7 +2379,6 @@ impl StagedJoin<'_> {
                     &reference.provenance_id,
                     &body,
                 ],
-                body.len(),
             )?;
         }
         Ok(())
@@ -2423,7 +2429,6 @@ impl StagedJoin<'_> {
             self.emit(
                 "INSERT INTO out_call_bindings VALUES(?1,?2,?3)",
                 &[&self.next_ord(CALLS), &call.provenance_id, &body],
-                body.len(),
             )?;
         }
         Ok(())
@@ -2464,7 +2469,6 @@ impl StagedJoin<'_> {
                         &relationship.provenance_id,
                         &body,
                     ],
-                    body.len(),
                 )?;
             } else {
                 self.omit(&document.language, &document.path)?;
@@ -2600,7 +2604,6 @@ impl StagedJoin<'_> {
                     &claim.fact_digest,
                     &body,
                 ],
-                body.len(),
             )?;
         }
         Ok(())
@@ -2720,7 +2723,6 @@ impl StagedJoin<'_> {
             self.emit(
                 "INSERT INTO out_coverage VALUES(?1,?2,?3,?4)",
                 &[&self.next_ord(COVERAGE), &doc.language, &doc.path, &body],
-                body.len(),
             )?;
             let mut counts = [0u64; 5];
             let mut statement = conn.prepare_cached(
@@ -2763,6 +2765,7 @@ impl StagedJoin<'_> {
     }
 
     fn closure(&self) -> Result<()> {
+        self.ctx.check_output()?;
         let conn = self.conn();
         let count = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |row| row.get(0))?) };
         for table in [
@@ -2803,6 +2806,12 @@ impl StagedJoin<'_> {
                 "SELECT COUNT(*) FROM (SELECT 1 FROM out_type_relationships GROUP BY provenance_id, \
                  json_extract(body,'$.kind'), json_extract(body,'$.source'), json_extract(body,'$.target') HAVING COUNT(*)>1)",
                 "duplicate relationship fact",
+            ),
+            (
+                "SELECT COUNT(*) FROM (SELECT 1 FROM out_symbols s JOIN out_provenance p \
+                 ON p.provenance_id=s.provenance_id \
+                 GROUP BY p.artifact, json_extract(s.body,'$.key') HAVING COUNT(*)>1)",
+                "duplicate semantic symbol key",
             ),
             (
                 "SELECT COUNT(*) FROM out_provenance p WHERE NOT EXISTS (SELECT 1 FROM out_coverage c \
@@ -2972,7 +2981,7 @@ pub fn join_staged(
             ..DocCache::default()
         }),
         rows: Cell::new(0),
-        output_bytes: Cell::new(0),
+        stage_base: stage_bytes(parts.conn)?,
         mutations: if shared {
             DestinationMutations::default()
         } else {
