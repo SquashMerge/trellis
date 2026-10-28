@@ -15,8 +15,11 @@ use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
     scip_raw::ScipCaptureError,
     semantic_batch::{
-        AdmittedBatch, BatchCounters, BatchLimits, StageOwner, limits, stage_batch, testing,
+        AdmittedBatch, BatchCounters, BatchLimits, LookupBudget, StageOwner,
+        descriptor::Descriptor, limits, stage_batch, testing,
     },
+    semantic_evidence::SemanticPublication,
+    semantic_import::{DestinationMutations, join_staged, rejoin_inventory},
     store::{
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
@@ -581,4 +584,622 @@ fn cache_budget_fits_sixty_four_mebibytes() {
         total <= kib(BatchLimits::PRODUCTION.cache_bytes),
         "{total} KiB"
     );
+}
+
+impl World {
+    fn republish(&self) {
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(self.root.clone()),
+            self.store.root_id(),
+            &self.cancel,
+            |_| {},
+        )
+        .unwrap();
+        let leader = self.store.publication_for_tests().unwrap();
+        self.store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                &leader,
+                self.store.index_baseline().unwrap(),
+                &self.cancel,
+            )
+            .unwrap();
+    }
+
+    fn join_with(
+        &self,
+        descriptor: &(PathBuf, String),
+        limits: &BatchLimits,
+        mutations: DestinationMutations,
+    ) -> anyhow::Result<(
+        AdmittedBatch,
+        trellis::semantic_batch::JoinedBatch,
+        BatchCounters,
+    )> {
+        testing::stage_and_join_admitted(
+            &self.store,
+            &self.root,
+            &descriptor.0,
+            &descriptor.1,
+            limits,
+            mutations,
+            &self.cancel,
+        )
+    }
+
+    /// The publication the in-memory join builds from the same batch bytes.
+    fn memory_publication(
+        &self,
+        descriptor: &(PathBuf, String),
+        mutations: DestinationMutations,
+    ) -> SemanticPublication {
+        let bytes = fs::read(&descriptor.0).unwrap();
+        let parsed = Descriptor::parse(&bytes).unwrap();
+        let pin = self
+            .store
+            .retained_native_pin_for(&parsed.source_revision, &parsed.source_set.id)
+            .unwrap();
+        let (r1, r1_sources) = self.store.retained_native_snapshot_at(pin).unwrap();
+        let head = self.store.index_baseline().unwrap();
+        let (mut destination, destination_sources) =
+            self.store.retained_native_snapshot_at(head).unwrap();
+        if r1.revision.id != destination.revision.id {
+            mutations.apply(&mut destination.declarations, &mut destination.references);
+        }
+        let pages: Vec<Vec<u8>> = parsed
+            .pages
+            .iter()
+            .map(|page| fs::read(self.root.join(&page.relative_path)).unwrap())
+            .collect();
+        let artifacts: Vec<Vec<u8>> = parsed
+            .artifacts
+            .iter()
+            .map(|artifact| fs::read(self.root.join(&artifact.relative_path)).unwrap())
+            .collect();
+        let page_refs: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let artifact_refs: Vec<&[u8]> = artifacts.iter().map(Vec::as_slice).collect();
+        let inventories = testing::admit_in_memory(
+            &self.root,
+            &r1,
+            &r1_sources,
+            &bytes,
+            &page_refs,
+            &artifact_refs,
+            &self.cancel,
+        )
+        .unwrap();
+        let mut merged = inventories[0].clone();
+        merged.claims = inventories
+            .iter()
+            .flat_map(|inventory| inventory.claims.clone())
+            .collect();
+        merged.claims.sort_by(|a, b| {
+            (
+                a.language.as_bytes(),
+                a.envelope.relative_path.as_bytes(),
+                &a.canonical_bytes,
+            )
+                .cmp(&(
+                    b.language.as_bytes(),
+                    b.envelope.relative_path.as_bytes(),
+                    &b.canonical_bytes,
+                ))
+        });
+        merged.artifact_hashes = inventories
+            .iter()
+            .flat_map(|inventory| inventory.artifact_hashes.clone())
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        merged.exclusions = inventories
+            .iter()
+            .flat_map(|inventory| inventory.exclusions.clone())
+            .filter(|e| seen.insert((e.language.clone(), e.relative_path.clone())))
+            .collect();
+        let producer = parsed.check_producer().unwrap().producer();
+        let basis = r1
+            .revision
+            .documents
+            .iter()
+            .filter(|document| {
+                producer.languages.iter().any(|language| {
+                    serde_json::to_value(language).unwrap() == json!(document.key.language)
+                })
+            })
+            .map(|document| {
+                let artifact = parsed
+                    .artifacts
+                    .iter()
+                    .find(|a| a.language == document.key.language)
+                    .unwrap_or(&parsed.artifacts[0]);
+                (
+                    document.key.clone(),
+                    trellis::semantic_evidence::SemanticBasis {
+                        producer_id: producer.id.clone(),
+                        producer_version: producer.version.clone(),
+                        producer_hash: producer.executable_hash.clone(),
+                        artifact_hash: artifact.sha256.clone(),
+                        language: serde_json::from_value(json!(document.key.language)).unwrap(),
+                        source_set_id: document.key.source_set_id.clone(),
+                        revision_id: r1.revision.id.clone(),
+                        source_manifest_hash: merged.source_manifest_hash.clone(),
+                        toolchain_hash: r1.revision.toolchain_hash.clone(),
+                        config_hash: r1.revision.config_hash.clone(),
+                        dependency_hash: r1.revision.dependency_hash.clone(),
+                        lookup_dependencies: vec![],
+                    },
+                )
+            })
+            .collect();
+        rejoin_inventory(
+            &merged,
+            &r1,
+            &r1_sources,
+            &destination,
+            &destination_sources,
+            producer,
+            &basis,
+            parsed.producer.position_encoding,
+        )
+        .unwrap()
+        .publication
+    }
+}
+
+fn assert_same_publication(staged: &SemanticPublication, memory: &SemanticPublication, case: &str) {
+    assert_eq!(staged.coverage, memory.coverage, "{case}: coverage");
+    assert_eq!(staged.provenance, memory.provenance, "{case}: provenance");
+    assert_eq!(staged.symbols, memory.symbols, "{case}: symbols");
+    assert_eq!(
+        staged.declaration_bindings, memory.declaration_bindings,
+        "{case}: declaration bindings"
+    );
+    assert_eq!(staged.references, memory.references, "{case}: references");
+    assert_eq!(
+        staged.call_bindings, memory.call_bindings,
+        "{case}: call bindings"
+    );
+    assert_eq!(
+        staged.type_relationships, memory.type_relationships,
+        "{case}: type relationships"
+    );
+}
+
+/// Byte-offset `(line, column)` of every `needle` in `source`.
+fn positions(source: &str, needle: &str) -> Vec<(i32, i32)> {
+    source
+        .match_indices(needle)
+        .map(|(start, _)| {
+            let prefix = &source[..start];
+            let line = prefix.bytes().filter(|b| *b == b'\n').count() as i32;
+            let column = prefix.rsplit('\n').next().unwrap().len() as i32;
+            (line, column)
+        })
+        .collect()
+}
+
+fn calls_source(count: usize, separator: &str) -> String {
+    format!(
+        "function run(){{ /* \u{1F600} */{separator}{}{separator}}}",
+        format!("f();{separator}").repeat(count)
+    )
+}
+
+fn calls_doc(source: &str) -> DocSpec {
+    let mut doc = DocSpec::new("A.js");
+    for (line, column) in positions(source, "f()") {
+        doc = doc.occurrence(
+            &[line, column, column + 1],
+            &[line, column, column + 3],
+            "external pkg f.",
+            0,
+        );
+    }
+    doc
+}
+
+const DEFINITIONS_A: &str = "function run(){ target(); }\n";
+const DEFINITIONS_B: &str = "function target(){ }\n";
+const JAVA_TYPES: &str = "class B {}\nclass A extends B {}\n";
+
+fn definitions_docs() -> (DocSpec, DocSpec) {
+    (
+        DocSpec::new("src/A.js")
+            .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+            .occurrence(&[0, 16, 22], &[0, 16, 24], "pkg target.", 0)
+            .symbol("pkg run.", 17, &[]),
+        DocSpec::new("src/B.js")
+            .occurrence(&[0, 9, 15], &[], "pkg target.", 1)
+            .symbol("pkg target.", 17, &[]),
+    )
+}
+
+fn java_doc() -> DocSpec {
+    DocSpec::new("J.java")
+        .occurrence(&[0, 6, 7], &[], "pkg B#", 1)
+        .occurrence(&[1, 6, 7], &[], "pkg A#", 1)
+        .occurrence(&[1, 16, 17], &[], "pkg B#", 0)
+        .symbol("pkg B#", 7, &[])
+        .symbol("pkg A#", 7, &["pkg B#"])
+}
+
+fn write_files(root: &Path, files: &[(&str, &str)]) {
+    for (path, text) in files {
+        let file = root.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, text).unwrap();
+    }
+}
+
+fn one_artifact_per_language(world: &World, docs: Vec<(&str, Vec<DocSpec>)>) -> (PathBuf, String) {
+    let mut fixture = world.fixture();
+    for (language, specs) in docs {
+        fixture.artifact(language, specs);
+    }
+    world.write(&fixture)
+}
+
+fn definitions_world() -> World {
+    world(|root| {
+        write_files(
+            root,
+            &[("src/A.js", DEFINITIONS_A), ("src/B.js", DEFINITIONS_B)],
+        )
+    })
+}
+
+#[test]
+fn staged_and_memory_join_stores_produce_identical_publications() {
+    let check = |world: &World, descriptor: &(PathBuf, String), mutations, case: &str| {
+        let (mut admitted, _, _) = world
+            .join_with(descriptor, &BatchLimits::PRODUCTION, mutations)
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let memory = world.memory_publication(descriptor, mutations);
+        assert_same_publication(&staged, &memory, case);
+        (staged, memory)
+    };
+    for (separator, name) in [(" ", "single-line"), ("\r\n", "multi-line")] {
+        let source = calls_source(24, separator);
+        let world = world(|root| write_files(root, &[("A.js", &source)]));
+        let descriptor =
+            one_artifact_per_language(&world, vec![("javascript", vec![calls_doc(&source)])]);
+        let (staged, _) = check(&world, &descriptor, DestinationMutations::default(), name);
+        assert_eq!(staged.references.len(), 24, "{name}");
+        assert_eq!(staged.call_bindings.len(), 24, "{name}");
+    }
+    let hooks = [
+        DestinationMutations::default(),
+        DestinationMutations {
+            duplicate_b_target: true,
+            ..Default::default()
+        },
+        DestinationMutations {
+            duplicate_a_reference: true,
+            ..Default::default()
+        },
+        DestinationMutations {
+            missing_a_reference: true,
+            ..Default::default()
+        },
+    ];
+    let (a, b) = definitions_docs();
+    for (changed, label) in [(false, "same revision"), (true, "changed destination")] {
+        let world = definitions_world();
+        let descriptor =
+            one_artifact_per_language(&world, vec![("javascript", vec![a.clone(), b.clone()])]);
+        if changed {
+            write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+            world.republish();
+        }
+        for (index, hook) in hooks.iter().enumerate() {
+            let case = format!("{label}, hook {index}");
+            let (staged, _) = check(&world, &descriptor, *hook, &case);
+            if index == 0 {
+                assert!(
+                    staged.references.iter().any(|r| r.spelling == "target"),
+                    "{case}"
+                );
+            }
+        }
+    }
+    let world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
+    let descriptor = one_artifact_per_language(&world, vec![("java", vec![java_doc()])]);
+    let (staged, _) = check(
+        &world,
+        &descriptor,
+        DestinationMutations::default(),
+        "java types",
+    );
+    assert_eq!(staged.type_relationships.len(), 1);
+}
+
+#[test]
+fn batch_memory_high_water_is_one_unit_not_the_corpus() {
+    // 50 rows per page keeps every page ordinal one digit at both sizes, so page lengths match.
+    let run = |per_language: usize| {
+        let world = world(|root| uniform_workspace(root, &["java", "javascript"], per_language));
+        let mut fixture = world.fixture().rows_per_page(50);
+        for language in ["java", "javascript"] {
+            let docs = fixture.paths(language);
+            fixture.artifact(language, docs);
+        }
+        let descriptor = world.write(&fixture);
+        let mut limits = BatchLimits::PRODUCTION;
+        limits.document_cache_bytes = 65_536;
+        let (mut admitted, _, counters) = world
+            .join_with(&descriptor, &limits, DestinationMutations::default())
+            .unwrap();
+        (
+            counters,
+            claim_count(&mut admitted),
+            testing::whole_snapshot_reads(),
+        )
+    };
+    let (small, small_claims, small_reads) = run(50);
+    let (large, large_claims, large_reads) = run(200);
+    assert_eq!(large_claims, 4 * small_claims);
+    for (counters, reads) in [(&small, small_reads), (&large, large_reads)] {
+        assert_eq!(counters.live_page_buffers_high_water, 1);
+        assert_eq!(counters.live_unit_buffers_high_water, 1);
+        assert_eq!(counters.active_document_groups_high_water, 1);
+        assert!(counters.candidate_group_high_water <= 2);
+        assert!(counters.document_cache_high_water_bytes <= 65_536);
+        assert_eq!(reads, 0);
+    }
+    assert!(large.document_cache_high_water_bytes > 0);
+    assert_eq!(
+        small.page_buffer_high_water_bytes,
+        large.page_buffer_high_water_bytes
+    );
+    assert_eq!(
+        small.unit_buffer_high_water_bytes,
+        large.unit_buffer_high_water_bytes
+    );
+    assert_eq!(
+        small.unit_reservation_high_water_bytes,
+        large.unit_reservation_high_water_bytes
+    );
+}
+
+fn split_definitions(world: &World, swap: bool) -> (PathBuf, String) {
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture();
+    if swap {
+        fixture.artifact("javascript", vec![b]);
+        fixture.artifact("javascript", vec![a]);
+    } else {
+        fixture.artifact("javascript", vec![a]);
+        fixture.artifact("javascript", vec![b]);
+    }
+    world.write(&fixture)
+}
+
+fn target_reference(publication: &SemanticPublication) -> trellis::semantic_evidence::Reference {
+    publication
+        .references
+        .iter()
+        .find(|r| r.spelling == "target")
+        .cloned()
+        .expect("target reference")
+}
+
+#[test]
+fn cross_artifact_reference_resolves_internal_in_any_artifact_order() {
+    let world = definitions_world();
+    let mut targets = vec![];
+    for swap in [false, true] {
+        let descriptor = split_definitions(&world, swap);
+        let (mut admitted, _, _) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let publication = testing::staged_publication(&mut admitted).unwrap();
+        let reference = target_reference(&publication);
+        assert_eq!(
+            reference.resolution,
+            trellis::semantic_evidence::Resolution::Resolved,
+            "swap {swap}"
+        );
+        targets.push(reference.declared_target);
+    }
+    assert_eq!(targets[0], targets[1]);
+    assert!(matches!(
+        targets[0],
+        Some(trellis::semantic_evidence::Target::Internal { .. })
+    ));
+}
+
+#[test]
+fn competing_definitions_across_artifacts_stay_ambiguous() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/C.js", DEFINITIONS_B),
+            ],
+        )
+    });
+    let (a, b) = definitions_docs();
+    let c = DocSpec::new("src/C.js")
+        .occurrence(&[0, 9, 15], &[], "pkg target.", 1)
+        .symbol("pkg target.", 17, &[]);
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a, b]);
+    fixture.artifact("javascript", vec![c]);
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let publication = testing::staged_publication(&mut admitted).unwrap();
+    let reference = target_reference(&publication);
+    assert_eq!(
+        reference.resolution,
+        trellis::semantic_evidence::Resolution::Ambiguous
+    );
+    assert_eq!(reference.candidates.len(), 2);
+    assert!(reference.declared_target.is_none());
+}
+
+#[test]
+fn forged_derived_from_is_rejected_before_publication() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    testing::before_join_closure(|conn| {
+        conn.execute(
+            "UPDATE out_provenance SET derived_digest=?1 WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
+            ["0".repeat(64)],
+        )
+        .unwrap();
+    });
+    let error = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("derived provenance without staged claim"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn lookup_staged_row_and_output_limits_are_typed() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    for (name, edit) in [
+        (
+            "lookup steps",
+            (|l: &mut BatchLimits| l.lookup_steps = 3) as fn(&mut BatchLimits),
+        ),
+        ("staged rows", |l| l.staged_rows = 5),
+        ("output bytes", |l| l.output_bytes = 10),
+    ] {
+        let mut limits = BatchLimits::PRODUCTION;
+        edit(&mut limits);
+        let error = world
+            .join_with(&descriptor, &limits, DestinationMutations::default())
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(detail(&error), name, "{error:#}");
+    }
+    let mut counters = BatchCounters::default();
+    let mut admitted = world
+        .stage(&descriptor, &BatchLimits::PRODUCTION, &mut counters)
+        .unwrap();
+    let head = world.store.index_baseline().unwrap();
+    let mut join = |limits: &BatchLimits, budget: &mut LookupBudget| {
+        join_staged(
+            &mut admitted,
+            &world.store,
+            head,
+            limits,
+            budget,
+            &mut counters,
+            DestinationMutations::default(),
+            &world.cancel,
+        )
+    };
+    let mut probe = LookupBudget::new(&BatchLimits::PRODUCTION);
+    join(&BatchLimits::PRODUCTION, &mut probe).unwrap();
+    let one_attempt = probe.used();
+    assert!(one_attempt > 0);
+    let mut limits = BatchLimits::PRODUCTION;
+    limits.lookup_steps = one_attempt + one_attempt / 2;
+    let mut budget = LookupBudget::new(&limits);
+    join(&limits, &mut budget).unwrap();
+    let error = join(&limits, &mut budget).map(|_| ()).unwrap_err();
+    assert_eq!(detail(&error), "lookup steps");
+}
+
+#[test]
+fn a_new_destination_clears_the_destination_tables() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let mut counters = BatchCounters::default();
+    let mut admitted = world
+        .stage(&descriptor, &BatchLimits::PRODUCTION, &mut counters)
+        .unwrap();
+    let limits = BatchLimits::PRODUCTION;
+    let mut budget = LookupBudget::new(&limits);
+    let mut join = |admitted: &mut AdmittedBatch| {
+        join_staged(
+            admitted,
+            &world.store,
+            world.store.index_baseline().unwrap(),
+            &limits,
+            &mut budget,
+            &mut counters,
+            DestinationMutations::default(),
+            &world.cancel,
+        )
+        .unwrap()
+    };
+    let first = join(&mut admitted);
+    let rows = |admitted: &mut AdmittedBatch| -> (i64, i64) {
+        let conn = admitted.stage_mut().conn().unwrap();
+        (
+            conn.query_row("SELECT COUNT(*) FROM out_coverage", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM out_provenance", [], |r| r.get(0))
+                .unwrap(),
+        )
+    };
+    let (coverage, provenance) = rows(&mut admitted);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    let second = join(&mut admitted);
+    assert_ne!(
+        first.destination_revision_id(),
+        second.destination_revision_id()
+    );
+    let (coverage_after, provenance_after) = rows(&mut admitted);
+    assert_eq!(coverage_after, coverage + 1);
+    assert_eq!(provenance_after, provenance);
+}
+
+#[test]
+fn join_cursor_plans_use_no_temp_btree() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let conn = admitted.stage_mut().conn().unwrap();
+    for sql in testing::join_cursor_sql() {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params = vec![rusqlite::types::Value::Null; statement.parameter_count()];
+        let plan: Vec<String> = statement
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+            "{sql}: {plan:?}"
+        );
+    }
 }

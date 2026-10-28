@@ -701,19 +701,26 @@ pub(crate) fn validate_evidence_with_witnessed_raw(
 
 /// Validates one coverage row against the producers and the native revision. Returns the
 /// row's language string, which keys the coverage tuple.
+/// What a coverage row is checked against: the destination header and its document set.
+struct CoverageEnv<'a> {
+    revision_id: &'a str,
+    source_set_id: &'a str,
+    languages: &'a [String],
+    has_document: &'a dyn Fn(&str, &str) -> bool,
+}
+
 fn validate_coverage_row(
     row: &Coverage,
     producers: &BTreeMap<&str, &Producer>,
-    native: &native::Artifact,
+    env: &CoverageEnv<'_>,
 ) -> Result<String> {
-    let revision = &native.revision;
     text(&row.producer_id)?;
     path(&row.document_path)?;
     let producer = producers
         .get(row.producer_id.as_str())
         .context("dangling coverage producer")?;
     ensure!(
-        row.revision_id == revision.id && row.source_set_id == revision.source_set_id,
+        row.revision_id == env.revision_id && row.source_set_id == env.source_set_id,
         "foreign coverage tuple"
     );
     let lang = serde_json::to_value(row.language)?
@@ -722,13 +729,8 @@ fn validate_coverage_row(
         .to_owned();
     ensure!(
         producer.languages.contains(&row.language)
-            && native.source_set.languages.contains(&lang)
-            && revision
-                .documents
-                .iter()
-                .any(|d| d.key.source_set_id == row.source_set_id
-                    && d.key.language == lang
-                    && d.key.path == row.document_path),
+            && env.languages.contains(&lang)
+            && (env.has_document)(&lang, &row.document_path),
         "unsupported coverage document"
     );
     ordered(&row.supported_roles)?;
@@ -790,7 +792,7 @@ pub(crate) struct RawClaimDocument {
 }
 
 /// Resolves `(proof_id, record_kind, fact_digest)` to exactly one raw claim.
-type ClaimLookup<'a> = dyn Fn(&str, &str, &str) -> Result<RawClaimDocument> + 'a;
+pub(crate) type ClaimLookup<'a> = dyn Fn(&str, &str, &str) -> Result<RawClaimDocument> + 'a;
 
 /// Validates a provenance row's derivation: a derived proof resolves through `claims` to
 /// exactly one claim with the same kind and digest; any other proof belongs to the captured
@@ -1508,7 +1510,22 @@ fn validate_evidence_inner(
     }
     let mut coverage = BTreeMap::new();
     for row in &semantic.coverage {
-        let lang = validate_coverage_row(row, &producers, native)?;
+        let lang = validate_coverage_row(
+            row,
+            &producers,
+            &CoverageEnv {
+                revision_id: &revision.id,
+                source_set_id: &revision.source_set_id,
+                languages: &native.source_set.languages,
+                has_document: &|language, path| {
+                    revision.documents.iter().any(|d| {
+                        d.key.source_set_id == revision.source_set_id
+                            && d.key.language == language
+                            && d.key.path == path
+                    })
+                },
+            },
+        )?;
         ensure!(
             coverage
                 .insert(
@@ -2000,6 +2017,243 @@ fn validate_evidence_inner(
         }
     }
     Ok(())
+}
+
+/// Per-row validation for rows a streaming join emits. It runs the same row validators as the
+/// whole-publication validator, against the batch header instead of a materialized revision.
+/// Rules that need the measured native facts of other documents are the join's own
+/// construction (it reads those facts) plus the caller's target lookups.
+pub(crate) struct EmissionValidator<'a> {
+    producer: &'a Producer,
+    captured: CapturedComponents,
+    revision: native::Revision,
+    languages: Vec<String>,
+    artifact_hashes: BTreeSet<String>,
+    manifest_hash: String,
+    producers: BTreeMap<&'a str, &'a Producer>,
+}
+
+/// The header values an emission validator needs.
+pub(crate) struct EmissionHeader<'a> {
+    pub producer: &'a Producer,
+    pub captured_revision: native::Revision,
+    pub destination_revision: native::Revision,
+    pub source_set_languages: Vec<String>,
+    pub artifact_hashes: BTreeSet<String>,
+    pub source_manifest_hash: String,
+}
+
+impl<'a> EmissionValidator<'a> {
+    pub(crate) fn new(header: EmissionHeader<'a>) -> Self {
+        let captured = CapturedComponents {
+            producer_executables: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            captured_revision: header.captured_revision,
+            native_toolchain: serde_json::Value::Null,
+            native_config: vec![],
+            native_dependencies: vec![],
+            requested_producers: vec![],
+            toolchain: vec![],
+            config: vec![],
+            dependency: vec![],
+            native_extraction_components: BTreeMap::new(),
+        };
+        Self {
+            producers: BTreeMap::from([(header.producer.id.as_str(), header.producer)]),
+            producer: header.producer,
+            captured,
+            revision: header.destination_revision,
+            languages: header.source_set_languages,
+            artifact_hashes: header.artifact_hashes,
+            manifest_hash: header.source_manifest_hash,
+        }
+    }
+
+    pub(crate) fn coverage(
+        &self,
+        row: &Coverage,
+        has_document: &dyn Fn(&str, &str) -> bool,
+    ) -> Result<()> {
+        validate_coverage_row(
+            row,
+            &self.producers,
+            &CoverageEnv {
+                revision_id: &self.revision.id,
+                source_set_id: &self.revision.source_set_id,
+                languages: &self.languages,
+                has_document,
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// Validates a derived proof. `claims` resolves `(proof, kind, digest)` to exactly one
+    /// staged claim, so a forged derivation fails before it can be published.
+    pub(crate) fn provenance(&self, p: &Provenance, claims: &ClaimLookup<'_>) -> Result<()> {
+        text(&p.id)?;
+        key(&p.document, &self.revision)?;
+        hash(&p.content_hash)?;
+        let identity = RawCaptureIdentity {
+            producer_id: &self.producer.id,
+            source_set_id: &self.captured.captured_revision.source_set_id,
+            captured_revision: &self.captured.captured_revision.id,
+        };
+        let claim_artifact =
+            validate_provenance_row(p, Some((&identity, claims)), &self.captured, &self.revision)?;
+        let basis = p
+            .basis
+            .as_ref()
+            .context("semantic proof requires captured basis")?;
+        validate_basis(
+            p,
+            basis,
+            self.producer,
+            &self.captured,
+            BasisArtifacts {
+                producer: Some(&self.artifact_hashes),
+                claim: claim_artifact.as_deref(),
+                raw_manifest_hash: None,
+            },
+            &self.manifest_hash,
+        )
+    }
+
+    fn check_target(&self, t: &Target) -> Result<()> {
+        match t {
+            Target::Internal {
+                syntax_id,
+                revision_id,
+                ..
+            } => {
+                sid(syntax_id)?;
+                ensure!(
+                    revision_id == &self.revision.id,
+                    "foreign internal target revision"
+                );
+                Ok(())
+            }
+            Target::External { symbol } => symbol_key(symbol, &self.revision),
+        }
+    }
+
+    fn check_targets(&self, items: &[Target]) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        let mut last: Option<Vec<u8>> = None;
+        for item in items {
+            self.check_target(item)?;
+            let bytes = native_ids::canonical(&serde_json::to_value(item)?);
+            ensure!(seen.insert(bytes.clone()), "duplicate semantic target");
+            ensure!(
+                last.as_ref().is_none_or(|previous| previous < &bytes),
+                "unsorted or duplicate semantic set"
+            );
+            last = Some(bytes);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn symbol(&self, row: &Symbol) -> Result<()> {
+        text(&row.provenance_id)?;
+        symbol_key(&row.key, &self.revision)?;
+        for item in &row.declarations {
+            self.check_target(item)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn declaration_binding(&self, b: &DeclarationBinding) -> Result<()> {
+        ensure!(
+            b.syntax_id.as_ref()
+                == (b.join.status == JoinStatus::Exact).then(|| &b.join.candidate_ids[0]),
+            "declaration binding ID mismatch"
+        );
+        ensure!(
+            b.join.status != JoinStatus::Exact || !b.symbols.is_empty(),
+            "exact binding without symbol"
+        );
+        let mut seen = BTreeSet::new();
+        for key_ in &b.symbols {
+            symbol_key(key_, &self.revision)?;
+            ensure!(
+                seen.insert(native_ids::canonical(&serde_json::to_value(key_)?)),
+                "duplicate binding symbol"
+            );
+        }
+        ensure!(
+            b.join.anchor.revision_id == self.captured.captured_revision.id
+                || b.join.anchor.revision_id == self.revision.id,
+            "foreign declaration anchor revision"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn reference(&self, r: &Reference) -> Result<()> {
+        ensure!(
+            r.revision_id == self.revision.id,
+            "foreign reference revision"
+        );
+        sid(&r.owner_syntax_id)?;
+        occ(&r.id)?;
+        uint(r.ordinal)?;
+        ensure!(!r.spelling.is_empty(), "empty reference spelling");
+        ensure!(
+            native::lookup(&r.document.language, &r.spelling)? == r.lookup_key,
+            "reference lookup mismatch"
+        );
+        ordered(&r.roles)?;
+        ensure!(
+            !r.roles.is_empty()
+                && (r.document.language != "java" || !r.roles.contains(&Role::Alias)),
+            "invalid reference roles"
+        );
+        ensure!(
+            !r.roles.contains(&Role::Alias) || r.roles.contains(&Role::Definition),
+            "alias without definition"
+        );
+        ensure!(
+            (r.site == ReferenceSite::Declaration) == r.roles.contains(&Role::Definition),
+            "reference site/role mismatch"
+        );
+        resolution(r.resolution, &r.declared_target, &r.candidates)?;
+        if let Some(t) = &r.declared_target {
+            self.check_target(t)?;
+        }
+        self.check_targets(&r.candidates)
+    }
+
+    pub(crate) fn call_binding(&self, b: &CallBinding) -> Result<()> {
+        ensure!(
+            b.call_id.as_ref()
+                == (b.join.status == JoinStatus::Exact).then(|| &b.join.candidate_ids[0]),
+            "call binding ID mismatch"
+        );
+        resolution(b.resolution, &b.declared_target, &b.candidates)?;
+        if let Some(t) = &b.declared_target {
+            self.check_target(t)?;
+        }
+        self.check_targets(&b.candidates)?;
+        self.check_targets(&b.possible_dispatch)?;
+        ensure!(
+            !b.possible_dispatch_complete && b.stale_target != Some(true),
+            "unsupported dispatch completeness/stale target"
+        );
+        ensure!(
+            b.stale_target
+                == if matches!(b.declared_target, Some(Target::Internal { .. })) {
+                    Some(false)
+                } else {
+                    None
+                },
+            "stale target mismatch"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn type_relationship(&self, r: &TypeRelationship) -> Result<()> {
+        self.check_target(&r.source)?;
+        self.check_target(&r.target)
+    }
 }
 
 #[cfg(test)]

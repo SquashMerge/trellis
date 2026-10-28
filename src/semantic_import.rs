@@ -9,11 +9,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod join_store;
 mod memory;
+mod staged;
 use join_store::{
     BasisFor, JoinIndex, JoinSink, JoinStore, NativeFacts, OccurrenceRow, ProofIdentities,
     ProofRef, PublicationSink, RelationshipRow,
 };
 use memory::{MemoryJoinSink, MemoryJoinStore};
+#[cfg(feature = "test-support")]
+pub(crate) use staged::cursor_sql as staged_cursor_sql;
+pub use staged::join_staged;
+
+/// Per-document anchor candidates and capability families.
+pub(crate) type AnchorParts = (
+    BTreeMap<(usize, usize, semantic::JoinKind), BTreeSet<String>>,
+    BTreeMap<semantic::JoinKind, native::MeasurementSupport>,
+);
 
 type AnchorKey = (native::DocumentKey, usize, usize, semantic::JoinKind);
 type ScopedKey = (String, Option<native::DocumentKey>);
@@ -30,6 +40,7 @@ pub struct MeasuredFacts<'a> {
     declaration_names:
         BTreeMap<(native::DocumentKey, usize, usize, String), Vec<&'a native::Declaration>>,
     declaration_keys: BTreeMap<(native::DocumentKey, Vec<u8>), Vec<&'a native::Declaration>>,
+    by_document: BTreeMap<native::DocumentKey, Vec<&'a native::Declaration>>,
     calls: BTreeMap<String, Vec<&'a native::Call>>,
     references: BTreeMap<String, Vec<&'a native::Reference>>,
     support: BTreeMap<(native::DocumentKey, semantic::JoinKind), &'a native::MeasurementSupport>,
@@ -69,6 +80,7 @@ impl<'a> MeasuredFacts<'a> {
         let mut references: BTreeMap<String, Vec<&native::Reference>> = BTreeMap::new();
         let mut declaration_names: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut declaration_keys: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
+        let mut by_document: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut anchors: BTreeMap<AnchorKey, BTreeSet<String>> = BTreeMap::new();
         let mut insert = |doc: &native::DocumentKey, range: &native::Range, kind, id: &str| {
             anchors
@@ -78,6 +90,7 @@ impl<'a> MeasuredFacts<'a> {
         };
         for d in &native.declarations {
             declarations.entry(d.syntax_id.clone()).or_default().push(d);
+            by_document.entry(d.document.clone()).or_default().push(d);
             declaration_keys
                 .entry((
                     d.document.clone(),
@@ -236,6 +249,7 @@ impl<'a> MeasuredFacts<'a> {
             declarations,
             declaration_names,
             declaration_keys,
+            by_document,
             calls,
             references,
             support,
@@ -277,10 +291,6 @@ impl<'a> MeasuredFacts<'a> {
             .get(document)
             .context("foreign anchor document")?;
         let source = self.sources.get(document).context("missing anchor bytes")?;
-        source
-            .get(range.start..range.end)
-            .filter(|s| !s.is_empty())
-            .context("invalid UTF-8 scalar anchor")?;
         let ids = self
             .candidates
             .get(&(document.clone(), range.start, range.end, kind))
@@ -288,56 +298,97 @@ impl<'a> MeasuredFacts<'a> {
             .flat_map(|ids| ids.iter())
             .cloned()
             .collect::<Vec<_>>();
+        compose_join(
+            &self.native.revision.id,
+            doc,
+            source,
+            ids,
+            self.support.get(&(document.clone(), kind)).copied(),
+            range,
+            kind,
+        )
+    }
+
+    /// The anchor candidates and capability families, without the per-record indexes. A
+    /// document group keeps these and serves joins from them.
+    pub(crate) fn into_anchor_parts(self, document: &native::DocumentKey) -> AnchorParts {
+        let candidates = self
+            .candidates
+            .into_iter()
+            .filter(|((owner, ..), _)| owner == document)
+            .map(|((_, start, end, kind), ids)| ((start, end, kind), ids))
+            .collect();
         let support = self
             .support
-            .get(&(document.clone(), kind))
-            .context("missing native measurement family")?;
-        ensure!(
-            support.available || ids.is_empty() && support.gaps.is_empty(),
-            "unavailable native family has candidates or gaps"
-        );
-        let unavailable = if !support.available {
-            Some(
-                support
-                    .diagnostic
-                    .as_deref()
-                    .context("missing capability diagnostic")?,
-            )
-        } else {
-            support
-                .gaps
-                .iter()
-                .find(|g| g.range.start <= range.start && range.end <= g.range.end)
-                .map(|g| g.diagnostic.as_str())
-        };
-        let (status, diagnostic) = if ids.len() == 1 {
-            (semantic::JoinStatus::Exact, None)
-        } else if ids.len() > 1 {
-            (
-                semantic::JoinStatus::Ambiguous,
-                Some("ambiguous_measured_anchor".to_owned()),
-            )
-        } else if let Some(reason) = unavailable {
-            (semantic::JoinStatus::Unsupported, Some(reason.to_owned()))
-        } else {
-            (
-                semantic::JoinStatus::Unmatched,
-                Some("unmatched_measured_anchor".to_owned()),
-            )
-        };
-        Ok(semantic::Join {
-            anchor: semantic::MeasuredAnchor {
-                document: document.clone(),
-                revision_id: self.native.revision.id.clone(),
-                content_hash: doc.content_hash.clone(),
-                range,
-                kind,
-            },
-            status,
-            candidate_ids: ids,
-            diagnostic,
-        })
+            .into_iter()
+            .filter(|((owner, _), _)| owner == document)
+            .map(|((_, kind), family)| (kind, family.clone()))
+            .collect();
+        (candidates, support)
     }
+}
+
+/// Classifies one anchor from its measured candidates. Shared by the in-memory facts and the
+/// staged document groups, so both apply one set of rules.
+pub(crate) fn compose_join(
+    revision_id: &str,
+    doc: &native::Document,
+    source: &str,
+    ids: Vec<String>,
+    support: Option<&native::MeasurementSupport>,
+    range: native::Range,
+    kind: semantic::JoinKind,
+) -> Result<semantic::Join> {
+    source
+        .get(range.start..range.end)
+        .filter(|s| !s.is_empty())
+        .context("invalid UTF-8 scalar anchor")?;
+    let support = support.context("missing native measurement family")?;
+    ensure!(
+        support.available || ids.is_empty() && support.gaps.is_empty(),
+        "unavailable native family has candidates or gaps"
+    );
+    let unavailable = if !support.available {
+        Some(
+            support
+                .diagnostic
+                .as_deref()
+                .context("missing capability diagnostic")?,
+        )
+    } else {
+        support
+            .gaps
+            .iter()
+            .find(|g| g.range.start <= range.start && range.end <= g.range.end)
+            .map(|g| g.diagnostic.as_str())
+    };
+    let (status, diagnostic) = if ids.len() == 1 {
+        (semantic::JoinStatus::Exact, None)
+    } else if ids.len() > 1 {
+        (
+            semantic::JoinStatus::Ambiguous,
+            Some("ambiguous_measured_anchor".to_owned()),
+        )
+    } else if let Some(reason) = unavailable {
+        (semantic::JoinStatus::Unsupported, Some(reason.to_owned()))
+    } else {
+        (
+            semantic::JoinStatus::Unmatched,
+            Some("unmatched_measured_anchor".to_owned()),
+        )
+    };
+    Ok(semantic::Join {
+        anchor: semantic::MeasuredAnchor {
+            document: doc.key.clone(),
+            revision_id: revision_id.to_owned(),
+            content_hash: doc.content_hash.clone(),
+            range,
+            kind,
+        },
+        status,
+        candidate_ids: ids,
+        diagnostic,
+    })
 }
 
 type Position = (i32, i32);
@@ -800,9 +851,13 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             path: claim.envelope.relative_path.clone(),
         };
         store
-            .source_bytes(&doc)
+            .bytes_of(&doc)?
             .context("missing admitted claim document")?;
-        if claim.envelope.record_kind == "occurrence" {
+        if claim.envelope.record_kind == "symbolInformation" {
+            if let Some(symbol) = claim.envelope.raw["symbol"].as_str() {
+                index.put_symbol(symbol, false, true)?;
+            }
+        } else if claim.envelope.record_kind == "occurrence" {
             let symbol = claim.envelope.raw["symbol"]
                 .as_str()
                 .filter(|s| !s.is_empty())
@@ -823,16 +878,18 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                 .as_i64()
                 .context("invalid syntax kind")?;
             let declaration = roles & 1 != 0;
+            if declaration {
+                index.put_symbol(symbol, true, false)?;
+            }
             let binding = store.join(&doc, range.clone(), semantic::JoinKind::DeclarationName)?;
             let reference = store.join(&doc, range.clone(), semantic::JoinKind::Reference)?;
             let call = store.join(&doc, range.clone(), semantic::JoinKind::Callee)?;
             if declaration && binding.status == semantic::JoinStatus::Exact {
                 let candidate = store
-                    .declaration(&binding.candidate_ids[0])
+                    .declaration_of(&doc, &binding.candidate_ids[0])?
                     .context("missing exact native declaration")?;
-                let symbol_info = store.symbol_info(&doc.language, &doc.path, symbol);
-                let compatible = symbol_info
-                    .and_then(|c| c.envelope.raw["kind"].as_i64())
+                let compatible = store
+                    .symbol_kind(&doc.language, &doc.path, symbol)?
                     .is_some_and(|kind| match candidate.kind.as_str() {
                         "type" => matches!(kind, 7 | 11 | 21),
                         "method" => kind == 26,
@@ -907,7 +964,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             provenance_id: claim.captured_proof_id.clone(),
         })?;
     }
-    let mut role_sites: BTreeMap<native::DocumentKey, RoleSites> = BTreeMap::new();
+    let mut role_sites: Option<(native::DocumentKey, RoleSites)> = None;
     for ordinal in 0..index.occurrence_count() {
         let OccurrenceRow {
             proof_id,
@@ -924,8 +981,8 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
         let mut asserted = targets(&index, &doc, &symbol)?;
         if asserted.is_empty()
             && key.scope == semantic::SymbolScope::Global
-            && !store.is_declared_symbol(&symbol)
-            && !store.is_information_symbol(&symbol)
+            && !index.is_declared_symbol(&symbol)?
+            && !index.is_information_symbol(&symbol)?
         {
             asserted.push(semantic::Target::External {
                 symbol: key.clone(),
@@ -973,13 +1030,15 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
         };
         if reference.status == semantic::JoinStatus::Exact {
             let r = store
-                .reference(&reference.candidate_ids[0])
+                .reference_of(&doc, &reference.candidate_ids[0])?
                 .context("missing indexed native reference")?;
             let declaration_site = roles & 1 != 0
-                && store.has_declaration_name(&doc, r.range.start, r.range.end, &r.spelling);
-            let is_call = invocation.as_ref().is_some_and(|j| {
-                j.status == semantic::JoinStatus::Exact
-                    && store.calls_by_id(&j.candidate_ids[0]).iter().any(|c| {
+                && store.has_declaration_name(&doc, r.range.start, r.range.end, &r.spelling)?;
+            let is_call = match &invocation {
+                Some(j) if j.status == semantic::JoinStatus::Exact => store
+                    .calls_with_id(&doc, &j.candidate_ids[0])?
+                    .iter()
+                    .any(|c| {
                         c.id == j.candidate_ids[0]
                             && c.document == doc
                             && c.owner_syntax_id == r.owner_syntax_id
@@ -991,17 +1050,18 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                                 .is_none_or(|callee| callee == &r.range)
                             && (call.status != semantic::JoinStatus::Exact
                                 || call.candidate_ids == j.candidate_ids)
-                    })
-            });
+                    }),
+                _ => false,
+            };
             let mut assigned = BTreeSet::new();
             if declaration_site {
                 assigned.insert(semantic::Role::Definition);
             }
             let site = (r.range.start, r.range.end);
-            if !role_sites.contains_key(&doc) {
-                role_sites.insert(doc.clone(), store.role_sites(&doc)?);
+            if role_sites.as_ref().is_none_or(|(owner, _)| owner != &doc) {
+                role_sites = Some((doc.clone(), store.role_sites(&doc)?));
             }
-            let sites = &role_sites[&doc];
+            let sites = &role_sites.as_ref().expect("role sites just cached").1;
             if roles & 2 != 0 && sites.imports.contains(&site) {
                 assigned.insert(semantic::Role::Import);
             }
@@ -1029,7 +1089,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                 && matches!(doc.language.as_str(), "javascript" | "rust")
                 && binding.status == semantic::JoinStatus::Exact
                 && store
-                    .declarations_by_id(&binding.candidate_ids[0])
+                    .declarations_with_id(&doc, &binding.candidate_ids[0])?
                     .iter()
                     .any(|d| {
                         d.syntax_id == binding.candidate_ids[0]
@@ -1069,7 +1129,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                 out.reference_claim(&claim.captured_proof_id, reference.clone())?;
                 #[cfg(test)]
                 complexity_work(|work| work.reference_map_lookups += 1);
-                if let Some(slot) = out.reference_slot(&r.id) {
+                if let Some(slot) = out.reference_slot(&r.id)? {
                     let mut prior = out.reference(slot)?;
                     assigned.extend(prior.roles.iter().copied());
                     prior.roles = assigned.into_iter().collect();
@@ -1083,9 +1143,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             }
         }
         if roles & 1 == 0 {
-            let source = store
-                .source_bytes(&doc)
-                .context("missing occurrence source")?;
+            let source = store.bytes_of(&doc)?.context("missing occurrence source")?;
             if let Some(join) = &invocation {
                 out.join(&claim.captured_proof_id, join.clone())?;
             }
@@ -1107,7 +1165,9 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                         && j.candidate_ids == candidate.candidate_ids
                 })
             {
-                let actual = store.call(&candidate.candidate_ids[0]);
+                let actual = store.call_of(&doc, &candidate.candidate_ids[0])?;
+                let owning_references =
+                    store.references_with_id(&doc, &reference.candidate_ids[0])?;
                 if actual.is_some_and(|c| {
                     let primary = &reference.anchor.range;
                     c.document == doc
@@ -1118,14 +1178,11 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                             == source
                                 .get(primary.start..primary.end)
                                 .and_then(|b| std::str::from_utf8(b).ok())
-                        && store
-                            .references_by_id(&reference.candidate_ids[0])
-                            .iter()
-                            .any(|r| {
-                                r.id == reference.candidate_ids[0]
-                                    && r.owner_syntax_id == c.owner_syntax_id
-                                    && r.range == *primary
-                            })
+                        && owning_references.iter().any(|r| {
+                            r.id == reference.candidate_ids[0]
+                                && r.owner_syntax_id == c.owner_syntax_id
+                                && r.range == *primary
+                        })
                 }) {
                     index.put_call_reference(
                         &claim.captured_proof_id,
@@ -1185,7 +1242,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             Some(id) => {
                 #[cfg(test)]
                 complexity_work(|work| work.reference_map_lookups += 1);
-                out.reference_slot(&id)
+                out.reference_slot(&id)?
             }
             None => None,
         };
@@ -1201,38 +1258,19 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             out.put_call_binding(Some(slot), binding)?;
         }
     }
-    let mut source_methods: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
-    let mut target_methods: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
-    let mut document_types: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
-    for declaration in store.native_declarations() {
-        #[cfg(test)]
-        complexity_work(|work| work.method_index_rows += 1);
-        if declaration.kind == "type" {
-            document_types
-                .entry(declaration.document.clone())
-                .or_default()
-                .push(declaration);
-        }
-        if declaration.kind != "method" {
-            continue;
-        }
-        let Some(range) = &declaration.name_range else {
-            continue;
-        };
-        let symbols = index.type_uses(&declaration.document, range.start, range.end)?;
-        if !symbols.is_empty() {
-            for symbol in &symbols {
-                source_methods
-                    .entry((declaration.document.clone(), symbol.clone()))
-                    .or_default()
-                    .push(declaration);
-                target_methods
-                    .entry((
-                        declaration.document.source_set_id.clone(),
-                        scoped_key(symbol, &declaration.document),
-                    ))
-                    .or_default()
-                    .push(declaration);
+    for doc in store.documents() {
+        let doc = doc?;
+        for declaration in store.document_declarations(&doc)? {
+            #[cfg(test)]
+            complexity_work(|work| work.method_index_rows += 1);
+            if declaration.kind != "method" {
+                continue;
+            }
+            let Some(range) = &declaration.name_range else {
+                continue;
+            };
+            for symbol in index.type_uses(&declaration.document, range.start, range.end)? {
+                index.put_method(&declaration.document, &symbol, &declaration)?;
             }
         }
     }
@@ -1256,11 +1294,12 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             index.put_relationship_endpoint(language, path, source, target, row.clone())?;
         }
     }
-    let documents: Vec<_> = store.source_documents().collect();
-    for doc in documents {
+    for doc in store.documents() {
+        let doc = &doc?;
         let bytes = store
-            .source_bytes(doc)
+            .bytes_of(doc)?
             .context("missing admitted document source")?;
+        let bytes: &[u8] = &bytes;
         #[cfg(feature = "test-support")]
         if matches!(doc.language.as_str(), "java" | "javascript" | "python") {
             note_parsed_type_document(doc);
@@ -1307,7 +1346,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                 && index
                     .declarations(&scoped_key(target_symbol, doc))?
                     .is_empty()
-                && !store.is_information_symbol(target_symbol)
+                && !index.is_information_symbol(target_symbol)?
             {
                 target_candidates.push(semantic::Target::External {
                     symbol: symbol_key(target_symbol, doc),
@@ -1344,13 +1383,10 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                 ) else {
                     continue;
                 };
-                let source_methods = source_methods
-                    .get(&(doc.clone(), source_symbol.to_owned()))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
+                let source_methods = index.source_methods(doc, source_symbol)?;
                 #[cfg(test)]
                 complexity_work(|work| work.method_lookup_rows += source_methods.len());
-                let [source_method] = source_methods else {
+                let [source_method] = source_methods.as_slice() else {
                     if source_methods.is_empty() && target(&index, doc, source_symbol)?.is_none() {
                         out.diagnostic(doc, "unmeasurable_override_endpoint")?;
                     }
@@ -1359,26 +1395,23 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                 let Some(source_target) = target(&index, doc, source_symbol)? else {
                     continue;
                 };
-                let target_methods = target_methods
-                    .get(&(doc.source_set_id.clone(), scoped_key(target_symbol, doc)))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
+                let target_methods = index.target_methods(doc, target_symbol)?;
                 #[cfg(test)]
                 complexity_work(|work| work.method_lookup_rows += target_methods.len());
                 if target_methods.len() > 1 {
                     out.diagnostic(doc, "unmeasurable_override_endpoint")?;
                     continue;
                 }
-                let target_method = target_methods.first().copied();
+                let target_method = target_methods.first();
                 let source_owner = source_method.ancestors.last();
                 let owner_rows = source_owner
                     .and_then(|key| serde_json::to_value(key).ok())
                     .map(|key| native_ids::canonical(&key))
-                    .map(|key| store.declarations_by_key(doc, &key));
+                    .map(|key| store.declarations_with_key(doc, &key))
+                    .transpose()?;
                 let owner_declarations: Vec<_> = owner_rows
                     .into_iter()
                     .flatten()
-                    .copied()
                     .filter(|d| {
                         d.document == *doc
                             && d.kind == "type"
@@ -1388,7 +1421,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                     })
                     .collect();
                 let base_uses = match (owner_declarations.len() == 1)
-                    .then(|| owner_declarations[0])
+                    .then(|| &owner_declarations[0])
                     .and_then(|owner| owner.name_range.as_ref())
                     .and_then(|r| java_bases.get(&(r.start, r.end)))
                 {
@@ -1418,10 +1451,10 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                             .last()
                             .and_then(|key| serde_json::to_value(key).ok())
                             .map(|key| native_ids::canonical(&key))
-                            .map(|key| store.declarations_by_key(&method.document, &key))
+                            .map(|key| store.declarations_with_key(&method.document, &key))
+                            .transpose()?
                             .into_iter()
-                            .flatten()
-                            .copied();
+                            .flatten();
                         let mut matching = 0usize;
                         for owner in owners {
                             let Some(name) = owner.name_range.as_ref() else {
@@ -1469,7 +1502,12 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                     })?;
                 }
             }
-            for declaration in document_types.get(doc).into_iter().flatten().filter(|d| {
+            let document_types: Vec<_> = store
+                .document_declarations(doc)?
+                .into_iter()
+                .filter(|d| d.kind == "type")
+                .collect();
+            for declaration in document_types.iter().filter(|d| {
                 std::str::from_utf8(bytes).ok().is_some_and(|source| {
                     d.name_range
                         .as_ref()
@@ -2185,7 +2223,7 @@ pub(crate) fn rejoin_inventory_with_reuse(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rejoin_with_stores<S: JoinStore>(
+fn rejoin_with_stores<S: JoinStore + NativeFacts>(
     inventory: &CapturedScipInventory,
     captured_native: &native::Artifact,
     destination_native: &native::Artifact,
@@ -2384,15 +2422,18 @@ fn rejoin_with_stores<S: JoinStore>(
                     && first_call.candidate_ids == binding.join.candidate_ids;
                 // The selected reference and invocation must belong to that same
                 // measured call, not merely be independent exact spans.
-                exact &= second.candidate_ids.first().is_some_and(|id| {
-                    measured.references_by_id(id).iter().any(|reference| {
-                        &reference.id == id
-                            && call
-                                .candidate_ids
-                                .first()
-                                .into_iter()
-                                .flat_map(|id| measured.calls_by_id(id).iter())
-                                .any(|candidate| {
+                let mut same_call = false;
+                if let Some(id) = second.candidate_ids.first() {
+                    let calls = match call.candidate_ids.first() {
+                        Some(call_id) => measured.calls_with_id(&doc, call_id)?,
+                        None => vec![],
+                    };
+                    same_call = measured
+                        .references_with_id(&doc, id)?
+                        .iter()
+                        .any(|reference| {
+                            &reference.id == id
+                                && calls.iter().any(|candidate| {
                                     call.candidate_ids == vec![candidate.id.clone()]
                                         && candidate.owner_syntax_id == reference.owner_syntax_id
                                         && candidate.range.start <= reference.range.start
@@ -2402,8 +2443,9 @@ fn rejoin_with_stores<S: JoinStore>(
                                             .as_ref()
                                             .is_none_or(|callee| callee == &reference.range)
                                 })
-                    })
-                });
+                        });
+                }
+                exact &= same_call;
             }
             if exact {
                 eligible.insert(doc);
@@ -2499,6 +2541,121 @@ fn rejoin_with_stores<S: JoinStore>(
         publication,
         report,
     })
+}
+
+/// The provenance ID of a rejoined fact: a digest of the raw proof, the destination revision
+/// and the evidence kind, so it needs no lookup table.
+fn rejoin_provenance_id(raw_id: &str, revision_id: &str, kind: semantic::EvidenceKind) -> String {
+    native_ids::digest(
+        b"trellis.semantic-rejoin.v1\0",
+        &native_ids::canonical(
+            &serde_json::json!({"proof":raw_id,"revision":revision_id,"kind":kind}),
+        ),
+    )
+}
+
+/// Test-support edits to the destination's measured facts, applied only when the captured and
+/// destination revisions differ. Both join backends take them as a value; the in-memory
+/// destination applies them to the whole artifact, the staged one to each document it reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DestinationMutations {
+    pub duplicate_b_target: bool,
+    pub duplicate_a_reference: bool,
+    pub missing_a_reference: bool,
+}
+
+impl DestinationMutations {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Reads the `TRELLIS_TEST_SEMANTIC_*` hook variables.
+    #[cfg(feature = "test-support")]
+    pub fn from_env() -> Self {
+        Self {
+            duplicate_b_target: std::env::var_os("TRELLIS_TEST_SEMANTIC_DUPLICATE_B_TARGET")
+                .is_some(),
+            duplicate_a_reference: std::env::var_os("TRELLIS_TEST_SEMANTIC_DUPLICATE_A_REFERENCE")
+                .is_some(),
+            missing_a_reference: std::env::var_os("TRELLIS_TEST_SEMANTIC_MISSING_A_REFERENCE")
+                .is_some(),
+        }
+    }
+
+    /// Edits `declarations` and `references`, which may be the whole artifact's or one
+    /// document's.
+    pub fn apply(
+        &self,
+        declarations: &mut Vec<native::Declaration>,
+        references: &mut Vec<native::Reference>,
+    ) {
+        if self.duplicate_b_target
+            && let Some(declaration) = declarations
+                .iter()
+                .find(|d| d.document.path == "src/B.js" && d.name.as_deref() == Some("target"))
+                .cloned()
+        {
+            declarations.push(declaration);
+        }
+        if self.duplicate_a_reference
+            && let Some(reference) = references
+                .iter()
+                .find(|r| r.document.path == "src/A.js" && r.spelling == "target")
+                .cloned()
+        {
+            let mut competing = reference;
+            competing.id = format!("{}-candidate-only", competing.id);
+            references.push(competing);
+        }
+        if self.missing_a_reference {
+            references.retain(|r| !(r.document.path == "src/A.js" && r.spelling == "target"));
+        }
+    }
+}
+
+/// The per-encoding coordinate maps of one document's occurrence claims.
+fn document_coordinates<'c>(
+    claims: impl IntoIterator<Item = &'c CapturedClaim>,
+    source: &str,
+    admitted_encoding: u8,
+) -> Result<BTreeMap<u8, CoordinateMap>> {
+    let mut positions: BTreeMap<u8, Vec<Position>> = BTreeMap::new();
+    for claim in claims {
+        if claim.envelope.record_kind != "occurrence" {
+            continue;
+        }
+        for enclosing in [false, true] {
+            if enclosing && claim.envelope.raw["enclosingRange"].is_null() {
+                continue;
+            }
+            let mut envelope_claim;
+            let range_claim = if enclosing {
+                envelope_claim = claim.clone();
+                envelope_claim.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
+                &envelope_claim
+            } else {
+                claim
+            };
+            let (encoding, endpoints) = occurrence_endpoints(range_claim, admitted_encoding)?;
+            positions
+                .entry(encoding)
+                .or_default()
+                .extend([endpoints.0, endpoints.1]);
+        }
+    }
+    let mut maps = BTreeMap::new();
+    for (encoding, mut positions) in positions {
+        maps.insert(
+            encoding,
+            crate::scip_raw::source_byte_offsets(
+                source,
+                encoding,
+                &mut positions,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+        );
+    }
+    Ok(maps)
 }
 
 fn empty_publication(producer: &semantic::Producer) -> semantic::SemanticPublication {
@@ -2962,12 +3119,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         } else {
             semantic::Freshness::Fresh
         };
-        let id = native_ids::digest(
-            b"trellis.semantic-rejoin.v1\0",
-            &native_ids::canonical(
-                &serde_json::json!({"proof":raw_id,"revision":destination_native.revision.id,"kind":kind}),
-            ),
-        );
+        let id = rejoin_provenance_id(&raw_id, &destination_native.revision.id, kind);
         ids.insert((raw_id.clone(), kind), id.clone());
         provenance.push(semantic::Provenance {
             id,

@@ -2,8 +2,8 @@
 use super::{
     CoordinateMaps, InventoryIndex, JoinedFacts, MeasuredFacts, RoleSites, ScopedKey,
     join_store::{
-        BasisFor, JoinIndex, JoinSink, JoinStore, NativeFacts, OccurrenceRow, ProofIdentities,
-        ProofRef, PublicationSink, RelationshipRow,
+        BasisFor, Bytes, JoinFacts, JoinIndex, JoinSink, JoinStore, NativeFacts, OccurrenceRow,
+        ProofIdentities, ProofRef, PublicationSink, RelationshipRow,
     },
     source_role_sites,
 };
@@ -57,33 +57,12 @@ impl<'a> MemoryJoinStore<'a> {
 }
 
 impl NativeFacts for MeasuredFacts<'_> {
-    fn revision_id(&self) -> &str {
-        &self.native.revision.id
-    }
-
-    fn source_set_id(&self) -> &str {
-        &self.native.revision.source_set_id
-    }
-
     fn source_bytes(&self, document: &native::DocumentKey) -> Option<&[u8]> {
         self.sources.get(document).map(|text| text.as_bytes())
     }
 
     fn source_documents(&self) -> Box<dyn Iterator<Item = &native::DocumentKey> + '_> {
         Box::new(self.sources.keys())
-    }
-
-    fn native_declarations(&self) -> Box<dyn Iterator<Item = &native::Declaration> + '_> {
-        Box::new(self.native.declarations.iter())
-    }
-
-    fn join(
-        &self,
-        document: &native::DocumentKey,
-        range: native::Range,
-        kind: semantic::JoinKind,
-    ) -> Result<semantic::Join> {
-        MeasuredFacts::join(self, document, range, kind)
     }
 
     fn document(&self, document: &native::DocumentKey) -> Option<&native::Document> {
@@ -94,61 +73,12 @@ impl NativeFacts for MeasuredFacts<'_> {
         self.sources.get(document).copied()
     }
 
-    fn declaration(&self, id: &str) -> Option<&native::Declaration> {
-        MeasuredFacts::declaration(self, id)
-    }
-
     fn declarations_by_id(&self, id: &str) -> &[&native::Declaration] {
         self.declarations.get(id).map_or(&[], Vec::as_slice)
-    }
-
-    fn declarations_by_key(
-        &self,
-        document: &native::DocumentKey,
-        key: &[u8],
-    ) -> &[&native::Declaration] {
-        self.declaration_keys
-            .get(&(document.clone(), key.to_vec()))
-            .map_or(&[], Vec::as_slice)
-    }
-
-    fn has_declaration_name(
-        &self,
-        document: &native::DocumentKey,
-        start: usize,
-        end: usize,
-        spelling: &str,
-    ) -> bool {
-        self.declaration_names
-            .contains_key(&(document.clone(), start, end, spelling.to_owned()))
-    }
-
-    fn call(&self, id: &str) -> Option<&native::Call> {
-        MeasuredFacts::call(self, id)
-    }
-
-    fn calls_by_id(&self, id: &str) -> &[&native::Call] {
-        self.calls.get(id).map_or(&[], Vec::as_slice)
-    }
-
-    fn reference(&self, id: &str) -> Option<&native::Reference> {
-        MeasuredFacts::reference(self, id)
-    }
-
-    fn references_by_id(&self, id: &str) -> &[&native::Reference] {
-        self.references.get(id).map_or(&[], Vec::as_slice)
     }
 }
 
 impl NativeFacts for MemoryJoinStore<'_> {
-    fn revision_id(&self) -> &str {
-        NativeFacts::revision_id(self.measured)
-    }
-
-    fn source_set_id(&self) -> &str {
-        NativeFacts::source_set_id(self.measured)
-    }
-
     fn source_bytes(&self, document: &native::DocumentKey) -> Option<&[u8]> {
         self.sources.get(document).map(Vec::as_slice)
     }
@@ -157,8 +87,26 @@ impl NativeFacts for MemoryJoinStore<'_> {
         Box::new(self.sources.keys())
     }
 
-    fn native_declarations(&self) -> Box<dyn Iterator<Item = &native::Declaration> + '_> {
-        self.measured.native_declarations()
+    fn document(&self, document: &native::DocumentKey) -> Option<&native::Document> {
+        NativeFacts::document(self.measured, document)
+    }
+
+    fn source(&self, document: &native::DocumentKey) -> Option<&str> {
+        NativeFacts::source(self.measured, document)
+    }
+
+    fn declarations_by_id(&self, id: &str) -> &[&native::Declaration] {
+        NativeFacts::declarations_by_id(self.measured, id)
+    }
+}
+
+impl JoinFacts for MemoryJoinStore<'_> {
+    fn revision_id(&self) -> &str {
+        &self.measured.native.revision.id
+    }
+
+    fn source_set_id(&self) -> &str {
+        &self.measured.native.revision.source_set_id
     }
 
     fn join(
@@ -170,28 +118,67 @@ impl NativeFacts for MemoryJoinStore<'_> {
         self.measured.join(document, range, kind)
     }
 
-    fn document(&self, document: &native::DocumentKey) -> Option<&native::Document> {
-        NativeFacts::document(self.measured, document)
+    fn bytes_of(&self, document: &native::DocumentKey) -> Result<Option<Bytes<'_>>> {
+        Ok(self
+            .sources
+            .get(document)
+            .map(|bytes| Bytes::Borrowed(bytes.as_slice())))
     }
 
-    fn source(&self, document: &native::DocumentKey) -> Option<&str> {
-        NativeFacts::source(self.measured, document)
+    fn documents(&self) -> Box<dyn Iterator<Item = Result<native::DocumentKey>> + '_> {
+        Box::new(self.sources.keys().cloned().map(Ok))
     }
 
-    fn declaration(&self, id: &str) -> Option<&native::Declaration> {
-        self.measured.declaration(id)
+    fn document_declarations(
+        &self,
+        document: &native::DocumentKey,
+    ) -> Result<Vec<Cow<'_, native::Declaration>>> {
+        Ok(self
+            .measured
+            .by_document
+            .get(document)
+            .into_iter()
+            .flatten()
+            .map(|declaration| Cow::Borrowed(*declaration))
+            .collect())
     }
 
-    fn declarations_by_id(&self, id: &str) -> &[&native::Declaration] {
-        self.measured.declarations_by_id(id)
+    fn declaration_of(
+        &self,
+        _document: &native::DocumentKey,
+        id: &str,
+    ) -> Result<Option<Cow<'_, native::Declaration>>> {
+        Ok(self.measured.declaration(id).map(Cow::Borrowed))
     }
 
-    fn declarations_by_key(
+    fn declarations_with_id(
+        &self,
+        _document: &native::DocumentKey,
+        id: &str,
+    ) -> Result<Vec<Cow<'_, native::Declaration>>> {
+        Ok(self
+            .measured
+            .declarations
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|declaration| Cow::Borrowed(*declaration))
+            .collect())
+    }
+
+    fn declarations_with_key(
         &self,
         document: &native::DocumentKey,
         key: &[u8],
-    ) -> &[&native::Declaration] {
-        self.measured.declarations_by_key(document, key)
+    ) -> Result<Vec<Cow<'_, native::Declaration>>> {
+        Ok(self
+            .measured
+            .declaration_keys
+            .get(&(document.clone(), key.to_vec()))
+            .into_iter()
+            .flatten()
+            .map(|declaration| Cow::Borrowed(*declaration))
+            .collect())
     }
 
     fn has_declaration_name(
@@ -200,25 +187,59 @@ impl NativeFacts for MemoryJoinStore<'_> {
         start: usize,
         end: usize,
         spelling: &str,
-    ) -> bool {
-        self.measured
-            .has_declaration_name(document, start, end, spelling)
+    ) -> Result<bool> {
+        Ok(self.measured.declaration_names.contains_key(&(
+            document.clone(),
+            start,
+            end,
+            spelling.to_owned(),
+        )))
     }
 
-    fn call(&self, id: &str) -> Option<&native::Call> {
-        self.measured.call(id)
+    fn call_of(
+        &self,
+        _document: &native::DocumentKey,
+        id: &str,
+    ) -> Result<Option<Cow<'_, native::Call>>> {
+        Ok(self.measured.call(id).map(Cow::Borrowed))
     }
 
-    fn calls_by_id(&self, id: &str) -> &[&native::Call] {
-        self.measured.calls_by_id(id)
+    fn calls_with_id(
+        &self,
+        _document: &native::DocumentKey,
+        id: &str,
+    ) -> Result<Vec<Cow<'_, native::Call>>> {
+        Ok(self
+            .measured
+            .calls
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|call| Cow::Borrowed(*call))
+            .collect())
     }
 
-    fn reference(&self, id: &str) -> Option<&native::Reference> {
-        self.measured.reference(id)
+    fn reference_of(
+        &self,
+        _document: &native::DocumentKey,
+        id: &str,
+    ) -> Result<Option<Cow<'_, native::Reference>>> {
+        Ok(self.measured.reference(id).map(Cow::Borrowed))
     }
 
-    fn references_by_id(&self, id: &str) -> &[&native::Reference] {
-        self.measured.references_by_id(id)
+    fn references_with_id(
+        &self,
+        _document: &native::DocumentKey,
+        id: &str,
+    ) -> Result<Vec<Cow<'_, native::Reference>>> {
+        Ok(self
+            .measured
+            .references
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|reference| Cow::Borrowed(*reference))
+            .collect())
     }
 }
 
@@ -262,27 +283,20 @@ impl<'a> JoinStore for MemoryJoinStore<'a> {
         Box::new(self.raw.claims.iter().map(|claim| Ok(Cow::Borrowed(claim))))
     }
 
-    fn lookup_proof(&self, proof: &str, kind: &str, digest: &str) -> Result<&CapturedClaim> {
-        self.raw.lookup(proof, kind, digest)
+    fn lookup_proof(&self, proof: &str, kind: &str, digest: &str) -> Result<()> {
+        self.raw.lookup(proof, kind, digest).map(|_| ())
     }
 
     fn claim(&self, proof: &str, kind: &str, digest: &str) -> Result<Cow<'_, CapturedClaim>> {
         self.raw.resolve(proof, kind, digest).map(Cow::Borrowed)
     }
 
-    fn symbol_info(&self, language: &str, path: &str, symbol: &str) -> Option<&CapturedClaim> {
-        self.raw
+    fn symbol_kind(&self, language: &str, path: &str, symbol: &str) -> Result<Option<i64>> {
+        Ok(self
+            .raw
             .symbol_info
             .get(&(language.to_owned(), path.to_owned(), symbol.to_owned()))
-            .copied()
-    }
-
-    fn is_declared_symbol(&self, symbol: &str) -> bool {
-        self.raw.declared_symbols.contains(symbol)
-    }
-
-    fn is_information_symbol(&self, symbol: &str) -> bool {
-        self.raw.information_symbols.contains(symbol)
+            .and_then(|claim| claim.envelope.raw["kind"].as_i64()))
     }
 
     fn occurrence_range(
@@ -318,6 +332,10 @@ pub(super) struct MemoryJoinIndex {
     relationship_endpoints: BTreeMap<(String, String, String, String), Vec<RelationshipRow>>,
     reference_claims: BTreeMap<String, Vec<(String, semantic::Target)>>,
     call_references: BTreeMap<String, String>,
+    declared_symbols: BTreeSet<String>,
+    information_symbols: BTreeSet<String>,
+    source_methods: BTreeMap<(native::DocumentKey, String), Vec<native::Declaration>>,
+    target_methods: BTreeMap<(String, ScopedKey), Vec<native::Declaration>>,
 }
 
 impl JoinIndex for MemoryJoinIndex {
@@ -474,6 +492,71 @@ impl JoinIndex for MemoryJoinIndex {
     fn call_reference(&self, proof_id: &str) -> Result<Option<String>> {
         Ok(self.call_references.get(proof_id).cloned())
     }
+
+    fn put_symbol(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
+        if declared {
+            self.declared_symbols.insert(symbol.to_owned());
+        }
+        if information {
+            self.information_symbols.insert(symbol.to_owned());
+        }
+        Ok(())
+    }
+
+    fn is_declared_symbol(&self, symbol: &str) -> Result<bool> {
+        Ok(self.declared_symbols.contains(symbol))
+    }
+
+    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
+        Ok(self.information_symbols.contains(symbol))
+    }
+
+    fn put_method(
+        &mut self,
+        document: &native::DocumentKey,
+        symbol: &str,
+        method: &native::Declaration,
+    ) -> Result<()> {
+        self.source_methods
+            .entry((document.clone(), symbol.to_owned()))
+            .or_default()
+            .push(method.clone());
+        self.target_methods
+            .entry((
+                document.source_set_id.clone(),
+                super::scoped_key(symbol, document),
+            ))
+            .or_default()
+            .push(method.clone());
+        Ok(())
+    }
+
+    fn source_methods(
+        &self,
+        document: &native::DocumentKey,
+        symbol: &str,
+    ) -> Result<Vec<native::Declaration>> {
+        Ok(self
+            .source_methods
+            .get(&(document.clone(), symbol.to_owned()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn target_methods(
+        &self,
+        document: &native::DocumentKey,
+        symbol: &str,
+    ) -> Result<Vec<native::Declaration>> {
+        Ok(self
+            .target_methods
+            .get(&(
+                document.source_set_id.clone(),
+                super::scoped_key(symbol, document),
+            ))
+            .cloned()
+            .unwrap_or_default())
+    }
 }
 
 /// `JoinedFacts` as the in-memory join sink.
@@ -510,8 +593,8 @@ impl JoinSink for MemoryJoinSink {
         Ok(())
     }
 
-    fn reference_slot(&self, reference_id: &str) -> Option<usize> {
-        self.reference_indices.get(reference_id).copied()
+    fn reference_slot(&self, reference_id: &str) -> Result<Option<usize>> {
+        Ok(self.reference_indices.get(reference_id).copied())
     }
 
     fn reference_count(&self) -> usize {

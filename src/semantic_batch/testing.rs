@@ -1,7 +1,7 @@
 //! Test-support entry points: admission over in-memory bytes, and the whole-snapshot-read seam.
 use super::{
-    BatchCounters, BatchLimits,
-    admit::{BatchInputs, NativeSource, Passes},
+    AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
+    admit::{BatchInputs, NativeSource, Passes, StageOwner, stage_batch},
     descriptor::{ArtifactEntry, Descriptor, PageEntry},
     staging::Stage,
 };
@@ -14,6 +14,9 @@ use crate::{
     scip_raw::{
         self, CapturedClaim, CapturedScipFactV1, CapturedScipInventory, Exclusion, ScipCaptureError,
     },
+    semantic_evidence as semantic,
+    semantic_import::{DestinationMutations, join_staged},
+    store::Store,
 };
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
@@ -24,8 +27,23 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+type ClosureHook = Box<dyn FnOnce(&Connection)>;
+
 thread_local! {
     static WHOLE_SNAPSHOT_READS: Cell<u64> = const { Cell::new(0) };
+    static BEFORE_CLOSURE: std::cell::RefCell<Option<ClosureHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once on this thread, with the stage connection, after the next staged join has
+/// emitted its rows and before its closure checks.
+pub fn before_join_closure(hook: impl FnOnce(&Connection) + 'static) {
+    BEFORE_CLOSURE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn run_before_closure_hook(conn: &Connection) {
+    if let Some(hook) = BEFORE_CLOSURE.with(|slot| slot.borrow_mut().take()) {
+        hook(conn);
+    }
 }
 
 /// Called by `retained_native_snapshot_from_db`: a whole-revision read happened.
@@ -294,4 +312,98 @@ pub fn admit_in_memory_from_capture(
         artifacts,
         cancel,
     )
+}
+
+static NEXT_JOIN: AtomicU64 = AtomicU64::new(0);
+
+/// Stages the batch named by `descriptor_path` and joins it against the store's current head,
+/// in the calling thread. The stage is removed when the result is dropped.
+pub fn stage_and_join(
+    store: &Store,
+    root: &Path,
+    descriptor_path: &Path,
+    descriptor_sha256: &str,
+    limits: &BatchLimits,
+    cancel: &CancelFlag,
+) -> Result<(JoinedBatch, BatchCounters)> {
+    let (_, joined, counters) = stage_and_join_admitted(
+        store,
+        root,
+        descriptor_path,
+        descriptor_sha256,
+        limits,
+        DestinationMutations::default(),
+        cancel,
+    )?;
+    Ok((joined, counters))
+}
+
+/// `stage_and_join` that keeps the stage alive and applies destination edits.
+pub fn stage_and_join_admitted(
+    store: &Store,
+    root: &Path,
+    descriptor_path: &Path,
+    descriptor_sha256: &str,
+    limits: &BatchLimits,
+    mutations: DestinationMutations,
+    cancel: &CancelFlag,
+) -> Result<(AdmittedBatch, JoinedBatch, BatchCounters)> {
+    let mut counters = BatchCounters::default();
+    let request = format!("join-{}", NEXT_JOIN.fetch_add(1, Ordering::Relaxed));
+    let mut admitted = stage_batch(
+        store,
+        root,
+        StageOwner {
+            request_id: &request,
+            incarnation: "claim-1",
+        },
+        descriptor_path,
+        descriptor_sha256,
+        limits,
+        &mut counters,
+        cancel,
+    )?;
+    let mut budget = LookupBudget::new(limits);
+    let joined = join_staged(
+        &mut admitted,
+        store,
+        store.index_baseline()?,
+        limits,
+        &mut budget,
+        &mut counters,
+        mutations,
+        cancel,
+    )?;
+    Ok((admitted, joined, counters))
+}
+
+/// The staged `out_*` rows, read back as the publication the in-memory join would build.
+pub fn staged_publication(batch: &mut AdmittedBatch) -> Result<semantic::SemanticPublication> {
+    let producer = batch.producer().producer();
+    let conn = batch.stage_mut().conn()?;
+    fn rows<T: serde::de::DeserializeOwned>(conn: &Connection, table: &str) -> Result<Vec<T>> {
+        let mut statement = conn.prepare(&format!("SELECT body FROM {table} ORDER BY ord"))?;
+        let bodies = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        bodies
+            .iter()
+            .map(|body| Ok(serde_json::from_str(body)?))
+            .collect()
+    }
+    Ok(semantic::SemanticPublication {
+        producers: vec![producer],
+        coverage: rows(conn, "out_coverage")?,
+        provenance: rows(conn, "out_provenance")?,
+        symbols: rows(conn, "out_symbols")?,
+        declaration_bindings: rows(conn, "out_declaration_bindings")?,
+        references: rows(conn, "out_references")?,
+        call_bindings: rows(conn, "out_call_bindings")?,
+        type_relationships: rows(conn, "out_type_relationships")?,
+    })
+}
+
+/// The ordered cursor queries of the staged join, for query-plan tests.
+pub fn join_cursor_sql() -> Vec<String> {
+    crate::semantic_import::staged_cursor_sql()
 }

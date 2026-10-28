@@ -32,15 +32,57 @@ fn extension(language: &str) -> &'static str {
     }
 }
 
-/// One document an artifact covers.
+/// One occurrence an artifact records in a document.
+#[derive(Debug, Clone)]
+pub struct OccSpec {
+    pub range: Vec<i32>,
+    pub enclosing: Vec<i32>,
+    pub symbol: String,
+    pub roles: i32,
+}
+
+/// One document an artifact covers. Without `occurrences` the document gets a single
+/// definition occurrence at `[0, 0, 1]`.
 #[derive(Debug, Clone)]
 pub struct DocSpec {
     pub path: String,
+    pub occurrences: Vec<OccSpec>,
+    /// `(symbol, SCIP kind, relationship targets)` symbol information rows.
+    pub symbols: Vec<(String, i32, Vec<String>)>,
 }
 
 impl DocSpec {
     pub fn new(path: &str) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            occurrences: vec![],
+            symbols: vec![],
+        }
+    }
+
+    pub fn occurrence(
+        mut self,
+        range: &[i32],
+        enclosing: &[i32],
+        symbol: &str,
+        roles: i32,
+    ) -> Self {
+        self.occurrences.push(OccSpec {
+            range: range.to_vec(),
+            enclosing: enclosing.to_vec(),
+            symbol: symbol.into(),
+            roles,
+        });
+        self
+    }
+
+    pub fn symbol(mut self, symbol: &str, kind: i32, related: &[&str]) -> Self {
+        self.symbols.push((
+            symbol.into(),
+            kind,
+            related.iter().map(|s| s.to_string()).collect(),
+        ));
+        self
     }
 }
 
@@ -272,18 +314,42 @@ impl BatchFixture {
             let mut document = scip::types::Document::new();
             document.relative_path = spec.path.clone();
             document.language = language.into();
-            let symbol = format!("pkg d{number}.");
-            let mut occurrence = scip::types::Occurrence::new();
-            occurrence.range = vec![0, 0, 1];
-            occurrence.symbol = symbol.clone();
-            occurrence.symbol_roles = 1;
-            occurrence.syntax_kind = EnumOrUnknown::from_i32(0);
-            document.occurrences.push(occurrence);
-            let mut info = scip::types::SymbolInformation::new();
-            info.symbol = symbol;
-            info.kind = EnumOrUnknown::from_i32(26);
-            info.display_name = format!("d{number}");
-            document.symbols.push(info);
+            if spec.occurrences.is_empty() && spec.symbols.is_empty() {
+                let symbol = format!("pkg d{number:05}.");
+                let mut occurrence = scip::types::Occurrence::new();
+                occurrence.range = vec![0, 0, 1];
+                occurrence.symbol = symbol.clone();
+                occurrence.symbol_roles = 1;
+                occurrence.syntax_kind = EnumOrUnknown::from_i32(0);
+                document.occurrences.push(occurrence);
+                let mut info = scip::types::SymbolInformation::new();
+                info.symbol = symbol;
+                info.kind = EnumOrUnknown::from_i32(26);
+                info.display_name = format!("d{number:05}");
+                document.symbols.push(info);
+            }
+            for occ in &spec.occurrences {
+                let mut occurrence = scip::types::Occurrence::new();
+                occurrence.range = occ.range.clone();
+                occurrence.enclosing_range = occ.enclosing.clone();
+                occurrence.symbol = occ.symbol.clone();
+                occurrence.symbol_roles = occ.roles;
+                occurrence.syntax_kind = EnumOrUnknown::from_i32(0);
+                document.occurrences.push(occurrence);
+            }
+            for (symbol, kind, related) in &spec.symbols {
+                let mut info = scip::types::SymbolInformation::new();
+                info.symbol = symbol.clone();
+                info.kind = EnumOrUnknown::from_i32(*kind);
+                info.display_name = symbol.clone();
+                for target in related {
+                    let mut relationship = scip::types::Relationship::new();
+                    relationship.symbol = target.clone();
+                    relationship.is_implementation = true;
+                    info.relationships.push(relationship);
+                }
+                document.symbols.push(info);
+            }
             index.documents.push(document);
         }
         index.write_to_bytes().unwrap()
