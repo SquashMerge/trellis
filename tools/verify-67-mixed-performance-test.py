@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -122,6 +123,19 @@ class Rusage(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
 
 
+    def test_reap_with_rusage_keeps_usage_of_already_exited_child(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if subprocess.run(["ps", "-o", "stat=", "-p", str(proc.pid)], capture_output=True,
+                              text=True).stdout.strip().startswith("Z"):
+                break
+            time.sleep(.02)
+        result = RUNNER.reap_with_rusage(proc)
+        self.assertGreater(result["maxRssBytes"], 0)
+        self.assertEqual(proc.returncode, 0)
+
+
 class ImportBatch(unittest.TestCase):
     def captured(self, root):
         rows = [{"language": "javascript", "relativePath": "javascript/Csmall0010.js", "contentHash": HEX},
@@ -152,6 +166,10 @@ class ImportBatch(unittest.TestCase):
             self.assertEqual(sorted(p["kind"] for p in data["pages"]), ["coverage", "source"])
             self.assertEqual(data["totals"]["sourceDocuments"], 2)
             self.assertEqual(data["totals"]["coveredDocuments"], 1)
+            self.assertEqual(data["totals"]["excludedDocuments"], 0)
+            self.assertEqual(data["completion"], "complete")
+            coverage = next(p for p in data["pages"] if p["kind"] == "coverage")
+            self.assertEqual(coverage["rowCount"], 1)
             self.assertEqual((root / ".trellis-semantic-batch/artifact-0.scip").read_bytes(), b"scip-bytes")
 
     def test_run_semantic_import_uses_batch_flags(self):

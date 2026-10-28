@@ -7,7 +7,7 @@ LOCAL watcher/request publisher and complete selected FULL parity per family.
 Failed evidence is retained.
 """
 import argparse
-from contextlib import closing
+from contextlib import closing, suppress
 import fcntl
 import hashlib
 import json
@@ -88,13 +88,17 @@ def reap_with_rusage(proc, grace=20):
     status = None
     killed = False
     deadline = time.monotonic() + grace
-    proc.terminate()
+    # Signal by pid: Popen.terminate()/kill() call poll(), which would reap the child
+    # before wait4 and lose its resource usage.
+    with suppress(ProcessLookupError):
+        os.kill(proc.pid, signal.SIGTERM)
     while True:
         pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
         if pid:
             break
         if time.monotonic() >= deadline and not killed:
-            proc.kill()
+            with suppress(ProcessLookupError):
+                os.kill(proc.pid, signal.SIGKILL)
             killed = True
         time.sleep(.02)
     proc.returncode = os.waitstatus_to_exitcode(status)
@@ -923,12 +927,13 @@ def write_import_batch(root, header, artifact_bytes, covered):
     profile = json.loads((REPO / "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json").read_text())
     producer = next(p for p in profile["semanticProducers"] if p["name"] == "scip-typescript")
     batch = load_batch_module()
+    producer_languages = ["javascript"]
     descriptor_header = {
         "trustOrigin": "referenceProfile", "profileId": profile["profileId"],
         "decoderVersion": DECODER_VERSION,
         "producer": {"name": producer["name"], "version": producer["version"],
                      "identityKind": "executable", "executableHash": producer["executableHash"],
-                     "positionEncoding": 2, "languages": ["javascript"]},
+                     "positionEncoding": 2, "languages": producer_languages},
         "sourceSet": header["source_set"], "sourceRevision": header["native_id"],
         "sourceManifestHash": header["manifest_hash"], "components": header["components"],
         "metadata": {"protocolVersion": 0, "projectRoot": Path(root).as_uri(),
@@ -941,7 +946,7 @@ def write_import_batch(root, header, artifact_bytes, covered):
                  "exclusion": None if (row["language"], row["relativePath"]) in covered_keys
                  else "notRequested",
                  "language": row["language"], "relativePath": row["relativePath"]}
-                for row in sources]
+                for row in sources if row["language"] in producer_languages]
     return batch.write_batch(Path(root) / ".trellis-semantic-batch", descriptor_header, sources, coverage,
                              [{"language": "javascript", "data": artifact_bytes}], root=Path(root))
 
