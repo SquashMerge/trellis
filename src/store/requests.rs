@@ -413,12 +413,12 @@ pub(crate) fn validate_gc_queue(db: &Connection, spelling: &str, key: &str) -> R
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SemanticImportOptions {
     pub version: u8,
-    pub scip: String,
-    pub manifest: String,
-    pub profile_id: String,
-    pub producer_name: String,
-    pub manifest_sha256: String,
+    pub descriptor: String,
+    pub descriptor_sha256: String,
 }
+
+/// Upper bound on the encoded options of one queued request, semantic or native.
+pub const MAX_SEMANTIC_OPTIONS_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestKind {
@@ -511,13 +511,14 @@ impl Request {
             "invalid request kind for semantic import"
         );
         ensure!(
-            self.options_json.len() <= 4096,
+            self.options_json.len() <= MAX_SEMANTIC_OPTIONS_BYTES,
             "invalid request options length"
         );
-        let options: SemanticImportOptions = serde_json::from_str(&self.options_json)?;
+        let options: SemanticImportOptions = serde_json::from_str(&self.options_json)
+            .map_err(|_| anyhow::anyhow!("invalid_request: semantic import options"))?;
         ensure!(
-            options.version == 1,
-            "invalid semantic import options version"
+            options.version == 2,
+            "invalid_request: semantic import options"
         );
         Ok(options)
     }
@@ -1229,29 +1230,43 @@ impl Store {
         )
     }
 
-    /// Accept a closed semantic job without reading mutable SCIP inputs yet.
+    /// Accept a closed semantic job without reading mutable batch inputs yet.
     pub fn enqueue_semantic_import(
         &self,
         root: &Path,
         options: &SemanticImportOptions,
     ) -> Result<Request> {
         ensure!(
-            options.version == 1
-                && !options.scip.is_empty()
-                && !options.manifest.is_empty()
-                && !options.profile_id.is_empty()
-                && !options.producer_name.is_empty()
-                && options.manifest_sha256.len() == 64
+            options.version == 2
+                && !options.descriptor.is_empty()
+                && options.descriptor_sha256.len() == 64
                 && options
-                    .manifest_sha256
+                    .descriptor_sha256
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "invalid_request: semantic import options"
         );
-        crate::scip_admission::validate_selected_role(root, Path::new(&options.scip))
+        crate::scip_admission::validate_selected_role(root, Path::new(&options.descriptor))
             .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
-        crate::scip_admission::validate_selected_role(root, Path::new(&options.manifest))
-            .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+        self.enqueue_typed_request(
+            root,
+            options,
+            RequestKind::SemanticImport,
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    /// Queues `options` verbatim as a semantic import row, skipping option validation, so a test
+    /// can queue a row of a shape the CLI no longer accepts.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn enqueue_semantic_options_json_for_tests(
+        &self,
+        root: &Path,
+        options: &serde_json::Value,
+    ) -> Result<Request> {
         self.enqueue_typed_request(
             root,
             options,
@@ -1283,7 +1298,10 @@ impl Store {
             "root_changed: request workspace mismatch"
         );
         let encoded = serde_json::to_string(&options)?;
-        ensure!(encoded.len() <= 4096, "invalid request options length");
+        ensure!(
+            encoded.len() <= MAX_SEMANTIC_OPTIONS_BYTES,
+            "invalid request options length"
+        );
         // Retry only queue admission. No request has been inserted yet; once
         // IMMEDIATE begins, even an ambiguous COMMIT must never be re-enqueued.
         let (_guard, mut db) =
@@ -2119,3 +2137,141 @@ mod root_failure_tests;
 
 #[cfg(test)]
 mod foreign_root_settlement_tests;
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const DIGEST: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+
+    fn workspace() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Store,
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(parent.path()).unwrap().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("descriptor.json"), b"{}").unwrap();
+        let store = Store::open_for_tests(state.path(), &root).unwrap();
+        (state, parent, root, store)
+    }
+
+    fn rows(store: &Store) -> i64 {
+        Connection::open(store.request_db_path())
+            .unwrap()
+            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn options(root: &Path, version: u8, descriptor: &str, digest: &str) -> SemanticImportOptions {
+        SemanticImportOptions {
+            version,
+            descriptor: root.join(descriptor).display().to_string(),
+            descriptor_sha256: digest.into(),
+        }
+    }
+
+    #[test]
+    fn semantic_import_options_v2_are_bounded_and_closed() {
+        let (_state, _parent, root, store) = workspace();
+        let accepted = store
+            .enqueue_semantic_import(&root, &options(&root, 2, "descriptor.json", DIGEST))
+            .unwrap();
+        assert_eq!(accepted.request_kind, RequestKind::SemanticImport);
+        let decoded = accepted.semantic_options().unwrap();
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.descriptor_sha256, DIGEST);
+        assert_eq!(rows(&store), 1);
+        // Every refused option set creates no row.
+        let uppercase = DIGEST.to_uppercase();
+        let short = &DIGEST[..63];
+        let mut refused = vec![
+            options(&root, 2, "descriptor.json", &uppercase),
+            options(&root, 2, "descriptor.json", short),
+            options(&root, 2, "missing.json", DIGEST),
+            options(&root, 2, "", DIGEST),
+        ];
+        refused[3].descriptor.clear();
+        let mut relative = options(&root, 2, "descriptor.json", DIGEST);
+        relative.descriptor = "descriptor.json".into();
+        refused.push(relative);
+        let mut outside = options(&root, 2, "descriptor.json", DIGEST);
+        outside.descriptor = "/etc/hosts".into();
+        refused.push(outside);
+        for candidate in refused {
+            let error = store
+                .enqueue_semantic_import(&root, &candidate)
+                .unwrap_err();
+            assert!(
+                error.to_string().starts_with("invalid_request"),
+                "{candidate:?}: {error:#}"
+            );
+        }
+        assert_eq!(rows(&store), 1);
+        // The row is closed: an unknown key fails at claim, and the encoded size is bounded.
+        let unknown = store
+            .enqueue_semantic_options_json_for_tests(
+                &root,
+                &json!({"version":2,"descriptor":"/x","descriptorSha256":DIGEST,"extra":1}),
+            )
+            .unwrap();
+        assert_eq!(
+            unknown.semantic_options().unwrap_err().to_string(),
+            "invalid_request: semantic import options"
+        );
+        let oversized = json!({
+            "version": 2,
+            "descriptor": "d".repeat(MAX_SEMANTIC_OPTIONS_BYTES),
+            "descriptorSha256": DIGEST,
+        });
+        let before = rows(&store);
+        let error = store
+            .enqueue_semantic_options_json_for_tests(&root, &oversized)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid request options length"),
+            "{error:#}"
+        );
+        assert_eq!(rows(&store), before);
+    }
+
+    #[test]
+    fn semantic_import_options_reject_version_one() {
+        let (_state, _parent, root, store) = workspace();
+        let error = store
+            .enqueue_semantic_import(&root, &options(&root, 1, "descriptor.json", DIGEST))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid_request: semantic import options"
+        );
+        // A durable version-one row still reads as a typed claim-time failure.
+        let queued = store
+            .enqueue_semantic_options_json_for_tests(
+                &root,
+                &json!({"version":1,"scip":"/a","manifest":"/b","profileId":"p",
+                    "producerName":"scip-typescript","manifestSha256":DIGEST}),
+            )
+            .unwrap();
+        assert_eq!(
+            rows(&store),
+            1,
+            "the refused version-one enqueue made no row"
+        );
+        assert_eq!(
+            queued.semantic_options().unwrap_err().to_string(),
+            "invalid_request: semantic import options"
+        );
+        let version_three = store
+            .enqueue_semantic_options_json_for_tests(
+                &root,
+                &json!({"version":3,"descriptor":"/x","descriptorSha256":DIGEST}),
+            )
+            .unwrap();
+        assert!(version_three.semantic_options().is_err());
+    }
+}

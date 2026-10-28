@@ -2572,6 +2572,18 @@ fn ambiguous_commit_is_resolved_from_durable_state() {
         "{error:#}"
     );
     assert_nothing_published(&world, head);
+    // A COMMIT that fails from contention and rolls back stays typed `storage_busy`. A revision
+    // conflict would re-join the batch and charge the shared lookup budget a second time.
+    let error = publish(&mut admitted, BatchPublishFault::CommitBusyBeforeCommit).unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("storage_busy"),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains("revision conflict"),
+        "{error:#}"
+    );
+    assert_nothing_published(&world, head);
     // The COMMIT ran but its result was lost: the durable head carries this descriptor.
     let pin = publish(&mut admitted, BatchPublishFault::CommitLostAfterCommit).unwrap();
     assert_eq!(pin.index_revision, head.index_revision + 1);

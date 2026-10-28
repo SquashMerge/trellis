@@ -149,16 +149,12 @@ enum SemanticAction {
 struct SemanticImportArgs {
     #[command(flatten)]
     workspace: WorkspaceArgs,
-    #[arg(long)]
-    scip: PathBuf,
-    #[arg(long)]
-    manifest: PathBuf,
-    #[arg(long)]
-    profile: String,
-    #[arg(long)]
-    producer: String,
-    #[arg(long = "manifest-sha256")]
-    manifest_sha256: String,
+    /// Batch descriptor file inside the workspace.
+    #[arg(long = "batch")]
+    batch: PathBuf,
+    /// Lowercase SHA-256 of the descriptor file.
+    #[arg(long = "batch-sha256")]
+    batch_sha256: String,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -802,19 +798,18 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                     .to_owned())
             };
             ensure!(
-                args.manifest_sha256.len() == 64
+                args.batch_sha256.len() == 64
                     && args
-                        .manifest_sha256
+                        .batch_sha256
                         .bytes()
                         .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-                "invalid_request: manifest digest"
+                "invalid_request: batch digest"
             );
             (
                 "semantic_import",
                 &args.workspace,
                 serde_json::json!({
-                    "version":1,"scip":anchor(&args.scip)?,"manifest":anchor(&args.manifest)?,
-                    "profileId":args.profile,"producerName":args.producer,"manifestSha256":args.manifest_sha256
+                    "version":2,"descriptor":anchor(&args.batch)?,"descriptorSha256":args.batch_sha256
                 }),
                 false,
             )

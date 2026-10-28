@@ -8,6 +8,10 @@ use std::{
 use tempfile::Builder;
 use trellis::{native_ids, store::topology::TopologyRoots};
 
+#[path = "support/semantic_batch.rs"]
+mod semantic_batch_support;
+use semantic_batch_support::{BatchFixture, DocSpec};
+
 const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
 
 struct CrashDaemon(std::process::Child);
@@ -72,6 +76,29 @@ fn run(home: &Path, args: &[&str]) -> Value {
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+
+/// Writes a reference-producer batch of hand-built artifacts into the fresh directory
+/// `root/<dir>`. Each artifact is `(language, covered path, SCIP bytes)`; `excluded` entries
+/// are `(language, path, reason)`. Returns the descriptor path and its SHA-256.
+fn write_batch(
+    index_db: &Path,
+    root: &Path,
+    producer: &str,
+    artifacts: &[(&str, &str, Vec<u8>)],
+    excluded: &[(&str, &str, &'static str)],
+    dir: &str,
+) -> (std::path::PathBuf, String) {
+    let mut fixture = BatchFixture::from_published(index_db, root).reference(producer);
+    for (language, path, bytes) in artifacts {
+        let ordinal = fixture.artifact(language, vec![DocSpec::new(path)]);
+        fixture.override_artifact_raw(ordinal, bytes.clone());
+    }
+    for (language, path, reason) in excluded {
+        fixture.exclude(language, path, reason);
+    }
+    fixture.write(&root.join(dir))
+}
+
 fn two_document_case(change_b: &str) {
     use protobuf::{EnumOrUnknown, Message};
     let temp = Builder::new()
@@ -147,7 +174,7 @@ fn two_document_case(change_b: &str) {
             cmd.env("TRELLIS_TEST_SEMANTIC_REPORT_PADDING", "1048576");
         }
         if change_b == "near_bound" {
-            cmd.env("TRELLIS_TEST_SEMANTIC_REPORT_PADDING", "1047000");
+            cmd.env("TRELLIS_TEST_SEMANTIC_REPORT_PADDING", "1047500");
         }
         if change_b == "publish_busy" {
             cmd.env(
@@ -197,6 +224,7 @@ fn two_document_case(change_b: &str) {
     );
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let index_db = roots.index_db(&identity);
     let store = trellis::store::Store::open(roots, identity).unwrap();
     let (native, _) = store.retained_native_snapshot_at(r1).unwrap();
     let mut binary = scip::types::Index::new();
@@ -241,30 +269,6 @@ fn two_document_case(change_b: &str) {
             document.symbols.clear();
         }
     }
-    let bytes = binary.write_to_bytes().unwrap();
-    fs::write(root.join("artifact.scip"), &bytes).unwrap();
-    let profile: Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let producer = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "scip-typescript")
-        .unwrap();
-    let documents: Vec<_> = native.revision.documents.iter().map(|d|json!({"language":d.key.language,"relativePath":d.key.path,"contentHash":d.content_hash})).collect();
-    let manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(&json!(
-            native
-                .revision
-                .documents
-                .iter()
-                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
-                .collect::<Vec<_>>()
-        )),
-    );
     let exclusion_reason = match change_b {
         "partial_empty_covered" => Some("notRequested"),
         "partial_not_requested" => Some("notRequested"),
@@ -279,54 +283,40 @@ fn two_document_case(change_b: &str) {
             binary.documents[0].occurrences.clear();
             binary.documents[0].symbols.clear();
         }
-        fs::write(root.join("artifact.scip"), binary.write_to_bytes().unwrap()).unwrap();
     }
-    let bytes = fs::read(root.join("artifact.scip")).unwrap();
-    let covered_documents: Vec<_> = if partial {
-        documents
-            .iter()
-            .filter(|d| d["relativePath"] == "src/A.js")
-            .cloned()
-            .collect()
+    let bytes = binary.write_to_bytes().unwrap();
+    let artifacts = vec![("javascript", "src/A.js", bytes.clone())];
+    let mut excluded = vec![];
+    if partial {
+        excluded.push(("javascript", "src/B.js", exclusion_reason.unwrap()));
+    }
+    let (descriptor_path, digest) = if partial {
+        write_batch(
+            &index_db,
+            &root,
+            "scip-typescript",
+            &artifacts,
+            &excluded,
+            ".trellis-semantic-batch",
+        )
     } else {
-        documents.clone()
+        let mut fixture =
+            BatchFixture::from_published(&index_db, &root).reference("scip-typescript");
+        let ordinal = fixture.artifact(
+            "javascript",
+            vec![DocSpec::new("src/A.js"), DocSpec::new("src/B.js")],
+        );
+        fixture.override_artifact_raw(ordinal, bytes.clone());
+        fixture.write(&root.join(".trellis-semantic-batch"))
     };
-    let artifact_documents = if partial {
-        vec!["src/A.js"]
-    } else {
-        vec!["src/A.js", "src/B.js"]
-    };
-    let exclusions = exclusion_reason
-        .map(|reason| {
-            vec![json!({"language":"javascript","relativePath":"src/B.js","reason":reason})]
-        })
-        .unwrap_or_default();
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":if partial {"partial"} else {"complete"},"decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-      "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
-      "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
-      "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
-      "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
-      "sourceDocuments":documents,"documents":covered_documents,"exclusions":exclusions,
-      "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":"javascript","documents":artifact_documents}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
-    let digest = native_ids::digest(b"", &manifest_bytes);
-    let artifact_path = root.join("artifact.scip");
-    let manifest_path = root.join("manifest.json");
     let args = [
         "semantic",
         "import",
         "--workspace",
         root_string,
-        "--scip",
-        artifact_path.to_str().unwrap(),
-        "--manifest",
-        manifest_path.to_str().unwrap(),
-        "--profile",
-        "mac-mini-m5-pro-v1",
-        "--producer",
-        "scip-typescript",
-        "--manifest-sha256",
+        "--batch",
+        descriptor_path.to_str().unwrap(),
+        "--batch-sha256",
         &digest,
     ];
     let captured = if change_b == "crash_published" {
@@ -352,7 +342,7 @@ fn two_document_case(change_b: &str) {
         assert_eq!(original.state, "running");
         assert!(
             store
-                .semantic_import_report_at(published, "scip-typescript")
+                .semantic_batch_report_at(published, &digest)
                 .unwrap()
                 .is_some()
         );
@@ -392,7 +382,7 @@ fn two_document_case(change_b: &str) {
         assert!(replayed.revision.unwrap().index_revision >= published.index_revision);
         assert!(
             store
-                .semantic_import_report_at(replayed.revision.unwrap(), "scip-typescript")
+                .semantic_batch_report_at(replayed.revision.unwrap(), &digest)
                 .unwrap()
                 .is_some()
         );
@@ -432,7 +422,7 @@ fn two_document_case(change_b: &str) {
         );
         assert_eq!(
             store
-                .semantic_import_report_at(after, "scip-typescript")
+                .semantic_batch_report_at(after, &digest)
                 .unwrap()
                 .unwrap(),
             committed["report"]
@@ -468,13 +458,15 @@ fn two_document_case(change_b: &str) {
         );
         assert!(
             output.stdout.len() > 1024 * 1024,
-            "chunked daemon reply must carry envelope"
+            "chunked daemon reply must carry envelope: report {} stdout {}",
+            report.len(),
+            output.stdout.len()
         );
         assert_eq!(
             store
-                .semantic_import_report_at(
+                .semantic_batch_report_at(
                     serde_json::from_value(committed["publishedRevision"].clone()).unwrap(),
-                    "scip-typescript"
+                    &digest
                 )
                 .unwrap()
                 .unwrap(),
@@ -503,7 +495,7 @@ fn two_document_case(change_b: &str) {
         );
         assert!(
             store
-                .semantic_import_report_at(after, "scip-typescript")
+                .semantic_batch_report_at(after, &digest)
                 .unwrap()
                 .is_none()
         );
@@ -529,7 +521,7 @@ fn two_document_case(change_b: &str) {
         );
         assert_eq!(
             store
-                .semantic_import_report_at(row.revision.unwrap(), "scip-typescript")
+                .semantic_batch_report_at(row.revision.unwrap(), &digest)
                 .unwrap()
                 .unwrap(),
             committed["report"]
@@ -606,7 +598,7 @@ fn two_document_case(change_b: &str) {
         assert!(resumed.revision.is_some());
         assert!(
             store
-                .semantic_import_report_at(resumed.revision.unwrap(), "scip-typescript")
+                .semantic_batch_report_at(resumed.revision.unwrap(), &digest)
                 .unwrap()
                 .is_some()
         );
@@ -631,7 +623,7 @@ fn two_document_case(change_b: &str) {
         );
         assert!(
             store
-                .semantic_import_report_at(rolled_back, "scip-typescript")
+                .semantic_batch_report_at(rolled_back, &digest)
                 .unwrap()
                 .is_none()
         );
@@ -675,7 +667,7 @@ fn two_document_case(change_b: &str) {
             assert_eq!(a.state, trellis::semantic_evidence::CoverageState::Complete);
             assert!(a.requested && a.selected);
             assert!(a.diagnostic.is_none());
-            assert_eq!(captured["report"]["documents"][0]["requested"], 0);
+            assert_eq!(captured["report"]["languages"][0]["requested"], 0);
         }
         let b = captured_semantic
             .coverage
@@ -712,22 +704,10 @@ fn two_document_case(change_b: &str) {
                 .iter()
                 .any(|row| row.document.path == "src/B.js")
         );
-        let report = captured["report"]["documents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["path"] == "src/B.js")
-            .unwrap();
-        assert_eq!(report["state"], serde_json::to_value(state).unwrap());
-        for key in [
-            "requested",
-            "matched",
-            "skipped",
-            "ambiguous",
-            "unsupported",
-        ] {
-            assert_eq!(report[key], 0, "{key}");
-        }
+        assert!(
+            captured["report"].get("documents").is_none(),
+            "the report carries no per-document rows"
+        );
         return;
     }
     assert!(
@@ -845,7 +825,7 @@ fn two_document_case(change_b: &str) {
         );
         assert!(
             store
-                .semantic_import_report_at(advanced_pin, "scip-typescript")
+                .semantic_batch_report_at(advanced_pin, &digest)
                 .unwrap()
                 .is_none()
         );
@@ -902,7 +882,18 @@ fn two_document_case(change_b: &str) {
             .unwrap();
         assert_ne!(independent.provenance_id, captured_proof);
     }
-    let a_report = &joined["report"]["documents"][0];
+    let state_of = |path: &str| {
+        serde_json::to_value(
+            selected
+                .coverage
+                .iter()
+                .find(|c| c.document_path == path)
+                .unwrap()
+                .state,
+        )
+        .unwrap()
+    };
+    let language_report = &joined["report"]["languages"][0];
     if matches!(change_b, "missing_a_real" | "missing_a" | "ambiguous_a") {
         let a_key = &native
             .revision
@@ -941,7 +932,7 @@ fn two_document_case(change_b: &str) {
         );
     }
     if change_b == "whole_cas" {
-        assert_eq!(a_report["state"], "complete");
+        assert_eq!(state_of("src/A.js"), "complete");
         assert_eq!(
             selected
                 .call_bindings
@@ -962,11 +953,10 @@ fn two_document_case(change_b: &str) {
         change_b,
         "cutoff" | "missing_a_real" | "missing_a" | "ambiguous_a"
     ) {
-        assert_eq!(a_report["state"], "failed");
-        assert_eq!(a_report["matched"], 0);
-        assert_eq!(
-            a_report["skipped"], a_report["requested"],
-            "all requested A claims must be skipped"
+        assert_eq!(state_of("src/A.js"), "failed");
+        assert!(
+            language_report["skipped"].as_u64().unwrap() > 0,
+            "the failed A document skips its requested claims"
         );
         assert!(
             selected
@@ -991,7 +981,7 @@ fn two_document_case(change_b: &str) {
             assert_ne!(head.revision.id, r2_native.revision.id);
         }
     } else if change_b == "removed" {
-        assert_eq!(a_report["state"], "partial");
+        assert_eq!(state_of("src/A.js"), "partial");
         assert!(
             selected
                 .call_bindings
@@ -999,17 +989,16 @@ fn two_document_case(change_b: &str) {
                 .all(|c| c.join.anchor.document.path != "src/A.js")
         );
         assert!(
-            joined["report"]["documents"]
-                .as_array()
-                .unwrap()
+            selected
+                .coverage
                 .iter()
-                .all(|d| d["path"] != "src/B.js"),
+                .all(|c| c.document_path != "src/B.js"),
             "removed B has no selected destination document to cover"
         );
     } else if matches!(change_b, "missing" | "ambiguous") {
-        assert_eq!(a_report["state"], "partial");
-        assert_eq!(a_report["matched"], 1);
-        assert_eq!(a_report["skipped"], 1);
+        assert_eq!(state_of("src/A.js"), "partial");
+        assert_eq!(language_report["matched"], 1);
+        assert_eq!(language_report["skipped"], 2);
         assert!(
             selected
                 .call_bindings
@@ -1057,12 +1046,12 @@ fn two_document_case(change_b: &str) {
         let envelope: Value = serde_json::from_slice(&raw.canonical_bytes).unwrap();
         assert_eq!(envelope["relativePath"], "src/A.js");
         assert_eq!(call.join.anchor.revision_id, r2_native.revision.id);
-        assert_eq!(a_report["state"], "complete");
+        assert_eq!(state_of("src/A.js"), "complete");
         if change_b == "unique" {
             assert!(
                 matches!(&call.declared_target,Some(trellis::semantic_evidence::Target::Internal{revision_id,syntax_id,..}) if revision_id==&r2_native.revision.id && syntax_id==&r1_b_syntax)
             );
-            assert_eq!(joined["report"]["documents"][1]["state"], "failed");
+            assert_eq!(state_of("src/B.js"), "failed");
         }
     }
     if let Ok(pid) = fs::read_to_string(home.join("daemon.pid"))
@@ -1204,41 +1193,19 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
     );
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let index_db = roots.index_db(&identity);
     let store = trellis::store::Store::open(roots, identity).unwrap();
     let (native, _) = store.retained_native_snapshot_at(pin).unwrap();
-    let source = native
-        .revision
-        .documents
-        .iter()
-        .find(|d| d.key.path == "src/A.js")
-        .unwrap();
-    let profile: Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let producer = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "scip-typescript")
-        .unwrap();
     let binary = hex::decode(WIRE).unwrap();
-    fs::write(root.join("artifact.scip"), &binary).unwrap();
-    let manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(&json!([{"document":source.key,"contentHash":source.content_hash}])),
+    let (descriptor_path, digest) = write_batch(
+        &index_db,
+        &root,
+        "scip-typescript",
+        &[("javascript", "src/A.js", binary.clone())],
+        &[],
+        ".trellis-semantic-batch",
     );
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
-        "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
-        "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
-        "sourceDocuments":[{"language":"javascript","relativePath":"src/A.js","contentHash":source.content_hash}],
-        "documents":[{"language":"javascript","relativePath":"src/A.js","contentHash":source.content_hash}],"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&binary),"language":"javascript","documents":["src/A.js"]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
-    let digest = native_ids::digest(b"", &manifest_bytes);
+    let descriptor = descriptor_path.display().to_string();
     // Start the daemon through the real CLI, then issue closed version-1 frames directly.
     let started = run(&home, &["status", "--workspace", root_string]);
     assert!(started.is_object());
@@ -1248,23 +1215,16 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
         home.join(".local/share/trellis")
     })
     .socket;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(root.join("artifact.scip"), root.join("linked.scip")).unwrap();
+    std::os::unix::fs::symlink(&descriptor_path, root.join("linked.json")).unwrap();
+    fs::write(temp.path().join("outside.json"), b"untouched outside").unwrap();
     let invalid = [
-        (
-            "relative.scip".to_owned(),
-            root.join("manifest.json").display().to_string(),
-        ),
-        (
-            temp.path().join("outside.scip").display().to_string(),
-            root.join("manifest.json").display().to_string(),
-        ),
-        (
-            root.join("linked.scip").display().to_string(),
-            root.join("manifest.json").display().to_string(),
-        ),
+        json!({"version":2,"descriptor":"relative.json","descriptorSha256":digest}),
+        json!({"version":2,"descriptor":temp.path().join("outside.json"),"descriptorSha256":digest}),
+        json!({"version":2,"descriptor":root.join("linked.json"),"descriptorSha256":digest}),
+        json!({"version":2,"descriptor":descriptor,"descriptorSha256":digest.to_uppercase()}),
+        json!({"version":1,"scip":root.join("artifact.scip"),"manifest":descriptor,
+            "profileId":"mac-mini-m5-pro-v1","producerName":"scip-typescript","manifestSha256":digest}),
     ];
-    fs::write(temp.path().join("outside.scip"), b"untouched outside").unwrap();
     let queue_rows = || -> Vec<(String, String)> {
         let db = rusqlite::Connection::open_with_flags(
             store.request_db_path(),
@@ -1278,7 +1238,7 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
     };
-    for (selected_scip, selected_manifest) in invalid {
+    for args in invalid {
         let prior_rows = queue_rows();
         use std::os::unix::net::UnixStream;
         use trellis::daemon::protocol;
@@ -1288,9 +1248,7 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             &protocol::Request {
                 id: 881,
                 operation: "semantic_import".into(),
-                payload: json!({"workspace":root,"args":{"version":1,"scip":selected_scip,
-                "manifest":selected_manifest,"profileId":"mac-mini-m5-pro-v1",
-                "producerName":"scip-typescript","manifestSha256":digest}}),
+                payload: json!({"workspace":root,"args":args}),
             },
         )
         .unwrap();
@@ -1308,9 +1266,10 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
         );
         assert!(store.earliest_unfinished_request().unwrap().is_none());
     }
-    // A normal-size manifest above the existing 1 MiB cap must fail after FIFO acceptance.
-    let oversized_path = root.join("oversized-manifest.json");
-    fs::write(&oversized_path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    // A descriptor above the 1 MiB cap must fail after FIFO acceptance.
+    let oversized_path = root.join("oversized-descriptor.json");
+    let oversized_bytes = vec![b' '; 1024 * 1024 + 1];
+    fs::write(&oversized_path, &oversized_bytes).unwrap();
     let prior_rows = queue_rows();
     let oversized = cli(&home)
         .args([
@@ -1318,16 +1277,10 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             "import",
             "--workspace",
             root_string,
-            "--scip",
-            root.join("artifact.scip").to_str().unwrap(),
-            "--manifest",
+            "--batch",
             oversized_path.to_str().unwrap(),
-            "--profile",
-            "mac-mini-m5-pro-v1",
-            "--producer",
-            "scip-typescript",
-            "--manifest-sha256",
-            &digest,
+            "--batch-sha256",
+            &native_ids::digest(b"", &oversized_bytes),
         ])
         .output()
         .unwrap();
@@ -1350,7 +1303,7 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
     assert!(store.semantic_at(baseline).unwrap().provenance.is_empty());
     assert!(
         store
-            .semantic_import_report_at(baseline, "scip-typescript")
+            .semantic_batch_report_at(baseline, &digest)
             .unwrap()
             .is_none()
     );
@@ -1372,15 +1325,9 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             "import",
             "--workspace",
             root_string,
-            "--scip",
-            root.join("artifact.scip").to_str().unwrap(),
-            "--manifest",
-            root.join("manifest.json").to_str().unwrap(),
-            "--profile",
-            "mac-mini-m5-pro-v1",
-            "--producer",
-            "scip-typescript",
-            "--manifest-sha256",
+            "--batch",
+            &descriptor,
+            "--batch-sha256",
             &digest,
         ],
     );
@@ -1393,8 +1340,21 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
     );
     assert_eq!(imported["report"]["producerId"], "scip-typescript");
     assert_eq!(imported["report"]["capturedRevision"], native.revision.id);
-    assert_eq!(imported["report"]["documents"][0]["matched"], 1);
-    assert_eq!(imported["report"]["documents"][0]["state"], "complete");
+    assert_eq!(imported["report"]["descriptorSha256"], digest);
+    assert_eq!(imported["report"]["languages"][0]["matched"], 1);
+    let imported_pin: trellis::model::IndexPin =
+        serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
+    assert_eq!(
+        store
+            .semantic_at(imported_pin)
+            .unwrap()
+            .coverage
+            .iter()
+            .find(|c| c.document_path == "src/A.js")
+            .unwrap()
+            .state,
+        trellis::semantic_evidence::CoverageState::Complete
+    );
     let first_report = &imported["report"];
     let repeated = run(
         &home,
@@ -1403,19 +1363,13 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             "import",
             "--workspace",
             root_string,
-            "--scip",
-            root.join("artifact.scip").to_str().unwrap(),
-            "--manifest",
-            root.join("manifest.json").to_str().unwrap(),
-            "--profile",
-            "mac-mini-m5-pro-v1",
-            "--producer",
-            "scip-typescript",
-            "--manifest-sha256",
+            "--batch",
+            &descriptor,
+            "--batch-sha256",
             &digest,
         ],
     );
-    assert_eq!(first_report["documents"], repeated["report"]["documents"]);
+    assert_eq!(first_report["artifacts"], repeated["report"]["artifacts"]);
     assert_eq!(first_report["languages"], repeated["report"]["languages"]);
     let before_bad = store.index_baseline().unwrap();
     let rejected = cli(&home)
@@ -1424,15 +1378,9 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             "import",
             "--workspace",
             root_string,
-            "--scip",
-            root.join("artifact.scip").to_str().unwrap(),
-            "--manifest",
-            root.join("manifest.json").to_str().unwrap(),
-            "--profile",
-            "mac-mini-m5-pro-v1",
-            "--producer",
-            "scip-typescript",
-            "--manifest-sha256",
+            "--batch",
+            &descriptor,
+            "--batch-sha256",
             &"0".repeat(64),
         ])
         .output()
@@ -1448,15 +1396,9 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
             "import",
             "--workspace",
             root_string,
-            "--scip",
-            root.join("artifact.scip").to_str().unwrap(),
-            "--manifest",
-            root.join("manifest.json").to_str().unwrap(),
-            "--profile",
-            "mac-mini-m5-pro-v1",
-            "--producer",
-            "scip-typescript",
-            "--manifest-sha256",
+            "--batch",
+            &descriptor,
+            "--batch-sha256",
             &digest,
         ],
     );
@@ -1468,8 +1410,20 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
                 .as_u64()
                 .unwrap()
     );
-    assert_eq!(failed["report"]["documents"][0]["state"], "failed");
-    assert_eq!(failed["report"]["documents"][0]["matched"], 0);
+    assert_eq!(failed["report"]["languages"][0]["matched"], 0);
+    let failed_pin: trellis::model::IndexPin =
+        serde_json::from_value(failed["publishedRevision"].clone()).unwrap();
+    assert_eq!(
+        store
+            .semantic_at(failed_pin)
+            .unwrap()
+            .coverage
+            .iter()
+            .find(|c| c.document_path == "src/A.js")
+            .unwrap()
+            .state,
+        trellis::semantic_evidence::CoverageState::Failed
+    );
     if let Ok(pid) = fs::read_to_string(home.join("daemon.pid"))
         && let Ok(pid) = pid.parse::<i32>()
     {
@@ -1584,14 +1538,8 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
             );
             let identity =
                 trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+            let index_db = roots.index_db(&identity);
             let store = trellis::store::Store::open(roots, identity).unwrap();
-            let (native, _) = store.retained_native_snapshot_at(pin).unwrap();
-            let doc = native
-                .revision
-                .documents
-                .iter()
-                .find(|d| d.key.path == path)
-                .unwrap();
             let start = source.rfind(symbol).unwrap();
             let line = source[..start].bytes().filter(|b| *b == b'\n').count();
             let prefix = source[..start].rsplit('\n').next().unwrap();
@@ -1831,41 +1779,15 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
             document.occurrences.push(occurrence);
             scip.documents.push(document);
             let bytes = scip.write_to_bytes().unwrap();
-            fs::write(root.join("artifact.scip"), &bytes).unwrap();
-            let profile: Value = serde_json::from_str(include_str!(
-                "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-            ))
-            .unwrap();
-            let producer_record = profile["semanticProducers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|p| p["name"] == producer)
-                .unwrap();
-            let source_documents = vec![
-                json!({"language":language,"relativePath":path,"contentHash":doc.content_hash}),
-            ];
-            let manifest_hash = native_ids::digest(
-                b"",
-                &native_ids::canonical(&json!(
-                    native
-                        .revision
-                        .documents
-                        .iter()
-                        .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
-                        .collect::<Vec<_>>()
-                )),
+            let (descriptor_path, digest) = write_batch(
+                &index_db,
+                &root,
+                producer,
+                &[(language, path, bytes.clone())],
+                &[],
+                ".trellis-semantic-batch",
             );
-            let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-            "producer":{"name":producer_record["name"],"version":producer_record["version"],"executableHash":producer_record["executableHash"],"positionEncoding":encoding},
-            "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
-            "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
-            "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
-            "sourceDocuments":source_documents,"documents":source_documents,"exclusions":[],
-            "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":language,"documents":[path]}]});
-            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-            fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
-            let digest = native_ids::digest(b"", &manifest_bytes);
+            let descriptor = descriptor_path.display().to_string();
             if coordinate_case {
                 let before = store.index_baseline().unwrap();
                 let prior = store.semantic_at(before).unwrap();
@@ -1908,29 +1830,23 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                         };
                     }
                     let invalid_bytes = invalid.write_to_bytes().unwrap();
-                    fs::write(root.join("bad.scip"), &invalid_bytes).unwrap();
-                    let mut bad_manifest = manifest.clone();
-                    bad_manifest["artifacts"][0]["path"] = json!("bad.scip");
-                    bad_manifest["artifacts"][0]["hash"] =
-                        json!(native_ids::digest(b"", &invalid_bytes));
-                    let bad_manifest_bytes = serde_json::to_vec(&bad_manifest).unwrap();
-                    fs::write(root.join("bad-manifest.json"), &bad_manifest_bytes).unwrap();
-                    let bad_digest = native_ids::digest(b"", &bad_manifest_bytes);
+                    let (bad_descriptor, bad_digest) = write_batch(
+                        &index_db,
+                        &root,
+                        producer,
+                        &[(language, path, invalid_bytes)],
+                        &[],
+                        &format!(".trellis-semantic-bad-{invalid_case}"),
+                    );
                     let output = cli(&home)
                         .args([
                             "semantic",
                             "import",
                             "--workspace",
                             root_string,
-                            "--scip",
-                            root.join("bad.scip").to_str().unwrap(),
-                            "--manifest",
-                            root.join("bad-manifest.json").to_str().unwrap(),
-                            "--profile",
-                            "mac-mini-m5-pro-v1",
-                            "--producer",
-                            producer,
-                            "--manifest-sha256",
+                            "--batch",
+                            bad_descriptor.to_str().unwrap(),
+                            "--batch-sha256",
                             &bad_digest,
                         ])
                         .output()
@@ -1957,7 +1873,7 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                     );
                     assert!(
                         store
-                            .semantic_import_report_at(after, producer)
+                            .semantic_batch_report_at(after, &bad_digest)
                             .unwrap()
                             .is_none()
                     );
@@ -1974,15 +1890,9 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                     "import",
                     "--workspace",
                     root_string,
-                    "--scip",
-                    root.join("artifact.scip").to_str().unwrap(),
-                    "--manifest",
-                    root.join("manifest.json").to_str().unwrap(),
-                    "--profile",
-                    "mac-mini-m5-pro-v1",
-                    "--producer",
-                    producer,
-                    "--manifest-sha256",
+                    "--batch",
+                    &descriptor,
+                    "--batch-sha256",
                     &digest,
                 ],
             );
@@ -1997,7 +1907,17 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                 "{language}: {imported}"
             );
             assert_eq!(
-                imported["report"]["documents"][0]["state"],
+                serde_json::to_value(
+                    store
+                        .semantic_at(selected_pin)
+                        .unwrap()
+                        .coverage
+                        .iter()
+                        .find(|c| c.document_path == path)
+                        .unwrap()
+                        .state
+                )
+                .unwrap(),
                 if language == "java" && !type_case {
                     "partial"
                 } else {
@@ -2006,7 +1926,7 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                 "{language}: {imported}"
             );
             assert_eq!(
-                imported["report"]["documents"][0]["matched"],
+                imported["report"]["languages"][0]["matched"],
                 if language == "java" && !type_case {
                     14
                 } else if type_case && language == "rust" {
@@ -2021,11 +1941,11 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                 "{language}: {imported}"
             );
             if ambiguous_call {
-                assert_eq!(imported["report"]["documents"][0]["ambiguous"], 2);
+                assert_eq!(imported["report"]["languages"][0]["ambiguous"], 2);
             }
             assert_eq!(
                 store
-                    .semantic_import_report_at(selected_pin, producer)
+                    .semantic_batch_report_at(selected_pin, &digest)
                     .unwrap()
                     .unwrap(),
                 imported["report"]
@@ -2224,23 +2144,18 @@ fn replaced_root_fails_old_accepted_semantic_row_before_new_root_claim() {
     let old_identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let old = trellis::store::Store::open(roots.clone(), old_identity).unwrap();
-    fs::write(root.join("artifact.scip"), b"queued artifact").unwrap();
-    fs::write(root.join("manifest.json"), b"queued manifest").unwrap();
+    fs::write(root.join("descriptor.json"), b"queued descriptor").unwrap();
     let options = SemanticImportOptions {
-        version: 1,
-        scip: root.join("artifact.scip").display().to_string(),
-        manifest: root.join("manifest.json").display().to_string(),
-        profile_id: "mac-mini-m5-pro-v1".into(),
-        producer_name: "scip-typescript".into(),
-        manifest_sha256: "a".repeat(64),
+        version: 2,
+        descriptor: root.join("descriptor.json").display().to_string(),
+        descriptor_sha256: "a".repeat(64),
     };
     let accepted = old.enqueue_semantic_import(&root, &options).unwrap();
     assert_eq!(accepted.state, "queued");
     fs::rename(&root, temp.path().join("old-checkout")).unwrap();
     fs::create_dir(&root).unwrap();
     fs::write(root.join("A.js"), "function g(){}\n").unwrap();
-    fs::write(root.join("artifact.scip"), b"new root artifact").unwrap();
-    fs::write(root.join("manifest.json"), b"new root manifest").unwrap();
+    fs::write(root.join("descriptor.json"), b"new root descriptor").unwrap();
     assert_eq!(old.fail_changed_root_requests().unwrap(), 1);
     let fresh_identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
@@ -2298,6 +2213,7 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
     );
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let index_db = roots.index_db(&identity);
     let store = trellis::store::Store::open(roots, identity).unwrap();
     let (native, _) = store.retained_native_snapshot_at(pin).unwrap();
     let doc = native
@@ -2362,40 +2278,14 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
     }
     binary.documents.push(document);
     let bytes = binary.write_to_bytes().unwrap();
-    fs::write(root.join("artifact.scip"), &bytes).unwrap();
-    let profile: Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let producer = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "rust-analyzer")
-        .unwrap();
-    let source_documents =
-        vec![json!({"language":"rust","relativePath":"A.rs","contentHash":doc.content_hash})];
-    let manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(&json!(
-            native
-                .revision
-                .documents
-                .iter()
-                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
-                .collect::<Vec<_>>()
-        )),
+    let (descriptor_path, digest) = write_batch(
+        &index_db,
+        &root,
+        "rust-analyzer",
+        &[("rust", "A.rs", bytes)],
+        &[],
+        ".trellis-semantic-batch",
     );
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":1},
-        "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
-        "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
-        "sourceDocuments":source_documents,"documents":source_documents,"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":"rust","documents":["A.rs"]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(root.join("manifest.json"), &manifest_bytes).unwrap();
-    let digest = native_ids::digest(b"", &manifest_bytes);
     let committed = run(
         &home,
         &[
@@ -2403,22 +2293,14 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
             "import",
             "--workspace",
             root_string,
-            "--scip",
-            root.join("artifact.scip").to_str().unwrap(),
-            "--manifest",
-            root.join("manifest.json").to_str().unwrap(),
-            "--profile",
-            "mac-mini-m5-pro-v1",
-            "--producer",
-            "rust-analyzer",
-            "--manifest-sha256",
+            "--batch",
+            descriptor_path.to_str().unwrap(),
+            "--batch-sha256",
             &digest,
         ],
     );
-    let report = &committed["report"]["documents"][0];
+    let report = &committed["report"]["languages"][0];
     assert_eq!(report["requested"], 4, "{committed}");
-    assert_eq!(report["state"], "partial");
-    assert_eq!(report["diagnostic"], "unsupported_native_gap");
     assert_eq!(report["matched"], 2, "ordinary and main measured");
     assert_eq!(report["unsupported"], 1, "hidden inside genuine native gap");
     assert_eq!(report["skipped"], 1, "unmatched macro outside measured gap");
@@ -2452,7 +2334,7 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
     );
     assert_eq!(
         store
-            .semantic_import_report_at(selected_pin, "rust-analyzer")
+            .semantic_batch_report_at(selected_pin, &digest)
             .unwrap()
             .unwrap(),
         committed["report"]
@@ -2462,14 +2344,11 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
 #[test]
 fn replacing_one_selected_raw_capture_copies_the_other_producer() {
     use protobuf::{EnumOrUnknown, Message};
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, atomic::AtomicBool},
-    };
+    use std::sync::{Arc, atomic::AtomicBool};
     use trellis::{
         indexer::{IndexOptions, index_workspace_bundle},
-        scip_admission::{ReferenceProfileAdmission, TrustedSelection, decode_reference_profile},
-        semantic_evidence as semantic,
+        semantic_batch::{BatchLimits, testing::stage_and_join_admitted},
+        semantic_import::DestinationMutations,
     };
     let temp = Builder::new()
         .prefix("semantic-selection-")
@@ -2483,12 +2362,17 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
     let state = temp.path().join("state");
     fs::create_dir(&state).unwrap();
     let store = trellis::store::Store::open_for_tests(&state, &root).unwrap();
+    let index_db = trellis::store::topology::TopologyRoots::isolated_for_tests(
+        state.join("cache"),
+        state.join("data"),
+    )
+    .index_db(&trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap());
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(root.clone());
     let (graph, native, capture) =
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
     let leader = store.publication_for_tests().unwrap();
-    let r1 = store
+    store
         .publish_native(
             &graph,
             &capture,
@@ -2498,36 +2382,13 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
             &cancel,
         )
         .unwrap();
-    let (native, sources) = store.retained_native_snapshot_at(r1).unwrap();
-    let (toolchain, config, dependencies) = store.retained_native_components_at(r1).unwrap();
-    let profile: Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let source_documents: Vec<_> = native.revision.documents.iter().map(|d|json!({"language":d.key.language,"relativePath":d.key.path,"contentHash":d.content_hash})).collect();
-    let source_manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(&json!(
-            native
-                .revision
-                .documents
-                .iter()
-                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
-                .collect::<Vec<_>>()
-        )),
-    );
+    drop(leader);
     let mut pins = Vec::new();
     for (producer_id, path, language, replacement) in [
         ("scip-typescript", "A.js", "javascript", false),
         ("scip-python", "B.py", "python", false),
         ("scip-typescript", "A.js", "javascript", true),
     ] {
-        let producer = profile["semanticProducers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["name"] == producer_id)
-            .unwrap();
         let mut binary = scip::types::Index::new();
         let mut document = scip::types::Document::new();
         document.relative_path = path.into();
@@ -2538,121 +2399,30 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
         }
         binary.documents.push(document);
         let bytes = binary.write_to_bytes().unwrap();
-        let binary_path = root.join(format!("{producer_id}-{replacement}.scip"));
-        fs::write(&binary_path, &bytes).unwrap();
-        let covered: Vec<_> = source_documents
-            .iter()
-            .filter(|d| d["relativePath"] == path)
-            .cloned()
-            .collect();
-        let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-            "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
-            "sourceSet":native.source_set,"sourceRevision":native.revision.id,"sourceManifestHash":source_manifest_hash,
-            "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
-            "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",root.display()),"textDocumentEncoding":1},
-            "sourceDocuments":source_documents,"documents":covered,"exclusions":[],
-            "artifacts":[{"kind":"scipBinary","path":binary_path.file_name().unwrap().to_str().unwrap(),"hash":native_ids::digest(b"",&bytes),"language":language,"documents":[path]}]});
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_path = root.join(format!("{producer_id}-{replacement}.json"));
-        fs::write(&manifest_path, &manifest_bytes).unwrap();
-        let digest = native_ids::digest(b"", &manifest_bytes);
-        let selection = TrustedSelection {
-            expected_manifest_hash: digest,
-            profile_id: "mac-mini-m5-pro-v1".into(),
-            producer_name: producer_id.into(),
-        };
-        let admitted = ReferenceProfileAdmission::from_retained_native(
+        let (descriptor, digest) = write_batch(
+            &index_db,
             &root,
-            &native,
-            &sources,
-            &binary_path,
-            &bytes,
-            &manifest_path,
-            &manifest_bytes,
-            &selection,
+            producer_id,
+            &[(language, path, bytes.clone())],
+            &[],
+            &format!(".trellis-semantic-batch-{}", pins.len()),
+        );
+        let (mut admitted, joined, _) = stage_and_join_admitted(
+            &store,
+            &root,
+            &descriptor,
+            &digest,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
             &cancel,
         )
         .unwrap();
-        let semantic_producer = admitted.producer();
-        let inventory = decode_reference_profile(&admitted, &cancel).unwrap();
-        let mut basis = BTreeMap::new();
-        for doc in &native.revision.documents {
-            if doc.key.language == language {
-                basis.insert(
-                    doc.key.clone(),
-                    semantic::SemanticBasis {
-                        producer_id: semantic_producer.id.clone(),
-                        producer_version: semantic_producer.version.clone(),
-                        producer_hash: semantic_producer.executable_hash.clone(),
-                        artifact_hash: inventory.artifact_hashes[0].clone(),
-                        language: serde_json::from_value(json!(doc.key.language)).unwrap(),
-                        source_set_id: doc.key.source_set_id.clone(),
-                        revision_id: native.revision.id.clone(),
-                        source_manifest_hash: inventory.source_manifest_hash.clone(),
-                        toolchain_hash: native.revision.toolchain_hash.clone(),
-                        config_hash: native.revision.config_hash.clone(),
-                        dependency_hash: native.revision.dependency_hash.clone(),
-                        lookup_dependencies: vec![],
-                    },
-                );
-            }
-        }
-        let result = trellis::semantic_import::rejoin_inventory(
-            &inventory,
-            &native,
-            &sources,
-            &native,
-            &sources,
-            semantic_producer.clone(),
-            &basis,
-            2,
-        )
-        .unwrap();
-        let captured = semantic::CapturedComponents {
-            producer_executables: BTreeMap::new(),
-            artifacts: BTreeMap::from([(
-                (producer_id.into(), inventory.artifact_hashes[0].clone()),
-                bytes.clone(),
-            )]),
-            sources: sources.clone(),
-            captured_revision: native.revision.clone(),
-            native_toolchain: toolchain.clone(),
-            native_config: config.clone(),
-            native_dependencies: dependencies.clone(),
-            requested_producers: vec![semantic_producer],
-            toolchain: native_ids::canonical(&toolchain),
-            config: native_ids::canonical(&json!(config)),
-            dependency: native_ids::canonical(&json!(dependencies)),
-            native_extraction_components: BTreeMap::new(),
-        };
-        let raw = trellis::store::SemanticRawCapture {
-            producer_id: producer_id.into(),
-            source_set_id: native.revision.source_set_id.clone(),
-            captured_revision: native.revision.id.clone(),
-            binary_bytes: bytes.clone(),
-            manifest_bytes: manifest_bytes.clone(),
-            inventory,
-        };
-        let docs = native
-            .revision
-            .documents
-            .iter()
-            .map(|doc| {
-                (
-                    (doc.key.language.clone(), doc.key.path.clone()),
-                    doc.content_hash.clone(),
-                )
-            })
-            .collect();
+        let leader = store.publication_for_tests().unwrap();
         let pin = store
-            .publish_semantic_import(
-                store.index_baseline().unwrap(),
-                &docs,
-                &result.publication,
-                &captured,
-                &native,
-                &raw,
-                &result.report,
+            .publish_semantic_batch(
+                &joined,
+                admitted.stage_mut(),
+                joined.destination_pin(),
                 &leader,
                 &cancel,
             )

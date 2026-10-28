@@ -219,9 +219,10 @@ class SchemaParity(unittest.TestCase):
                    (HEX, artifact, source_set, natives["r1"], header["manifest_hash"], HEX, HEX, HEX))
         db.execute("INSERT INTO semantic_provenance VALUES(1,'prov',?,'semanticReference','fresh',1,1,'proof','occurrence',?)",
                    (HEX, HEX))
-        report = {"capturedRevision": natives["r1"], "destinationRevision": natives["r2"],
-                  "documents": [], "languages": [], "producerId": "scip-typescript",
-                  "sourceSetId": source_set}
+        report = {"producerId": "scip-typescript", "identityKind": "executable",
+                  "sourceSetId": source_set, "capturedRevision": natives["r1"],
+                  "destinationRevision": natives["r2"], "descriptorSha256": HEX,
+                  "artifacts": [], "languages": []}
         db.execute("INSERT INTO semantic_import_reports VALUES(?,?,?)",
                    (pins["import"], "scip-typescript", json.dumps(report)))
         return root, pins["r2"]

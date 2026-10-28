@@ -117,6 +117,7 @@ pub struct BatchFixture {
     producer: Producer,
     artifacts: Vec<(String, Vec<DocSpec>)>,
     byte_docs: BTreeMap<u32, Vec<DocSpec>>,
+    raw_bytes: BTreeMap<u32, Vec<u8>>,
     exclusions: BTreeMap<(String, String), &'static str>,
     rows_per_page: usize,
 }
@@ -219,6 +220,7 @@ impl BatchFixture {
             producer: synthetic_producer(),
             artifacts: vec![],
             byte_docs: BTreeMap::new(),
+            raw_bytes: BTreeMap::new(),
             exclusions: BTreeMap::new(),
             rows_per_page: 1000,
         }
@@ -288,6 +290,11 @@ impl BatchFixture {
     /// documents, to build missing, unlisted and duplicate documents.
     pub fn override_artifact_bytes(&mut self, ordinal: u32, docs: Vec<DocSpec>) {
         self.byte_docs.insert(ordinal, docs);
+    }
+
+    /// Makes artifact `ordinal`'s bytes exactly `bytes`, for tests that hand-build the SCIP.
+    pub fn override_artifact_raw(&mut self, ordinal: u32, bytes: Vec<u8>) {
+        self.raw_bytes.insert(ordinal, bytes);
     }
 
     pub fn exclude(&mut self, language: &str, path: &str, reason: &'static str) {
@@ -407,10 +414,13 @@ impl BatchFixture {
         }
         let mut artifacts = vec![];
         for (ordinal, (language, docs)) in self.artifacts.iter().enumerate() {
-            let bytes = self.scip_bytes(
-                language,
-                self.byte_docs.get(&(ordinal as u32)).unwrap_or(docs),
-            );
+            let bytes = match self.raw_bytes.get(&(ordinal as u32)) {
+                Some(bytes) => bytes.clone(),
+                None => self.scip_bytes(
+                    language,
+                    self.byte_docs.get(&(ordinal as u32)).unwrap_or(docs),
+                ),
+            };
             let name = format!("artifact-{ordinal}.scip");
             fs::write(dir.join(&name), &bytes).unwrap();
             artifacts.push(json!({"ordinal":ordinal,"relativePath":relative(&name),"byteLength":bytes.len(),"sha256":sha256(&bytes),"language":language}));

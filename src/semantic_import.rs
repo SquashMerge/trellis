@@ -3302,7 +3302,6 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             },
         });
     }
-    let mut document_counts = Vec::new();
     let mut language_counts: BTreeMap<semantic::Language, [usize; 5]> = BTreeMap::new();
     for row in &coverage {
         let mut counts = [0usize; 5];
@@ -3333,18 +3332,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         for (total, count) in aggregate.iter_mut().zip(counts) {
             *total += count;
         }
-        document_counts.push((
-            row.language,
-            row.document_path.clone(),
-            serde_json::json!({
-                "language": row.language, "path": row.document_path, "state": row.state,
-                "supportedRoles": row.supported_roles, "observedRoles": row.observed_roles,
-                "diagnostic": row.diagnostic, "requested": counts[0], "matched": counts[1],
-                "skipped": counts[2], "ambiguous": counts[3], "unsupported": counts[4]
-            }),
-        ));
     }
-    document_counts.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
     let languages: Vec<_> = language_counts
         .into_iter()
         .map(|(language, counts)| {
@@ -3354,20 +3342,17 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             })
         })
         .collect();
+    #[allow(unused_mut)]
+    let mut report = serde_json::json!({"producerId":producer.id,"sourceSetId":destination_native.revision.source_set_id,
+        "capturedRevision":captured_native.revision.id,"destinationRevision":destination_native.revision.id,
+        "languages":languages});
     #[cfg(feature = "test-support")]
     if let Ok(bytes) = std::env::var("TRELLIS_TEST_SEMANTIC_REPORT_PADDING")
         && let Ok(bytes) = bytes.parse::<usize>()
         && bytes <= 1024 * 1024
     {
-        document_counts.push((
-            semantic::Language::Java,
-            "test-only report padding".into(),
-            serde_json::json!({"diagnostic":"x".repeat(bytes)}),
-        ));
+        report["padding"] = serde_json::Value::String("x".repeat(bytes));
     }
-    let report = serde_json::json!({"producerId":producer.id,"sourceSetId":destination_native.revision.source_set_id,
-        "capturedRevision":captured_native.revision.id,"destinationRevision":destination_native.revision.id,
-        "languages":languages,"documents":document_counts.into_iter().map(|(_,_,row)|row).collect::<Vec<_>>()});
     ensure!(
         serde_json::to_vec(&report)?.len() <= 1024 * 1024,
         "semantic import report exceeds response bound"

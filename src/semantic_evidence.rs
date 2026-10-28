@@ -582,7 +582,7 @@ pub fn validate_evidence(
     native: &native::Artifact,
     captured: &CapturedComponents,
 ) -> Result<()> {
-    validate_evidence_with_raw(semantic, native, captured, None)
+    validate_evidence_inner(semantic, native, captured, None, None, None)
 }
 
 struct ValidatedRaw<'a> {
@@ -595,18 +595,6 @@ struct ValidatedRaw<'a> {
     inventory: crate::scip_raw::ProofInventory,
 }
 impl<'a> ValidatedRaw<'a> {
-    fn from_decoded(raw: &'a crate::store::SemanticRawCapture) -> Self {
-        Self {
-            producer_id: &raw.producer_id,
-            source_set_id: &raw.source_set_id,
-            captured_revision: &raw.captured_revision,
-            binaries: BTreeMap::from([(
-                native_ids::digest(b"", &raw.binary_bytes),
-                &raw.binary_bytes[..],
-            )]),
-            inventory: raw.inventory.proof_identities(),
-        }
-    }
     fn from_witnessed(raw: &'a crate::store::WitnessedRawCapture) -> Self {
         Self {
             producer_id: &raw.producer_id,
@@ -635,39 +623,6 @@ impl<'a> ValidatedRaw<'a> {
             inventory: inventory.proof_identities(),
         }
     }
-}
-
-pub fn validate_evidence_with_raw(
-    semantic: &SemanticPublication,
-    native: &native::Artifact,
-    captured: &CapturedComponents,
-    raw: Option<&crate::store::SemanticRawCapture>,
-) -> Result<()> {
-    validate_evidence_inner(
-        semantic,
-        native,
-        captured,
-        raw.map(ValidatedRaw::from_decoded),
-        None,
-        None,
-    )
-}
-
-pub(crate) fn validate_evidence_with_attested_raw(
-    semantic: &SemanticPublication,
-    native: &native::Artifact,
-    captured: &CapturedComponents,
-    raw: &crate::store::SemanticRawCapture,
-    attested: &crate::store::AttestedProfileProducer,
-) -> Result<()> {
-    validate_evidence_inner(
-        semantic,
-        native,
-        captured,
-        Some(ValidatedRaw::from_decoded(raw)),
-        Some(attested),
-        None,
-    )
 }
 
 /// The whole-publication validator over a stored batch of one or more original artifacts: each

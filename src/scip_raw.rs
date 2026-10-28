@@ -65,49 +65,6 @@ fn cancelled(flag: &CancelFlag) -> Result<(), ScipCaptureError> {
 pub(crate) fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
-/// Digest the exact payload bytes of each already-admitted Index.documents field.
-/// The caller must first complete `decode_authenticated`; this does not admit bytes.
-pub(crate) fn admitted_document_wire_digests(
-    artifact: &[u8],
-    flag: &CancelFlag,
-) -> Result<BTreeMap<(String, String), String>, ScipCaptureError> {
-    wire(artifact, Node::Index, 0, &mut WireBudget::default(), flag)?;
-    let index = types::Index::parse_from_bytes(artifact).map_err(|_| invalid("protobuf parse"))?;
-    let mut payloads = Vec::new();
-    let mut i = 0;
-    while i < artifact.len() {
-        let tag = varint(artifact, &mut i)?;
-        if tag & 7 == 0 {
-            varint(artifact, &mut i)?;
-            continue;
-        }
-        let len = usize::try_from(varint(artifact, &mut i)?).map_err(|_| limit("field length"))?;
-        let end = i
-            .checked_add(len)
-            .filter(|end| *end <= artifact.len())
-            .ok_or_else(|| invalid("truncated field"))?;
-        if tag >> 3 == 2 {
-            payloads.push(sha(&artifact[i..end]));
-        }
-        i = end;
-    }
-    if payloads.len() != index.documents.len() {
-        return Err(invalid("document wire identity mismatch"));
-    }
-    let mut digests = BTreeMap::new();
-    for (document, digest) in index.documents.iter().zip(payloads) {
-        if digests
-            .insert(
-                (document.language.clone(), document.relative_path.clone()),
-                digest,
-            )
-            .is_some()
-        {
-            return Err(invalid("duplicate document wire identity"));
-        }
-    }
-    Ok(digests)
-}
 #[derive(Debug)]
 pub(crate) struct AuthenticatedScipDocument<'a> {
     pub language: String,
@@ -115,6 +72,7 @@ pub(crate) struct AuthenticatedScipDocument<'a> {
     pub source_bytes: &'a [u8],
     pub content_hash: String,
 }
+#[cfg(test)]
 pub(crate) struct AuthenticatedScipInput<'a> {
     pub artifact_bytes: &'a [u8],
     pub artifact_hash: String,
@@ -261,6 +219,7 @@ enum Wire {
 }
 #[derive(Clone, Copy)]
 enum Node {
+    #[cfg(test)]
     Index,
     Metadata,
     Tool,
@@ -277,8 +236,11 @@ fn field(node: Node, n: u64) -> Option<(u8, Wire, usize)> {
     use Node::*;
     use Wire::*;
     Some(match (node, n) {
+        #[cfg(test)]
         (Index, 1) => (2, Message(Metadata), 1),
+        #[cfg(test)]
         (Index, 2) => (2, Message(Document), 1000),
+        #[cfg(test)]
         (Index, 3) => (2, Message(Symbol), 10000),
         (Metadata, 1) => (0, Scalar, 1),
         (Metadata, 2) => (2, Message(Tool), 1),
@@ -1159,6 +1121,7 @@ pub fn decode_streaming<'s, R: Read>(
 }
 
 /// Whole-artifact decoder over an in-memory artifact: the streaming decoder into a `VecSink`.
+#[cfg(test)]
 pub(crate) fn decode_authenticated(
     input: &AuthenticatedScipInput<'_>,
     flag: &CancelFlag,
@@ -1376,9 +1339,63 @@ mod tests {
         assert_eq!(&alternate[88..90], &[0x30, 0x01]);
         alternate[1] += 1;
         alternate.splice(88..90, [0x30, 0x81, 0x00]);
-        let flag = Arc::new(AtomicBool::new(false));
-        let first = admitted_document_wire_digests(&original, &flag).unwrap();
-        let second = admitted_document_wire_digests(&alternate, &flag).unwrap();
+        struct Digests(BTreeMap<(String, String), String>);
+        impl ClaimSink for Digests {
+            fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError> {
+                self.0.insert(
+                    (doc.language.to_owned(), doc.path.to_owned()),
+                    doc.wire_digest.to_owned(),
+                );
+                Ok(())
+            }
+            fn claim(&mut self, _claim: CapturedClaim) -> Result<(), ScipCaptureError> {
+                Ok(())
+            }
+            fn end_document(&mut self) -> Result<(), ScipCaptureError> {
+                Ok(())
+            }
+        }
+        let wire_digests = |bytes: &[u8]| {
+            let documents = vector_documents(FULL);
+            let hash = sha(bytes);
+            let artifact = AuthenticatedArtifact {
+                artifact_hash: &hash,
+                producer_id: "scip-test",
+                producer_version: "1.0.0",
+                source_set_id: "app",
+                source_revision: "r1",
+                position_encoding: 1,
+                protocol_version: 0,
+                text_document_encoding: 1,
+                project_root_uri: "file:///synthetic",
+                assigned_documents: documents.len() as u64,
+            };
+            let mut resolve = |path: &str, _language: &str| {
+                let document = documents
+                    .iter()
+                    .find(|document| document.relative_path == path)
+                    .ok_or_else(|| invalid("unlisted document"))?;
+                Ok(DocumentSource {
+                    bytes: Cow::Borrowed(document.source_bytes),
+                    content_hash: document.content_hash.clone(),
+                })
+            };
+            let mut sink = Digests(BTreeMap::new());
+            decode_streaming(
+                bytes,
+                bytes.len() as u64,
+                &artifact,
+                &mut resolve,
+                &mut BatchCounters::default(),
+                &BatchLimits::PRODUCTION,
+                &mut sink,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            sink.0
+        };
+        let first = wire_digests(&original);
+        let second = wire_digests(&alternate);
         assert_ne!(
             first[&("javascript".into(), "src/A.js".into())],
             second[&("javascript".into(), "src/A.js".into())]

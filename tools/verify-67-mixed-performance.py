@@ -975,7 +975,6 @@ def run_semantic_import(binary, root, daemon, descriptor, sha, env, timed=False,
 def import_fixture(binary, root, daemon, size, r1):
     anchor = Path("javascript") / f"C{size}0010.js"
     raw = scip_anchor(root / anchor, anchor)
-    (root / "artifact.scip").write_bytes(raw)
     digest = hashlib.sha256(raw).hexdigest()
     with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
         captured = capture_r1(db, r1)
@@ -983,32 +982,17 @@ def import_fixture(binary, root, daemon, size, r1):
     covered = [row for row in rows if row["language"] == "javascript"]
     require(len(covered) == 1 and covered[0]["relativePath"] == anchor.as_posix(),
             "r1 JavaScript closure must contain exactly the frozen anchor")
-    profile = json.loads((REPO / "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json").read_text())
-    producer = next(p for p in profile["semanticProducers"] if p["name"] == "scip-typescript")
-    manifest = {"formatVersion": 1, "trustOrigin": "referenceProfile", "completion": "complete",
-                "decoderVersion": DECODER_VERSION, "profileId": profile["profileId"],
-                "producer": {"name": producer["name"], "version": producer["version"],
-                             "executableHash": producer["executableHash"], "positionEncoding": 2},
-                "sourceSet": captured["source_set"], "sourceRevision": captured["native_id"],
-                "sourceManifestHash": captured["manifest_hash"], "components": captured["components"],
-                "metadata": {"protocolVersion": 0, "projectRoot": root.as_uri(), "textDocumentEncoding": 1},
-                "sourceDocuments": rows, "documents": covered, "exclusions": [],
-                "artifacts": [{"kind": "scipBinary", "path": "artifact.scip", "hash": digest,
-                               "language": "javascript", "documents": [anchor.as_posix()]}]}
-    serialized = canonical(manifest)
-    (root / "manifest.json").write_bytes(serialized)
-    manifest_hash = hashlib.sha256(serialized).hexdigest()
-    output = command([str(binary), "semantic", "import", "--workspace", str(root),
-                      "--scip", str(root / "artifact.scip"), "--manifest", str(root / "manifest.json"),
-                      "--profile", profile["profileId"], "--producer", producer["name"],
-                      "--manifest-sha256", manifest_hash], env=env_for(daemon.home))
+    # write_batch needs an empty directory, and a workspace root imports once per directory.
+    shutil.rmtree(root / ".trellis-semantic-batch", ignore_errors=True)
+    descriptor, descriptor_sha = write_import_batch(root, captured, raw, covered)
+    output = run_semantic_import(binary, root, daemon, descriptor, descriptor_sha, env_for(daemon.home))
     pin = json.loads(output)["publishedRevision"]
     selected = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
     with closing(sqlite3.connect(f"file:{db_for(daemon.home)}?mode=ro", uri=True)) as db:
         proof = selected_proof(db, selected, anchor.as_posix(), digest)
-    record("fixture_import", size=size, r1=r1, selection_pin=selected, manifest_sha256=manifest_hash,
+    record("fixture_import", size=size, r1=r1, selection_pin=selected, descriptor_sha256=descriptor_sha,
            source_manifest_hash=captured["manifest_hash"], artifact_sha256=digest,
-           requested_tuple=(producer["name"], "javascript", anchor.as_posix()), proof=proof)
+           requested_tuple=("scip-typescript", "javascript", anchor.as_posix()), proof=proof)
     return digest, selected
 
 
@@ -1063,7 +1047,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-25 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-26 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
@@ -1308,9 +1292,10 @@ class SelectedView:
             cells["source_manifest_hash"] = descriptor["sourceManifestHash"]
         if table == "semantic_import_reports":
             report = json.loads(cells["report_json"])
-            require(set(report) == {"capturedRevision", "destinationRevision", "documents",
-                                    "languages", "producerId", "sourceSetId"},
+            require(set(report) == {"producerId", "identityKind", "sourceSetId", "capturedRevision",
+                                    "destinationRevision", "descriptorSha256", "artifacts", "languages"},
                     "unknown import report field")
+            report["descriptorSha256"] = "<descriptor-sha256>"
             report["capturedRevision"] = self.map("native-revision", report["capturedRevision"])
             report["destinationRevision"] = self.map("native-revision", report["destinationRevision"])
             report["sourceSetId"] = self.map("source-set", report["sourceSetId"])

@@ -84,12 +84,12 @@ impl BatchLimits {
 
     /// Production limits with the `TRELLIS_TEST_SEMANTIC_LIMITS` JSON object applied. The
     /// caller reads this once per operation; an unparsable object or unknown key is an error.
-    #[cfg(feature = "test-support")]
     pub fn effective() -> Result<BatchLimits, String> {
-        match std::env::var("TRELLIS_TEST_SEMANTIC_LIMITS") {
-            Ok(text) => serde_json::from_str(&text).map_err(|_| "test limits".to_string()),
-            Err(_) => Ok(BatchLimits::PRODUCTION),
+        #[cfg(feature = "test-support")]
+        if let Ok(text) = std::env::var("TRELLIS_TEST_SEMANTIC_LIMITS") {
+            return serde_json::from_str(&text).map_err(|_| "test limits".to_string());
         }
+        Ok(BatchLimits::PRODUCTION)
     }
 }
 
