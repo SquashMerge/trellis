@@ -231,7 +231,7 @@ impl EvidenceResponse {
         expected: Option<IndexPin>,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<GraphAnswer> {
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"

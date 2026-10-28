@@ -14,7 +14,7 @@ impl EvidenceResponse {
         {
             return Err(SqliteContention(()).into());
         }
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         let mut counts = [[0_u64; 5]; 4];
         let mut rows = self.db.prepare(
             "SELECT language,coverage_selected,coverage_state FROM revision_documents WHERE revision_id=?1"
@@ -298,7 +298,7 @@ fn mcp_lf_range(bytes: &[u8], start: u64, end: u64) -> Result<(usize, usize)> {
 
 impl EvidenceResponse {
     pub fn mcp_source_hash(&self, path: &str) -> Result<Option<String>> {
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         Ok(self
             .store
             .mcp_selected_raw_source_for(&self.db, path, &selected)?
@@ -313,7 +313,7 @@ impl EvidenceResponse {
         expected: Option<IndexPin>,
         expected_hash: Option<&str>,
     ) -> Result<Option<McpSource>> {
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"
@@ -531,7 +531,7 @@ impl EvidenceResponse {
         {
             return Err(SqliteContention(()).into());
         }
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"
@@ -796,9 +796,7 @@ impl EvidenceResponse {
         found: McpFind,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<McpFindWithLines> {
-        let selected = self
-            .store
-            .read_revision_for(&self.db, Some(found.pin), true)?;
+        let selected = self.selected(Some(found.pin))?;
         // Hits from one document may be interleaved with others in rank order.
         // Visit them document by document so at most one raw BLOB is held (#165).
         let mut by_document: BTreeMap<&crate::native_evidence::DocumentKey, Vec<usize>> =
@@ -882,7 +880,7 @@ impl EvidenceResponse {
         {
             return Err(SqliteContention(()).into());
         }
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"
@@ -973,9 +971,7 @@ impl EvidenceResponse {
         let Some(declaration) = self.mcp_declaration(symbol_id, expected)? else {
             return Ok(None);
         };
-        let selected = self
-            .store
-            .read_revision_for(&self.db, Some(declaration.pin), true)?;
+        let selected = self.selected(Some(declaration.pin))?;
         let proof = declaration
             .provenance
             .iter()
@@ -1130,7 +1126,7 @@ impl EvidenceResponse {
         required_deadline: std::time::Instant,
     ) -> Result<Option<McpOutgoing>> {
         use crate::native_evidence::{DocumentKey, Provenance};
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"
@@ -1555,9 +1551,7 @@ impl EvidenceResponse {
         else {
             return Ok(None);
         };
-        let selected = self
-            .store
-            .read_revision_for(&self.db, Some(outgoing.owner.pin), true)?;
+        let selected = self.selected(Some(outgoing.owner.pin))?;
         let proof = outgoing
             .owner
             .provenance
@@ -1656,7 +1650,7 @@ impl EvidenceResponse {
         expected: Option<IndexPin>,
     ) -> Result<Option<McpIncomingWithLines>> {
         use crate::native_evidence::{DeclarationRole, DocumentKey, Provenance};
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         ensure!(
             expected.is_none_or(|pin| pin == selected.pin),
             "revision conflict: expected basis differs from admitted head"
