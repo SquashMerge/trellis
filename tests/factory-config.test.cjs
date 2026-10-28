@@ -195,6 +195,17 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
     }
+    // The #40 smoke needs the real trellis binary, which the fake cargo never
+    // builds. Skip only that script; every other python3 call runs for real.
+    const realPython = spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
+    const pythonShim = join(fakeDir, "python3");
+    writeFileSync(pythonShim, `#!/bin/sh
+case "$1" in
+  tools/verify-40-query-performance.py) exit 0 ;;
+esac
+exec "${realPython}" "$@"
+`);
+    chmodSync(pythonShim, 0o755);
     function runVerify(extraEnv = {}, timeout = undefined) {
       const result = spawnSync(config.verify, [], {
         cwd: ROOT,
