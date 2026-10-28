@@ -261,12 +261,19 @@ class ReuseWiring(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "private HOME processes"):
                 H.measure(False)
 
-    def test_finally_stops_every_live_daemon_and_raises_first_failure(self):
+    def test_finally_keeps_the_cohort_error_but_stops_every_daemon(self):
         events = []
         with self.measure_patches(events, measure_error=RuntimeError("boom"), stop_error=RuntimeError("stuck")):
-            with self.assertRaisesRegex(RuntimeError, "stuck"):
+            with self.assertRaisesRegex(RuntimeError, "boom") as caught:
                 H.measure(False)
         self.assertEqual(events, [("start", "medium"), ("measure", "medium"), ("stop", "medium")])
+        self.assertIn("teardown also failed: stuck", getattr(caught.exception, "__notes__", []))
+
+    def test_teardown_error_is_raised_when_the_body_succeeded(self):
+        events = []
+        with self.measure_patches(events, stop_error=RuntimeError("stuck")):
+            with self.assertRaisesRegex(RuntimeError, "stuck"):
+                H.measure(False)
 
     def measure_patches(self, events, measure_error=None, observe_unexpected=False, stop_error=None):
         scratch = tempfile.TemporaryDirectory()
@@ -341,6 +348,18 @@ class CohortTeardown(unittest.TestCase):
                 patch.object(H.V67, "record"):
             H.stop_cohort_daemon(self.daemon(), Path("/b"))
         self.assertEqual(events, ["stop_child", "election", "safety-net"])
+
+    def test_term_wait_is_the_generous_deadline_capped_bound(self):
+        with patch.object(H.V67, "stop_child") as stop_child, patch.object(H.V67, "election_free", return_value=True), \
+                patch.object(H.V67, "stop_home_processes"), patch.object(H.V67, "record"), \
+                patch.object(H.V67, "DEADLINE", H.time.monotonic() + 10 ** 6):
+            H.stop_cohort_daemon(self.daemon(), Path("/b"))
+            self.assertEqual(stop_child.call_args.kwargs["grace"], H.ELECTION_RELEASE_WAIT)
+        with patch.object(H.V67, "stop_child") as stop_child, patch.object(H.V67, "election_free", return_value=True), \
+                patch.object(H.V67, "stop_home_processes"), patch.object(H.V67, "record"), \
+                patch.object(H.V67, "DEADLINE", H.time.monotonic() + 40):
+            H.stop_cohort_daemon(self.daemon(), Path("/b"))
+            self.assertTrue(30 < stop_child.call_args.kwargs["grace"] <= 40)
 
     def test_waits_for_election_release(self):
         answers = iter([False, False, True])

@@ -140,6 +140,27 @@ def remaining():
     return V67.DEADLINE - time.monotonic()
 
 
+def stop_all(daemons, binary):
+    """Stop every daemon, even if one stop fails; call from a finally block.
+
+    A failure raises only when the body succeeded. When the body already raised, that
+    original exception propagates and teardown failures are recorded and noted on it.
+    """
+    in_flight = sys.exc_info()[1]
+    errors = []
+    for daemon in daemons:
+        try:
+            stop_cohort_daemon(daemon, binary)
+        except BaseException as exc:
+            errors.append(exc)
+    if errors and in_flight is None:
+        raise errors[0]
+    for exc in errors:
+        V67.record("teardown_failed", error=str(exc))
+        if hasattr(in_flight, "add_note"):
+            in_flight.add_note(f"teardown also failed: {exc}")
+
+
 def require_clean_teardown():
     require("unexpected_home_processes" not in OBSERVED,
             "teardown found private HOME processes after the daemon stopped")
@@ -153,7 +174,8 @@ def stop_cohort_daemon(daemon, binary):
     safety net that must find nothing: it assumes the known daemon has already stopped.
     """
     if daemon.proc is not None:
-        V67.stop_child(daemon.proc, grace=max(1, min(20, remaining())))
+        # TERM gets the whole generous bound; KILL only follows if it lapses.
+        V67.stop_child(daemon.proc, grace=max(1, min(ELECTION_RELEASE_WAIT, remaining())))
     if daemon.log is not None and not daemon.log.closed:
         daemon.log.close()
     end = time.monotonic() + max(0, min(ELECTION_RELEASE_WAIT, remaining()))
@@ -551,7 +573,7 @@ def smoke(binary):
     finally:
         try:
             if not stopped:
-                stop_cohort_daemon(daemon, binary)
+                stop_all([daemon], binary)
         finally:
             if ok:
                 shutil.rmtree(scratch, ignore_errors=True)
@@ -584,7 +606,7 @@ def teardown_check(binary):
         require_clean_teardown()
     finally:
         if not stopped:
-            stop_cohort_daemon(daemon, binary)
+            stop_all([daemon], binary)
     print("TEARDOWN_40_RESULT=" + json.dumps({"pin": pin, "unexpectedHomeProcesses": False}), flush=True)
     shutil.rmtree(scratch, ignore_errors=True)
 
@@ -628,16 +650,8 @@ def measure(semantic):
             stop_cohort_daemon(daemon, RELEASE_BINARY)
             live.remove(daemon)
     finally:
-        # Interrupted cohorts only: stopped daemons were already removed. Stop every
-        # one even if an earlier stop fails, then raise the first failure.
-        errors = []
-        for daemon in live:
-            try:
-                stop_cohort_daemon(daemon, RELEASE_BINARY)
-            except BaseException as exc:
-                errors.append(exc)
-        if errors:
-            raise errors[0]
+        # Interrupted cohorts only: stopped daemons were already removed.
+        stop_all(live, RELEASE_BINARY)
     require_clean_teardown()
     report = build_report(model, hashlib.sha256(pinned).hexdigest(), semantic, sizes, policy)
     print("REFERENCE_40_RESULT=" + json.dumps(report, sort_keys=True), flush=True)
