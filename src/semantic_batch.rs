@@ -109,6 +109,7 @@ pub struct JoinedBatch {
     destination: IndexPin,
     destination_revision_id: String,
     descriptor_sha256: String,
+    attempt: i64,
     report: serde_json::Value,
 }
 
@@ -118,6 +119,7 @@ impl JoinedBatch {
         destination: IndexPin,
         destination_revision_id: String,
         descriptor_sha256: String,
+        attempt: i64,
         report: serde_json::Value,
     ) -> Self {
         Self {
@@ -125,6 +127,7 @@ impl JoinedBatch {
             destination,
             destination_revision_id,
             descriptor_sha256,
+            attempt,
             report,
         }
     }
@@ -143,6 +146,12 @@ impl JoinedBatch {
 
     pub fn descriptor_sha256(&self) -> &str {
         &self.descriptor_sha256
+    }
+
+    /// The stage join attempt this batch certified. Publication refuses it once a later
+    /// attempt has replaced the stage's output.
+    pub fn attempt(&self) -> i64 {
+        self.attempt
     }
 
     pub fn report(&self) -> &serde_json::Value {

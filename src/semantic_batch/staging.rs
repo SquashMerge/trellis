@@ -22,7 +22,7 @@ CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL
 CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
-CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL);
+CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL, attempt INTEGER NOT NULL);
 CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
 CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
 CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id TEXT NOT NULL, name_start INTEGER, name_end INTEGER, name_ok INTEGER NOT NULL);
@@ -66,6 +66,12 @@ CREATE TABLE out_declaration_bindings(ord INTEGER PRIMARY KEY, provenance_id TEX
 CREATE TABLE out_references(ord INTEGER PRIMARY KEY, reference_id TEXT NOT NULL UNIQUE, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE out_call_bindings(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
+CREATE INDEX out_provenance_document ON out_provenance(json_extract(body,'$.document.language'), json_extract(body,'$.document.path'), ord);
+CREATE INDEX out_symbols_provenance ON out_symbols(provenance_id);
+CREATE INDEX out_declaration_bindings_provenance ON out_declaration_bindings(provenance_id);
+CREATE INDEX out_references_provenance ON out_references(provenance_id);
+CREATE INDEX out_call_bindings_provenance ON out_call_bindings(provenance_id);
+CREATE INDEX out_type_relationships_provenance ON out_type_relationships(provenance_id);
 ";
 
 /// Tables a join fills that depend on the destination revision. A new destination clears them all.

@@ -13,6 +13,7 @@ use std::{
 };
 use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
+    model::IndexPin,
     scip_raw::ScipCaptureError,
     semantic_batch::{
         AdmittedBatch, BatchCounters, BatchLimits, LookupBudget, StageOwner,
@@ -573,13 +574,44 @@ fn cache_budget_fits_sixty_four_mebibytes() {
         .store
         .with_native_reader(pin, |reader| reader.cache_size_kib())
         .unwrap();
+    // The publication writer's own page cache, as the connection reports it just before commit.
+    let descriptor = world.write(&full_fixture(&world));
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let mut caches = (0i64, 0i64);
+    world
+        .store
+        .publish_semantic_batch_observing_for_tests(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &world.cancel,
+            |db| {
+                caches = (
+                    db.pragma_query_value(None, "cache_size", |row| row.get(0))?,
+                    db.pragma_query_value(Some("stage"), "cache_size", |row| row.get(0))?,
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    let (writer_kib, attached_kib) = (-caches.0, -caches.1);
+    assert_eq!(writer_kib as u64, limits::BATCH_WRITER_CACHE_KIB);
+    assert_eq!(attached_kib as u64, limits::STAGE_ATTACH_CACHE_KIB);
     let kib = |bytes: u64| bytes / 1024;
     let total = limits::STAGE_CACHE_KIB
-        + limits::STAGE_ATTACH_CACHE_KIB
+        + attached_kib as u64
         + kib(BatchLimits::PRODUCTION.document_cache_bytes)
         + kib(limits::IO_BUFFER_BYTES * limits::IO_BUFFERS)
         + reader_kib as u64
-        + limits::BATCH_WRITER_CACHE_KIB;
+        + writer_kib as u64;
     assert!(
         total <= kib(BatchLimits::PRODUCTION.cache_bytes),
         "{total} KiB"
@@ -1694,4 +1726,1029 @@ fn join_cursor_plans_use_no_temp_btree() {
             "{sql}: {plan:?}"
         );
     }
+}
+
+impl World {
+    fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(
+            &self.index_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        self.db().query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// Joins `descriptor` against the head and publishes it, returning the join for inspection.
+    fn publish(
+        &self,
+        descriptor: &(PathBuf, String),
+    ) -> anyhow::Result<(
+        IndexPin,
+        AdmittedBatch,
+        trellis::semantic_batch::JoinedBatch,
+    )> {
+        let (mut admitted, joined, _) = self.join_with(
+            descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )?;
+        let leader = self.store.publication_for_tests()?;
+        let pin = self.store.publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &self.cancel,
+        )?;
+        Ok((pin, admitted, joined))
+    }
+}
+
+/// Canonical, order-independent form of one table of a publication.
+fn canonical<T: serde::Serialize>(rows: &[T]) -> Vec<String> {
+    let mut rows: Vec<String> = rows
+        .iter()
+        .map(|row| serde_json::to_string(row).unwrap())
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn assert_published_matches_staged(
+    published: &trellis::semantic_evidence::SemanticSnapshot,
+    staged: &SemanticPublication,
+) {
+    assert_eq!(canonical(&published.coverage), canonical(&staged.coverage));
+    assert_eq!(
+        canonical(&published.provenance),
+        canonical(&staged.provenance)
+    );
+    assert_eq!(canonical(&published.symbols), canonical(&staged.symbols));
+    assert_eq!(
+        canonical(&published.declaration_bindings),
+        canonical(&staged.declaration_bindings)
+    );
+    assert_eq!(
+        canonical(&published.references),
+        canonical(&staged.references)
+    );
+    assert_eq!(
+        canonical(&published.call_bindings),
+        canonical(&staged.call_bindings)
+    );
+    assert_eq!(
+        canonical(&published.type_relationships),
+        canonical(&staged.type_relationships)
+    );
+}
+
+#[test]
+fn two_artifacts_for_one_producer_store_artifact_keyed_raw_rows() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let parsed = Descriptor::parse(&fs::read(&descriptor.0).unwrap()).unwrap();
+    let (pin, mut admitted, joined) = world.publish(&descriptor).unwrap();
+    assert_eq!(
+        pin.index_revision,
+        joined.destination_pin().index_revision + 1
+    );
+    let db = world.db();
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    let captures: Vec<(i64, String, i64)> = db
+        .prepare("SELECT ordinal,artifact_hash,length(binary_bytes) FROM semantic_raw_captures ORDER BY ordinal")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(captures.len(), 2);
+    for (capture, artifact) in captures.iter().zip(&parsed.artifacts) {
+        assert_eq!(capture.1, artifact.sha256);
+        assert_eq!(capture.2 as u64, artifact.byte_length);
+    }
+    for ordinal in 0..2 {
+        let documents: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_raw_documents d JOIN semantic_raw_captures c ON c.capture_id=d.capture_id WHERE c.ordinal=?1",
+                [ordinal],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(documents, 1, "artifact {ordinal}");
+    }
+    let proofs = world.count("SELECT COUNT(*) FROM semantic_raw_proofs");
+    assert_eq!(proofs, claim_count(&mut admitted));
+    assert_eq!(
+        world.count(
+            "SELECT COUNT(*) FROM semantic_revision_raw_selections s JOIN semantic_raw_batches b ON b.batch_id=s.batch_id"
+        ),
+        1
+    );
+    let published = world.store.semantic_at(pin).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    assert!(
+        published
+            .provenance
+            .iter()
+            .filter_map(|p| p.basis.as_ref())
+            .map(|basis| basis.artifact_hash.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == 2
+    );
+    let report = world
+        .store
+        .semantic_batch_report_at(pin, &parsed_sha(&descriptor))
+        .unwrap()
+        .unwrap();
+    assert_eq!(report["descriptorSha256"], json!(descriptor.1));
+}
+
+fn parsed_sha(descriptor: &(PathBuf, String)) -> String {
+    descriptor.1.clone()
+}
+
+/// `(proof_id, kind, digest, language, path)` of every stored proof, ordinal-free.
+fn stored_proofs(world: &World) -> Vec<(String, String, String, String, String)> {
+    world
+        .db()
+        .prepare("SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs ORDER BY proof_id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn proof_ids_and_fact_digests_ignore_page_split_and_artifact_order() {
+    let variant = |world: &World, swap: bool, rows: usize| {
+        let (a, b) = definitions_docs();
+        let mut fixture = world.fixture().rows_per_page(rows);
+        if swap {
+            fixture.artifact("javascript", vec![b]);
+            fixture.artifact("javascript", vec![a]);
+        } else {
+            fixture.artifact("javascript", vec![a]);
+            fixture.artifact("javascript", vec![b]);
+        }
+        world.write(&fixture)
+    };
+    // Within one revision the staged proof and provenance identities are the same however the
+    // batch is split.
+    let world = definitions_world();
+    let identities = |descriptor: &(PathBuf, String)| {
+        let (mut admitted, _, _) = world
+            .join_with(
+                descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let claims: Vec<(String, String)> = admitted
+            .stage_mut()
+            .conn()
+            .unwrap()
+            .prepare("SELECT proof_id,fact_digest FROM claims ORDER BY proof_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let publication = testing::staged_publication(&mut admitted).unwrap();
+        let mut provenance: Vec<String> = publication
+            .provenance
+            .iter()
+            .map(|p| format!("{}|{:?}", p.id, p.derived_from))
+            .collect();
+        provenance.sort();
+        (claims, provenance)
+    };
+    let (claims, provenance) = identities(&variant(&world, false, 1));
+    assert_eq!(claims.len(), 5);
+    for (swap, rows) in [(false, 2), (true, 1), (true, 8)] {
+        let (other_claims, other_provenance) = identities(&variant(&world, swap, rows));
+        assert_eq!(claims, other_claims, "swap {swap}, rows {rows}");
+        assert_eq!(provenance, other_provenance, "swap {swap}, rows {rows}");
+    }
+    // Published rows carry the same fact digests whatever the split.
+    let digests = |swap: bool, rows: usize| {
+        let world = definitions_world();
+        let descriptor = variant(&world, swap, rows);
+        world.publish(&descriptor).unwrap();
+        stored_proofs(&world)
+            .into_iter()
+            .map(|(_, kind, digest, language, path)| (kind, digest, language, path))
+            .collect::<Vec<_>>()
+    };
+    let mut expected = digests(false, 1);
+    expected.sort();
+    for (swap, rows) in [(false, 2), (true, 1), (true, 8)] {
+        let mut other = digests(swap, rows);
+        other.sort();
+        assert_eq!(expected, other, "swap {swap}, rows {rows}");
+    }
+}
+
+#[test]
+fn identical_envelopes_are_deduplicated_per_authenticated_tuple() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    // The same occurrence is recorded twice in one artifact.
+    let repeated = a.clone().occurrence(&[0, 9, 12], &[], "pkg run.", 1);
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![repeated, b])]);
+    let (_, mut admitted, _) = world.publish(&descriptor).unwrap();
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_proofs"), 5);
+    assert_eq!(claim_count(&mut admitted), 5);
+    assert_eq!(
+        world.count("SELECT COUNT(DISTINCT capture_id||fact_digest) FROM semantic_raw_proofs"),
+        5
+    );
+    // The same facts in a second world carry the same digests: the dedup key is the fact, not
+    // the artifact position.
+    let other = definitions_world();
+    let descriptor =
+        one_artifact_per_language(&other, vec![("javascript", vec![a, definitions_docs().1])]);
+    other.publish(&descriptor).unwrap();
+    let digests = |world: &World| -> Vec<String> {
+        world
+            .db()
+            .prepare("SELECT fact_digest FROM semantic_raw_proofs ORDER BY fact_digest")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(digests(&world), digests(&other));
+}
+
+#[test]
+fn original_artifact_bytes_are_retained_byte_identical() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, true);
+    let parsed = Descriptor::parse(&fs::read(&descriptor.0).unwrap()).unwrap();
+    world.publish(&descriptor).unwrap();
+    let db = world.db();
+    for artifact in &parsed.artifacts {
+        let original = fs::read(world.root.join(&artifact.relative_path)).unwrap();
+        let stored: Vec<u8> = db
+            .query_row(
+                "SELECT binary_bytes FROM semantic_raw_captures WHERE ordinal=?1",
+                [artifact.ordinal],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, original, "artifact {}", artifact.ordinal);
+    }
+    let stored_batch: Vec<u8> = db
+        .query_row(
+            "SELECT descriptor_bytes FROM semantic_raw_batches",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_batch, fs::read(&descriptor.0).unwrap());
+}
+
+#[test]
+fn replayed_batch_refills_partially_collected_raw_rows() {
+    let world = definitions_world();
+    // A reference to no measured syntax is stored as a proof that no provenance row uses.
+    let a = definitions_docs()
+        .0
+        .occurrence(&[0, 0, 1], &[], "pkg unused.", 0);
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a]);
+    fixture.exclude("javascript", "src/B.js", "unsupported");
+    let descriptor = world.write(&fixture);
+    let (first, _, _) = world.publish(&descriptor).unwrap();
+    let captures = world.count("SELECT capture_id FROM semantic_raw_captures");
+    let before = (
+        world.count("SELECT COUNT(*) FROM semantic_raw_proofs"),
+        world.count("SELECT COUNT(*) FROM semantic_raw_documents"),
+        world.count("SELECT COUNT(*) FROM semantic_raw_exclusions"),
+    );
+    assert!(before.0 > 0 && before.1 > 0 && before.2 == 1, "{before:?}");
+    // Part of the batch was collected while it was unselected.
+    world
+        .store
+        .with_index_sql_for_tests(|db| {
+            db.execute("DELETE FROM semantic_raw_documents", [])?;
+            db.execute("DELETE FROM semantic_raw_exclusions", [])?;
+            let removed = db.execute(
+                "DELETE FROM semantic_raw_proofs WHERE rowid IN (SELECT p.rowid FROM semantic_raw_proofs p WHERE NOT EXISTS(SELECT 1 FROM semantic_provenance v WHERE v.capture_id=p.capture_id AND v.derived_from_provenance_id=p.proof_id))",
+                [],
+            )?;
+            assert!(removed > 0, "no unreferenced proof to collect");
+            Ok(())
+        })
+        .unwrap();
+    // The request is replayed after publication, against the new head.
+    let (second, _, _) = world.publish(&descriptor).unwrap();
+    assert_eq!(second.index_revision, first.index_revision + 1);
+    let after = (
+        world.count("SELECT COUNT(*) FROM semantic_raw_proofs"),
+        world.count("SELECT COUNT(*) FROM semantic_raw_documents"),
+        world.count("SELECT COUNT(*) FROM semantic_raw_exclusions"),
+    );
+    assert_eq!(before, after);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(
+        world.count("SELECT capture_id FROM semantic_raw_captures"),
+        captures
+    );
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 1);
+}
+
+#[test]
+fn artifact_captured_by_another_batch_fails_typed() {
+    let world = definitions_world();
+    let first = split_definitions(&world, false);
+    let (pin, _, _) = world.publish(&first).unwrap();
+    // A different descriptor over a revision that shares the first artifact.
+    let (a, _) = definitions_docs();
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a]);
+    fixture.exclude("javascript", "src/B.js", "notRequested");
+    let second = world.write(&fixture);
+    let error = world.publish(&second).err().expect("shared artifact");
+    assert!(
+        format!("{error:#}")
+            .starts_with("invalid_request: artifact already captured by another batch"),
+        "{error:#}"
+    );
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 2);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections WHERE batch_id NOT IN (SELECT batch_id FROM semantic_raw_batches)"),
+        0
+    );
+}
+
+#[test]
+fn generation_change_before_publish_is_a_revision_conflict() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    // The head moves between the join and the publication.
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    let moved = world.store.index_baseline().unwrap();
+    assert_ne!(moved, joined.destination_pin());
+    let error = world
+        .store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &world.cancel,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("revision conflict"),
+        "{error:#}"
+    );
+    // A pin from another generation never matches the join either.
+    let foreign = IndexPin {
+        index_generation: uuid::Uuid::new_v4(),
+        ..joined.destination_pin()
+    };
+    let error = world
+        .store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            foreign,
+            &leader,
+            &world.cancel,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("revision conflict"),
+        "{error:#}"
+    );
+    assert_eq!(world.store.index_baseline().unwrap(), moved);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 0);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_revision_raw_selections"),
+        0
+    );
+    // The retry joins again on the same stage, which reopens its connection, and publishes.
+    let mut budget = LookupBudget::new(&BatchLimits::PRODUCTION);
+    let rejoined = join_staged(
+        &mut admitted,
+        &world.store,
+        moved,
+        &BatchLimits::PRODUCTION,
+        &mut budget,
+        &mut BatchCounters::default(),
+        DestinationMutations::default(),
+        &world.cancel,
+    )
+    .unwrap();
+    let pin = world
+        .store
+        .publish_semantic_batch(
+            &rejoined,
+            admitted.stage_mut(),
+            moved,
+            &leader,
+            &world.cancel,
+        )
+        .unwrap();
+    assert_eq!(pin.index_revision, moved.index_revision + 1);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+}
+
+#[test]
+fn synthetic_producer_row_records_generator_source_identity_kind() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    world.publish(&descriptor).unwrap();
+    let kinds: Vec<(String, String)> = world
+        .db()
+        .prepare("SELECT id,identity_kind FROM semantic_producers")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(kinds.len(), 1);
+    assert_eq!(kinds[0].1, "generatorSource");
+    let report = world
+        .store
+        .semantic_batch_report_at(world.store.index_baseline().unwrap(), &descriptor.1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(report["identityKind"], json!("generatorSource"));
+}
+
+impl World {
+    /// Publishes the current workspace as a native recovery publication, which rejoins every
+    /// selected batch over the new revision.
+    fn republish_with_rejoin(&self) {
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(self.root.clone()),
+            self.store.root_id(),
+            &self.cancel,
+            |_| {},
+        )
+        .unwrap();
+        let leader = self.store.publication_for_tests().unwrap();
+        self.store
+            .publish_native_recovery_for_tests(&graph, &capture, &native, &leader, &self.cancel)
+            .unwrap();
+    }
+
+    fn head_key(&self) -> String {
+        let pin = self.store.index_baseline().unwrap();
+        format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision)
+    }
+
+    /// `(document path, artifact hash)` of every stored basis at the head.
+    fn basis_artifacts(&self) -> Vec<(String, String)> {
+        self.db()
+            .prepare("SELECT DISTINCT c.path,b.artifact_hash FROM semantic_basis b JOIN semantic_coverage c ON c.tuple_id=b.tuple_id WHERE c.revision_id=?1 ORDER BY c.path")
+            .unwrap()
+            .query_map([self.head_key()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn rejoin_failures(&self) -> i64 {
+        self.db()
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_coverage WHERE revision_id=?1 AND diagnostic LIKE 'selected raw capture unavailable%'",
+                [self.head_key()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+fn mixed_language_world() -> World {
+    world(|root| {
+        write_files(
+            root,
+            &[
+                ("J.java", JAVA_TYPES),
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+            ],
+        )
+    })
+}
+
+fn mixed_language_batch(world: &World) -> (PathBuf, String) {
+    let (a, b) = definitions_docs();
+    one_artifact_per_language(
+        world,
+        vec![("java", vec![java_doc()]), ("javascript", vec![a, b])],
+    )
+}
+
+#[test]
+fn native_rejoin_after_batch_import_rejoins_every_artifact() {
+    let world = mixed_language_world();
+    let descriptor = mixed_language_batch(&world);
+    let parsed = Descriptor::parse(&fs::read(&descriptor.0).unwrap()).unwrap();
+    world.publish(&descriptor).unwrap();
+    let imported = world.basis_artifacts();
+    let hash_of = |language: &str| {
+        parsed
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.language == language)
+            .unwrap()
+            .sha256
+            .clone()
+    };
+    assert_eq!(
+        imported,
+        vec![
+            ("J.java".to_owned(), hash_of("java")),
+            ("src/A.js".to_owned(), hash_of("javascript")),
+            ("src/B.js".to_owned(), hash_of("javascript")),
+        ]
+    );
+    // A native edit rejoins the stored batch over the new head: both originals are
+    // authenticated against their own binary.
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(world.basis_artifacts(), imported);
+    let rejoined = world
+        .store
+        .selected_raw_inputs_at(world.store.index_baseline().unwrap())
+        .unwrap();
+    assert_eq!(rejoined.len(), 1);
+    assert_eq!(rejoined[0].captures.len(), 2);
+}
+
+#[test]
+fn multi_artifact_reference_batch_records_multi_artifact_fallback() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let mut fixture = world.fixture().reference("scip-typescript");
+    fixture.artifact("javascript", vec![a]);
+    fixture.artifact("javascript", vec![b]);
+    let descriptor = world.write(&fixture);
+    world.publish(&descriptor).unwrap();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    let options = IndexOptions::new(world.root.clone());
+    let capture = trellis::capture::Capture::admit(&options, &world.cancel, &|_| {}).unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .store
+        .publish_local_for_tests(&options, &capture, &leader, &world.cancel)
+        .unwrap();
+    let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+    let reasons: Vec<&str> = work["fallbackReasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reason| reason.as_str().unwrap())
+        .collect();
+    assert!(reasons.contains(&"multi_artifact_batch"), "{work}");
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(world.basis_artifacts().len(), 2);
+}
+
+/// Publishes one batch, then a native-only revision that drops its selection, then a second
+/// batch. The first batch is selected only by the older pin, which nothing captures. Returns
+/// that pin and the head, with the retention clock past the older pin's release horizon.
+fn replaced_batch_world() -> (World, IndexPin, IndexPin) {
+    let world = definitions_world();
+    world.store.set_retention_clock_for_tests(1_000, 0);
+    let first = split_definitions(&world, false);
+    let (older, _, _) = world.publish(&first).unwrap();
+    world.store.set_retention_clock_for_tests(1_001, 1);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    world.store.set_retention_clock_for_tests(1_002, 2);
+    let (a, b) = definitions_docs();
+    let a = a.occurrence(&[0, 0, 1], &[], "pkg extra.", 0);
+    let mut fixture = world.fixture();
+    fixture.artifact("javascript", vec![a, b, DocSpec::new("src/C.js")]);
+    let second = world.write(&fixture);
+    let (head, _, _) = world.publish(&second).unwrap();
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 2);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 3);
+    world.store.set_retention_clock_for_tests(1_902, 902);
+    (world, older, head)
+}
+
+/// Releases `pin`, whose garbage collection proceeds in bounded steps.
+fn release(world: &World, pin: IndexPin, leader: &trellis::store::topology::WriterGuard) {
+    for _ in 0..64 {
+        match world.store.release_revision(pin, leader) {
+            Ok(()) => return,
+            Err(error) if format!("{error:#}").starts_with("storage_busy") => {}
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    panic!("release did not finish");
+}
+
+#[test]
+fn unreferenced_batches_are_collected_with_their_captures() {
+    let (world, older, head) = replaced_batch_world();
+    let first_batch = world.count("SELECT MIN(batch_id) FROM semantic_raw_batches");
+    let leader = world.store.publication_for_tests().unwrap();
+    release(&world, older, &leader);
+    let of_first = |table: &str| -> i64 {
+        world.count(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE batch_id={first_batch}"
+        ))
+    };
+    assert_eq!(of_first("semantic_raw_batches"), 0);
+    assert_eq!(of_first("semantic_raw_captures"), 0);
+    assert_eq!(of_first("semantic_raw_exclusions"), 0);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id<>(SELECT MAX(batch_id) FROM semantic_raw_batches)"),
+        0
+    );
+    // The batch the head selects is untouched and still reads.
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_captures"), 1);
+    assert!(world.count("SELECT COUNT(*) FROM semantic_raw_proofs") > 0);
+    assert!(world.count("SELECT COUNT(*) FROM semantic_raw_documents") > 0);
+    assert!(!world.store.semantic_at(head).unwrap().coverage.is_empty());
+    assert_eq!(world.store.selected_raw_inputs_at(head).unwrap().len(), 1);
+}
+
+#[test]
+fn gc_keeps_proofs_referenced_by_retained_provenance() {
+    let (world, older, head) = replaced_batch_world();
+    let first_batch = world.count("SELECT MIN(batch_id) FROM semantic_raw_batches");
+    // A retained provenance row of the head still derives from one proof of the first batch.
+    let (capture_id, proof_id): (i64, String) = world
+        .db()
+        .query_row(
+            "SELECT p.capture_id,p.proof_id FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.rowid LIMIT 1",
+            [first_batch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    world
+        .store
+        .with_index_sql_for_tests(|db| {
+            let changed = db.execute(
+                "UPDATE semantic_provenance SET capture_id=?1,derived_from_provenance_id=?2,derived_from_record_kind=(SELECT record_kind FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2),derived_from_fact_digest=(SELECT fact_digest FROM semantic_raw_proofs WHERE capture_id=?1 AND proof_id=?2) WHERE rowid=(SELECT v.rowid FROM semantic_provenance v JOIN semantic_coverage c ON c.tuple_id=v.tuple_id WHERE c.revision_id=?3 AND v.capture_id IS NOT NULL LIMIT 1)",
+                rusqlite::params![capture_id, proof_id, format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        })
+        .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    release(&world, older, &leader);
+    let survivors: Vec<(i64, String)> = world
+        .db()
+        .prepare("SELECT p.capture_id,p.proof_id FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1")
+        .unwrap()
+        .query_map([first_batch], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(survivors, vec![(capture_id, proof_id)]);
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_raw_captures WHERE batch_id={first_batch}"
+        )),
+        1
+    );
+    assert_eq!(
+        world.count(&format!(
+            "SELECT COUNT(*) FROM semantic_raw_batches WHERE batch_id={first_batch}"
+        )),
+        1
+    );
+}
+
+fn assert_nothing_published(world: &World, head: IndexPin) {
+    assert_eq!(world.store.index_baseline().unwrap(), head);
+    for table in [
+        "semantic_raw_batches",
+        "semantic_raw_captures",
+        "semantic_raw_documents",
+        "semantic_raw_proofs",
+        "semantic_raw_exclusions",
+        "semantic_revision_raw_selections",
+        "semantic_coverage",
+        "semantic_import_reports",
+    ] {
+        assert_eq!(
+            world.count(&format!("SELECT COUNT(*) FROM {table}")),
+            0,
+            "{table}"
+        );
+    }
+}
+
+#[test]
+fn failed_publication_leaves_no_partial_rows_and_the_batch_publishes_on_retry() {
+    use trellis::store::BatchPublishFault;
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let head = joined.destination_pin();
+    let leader = world.store.publication_for_tests().unwrap();
+    let fault = |admitted: &mut AdmittedBatch, fault| {
+        world
+            .store
+            .publish_semantic_batch_with_fault_for_tests(
+                &joined,
+                admitted.stage_mut(),
+                head,
+                &leader,
+                &world.cancel,
+                fault,
+            )
+            .unwrap_err()
+    };
+    let error = fault(&mut admitted, BatchPublishFault::SqlFault);
+    assert!(format!("{error:#}").contains("NOT NULL"), "{error:#}");
+    assert_nothing_published(&world, head);
+    let error = fault(&mut admitted, BatchPublishFault::PrecommitCancel);
+    assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+    world
+        .cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert_nothing_published(&world, head);
+    // The stage was detached after each failure, so the same joined batch still publishes.
+    let pin = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap();
+    assert_eq!(pin.index_revision, head.index_revision + 1);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+}
+
+#[test]
+fn cancelled_publication_changes_nothing() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    world
+        .cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let error = world
+        .store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &world.cancel,
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+    assert_nothing_published(&world, joined.destination_pin());
+}
+
+#[test]
+fn ambiguous_commit_is_resolved_from_durable_state() {
+    use trellis::store::BatchPublishFault;
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let head = joined.destination_pin();
+    let leader = world.store.publication_for_tests().unwrap();
+    let publish = |admitted: &mut AdmittedBatch, fault| {
+        world.store.publish_semantic_batch_with_fault_for_tests(
+            &joined,
+            admitted.stage_mut(),
+            head,
+            &leader,
+            &world.cancel,
+            fault,
+        )
+    };
+    // The COMMIT never ran: the head is still the expected pin, which is a retryable conflict.
+    let error = publish(&mut admitted, BatchPublishFault::CommitLostBeforeCommit).unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("revision conflict"),
+        "{error:#}"
+    );
+    assert_nothing_published(&world, head);
+    // The COMMIT ran but its result was lost: the durable head carries this descriptor.
+    let pin = publish(&mut admitted, BatchPublishFault::CommitLostAfterCommit).unwrap();
+    assert_eq!(pin.index_revision, head.index_revision + 1);
+    assert_eq!(world.store.index_baseline().unwrap(), pin);
+    assert_eq!(world.count("SELECT COUNT(*) FROM semantic_raw_batches"), 1);
+    // A head that does not select this descriptor is never reported as this publication.
+    let error = world
+        .store
+        .resolve_ambiguous_batch_commit(head, pin, &"0".repeat(64))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("revision conflict"),
+        "{error:#}"
+    );
+    assert_eq!(
+        world
+            .store
+            .resolve_ambiguous_batch_commit(head, pin, &descriptor.1)
+            .unwrap(),
+        pin
+    );
+}
+
+#[test]
+fn joined_batch_of_an_earlier_attempt_is_refused_after_a_later_join_failed() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, earlier, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let head = earlier.destination_pin();
+    // A later attempt over the same stage fails part way and leaves partial output rows.
+    let mut tight = BatchLimits::PRODUCTION;
+    tight.lookup_steps = 1;
+    let mut budget = LookupBudget::new(&tight);
+    let failed = join_staged(
+        &mut admitted,
+        &world.store,
+        head,
+        &tight,
+        &mut budget,
+        &mut BatchCounters::default(),
+        DestinationMutations::default(),
+        &world.cancel,
+    );
+    assert!(failed.is_err());
+    let leader = world.store.publication_for_tests().unwrap();
+    let error = world
+        .store
+        .publish_semantic_batch(&earlier, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("superseded"), "{error:#}");
+    assert_nothing_published(&world, head);
+    // A successful join certifies the stage again.
+    let mut budget = LookupBudget::new(&BatchLimits::PRODUCTION);
+    let rejoined = join_staged(
+        &mut admitted,
+        &world.store,
+        head,
+        &BatchLimits::PRODUCTION,
+        &mut budget,
+        &mut BatchCounters::default(),
+        DestinationMutations::default(),
+        &world.cancel,
+    )
+    .unwrap();
+    assert_ne!(rejoined.attempt(), earlier.attempt());
+    world
+        .store
+        .publish_semantic_batch(
+            &rejoined,
+            admitted.stage_mut(),
+            head,
+            &leader,
+            &world.cancel,
+        )
+        .unwrap();
+}
+
+#[test]
+fn publication_statements_use_the_stage_indexes() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    admitted.stage_mut().release_connection();
+    let db = rusqlite::Connection::open(&world.index_db).unwrap();
+    db.execute(
+        "ATTACH DATABASE ?1 AS stage",
+        [admitted.stage().db_path().to_str().unwrap()],
+    )
+    .unwrap();
+    for sql in trellis::store::batch_publication_statements_for_tests() {
+        let mut statement = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params = vec![rusqlite::types::Value::Null; statement.parameter_count()];
+        let plan: Vec<String> = statement
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter()
+                .all(|step| !step.contains("TEMP B-TREE") || sql.contains("provenance_id IN")),
+            "{sql}: {plan:?}"
+        );
+        // Joined stage tables are searched by key, never scanned per driving row. The ordinal
+        // pairs are a constant list of at most 64 rows. SQLite plans a child scan for the
+        // foreign key onto raw proofs, but runs it only while a violation is outstanding.
+        let scans: Vec<&String> = plan
+            .iter()
+            .filter(|step| {
+                step.starts_with("SCAN")
+                    && !["SCAN m", "SCAN CONSTANT ROW", "SCAN semantic_provenance"]
+                        .contains(&step.as_str())
+            })
+            .collect();
+        assert!(scans.len() <= 1, "{sql}: {plan:?}");
+        if sql.contains("out_provenance") && !sql.contains("INSERT") {
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("out_provenance_document")
+                        || step.contains("out_provenance_provenance_id")
+                        || step.contains("sqlite_autoindex_out_provenance")),
+                "{sql}: {plan:?}"
+            );
+        }
+        if sql.contains("provenance_id IN") {
+            assert!(
+                plan.iter().any(|step| step.contains("_provenance (")
+                    || step.contains("USING INDEX out_")),
+                "{sql}: {plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn whole_publication_validator_runs_over_every_original_of_a_batch() {
+    let world = mixed_language_world();
+    let descriptor = mixed_language_batch(&world);
+    world.publish(&descriptor).unwrap();
+    let counts = world._state.path().join("work-counts.json");
+    // SAFETY: each test runs in its own process under nextest, and no other thread reads this.
+    unsafe { std::env::set_var("TRELLIS_TEST_LOCAL_WORK_COUNTS_FILE", &counts) };
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish_with_rejoin();
+    let work: Value = serde_json::from_slice(&fs::read(&counts).unwrap()).unwrap();
+    // The FULL rejoin decoded and validated both originals against their own binaries.
+    assert_eq!(work["originalRawDecodes"], json!(2), "{work}");
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(world.basis_artifacts().len(), 3);
+    // A stored original that no longer matches its hash makes that artifact's documents fail
+    // typed instead of validating against another artifact's binary.
+    world
+        .store
+        .with_index_sql_for_tests(|db| {
+            let changed = db.execute(
+                "UPDATE semantic_raw_captures SET binary_bytes=zeroblob(length(binary_bytes)) WHERE language='java'",
+                [],
+            )?;
+            assert_eq!(changed, 1);
+            Ok(())
+        })
+        .unwrap();
+    write_files(&world.root, &[("src/D.js", "function more(){ }\n")]);
+    world.republish_with_rejoin();
+    assert!(world.rejoin_failures() > 0);
 }

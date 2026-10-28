@@ -589,7 +589,9 @@ struct ValidatedRaw<'a> {
     producer_id: &'a str,
     source_set_id: &'a str,
     captured_revision: &'a str,
-    binary_bytes: &'a [u8],
+    /// Every original artifact of the capture, keyed by its SHA-256, so each captured artifact is
+    /// compared with its own binary.
+    binaries: BTreeMap<String, &'a [u8]>,
     inventory: crate::scip_raw::ProofInventory,
 }
 impl<'a> ValidatedRaw<'a> {
@@ -598,7 +600,10 @@ impl<'a> ValidatedRaw<'a> {
             producer_id: &raw.producer_id,
             source_set_id: &raw.source_set_id,
             captured_revision: &raw.captured_revision,
-            binary_bytes: &raw.binary_bytes,
+            binaries: BTreeMap::from([(
+                native_ids::digest(b"", &raw.binary_bytes),
+                &raw.binary_bytes[..],
+            )]),
             inventory: raw.inventory.proof_identities(),
         }
     }
@@ -607,8 +612,27 @@ impl<'a> ValidatedRaw<'a> {
             producer_id: &raw.producer_id,
             source_set_id: &raw.source_set_id,
             captured_revision: &raw.captured_revision,
-            binary_bytes: &raw.binary_bytes,
+            binaries: BTreeMap::from([(
+                native_ids::digest(b"", &raw.binary_bytes),
+                &raw.binary_bytes[..],
+            )]),
             inventory: raw.inventory.clone(),
+        }
+    }
+    fn from_batch(
+        raw: &'a crate::store::SelectedRawBatch,
+        inventory: &crate::scip_raw::CapturedScipInventory,
+    ) -> Self {
+        Self {
+            producer_id: &raw.producer_id,
+            source_set_id: &raw.source_set_id,
+            captured_revision: &raw.captured_revision,
+            binaries: raw
+                .captures
+                .iter()
+                .map(|capture| (capture.artifact_hash.clone(), &capture.binary_bytes[..]))
+                .collect(),
+            inventory: inventory.proof_identities(),
         }
     }
 }
@@ -641,6 +665,26 @@ pub(crate) fn validate_evidence_with_attested_raw(
         native,
         captured,
         Some(ValidatedRaw::from_decoded(raw)),
+        Some(attested),
+        None,
+    )
+}
+
+/// The whole-publication validator over a stored batch of one or more original artifacts: each
+/// captured artifact must equal the stored binary with its own digest.
+pub(crate) fn validate_evidence_with_attested_batch(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    raw: &crate::store::SelectedRawBatch,
+    inventory: &crate::scip_raw::CapturedScipInventory,
+    attested: &crate::store::AttestedProfileProducer,
+) -> Result<()> {
+    validate_evidence_inner(
+        semantic,
+        native,
+        captured,
+        Some(ValidatedRaw::from_batch(raw, inventory)),
         Some(attested),
         None,
     )
@@ -1671,7 +1715,8 @@ fn validate_evidence_inner(
         ensure!(&digest == keyed_hash, "captured artifact key mismatch");
         if let Some(raw) = &raw {
             ensure!(
-                raw.producer_id == producer_id && raw.binary_bytes == bytes.as_slice(),
+                raw.producer_id == producer_id
+                    && raw.binaries.get(&digest).copied() == Some(bytes.as_slice()),
                 "captured artifact differs from admitted raw binary"
             );
             ensure!(

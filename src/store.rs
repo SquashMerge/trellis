@@ -19,7 +19,7 @@ use crate::model::*;
 use crate::native_evidence::DeclarationRole;
 use anyhow::{Context, Result, ensure};
 pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -3887,8 +3887,10 @@ fn open_index_marker_probe(
     use rusqlite::OpenFlags;
     reject_sidecars(path, writable)?;
     verify_index_file(path)?;
+    // The writer attaches a batch stage by `file:` URI with `mode=ro`, so it must parse URIs. The
+    // main path is absolute and never starts with `file:`, so it is always taken literally.
     let flags = if writable {
-        OpenFlags::SQLITE_OPEN_READ_WRITE
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -7519,6 +7521,15 @@ fn write_import_semantic(
             }
         }
     }
+    write_import_coverage(db, key, publication)
+}
+
+/// Writes every coverage tuple of `publication` with its owned semantic rows.
+fn write_import_coverage(
+    db: &Connection,
+    key: &str,
+    publication: &crate::semantic_evidence::SemanticPublication,
+) -> Result<()> {
     for coverage in &publication.coverage {
         let producer = publication
             .producers
@@ -7539,6 +7550,272 @@ fn write_import_semantic(
             }
         }
         write_semantic_tuple(db, tuple, coverage, publication)?;
+    }
+    Ok(())
+}
+
+/// Faults the store-level batch publication tests inject.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchPublishFault {
+    /// A forced SQL error inside the transaction.
+    SqlFault,
+    /// The cancel flag is raised after the last statement, before commit.
+    PrecommitCancel,
+    /// COMMIT succeeds but its result is reported lost.
+    CommitLostAfterCommit,
+    /// COMMIT never happens and its result is reported lost.
+    CommitLostBeforeCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+enum CommitLoss {
+    AfterCommit,
+    BeforeCommit,
+}
+
+/// Limits the publication measures disk growth against.
+fn batch_publication_limits() -> crate::semantic_batch::BatchLimits {
+    #[cfg(feature = "test-support")]
+    {
+        crate::semantic_batch::BatchLimits::effective()
+            .unwrap_or(crate::semantic_batch::BatchLimits::PRODUCTION)
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        crate::semantic_batch::BatchLimits::PRODUCTION
+    }
+}
+
+/// `file:` URI that attaches `stage.db` read-only.
+fn stage_attach_uri(path: &Path) -> String {
+    use std::fmt::Write as _;
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(*byte as char);
+        } else {
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    uri.push_str("?mode=ro");
+    uri
+}
+
+/// Detaches the batch stage on every exit. Declared before the transaction so it drops after
+/// the rollback or commit, which is the only time SQLite permits DETACH.
+struct StageAttachment<'a>(&'a Connection);
+impl Drop for StageAttachment<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.execute_batch("DETACH DATABASE stage");
+    }
+}
+
+/// Fills a zero-filled capture blob from the staged artifact file in `IO_BUFFER_BYTES` chunks.
+fn fill_capture_blob(
+    db: &Connection,
+    capture_id: i64,
+    path: &Path,
+    length: i64,
+    cancel_between_chunks: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut file = std::fs::File::open(path).context("staged artifact")?;
+    ensure!(
+        i64::try_from(file.metadata()?.len())? == length,
+        "staged artifact length differs"
+    );
+    let mut blob = db.blob_open(
+        "main",
+        "semantic_raw_captures",
+        "binary_bytes",
+        capture_id,
+        false,
+    )?;
+    let mut buffer = vec![0u8; crate::semantic_batch::limits::IO_BUFFER_BYTES as usize];
+    let mut written = 0i64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        blob.write_all(&buffer[..read])?;
+        written += read as i64;
+        cancel_between_chunks()?;
+    }
+    ensure!(written == length, "staged artifact length differs");
+    Ok(())
+}
+
+/// Raw rows of a batch. The document and proof statements join the ordinal-to-capture pairs of
+/// `with_capture_ids`; `CROSS JOIN` keeps the staged table as the driver, so every select reads in
+/// the order that table is stored and needs no sorter.
+const RAW_DOCUMENTS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_documents SELECT m.capture_id,s.language,s.path,s.content_hash,d.wire_digest FROM stage.documents d CROSS JOIN stage.sources s ON s.ord=d.source_ord CROSS JOIN capture_ids m ON m.ordinal=d.artifact ORDER BY d.source_ord";
+const RAW_EXCLUSIONS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_exclusions SELECT ?1,s.language,s.path,c.exclusion FROM stage.coverage c JOIN stage.sources s ON s.ord=c.source_ord WHERE c.exclusion IS NOT NULL ORDER BY c.source_ord";
+const RAW_PROOFS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_proofs SELECT m.capture_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact ORDER BY c.claim_id";
+const STAGED_DOCUMENT: &str =
+    "json_extract(body,'$.document.language')=?1 AND json_extract(body,'$.document.path')=?2";
+
+fn with_capture_ids(values: &str, statement: &str) -> String {
+    format!("WITH capture_ids(ordinal,capture_id) AS (VALUES {values}) {statement}")
+}
+
+/// The statements batch publication runs against the attached stage, for query-plan tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn batch_publication_statements_for_tests() -> Vec<String> {
+    let mut statements = vec![
+        with_capture_ids("(0,1)", RAW_DOCUMENTS_SQL),
+        RAW_EXCLUSIONS_SQL.to_owned(),
+        with_capture_ids("(0,1)", RAW_PROOFS_SQL),
+        format!("SELECT body FROM stage.out_provenance WHERE {STAGED_DOCUMENT} ORDER BY ord"),
+    ];
+    statements.extend(
+        [
+            "out_symbols",
+            "out_declaration_bindings",
+            "out_references",
+            "out_call_bindings",
+            "out_type_relationships",
+        ]
+        .map(staged_owned_rows_sql),
+    );
+    statements
+}
+
+fn staged_owned_rows_sql(table: &str) -> String {
+    format!(
+        "SELECT body FROM stage.{table} WHERE provenance_id IN (SELECT provenance_id FROM stage.out_provenance WHERE {STAGED_DOCUMENT}) ORDER BY ord"
+    )
+}
+
+/// Writes the batch row, one capture per staged artifact, and the document, exclusion and proof
+/// rows. Rows of a batch that is already stored are refilled and never compared. Returns the
+/// batch id.
+fn write_staged_raw_rows(
+    db: &Connection,
+    stage: &crate::semantic_batch::staging::Stage,
+    descriptor: &crate::semantic_batch::descriptor::Descriptor,
+    descriptor_bytes: &[u8],
+    descriptor_sha256: &str,
+    gate: &dyn Fn() -> Result<()>,
+) -> Result<i64> {
+    let producer_id = &descriptor.producer.name;
+    let source_set_id = &descriptor.source_set.id;
+    let captured_revision = &descriptor.source_revision;
+    db.execute("INSERT INTO semantic_raw_batches(producer_id,producer_version,profile_id,source_set_id,captured_revision,source_manifest_hash,descriptor_sha256,descriptor_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(producer_id,descriptor_sha256,captured_revision) DO NOTHING", params![producer_id,descriptor.producer.version,descriptor.profile_id,source_set_id,captured_revision,descriptor.source_manifest_hash,descriptor_sha256,descriptor_bytes,descriptor.decoder_version])?;
+    let batch_id: i64 = db.query_row("SELECT batch_id FROM semantic_raw_batches WHERE producer_id=?1 AND descriptor_sha256=?2 AND captured_revision=?3", params![producer_id,descriptor_sha256,captured_revision], |r| r.get(0))?;
+    let artifacts: Vec<(i64, String, String, i64)> = db
+        .prepare(
+            "SELECT ordinal,language,sha256,byte_length FROM stage.artifacts ORDER BY ordinal",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    ensure!(!artifacts.is_empty(), "staged batch has no artifacts");
+    let mut capture_ids = Vec::with_capacity(artifacts.len());
+    for (ordinal, language, sha256, length) in &artifacts {
+        let other: Option<i64> = db.query_row("SELECT batch_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![producer_id,sha256,source_set_id,captured_revision], |r| r.get(0)).optional()?;
+        ensure!(
+            other.is_none_or(|other| other == batch_id),
+            "invalid_request: artifact already captured by another batch"
+        );
+        let existing: Option<i64> = db
+            .query_row(
+                "SELECT capture_id FROM semantic_raw_captures WHERE batch_id=?1 AND ordinal=?2",
+                params![batch_id, ordinal],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let capture_id = if let Some(existing) = existing {
+            existing
+        } else {
+            db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,language,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7,zeroblob(?8),?9)", params![batch_id,ordinal,language,producer_id,sha256,source_set_id,captured_revision,length,descriptor.decoder_version])?;
+            let capture_id = db.last_insert_rowid();
+            fill_capture_blob(
+                db,
+                capture_id,
+                &stage.artifact_path(u32::try_from(*ordinal)?),
+                *length,
+                &|| {
+                    gate()?;
+                    Ok(())
+                },
+            )?;
+            capture_id
+        };
+        capture_ids.push((*ordinal, capture_id));
+        gate()?;
+    }
+    let values = capture_ids
+        .iter()
+        .map(|(ordinal, capture_id)| format!("({ordinal},{capture_id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(&with_capture_ids(&values, RAW_DOCUMENTS_SQL), [])?;
+    gate()?;
+    db.execute(RAW_EXCLUSIONS_SQL, [batch_id])?;
+    gate()?;
+    db.execute(&with_capture_ids(&values, RAW_PROOFS_SQL), [])?;
+    Ok(batch_id)
+}
+
+/// Streams the staged `out_*` rows into the semantic tables one coverage tuple at a time: each
+/// tuple's rows are read through the document and provenance indexes, so memory is bounded by
+/// one document and the rows match what the in-memory writer produces.
+fn write_staged_semantic(
+    db: &Connection,
+    key: &str,
+    producer: &crate::semantic_evidence::Producer,
+    gate: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    use crate::semantic_evidence as sem;
+    fn rows<T: serde::de::DeserializeOwned>(
+        statement: &mut rusqlite::Statement<'_>,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<T>> {
+        let bodies = statement
+            .query_map(params, |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        bodies
+            .iter()
+            .map(|body| serde_json::from_str(body).context("staged output row"))
+            .collect()
+    }
+    let mut coverage_cursor = db.prepare("SELECT body FROM stage.out_coverage ORDER BY ord")?;
+    let mut provenance_query = db.prepare(&format!(
+        "SELECT body FROM stage.out_provenance WHERE {STAGED_DOCUMENT} ORDER BY ord"
+    ))?;
+    let owned = |table: &str| db.prepare(&staged_owned_rows_sql(table));
+    let mut symbols_query = owned("out_symbols")?;
+    let mut bindings_query = owned("out_declaration_bindings")?;
+    let mut references_query = owned("out_references")?;
+    let mut calls_query = owned("out_call_bindings")?;
+    let mut relationships_query = owned("out_type_relationships")?;
+    let coverage_bodies = coverage_cursor.query_map([], |row| row.get::<_, String>(0))?;
+    for (index, body) in coverage_bodies.enumerate() {
+        let coverage: sem::Coverage = serde_json::from_str(&body?).context("staged output row")?;
+        let key_params = params![
+            semantic_variant(&coverage.language)?,
+            coverage.document_path
+        ];
+        let publication = sem::SemanticPublication {
+            producers: vec![producer.clone()],
+            provenance: rows(&mut provenance_query, key_params)?,
+            symbols: rows(&mut symbols_query, key_params)?,
+            declaration_bindings: rows(&mut bindings_query, key_params)?,
+            references: rows(&mut references_query, key_params)?,
+            call_bindings: rows(&mut calls_query, key_params)?,
+            type_relationships: rows(&mut relationships_query, key_params)?,
+            coverage: vec![coverage],
+        };
+        write_import_coverage(db, key, &publication)?;
+        if index % 1000 == 999 {
+            gate()?;
+        }
     }
     Ok(())
 }
@@ -8934,14 +9211,6 @@ fn selected_native_rejoin_once(
                 dependency: native_ids::canonical(&serde_json::json!(dependencies)),
                 native_extraction_components: BTreeMap::new(),
             };
-            let raw_capture = SemanticRawCapture {
-                producer_id: raw.producer_id.clone(),
-                source_set_id: raw.source_set_id.clone(),
-                captured_revision: raw.captured_revision.clone(),
-                binary_bytes: raw.captures[0].binary_bytes.clone(),
-                manifest_bytes: Vec::new(),
-                inventory: inventory.clone(),
-            };
             let attested = authenticate_stored_batch(
                 raw,
                 &inventory,
@@ -9036,11 +9305,12 @@ fn selected_native_rejoin_once(
                     return Err(RejoinOracleMismatch.into());
                 }
             }
-            sem::validate_evidence_with_attested_raw(
+            sem::validate_evidence_with_attested_batch(
                 &outcome.publication,
                 &validated_native,
                 &captured,
-                &raw_capture,
+                raw,
+                &inventory,
                 &attested,
             )?;
             Ok((outcome.publication, captured))
@@ -9131,6 +9401,70 @@ fn selected_native_rejoin_once(
     Ok(())
 }
 
+/// Records one producer descriptor, its languages and its binding to revision `key`. An
+/// existing descriptor must be identical.
+fn write_producer_descriptor(
+    db: &Connection,
+    key: &str,
+    producer: &crate::semantic_evidence::Producer,
+) -> Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO semantic_producers VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            producer.id,
+            producer.version,
+            producer.executable_hash,
+            semantic_variant(&producer.kind)?,
+            semantic_variant(&producer.position_encoding)?,
+            producer_identity_kind(&producer.id),
+        ],
+    )?;
+    let descriptor: (String,String,String,String) = db.query_row(
+        "SELECT executable_hash,kind,position_encoding,identity_kind FROM semantic_producers WHERE id=?1 AND version=?2",
+        params![producer.id,producer.version], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    )?;
+    ensure!(
+        descriptor
+            == (
+                producer.executable_hash.clone(),
+                semantic_variant(&producer.kind)?,
+                semantic_variant(&producer.position_encoding)?,
+                producer_identity_kind(&producer.id).to_owned()
+            ),
+        "incompatible_index: semantic producer descriptor changed"
+    );
+    for (ordinal, language) in producer.languages.iter().enumerate() {
+        db.execute(
+            "INSERT OR IGNORE INTO semantic_producer_languages VALUES(?1,?2,?3,?4)",
+            params![
+                producer.id,
+                producer.version,
+                semantic_variant(language)?,
+                ordinal as i64
+            ],
+        )?;
+    }
+    let persisted: Vec<String> = semantic_ordered(
+        db,
+        "SELECT ordinal,language FROM semantic_producer_languages WHERE id=?1 AND version=?2 ORDER BY ordinal",
+        &[&producer.id, &producer.version],
+    )?;
+    let supplied = producer
+        .languages
+        .iter()
+        .map(semantic_variant)
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        persisted == supplied,
+        "incompatible_index: semantic producer languages changed"
+    );
+    db.execute(
+        "INSERT INTO semantic_revision_producers VALUES(?1,?2,?3)",
+        params![key, producer.id, producer.version],
+    )?;
+    Ok(())
+}
+
 fn write_semantic(
     db: &Connection,
     native: &crate::native_evidence::Artifact,
@@ -9173,60 +9507,7 @@ fn write_semantic(
     };
     if let Some((publication, captured)) = supplied {
         for producer in &publication.producers {
-            db.execute(
-                "INSERT OR IGNORE INTO semantic_producers VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    producer.id,
-                    producer.version,
-                    producer.executable_hash,
-                    semantic_variant(&producer.kind)?,
-                    semantic_variant(&producer.position_encoding)?,
-                    producer_identity_kind(&producer.id),
-                ],
-            )?;
-            let descriptor: (String,String,String,String) = db.query_row(
-                "SELECT executable_hash,kind,position_encoding,identity_kind FROM semantic_producers WHERE id=?1 AND version=?2",
-                params![producer.id,producer.version], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
-            )?;
-            ensure!(
-                descriptor
-                    == (
-                        producer.executable_hash.clone(),
-                        semantic_variant(&producer.kind)?,
-                        semantic_variant(&producer.position_encoding)?,
-                        producer_identity_kind(&producer.id).to_owned()
-                    ),
-                "incompatible_index: semantic producer descriptor changed"
-            );
-            for (ordinal, language) in producer.languages.iter().enumerate() {
-                db.execute(
-                    "INSERT OR IGNORE INTO semantic_producer_languages VALUES(?1,?2,?3,?4)",
-                    params![
-                        producer.id,
-                        producer.version,
-                        semantic_variant(language)?,
-                        ordinal as i64
-                    ],
-                )?;
-            }
-            let persisted: Vec<String> = semantic_ordered(
-                db,
-                "SELECT ordinal,language FROM semantic_producer_languages WHERE id=?1 AND version=?2 ORDER BY ordinal",
-                &[&producer.id, &producer.version],
-            )?;
-            let supplied = producer
-                .languages
-                .iter()
-                .map(semantic_variant)
-                .collect::<Result<Vec<_>>>()?;
-            ensure!(
-                persisted == supplied,
-                "incompatible_index: semantic producer languages changed"
-            );
-            db.execute(
-                "INSERT INTO semantic_revision_producers VALUES(?1,?2,?3)",
-                params![key, producer.id, producer.version],
-            )?;
+            write_producer_descriptor(db, &key, producer)?;
         }
         for producer in &captured.requested_producers {
             db.execute(
@@ -14770,6 +15051,342 @@ impl Store {
         Ok(next)
     }
 
+    /// Publishes one joined batch as the next revision: raw rows, semantic rows, selection and
+    /// report in a single transaction against `expected`.
+    pub fn publish_semantic_batch(
+        &self,
+        joined: &crate::semantic_batch::JoinedBatch,
+        stage: &mut crate::semantic_batch::staging::Stage,
+        expected: IndexPin,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        self.publish_semantic_batch_inner(joined, stage, expected, leader, cancel, |_| Ok(()), None)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_semantic_batch_with_fault_for_tests(
+        &self,
+        joined: &crate::semantic_batch::JoinedBatch,
+        stage: &mut crate::semantic_batch::staging::Stage,
+        expected: IndexPin,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        fault: BatchPublishFault,
+    ) -> Result<IndexPin> {
+        let loss = match fault {
+            BatchPublishFault::CommitLostAfterCommit => Some(CommitLoss::AfterCommit),
+            BatchPublishFault::CommitLostBeforeCommit => Some(CommitLoss::BeforeCommit),
+            _ => None,
+        };
+        self.publish_semantic_batch_inner(
+            joined,
+            stage,
+            expected,
+            leader,
+            cancel,
+            |db| {
+                match fault {
+                    BatchPublishFault::PrecommitCancel => {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed)
+                    }
+                    BatchPublishFault::SqlFault => {
+                        db.execute(
+                            "INSERT INTO semantic_import_reports(revision_id) VALUES ('forced-sql-fault')",
+                            [],
+                        )?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+            loss,
+        )
+    }
+
+    /// Publishes like `publish_semantic_batch` and lets `observe` read the writer connection just
+    /// before commit.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_semantic_batch_observing_for_tests(
+        &self,
+        joined: &crate::semantic_batch::JoinedBatch,
+        stage: &mut crate::semantic_batch::staging::Stage,
+        expected: IndexPin,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        observe: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<IndexPin> {
+        let mut observe = Some(observe);
+        self.publish_semantic_batch_inner(
+            joined,
+            stage,
+            expected,
+            leader,
+            cancel,
+            |db| observe.take().map_or(Ok(()), |observe| observe(db)),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_semantic_batch_inner(
+        &self,
+        joined: &crate::semantic_batch::JoinedBatch,
+        stage: &mut crate::semantic_batch::staging::Stage,
+        expected: IndexPin,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        mut before_commit: impl FnMut(&Connection) -> Result<()>,
+        commit_loss: Option<CommitLoss>,
+    ) -> Result<IndexPin> {
+        use crate::semantic_batch::{descriptor::Descriptor, limits};
+        leader.belongs_to(&self.identity)?;
+        self.identity.verify()?;
+        check_cancel(cancel)?;
+        ensure!(
+            joined.destination_pin() == expected,
+            "revision conflict: semantic batch destination changed"
+        );
+        let report_json = serde_json::to_string(joined.report())?;
+        ensure!(
+            report_json.len() <= 1024 * 1024,
+            "semantic import report exceeds response bound"
+        );
+        let batch_limits = batch_publication_limits();
+        // No handle on stage.db may exist while the writer has it attached.
+        stage.release_connection();
+        let stage_uri = stage_attach_uri(&stage.db_path());
+        let conn = self.cache_write()?;
+        let db: &Connection = &conn;
+        storage_result(db.pragma_update(
+            None,
+            "cache_size",
+            -i64::try_from(limits::BATCH_WRITER_CACHE_KIB)?,
+        ))?;
+        storage_result(db.execute("ATTACH DATABASE ?1 AS stage", [&stage_uri]))?;
+        let attachment = StageAttachment(db);
+        storage_result(db.pragma_update(
+            Some("stage"),
+            "cache_size",
+            -i64::try_from(limits::STAGE_ATTACH_CACHE_KIB)?,
+        ))?;
+        let gate = || -> Result<()> {
+            check_cancel(cancel)?;
+            stage.budget(&batch_limits).check()?;
+            Ok(())
+        };
+        let tx = storage_result(Transaction::new_unchecked(
+            db,
+            TransactionBehavior::Immediate,
+        ))?;
+        let current = self.recovery_baseline_preflight(&tx)?;
+        ensure!(
+            current.pin == Some(expected),
+            "revision conflict: semantic batch destination changed"
+        );
+        let (header_sha, descriptor_bytes): (String, Vec<u8>) = tx.query_row(
+            "SELECT descriptor_sha256,descriptor_bytes FROM stage.header",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let attempt: i64 =
+            tx.query_row("SELECT attempt FROM stage.join_state", [], |row| row.get(0))?;
+        ensure!(
+            attempt == joined.attempt() && header_sha == joined.descriptor_sha256(),
+            "joined batch superseded by a later join attempt"
+        );
+        let descriptor = Descriptor::parse(&descriptor_bytes)?;
+        let producer = descriptor.check_producer()?.producer();
+        let old_key = semantic_pin_key(expected);
+        let head_native: String = tx.query_row(
+            "SELECT native_revision_id FROM native_revisions WHERE id=?1",
+            [&old_key],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            head_native == joined.destination_revision_id(),
+            "revision conflict: semantic batch destination changed"
+        );
+        let captured_key = semantic_pin_key(joined.captured_pin());
+        let retained: Option<String> = tx
+            .query_row(
+                "SELECT native_revision_id FROM native_revisions r WHERE id=?1 AND source_set_id=?2 AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs WHERE revision_id=r.id AND input_key IN ('__released:v1','__pending_release:v1'))",
+                params![captured_key, descriptor.source_set.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(
+            retained.as_deref() == Some(descriptor.source_revision.as_str()),
+            "capture_unavailable: captured revision not retained"
+        );
+        gate()?;
+        let next = IndexPin {
+            index_generation: expected.index_generation,
+            index_revision: expected
+                .index_revision
+                .checked_add(1)
+                .filter(|n| *n <= 9_007_199_254_740_991)
+                .context("revision overflow")?,
+        };
+        let next_key = semantic_pin_key(next);
+        tx.execute("INSERT INTO native_revisions SELECT ?1,source_set_id,toolchain_hash,config_hash,dependency_hash,native_revision_id,source_inventory,dependency_observations,retained_toolchain,retained_config,retained_dependencies,reconcile_options,class_warnings,class_truncated,graph_stats,graph_diagnostics,?2 FROM native_revisions WHERE id=?3",params![next_key,next.index_revision as i64,old_key])?;
+        tx.execute("INSERT INTO revision_documents SELECT ?1,language,path,vid,gid,cid,capture_stat,coverage_requested,coverage_selected,coverage_state,coverage_diagnostic,ordinal,class_complete FROM revision_documents WHERE revision_id=?2",params![next_key,old_key])?;
+        tx.execute("INSERT INTO revision_capture_inputs SELECT ?1,input_key,payload FROM revision_capture_inputs WHERE revision_id=?2",params![next_key,old_key])?;
+        let (producer_sha, binding_sha) = revision_producer_binding(&tx, &next_key)?;
+        tx.execute(
+            "INSERT INTO revision_producer_bindings VALUES(?1,?2,?3)",
+            params![next_key, producer_sha, binding_sha],
+        )?;
+        gate()?;
+        tx.execute("INSERT INTO semantic_revision_producers SELECT ?1,id,version FROM semantic_revision_producers WHERE revision_id=?2 AND id<>?3",params![next_key,old_key,producer.id])?;
+        tx.execute("INSERT INTO semantic_requested_producers SELECT ?1,id,version,executable_hash FROM semantic_requested_producers WHERE revision_id=?2 AND id<>?3",params![next_key,old_key,producer.id])?;
+        tx.execute("INSERT INTO semantic_requested_producer_languages SELECT ?1,id,language,ordinal FROM semantic_requested_producer_languages WHERE revision_id=?2 AND id<>?3",params![next_key,old_key,producer.id])?;
+        tx.execute("INSERT INTO semantic_revision_raw_selections SELECT ?1,producer_id,batch_id,captured_pin FROM semantic_revision_raw_selections WHERE revision_id=?2 AND producer_id<>?3",params![next_key,old_key,producer.id])?;
+        copy_semantic_rows_except(&tx, &old_key, &next_key, &producer.id)?;
+        write_producer_descriptor(&tx, &next_key, &producer)?;
+        tx.execute(
+            "INSERT INTO semantic_requested_producers VALUES(?1,?2,?3,?4)",
+            params![
+                next_key,
+                producer.id,
+                producer.version,
+                producer.executable_hash
+            ],
+        )?;
+        for (ordinal, language) in producer.languages.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO semantic_requested_producer_languages VALUES(?1,?2,?3,?4)",
+                params![
+                    next_key,
+                    producer.id,
+                    semantic_variant(language)?,
+                    ordinal as i64
+                ],
+            )?;
+        }
+        gate()?;
+        let batch_id = write_staged_raw_rows(
+            &tx,
+            stage,
+            &descriptor,
+            &descriptor_bytes,
+            &header_sha,
+            &gate,
+        )?;
+        gate()?;
+        write_staged_semantic(&tx, &next_key, &producer, &gate)?;
+        tx.execute(
+            "INSERT INTO semantic_revision_raw_selections VALUES(?1,?2,?3,?4)",
+            params![next_key, producer.id, batch_id, captured_key],
+        )?;
+        tx.execute("INSERT INTO semantic_import_reports(revision_id,producer_id,report_json) VALUES(?1,?2,?3)",params![next_key,producer.id,report_json])?;
+        tx.execute("INSERT INTO semantic_import_reports SELECT ?1,producer_id,report_json FROM semantic_import_reports WHERE revision_id=?2 AND producer_id<>?3",params![next_key,old_key,producer.id])?;
+        search::publish_head(&tx, &next_key)?;
+        let published_at = self.retention_time()?;
+        stamp_predecessor(&tx, &old_key, published_at.as_secs() as i64)?;
+        tx.execute("UPDATE index_metadata SET index_revision=?1,indexed_at=?2 WHERE singleton=1 AND index_generation=?3 AND index_revision=?4", params![next.index_revision as i64,published_at.as_millis().to_string(),expected.index_generation.to_string(),expected.index_revision as i64])?;
+        gate()?;
+        before_commit(&tx)?;
+        leader.verify()?;
+        self.identity.verify()?;
+        check_cancel(cancel)?;
+        #[cfg(all(feature = "test-support", unix))]
+        if let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_PAUSE_BEFORE_COMMIT_SOCKET") {
+            use std::os::unix::net::UnixListener;
+            let path = std::path::PathBuf::from(path);
+            if !path.exists() {
+                let listener = UnixListener::bind(&path)?;
+                std::fs::write(path.with_extension("ready"), [])?;
+                let (_stream, _) = listener.accept()?;
+            }
+        }
+        #[allow(unused_mut)]
+        let mut loss = commit_loss;
+        #[cfg(feature = "test-support")]
+        if loss.is_none()
+            && std::env::var_os("TRELLIS_TEST_SEMANTIC_AMBIGUOUS_COMMIT").is_some_and(|marker| {
+                let marker = std::path::PathBuf::from(marker);
+                !marker.exists() && std::fs::write(marker, b"semantic commit succeeded").is_ok()
+            })
+        {
+            loss = Some(CommitLoss::AfterCommit);
+        }
+        let committed = if loss == Some(CommitLoss::BeforeCommit) {
+            drop(tx);
+            Err(topology::StorageBusy.into())
+        } else {
+            let outcome = storage_result(tx.commit());
+            if outcome.is_ok() && loss == Some(CommitLoss::AfterCommit) {
+                Err(topology::StorageBusy.into())
+            } else {
+                outcome
+            }
+        };
+        match committed {
+            Ok(()) => Ok(next),
+            Err(_) => {
+                drop(attachment);
+                drop(conn);
+                self.resolve_ambiguous_batch_commit(expected, next, joined.descriptor_sha256())
+            }
+        }
+    }
+
+    /// Settles a COMMIT whose outcome is unknown by re-reading durable state. It reports success
+    /// only when the next revision is the head and selects this descriptor, and a conflict only
+    /// when the head is still `expected` or has moved on.
+    pub fn resolve_ambiguous_batch_commit(
+        &self,
+        expected: IndexPin,
+        new_pin: IndexPin,
+        descriptor_sha256: &str,
+    ) -> Result<IndexPin> {
+        let head = self.index_baseline()?;
+        if head == new_pin {
+            let selected = self.with_evidence(|db| {
+                Ok(db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM semantic_revision_raw_selections s JOIN semantic_raw_batches b ON b.batch_id=s.batch_id AND b.producer_id=s.producer_id WHERE s.revision_id=?1 AND b.descriptor_sha256=?2)",
+                    params![semantic_pin_key(head), descriptor_sha256],
+                    |row| row.get::<_, bool>(0),
+                )?)
+            })?;
+            if selected {
+                return Ok(new_pin);
+            }
+        }
+        if head == expected {
+            anyhow::bail!("revision conflict: semantic batch commit did not persist");
+        }
+        anyhow::bail!("revision conflict: semantic batch destination changed")
+    }
+
+    /// The report committed with the batch whose descriptor digest is `descriptor_sha256`, if
+    /// that batch is selected at `pin`.
+    pub fn semantic_batch_report_at(
+        &self,
+        pin: IndexPin,
+        descriptor_sha256: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        self.native_at(pin, |db, selected| {
+            let report: Option<String> = db
+                .query_row(
+                    "SELECT r.report_json FROM semantic_import_reports r JOIN semantic_revision_raw_selections s ON s.revision_id=r.revision_id AND s.producer_id=r.producer_id JOIN semantic_raw_batches b ON b.batch_id=s.batch_id AND b.producer_id=s.producer_id WHERE r.revision_id=?1 AND b.descriptor_sha256=?2",
+                    params![selected.key, descriptor_sha256],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            report
+                .map(|payload| {
+                    serde_json::from_str(&payload).context(SelectedIntegrity(
+                        "incompatible_index: corrupt semantic import report".into(),
+                    ))
+                })
+                .transpose()
+        })
+    }
+
     /// Publish captured semantic evidence with a native revision in the same transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn publish_native_semantic(
@@ -15336,6 +15953,33 @@ impl Store {
             },
             Some((semantic, captured)),
         )
+    }
+
+    /// A document-local native publication, which rejoins selected batches through the
+    /// witness path where it applies.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn publish_local_for_tests(
+        &self,
+        options: &crate::indexer::IndexOptions,
+        capture: &crate::capture::Capture,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+    ) -> Result<IndexPin> {
+        let expected = self.publication_index_baseline()?;
+        let prepared = self
+            .prepare_local_revision(capture, &expected, cancel)?
+            .context("document-local publication unavailable")?;
+        let changed = crate::indexer::project_native_documents(
+            options,
+            capture,
+            &prepared.native,
+            &prepared.changed_paths,
+            cancel,
+            &|_| {},
+        )?;
+        let graph = self.compose_local_revision(capture, &prepared, changed, cancel)?;
+        self.publish_local_native_recovery(&graph, capture, prepared, leader, expected, cancel)
     }
 
     #[cfg(feature = "test-support")]

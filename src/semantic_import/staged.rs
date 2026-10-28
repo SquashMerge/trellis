@@ -1555,7 +1555,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
 }
 
 /// Clears the destination-dependent tables when the destination differs from the last attempt.
-fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<()> {
+fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64> {
     for table in JOIN_TABLES {
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
@@ -1570,12 +1570,17 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<()>
             conn.execute(&format!("DELETE FROM {table} WHERE rev=1"), [])?;
         }
     }
+    // Every attempt takes a fresh nonce, so a `JoinedBatch` sealed by an earlier attempt no
+    // longer matches once a later attempt has cleared or partly refilled the output tables.
+    let attempt = NEXT_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i64;
     conn.execute(
-        "INSERT OR REPLACE INTO join_state VALUES(1,?1,?2)",
-        params![generation, destination.index_revision as i64],
+        "INSERT OR REPLACE INTO join_state VALUES(1,?1,?2,?3)",
+        params![generation, destination.index_revision as i64, attempt],
     )?;
-    Ok(())
+    Ok(attempt)
 }
+
+static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The native rows an earlier attempt left in the stage. They count against `staged_rows`
 /// together with the rows this attempt writes.
@@ -2990,82 +2995,84 @@ pub fn join_staged(
         cancel: cancel.clone(),
     };
     let producer = parts.producer.producer();
-    let body = |captured: &NativeReader<'_>, destination_reader: &NativeReader<'_>| {
-        let captured_header = captured.header()?;
-        let destination_header = destination_reader.header()?;
-        let descriptor = parts.descriptor;
-        native_pass(&ctx, captured, 0, false)?;
-        if !shared {
-            native_pass(&ctx, destination_reader, 1, !ctx.mutations.is_empty())?;
-        }
-        let destination_rev = if shared { 0 } else { 1 };
-        let side = |reader, header, rev, side, filtered| StagedSide {
-            ctx: &ctx,
-            reader,
-            header,
-            rev,
-            side,
-            filtered,
-        };
-        let join = StagedJoin {
-            ctx: &ctx,
-            producer: &producer,
-            descriptor,
-            admitted_encoding: descriptor.producer.position_encoding,
-            captured: side(captured, &captured_header, 0, 0, false),
-            destination: side(
-                destination_reader,
-                &destination_header,
-                destination_rev,
-                1,
-                false,
-            ),
-            filtered: side(
-                destination_reader,
-                &destination_header,
-                destination_rev,
-                1,
-                true,
-            ),
-            destination_header: &destination_header,
-            validator: EmissionValidator::new(EmissionHeader {
+    let body =
+        |attempt: i64, captured: &NativeReader<'_>, destination_reader: &NativeReader<'_>| {
+            let captured_header = captured.header()?;
+            let destination_header = destination_reader.header()?;
+            let descriptor = parts.descriptor;
+            native_pass(&ctx, captured, 0, false)?;
+            if !shared {
+                native_pass(&ctx, destination_reader, 1, !ctx.mutations.is_empty())?;
+            }
+            let destination_rev = if shared { 0 } else { 1 };
+            let side = |reader, header, rev, side, filtered| StagedSide {
+                ctx: &ctx,
+                reader,
+                header,
+                rev,
+                side,
+                filtered,
+            };
+            let join = StagedJoin {
+                ctx: &ctx,
                 producer: &producer,
-                captured_revision: captured_header.revision.clone(),
-                destination_revision: destination_header.revision.clone(),
-                source_set_languages: destination_header.source_set.languages.clone(),
-                artifact_hashes: descriptor
-                    .artifacts
-                    .iter()
-                    .map(|artifact| artifact.sha256.clone())
-                    .collect(),
-                source_manifest_hash: descriptor.source_manifest_hash.clone(),
-            }),
-            basis: StagedBasis {
-                conn: ctx.conn,
                 descriptor,
-                producer: &producer,
-                captured: &captured_header.revision,
-            },
-            emitted: Cell::new([0; 7]),
-            identity_kind: descriptor.producer.identity_kind.as_str(),
-            descriptor_sha256: parts.descriptor_sha256,
+                admitted_encoding: descriptor.producer.position_encoding,
+                captured: side(captured, &captured_header, 0, 0, false),
+                destination: side(
+                    destination_reader,
+                    &destination_header,
+                    destination_rev,
+                    1,
+                    false,
+                ),
+                filtered: side(
+                    destination_reader,
+                    &destination_header,
+                    destination_rev,
+                    1,
+                    true,
+                ),
+                destination_header: &destination_header,
+                validator: EmissionValidator::new(EmissionHeader {
+                    producer: &producer,
+                    captured_revision: captured_header.revision.clone(),
+                    destination_revision: destination_header.revision.clone(),
+                    source_set_languages: destination_header.source_set.languages.clone(),
+                    artifact_hashes: descriptor
+                        .artifacts
+                        .iter()
+                        .map(|artifact| artifact.sha256.clone())
+                        .collect(),
+                    source_manifest_hash: descriptor.source_manifest_hash.clone(),
+                }),
+                basis: StagedBasis {
+                    conn: ctx.conn,
+                    descriptor,
+                    producer: &producer,
+                    captured: &captured_header.revision,
+                },
+                emitted: Cell::new([0; 7]),
+                identity_kind: descriptor.producer.identity_kind.as_str(),
+                descriptor_sha256: parts.descriptor_sha256,
+            };
+            let report = join.run()?;
+            Ok(JoinedBatch::seal(
+                captured_pin,
+                destination,
+                destination_header.revision.id.clone(),
+                parts.descriptor_sha256.to_owned(),
+                attempt,
+                report,
+            ))
         };
-        let report = join.run()?;
-        Ok(JoinedBatch::seal(
-            captured_pin,
-            destination,
-            destination_header.revision.id.clone(),
-            parts.descriptor_sha256.to_owned(),
-            report,
-        ))
-    };
-    let result = reset_for_destination(ctx.conn, destination).and_then(|()| {
+    let result = reset_for_destination(ctx.conn, destination).and_then(|attempt| {
         ctx.rows.set(retained_rows(ctx.conn)?);
         if shared {
-            store.with_native_reader(captured_pin, |reader| body(reader, reader))
+            store.with_native_reader(captured_pin, |reader| body(attempt, reader, reader))
         } else {
             store.with_native_reader(captured_pin, |captured| {
-                store.with_native_reader(destination, |reader| body(captured, reader))
+                store.with_native_reader(destination, |reader| body(attempt, captured, reader))
             })
         }
     });
