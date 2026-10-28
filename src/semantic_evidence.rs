@@ -92,7 +92,8 @@ record!(SemanticSnapshot { producers: Vec<Producer>, coverage: Vec<Coverage>, pr
 #[derive(Debug, Clone)]
 pub struct CapturedComponents {
     pub producer_executables: BTreeMap<String, Vec<u8>>,
-    pub artifacts: BTreeMap<String, Vec<u8>>,
+    /// Captured artifact bytes keyed by `(producer_id, artifact_hash)`, one entry per capture.
+    pub artifacts: BTreeMap<(String, String), Vec<u8>>,
     pub sources: BTreeMap<native::DocumentKey, Vec<u8>>,
     pub captured_revision: native::Revision,
     /// Canonical native revision input components, captured with the native header.
@@ -785,6 +786,7 @@ struct RawCaptureIdentity<'a> {
 pub(crate) struct RawClaimDocument {
     pub(crate) language: String,
     pub(crate) path: String,
+    pub(crate) artifact_hash: String,
 }
 
 /// Resolves `(proof_id, record_kind, fact_digest)` to exactly one raw claim.
@@ -799,7 +801,7 @@ fn validate_provenance_row(
     raw: Option<(&RawCaptureIdentity<'_>, &ClaimLookup<'_>)>,
     captured: &CapturedComponents,
     revision: &native::Revision,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if let Some(derived) = &p.derived_from {
         ensure!(
             p.revision_id == revision.id,
@@ -821,25 +823,33 @@ fn validate_provenance_row(
                 && raw.captured_revision == captured.captured_revision.id,
             "derived provenance raw capture identity mismatch"
         );
+        Ok(Some(claim.artifact_hash))
     } else {
         ensure!(
             p.revision_id == captured.captured_revision.id,
             "captured proof revision mismatch"
         );
+        Ok(None)
     }
-    Ok(())
 }
 
-/// Validates a proof's captured basis. `expected_artifact_hash` is the digest of the artifact
-/// this row's producer was captured from; `raw_binding` is the raw inventory's
-/// `(artifact_hash, source_manifest_hash)` when it must also match the basis.
+/// The artifact digests a proof's basis is checked against.
+struct BasisArtifacts<'a> {
+    /// The artifacts this row's producer was captured from.
+    producer: Option<&'a BTreeSet<String>>,
+    /// The derived-from claim's artifact, which the basis must name.
+    claim: Option<&'a str>,
+    /// The raw inventory's source manifest hash, when it must also match the basis.
+    raw_manifest_hash: Option<&'a str>,
+}
+
+/// Validates a proof's captured basis against `artifacts`.
 fn validate_basis(
     p: &Provenance,
     basis: &SemanticBasis,
     producer: &Producer,
     captured: &CapturedComponents,
-    expected_artifact_hash: Option<&String>,
-    raw_binding: Option<(&str, &str)>,
+    artifacts: BasisArtifacts<'_>,
     manifest_hash: &str,
 ) -> Result<()> {
     for field in [
@@ -862,11 +872,16 @@ fn validate_basis(
         "captured basis identity mismatch"
     );
     ensure!(
-        basis.artifact_hash
-            == *expected_artifact_hash.context("missing captured semantic artifact")?
-            && raw_binding.is_none_or(|(artifact_hash, source_manifest_hash)| {
-                basis.artifact_hash == artifact_hash && source_manifest_hash == manifest_hash
-            })
+        artifacts
+            .producer
+            .context("missing captured semantic artifact")?
+            .contains(&basis.artifact_hash)
+            && artifacts
+                .claim
+                .is_none_or(|artifact_hash| basis.artifact_hash == artifact_hash)
+            && artifacts
+                .raw_manifest_hash
+                .is_none_or(|source_manifest_hash| source_manifest_hash == manifest_hash)
             && basis.source_manifest_hash == manifest_hash
             && basis.toolchain_hash == captured.captured_revision.toolchain_hash
             && basis.config_hash == captured.captured_revision.config_hash
@@ -1471,7 +1486,13 @@ fn validate_evidence_inner(
             } else {
                 producers.len()
             }
-            && captured.artifacts.len() == producers.len(),
+            && captured
+                .artifacts
+                .keys()
+                .map(|(producer_id, _)| producer_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == producers.len(),
         "unclaimed semantic bytes"
     );
     let mut requested_producers = BTreeMap::new();
@@ -1583,23 +1604,24 @@ fn validate_evidence_inner(
             }
         }
     }
-    let mut artifact_hashes = BTreeMap::new();
-    for (producer_id, bytes) in &captured.artifacts {
-        let artifact_hash = if let Some(raw) = &raw {
+    let mut artifact_hashes: BTreeMap<&String, BTreeSet<String>> = BTreeMap::new();
+    for ((producer_id, keyed_hash), bytes) in &captured.artifacts {
+        let digest = native_ids::digest(b"", bytes);
+        ensure!(&digest == keyed_hash, "captured artifact key mismatch");
+        if let Some(raw) = &raw {
             ensure!(
                 raw.producer_id == producer_id && raw.binary_bytes == bytes.as_slice(),
                 "captured artifact differs from admitted raw binary"
             );
-            let digest = native_ids::digest(b"", raw.binary_bytes);
             ensure!(
-                raw.inventory.artifact_hash == digest,
+                raw.inventory.artifact_hashes.contains(&digest),
                 "raw binary identity mismatch"
             );
-            digest
-        } else {
-            native_ids::digest(b"", bytes)
-        };
-        artifact_hashes.insert(producer_id, artifact_hash);
+        }
+        artifact_hashes
+            .entry(producer_id)
+            .or_default()
+            .insert(digest);
     }
     let mut proof = BTreeMap::new();
     for p in &semantic.provenance {
@@ -1624,9 +1646,10 @@ fn validate_evidence_inner(
             Ok(RawClaimDocument {
                 language: claim.language.clone(),
                 path: claim.path.clone(),
+                artifact_hash: claim.artifact_hash.clone(),
             })
         };
-        validate_provenance_row(
+        let claim_artifact = validate_provenance_row(
             p,
             identity
                 .as_ref()
@@ -1657,13 +1680,14 @@ fn validate_evidence_inner(
             basis,
             producer,
             captured,
-            artifact_hashes.get(&p.producer_id),
-            raw.as_ref().filter(|_| witnessed.is_some()).map(|raw| {
-                (
-                    raw.inventory.artifact_hash.as_str(),
-                    raw.inventory.source_manifest_hash.as_str(),
-                )
-            }),
+            BasisArtifacts {
+                producer: artifact_hashes.get(&p.producer_id),
+                claim: claim_artifact.as_deref(),
+                raw_manifest_hash: raw
+                    .as_ref()
+                    .filter(|_| witnessed.is_some())
+                    .map(|raw| raw.inventory.source_manifest_hash.as_str()),
+            },
             &manifest_hash,
         )?;
         let document = captured

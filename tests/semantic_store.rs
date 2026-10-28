@@ -240,7 +240,13 @@ fn evidence(
     };
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([(producer.id.clone(), b"exe".to_vec())]),
-        artifacts: BTreeMap::from([(producer.id.clone(), b"artifact".to_vec())]),
+        artifacts: BTreeMap::from([(
+            (
+                producer.id.clone(),
+                trellis::native_ids::digest(b"", b"artifact"),
+            ),
+            b"artifact".to_vec(),
+        )]),
         sources: BTreeMap::from([(document.key.clone(), bytes)]),
         captured_revision: native.revision.clone(),
         native_toolchain: toolchain.clone(),
@@ -508,9 +514,13 @@ fn multiple_producers_keep_distinct_coverage_without_spurious_facts() {
     captured
         .producer_executables
         .insert(other.id.clone(), b"exe".to_vec());
-    captured
-        .artifacts
-        .insert(other.id.clone(), b"artifact".to_vec());
+    captured.artifacts.insert(
+        (
+            other.id.clone(),
+            trellis::native_ids::digest(b"", b"artifact"),
+        ),
+        b"artifact".to_vec(),
+    );
     captured.requested_producers.push(other);
     s::validate_evidence(&semantic, &native, &captured).unwrap();
     let leader = store.publication_for_tests().unwrap();
@@ -979,9 +989,13 @@ fn typed_next_revision_fills_unsupplied_producer_new_document() {
     captured
         .producer_executables
         .insert(other.id.clone(), b"exe".to_vec());
-    captured
-        .artifacts
-        .insert(other.id.clone(), b"artifact".to_vec());
+    captured.artifacts.insert(
+        (
+            other.id.clone(),
+            trellis::native_ids::digest(b"", b"artifact"),
+        ),
+        b"artifact".to_vec(),
+    );
     captured.requested_producers.push(other.clone());
     let mut requested = semantic.producers[0].clone();
     requested.id = "semantic.zrequested".into();
@@ -996,9 +1010,13 @@ fn typed_next_revision_fills_unsupplied_producer_new_document() {
     captured
         .producer_executables
         .insert(requested.id.clone(), b"exe".to_vec());
-    captured
-        .artifacts
-        .insert(requested.id.clone(), b"artifact".to_vec());
+    captured.artifacts.insert(
+        (
+            requested.id.clone(),
+            trellis::native_ids::digest(b"", b"artifact"),
+        ),
+        b"artifact".to_vec(),
+    );
     captured.requested_producers.push(requested.clone());
     let leader = store.publication_for_tests().unwrap();
     let first = store
@@ -2332,7 +2350,7 @@ fn contradictory_plain_reference_proofs_survive_store_selected_roundtrip() {
         producer_id: producer.id.clone(),
         producer_version: producer.version.clone(),
         producer_hash: producer.executable_hash.clone(),
-        artifact_hash: inventory.artifact_hash.clone(),
+        artifact_hash: inventory.artifact_hashes[0].clone(),
         language: s::Language::Javascript,
         source_set_id: doc.key.source_set_id.clone(),
         revision_id: r1.revision.id.clone(),
@@ -2369,7 +2387,10 @@ fn contradictory_plain_reference_proofs_survive_store_selected_roundtrip() {
     };
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::new(),
-        artifacts: BTreeMap::from([(producer.id.clone(), raw.binary_bytes.clone())]),
+        artifacts: BTreeMap::from([(
+            (producer.id.clone(), inventory.artifact_hashes[0].clone()),
+            raw.binary_bytes.clone(),
+        )]),
         sources: sources.clone(),
         captured_revision: r1.revision.clone(),
         native_toolchain: toolchain.clone(),
@@ -2426,7 +2447,7 @@ fn contradictory_plain_reference_proofs_survive_store_selected_roundtrip() {
         let persisted = store
             .semantic_raw_proof_at(
                 &producer.id,
-                &inventory.artifact_hash,
+                &inventory.artifact_hashes[0],
                 &doc.key.source_set_id,
                 &r1.revision.id,
                 &link.provenance_id,
@@ -2498,7 +2519,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         producer_id: producer.id.clone(),
         producer_version: producer.version.clone(),
         producer_hash: producer.executable_hash.clone(),
-        artifact_hash: inventory.artifact_hash.clone(),
+        artifact_hash: inventory.artifact_hashes[0].clone(),
         language: s::Language::Javascript,
         source_set_id: document.key.source_set_id.clone(),
         revision_id: native.revision.id.clone(),
@@ -2615,7 +2636,10 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     );
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::new(),
-        artifacts: BTreeMap::from([(producer.id.clone(), raw.binary_bytes.clone())]),
+        artifacts: BTreeMap::from([(
+            (producer.id.clone(), inventory.artifact_hashes[0].clone()),
+            raw.binary_bytes.clone(),
+        )]),
         sources: BTreeMap::from([(
             document.key.clone(),
             fs::read(root.path().join(&document.key.path)).unwrap(),
@@ -2642,8 +2666,13 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     let mut other_captured = captured.clone();
     other_captured.producer_executables =
         BTreeMap::from([("other.semantic".into(), b"exe".to_vec())]);
-    other_captured.artifacts =
-        BTreeMap::from([("other.semantic".into(), raw.binary_bytes.clone())]);
+    other_captured.artifacts = BTreeMap::from([(
+        (
+            "other.semantic".into(),
+            inventory.artifact_hashes[0].clone(),
+        ),
+        raw.binary_bytes.clone(),
+    )]);
     other_captured.requested_producers = other.producers.clone();
     let first = store
         .publish_native_semantic(
@@ -2781,7 +2810,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     invented.captured_proof_id = native_ids::digest(
         b"trellis.capture-proof.v1\0",
         &native_ids::canonical(
-            &json!({"producerId":raw.producer_id,"artifactHash":raw.inventory.artifact_hash,"sourceSetId":raw.source_set_id,"sourceRevision":raw.captured_revision,"language":invented.language,"relativePath":invented.envelope.relative_path,"factDigest":invented.fact_digest}),
+            &json!({"producerId":raw.producer_id,"artifactHash":raw.inventory.artifact_hashes[0],"sourceSetId":raw.source_set_id,"sourceRevision":raw.captured_revision,"language":invented.language,"relativePath":invented.envelope.relative_path,"factDigest":invented.fact_digest}),
         ),
     );
     forged.inventory.claims.push(invented);
@@ -2804,7 +2833,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         store
             .semantic_raw_proof_at(
                 &raw.producer_id,
-                &raw.inventory.artifact_hash,
+                &raw.inventory.artifact_hashes[0],
                 &raw.source_set_id,
                 &raw.captured_revision,
                 &claim.captured_proof_id
@@ -2834,7 +2863,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         store
             .semantic_raw_proof_at(
                 &raw.producer_id,
-                &raw.inventory.artifact_hash,
+                &raw.inventory.artifact_hashes[0],
                 &raw.source_set_id,
                 &raw.captured_revision,
                 &claim.captured_proof_id
@@ -2929,7 +2958,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     let stored = store
         .semantic_raw_proof_at(
             &raw.producer_id,
-            &raw.inventory.artifact_hash,
+            &raw.inventory.artifact_hashes[0],
             &raw.source_set_id,
             &raw.captured_revision,
             &claim.captured_proof_id,
@@ -2942,7 +2971,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         store
             .semantic_raw_proof_at(
                 &raw.producer_id,
-                &raw.inventory.artifact_hash,
+                &raw.inventory.artifact_hashes[0],
                 &raw.source_set_id,
                 &raw.captured_revision,
                 "nonexistent"
@@ -3119,7 +3148,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         let stored = store
             .semantic_raw_proof_at(
                 &raw.producer_id,
-                &raw.inventory.artifact_hash,
+                &raw.inventory.artifact_hashes[0],
                 &raw.source_set_id,
                 &raw.captured_revision,
                 &derived.provenance_id,
@@ -3143,7 +3172,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
         store
             .semantic_raw_proof_at(
                 &raw.producer_id,
-                &raw.inventory.artifact_hash,
+                &raw.inventory.artifact_hashes[0],
                 &raw.source_set_id,
                 &raw.captured_revision,
                 &claim.captured_proof_id
@@ -3179,7 +3208,7 @@ fn raw_proof_import_cas_and_selected_read_are_atomic() {
     let direct = store
         .semantic_raw_proof_at(
             &raw.producer_id,
-            &raw.inventory.artifact_hash,
+            &raw.inventory.artifact_hashes[0],
             &raw.source_set_id,
             &raw.captured_revision,
             &claim.captured_proof_id,

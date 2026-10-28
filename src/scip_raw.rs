@@ -14,7 +14,7 @@ use std::io::{BufReader, Read};
 use std::sync::atomic::Ordering;
 
 pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/2";
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Completion {
     Complete,
@@ -148,6 +148,7 @@ pub struct CapturedClaim {
     pub fact_digest: String,
     pub captured_proof_id: String,
     pub language: String,
+    pub artifact_hash: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawProofIdentity {
@@ -156,11 +157,12 @@ pub(crate) struct RawProofIdentity {
     pub(crate) fact_digest: String,
     pub(crate) language: String,
     pub(crate) path: String,
+    pub(crate) artifact_hash: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProofInventory {
-    pub(crate) artifact_hash: String,
+    pub(crate) artifact_hashes: Vec<String>,
     pub(crate) source_manifest_hash: String,
     pub(crate) exclusions: Vec<Exclusion>,
     pub(crate) claims: Vec<RawProofIdentity>,
@@ -205,7 +207,7 @@ impl ProofInventory {
 
 #[derive(Debug, Clone)]
 pub struct CapturedScipInventory {
-    pub artifact_hash: String,
+    pub artifact_hashes: Vec<String>,
     pub decoder_version: String,
     pub source_manifest_hash: String,
     pub completion: Completion,
@@ -215,7 +217,7 @@ pub struct CapturedScipInventory {
 impl CapturedScipInventory {
     pub(crate) fn proof_identities(&self) -> ProofInventory {
         ProofInventory {
-            artifact_hash: self.artifact_hash.clone(),
+            artifact_hashes: self.artifact_hashes.clone(),
             source_manifest_hash: self.source_manifest_hash.clone(),
             exclusions: self.exclusions.clone(),
             claims: self
@@ -227,6 +229,7 @@ impl CapturedScipInventory {
                     fact_digest: claim.fact_digest.clone(),
                     language: claim.language.clone(),
                     path: claim.envelope.relative_path.clone(),
+                    artifact_hash: claim.artifact_hash.clone(),
                 })
                 .collect(),
         }
@@ -824,6 +827,7 @@ fn make_claim(
         fact_digest: fact,
         captured_proof_id: proof,
         language: d.language.clone(),
+        artifact_hash: artifact.artifact_hash.to_owned(),
     }
 }
 
@@ -1221,7 +1225,7 @@ pub(crate) fn decode_authenticated(
         flag,
     )?;
     Ok(CapturedScipInventory {
-        artifact_hash: input.artifact_hash.clone(),
+        artifact_hashes: vec![input.artifact_hash.clone()],
         decoder_version: input.decoder_version.into(),
         source_manifest_hash: input.source_manifest_hash.clone(),
         completion: input.completion,

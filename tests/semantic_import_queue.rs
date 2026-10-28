@@ -2584,7 +2584,7 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
                         producer_id: semantic_producer.id.clone(),
                         producer_version: semantic_producer.version.clone(),
                         producer_hash: semantic_producer.executable_hash.clone(),
-                        artifact_hash: inventory.artifact_hash.clone(),
+                        artifact_hash: inventory.artifact_hashes[0].clone(),
                         language: serde_json::from_value(json!(doc.key.language)).unwrap(),
                         source_set_id: doc.key.source_set_id.clone(),
                         revision_id: native.revision.id.clone(),
@@ -2610,7 +2610,10 @@ fn replacing_one_selected_raw_capture_copies_the_other_producer() {
         .unwrap();
         let captured = semantic::CapturedComponents {
             producer_executables: BTreeMap::new(),
-            artifacts: BTreeMap::from([(producer_id.into(), bytes.clone())]),
+            artifacts: BTreeMap::from([(
+                (producer_id.into(), inventory.artifact_hashes[0].clone()),
+                bytes.clone(),
+            )]),
             sources: sources.clone(),
             captured_revision: native.revision.clone(),
             native_toolchain: toolchain.clone(),

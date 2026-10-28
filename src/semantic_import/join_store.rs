@@ -57,6 +57,7 @@ pub(super) struct ProofRef {
     pub(super) path: String,
     pub(super) record_kind: String,
     pub(super) fact_digest: String,
+    pub(super) artifact_hash: String,
 }
 
 /// Proof-identity lookups over one claim set.

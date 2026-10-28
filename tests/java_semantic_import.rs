@@ -21,6 +21,7 @@ fn java_converted_type_use_must_obey_exact_admitted_encoding() {
         fact_digest: "raw".into(),
         captured_proof_id: "raw".into(),
         language: "java".into(),
+        artifact_hash: "0".repeat(64),
     };
     assert_eq!(
         occurrence_range(&claim, source, 2).unwrap(),

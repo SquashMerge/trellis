@@ -66,11 +66,12 @@ fn case(
                 ),
                 canonical_bytes,
                 language: document.language.clone(),
+                artifact_hash: "0".repeat(64),
             }
         })
         .collect();
     let inventory = CapturedScipInventory {
-        artifact_hash: "0".repeat(64),
+        artifact_hashes: vec!["0".repeat(64)],
         decoder_version: crate::scip_raw::DECODER_VERSION.into(),
         source_manifest_hash: manifest_hash(&native.revision),
         completion: crate::scip_raw::Completion::Complete,
@@ -124,7 +125,7 @@ fn import_and_rejoin_walk_coordinates_and_index_native_records_once_per_snapshot
                                 producer_id: "scip-typescript".into(),
                                 producer_version: "0.0".into(),
                                 producer_hash: "0".repeat(64),
-                                artifact_hash: inventory.artifact_hash.clone(),
+                                artifact_hash: inventory.artifact_hashes[0].clone(),
                                 language: semantic::Language::Javascript,
                                 source_set_id: native.source_set.id.clone(),
                                 revision_id: native.revision.id.clone(),
@@ -403,6 +404,7 @@ fn java_local_method_in_other_document_does_not_make_override_endpoint_ambiguous
             canonical_bytes,
             envelope,
             language: "java".into(),
+            artifact_hash: "0".repeat(64),
         });
     };
     let derived = "scip-java pkg Child#f().";
@@ -442,7 +444,7 @@ fn java_local_method_in_other_document_does_not_make_override_endpoint_ambiguous
         }),
     );
     let inventory = CapturedScipInventory {
-        artifact_hash: "0".repeat(64),
+        artifact_hashes: vec!["0".repeat(64)],
         decoder_version: crate::scip_raw::DECODER_VERSION.into(),
         source_manifest_hash: manifest_hash(&native.revision),
         completion: crate::scip_raw::Completion::Complete,
@@ -518,6 +520,7 @@ fn java_relationship_indexes_visit_each_snapshot_once_and_preserve_method_multip
                 canonical_bytes,
                 envelope,
                 language: "java".into(),
+                artifact_hash: "0".repeat(64),
             });
         };
         for declaration in native
@@ -591,7 +594,7 @@ fn java_relationship_indexes_visit_each_snapshot_once_and_preserve_method_multip
             }
         }
         let inventory = CapturedScipInventory {
-            artifact_hash: "0".repeat(64),
+            artifact_hashes: vec!["0".repeat(64)],
             decoder_version: crate::scip_raw::DECODER_VERSION.into(),
             source_manifest_hash: manifest_hash(&native.revision),
             completion: crate::scip_raw::Completion::Complete,

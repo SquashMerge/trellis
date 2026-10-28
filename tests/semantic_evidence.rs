@@ -300,7 +300,10 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
     };
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([("semantic".into(), b"semantic-exe".to_vec())]),
-        artifacts: BTreeMap::from([("semantic".into(), b"semantic-artifact".to_vec())]),
+        artifacts: BTreeMap::from([(
+            ("semantic".into(), h(b"semantic-artifact")),
+            b"semantic-artifact".to_vec(),
+        )]),
         sources: BTreeMap::from([(document, bytes)]),
         captured_revision: revision,
         native_toolchain,
@@ -633,9 +636,13 @@ fn independent_producers_and_duplicate_fact_partitions() {
     captured
         .producer_executables
         .insert(second.id.clone(), b"semantic-exe".to_vec());
-    captured
-        .artifacts
-        .insert(second.id.clone(), b"semantic-artifact".to_vec());
+    captured.artifacts.insert(
+        (
+            second.id.clone(),
+            native_ids::digest(b"", b"semantic-artifact"),
+        ),
+        b"semantic-artifact".to_vec(),
+    );
     captured.requested_producers.push(second.clone());
     semantic.producers.push(second);
     let mut coverage = semantic.coverage[0].clone();

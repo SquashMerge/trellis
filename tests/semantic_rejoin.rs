@@ -370,7 +370,7 @@ fn basis(
                     producer_id: "scip-typescript".into(),
                     producer_version: "0.0".into(),
                     producer_hash: "0".repeat(64),
-                    artifact_hash: inventory.artifact_hash.clone(),
+                    artifact_hash: inventory.artifact_hashes[0].clone(),
                     language: semantic::Language::Javascript,
                     source_set_id: doc.key.source_set_id.clone(),
                     revision_id: native.revision.id.clone(),

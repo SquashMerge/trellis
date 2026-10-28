@@ -2541,6 +2541,7 @@ impl ProofIdentities for ProofIdentityIndex<'_> {
             path: claim.path.clone(),
             record_kind: claim.record_kind.clone(),
             fact_digest: claim.fact_digest.clone(),
+            artifact_hash: claim.artifact_hash.clone(),
         }))
     }
 
@@ -2930,7 +2931,7 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
             .context("missing immutable captured basis")?;
         ensure!(
             captured_basis.revision_id == captured_native.revision.id
-                && captured_basis.artifact_hash == inventory.artifact_hash
+                && captured_basis.artifact_hash == claim.artifact_hash
                 && captured_basis.source_manifest_hash == inventory.source_manifest_hash
                 && captured_basis.producer_id == producer.id
                 && captured_basis.language
@@ -3346,7 +3347,7 @@ pub(crate) fn rejoin_inventory_with_original_witness(
     }))
 }
 
-fn manifest_hash(revision: &native::Revision) -> String {
+pub(crate) fn manifest_hash(revision: &native::Revision) -> String {
     native_ids::digest(
         b"",
         &native_ids::canonical(&serde_json::json!(

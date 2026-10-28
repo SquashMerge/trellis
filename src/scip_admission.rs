@@ -9,13 +9,15 @@ use crate::{
     native_evidence::captured_revision_header,
     native_ids::canonical,
     scip_raw::{self, AuthenticatedScipDocument, AuthenticatedScipInput},
+    semantic_batch::descriptor::{DescriptorProducer, IdentityKind},
+    semantic_evidence::{self, Language, PositionEncoding, SemanticKind},
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::atomic::Ordering,
+    sync::{OnceLock, atomic::Ordering},
 };
 
 #[derive(Debug, Clone)]
@@ -26,32 +28,14 @@ pub struct TrustedSelection {
 }
 pub struct ReferenceProfileAdmission<'a> {
     input: AuthenticatedScipInput<'a>,
-    producer_hash: String,
+    pinned: PinnedProducer,
 }
 impl ReferenceProfileAdmission<'_> {
     pub fn admitted_encoding(&self) -> u8 {
         self.input.position_encoding
     }
-    pub fn producer(&self) -> crate::semantic_evidence::Producer {
-        let language = match self.input.producer_id.as_str() {
-            "scip-java" => crate::semantic_evidence::Language::Java,
-            "scip-typescript" => crate::semantic_evidence::Language::Javascript,
-            "scip-python" => crate::semantic_evidence::Language::Python,
-            "rust-analyzer" => crate::semantic_evidence::Language::Rust,
-            _ => unreachable!("closed reference profile"),
-        };
-        crate::semantic_evidence::Producer {
-            id: self.input.producer_id.clone(),
-            version: self.input.producer_version.clone(),
-            executable_hash: self.producer_hash.clone(),
-            kind: crate::semantic_evidence::SemanticKind::Semantic,
-            languages: vec![language],
-            position_encoding: match self.input.position_encoding {
-                1 => crate::semantic_evidence::PositionEncoding::Utf8,
-                2 => crate::semantic_evidence::PositionEncoding::Utf16,
-                _ => crate::semantic_evidence::PositionEncoding::UnicodeScalar,
-            },
-        }
+    pub fn producer(&self) -> semantic_evidence::Producer {
+        self.pinned.producer()
     }
 }
 #[derive(Deserialize)]
@@ -135,6 +119,207 @@ struct HardwareProducer {
     #[serde(rename = "positionEncoding")]
     position_encoding: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyntheticProfile {
+    profile_id: String,
+    identity_kind: String,
+    generator: SyntheticGenerator,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyntheticGenerator {
+    name: String,
+    version: String,
+    source_sha256: String,
+    position_encoding: String,
+    languages: Vec<String>,
+}
+
+pub const REFERENCE_TRUST_ORIGIN: &str = "referenceProfile";
+pub const SYNTHETIC_TRUST_ORIGIN: &str = "syntheticProfile";
+
+/// A producer identity fixed by a checked-in profile, never by the descriptor that names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedProducer {
+    pub name: String,
+    pub version: String,
+    pub identity_kind: IdentityKind,
+    /// For `generatorSource` identities this is the SHA-256 of the generator source.
+    pub executable_hash: String,
+    pub position_encoding: u8,
+    pub languages: Vec<String>,
+    pub trust_origin: &'static str,
+    pub profile_id: String,
+}
+
+impl PinnedProducer {
+    pub fn producer(&self) -> semantic_evidence::Producer {
+        semantic_evidence::Producer {
+            id: self.name.clone(),
+            version: self.version.clone(),
+            executable_hash: self.executable_hash.clone(),
+            kind: SemanticKind::Semantic,
+            languages: self
+                .languages
+                .iter()
+                .filter_map(|language| semantic_language(language))
+                .collect(),
+            position_encoding: match self.position_encoding {
+                1 => PositionEncoding::Utf8,
+                2 => PositionEncoding::Utf16,
+                _ => PositionEncoding::UnicodeScalar,
+            },
+        }
+    }
+}
+
+struct Profiles {
+    reference: Vec<PinnedProducer>,
+    synthetic: PinnedProducer,
+}
+
+fn semantic_language(name: &str) -> Option<Language> {
+    match name {
+        "java" => Some(Language::Java),
+        "rust" => Some(Language::Rust),
+        "python" => Some(Language::Python),
+        "javascript" => Some(Language::Javascript),
+        _ => None,
+    }
+}
+
+fn encoding_code(name: &str) -> Option<u8> {
+    match name {
+        "utf8" => Some(1),
+        "utf16" => Some(2),
+        "unicodeScalar" => Some(3),
+        _ => None,
+    }
+}
+
+/// The language of each real reference producer.
+pub fn producer_language(producer_id: &str) -> Option<&'static str> {
+    match producer_id {
+        "scip-java" => Some("java"),
+        "scip-typescript" => Some("javascript"),
+        "scip-python" => Some("python"),
+        "rust-analyzer" => Some("rust"),
+        _ => None,
+    }
+}
+
+/// The language of each producer the witness fast path accepts. `scip-java` is omitted on
+/// purpose: its rejoin has always taken the FULL path, and that behavior is preserved.
+pub fn witness_language(producer_id: &str) -> Option<&'static str> {
+    match producer_id {
+        "scip-java" => None,
+        other => producer_language(other),
+    }
+}
+
+fn profiles() -> Result<&'static Profiles, ScipCaptureError> {
+    static PROFILES: OnceLock<Option<Profiles>> = OnceLock::new();
+    PROFILES
+        .get_or_init(load_profiles)
+        .as_ref()
+        .ok_or_else(|| admission("checked-in producer profile"))
+}
+
+fn load_profiles() -> Option<Profiles> {
+    let hardware: Hardware = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+    ))
+    .ok()?;
+    let synthetic: SyntheticProfile = serde_json::from_str(include_str!(
+        "../docs/semantic-evidence/synthetic-profiles/trellis-synthetic-scip-v1.json"
+    ))
+    .ok()?;
+    let reference = hardware
+        .semantic_producers
+        .iter()
+        .filter_map(|producer| {
+            let language = producer_language(&producer.name)?;
+            Some(PinnedProducer {
+                name: producer.name.clone(),
+                version: producer.version.clone(),
+                identity_kind: IdentityKind::Executable,
+                executable_hash: producer.executable_hash.clone(),
+                position_encoding: encoding_code(producer.position_encoding.as_deref()?)?,
+                languages: vec![language.into()],
+                trust_origin: REFERENCE_TRUST_ORIGIN,
+                profile_id: hardware.profile_id.clone(),
+            })
+            .filter(|pinned| hexhash(&pinned.executable_hash))
+        })
+        .collect();
+    let generator = synthetic.generator;
+    if synthetic.identity_kind != "generatorSource"
+        || !hexhash(&generator.source_sha256)
+        || generator
+            .languages
+            .iter()
+            .any(|language| semantic_language(language).is_none())
+    {
+        return None;
+    }
+    Some(Profiles {
+        reference,
+        synthetic: PinnedProducer {
+            name: generator.name,
+            version: generator.version,
+            identity_kind: IdentityKind::GeneratorSource,
+            executable_hash: generator.source_sha256,
+            position_encoding: encoding_code(&generator.position_encoding)?,
+            languages: generator.languages,
+            trust_origin: SYNTHETIC_TRUST_ORIGIN,
+            profile_id: synthetic.profile_id,
+        },
+    })
+}
+
+/// The pin for a producer id, as the store re-derives it from stored rows.
+pub fn pinned_producer_by_id(producer_id: &str) -> Option<PinnedProducer> {
+    let profiles = profiles().ok()?;
+    if profiles.synthetic.name == producer_id {
+        return Some(profiles.synthetic.clone());
+    }
+    profiles
+        .reference
+        .iter()
+        .find(|pinned| pinned.name == producer_id)
+        .cloned()
+}
+
+/// The checked-in pin that a declared producer must equal in every field.
+pub fn pinned_producer(
+    trust_origin: &str,
+    profile_id: &str,
+    declared: &DescriptorProducer,
+) -> Result<PinnedProducer, ScipCaptureError> {
+    let profiles = profiles()?;
+    let pinned = match trust_origin {
+        REFERENCE_TRUST_ORIGIN => profiles
+            .reference
+            .iter()
+            .find(|pinned| pinned.name == declared.name)
+            .ok_or_else(|| admission("producer not pinned"))?,
+        SYNTHETIC_TRUST_ORIGIN => &profiles.synthetic,
+        _ => return Err(admission("producer profile pin")),
+    };
+    if pinned.profile_id != profile_id
+        || pinned.name != declared.name
+        || pinned.version != declared.version
+        || pinned.identity_kind != declared.identity_kind
+        || pinned.executable_hash != declared.executable_hash
+        || pinned.position_encoding != declared.position_encoding
+        || pinned.languages != declared.languages
+    {
+        return Err(admission("producer profile pin"));
+    }
+    Ok(pinned.clone())
+}
+
 fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ScipCaptureError> {
     serde_json::from_slice(bytes).map_err(|_| admission("closed manifest"))
 }
@@ -148,15 +333,15 @@ pub(crate) fn validate_closed_manifest(bytes: &[u8]) -> Result<(), ScipCaptureEr
     parse_manifest(bytes).map(|_| ())
 }
 
-fn admission(s: &str) -> ScipCaptureError {
+pub(crate) fn admission(s: &str) -> ScipCaptureError {
     ScipCaptureError::InvalidAdmission(s.into())
 }
-fn hexhash(s: &str) -> bool {
+pub(crate) fn hexhash(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn path(s: &str) -> bool {
+pub(crate) fn path(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('/')
         && !s.contains(['\\', '\0'])
@@ -188,7 +373,7 @@ fn relative(root: &Path, p: &Path) -> Result<String, ScipCaptureError> {
     }
     Ok(r.into())
 }
-fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
+pub(crate) fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
     let s = root
         .to_str()
         .filter(|s| s.starts_with('/'))
@@ -203,7 +388,7 @@ fn file_uri(root: &Path) -> Result<String, ScipCaptureError> {
     }
     Ok(out)
 }
-fn order(language: &str) -> usize {
+pub(crate) fn order(language: &str) -> usize {
     match language {
         "java" => 0,
         "rust" => 1,
@@ -334,36 +519,20 @@ impl<'a> ReferenceProfileAdmission<'a> {
         {
             return Err(admission("manifest identity"));
         }
-        let profile: Hardware = serde_json::from_str(include_str!(
-            "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-        ))
-        .map_err(|_| admission("checked-in producer profile"))?;
-        let language = match selection.producer_name.as_str() {
-            "scip-java" => "java",
-            "scip-typescript" => "javascript",
-            "scip-python" => "python",
-            "rust-analyzer" => "rust",
-            _ => return Err(admission("unsupported producer")),
-        };
-        let pinned = profile
-            .semantic_producers
-            .iter()
-            .find(|p| p.name == selection.producer_name)
-            .ok_or_else(|| admission("producer not pinned"))?;
-        let encoding = match pinned.position_encoding.as_deref() {
-            Some("utf8") => 1,
-            Some("utf16") => 2,
-            Some("unicodeScalar") => 3,
-            _ => return Err(admission("producer position encoding")),
-        };
-        if profile.profile_id != selection.profile_id
-            || manifest.producer.version != pinned.version
-            || manifest.producer.executable_hash != pinned.executable_hash
-            || !hexhash(&pinned.executable_hash)
-            || manifest.producer.position_encoding != encoding
-        {
-            return Err(admission("producer profile pin"));
-        }
+        let language = producer_language(&selection.producer_name)
+            .ok_or_else(|| admission("unsupported producer"))?;
+        let pinned = pinned_producer(
+            REFERENCE_TRUST_ORIGIN,
+            &selection.profile_id,
+            &DescriptorProducer {
+                name: manifest.producer.name.clone(),
+                version: manifest.producer.version.clone(),
+                identity_kind: IdentityKind::Executable,
+                executable_hash: manifest.producer.executable_hash.clone(),
+                position_encoding: manifest.producer.position_encoding,
+                languages: vec![language.into()],
+            },
+        )?;
         if source_set.id != revision.source_set_id
             || manifest.source_set.id != source_set.id
             || manifest.source_set.root_id != source_set.root_id
@@ -520,12 +689,11 @@ impl<'a> ReferenceProfileAdmission<'a> {
             return Err(ScipCaptureError::Cancelled);
         }
         Ok(Self {
-            producer_hash: pinned.executable_hash.clone(),
             input: AuthenticatedScipInput {
                 artifact_bytes,
                 artifact_hash: artifact.hash.clone(),
                 producer_id: pinned.name.clone(),
-                profile_id: profile.profile_id,
+                profile_id: pinned.profile_id.clone(),
                 source_set_id: source_set.id.clone(),
                 source_revision: revision.id.clone(),
                 source_manifest_hash: manifest.source_manifest_hash,
@@ -534,11 +702,12 @@ impl<'a> ReferenceProfileAdmission<'a> {
                 exclusions: manifest.exclusions,
                 project_root_uri: uri,
                 producer_version: pinned.version.clone(),
-                position_encoding: encoding,
+                position_encoding: pinned.position_encoding,
                 protocol_version: 0,
                 text_document_encoding: 1,
                 documents: docs,
             },
+            pinned,
         })
     }
 }
@@ -659,8 +828,8 @@ mod tests {
         let inventory = decode_reference_profile(&admitted, &cancel).unwrap();
         assert_eq!(inventory.claims.len(), 2);
         assert_eq!(
-            inventory.artifact_hash,
-            scip_raw::sha(&hex::decode(WIRE).unwrap())
+            inventory.artifact_hashes,
+            [scip_raw::sha(&hex::decode(WIRE).unwrap())]
         );
         let mut wrong = selection.clone();
         wrong.expected_manifest_hash = "0".repeat(64);
@@ -867,5 +1036,170 @@ mod tests {
         assert!(
             matches!(raw.admit(&capture, &selection, &cancel), Err(ScipCaptureError::InvalidAdmission(message)) if message == "symlinked selected role")
         );
+    }
+    fn declared(pinned: &PinnedProducer) -> DescriptorProducer {
+        DescriptorProducer {
+            name: pinned.name.clone(),
+            version: pinned.version.clone(),
+            identity_kind: pinned.identity_kind,
+            executable_hash: pinned.executable_hash.clone(),
+            position_encoding: pinned.position_encoding,
+            languages: pinned.languages.clone(),
+        }
+    }
+    #[test]
+    fn synthetic_profile_pins_generator_identity() {
+        let synthetic = pinned_producer_by_id("trellis-synthetic-scip").unwrap();
+        let profile: Value = serde_json::from_str(include_str!(
+            "../docs/semantic-evidence/synthetic-profiles/trellis-synthetic-scip-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(synthetic.identity_kind, IdentityKind::GeneratorSource);
+        assert_eq!(synthetic.trust_origin, "syntheticProfile");
+        assert_eq!(synthetic.profile_id, "trellis-synthetic-scip-v1");
+        assert_eq!(synthetic.version, "1");
+        assert_eq!(synthetic.position_encoding, 1);
+        assert_eq!(
+            synthetic.languages,
+            ["java", "rust", "python", "javascript"]
+        );
+        assert_eq!(
+            synthetic.executable_hash,
+            profile["generator"]["sourceSha256"].as_str().unwrap()
+        );
+        assert_eq!(
+            synthetic.executable_hash,
+            scip_raw::sha(include_bytes!(
+                "../tools/semantic-contract/generate-performance-scip.py"
+            ))
+        );
+        let producer = synthetic.producer();
+        assert_eq!(producer.id, "trellis-synthetic-scip");
+        assert_eq!(producer.executable_hash, synthetic.executable_hash);
+        assert_eq!(producer.languages.len(), 4);
+        assert_eq!(producer.position_encoding, PositionEncoding::Utf8);
+        assert_eq!(
+            pinned_producer(
+                "syntheticProfile",
+                &synthetic.profile_id,
+                &declared(&synthetic)
+            )
+            .unwrap(),
+            synthetic
+        );
+    }
+    #[test]
+    fn reference_profile_producers_are_unchanged() {
+        let profile: Hardware = serde_json::from_str(include_str!(
+            "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+        ))
+        .unwrap();
+        for (id, language, semantic_language) in [
+            ("scip-java", "java", Language::Java),
+            ("scip-typescript", "javascript", Language::Javascript),
+            ("scip-python", "python", Language::Python),
+            ("rust-analyzer", "rust", Language::Rust),
+        ] {
+            let row = profile
+                .semantic_producers
+                .iter()
+                .find(|p| p.name == id)
+                .unwrap();
+            let pinned = pinned_producer_by_id(id).unwrap();
+            let encoding = match row.position_encoding.as_deref().unwrap() {
+                "utf8" => (1, PositionEncoding::Utf8),
+                "utf16" => (2, PositionEncoding::Utf16),
+                _ => (3, PositionEncoding::UnicodeScalar),
+            };
+            assert_eq!(producer_language(id), Some(language));
+            assert_eq!(pinned.identity_kind, IdentityKind::Executable);
+            assert_eq!(pinned.trust_origin, "referenceProfile");
+            assert_eq!(pinned.profile_id, profile.profile_id);
+            assert_eq!(pinned.position_encoding, encoding.0);
+            assert_eq!(pinned.languages, [language]);
+            assert_eq!(
+                pinned.producer(),
+                semantic_evidence::Producer {
+                    id: id.into(),
+                    version: row.version.clone(),
+                    executable_hash: row.executable_hash.clone(),
+                    kind: SemanticKind::Semantic,
+                    languages: vec![semantic_language],
+                    position_encoding: encoding.1,
+                }
+            );
+            assert_eq!(
+                pinned_producer("referenceProfile", &profile.profile_id, &declared(&pinned))
+                    .unwrap(),
+                pinned
+            );
+        }
+        assert_eq!(pinned_producer_by_id("scip-unknown"), None);
+        assert_eq!(producer_language("scip-unknown"), None);
+    }
+    #[test]
+    fn synthetic_and_reference_identities_cannot_be_crossed() {
+        let synthetic = pinned_producer_by_id("trellis-synthetic-scip").unwrap();
+        let reference = pinned_producer_by_id("rust-analyzer").unwrap();
+        let pin = |origin: &str, profile: &str, producer: &DescriptorProducer| match pinned_producer(
+            origin, profile, producer,
+        ) {
+            Err(ScipCaptureError::InvalidAdmission(detail)) => detail,
+            other => panic!("expected an admission error, got {other:?}"),
+        };
+        assert_eq!(
+            pin(
+                "referenceProfile",
+                &synthetic.profile_id,
+                &declared(&synthetic)
+            ),
+            "producer not pinned"
+        );
+        assert_eq!(
+            pin(
+                "syntheticProfile",
+                &reference.profile_id,
+                &declared(&synthetic)
+            ),
+            "producer profile pin"
+        );
+        assert_eq!(
+            pin(
+                "syntheticProfile",
+                &synthetic.profile_id,
+                &declared(&reference)
+            ),
+            "producer profile pin"
+        );
+        let mut kind = declared(&synthetic);
+        kind.identity_kind = IdentityKind::Executable;
+        assert_eq!(
+            pin("syntheticProfile", &synthetic.profile_id, &kind),
+            "producer profile pin"
+        );
+        let mut kind = declared(&reference);
+        kind.identity_kind = IdentityKind::GeneratorSource;
+        assert_eq!(
+            pin("referenceProfile", &reference.profile_id, &kind),
+            "producer profile pin"
+        );
+        let mut languages = declared(&synthetic);
+        languages.languages.reverse();
+        assert_eq!(
+            pin("syntheticProfile", &synthetic.profile_id, &languages),
+            "producer profile pin"
+        );
+        assert_eq!(
+            pin("localProfile", &reference.profile_id, &declared(&reference)),
+            "producer profile pin"
+        );
+    }
+    #[test]
+    fn witness_language_keeps_the_fast_path_closure() {
+        assert_eq!(witness_language("scip-typescript"), Some("javascript"));
+        assert_eq!(witness_language("scip-python"), Some("python"));
+        assert_eq!(witness_language("rust-analyzer"), Some("rust"));
+        assert_eq!(witness_language("scip-java"), None);
+        assert_eq!(witness_language("trellis-synthetic-scip"), None);
     }
 }

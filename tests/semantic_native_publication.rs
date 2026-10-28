@@ -843,7 +843,7 @@ fn selected_case(change_b: &str) {
                         producer_id: producer.id.clone(),
                         producer_version: producer.version.clone(),
                         producer_hash: producer.executable_hash.clone(),
-                        artifact_hash: inventory.artifact_hash.clone(),
+                        artifact_hash: inventory.artifact_hashes[0].clone(),
                         language: semantic::Language::Javascript,
                         source_set_id: doc.key.source_set_id.clone(),
                         revision_id: r1.revision.id.clone(),
@@ -869,7 +869,10 @@ fn selected_case(change_b: &str) {
         .unwrap();
         let captured = semantic::CapturedComponents {
             producer_executables: BTreeMap::new(),
-            artifacts: BTreeMap::from([(producer.id.clone(), binary_bytes.clone())]),
+            artifacts: BTreeMap::from([(
+                (producer.id.clone(), inventory.artifact_hashes[0].clone()),
+                binary_bytes.clone(),
+            )]),
             sources,
             captured_revision: r1.revision.clone(),
             native_toolchain: toolchain.clone(),

@@ -311,7 +311,7 @@ fn duplicate_and_conflicting_authenticated_claims_preserve_raw_proofs() {
     other.captured_proof_id = native_ids::digest(
         b"trellis.capture-proof.v1\0",
         &native_ids::canonical(&json!({
-        "producerId":"scip-typescript","artifactHash":inventory.artifact_hash,"sourceSetId":native.source_set.id,
+        "producerId":"scip-typescript","artifactHash":inventory.artifact_hashes[0],"sourceSetId":native.source_set.id,
         "sourceRevision":native.revision.id,"language":other.language,"relativePath":other.envelope.relative_path,
         "factDigest":other.fact_digest})),
     );

@@ -229,6 +229,7 @@ impl ProofIdentities for MemoryJoinStore<'_> {
             path: claim.envelope.relative_path.clone(),
             record_kind: claim.envelope.record_kind.clone(),
             fact_digest: claim.fact_digest.clone(),
+            artifact_hash: claim.artifact_hash.clone(),
         }))
     }
 

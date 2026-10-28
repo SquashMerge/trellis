@@ -5420,7 +5420,7 @@ pub(crate) struct AttestedProfileProducer {
     version: String,
     executable_hash: String,
     position_encoding: crate::semantic_evidence::PositionEncoding,
-    language: crate::semantic_evidence::Language,
+    languages: Vec<crate::semantic_evidence::Language>,
 }
 
 impl AttestedProfileProducer {
@@ -5430,7 +5430,7 @@ impl AttestedProfileProducer {
             && producer.executable_hash == self.executable_hash
             && producer.position_encoding == self.position_encoding
             && producer.kind == crate::semantic_evidence::SemanticKind::Semantic
-            && producer.languages == [self.language]
+            && producer.languages == self.languages
     }
 }
 
@@ -5474,26 +5474,12 @@ fn authenticate_import_raw(
         .context("invalid closed raw manifest")?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&raw.manifest_bytes).context("invalid raw manifest")?;
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))?;
-    let pinned = profile["semanticProducers"]
-        .as_array()
-        .and_then(|rows| rows.iter().find(|p| p["name"] == raw.producer_id))
+    let pinned = crate::scip_admission::pinned_producer_by_id(&raw.producer_id)
+        .filter(|pinned| pinned.trust_origin == crate::scip_admission::REFERENCE_TRUST_ORIGIN)
         .context("raw producer not pinned")?;
-    let encoding = match pinned["positionEncoding"].as_str() {
-        Some("utf8") => 1,
-        Some("utf16") => 2,
-        Some("unicodeScalar") => 3,
-        _ => anyhow::bail!("raw producer encoding not pinned"),
-    };
-    let language = match raw.producer_id.as_str() {
-        "scip-java" => "java",
-        "scip-typescript" => "javascript",
-        "scip-python" => "python",
-        "rust-analyzer" => "rust",
-        _ => anyhow::bail!("raw producer not supported"),
-    };
+    let encoding = pinned.position_encoding;
+    let language = crate::scip_admission::producer_language(&raw.producer_id)
+        .context("raw producer not supported")?;
     let source_docs: Vec<_> = r1
         .revision
         .documents
@@ -5567,8 +5553,8 @@ fn authenticate_import_raw(
     ensure!(manifest["formatVersion"] == 1
         && manifest["trustOrigin"] == "referenceProfile"
         && manifest["decoderVersion"] == scip_raw::DECODER_VERSION
-        && manifest["profileId"] == profile["profileId"]
-        && manifest["producer"] == serde_json::json!({"name":pinned["name"],"version":pinned["version"],"executableHash":pinned["executableHash"],"positionEncoding":encoding})
+        && manifest["profileId"] == pinned.profile_id
+        && manifest["producer"] == serde_json::json!({"name":pinned.name,"version":pinned.version,"executableHash":pinned.executable_hash,"positionEncoding":encoding})
         && manifest["sourceSet"] == serde_json::to_value(&r1.source_set)?
         && manifest["sourceRevision"] == r1.revision.id
         && manifest["sourceManifestHash"] == raw.inventory.source_manifest_hash
@@ -5585,7 +5571,7 @@ fn authenticate_import_raw(
         && serde_json::from_value::<scip_raw::Completion>(manifest["completion"].clone())? == raw.inventory.completion,
         "raw original manifest does not bind captured revision and producer");
     ensure!(
-        raw.producer_id == pinned["name"]
+        raw.producer_id == pinned.name
             && raw.source_set_id == r1.source_set.id
             && raw.captured_revision == r1.revision.id
             && captured.captured_revision == r1.revision
@@ -5599,10 +5585,7 @@ fn authenticate_import_raw(
             artifact_bytes: &raw.binary_bytes,
             artifact_hash,
             producer_id: raw.producer_id.clone(),
-            profile_id: profile["profileId"]
-                .as_str()
-                .context("profile id")?
-                .to_owned(),
+            profile_id: pinned.profile_id.clone(),
             source_set_id: raw.source_set_id.clone(),
             source_revision: raw.captured_revision.clone(),
             source_manifest_hash: raw.inventory.source_manifest_hash.clone(),
@@ -5610,10 +5593,7 @@ fn authenticate_import_raw(
             completion: raw.inventory.completion,
             exclusions: raw.inventory.exclusions.clone(),
             project_root_uri: uri,
-            producer_version: pinned["version"]
-                .as_str()
-                .context("producer version")?
-                .to_owned(),
+            producer_version: pinned.version.clone(),
             position_encoding: encoding,
             protocol_version: 0,
             text_document_encoding: 1,
@@ -5623,7 +5603,7 @@ fn authenticate_import_raw(
     )
     .context("raw original binary admission")?;
     ensure!(
-        admitted.artifact_hash == raw.inventory.artifact_hash
+        admitted.artifact_hashes == raw.inventory.artifact_hashes
             && admitted.decoder_version == raw.inventory.decoder_version
             && admitted.source_manifest_hash == raw.inventory.source_manifest_hash
             && admitted.completion == raw.inventory.completion
@@ -5637,22 +5617,13 @@ fn authenticate_import_raw(
             },
         "raw inventory differs from authenticated binary"
     );
+    let attested = pinned.producer();
     Ok(AttestedProfileProducer {
         id: raw.producer_id.clone(),
-        version: pinned["version"]
-            .as_str()
-            .context("producer version")?
-            .to_owned(),
-        executable_hash: pinned["executableHash"]
-            .as_str()
-            .context("producer executable hash")?
-            .to_owned(),
-        position_encoding: serde_json::from_value(serde_json::json!(match encoding {
-            1 => "utf8",
-            2 => "utf16",
-            _ => "unicodeScalar",
-        }))?,
-        language: serde_json::from_value(serde_json::json!(language))?,
+        version: attested.version,
+        executable_hash: attested.executable_hash,
+        position_encoding: attested.position_encoding,
+        languages: attested.languages,
     })
 }
 
@@ -5666,12 +5637,13 @@ fn write_raw_capture(
         raw.binary_bytes.len() <= 64 * 1024 * 1024 && raw.manifest_bytes.len() <= 1024 * 1024,
         "raw capture exceeds admission bounds"
     );
+    let artifact_hash = digest(b"", &raw.binary_bytes);
     ensure!(
-        raw.inventory.artifact_hash == digest(b"", &raw.binary_bytes),
+        raw.inventory.artifact_hashes == [artifact_hash.clone()],
         "raw binary digest mismatch"
     );
-    db.execute("INSERT OR IGNORE INTO semantic_raw_captures(producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,manifest_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![raw.producer_id,raw.inventory.artifact_hash,raw.source_set_id,raw.captured_revision,raw.binary_bytes,raw.manifest_bytes,raw.inventory.decoder_version])?;
-    let (id, binary, manifest, decoder): (i64, Vec<u8>, Vec<u8>, String) = db.query_row("SELECT capture_id,binary_bytes,manifest_bytes,decoder_version FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![raw.producer_id,raw.inventory.artifact_hash,raw.source_set_id,raw.captured_revision], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    db.execute("INSERT OR IGNORE INTO semantic_raw_captures(producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,manifest_bytes,decoder_version) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![raw.producer_id,artifact_hash,raw.source_set_id,raw.captured_revision,raw.binary_bytes,raw.manifest_bytes,raw.inventory.decoder_version])?;
+    let (id, binary, manifest, decoder): (i64, Vec<u8>, Vec<u8>, String) = db.query_row("SELECT capture_id,binary_bytes,manifest_bytes,decoder_version FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![raw.producer_id,artifact_hash,raw.source_set_id,raw.captured_revision], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     ensure!(
         binary == raw.binary_bytes
             && manifest == raw.manifest_bytes
@@ -5735,6 +5707,7 @@ fn write_raw_capture(
         let kind = &claim.envelope.record_kind;
         ensure!(
             ["occurrence", "symbolInformation", "relationship"].contains(&kind.as_str())
+                && claim.artifact_hash == artifact_hash
                 && !claim.envelope.relative_path.is_empty()
                 && claim.fact_digest
                     == digest(b"trellis.semantic-fact.v1\0", &claim.canonical_bytes),
@@ -5743,7 +5716,7 @@ fn write_raw_capture(
         let proof = digest(
             b"trellis.capture-proof.v1\0",
             &canonical(
-                &serde_json::json!({"producerId":raw.producer_id,"artifactHash":raw.inventory.artifact_hash,"sourceSetId":raw.source_set_id,"sourceRevision":raw.captured_revision,"language":claim.language,"relativePath":claim.envelope.relative_path,"factDigest":claim.fact_digest}),
+                &serde_json::json!({"producerId":raw.producer_id,"artifactHash":artifact_hash,"sourceSetId":raw.source_set_id,"sourceRevision":raw.captured_revision,"language":claim.language,"relativePath":claim.envelope.relative_path,"factDigest":claim.fact_digest}),
             ),
         );
         ensure!(
@@ -7142,21 +7115,12 @@ fn attest_selected_profile_fast(
 ) -> Result<Option<AttestedProfileProducer>> {
     use crate::native_ids::{canonical, digest};
     let manifest: serde_json::Value = serde_json::from_slice(&raw.manifest_bytes)?;
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))?;
-    let Some(pinned) = profile["semanticProducers"]
-        .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["name"] == raw.producer_id))
+    let Some(pinned) = crate::scip_admission::pinned_producer_by_id(&raw.producer_id)
+        .filter(|pinned| pinned.trust_origin == crate::scip_admission::REFERENCE_TRUST_ORIGIN)
     else {
         return Ok(None);
     };
-    let Some(language) = (match raw.producer_id.as_str() {
-        "scip-typescript" => Some("javascript"),
-        "scip-python" => Some("python"),
-        "rust-analyzer" => Some("rust"),
-        _ => None,
-    }) else {
+    let Some(language) = crate::scip_admission::witness_language(&raw.producer_id) else {
         return Ok(None);
     };
     let encoding = match producer.position_encoding {
@@ -7175,8 +7139,8 @@ fn attest_selected_profile_fast(
         || manifest["trustOrigin"] != "referenceProfile"
         || manifest["decoderVersion"] != crate::scip_raw::DECODER_VERSION
         || raw.decoder_version != crate::scip_raw::DECODER_VERSION
-        || manifest["profileId"] != profile["profileId"]
-        || manifest["producer"] != serde_json::json!({"name":pinned["name"],"version":pinned["version"],"executableHash":pinned["executableHash"],"positionEncoding":encoding})
+        || manifest["profileId"] != pinned.profile_id
+        || manifest["producer"] != serde_json::json!({"name":pinned.name,"version":pinned.version,"executableHash":pinned.executable_hash,"positionEncoding":encoding})
         || manifest["sourceSet"] != serde_json::to_value(&original.source_set)?
         || manifest["sourceRevision"] != original.revision.id
         || manifest["sourceManifestHash"] != inventory.source_manifest_hash
@@ -7195,16 +7159,10 @@ fn attest_selected_profile_fast(
     { return Ok(None); }
     let attested = AttestedProfileProducer {
         id: raw.producer_id.clone(),
-        version: pinned["version"]
-            .as_str()
-            .context("profile version")?
-            .to_owned(),
-        executable_hash: pinned["executableHash"]
-            .as_str()
-            .context("profile executable hash")?
-            .to_owned(),
+        version: pinned.version.clone(),
+        executable_hash: pinned.executable_hash.clone(),
         position_encoding: producer.position_encoding,
-        language: serde_json::from_value(serde_json::json!(language))?,
+        languages: serde_json::from_value(serde_json::json!([language]))?,
     };
     Ok(attested.matches(producer).then_some(attested))
 }
@@ -7864,7 +7822,7 @@ fn try_original_witness_rejoin(
                     producer_id: producer.id.clone(),
                     producer_version: producer.version.clone(),
                     producer_hash: producer.executable_hash.clone(),
-                    artifact_hash: inventory.artifact_hash.clone(),
+                    artifact_hash: raw.artifact_hash.clone(),
                     language,
                     source_set_id: doc.key.source_set_id.clone(),
                     revision_id: original_native.revision.id.clone(),
@@ -7937,7 +7895,10 @@ fn try_original_witness_rejoin(
     };
     let captured = sem::CapturedComponents {
         producer_executables: BTreeMap::new(),
-        artifacts: BTreeMap::from([(raw.producer_id.clone(), raw.binary_bytes.clone())]),
+        artifacts: BTreeMap::from([(
+            (raw.producer_id.clone(), raw.artifact_hash.clone()),
+            raw.binary_bytes.clone(),
+        )]),
         sources: original_sources
             .iter()
             .filter(|(doc, _)| !reusable.contains(*doc))
@@ -8027,7 +7988,7 @@ fn decoded_selected_inventory(
     manifest: &serde_json::Value,
 ) -> Result<crate::scip_raw::CapturedScipInventory> {
     Ok(crate::scip_raw::CapturedScipInventory {
-        artifact_hash: raw.artifact_hash.clone(),
+        artifact_hashes: vec![raw.artifact_hash.clone()],
         decoder_version: raw.decoder_version.clone(),
         source_manifest_hash: manifest["sourceManifestHash"]
             .as_str()
@@ -8071,6 +8032,7 @@ fn decoded_selected_inventory(
                     fact_digest: proof.fact_digest.clone(),
                     captured_proof_id: id.clone(),
                     language: proof.language.clone(),
+                    artifact_hash: raw.artifact_hash.clone(),
                 })
             })
             .collect::<Result<_>>()?,
@@ -8302,7 +8264,7 @@ fn selected_native_rejoin_once(
                 .map_err(|error| anyhow::anyhow!("{error:#}"))?;
             let manifest: serde_json::Value = serde_json::from_slice(&raw.manifest_bytes)?;
             let metadata_inventory = crate::scip_raw::ProofInventory {
-                artifact_hash: raw.artifact_hash.clone(),
+                artifact_hashes: vec![raw.artifact_hash.clone()],
                 source_manifest_hash: manifest["sourceManifestHash"]
                     .as_str()
                     .context("raw source manifest hash")?
@@ -8397,7 +8359,7 @@ fn selected_native_rejoin_once(
                     let full_captured = sem::CapturedComponents {
                         producer_executables: BTreeMap::new(),
                         artifacts: BTreeMap::from([(
-                            full_raw.producer_id.clone(),
+                            (full_raw.producer_id.clone(), full_raw.artifact_hash.clone()),
                             full_raw.binary_bytes.clone(),
                         )]),
                         sources: full_sources.clone(),
@@ -8442,7 +8404,7 @@ fn selected_native_rejoin_once(
                                     producer_id: input.producer.id.clone(),
                                     producer_version: input.producer.version.clone(),
                                     producer_hash: input.producer.executable_hash.clone(),
-                                    artifact_hash: full_inventory.artifact_hash.clone(),
+                                    artifact_hash: full_raw.artifact_hash.clone(),
                                     language,
                                     source_set_id: doc.key.source_set_id.clone(),
                                     revision_id: full_r1.revision.id.clone(),
@@ -8495,7 +8457,10 @@ fn selected_native_rejoin_once(
                 .context("missing shared native destination")?;
             let captured = sem::CapturedComponents {
                 producer_executables: BTreeMap::new(),
-                artifacts: BTreeMap::from([(raw.producer_id.clone(), raw.binary_bytes.clone())]),
+                artifacts: BTreeMap::from([(
+                    (raw.producer_id.clone(), raw.artifact_hash.clone()),
+                    raw.binary_bytes.clone(),
+                )]),
                 sources: r1_sources.clone(),
                 captured_revision: r1.revision.clone(),
                 native_toolchain: toolchain.clone(),
@@ -8543,7 +8508,7 @@ fn selected_native_rejoin_once(
                             producer_id: input.producer.id.clone(),
                             producer_version: input.producer.version.clone(),
                             producer_hash: input.producer.executable_hash.clone(),
-                            artifact_hash: inventory.artifact_hash.clone(),
+                            artifact_hash: raw.artifact_hash.clone(),
                             language,
                             source_set_id: doc.key.source_set_id.clone(),
                             revision_id: r1.revision.id.clone(),
@@ -14209,7 +14174,10 @@ impl Store {
                 && captured.requested_producers.len() == 1
                 && attested.matches(&captured.requested_producers[0])
                 && captured.artifacts.len() == 1
-                && captured.artifacts.get(&raw.producer_id) == Some(&raw.binary_bytes)
+                && captured.artifacts.get(&(
+                    raw.producer_id.clone(),
+                    crate::native_ids::digest(b"", &raw.binary_bytes)
+                )) == Some(&raw.binary_bytes)
                 && captured.producer_executables.is_empty(),
             "authenticated semantic producer identity differs"
         );
@@ -18125,10 +18093,10 @@ impl Store {
                     other => other,
                 };
                 let proof_identities = if let (Some(_),Ok(input)) = (loaded_docs,&raw) {
-                    db.prepare("SELECT proof_id,record_kind,fact_digest,language,path FROM semantic_raw_proofs WHERE capture_id=?1 ORDER BY proof_id")?
+                    db.prepare("SELECT p.proof_id,p.record_kind,p.fact_digest,p.language,p.path,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE p.capture_id=?1 ORDER BY p.proof_id")?
                         .query_map([input.capture_id],|r|Ok(crate::scip_raw::RawProofIdentity {
                             proof_id:r.get(0)?,record_kind:r.get(1)?,fact_digest:r.get(2)?,
-                            language:r.get(3)?,path:r.get(4)?
+                            language:r.get(3)?,path:r.get(4)?,artifact_hash:r.get(5)?
                         }))?.collect::<rusqlite::Result<Vec<_>>>()?
                 } else {Vec::new()};
                 let captured = match &raw {

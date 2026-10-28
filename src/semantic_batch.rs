@@ -1,8 +1,11 @@
 //! Bounded streamed semantic batch import: resource policy and the high-water counters that prove it.
+pub mod descriptor;
 pub mod limits;
 
 pub use limits::BatchLimits;
 
+#[cfg(test)]
+mod descriptor_tests;
 #[cfg(test)]
 mod limits_tests;
 

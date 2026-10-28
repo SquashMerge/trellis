@@ -258,7 +258,10 @@ fn evidence_for(
     };
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([(producer.id.clone(), b"exe".to_vec())]),
-        artifacts: BTreeMap::from([(producer.id.clone(), b"artifact".to_vec())]),
+        artifacts: BTreeMap::from([(
+            (producer.id.clone(), native_ids::digest(b"", b"artifact")),
+            b"artifact".to_vec(),
+        )]),
         sources: native
             .revision
             .documents
@@ -835,9 +838,10 @@ fn streamed_new_native_revision_omits_old_facts_and_keeps_producers_separate() {
     captured
         .producer_executables
         .insert(other.id.clone(), b"exe".to_vec());
-    captured
-        .artifacts
-        .insert(other.id.clone(), b"artifact".to_vec());
+    captured.artifacts.insert(
+        (other.id.clone(), native_ids::digest(b"", b"artifact")),
+        b"artifact".to_vec(),
+    );
     captured.requested_producers.push(other);
     let leader = store.publication_for_tests().unwrap();
     let first = store
@@ -1037,7 +1041,10 @@ fn explicit_producer_without_applicable_documents_survives_pins_and_supplied_ref
         proof.basis.as_mut().unwrap().producer_id = "semantic.rust".into();
     }
     components.producer_executables = BTreeMap::from([("semantic.rust".into(), b"exe".to_vec())]);
-    components.artifacts = BTreeMap::from([("semantic.rust".into(), b"artifact".to_vec())]);
+    components.artifacts = BTreeMap::from([(
+        ("semantic.rust".into(), native_ids::digest(b"", b"artifact")),
+        b"artifact".to_vec(),
+    )]);
     components.requested_producers = refreshed.producers.clone();
     let third = store
         .publish_native_semantic(

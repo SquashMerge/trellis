@@ -1671,6 +1671,11 @@ fn run_semantic_request(
     let producer = admission.producer();
     let encoding = admission.admitted_encoding();
     let inventory = decode_reference_profile(&admission, cancel)?;
+    let artifact_hash = inventory
+        .artifact_hashes
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("admitted inventory has no artifact"))?;
     let mut basis = BTreeMap::new();
     for document in &r1.revision.documents {
         if producer.languages.iter().any(|language| {
@@ -1686,7 +1691,7 @@ fn run_semantic_request(
                     producer_id: producer.id.clone(),
                     producer_version: producer.version.clone(),
                     producer_hash: producer.executable_hash.clone(),
-                    artifact_hash: inventory.artifact_hash.clone(),
+                    artifact_hash: artifact_hash.clone(),
                     language: serde_json::from_value(serde_json::json!(document.key.language))?,
                     source_set_id: document.key.source_set_id.clone(),
                     revision_id: r1.revision.id.clone(),
@@ -1701,7 +1706,7 @@ fn run_semantic_request(
     }
     let captured = semantic::CapturedComponents {
         producer_executables: BTreeMap::new(),
-        artifacts: BTreeMap::from([(producer.id.clone(), binary.clone())]),
+        artifacts: BTreeMap::from([((producer.id.clone(), artifact_hash.clone()), binary.clone())]),
         sources: r1_sources.clone(),
         captured_revision: r1.revision.clone(),
         native_toolchain: toolchain.clone(),

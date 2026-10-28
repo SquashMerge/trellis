@@ -245,7 +245,7 @@ pub(super) fn decode_whole_index_oracle(
         }
     }
     Ok(CapturedScipInventory {
-        artifact_hash: input.artifact_hash.clone(),
+        artifact_hashes: vec![input.artifact_hash.clone()],
         decoder_version: input.decoder_version.into(),
         source_manifest_hash: input.source_manifest_hash.clone(),
         completion: input.completion,
@@ -271,7 +271,7 @@ fn assert_equivalent(name: &str, bytes: &[u8], docs: Vec<AuthenticatedScipDocume
     let actual = streamed(&input).unwrap_or_else(|e| panic!("{name}: stream rejected {e:?}"));
     assert!(!expected.claims.is_empty(), "{name}");
     assert_eq!(actual.claims, expected.claims, "{name}");
-    assert_eq!(actual.artifact_hash, expected.artifact_hash, "{name}");
+    assert_eq!(actual.artifact_hashes, expected.artifact_hashes, "{name}");
 }
 fn metadata_body() -> Vec<u8> {
     let tool = [

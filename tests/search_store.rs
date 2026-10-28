@@ -429,7 +429,13 @@ fn omitted_semantics(
     };
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([(producer.id.clone(), b"synthetic".to_vec())]),
-        artifacts: BTreeMap::from([(producer.id.clone(), b"artifact".to_vec())]),
+        artifacts: BTreeMap::from([(
+            (
+                producer.id.clone(),
+                trellis::native_ids::digest(b"", b"artifact"),
+            ),
+            b"artifact".to_vec(),
+        )]),
         sources: native
             .revision
             .documents
