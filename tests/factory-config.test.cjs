@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
-const { delimiter, join } = require("node:path");
+const { delimiter, join, resolve: resolvePath } = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
@@ -195,6 +195,21 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
     }
+    // The #40 smoke needs the real trellis binary, which the fake cargo never
+    // builds. Skip only that script; every other python3 call runs for real.
+    const realPython = spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
+    const pythonShim = join(fakeDir, "python3");
+    writeFileSync(pythonShim, `#!/bin/sh
+case "$1" in
+  tools/verify-40-query-performance.py)
+    line="python3"
+    for arg in "$@"; do line="$line$(printf '\\t')$arg"; done
+    printf '%s\\n' "$line" >> "$FAKE_VERIFY_LOG"
+    exit 0 ;;
+esac
+exec "${realPython}" "$@"
+`);
+    chmodSync(pythonShim, 0o755);
     function runVerify(extraEnv = {}, timeout = undefined) {
       const result = spawnSync(config.verify, [], {
         cwd: ROOT,
@@ -221,6 +236,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
         ["cargo", "build", "--locked", "--bin", "trellis"],
+        ["python3", "tools/verify-40-query-performance.py", "--smoke", "--binary", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis")],
         ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/treemap.test.cjs"],
       ],
       tests: [
@@ -264,7 +280,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
     assert.equal(depsFailure.result.status, 1);
-    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, 4) });
+    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, 5) });
     assert.match(depsFailure.result.stdout, /fake apt failure/);
     assert.match(depsFailure.result.stdout, /Chromium system package install failed \(exit 41\)/);
     assert.match(depsFailure.result.stderr, /failed lane\(s\): rust$/m);

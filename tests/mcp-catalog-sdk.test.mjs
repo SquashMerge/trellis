@@ -45,7 +45,7 @@ test("architecture prompt messages and catalog use SDK prompt shapes", () => {
   for (const result of [{messages}, {resultType: "complete", messages}]) {
     assert.ok(GetPromptResultSchema.safeParse(result).success);
   }
-  assert.equal(tools.length, 10);
+  assert.equal(tools.length, 11);
   assert.ok(!tools.some(tool => tool.name === "trellis_propose_layers"));
 });
 
@@ -54,11 +54,12 @@ const Ajv2020 = require("ajv/dist/2020.js").default;
 const ajv = new Ajv2020({ strict: false });
 const search = tools.find(tool => tool.name === "trellis_search_symbols");
 
-test("the ten-tool order and unchanged schemas are explicit", () => {
+test("the eleven-tool order and unchanged schemas are explicit", () => {
   assert.deepEqual(tools.map(tool => tool.name), [
     "trellis_workspace_describe", "trellis_find_symbols", "trellis_search_symbols",
     "trellis_declaration", "trellis_outgoing_calls", "trellis_incoming_calls",
-    "trellis_read_source", "trellis_references", "trellis_rules_check", "trellis_rules_explain",
+    "trellis_read_source", "trellis_call_graph", "trellis_references", "trellis_rules_check",
+    "trellis_rules_explain",
   ]);
   const describe = tools[0].outputSchema.oneOf[0].properties.data.properties;
   assert.equal(describe.toolVersion.const, 2);
@@ -117,4 +118,26 @@ test("search status and rank membership definitions are closed", () => {
   const validateRank = ajv.compile(defs.SearchHit.properties.rank);
   assert.ok(validateRank(1));
   for (const rank of [0, -1, 1.5, null]) assert.equal(validateRank(rank), false);
+});
+
+test("call graph accepts only its closed, unclamped public input", () => {
+  const graph = tools.find(tool => tool.name === "trellis_call_graph");
+  const validate = ajv.compile(graph.inputSchema);
+  const valid = { schemaVersion: 1, symbolId: `sid:v1:${"a".repeat(32)}` };
+  assert.ok(validate(valid), JSON.stringify(validate.errors));
+  assert.ok(validate({ ...valid, depth: 0, maxNodes: 1, maxCalls: 0 }));
+  assert.ok(validate({ ...valid, depth: 5, maxNodes: 150, maxCalls: 500, semanticProducerId: null }));
+  assert.ok(validate({ ...valid, semanticProducerId: "scip-typescript" }));
+  for (const depth of [6, -1, 1.5, null, "2"]) assert.equal(validate({ ...valid, depth }), false, `depth ${depth}`);
+  for (const maxNodes of [0, 151, 1.5, null, "2"]) assert.equal(validate({ ...valid, maxNodes }), false, `maxNodes ${maxNodes}`);
+  for (const maxCalls of [-1, 501, 1.5, null, "2"]) assert.equal(validate({ ...valid, maxCalls }), false, `maxCalls ${maxCalls}`);
+  for (const semanticProducerId of ["", 1, true]) assert.equal(validate({ ...valid, semanticProducerId }), false);
+  for (const field of ["limit", "view", "revisionId", "sourceSetId", "cursor", "unknown"]) {
+    assert.equal(validate({ ...valid, [field]: 1 }), false, field);
+  }
+  assert.equal(validate({ schemaVersion: 1 }), false);
+  assert.equal(validate({ ...valid, symbolId: "sid:v1:ABC" }), false);
+  assert.equal(graph.inputSchema.properties.depth.default, 2);
+  assert.equal(graph.inputSchema.properties.maxNodes.default, 150);
+  assert.equal(graph.inputSchema.properties.maxCalls.default, 500);
 });

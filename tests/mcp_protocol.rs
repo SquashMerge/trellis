@@ -540,6 +540,12 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
             )
         } else if data.get("declaration").is_some() {
             ("trellis_declaration", 1, "declaration")
+        } else if let Some(result) = data.get("result") {
+            (
+                "trellis_call_graph",
+                result["edges"].as_array().unwrap().len(),
+                "edges",
+            )
         } else if let Some(calls) = data.get("calls") {
             (
                 "trellis_outgoing_calls",
@@ -917,7 +923,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let response = peer.ask(list);
         let catalog: Value =
             serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 10);
+        assert_eq!(catalog.as_array().unwrap().len(), 11);
         let expected_list = |id: Value| {
             let result = if legacy {
                 json!({"tools":catalog})
@@ -1098,7 +1104,7 @@ fn framing_ids_negotiation_and_application_validation() {
     for spelling in [r#""\u00e9""#, r#""é""#, r#""\ud83d\ude00""#, r#""😀""#] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{spelling},"method":"tools/list","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
         let v = peer.reply();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 11);
     }
     for n in ["1e0", "1.0", "-0", "9007199254740991", "-9007199254740991"] {
         peer.send_raw(format!(r#"{{"jsonrpc":"2.0","id":{n},"method":"server/discover","params":{{"_meta":{}}}}}"#,fixture()["modernMeta"]).as_bytes());
@@ -1203,7 +1209,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
             .as_array()
             .unwrap()
             .len(),
-        10
+        11
     );
     assert!(peer.finish().0.success());
     // Topology overlap is refused before marker attachment.
@@ -1717,6 +1723,7 @@ async fn warm_relay_serves_both_new_tools_and_rejects_closed_inputs() {
             .collect();
         expected_names.insert(2, "trellis_search_symbols".to_owned());
         expected_names.extend([
+            "trellis_call_graph".to_owned(),
             "trellis_references".to_owned(),
             "trellis_rules_check".to_owned(),
             "trellis_rules_explain".to_owned(),
@@ -2823,7 +2830,7 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
 #[test]
 fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
     let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 10);
+    assert_eq!(catalog.as_array().unwrap().len(), 11);
     for entry in catalog.as_array().unwrap() {
         let defs = &entry["outputSchema"]["$defs"];
         assert_eq!(
@@ -6853,18 +6860,18 @@ async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
     assert!(envelope.get("catchingUp").is_none(), "{reply}");
 }
 
-/// #156: find still validates every searched coverage tuple, although only
-/// counts leave the store. A corrupt row in an unrelated document fails a
-/// zero-hit query, and a query whose hit lies elsewhere, as store_unavailable,
-/// never a successful answer with counts.
+/// #156, relaxed by #261: find validates the coverage tuple of each hydrated
+/// hit only. A corrupt row in a document no hit reaches no longer fails a
+/// zero-hit query or a hit elsewhere; a hit on the corrupt document fails as
+/// store_unavailable, never a successful answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
+async fn mcp_find_corrupt_scope_row_fails_only_when_hydrated() {
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::{
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
     };
-    for query in ["no_such_name", "Alpha"] {
+    for query in ["no_such_name", "Alpha", "Beta"] {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
@@ -6936,6 +6943,19 @@ async fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits(
             .unwrap();
         drop(writer);
         let response = store.evidence_response().unwrap();
+        if query != "Beta" {
+            let found = response
+                .mcp_find(query, 20, None)
+                .unwrap_or_else(|error| panic!("{query}: {error:#}"));
+            assert_eq!(
+                found.symbols.len(),
+                usize::from(query == "Alpha"),
+                "{query}"
+            );
+            assert_eq!(found.scope[3], [1, 1, 0, 0, 1], "{query}");
+            response.finish(()).unwrap();
+            continue;
+        }
         let error = response.mcp_find(query, 20, None).map(|_| ()).unwrap_err();
         let reason = format!("{error:#}");
         assert!(
@@ -13329,4 +13349,1059 @@ async fn mcp_search_during_startup_defers_background_head_and_serves_valid_prior
     drop(client);
     session.join().unwrap().unwrap();
     validate_structured_content(&[search_schema_pair(&reply)]);
+}
+
+#[path = "common/graph_fixtures.rs"]
+mod graph_fixtures;
+
+/// A published synthetic index served through an in-process daemon-socket MCP session. Startup
+/// reconciliation is held for the session's life, so the published head is served as published.
+struct GraphMcp {
+    temp: tempfile::TempDir,
+    root: PathBuf,
+    pins: Vec<trellis::model::IndexPin>,
+    names: std::collections::BTreeMap<String, String>,
+    runtime: std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+    client: std::os::unix::net::UnixStream,
+    reader: BufReader<std::os::unix::net::UnixStream>,
+    session: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    release: mpsc::SyncSender<()>,
+    _entered: Receiver<()>,
+    next_id: i64,
+    pairs: Vec<Value>,
+}
+
+impl GraphMcp {
+    async fn start(
+        session: u64,
+        specs: &[graph_fixtures::Spec],
+        hooks: trellis::mcp::TransportHooksForTests,
+    ) -> Self {
+        use trellis::daemon::registry::CheckoutRegistry;
+        use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(temp.path());
+        let identity = WorkspaceIdentity::discover(Some(&root), &root)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let mut publisher = graph_fixtures::Publisher::open(temp.path(), &root);
+        publisher
+            .store
+            .mcp_prepare_virgin_queue_for_tests()
+            .unwrap();
+        let pins = specs.iter().map(|spec| publisher.publish(spec)).collect();
+        let names = publisher
+            .native()
+            .declarations
+            .iter()
+            .filter_map(|d| Some((d.syntax_id.clone(), d.name.clone()?)))
+            .collect();
+        drop(publisher);
+        let topology =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(session, &identity).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        registry.set_next_startup_hook_for_tests(std::sync::Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        let (mut client, mut reader, thread) =
+            hooked_session(&identity, &registry, session, None, hooks);
+        writeln!(client, "{}", describe_call(1)).unwrap();
+        entered_rx
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        tool(&next_reply(&mut reader), None, true);
+        let runtime = registry
+            .lock()
+            .await
+            .runtime(&identity.root_key)
+            .expect("the served checkout has a runtime");
+        Self {
+            temp,
+            root,
+            pins,
+            names,
+            runtime,
+            client,
+            reader,
+            session: Some(thread),
+            release,
+            _entered: entered_rx,
+            next_id: 1,
+            pairs: vec![],
+        }
+    }
+
+    fn id_of(&self, name: &str) -> String {
+        let mut found = self.names.iter().filter(|(_, n)| *n == name);
+        let (id, _) = found
+            .next()
+            .unwrap_or_else(|| panic!("no declaration {name}"));
+        id.clone()
+    }
+
+    /// Tool arguments for the root declaration `name`; `extra` fields are merged in.
+    fn args(&self, name: &str, extra: Value) -> Value {
+        let mut arguments = json!({"schemaVersion":1,"symbolId":self.id_of(name)});
+        for (key, value) in extra.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        arguments
+    }
+
+    fn send(&mut self, arguments: Value) -> i64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        writeln!(
+            self.client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":"trellis_call_graph","arguments":arguments})
+            )
+        )
+        .unwrap();
+        id
+    }
+
+    fn record(&mut self, reply: &Value) -> Value {
+        let envelope = reply["result"]["structuredContent"].clone();
+        self.pairs
+            .push(json!({"name":"trellis_call_graph","structuredContent":envelope}));
+        envelope
+    }
+
+    /// A successful call; the envelope is validated against the catalog schema in `finish`.
+    fn graph(&mut self, arguments: Value) -> Value {
+        let id = self.send(arguments);
+        let reply = next_reply(&mut self.reader);
+        assert_eq!(reply["id"], id);
+        tool(&reply, None, true);
+        self.record(&reply)
+    }
+
+    fn failure(&mut self, arguments: Value, code: &str) -> Value {
+        let id = self.send(arguments);
+        let reply = next_reply(&mut self.reader);
+        assert_eq!(reply["id"], id);
+        tool(&reply, Some(code), true);
+        self.record(&reply)
+    }
+
+    /// The store reader's answer for the same request, with `maxCalls` optionally replaced.
+    fn store_answer(&self, arguments: &Value, max_calls: Option<u64>) -> Value {
+        let number = |field: &str, default: u64| {
+            arguments
+                .get(field)
+                .map_or(default, |v| v.as_u64().unwrap())
+        };
+        let query = trellis::graph_query::GraphQuery {
+            root_syntax_id: arguments["symbolId"].as_str().unwrap().to_owned(),
+            semantic_producer_id: arguments
+                .get("semanticProducerId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            depth: number("depth", 2),
+            max_nodes: number("maxNodes", 150),
+            max_calls: max_calls.unwrap_or_else(|| number("maxCalls", 500)),
+        };
+        let store = trellis::store::Store::open_for_tests(self.temp.path(), &self.root).unwrap();
+        let answer = store
+            .evidence_response()
+            .unwrap()
+            .graph_query(&query, None, &mut || Ok(()))
+            .unwrap();
+        serde_json::to_value(answer.outcome.unwrap()).unwrap()
+    }
+
+    fn name(&self, id: &Value) -> String {
+        id.as_str()
+            .map_or("-".to_owned(), |id| self.names[id].clone())
+    }
+
+    /// `(nodes, edges, frontier)` in the contract's compact notation, by declaration name.
+    fn shape(&self, result: &Value) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let dash = |value: &Value| {
+            if value.is_null() {
+                "-".to_owned()
+            } else {
+                value.to_string().trim_matches('"').to_owned()
+            }
+        };
+        let nodes = result["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                format!(
+                    "{}:{}",
+                    self.name(&n["declaration"]["syntaxId"]),
+                    n["depth"]
+                )
+            })
+            .collect();
+        let mut spelling = std::collections::BTreeMap::new();
+        let edges = result["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                spelling.insert(
+                    e["call"]["id"].clone().to_string(),
+                    e["call"]["spelling"].clone(),
+                );
+                format!(
+                    "{}:{}>{}:{}:{}",
+                    dash(&e["call"]["spelling"]),
+                    self.name(&e["from"]),
+                    self.name(&e["to"]),
+                    dash(&e["visit"]),
+                    dash(&e["boundaryReason"])
+                )
+            })
+            .collect();
+        let frontier = result["frontier"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                let call = spelling
+                    .get(&f["callId"].to_string())
+                    .map_or("-".to_owned(), dash);
+                format!(
+                    "{}:{}:{}:{}:{}:{}",
+                    dash(&f["reason"]),
+                    self.name(&f["nodeId"]),
+                    call,
+                    self.name(&f["targetId"]),
+                    dash(&f["nextOrdinal"]),
+                    dash(&f["omittedCalls"])
+                )
+            })
+            .collect();
+        (nodes, edges, frontier)
+    }
+
+    /// One graph case: the hand-evaluated arrays, and `data.result` equal to the store reader's.
+    fn case(
+        &mut self,
+        root: &str,
+        extra: Value,
+        nodes: &[&str],
+        edges: &[&str],
+        frontier: &[&str],
+        (truncated, partial): (bool, bool),
+    ) -> Value {
+        let arguments = self.args(root, extra);
+        let envelope = self.graph(arguments.clone());
+        let result = &envelope["data"]["result"];
+        let (got_nodes, got_edges, got_frontier) = self.shape(result);
+        assert_eq!(got_nodes, nodes, "{root} nodes");
+        assert_eq!(got_edges, edges, "{root} edges");
+        assert_eq!(got_frontier, frontier, "{root} frontier");
+        assert_eq!(result["truncated"], truncated, "{root} truncated");
+        assert_eq!(result["partial"], partial, "{root} partial");
+        assert_eq!(envelope["truncated"], truncated);
+        assert_eq!(envelope["partial"], partial);
+        assert_eq!(envelope["warnings"], result["warnings"]);
+        assert_eq!(
+            envelope["truncationReason"],
+            if truncated {
+                json!("limit")
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(*result, self.store_answer(&arguments, None), "{root}");
+        envelope
+    }
+
+    fn warning_keys(envelope: &Value) -> Vec<(String, Option<String>)> {
+        envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| {
+                (
+                    w["code"].as_str().unwrap().to_owned(),
+                    w["provenanceId"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    fn finish(mut self) {
+        validate_structured_content(&self.pairs);
+        let _ = self.release.send(());
+        let session = self.session.take().unwrap();
+        drop(self.reader);
+        drop(self.client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+fn keys(items: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+    items
+        .iter()
+        .map(|(code, id)| (code.to_string(), id.map(str::to_string)))
+        .collect()
+}
+
+fn with_bindings(
+    files: &[(&str, &str)],
+    bindings: Vec<graph_fixtures::Bind>,
+) -> graph_fixtures::Spec {
+    let mut spec = graph_fixtures::Spec::new(files);
+    spec.bindings = bindings;
+    spec
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_eight_cases_through_mcp() {
+    use graph_fixtures::{Bind, bind};
+    use trellis::semantic_evidence::Dispatch;
+    let files = [
+        (
+            "c1.rs",
+            "fn c1_a() { c1_f(c1_g()); }\nfn c1_f(_x: i32) {}\nfn c1_g() {}\n",
+        ),
+        (
+            "c2.rs",
+            "fn c2_a() { c2_scheduler(C2::c2_run); }\nfn c2_scheduler() {}\nstruct C2;\nimpl C2 { fn c2_run() {} }\n",
+        ),
+        (
+            "c3.rs",
+            "fn c3_a() { c3_b(); }\nfn c3_b() { c3_a(); }\nfn c3_s() { c3_s(); }\n",
+        ),
+        (
+            "c4.rs",
+            "fn c4_a() { c4_b(); c4_c(); }\nfn c4_b() { c4_d(); }\nfn c4_c() { c4_d(); }\nfn c4_d() {}\n",
+        ),
+        (
+            "c5.rs",
+            "fn c5_a() { c5_b(); }\nfn c5_b() { c5_c(); }\nfn c5_c() {}\n",
+        ),
+        (
+            "c6.rs",
+            "fn c6_a() { c6_b(); c6_c(); c6_a(); }\nfn c6_b() {}\nfn c6_c() {}\n",
+        ),
+        (
+            "c7.rs",
+            "fn c7_a() { c7_b(); c7_c(); }\nfn c7_b() { c7_d(); }\nfn c7_c() {}\nfn c7_d() {}\nfn c7x_a() { c7x_b(); }\nfn c7x_b() {}\n",
+        ),
+        (
+            "c8.rs",
+            "fn c8_a() { c8_v(); }\nfn c8_v() {}\nfn c8_w() {}\n",
+        ),
+    ];
+    let virtual_call = Bind {
+        dispatch: Dispatch::Virtual,
+        possible: vec!["c8_w".into()],
+        ..bind("c8_a", 0, "c8_v")
+    };
+    let spec = with_bindings(
+        &files,
+        vec![
+            bind("c1_a", 0, "c1_f"),
+            bind("c1_a", 1, "c1_g"),
+            bind("c2_a", 0, "c2_scheduler"),
+            bind("c3_a", 0, "c3_b"),
+            bind("c3_b", 0, "c3_a"),
+            bind("c3_s", 0, "c3_s"),
+            bind("c4_a", 0, "c4_b"),
+            bind("c4_a", 1, "c4_c"),
+            bind("c4_b", 0, "c4_d"),
+            bind("c4_c", 0, "c4_d"),
+            bind("c5_a", 0, "c5_b"),
+            bind("c5_b", 0, "c5_c"),
+            bind("c6_a", 0, "c6_b"),
+            bind("c6_a", 1, "c6_c"),
+            bind("c6_a", 2, "c6_a"),
+            bind("c7_a", 0, "c7_b"),
+            bind("c7_a", 1, "c7_c"),
+            bind("c7_b", 0, "c7_d"),
+            bind("c7x_a", 0, "c7x_b"),
+            virtual_call,
+        ],
+    );
+    let mut mcp = GraphMcp::start(311, &[spec], Default::default()).await;
+    let producer = json!({"semanticProducerId":graph_fixtures::PRODUCER});
+    let with = |extra: Value| {
+        let mut merged = producer.clone();
+        for (key, value) in extra.as_object().unwrap() {
+            merged[key] = value.clone();
+        }
+        merged
+    };
+    // 1. Source order versus evaluation: the outer call sorts before the nested one.
+    mcp.case(
+        "c1_a",
+        with(json!({})),
+        &["c1_a:0", "c1_f:1", "c1_g:1"],
+        &["c1_f:c1_a>c1_f:new:none", "c1_g:c1_a>c1_g:new:none"],
+        &[],
+        (false, false),
+    );
+    // 2. A callback reference is not a call.
+    mcp.case(
+        "c2_a",
+        with(json!({"depth":1})),
+        &["c2_a:0", "c2_scheduler:1"],
+        &["c2_scheduler:c2_a>c2_scheduler:new:none"],
+        &[],
+        (false, false),
+    );
+    // 3. Cycle and self-loop.
+    mcp.case(
+        "c3_a",
+        with(json!({})),
+        &["c3_a:0", "c3_b:1"],
+        &["c3_b:c3_a>c3_b:new:none", "c3_a:c3_b>c3_a:seen:none"],
+        &[],
+        (false, false),
+    );
+    mcp.case(
+        "c3_s",
+        with(json!({})),
+        &["c3_s:0"],
+        &["c3_s:c3_s>c3_s:seen:none"],
+        &[],
+        (false, false),
+    );
+    // 4. Queued/visited diamond.
+    mcp.case(
+        "c4_a",
+        with(json!({"depth":3})),
+        &["c4_a:0", "c4_b:1", "c4_c:1", "c4_d:2"],
+        &[
+            "c4_b:c4_a>c4_b:new:none",
+            "c4_c:c4_a>c4_c:new:none",
+            "c4_d:c4_b>c4_d:new:none",
+            "c4_d:c4_c>c4_d:seen:none",
+        ],
+        &[],
+        (false, false),
+    );
+    // 5. Depth.
+    mcp.case(
+        "c5_a",
+        with(json!({"depth":1})),
+        &["c5_a:0", "c5_b:1"],
+        &["c5_b:c5_a>c5_b:new:none"],
+        &["depth:c5_b:-:-:0:1"],
+        (true, true),
+    );
+    mcp.case(
+        "c5_a",
+        with(json!({"depth":0})),
+        &["c5_a:0"],
+        &[],
+        &["depth:c5_a:-:-:0:1"],
+        (true, true),
+    );
+    // 6. Node cap with a later seen edge.
+    mcp.case(
+        "c6_a",
+        with(json!({"maxNodes":2})),
+        &["c6_a:0", "c6_b:1"],
+        &[
+            "c6_b:c6_a>c6_b:new:none",
+            "c6_c:c6_a>-:boundary:nodeLimit",
+            "c6_a:c6_a>c6_a:seen:none",
+        ],
+        &["nodeLimit:c6_a:c6_c:c6_c:-:0"],
+        (true, true),
+    );
+    // 7. Global call cap, three sub-cases.
+    mcp.case(
+        "c7_a",
+        with(json!({"maxCalls":1})),
+        &["c7_a:0", "c7_b:1"],
+        &["c7_b:c7_a>c7_b:new:none"],
+        &["callLimit:c7_a:-:-:1:1", "callLimit:c7_b:-:-:0:1"],
+        (true, true),
+    );
+    mcp.case(
+        "c7_a",
+        with(json!({"maxCalls":0})),
+        &["c7_a:0"],
+        &[],
+        &["callLimit:c7_a:-:-:0:2"],
+        (true, true),
+    );
+    mcp.case(
+        "c7x_a",
+        with(json!({"maxCalls":1})),
+        &["c7x_a:0", "c7x_b:1"],
+        &["c7x_b:c7x_a>c7x_b:new:none"],
+        &[],
+        (false, false),
+    );
+    // 8a. A virtual dispatch is a boundary; the possible target is not admitted.
+    mcp.case(
+        "c8_a",
+        with(json!({})),
+        &["c8_a:0"],
+        &["c8_v:c8_a>-:boundary:dispatch"],
+        &[],
+        (false, true),
+    );
+    mcp.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_five_warning_checks_through_mcp() {
+    use graph_fixtures::{Bind, bind};
+    use trellis::semantic_evidence::{CoverageState, Dispatch, Resolution};
+    let producer = json!({"semanticProducerId":graph_fixtures::PRODUCER});
+    let with = |extra: Value| {
+        let mut merged = producer.clone();
+        for (key, value) in extra.as_object().unwrap() {
+            merged[key] = value.clone();
+        }
+        merged
+    };
+
+    // Check 1 (syntax only), over a syntax-only publication.
+    let spec = graph_fixtures::Spec::syntax_only(&[("s1.rs", "fn s1_a() {}\n")]);
+    let mut mcp = GraphMcp::start(312, &[spec], Default::default()).await;
+    let envelope = mcp.case("s1_a", json!({}), &["s1_a:0"], &[], &[], (false, false));
+    assert_eq!(
+        GraphMcp::warning_keys(&envelope),
+        keys(&[("syntaxOnly", None)])
+    );
+    mcp.finish();
+
+    // Checks 2 and 5, over fresh evidence.
+    let ambiguous = |nth| Bind {
+        resolution: Resolution::Ambiguous,
+        provenance: "pA".into(),
+        ..bind("k2_a", nth, "k2_b")
+    };
+    let mut spec = with_bindings(
+        &[
+            ("k2.rs", "fn k2_a() { k2_b(); k2_b(); }\nfn k2_b() {}\n"),
+            ("k5a.rs", "fn k5_a() { k5_b(); }\n"),
+            ("k5b.rs", "fn k5_b() {}\n"),
+            ("k5c.rs", "fn k5_c() { k5_d(); }\n"),
+            ("k5d.rs", "fn k5_d() {}\n"),
+        ],
+        vec![
+            ambiguous(0),
+            ambiguous(1),
+            bind("k5_a", 0, "k5_b"),
+            bind("k5_c", 0, "k5_d"),
+        ],
+    );
+    spec.states.insert("k5a.rs".into(), CoverageState::Partial);
+    spec.states
+        .insert("k5b.rs".into(), CoverageState::Unsupported);
+    spec.states
+        .insert("k5d.rs".into(), CoverageState::Unsupported);
+    let mut mcp = GraphMcp::start(313, &[spec], Default::default()).await;
+    // 2. Two ambiguous bindings share one provenance: one warning, and no coverage warning.
+    let envelope = mcp.case(
+        "k2_a",
+        with(json!({})),
+        &["k2_a:0"],
+        &[
+            "k2_b:k2_a>-:boundary:ambiguous",
+            "k2_b:k2_a>-:boundary:ambiguous",
+        ],
+        &[],
+        (false, true),
+    );
+    assert_eq!(
+        GraphMcp::warning_keys(&envelope),
+        keys(&[("bindingAmbiguous", Some("pA"))])
+    );
+    // 5. A selected partial row warns; an unselected unsupported row alone does not.
+    let envelope = mcp.case(
+        "k5_a",
+        with(json!({})),
+        &["k5_a:0", "k5_b:1"],
+        &["k5_b:k5_a>k5_b:new:none"],
+        &[],
+        (false, true),
+    );
+    assert_eq!(
+        GraphMcp::warning_keys(&envelope),
+        keys(&[("coverageIncomplete", None)])
+    );
+    let envelope = mcp.case(
+        "k5_c",
+        with(json!({})),
+        &["k5_c:0", "k5_d:1"],
+        &["k5_d:k5_c>k5_d:new:none"],
+        &[],
+        (false, false),
+    );
+    assert!(GraphMcp::warning_keys(&envelope).is_empty());
+    let rows = envelope["data"]["result"]["coverage"].as_array().unwrap();
+    assert!(rows.iter().any(|row| {
+        row["producerId"] == graph_fixtures::PRODUCER
+            && row["state"] == "unsupported"
+            && row["selected"] == false
+    }));
+    // A depth frontier alone is partial and truncated, with no warning.
+    let envelope = mcp.case(
+        "k5_c",
+        with(json!({"depth":0})),
+        &["k5_c:0"],
+        &[],
+        &["depth:k5_c:-:-:0:1"],
+        (true, true),
+    );
+    assert!(GraphMcp::warning_keys(&envelope).is_empty());
+    mcp.finish();
+
+    // Case 8b and check 3: every proof of a different requested producer version is
+    // possiblyStale, and `stale` precedes `dispatch`.
+    let virtual_call = Bind {
+        dispatch: Dispatch::Virtual,
+        possible: vec!["c8b_w".into()],
+        ..bind("c8b_a", 0, "c8b_v")
+    };
+    let named = |caller: &str, target: &str, id: &str| Bind {
+        provenance: id.into(),
+        ..bind(caller, 0, target)
+    };
+    let mut spec = with_bindings(
+        &[
+            (
+                "c8b.rs",
+                "fn c8b_a() { c8b_v(); c8b_d(); }\nfn c8b_v() {}\nfn c8b_w() {}\nfn c8b_d() {}\n",
+            ),
+            (
+                "t3.rs",
+                "fn t3_a() { t3_x(); t3_y(); t3_z(); }\nfn t3_x() {}\nfn t3_y() {}\nfn t3_z() {}\n",
+            ),
+        ],
+        vec![
+            virtual_call,
+            bind("c8b_a", 1, "c8b_d"),
+            Bind {
+                provenance: "p1".into(),
+                ..bind("t3_a", 0, "t3_x")
+            },
+            Bind {
+                provenance: "p2".into(),
+                ..bind("t3_a", 1, "t3_y")
+            },
+            named("t3_a", "t3_z", "p3"),
+        ],
+    );
+    spec.requested_version = "v2".into();
+    // `named` binds the first call; move the third binding to its own call.
+    spec.bindings[4].nth = 2;
+    let mut mcp = GraphMcp::start(314, &[spec], Default::default()).await;
+    mcp.case(
+        "c8b_a",
+        with(json!({})),
+        &["c8b_a:0"],
+        &[
+            "c8b_v:c8b_a>-:boundary:stale",
+            "c8b_d:c8b_a>-:boundary:stale",
+        ],
+        &[],
+        (false, true),
+    );
+    // 3. Three possiblyStale provenances give one aggregate warning.
+    let envelope = mcp.case(
+        "t3_a",
+        with(json!({})),
+        &["t3_a:0"],
+        &[
+            "t3_x:t3_a>-:boundary:stale",
+            "t3_y:t3_a>-:boundary:stale",
+            "t3_z:t3_a>-:boundary:stale",
+        ],
+        &[],
+        (false, true),
+    );
+    assert_eq!(
+        GraphMcp::warning_keys(&envelope),
+        keys(&[("staleEvidence", None)])
+    );
+    for id in ["p1", "p2", "p3"] {
+        let proof = envelope["data"]["result"]["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("missing provenance {id}"));
+        assert_eq!(proof["freshness"], "possiblyStale");
+    }
+    mcp.finish();
+
+    // 4. Mixed freshness with a stale boundary, over two publications: r1 declares x and z;
+    // at r2 the producer is omitted for both documents, x's document changed and z's did not.
+    let mut r1 = graph_fixtures::Spec::new(&[
+        ("d1.rs", "fn k4_root() { k4_x(); k4_z(); }\n"),
+        ("d2.rs", "fn k4_x() {}\n"),
+        ("d4.rs", "fn k4_z() {}\n"),
+    ]);
+    r1.declaration_bindings = vec!["k4_x".into(), "k4_z".into()];
+    r1.declaration_proofs = [("k4_x", "p2"), ("k4_z", "p1")]
+        .into_iter()
+        .map(|(name, id)| (name.to_owned(), id.to_owned()))
+        .collect();
+    let mut r2 = with_bindings(
+        &[
+            ("d1.rs", "fn k4_root() { k4_x(); k4_z(); }\n"),
+            ("d2.rs", "fn k4_x() { k4_w(); }\nfn k4_w() {}\n"),
+            ("d4.rs", "fn k4_z() {}\n"),
+        ],
+        vec![bind("k4_root", 0, "k4_x"), bind("k4_root", 1, "k4_z")],
+    );
+    r2.states.insert("d2.rs".into(), CoverageState::Omitted);
+    r2.states.insert("d4.rs".into(), CoverageState::Omitted);
+    let mut mcp = GraphMcp::start(315, &[r1, r2], Default::default()).await;
+    let envelope = mcp.case(
+        "k4_root",
+        with(json!({})),
+        &["k4_root:0", "k4_x:1", "k4_z:1"],
+        &[
+            "k4_x:k4_root>k4_x:new:none",
+            "k4_z:k4_root>k4_z:new:none",
+            "k4_w:k4_x>-:boundary:missingEvidence",
+        ],
+        &[],
+        (false, true),
+    );
+    assert_eq!(
+        GraphMcp::warning_keys(&envelope),
+        keys(&[("staleEvidence", None), ("staleEvidence", Some("p2"))])
+    );
+    let freshness = |id: &str| {
+        envelope["data"]["result"]["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .map(|p| p["freshness"].clone())
+    };
+    assert_eq!(freshness("p1"), Some(json!("possiblyStale")));
+    assert_eq!(freshness("p2"), Some(json!("stale")));
+    mcp.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_oversized_answer_is_byte_reduced_and_valid() {
+    let spec =
+        graph_fixtures::Spec::syntax_only(&[("fan.rs", &graph_fixtures::fanout_source(600))]);
+    let mut mcp = GraphMcp::start(316, &[spec], Default::default()).await;
+    let arguments = mcp.args("root", json!({}));
+    let id = mcp.send(arguments.clone());
+    let mut line = String::new();
+    mcp.reader.read_line(&mut line).unwrap();
+    assert!(line.ends_with('\n'));
+    assert!(
+        line.len() <= trellis::mcp::wire::RESPONSE_BYTES,
+        "frame is {} bytes",
+        line.len()
+    );
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["id"], id);
+    tool(&reply, None, true);
+    let envelope = mcp.record(&reply);
+    let result = &envelope["data"]["result"];
+    let k = result["request"]["maxCalls"].as_u64().unwrap();
+    assert!(0 < k && k < 500, "reduced to {k}");
+    assert_eq!(envelope["data"]["requested"]["maxCalls"], 500);
+    assert_eq!(envelope["truncationReason"], "response_bytes");
+    assert_eq!(envelope["truncated"], true);
+    assert_eq!(envelope["partial"], true);
+    assert_eq!(result["edges"].as_array().unwrap().len() as u64, k);
+    let last = result["frontier"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last["reason"], "callLimit");
+    assert_eq!(last["nextOrdinal"], k);
+    assert_eq!(last["omittedCalls"], 600 - k);
+    assert_eq!(*result, mcp.store_answer(&arguments, Some(k)));
+    // The prefix is maximal: one more call would not have fit.
+    let next = mcp.store_answer(&arguments, Some(k + 1));
+    let mut longer = envelope.clone();
+    longer["data"]["result"] = next;
+    let frame = json!({"jsonrpc":"2.0","id":id,
+        "result":{"isError":false,"structuredContent":longer,
+            "content":[{"type":"text","text":reply["result"]["content"][0]["text"]}],
+            "resultType":"complete"}});
+    assert!(serde_json::to_vec(&frame).unwrap().len() + 1 >= trellis::mcp::wire::RESPONSE_BYTES);
+    // A caller's own smaller cap is honoured and not reported as a byte reduction.
+    let envelope = mcp.graph(mcp.args("root", json!({"maxCalls":3})));
+    assert_eq!(
+        envelope["data"]["result"]["edges"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(envelope["truncationReason"], "limit");
+    assert_eq!(envelope["data"]["requested"]["maxCalls"], 3);
+    mcp.finish();
+}
+
+fn index_db(state: &Path) -> PathBuf {
+    fs::read_dir(state.join("cache/indexes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap()
+        .join("index.db")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_basis_conflict_and_failure_codes() {
+    let binding = graph_fixtures::bind("fc_a", 0, "fc_b");
+    let r1 = with_bindings(
+        &[("a.rs", "fn fc_a() { fc_b(); }\nfn fc_b() {}\n")],
+        vec![binding.clone()],
+    );
+    let r2 = with_bindings(
+        &[(
+            "a.rs",
+            "fn fc_a() { fc_b(); }\nfn fc_b() {}\nfn fc_c() {}\n",
+        )],
+        vec![binding],
+    );
+    let mut mcp = GraphMcp::start(317, &[r1, r2], Default::default()).await;
+    let pin = |pin: trellis::model::IndexPin| json!({"indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision});
+    let (old, head) = (pin(mcp.pins[0]), pin(mcp.pins[1]));
+    assert_ne!(old, head);
+    let producer = json!({"semanticProducerId":graph_fixtures::PRODUCER});
+    // The admitted head: the basis, the requested revision and the resolved revision agree.
+    let envelope = mcp.graph(mcp.args(
+        "fc_a",
+        json!({"semanticProducerId":graph_fixtures::PRODUCER,"expectedBasis":head}),
+    ));
+    assert_eq!(envelope["evidenceBasis"], head);
+    let sql_revision: String = rusqlite::Connection::open(index_db(mcp.temp.path()))
+        .unwrap()
+        .query_row(
+            "SELECT native_revision_id FROM native_revisions ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        envelope["data"]["result"]["resolvedRevisionId"],
+        sql_revision
+    );
+    assert_eq!(envelope["data"]["requested"]["revisionId"], sql_revision);
+    assert_eq!(
+        envelope["data"]["result"]["request"]["revisionId"],
+        sql_revision
+    );
+    // A retained older pin is a conflict, never served.
+    let conflict = mcp.failure(
+        mcp.args("fc_a", json!({"expectedBasis":old})),
+        "revision_conflict",
+    );
+    assert!(conflict.get("data").is_none());
+    // Contract failures keep the shared code set and carry their own message.
+    let missing = format!("sid:v1:{}", "0".repeat(32));
+    let mut arguments = mcp.args("fc_a", producer.clone());
+    arguments["symbolId"] = json!(missing);
+    let envelope = mcp.failure(arguments, "not_found");
+    assert_eq!(
+        envelope["error"]["message"],
+        "Call graph root not found in the admitted snapshot"
+    );
+    let envelope = mcp.failure(
+        mcp.args("fc_a", json!({"semanticProducerId":"semantic.unpublished"})),
+        "not_found",
+    );
+    assert_eq!(
+        envelope["error"]["message"],
+        "Semantic producer not published for the admitted revision"
+    );
+    // Out-of-range input is invalid, never clamped.
+    for extra in [
+        json!({"depth":6}),
+        json!({"maxNodes":0}),
+        json!({"maxNodes":151}),
+        json!({"maxCalls":501}),
+        json!({"semanticProducerId":""}),
+        json!({"unknown":1}),
+    ] {
+        mcp.failure(mcp.args("fc_a", extra), "invalid_request");
+    }
+    mcp.finish();
+}
+
+/// Runs a child test binary with the phase hook armed in the child's environment only.
+fn run_hook_child(test: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            test,
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("TRELLIS_TEST_MCP_PHASE", "call_graph_node")
+        .env(
+            "TRELLIS_TEST_MCP_PHASE_SOCKET",
+            dir.path().join("phase.sock"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let err = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let log = format!("{}\n{}", out.join().unwrap(), err.join().unwrap());
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{test} failed:\n{log}"
+    );
+}
+
+/// The hook child binds the phase socket itself, so nothing outside it is ever armed.
+fn bind_phase_socket() -> std::os::unix::net::UnixListener {
+    let path = std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").expect("run by its parent test");
+    std::os::unix::net::UnixListener::bind(path).unwrap()
+}
+
+/// Accepts one hook connection from the call graph and returns the stream held at the hook.
+fn hold_at_node_hook(
+    listener: &std::os::unix::net::UnixListener,
+) -> std::os::unix::net::UnixStream {
+    let (gate, _) = listener.accept().unwrap();
+    gate.set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+        .unwrap();
+    let mut received = String::new();
+    BufReader::new(gate.try_clone().unwrap())
+        .read_line(&mut received)
+        .unwrap();
+    assert_eq!(received, "call_graph_node\n");
+    gate
+}
+
+fn hook_spec() -> graph_fixtures::Spec {
+    with_bindings(
+        &[("a.rs", "fn hk_a() { hk_b(); }\nfn hk_b() {}\n")],
+        vec![graph_fixtures::bind("hk_a", 0, "hk_b")],
+    )
+}
+
+#[test]
+fn call_graph_deadline_at_node_hook() {
+    run_hook_child("call_graph_deadline_child");
+}
+
+#[test]
+#[ignore = "runs only as the child of call_graph_deadline_at_node_hook"]
+fn call_graph_deadline_child() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = bind_phase_socket();
+            let mut mcp = GraphMcp::start(318, &[hook_spec()], Default::default()).await;
+            let arguments = mcp.args(
+                "hk_a",
+                json!({"semanticProducerId":graph_fixtures::PRODUCER}),
+            );
+            let id = mcp.send(arguments);
+            let mut gate = hold_at_node_hook(&listener);
+            mcp.runtime
+                .advance_mcp_clock_for_tests(Duration::from_millis(5001));
+            gate.write_all(b"!").unwrap();
+            let reply = next_reply(&mut mcp.reader);
+            assert_eq!(reply["id"], id);
+            tool(&reply, Some("deadline_exceeded"), true);
+            mcp.record(&reply);
+            mcp.finish();
+        });
+}
+
+#[test]
+fn call_graph_cancel_at_node_hook_is_suppressed() {
+    run_hook_child("call_graph_cancel_child");
+}
+
+#[test]
+#[ignore = "runs only as the child of call_graph_cancel_at_node_hook_is_suppressed"]
+fn call_graph_cancel_child() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = bind_phase_socket();
+            let (read_tx, read_rx) = mpsc::sync_channel(1);
+            let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hooks = trellis::mcp::TransportHooksForTests {
+                frame_read: Some(std::sync::Arc::new(move || {
+                    // Frames: the startup describe, the graph call, then the cancellation.
+                    if frames.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 2 {
+                        let _ = read_tx.try_send(());
+                    }
+                })),
+                ..Default::default()
+            };
+            let mut mcp = GraphMcp::start(319, &[hook_spec()], hooks).await;
+            let arguments = mcp.args("hk_a", json!({"semanticProducerId":graph_fixtures::PRODUCER}));
+            let id = mcp.send(arguments);
+            let mut gate = hold_at_node_hook(&listener);
+            writeln!(
+                mcp.client,
+                "{}",
+                json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}})
+            )
+            .unwrap();
+            read_rx
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+            gate.write_all(b"!").unwrap();
+            // The cancelled call is suppressed, and the next call on the connection is answered.
+            writeln!(mcp.client, "{}", describe_call(90)).unwrap();
+            let reply = next_reply(&mut mcp.reader);
+            assert_eq!(reply["id"], 90, "cancelled call emitted a reply: {reply}");
+            tool(&reply, None, true);
+            mcp.finish();
+        });
 }
