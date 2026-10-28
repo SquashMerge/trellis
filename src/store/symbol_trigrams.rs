@@ -203,22 +203,20 @@ impl Search<'_> {
                 )
             }
             _ => {
-                // CASE, unlike NOT(prefix), also keeps unnamed ID-only hits.
-                let candidate = if id_shaped {
-                    format!(
+                let predicate = if id_shaped {
+                    // CASE, unlike NOT(prefix), also keeps unnamed ID-only hits.
+                    let candidate = format!(
                         "((instr(lower({name}),lower(?{q}))>0 AND {membership}) OR {})",
                         self.id_match()
-                    )
-                } else {
-                    format!("instr(lower({name}),lower(?{q}))>0 AND {membership}")
-                };
-                (
-                    "name",
+                    );
                     format!(
                         "CASE WHEN lower({name})=lower(?{q}) THEN 0
                      WHEN instr(lower({name}),lower(?{q}))=1 THEN 1 ELSE 2 END=2 AND {candidate}"
-                    ),
-                )
+                    )
+                } else {
+                    format!("instr(lower({name}),lower(?{q}))>1 AND {membership}")
+                };
+                ("name", predicate)
             }
         };
         format!(
@@ -784,6 +782,75 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn non_id_rank_two_walk_checks_nonmatching_names_once() {
+        use rusqlite::StatementStatus;
+        let db = ranking_fixture();
+        for rowid in 1..=256 {
+            insert_ranked(&db, rowid, 1, Some(&format!("a_other_{rowid:03}")));
+        }
+        for at in 0..32 {
+            insert_ranked(&db, 257 + at, 1, Some(&format!("b_oca_{at:03}")));
+        }
+        for search in [w2_search(), graph_search()] {
+            let query = "oca";
+            assert!(!can_match_an_id(query));
+            let limit = 5_i64;
+            let revision = "pin:v1:test:1";
+            let expression = match_expression(query).unwrap();
+            let mut values: Vec<&dyn rusqlite::ToSql> = vec![&query, &limit];
+            if search.query_parameter == 2 {
+                values.insert(0, &revision);
+            }
+            let literal = with_literal_scan(|| search.hits(&db, query, limit, &values)).unwrap();
+            values.push(&expression);
+            let table = search.source.split(' ').next().unwrap();
+            let alias = search.source.rsplit(' ').next().unwrap();
+            let legacy = format!(
+                "SELECT {columns} FROM {source} INDEXED BY {table}_search_name {joins}
+                 WHERE CASE WHEN lower({name})=lower(?{q}) THEN 0
+                 WHEN instr(lower({name}),lower(?{q}))=1 THEN 1 ELSE 2 END=2
+                 AND instr(lower({name}),lower(?{q}))>0
+                 AND EXISTS(SELECT 1 FROM {names} WHERE rowid={alias}.rowid AND {names} MATCH ?{p})
+                 ORDER BY {name} COLLATE BINARY,{id} LIMIT ?{limit}",
+                columns = search.columns,
+                source = search.source,
+                joins = search.joins(true),
+                name = search.name,
+                q = search.query_parameter,
+                names = search.names,
+                p = search.match_parameter,
+                id = search.id,
+                limit = search.limit_parameter,
+            );
+            let measure = |sql: &str| {
+                let mut statement = db.prepare(sql).unwrap();
+                let rows: Vec<(String, Vec<u8>, i64)> = statement
+                    .query_map(values.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                let hits: Vec<_> = rows
+                    .into_iter()
+                    .map(|(first, id, rank)| {
+                        assert_eq!(rank, 2);
+                        (first, super::super::id_codec::decode_sid(&id).unwrap())
+                    })
+                    .collect();
+                assert_eq!(hits, literal, "{}", search.source);
+                assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+                i64::from(statement.get_status(StatementStatus::VmStep))
+            };
+            let legacy_steps = measure(&legacy);
+            let steps = measure(&search.ordered_sql(2, false, false));
+            assert!(
+                steps * 10 < legacy_steps * 7,
+                "{}: {steps} VM steps versus legacy {legacy_steps}",
+                search.source,
+            );
         }
     }
 
