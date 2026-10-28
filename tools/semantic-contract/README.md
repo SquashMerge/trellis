@@ -194,3 +194,26 @@ and SHA-256. It requires a new or empty `out_dir` and non-empty source and cover
 rows (checked before anything is written); the optional `root` keyword names the
 workspace root that descriptor paths are relative to (default `out_dir`). `canonical`, `source_manifest_hash` and `DESCRIPTOR_KEYS` are shared
 with the runner and its tests.
+
+### Qualifying a combined-gate report
+
+```sh
+python3 tools/semantic-contract/qualify-performance.py --report /path/to/report.json
+python3 -m unittest discover -s tools/semantic-contract/test -p test_performance_qualification.py
+```
+
+`qualify(report, policy, cohorts)` fills the `qualification` object, the
+per-size `median`, `peakWorkerRssBytes` and `evaluations`, and the campaign
+`status`. The CLI prints the qualified report as JSON; it exits 1 for
+`unqualified` and 2 for an unreadable report. Thresholds come from
+`docs/semantic-evidence/benchmark-policy-v1.json` and `cohorts-v1.json`; nothing
+is hard-coded or extrapolated. Wall time uses the median of the three raw
+samples; RSS and storage require every sample within the limit. The steady
+ratio and peak ratio apply to medium and large only.
+
+A criterion is `notMeasured` for a smoke report, off the reference host, with a
+missing repetition or instrumentation value, or while its flag is false (the
+steady ratio needs `denominatorRatified`, the peak ratio needs
+`sqlitePeakMethodReviewed`). Status precedence is `unqualified` > `failed` >
+`notMeasured` > `passed`; `passed` is unreachable with the constant flags. The
+output always carries `authoritativeAcceptance: false` and `issue11: "open"`.
