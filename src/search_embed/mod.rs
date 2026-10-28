@@ -369,6 +369,116 @@ pub struct QuantizedVector {
     pub values: Vec<i8>,
 }
 
+/// Maximum documents and padded token work in one prepared inference slice.
+/// The token-work bound keeps long-document slices at the old 16 x 512 limit.
+pub const DOCUMENT_BATCH_MAX: usize = 128;
+pub const DOCUMENT_BATCH_TOKEN_WORK_MAX: usize = MAX_BATCH * MAX_TOKENS;
+
+/// An unpadded, prompted document, or original text for an injected embedder.
+#[derive(Clone, Debug)]
+pub struct PreparedDocument {
+    input: PreparedDocumentInput,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedDocumentInput {
+    Tokens(Vec<u32>),
+    Text(String),
+}
+
+impl PreparedDocument {
+    /// Actual prompted token count in production; conservative for test models.
+    pub fn token_len(&self) -> usize {
+        match &self.input {
+            PreparedDocumentInput::Tokens(ids) => ids.len(),
+            PreparedDocumentInput::Text(_) => MAX_TOKENS,
+        }
+    }
+}
+
+/// Owns only tokenizer state, never model tensors. A clone can prepare documents
+/// on the read pipeline while the model owner serves queries or embeds a slice.
+#[derive(Clone, Default)]
+pub struct DocumentTokenizer {
+    tokenizer: Option<Tokenizer>,
+}
+
+impl DocumentTokenizer {
+    pub(crate) fn from_tokenizer(tokenizer: &Tokenizer) -> Self {
+        let mut tokenizer = tokenizer.clone();
+        tokenizer.with_padding(None);
+        Self {
+            tokenizer: Some(tokenizer),
+        }
+    }
+
+    pub fn prepare(
+        &self,
+        texts: &[String],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<PreparedDocument>, EmbedError> {
+        batch_boundary(|| {
+            control.check()?;
+            let mut documents = Vec::with_capacity(texts.len());
+            for text in texts {
+                control.check()?;
+                let input = if let Some(tokenizer) = &self.tokenizer {
+                    let encoding = tokenizer
+                        .encode(prepare_input(text, InputKind::Document), false)
+                        .map_err(|error| EmbedError::Runtime(format!("tokenization: {error}")))?;
+                    if encoding.is_empty() || encoding.len() > MAX_TOKENS {
+                        return Err(EmbedError::Runtime(
+                            "invalid tokenized sequence length".into(),
+                        ));
+                    }
+                    PreparedDocumentInput::Tokens(encoding.get_ids().to_vec())
+                } else {
+                    PreparedDocumentInput::Text(text.clone())
+                };
+                documents.push(PreparedDocument { input });
+            }
+            control.check()?;
+            Ok(documents)
+        })
+    }
+}
+
+fn prepared_shape(documents: &[PreparedDocument]) -> Result<(usize, usize), EmbedError> {
+    let tokens = documents
+        .iter()
+        .map(PreparedDocument::token_len)
+        .max()
+        .unwrap_or(0);
+    if documents.len() > DOCUMENT_BATCH_MAX
+        || documents.len() * tokens > DOCUMENT_BATCH_TOKEN_WORK_MAX
+    {
+        return Err(EmbedError::InvalidInput(format!(
+            "prepared batch exceeds {DOCUMENT_BATCH_MAX} documents or {DOCUMENT_BATCH_TOKEN_WORK_MAX} padded tokens"
+        )));
+    }
+    Ok((documents.len(), tokens))
+}
+
+fn pad_prepared(
+    documents: &[PreparedDocument],
+    tokens: usize,
+) -> Result<(Vec<u32>, Vec<u32>), EmbedError> {
+    let mut ids = Vec::with_capacity(documents.len() * tokens);
+    let mut masks = Vec::with_capacity(documents.len() * tokens);
+    for document in documents {
+        let PreparedDocumentInput::Tokens(document_ids) = &document.input else {
+            return Err(EmbedError::InvalidInput(
+                "production embedding requires prepared token ids".into(),
+            ));
+        };
+        ids.extend_from_slice(document_ids);
+        ids.resize(ids.len() + tokens - document_ids.len(), 151_643);
+        masks.extend(std::iter::repeat_n(1, document_ids.len()));
+        masks.resize(masks.len() + tokens - document_ids.len(), 0);
+    }
+    Ok((ids, masks))
+}
+
 /// The production model and deterministic test models use the same job path.
 pub trait SearchEmbedder: Send {
     fn embed(
@@ -377,6 +487,29 @@ pub trait SearchEmbedder: Send {
         kind: InputKind,
         control: &EmbeddingControl<'_>,
     ) -> Result<Vec<QuantizedVector>, EmbedError>;
+
+    fn document_tokenizer(&self) -> DocumentTokenizer {
+        DocumentTokenizer::default()
+    }
+
+    fn embed_prepared(
+        &self,
+        documents: &[PreparedDocument],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<QuantizedVector>, EmbedError> {
+        control.check()?;
+        prepared_shape(documents)?;
+        let texts = documents
+            .iter()
+            .map(|document| match &document.input {
+                PreparedDocumentInput::Text(text) => Ok(text.clone()),
+                PreparedDocumentInput::Tokens(_) => Err(EmbedError::InvalidInput(
+                    "prepared tokens require their production embedder".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.embed(&texts, InputKind::Document, control)
+    }
 }
 
 pub trait SearchEmbedderFactory: Send + Sync {
@@ -391,6 +524,18 @@ impl SearchEmbedder for Embedder {
         control: &EmbeddingControl<'_>,
     ) -> Result<Vec<QuantizedVector>, EmbedError> {
         Embedder::embed(self, texts, kind, control)
+    }
+
+    fn document_tokenizer(&self) -> DocumentTokenizer {
+        Embedder::document_tokenizer(self)
+    }
+
+    fn embed_prepared(
+        &self,
+        documents: &[PreparedDocument],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<QuantizedVector>, EmbedError> {
+        Embedder::embed_prepared(self, documents, control)
     }
 }
 
@@ -501,6 +646,48 @@ impl Embedder {
         batch_boundary(|| self.encode_float(texts, kind, control))
     }
 
+    pub fn document_tokenizer(&self) -> DocumentTokenizer {
+        DocumentTokenizer::from_tokenizer(&self.tokenizer)
+    }
+
+    /// Embeds one bounded slice of prepared documents, preserving slice order.
+    pub fn embed_prepared(
+        &self,
+        documents: &[PreparedDocument],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<QuantizedVector>, EmbedError> {
+        batch_boundary(|| {
+            let vectors = self.encode_prepared_float(documents, control)?;
+            let result = vectors.iter().map(|vector| quantize(vector)).collect();
+            control.check()?;
+            result
+        })
+    }
+
+    /// Full-dimensional prepared output for numerical reference evaluation.
+    #[cfg(feature = "test-support")]
+    pub fn embed_prepared_reference(
+        &self,
+        documents: &[PreparedDocument],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        batch_boundary(|| self.encode_prepared_float(documents, control))
+    }
+
+    fn encode_prepared_float(
+        &self,
+        documents: &[PreparedDocument],
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        control.check()?;
+        let (batch, tokens) = prepared_shape(documents)?;
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+        let (ids, masks) = pad_prepared(documents, tokens)?;
+        self.encode_tokens(ids, masks, batch, tokens, control)
+    }
+
     fn encode_float(
         &self,
         texts: &[String],
@@ -537,12 +724,23 @@ impl Embedder {
             .iter()
             .flat_map(|encoding| encoding.get_attention_mask().iter().copied())
             .collect();
-        let ids = Tensor::from_vec(ids, (texts.len(), tokens), &self.device).map_err(runtime)?;
-        let mask = Tensor::from_vec(masks, (texts.len(), tokens), &self.device).map_err(runtime)?;
+        self.encode_tokens(ids, masks, texts.len(), tokens, control)
+    }
+
+    fn encode_tokens(
+        &self,
+        ids: Vec<u32>,
+        masks: Vec<u32>,
+        batch: usize,
+        tokens: usize,
+        control: &EmbeddingControl<'_>,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let ids = Tensor::from_vec(ids, (batch, tokens), &self.device).map_err(runtime)?;
+        let mask = Tensor::from_vec(masks, (batch, tokens), &self.device).map_err(runtime)?;
         control.check()?;
         let hidden = self.model.forward(&ids, &mask, control)?;
         control.check()?;
-        if hidden.dims() != [texts.len(), tokens, FULL_DIMENSIONS] {
+        if hidden.dims() != [batch, tokens, FULL_DIMENSIONS] {
             return Err(EmbedError::Runtime("unexpected model output shape".into()));
         }
         // Pool all non-padding tokens, including the retrieval prompt. Keep the
@@ -700,6 +898,170 @@ pub fn quantize(vector: &[f32]) -> Result<QuantizedVector, EmbedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_tokenizer() -> Tokenizer {
+        let mut tokenizer = Tokenizer::from_bytes(
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": {"type": "NFC"},
+                "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {"[UNK]": 0, "a": 1, "é": 2},
+                    "unk_token": "[UNK]"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_TOKENS,
+                ..Default::default()
+            }))
+            .unwrap();
+        tokenizer.with_padding(Some(PaddingParams {
+            pad_id: 151_643,
+            ..Default::default()
+        }));
+        tokenizer
+    }
+
+    #[test]
+    fn prepared_documents_match_prompted_unpadded_ids_and_original_batch_padding() {
+        let tokenizer = test_tokenizer();
+        let documents_tokenizer = DocumentTokenizer::from_tokenizer(&tokenizer);
+        let texts = vec![
+            " a e\u{301} \u{1c}".into(),
+            "a ".repeat(MAX_TOKENS + 10),
+            "界".repeat(MAX_INPUT_BYTES),
+            String::new(),
+        ];
+        let cancel = AtomicBool::new(false);
+        let control = EmbeddingControl::new(&cancel);
+        let documents = documents_tokenizer.prepare(&texts, &control).unwrap();
+        let original = tokenizer
+            .encode_batch(
+                texts
+                    .iter()
+                    .map(|text| prepare_input(text, InputKind::Document))
+                    .collect::<Vec<_>>(),
+                false,
+            )
+            .unwrap();
+        for (document, original) in documents.iter().zip(&original) {
+            let PreparedDocumentInput::Tokens(ids) = &document.input else {
+                panic!("production preparation must retain ids");
+            };
+            let actual_len = original.get_attention_mask().iter().sum::<u32>() as usize;
+            assert_eq!(document.token_len(), actual_len);
+            assert_eq!(ids, &original.get_ids()[..actual_len]);
+        }
+        assert!(documents[0].token_len() < documents[1].token_len());
+        assert_eq!(documents[1].token_len(), MAX_TOKENS);
+        let (_, tokens) = prepared_shape(&documents).unwrap();
+        let (ids, masks) = pad_prepared(&documents, tokens).unwrap();
+        assert_eq!(
+            ids,
+            original
+                .iter()
+                .flat_map(|row| row.get_ids().iter().copied())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            masks,
+            original
+                .iter()
+                .flat_map(|row| row.get_attention_mask().iter().copied())
+                .collect::<Vec<_>>()
+        );
+        // Preparation disables padding only on the clone.
+        assert!(tokenizer.get_padding().is_some());
+        assert!(
+            documents_tokenizer
+                .tokenizer
+                .as_ref()
+                .unwrap()
+                .get_padding()
+                .is_none()
+        );
+        let mut sorted = documents.clone();
+        sorted.sort_by_key(PreparedDocument::token_len);
+        assert!(
+            sorted
+                .windows(2)
+                .all(|pair| pair[0].token_len() <= pair[1].token_len())
+        );
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            documents_tokenizer.prepare(&texts, &control),
+            Err(EmbedError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn prepared_slices_bound_padded_work_and_document_count() {
+        let tokens = |count| PreparedDocument {
+            input: PreparedDocumentInput::Tokens(vec![1; count]),
+        };
+        for (length, count) in [(512, 16), (128, 64), (64, 128), (1, 128)] {
+            let mut documents = vec![tokens(length); count];
+            assert_eq!(prepared_shape(&documents).unwrap(), (count, length));
+            documents.push(tokens(length));
+            assert!(matches!(
+                prepared_shape(&documents),
+                Err(EmbedError::InvalidInput(_))
+            ));
+        }
+        // Work uses the longest padded row, not the sum of unpadded lengths.
+        let mut mixed = vec![tokens(1); 16];
+        mixed.push(tokens(512));
+        assert!(matches!(
+            prepared_shape(&mixed),
+            Err(EmbedError::InvalidInput(_))
+        ));
+        assert_eq!(prepared_shape(&[]).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn injected_embedders_need_only_existing_embed_implementation() {
+        struct Injected;
+        impl SearchEmbedder for Injected {
+            fn embed(
+                &self,
+                texts: &[String],
+                kind: InputKind,
+                control: &EmbeddingControl<'_>,
+            ) -> Result<Vec<QuantizedVector>, EmbedError> {
+                control.check()?;
+                assert_eq!(kind, InputKind::Document);
+                assert_eq!(texts, &["original text ".to_owned()]);
+                Ok(vec![QuantizedVector { values: vec![42] }])
+            }
+        }
+        let model: Box<dyn SearchEmbedder> = Box::new(Injected);
+        let cancel = AtomicBool::new(false);
+        let control = EmbeddingControl::new(&cancel);
+        let documents = model
+            .document_tokenizer()
+            .prepare(&["original text ".into()], &control)
+            .unwrap();
+        assert_eq!(documents[0].token_len(), MAX_TOKENS);
+        assert_eq!(
+            model.embed_prepared(&documents, &control).unwrap()[0].values,
+            vec![42]
+        );
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            model.embed_prepared(&documents, &control),
+            Err(EmbedError::Cancelled)
+        ));
+    }
 
     #[test]
     fn production_quantization_truncates_and_uses_per_vector_scale() {

@@ -157,7 +157,7 @@ fn startup_stops_at_cap_without_evicting_an_active_matrix() {
 }
 #[test]
 fn unpublished_delta_keeps_the_old_charge_and_releases_everything_on_cancel() {
-    let core = core(1_000_000);
+    let core = core(MATRIX_FILL_SCRATCH + 1_000_000);
     let (_source, registration) = register(&core);
     build(&registration.head, 1, 2).unwrap();
     let old = used(&core);
@@ -175,7 +175,7 @@ fn unpublished_delta_keeps_the_old_charge_and_releases_everything_on_cancel() {
         1,
         None,
         &mut || {
-            assert!(used(&core) <= 1_000_000);
+            assert!(used(&core) <= MATRIX_FILL_SCRATCH + 1_000_000);
             if !registration.head.resident()? {
                 observed_unpublished = true;
                 assert!(
@@ -193,7 +193,7 @@ fn unpublished_delta_keeps_the_old_charge_and_releases_everything_on_cancel() {
 }
 #[test]
 fn cold_replacement_and_stop_keep_inflight_bytes_until_the_build_drops() {
-    let core = core(1_000_000);
+    let core = core(MATRIX_FILL_SCRATCH + 1_000_000);
     let (_source, registration) = register(&core);
     build(&registration.head, 1, 1).unwrap();
     let old = used(&core);
@@ -217,7 +217,7 @@ fn cold_replacement_and_stop_keep_inflight_bytes_until_the_build_drops() {
 }
 #[test]
 fn registration_drop_idle_clear_and_failed_build_release_reservations() {
-    let core = core(1_000_000);
+    let core = core(MATRIX_FILL_SCRATCH + 1_000_000);
     let (_source, registration) = register(&core);
     build(&registration.head, 1, 1).unwrap();
     assert!(used(&core) > 0);
@@ -375,7 +375,7 @@ fn exact_cold_limit_keeps_fill_allowance_and_completes_without_another_query() {
 
 #[test]
 fn fill_staging_charge_outlives_unregistration_until_owner_job_drops_it() {
-    let core = core(1_000_000);
+    let core = core(MATRIX_FILL_SCRATCH + 1_000_000);
     let (_source, registration) = register(&core);
     build(&registration.head, 1, 1).unwrap();
     let scratch = registration.head.fill_scratch().unwrap();
@@ -540,7 +540,7 @@ fn local_delta_keeps_resident_matrix_without_full_head_enumeration() {
             writer.put_many(&entries)
         })
         .unwrap();
-    let limit = 100_000;
+    let limit = MATRIX_FILL_SCRATCH + 100_000;
     let owner = SearchFill::start_with_limit_for_tests(service.clone(), limit).unwrap();
     let source = Arc::new(DeltaPeakSource {
         revised: AtomicBool::new(false),

@@ -195,6 +195,8 @@ pub struct SearchService {
     model_configured: bool,
     model_clock: ModelClock,
     maintenance: Mutex<Option<Weak<super::search_fill::Core>>>,
+    #[cfg(test)]
+    pub(crate) before_fill_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl SearchService {
@@ -242,14 +244,21 @@ impl SearchService {
             model_configured,
             model_clock: Arc::new(std::time::Instant::now),
             maintenance: Mutex::new(None),
+            #[cfg(test)]
+            before_fill_put: Mutex::new(None),
         })
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn wait_for_queued_query_for_tests(&self) {
+        self.wait_for_queued_queries_for_tests(1);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_for_queued_queries_for_tests(&self, count: usize) {
         let deadline = std::time::Instant::now() + crate::testing::HANG_BACKSTOP;
         let mut admission = self.admission.lock().unwrap();
-        while admission.queries.is_empty() {
+        while admission.queries.len() < count {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!remaining.is_zero(), "query did not enter the owner queue");
             admission = self
@@ -570,6 +579,40 @@ impl SearchService {
                 .unwrap_or_else(|error| error.into_inner());
             let _ = request.reply.send(result);
             self.model_changed.notify_all();
+        }
+    }
+
+    /// Pipeline workers publish completion under the same mutex as query enqueue,
+    /// so the model owner can wait for either without polling or lost wakeups.
+    pub(crate) fn fill_progress(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.model_changed.notify_all();
+    }
+
+    pub(crate) fn wait_fill_progress<T>(
+        &self,
+        model: &dyn SearchEmbedder,
+        mut ready: impl FnMut() -> Option<T>,
+    ) -> T {
+        loop {
+            self.serve_queries(model);
+            let mut admission = self
+                .admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(value) = ready() {
+                return value;
+            }
+            if admission.queries.is_empty() {
+                admission = self
+                    .model_changed
+                    .wait(admission)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+            drop(admission);
         }
     }
 

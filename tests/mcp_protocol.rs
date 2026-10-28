@@ -12679,20 +12679,21 @@ async fn mcp_search_fill_serves_queued_query_between_real_batches_and_reports_bu
     assert!(status["modelId"].is_string());
     assert_eq!(status["backend"], "cpu");
     assert_eq!(status["declarations"], 17);
-    assert_eq!(status["embedded"], 16);
+    // The queued query runs before the asynchronous cache write is published.
+    assert_eq!(status["embedded"], 0);
     let hits = envelope["data"]["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 17);
     assert_eq!(
         hits.iter()
             .filter(|hit| hit["matchedBy"] == json!(["lexical", "vector"]))
             .count(),
-        16
+        0
     );
     assert_eq!(
         hits.iter()
             .filter(|hit| hit["matchedBy"] == json!(["lexical"]))
             .count(),
-        1
+        17
     );
     assert_eq!(envelope["partial"], false);
     assert_eq!(
