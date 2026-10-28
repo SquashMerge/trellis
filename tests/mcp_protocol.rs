@@ -6944,9 +6944,15 @@ async fn mcp_find_corrupt_scope_row_fails_only_when_hydrated() {
         drop(writer);
         let response = store.evidence_response().unwrap();
         if query != "Beta" {
-            response
+            let found = response
                 .mcp_find(query, 20, None)
                 .unwrap_or_else(|error| panic!("{query}: {error:#}"));
+            assert_eq!(
+                found.symbols.len(),
+                usize::from(query == "Alpha"),
+                "{query}"
+            );
+            assert_eq!(found.scope[3], [1, 1, 0, 0, 1], "{query}");
             response.finish(()).unwrap();
             continue;
         }

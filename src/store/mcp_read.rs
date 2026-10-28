@@ -603,9 +603,9 @@ impl EvidenceResponse {
             "SELECT s.id,m.language,m.path,m.coverage_selected,m.coverage_state,
                     d.id,d.vid,r.native_revision_id,d.producer_id
             FROM revision_documents m
-            JOIN native_source_sets s ON 1=1
-            LEFT JOIN native_revisions r ON r.id=m.revision_id AND r.source_set_id=s.id
-            LEFT JOIN document_versions d ON r.id IS NOT NULL AND d.vid=m.vid
+            JOIN native_revisions r ON r.id=m.revision_id
+            JOIN native_source_sets s ON s.id=r.source_set_id
+            LEFT JOIN document_versions d ON d.vid=m.vid
               AND d.language=m.language AND d.path=m.path
             WHERE m.revision_id=?1 ORDER BY s.id,m.language,m.path",
         )?;

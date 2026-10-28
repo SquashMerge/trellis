@@ -720,7 +720,7 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
 }
 
 #[test]
-fn empty_search_hydration_rejects_unrelated_corrupt_scope() {
+fn search_hydration_validates_coverage_only_for_hydrated_documents() {
     let (_state, root, store, cancel) = fixture();
     fs::write(root.path().join("other.rs"), "fn other() {}\n").unwrap();
     let leader = store.publication_for_tests().unwrap();
@@ -733,14 +733,23 @@ fn empty_search_hydration_rejects_unrelated_corrupt_scope() {
         .mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
         .unwrap();
     assert!(candidates.lexical.is_empty());
+    // #261: a defect in a document no candidate reaches does not fail hydration.
+    let empty = read.mcp_search_hydrate(&[], pin, &mut || Ok(())).unwrap();
+    assert!(empty.symbols.is_empty());
+    assert_eq!(empty.scope[1], [1, 1, 0, 0, 1]);
+    let other = read
+        .mcp_search_candidates("other", Some(pin), &mut || Ok(()))
+        .unwrap();
+    assert_eq!(other.lexical.len(), 1);
     let error = read
-        .mcp_search_hydrate(&[], pin, &mut || Ok(()))
+        .mcp_search_hydrate(&other.lexical, pin, &mut || Ok(()))
         .map(|_| ())
         .unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("store_unavailable: inconsistent native coverage tuple")
+            .contains("store_unavailable: inconsistent native coverage tuple"),
+        "{error:#}"
     );
 }
 
