@@ -1541,28 +1541,8 @@ fn read_semantic_input_before_open(
     before_open: impl FnOnce(),
 ) -> Result<Vec<u8>> {
     use std::io::Read;
-    crate::scip_admission::validate_selected_role(root, path)
-        .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_file(),
-        "invalid_request: semantic input must be a regular file"
-    );
-    ensure!(
-        metadata.len() <= max,
-        "invalid_request: semantic import input bound"
-    );
-    before_open();
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("invalid_request: semantic input open: {error}"))?;
-    ensure!(
-        file.metadata()?.is_file(),
-        "invalid_request: semantic input must be a regular file"
-    );
+    let (file, len) = open_semantic_input_before_open(root, path, before_open)?;
+    ensure!(len <= max, "invalid_request: semantic import input bound");
     let mut bytes = Vec::new();
     file.take(max + 1).read_to_end(&mut bytes)?;
     ensure!(
@@ -1572,9 +1552,118 @@ fn read_semantic_input_before_open(
     Ok(bytes)
 }
 
+/// Opens a selected semantic input under `root` with the no-follow, nonblocking, regular-file
+/// rules and returns the file with its length.
+pub(crate) fn open_semantic_input(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(std::fs::File, u64)> {
+    open_semantic_input_before_open(root, path, || {})
+}
+
+fn open_semantic_input_before_open(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    before_open: impl FnOnce(),
+) -> Result<(std::fs::File, u64)> {
+    crate::scip_admission::validate_selected_role(root, path)
+        .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file(),
+        "invalid_request: semantic input must be a regular file"
+    );
+    before_open();
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("invalid_request: semantic input open: {error}"))?;
+    let opened = file.metadata()?;
+    ensure!(
+        opened.is_file(),
+        "invalid_request: semantic input must be a regular file"
+    );
+    Ok((file, opened.len()))
+}
+
+/// Digest and length of an input copied by `copy_semantic_input_to_stage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopiedInput {
+    pub(crate) sha256: String,
+    pub(crate) len: u64,
+}
+
+/// Streams `reader` into `dest` in chunks of at most `chunk` bytes, hashing while copying.
+/// Reads stop at `max + 1` bytes; a larger input is `LimitExceeded("artifact bytes")`.
+/// `progress` receives the running total after every chunk.
+pub(crate) fn copy_stream_to_stage(
+    reader: impl std::io::Read,
+    dest: &std::path::Path,
+    max: u64,
+    chunk: usize,
+    mut progress: impl FnMut(u64) -> Result<()>,
+) -> Result<CopiedInput> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    let mut reader = reader.take(max.saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; chunk];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > max {
+            return Err(
+                crate::scip_raw::ScipCaptureError::LimitExceeded("artifact bytes".into()).into(),
+            );
+        }
+        hasher.update(&buffer[..read]);
+        out.write_all(&buffer[..read])?;
+        progress(total)?;
+    }
+    out.flush()?;
+    Ok(CopiedInput {
+        sha256: hex::encode(hasher.finalize()),
+        len: total,
+    })
+}
+
+/// Copies one selected artifact into the stage in 1 MiB chunks.
+pub(crate) fn copy_semantic_input_to_stage(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    dest: &std::path::Path,
+    max: u64,
+    progress: impl FnMut(u64) -> Result<()>,
+) -> Result<CopiedInput> {
+    let (file, len) = open_semantic_input(root, path)?;
+    if len > max {
+        return Err(
+            crate::scip_raw::ScipCaptureError::LimitExceeded("artifact bytes".into()).into(),
+        );
+    }
+    copy_stream_to_stage(
+        file,
+        dest,
+        max,
+        crate::semantic_batch::limits::IO_BUFFER_BYTES as usize,
+        progress,
+    )
+}
+
 #[cfg(test)]
 mod semantic_input_tests {
     use super::read_semantic_input;
+    use sha2::Digest;
 
     #[test]
     fn selected_input_replaced_by_symlink_before_open_is_rejected() {
@@ -1607,6 +1696,60 @@ mod semantic_input_tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"next").unwrap();
         assert_eq!(read_semantic_input(root.path(), &path, 4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn artifact_copy_streams_and_hashes_in_bounded_chunks() {
+        use std::io::Read;
+        struct Spy<R>(R, usize);
+        impl<R: Read> Read for Spy<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.1 = self.1.max(buffer.len());
+                self.0.read(buffer)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("big.scip");
+        let bytes: Vec<u8> = (0..(2 * 1024 * 1024 + 17))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let dest = root.path().join("copy.scip");
+        let mut spy = Spy(std::fs::File::open(&source).unwrap(), 0);
+        let mut totals = vec![];
+        let copied = super::copy_stream_to_stage(&mut spy, &dest, 3 * 1024 * 1024, 1 << 20, |t| {
+            totals.push(t);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(copied.len, bytes.len() as u64);
+        assert_eq!(copied.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        assert_eq!(spy.1, 1 << 20, "no read larger than one chunk");
+        assert!(totals.len() >= 3);
+        let over = root.path().join("over.scip");
+        let error =
+            super::copy_stream_to_stage(&bytes[..], &over, 1024, 1 << 20, |_| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("artifact bytes"));
+        let via_file = root.path().join("via.scip");
+        let copied =
+            super::copy_semantic_input_to_stage(root.path(), &source, &via_file, 4 << 20, |_| {
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(copied.len, bytes.len() as u64);
+        let symlink = root.path().join("link.scip");
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        assert!(
+            super::copy_semantic_input_to_stage(
+                root.path(),
+                &symlink,
+                &root.path().join("x"),
+                4 << 20,
+                |_| Ok(())
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2020,6 +2163,7 @@ pub fn establish_serving_session(
         })?;
         let (_, session) = store.recreate_pending_writer_session(options, cancel)?;
         session.verify()?;
+        sweep_abandoned_semantic_stages(store);
         return Ok(session);
     }
     let session = store.writer_session()?;
@@ -2040,7 +2184,16 @@ pub fn establish_serving_session(
     )?;
     coordinator.run_serving(&options, cancel, |_| {})?;
     session.verify()?;
+    sweep_abandoned_semantic_stages(store);
     Ok(session)
+}
+
+/// Startup reconciliation has committed and no attempt is active, so every stage directory
+/// left in the index directory belongs to a crashed attempt.
+fn sweep_abandoned_semantic_stages(store: &Store) {
+    if let Ok(index_dir) = store.semantic_stage_parent() {
+        crate::semantic_batch::staging::remove_abandoned_semantic_stages(&index_dir);
+    }
 }
 
 #[cfg(test)]

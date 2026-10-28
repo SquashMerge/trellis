@@ -66,3 +66,20 @@ fn test_limits_override_named_fields_and_reject_unknown_keys() {
     assert_eq!(parsed.pages, BatchLimits::PRODUCTION.pages);
     assert!(serde_json::from_str::<BatchLimits>(r#"{"nope": 1}"#).is_err());
 }
+
+#[test]
+fn cache_budget_fits_sixty_four_mebibytes() {
+    use super::limits::*;
+    // The native reader's live PRAGMA is added by the integration test of the same name.
+    let kib = |bytes: u64| bytes / 1024;
+    let total = STAGE_CACHE_KIB
+        + STAGE_ATTACH_CACHE_KIB
+        + kib(BatchLimits::PRODUCTION.document_cache_bytes)
+        + kib(IO_BUFFER_BYTES * IO_BUFFERS)
+        + NATIVE_READER_CACHE_KIB
+        + BATCH_WRITER_CACHE_KIB;
+    assert!(
+        total <= kib(BatchLimits::PRODUCTION.cache_bytes),
+        "{total} KiB"
+    );
+}

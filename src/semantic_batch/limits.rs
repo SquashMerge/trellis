@@ -5,6 +5,24 @@ use serde::Deserialize;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
+/// Size of every streaming I/O buffer: artifact copy, decoder reader, blob writer and the
+/// source-inventory reader.
+pub const IO_BUFFER_BYTES: u64 = MIB;
+/// Number of such buffers that count against `cache_bytes`.
+pub const IO_BUFFERS: u64 = 4;
+/// `PRAGMA cache_size` of the stage connection, in KiB.
+pub const STAGE_CACHE_KIB: u64 = 8 * 1024;
+/// `PRAGMA stage.cache_size` of the schema the publishing writer attaches, in KiB.
+pub const STAGE_ATTACH_CACHE_KIB: u64 = 2 * 1024;
+/// `PRAGMA cache_size` of the native reader used by batch staging, in KiB.
+pub const NATIVE_READER_CACHE_KIB: u64 = 16 * 1024;
+/// `PRAGMA cache_size` the batch publication writer applies, in KiB.
+pub const BATCH_WRITER_CACHE_KIB: u64 = 16 * 1024;
+/// The stage directory is measured after this many staged rows.
+pub const STAGE_CHECK_ROWS: u64 = 10_000;
+/// The stage directory is measured after this many artifact bytes are copied.
+pub const STAGE_CHECK_COPIED_BYTES: u64 = 16 * MIB;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BatchLimits {

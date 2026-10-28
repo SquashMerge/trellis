@@ -911,6 +911,162 @@ fn derived_graph_bytes(
     Ok(total)
 }
 
+/// Header of a retained native revision: everything but the document inventory.
+pub struct NativeHeader {
+    pub source_set: crate::native_evidence::SourceSet,
+    pub revision: crate::native_evidence::Revision,
+    pub producer: crate::native_evidence::Producer,
+}
+
+/// One retained native document: its exact source bytes and measured native rows.
+pub struct NativeDocumentRows {
+    pub source: Vec<u8>,
+    pub coverage: crate::native_evidence::Coverage,
+    pub provenance: crate::native_evidence::Provenance,
+    pub declarations: Vec<crate::native_evidence::Declaration>,
+    pub calls: Vec<crate::native_evidence::Call>,
+    pub control_regions: Vec<crate::native_evidence::ControlRegion>,
+    pub references: Vec<crate::native_evidence::Reference>,
+    pub capability_report: crate::native_evidence::CapabilityReport,
+    pub search_cards: Vec<crate::search_capture::CapturedCard>,
+}
+
+/// Reads one retained native revision inside a single read transaction, one document at a time.
+pub struct NativeReader<'a> {
+    store: &'a Store,
+    db: &'a Connection,
+    selected: &'a ReadRevision,
+}
+
+impl NativeReader<'_> {
+    #[cfg(feature = "test-support")]
+    pub fn cache_size_kib(&self) -> Result<i64> {
+        let pages: i64 = self
+            .db
+            .pragma_query_value(None, "cache_size", |r| r.get(0))?;
+        Ok(-pages)
+    }
+
+    pub fn header(&self) -> Result<NativeHeader> {
+        Store::read_native_header(self.db, self.selected)
+    }
+
+    /// The retained source bytes of one inventory entry, checked against its identity.
+    pub fn source_bytes(&self, document: &crate::native_evidence::Document) -> Result<Vec<u8>> {
+        self.store
+            .read_native_source(self.db, self.selected, document)
+    }
+
+    pub fn document(
+        &self,
+        document: &crate::native_evidence::Document,
+    ) -> Result<NativeDocumentRows> {
+        self.store
+            .read_native_document(self.db, self.selected, document)
+    }
+
+    /// Streams the stored source inventory through SQLite incremental blob I/O and a 1 MiB
+    /// buffer, yielding one entry at a time. The array is never held whole.
+    pub fn inventory(&self) -> Result<InventoryStream<'_>> {
+        let rowid: i64 = self.db.query_row(
+            "SELECT rowid FROM native_revisions WHERE id=?1",
+            [&self.selected.key],
+            |row| row.get(0),
+        )?;
+        let blob = self.db.blob_open(
+            rusqlite::MAIN_DB,
+            "native_revisions",
+            "source_inventory",
+            rowid,
+            true,
+        )?;
+        Ok(InventoryStream {
+            reader: std::io::BufReader::with_capacity(1 << 20, blob),
+            state: InventoryState::Start,
+        })
+    }
+}
+
+enum InventoryState {
+    Start,
+    Elements,
+    Done,
+}
+
+/// Pull parser over the stored `[Document, ...]` array.
+pub struct InventoryStream<'a> {
+    reader: std::io::BufReader<rusqlite::blob::Blob<'a>>,
+    state: InventoryState,
+}
+
+impl InventoryStream<'_> {
+    fn corrupt<T>() -> Result<T> {
+        Err(SelectedIntegrity("incompatible_index: corrupt retained native manifest".into()).into())
+    }
+
+    /// Next non-whitespace byte, consumed.
+    fn token(&mut self) -> Result<Option<u8>> {
+        use std::io::BufRead;
+        loop {
+            let buffer = self.reader.fill_buf()?;
+            let Some(&byte) = buffer.first() else {
+                return Ok(None);
+            };
+            self.reader.consume(1);
+            if !byte.is_ascii_whitespace() {
+                return Ok(Some(byte));
+            }
+        }
+    }
+
+    pub fn next_document(&mut self) -> Result<Option<crate::native_evidence::Document>> {
+        loop {
+            match self.state {
+                InventoryState::Done => return Ok(None),
+                InventoryState::Start => {
+                    if self.token()? != Some(b'[') {
+                        return Self::corrupt();
+                    }
+                    match self.peek()? {
+                        Some(b']') => {
+                            self.token()?;
+                            self.state = InventoryState::Done;
+                        }
+                        _ => self.state = InventoryState::Elements,
+                    }
+                }
+                InventoryState::Elements => {
+                    let mut elements = serde_json::Deserializer::from_reader(&mut self.reader);
+                    let document = match serde::Deserialize::deserialize(&mut elements) {
+                        Ok(document) => document,
+                        Err(_) => return Self::corrupt(),
+                    };
+                    match self.token()? {
+                        Some(b',') => {}
+                        Some(b']') => self.state = InventoryState::Done,
+                        _ => return Self::corrupt(),
+                    }
+                    return Ok(Some(document));
+                }
+            }
+        }
+    }
+
+    fn peek(&mut self) -> Result<Option<u8>> {
+        use std::io::BufRead;
+        loop {
+            let buffer = self.reader.fill_buf()?;
+            let Some(&byte) = buffer.first() else {
+                return Ok(None);
+            };
+            if !byte.is_ascii_whitespace() {
+                return Ok(Some(byte));
+            }
+            self.reader.consume(1);
+        }
+    }
+}
+
 /// One selected document's source and native rows with the graph projected
 /// from them once.
 struct SelectedDocument {
@@ -13875,6 +14031,11 @@ impl Store {
         self.roots.existing_index_dir(&self.identity)
     }
 
+    /// Directory that holds per-operation semantic stages: the existing index directory.
+    pub(crate) fn semantic_stage_parent(&self) -> Result<std::path::PathBuf> {
+        self.roots.existing_index_dir(&self.identity)
+    }
+
     pub(crate) fn begin_writer_publication(&self, session: &topology::WriterSession) -> Result<()> {
         // A routine capture does not invalidate the committed head. Public
         // readers keep their own selected snapshot while the writer prepares
@@ -17853,6 +18014,24 @@ impl Store {
         })
     }
 
+    /// Runs `read` over one retained native revision in a single read transaction.
+    pub fn with_native_reader<T>(
+        &self,
+        pin: IndexPin,
+        read: impl FnOnce(&NativeReader<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.native_at(pin, |db, selected| {
+            // The response connection is per request: bound its page cache for batch staging.
+            let kib = crate::semantic_batch::limits::NATIVE_READER_CACHE_KIB;
+            storage_result(db.pragma_update(None, "cache_size", -i64::try_from(kib)?))?;
+            read(&NativeReader {
+                store: self,
+                db,
+                selected,
+            })
+        })
+    }
+
     fn native_at_reconcile<T>(
         &self,
         pin: IndexPin,
@@ -19360,10 +19539,79 @@ impl Store {
         BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
     )> {
         use crate::native_evidence as n;
-        let (source_set_id, native_id, toolchain_hash, config_hash, dependency_hash, inventory): (String,String,String,String,String,String) = db.query_row("SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash,source_inventory FROM native_revisions WHERE id=?1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        #[cfg(feature = "test-support")]
+        crate::semantic_batch::testing::note_whole_snapshot_read();
+        let inventory: String = db.query_row(
+            "SELECT source_inventory FROM native_revisions WHERE id=?1",
+            [&selected.key],
+            |r| r.get(0),
+        )?;
         let documents: Vec<n::Document> = serde_json::from_str(&inventory).context(
             SelectedIntegrity("incompatible_index: corrupt retained native manifest".into()),
         )?;
+        let NativeHeader {
+            source_set,
+            mut revision,
+            producer,
+        } = Self::read_native_header(db, selected)?;
+        revision.documents = documents;
+        let mut sources = BTreeMap::new();
+        let (
+            mut coverage,
+            mut provenance,
+            mut declarations,
+            mut calls,
+            mut control_regions,
+            mut references,
+            mut capability_reports,
+            mut search_cards,
+        ) = (
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        for document in &revision.documents {
+            if loaded_docs.is_some_and(|loaded| !loaded.contains(&document.key)) {
+                continue;
+            }
+            let rows = self.read_native_document(db, selected, document)?;
+            sources.insert(document.key.clone(), rows.source);
+            coverage.push(rows.coverage);
+            provenance.push(rows.provenance);
+            declarations.extend(rows.declarations);
+            calls.extend(rows.calls);
+            control_regions.extend(rows.control_regions);
+            references.extend(rows.references);
+            capability_reports.push(rows.capability_report);
+            search_cards.extend(rows.search_cards);
+        }
+        Ok((
+            n::Artifact {
+                producer,
+                source_set,
+                revision,
+                coverage,
+                provenance,
+                declarations,
+                calls,
+                control_regions,
+                references,
+                capability_reports,
+                search_cards,
+            },
+            sources,
+        ))
+    }
+
+    /// Header rows of a retained native revision. The document inventory is not read.
+    fn read_native_header(db: &Connection, selected: &ReadRevision) -> Result<NativeHeader> {
+        use crate::native_evidence as n;
+        let (source_set_id, native_id, toolchain_hash, config_hash, dependency_hash): (String,String,String,String,String) = db.query_row("SELECT source_set_id,native_revision_id,toolchain_hash,config_hash,dependency_hash FROM native_revisions WHERE id=?1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         let (producer_id, producer_version): (String,String) = db.query_row("SELECT producer_id,producer_version FROM document_versions d JOIN revision_documents m ON m.vid=d.vid WHERE m.revision_id=?1 LIMIT 1",[&selected.key],|r|Ok((r.get(0)?,r.get(1)?)))?;
         let (executable_hash,kind,position_encoding): (String,String,String) = db.query_row("SELECT executable_hash,kind,position_encoding FROM native_producers WHERE id=?1 AND version=?2",params![producer_id,producer_version],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let languages = semantic_ordered(
@@ -19390,99 +19638,86 @@ impl Store {
         let revision = n::Revision {
             id: native_id,
             source_set_id,
-            documents,
+            documents: vec![],
             toolchain_hash,
             config_hash,
             dependency_hash,
         };
-        let mut sources = BTreeMap::new();
-        let (
-            mut coverage,
-            mut provenance,
-            mut declarations,
-            mut calls,
-            mut control_regions,
-            mut references,
-            mut capability_reports,
-            mut search_cards,
-        ) = (
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
-        for document in &revision.documents {
-            if loaded_docs.is_some_and(|loaded| !loaded.contains(&document.key)) {
-                continue;
-            }
-            #[cfg(feature = "test-support")]
-            crate::semantic_import::note_selected_original_native_row(&document.key);
-            let scope = v8_native_scope_for(db, &document.key, selected)?.context(
-                SelectedIntegrity("incompatible_index: retained native document absent".into()),
-            )?;
-            let source = self
-                .selected_source_row_for(db, &document.key.path, selected)?
-                .context(SelectedIntegrity(
-                    "incompatible_index: retained source missing".into(),
-                ))?;
-            selected_ensure!(
-                source.language == document.key.language
-                    && source.hash == document.content_hash
-                    && source.text.len() == document.byte_length,
-                "incompatible_index: retained source identity mismatch"
-            );
-            #[cfg(feature = "test-support")]
-            crate::semantic_import::note_selected_original_source_bytes(
-                &document.key,
-                source.text.len(),
-            );
-            sources.insert(document.key.clone(), source.text.into_bytes());
-            coverage.push(read_native_coverage_v8(db, &scope)?);
-            provenance.push(n::Provenance {
+        Ok(NativeHeader {
+            source_set,
+            revision,
+            producer: n::Producer {
+                id: producer_id,
+                version: producer_version,
+                executable_hash,
+                kind,
+                languages,
+                position_encoding,
+            },
+        })
+    }
+
+    /// One retained document's source bytes and native rows, checked against its inventory entry.
+    fn read_native_document(
+        &self,
+        db: &Connection,
+        selected: &ReadRevision,
+        document: &crate::native_evidence::Document,
+    ) -> Result<NativeDocumentRows> {
+        use crate::native_evidence as n;
+        #[cfg(feature = "test-support")]
+        crate::semantic_import::note_selected_original_native_row(&document.key);
+        let scope = v8_native_scope_for(db, &document.key, selected)?.context(
+            SelectedIntegrity("incompatible_index: retained native document absent".into()),
+        )?;
+        let source = self.read_native_source(db, selected, document)?;
+        Ok(NativeDocumentRows {
+            source,
+            coverage: read_native_coverage_v8(db, &scope)?,
+            provenance: n::Provenance {
                 id: scope.proof_id(),
                 producer_id: scope.producer_id.clone(),
                 document: document.key.clone(),
-                revision_id: revision.id.clone(),
+                revision_id: scope.native_revision_id.clone(),
                 content_hash: document.content_hash.clone(),
                 evidence_kind: "measuredSyntax".into(),
                 basis: None,
                 freshness: "fresh".into(),
                 derived_from: None,
-            });
-            declarations.extend(read_native_declarations_v8(db, &scope, None, true)?);
-            calls.extend(read_native_calls_v8(db, &scope, None)?);
-            control_regions.extend(read_native_control_regions_v8(db, &scope, None)?);
-            references.extend(read_native_references(db, &scope, None)?);
-            capability_reports.push(read_native_capability_report(db, &scope)?);
-            search_cards.extend(search::read_cards(db, scope.vid, &document.key.path)?);
-        }
-        Ok((
-            n::Artifact {
-                producer: n::Producer {
-                    id: producer_id,
-                    version: producer_version,
-                    executable_hash,
-                    kind,
-                    languages,
-                    position_encoding,
-                },
-                source_set,
-                revision,
-                coverage,
-                provenance,
-                declarations,
-                calls,
-                control_regions,
-                references,
-                capability_reports,
-                search_cards,
             },
-            sources,
-        ))
+            declarations: read_native_declarations_v8(db, &scope, None, true)?,
+            calls: read_native_calls_v8(db, &scope, None)?,
+            control_regions: read_native_control_regions_v8(db, &scope, None)?,
+            references: read_native_references(db, &scope, None)?,
+            capability_report: read_native_capability_report(db, &scope)?,
+            search_cards: search::read_cards(db, scope.vid, &document.key.path)?,
+        })
+    }
+
+    /// The retained source bytes of one inventory entry, checked against its identity.
+    fn read_native_source(
+        &self,
+        db: &Connection,
+        selected: &ReadRevision,
+        document: &crate::native_evidence::Document,
+    ) -> Result<Vec<u8>> {
+        let source = self
+            .selected_source_row_for(db, &document.key.path, selected)?
+            .context(SelectedIntegrity(
+                "incompatible_index: retained source missing".into(),
+            ))?;
+        selected_ensure!(
+            source.language == document.key.language
+                && source.hash == document.content_hash
+                && source.text.len() == document.byte_length,
+            "incompatible_index: retained source identity mismatch"
+        );
+        #[cfg(feature = "test-support")]
+        crate::semantic_import::note_selected_original_source_bytes(
+            &document.key,
+            source.text.len(),
+        );
+        Ok(source.text.into_bytes())
     }
 
     pub fn native_source_at(
