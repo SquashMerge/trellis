@@ -1177,9 +1177,13 @@ impl ReadFence {
     fn verify(&self, store: &Store, db: Option<&Connection>) -> Result<()> {
         store.identity.verify()?;
         if let Some(db) = db {
-            let status = store.read_status_for(db, true)?;
+            // Every read of a response shares one SQLite read transaction, so
+            // the pin is the only state that can move underneath it. The
+            // admitted head was fully validated once, at admission; the fence
+            // does not repeat that validation (owner-accepted relaxation under
+            // #261: reads trust what the indexer published).
             ensure!(
-                status.revision == self.0,
+                ReadRevision::current(db)?.pin == self.0,
                 "index_not_ready: selected snapshot changed"
             );
         }
@@ -1418,7 +1422,7 @@ impl EvidenceResponse {
         options.validate()?;
         check()?;
         let config = crate::rules::load(Path::new(self.store.workspace_root()))?;
-        let selected = self.store.read_revision_for(&self.db, options.pin, true)?;
+        let selected = self.selected(options.pin)?;
         let layers = config
             .as_ref()
             .map(crate::rules::view_layers)
@@ -1610,7 +1614,7 @@ impl EvidenceResponse {
     ) -> Result<crate::references::Snapshot> {
         use crate::native_evidence::DocumentKey;
         check()?;
-        let selected = self.store.read_revision_for(&self.db, pin, true)?;
+        let selected = self.selected(pin)?;
         let mut statement = self.db.prepare(
             "SELECT r.source_set_id,m.language,m.path FROM revision_documents m
              JOIN native_revisions r ON r.id=m.revision_id
@@ -1806,7 +1810,7 @@ impl EvidenceResponse {
             stopped: AtomicBool::new(false),
         };
         progress.check()?;
-        let selected = self.store.read_revision_for(&self.db, options.pin, true)?;
+        let selected = self.selected(options.pin)?;
         let selected_metrics: Vec<String> = crate::metrics::METRIC_ORDER
             .iter()
             .filter(|name| {
@@ -2341,15 +2345,20 @@ impl EvidenceResponse {
         self.store.read_status_for(&self.db, true)
     }
     pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
-        self.store.read_revision_for(&self.db, Some(pin), true)?;
+        self.selected(Some(pin))?;
         Ok(())
+    }
+    /// The response's selected revision: its admitted head, or `pin` after the
+    /// usual conflict and expiry checks, without re-validating the index.
+    fn selected(&self, pin: Option<IndexPin>) -> Result<ReadRevision> {
+        self.store.read_revision_for(&self.db, pin, true)
     }
     pub fn source_at(
         &self,
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, SourceFile)>> {
-        let selected = self.store.read_revision_for(&self.db, expected, true)?;
+        let selected = self.selected(expected)?;
         let source = self
             .store
             .selected_source_row_for(&self.db, path, &selected)?;
@@ -2447,7 +2456,7 @@ impl EvidenceResponse {
         self.store.symbols_in(&self.db, query, limit, true)
     }
     pub fn graph(&self) -> Result<Graph> {
-        let selected = self.store.read_revision_for(&self.db, None, true)?;
+        let selected = self.selected(None)?;
         self.store.read_graph_for(&self.db, &selected)
     }
     pub fn symbol_at(
@@ -3235,9 +3244,11 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(CACHE_SCHEMA_V25)?;
     let built = cache_objects(&expected)?;
-    #[cfg(test)]
-    EXPECTED_CACHE_SHAPE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    Ok(EXPECTED.get_or_init(|| built))
+    Ok(EXPECTED.get_or_init(|| {
+        #[cfg(test)]
+        EXPECTED_CACHE_SHAPE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        built
+    }))
 }
 
 fn cache_objects(db: &Connection) -> Result<Vec<CacheObject>> {
@@ -3847,7 +3858,14 @@ pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
+mod admit_once_tests;
+#[cfg(test)]
 mod terminal_status_contention_tests;
+#[cfg(test)]
+thread_local! {
+    /// Full status validations run on this thread; tests assert one per response.
+    static STATUS_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Publication contention only. A cached-claim mismatch or unresolved
 /// completion also uses the `storage_busy` prefix, but is not a retryable
@@ -13090,6 +13108,8 @@ impl Store {
         self.read_status_for(db, false)
     }
     fn read_status_for(&self, db: &Connection, pre_startup: bool) -> Result<IndexStatus> {
+        #[cfg(test)]
+        STATUS_VALIDATIONS.with(|count| count.set(count.get() + 1));
         let status = if pre_startup {
             self.verify_metadata_root(db)
                 .map_err(|error| self.report_index_failure(error))?;
@@ -17372,7 +17392,12 @@ impl Store {
         expected: Option<IndexPin>,
         pre_startup: bool,
     ) -> Result<ReadRevision> {
-        let head = self.read_status_for(db, pre_startup)?.revision;
+        // A response's own Store already validated its head at admission and
+        // every read of the response shares that snapshot.
+        let head = match &self.admitted {
+            Some((admitted, _)) if pre_startup => *admitted,
+            _ => self.read_status_for(db, pre_startup)?.revision,
+        };
         let pin = expected.unwrap_or(head);
         ensure!(
             pin.index_generation == head.index_generation

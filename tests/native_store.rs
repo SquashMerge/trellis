@@ -4107,7 +4107,9 @@ fn incoming_read_rejects_mismatched_indexed_call_language() {
         "{reported:#}"
     );
     assert!(store.recovery_pending_for_tests());
-    assert_current_corruption(read.finish(()).unwrap_err());
+    // The fence compares the pin only (#261): the corruption was already
+    // returned typed by the in-body reads and has scheduled recovery.
+    read.finish(()).unwrap();
 }
 
 #[test]
@@ -4233,7 +4235,9 @@ fn incoming_read_invalid_role_after_limited_valid_hits_fails_typed() {
         "{reported:#}"
     );
     assert!(store.recovery_pending_for_tests());
-    assert_current_corruption(read.finish(()).unwrap_err());
+    // The fence compares the pin only (#261): the corruption was already
+    // returned typed by the in-body reads and has scheduled recovery.
+    read.finish(()).unwrap();
 }
 
 #[test]
