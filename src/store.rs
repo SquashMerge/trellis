@@ -4125,6 +4125,16 @@ thread_local! {
 /// Publication contention only. A cached-claim mismatch or unresolved
 /// completion also uses the `storage_busy` prefix, but is not a retryable
 /// SQLite/lock conflict and must never be silently requeued.
+/// A SQLite error from a full disk or a failed read or write.
+fn storage_fault(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(info, _))
+                if matches!(info.code,
+                    rusqlite::ErrorCode::DiskFull | rusqlite::ErrorCode::SystemIoFailure))
+    })
+}
+
 pub(crate) fn transient_storage_contention(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| {
         cause.downcast_ref::<topology::StorageBusy>().is_some()
@@ -7237,6 +7247,7 @@ enum CommitLoss {
     After,
     Before,
     BusyBefore,
+    DiskFullBefore,
 }
 
 /// Limits the publication measures disk growth against.
@@ -14758,7 +14769,24 @@ impl Store {
         {
             loss = Some(CommitLoss::BusyBefore);
         }
+        #[cfg(feature = "test-support")]
+        if loss.is_none()
+            && std::env::var_os("TRELLIS_TEST_SEMANTIC_COMMIT_DISK_FULL").is_some_and(|marker| {
+                let marker = std::path::PathBuf::from(marker);
+                !marker.exists() && std::fs::write(marker, b"semantic commit disk full").is_ok()
+            })
+        {
+            loss = Some(CommitLoss::DiskFullBefore);
+        }
         let committed = match loss {
+            Some(CommitLoss::DiskFullBefore) => {
+                drop(tx);
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                    Some("database or disk is full".into()),
+                )
+                .into())
+            }
             Some(CommitLoss::Before) => {
                 drop(tx);
                 Err(anyhow::anyhow!("semantic batch commit result lost"))
@@ -14789,6 +14817,11 @@ impl Store {
                     // would charge the shared lookup budget again.
                     BatchCommitState::RolledBack if transient_storage_contention(&commit_error) => {
                         Err(commit_error)
+                    }
+                    // A full disk or I/O error rolled the COMMIT back. Re-joining cannot help,
+                    // so the request fails with the real cause and the prior head stays.
+                    BatchCommitState::RolledBack if storage_fault(&commit_error) => {
+                        Err(commit_error.context("semantic batch commit rolled back"))
                     }
                     BatchCommitState::RolledBack => {
                         anyhow::bail!("revision conflict: semantic batch commit did not persist")

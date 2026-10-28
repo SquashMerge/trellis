@@ -1601,6 +1601,14 @@ pub(crate) fn copy_stream_to_stage(
             );
         }
         hasher.update(&buffer[..read]);
+        #[cfg(feature = "test-support")]
+        if std::env::var("TRELLIS_TEST_SEMANTIC_STAGE_ENOSPC_AFTER_BYTES")
+            .ok()
+            .and_then(|bytes| bytes.parse::<u64>().ok())
+            .is_some_and(|after| total > after)
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into());
+        }
         out.write_all(&buffer[..read])?;
         progress(total)?;
     }

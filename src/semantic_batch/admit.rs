@@ -243,8 +243,7 @@ impl Passes<'_> {
                 conn.prepare_cached(
                     "INSERT INTO coverage(source_ord, artifact, exclusion) VALUES(?1,?2,?3)",
                 )?
-                .execute(params![source, artifact, exclusion])
-                .map_err(|_| admission("duplicate coverage row"))?;
+                .execute(params![source, artifact, exclusion])?;
             }
             conn.execute_batch("COMMIT")?;
             self.budget.check()?;
@@ -300,6 +299,10 @@ impl Passes<'_> {
                 return Err(admission("artifact digest").into());
             }
             self.decode(entry, &dest, conn, native, counters)?;
+            #[cfg(all(feature = "test-support", unix))]
+            if entry.ordinal == 0 {
+                pause_after_first_artifact()?;
+            }
         }
         let unseen: i64 = conn.query_row(
             "SELECT COUNT(*) FROM coverage c WHERE c.artifact IS NOT NULL \
@@ -400,6 +403,24 @@ impl Passes<'_> {
         sink.finish()?;
         Ok(())
     }
+}
+
+/// Test hook: once artifact 0 is staged, binds `TRELLIS_TEST_SEMANTIC_STAGING_SOCKET`, signals
+/// `.ready` and blocks until the test connects. A `.done` marker skips the pause, so a
+/// recovering run proceeds.
+#[cfg(all(feature = "test-support", unix))]
+fn pause_after_first_artifact() -> Result<()> {
+    use std::os::unix::net::UnixListener;
+    let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_STAGING_SOCKET") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    if !path.with_extension("done").exists() {
+        let listener = UnixListener::bind(&path)?;
+        std::fs::write(path.with_extension("ready"), [])?;
+        let (_stream, _) = listener.accept()?;
+    }
+    Ok(())
 }
 
 /// File-backed pages and artifacts, opened with the no-follow rules under the workspace root.

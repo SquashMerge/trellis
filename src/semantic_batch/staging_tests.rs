@@ -203,3 +203,42 @@ fn only_documents_assigned_to_the_artifact_resolve() {
     );
     let _ = params![0];
 }
+
+/// Duplicate coverage rows are rejected by the row-order check, so a failing coverage insert is
+/// a storage fault. It must surface as itself, not as `invalid_request: duplicate coverage row`.
+#[cfg(feature = "test-support")]
+#[test]
+fn coverage_insert_storage_fault_propagates_typed() {
+    use super::testing;
+    use std::sync::{Arc, atomic::AtomicBool};
+    const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
+    let workspace = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(workspace.path()).unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("src/A.js"), "function f(){g();}\n").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let options = crate::indexer::IndexOptions::new(root);
+    let capture = crate::capture::Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let artifact = hex::decode(WIRE).unwrap();
+    let (descriptor, pages) =
+        testing::single_artifact_batch(&capture, "scip-typescript", "javascript", &artifact)
+            .unwrap();
+    let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+    let admit = || {
+        testing::admit_in_memory_from_capture(&capture, &descriptor, &pages, &[&artifact], &cancel)
+    };
+    assert_eq!(admit().unwrap().len(), 1, "the batch is admissible");
+    testing::before_coverage_pass(|conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER disk_full BEFORE INSERT ON coverage \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END",
+        )
+        .unwrap();
+    });
+    match admit().unwrap_err() {
+        ScipCaptureError::InvalidArtifact(cause) => {
+            assert!(cause.contains("database or disk is full"), "{cause}");
+        }
+        other => panic!("the storage fault was reported as {other:?}"),
+    }
+}

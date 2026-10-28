@@ -1016,3 +1016,92 @@ fn cancelled_full_document_stream_never_changes_selected_pin() {
         .unwrap();
     assert_eq!(store.status().unwrap().revision, next);
 }
+
+/// `run_semantic_batch_request` creates one `LookupBudget` before its retry loop and passes it
+/// to every `join_staged`. Two joins of one staged batch, as a destination change causes, must
+/// therefore be charged to the same budget.
+#[cfg(feature = "test-support")]
+#[test]
+fn lookup_budget_is_shared_across_destination_retries() {
+    use crate::{
+        scip_raw::ScipCaptureError,
+        semantic_batch::{
+            BatchCounters, BatchLimits, LookupBudget, StageOwner, stage_batch,
+            testing::single_artifact_batch,
+        },
+        semantic_import::{DestinationMutations, join_staged},
+    };
+    const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(workspace.path()).unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/A.js"), "function f(){g();}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let options = IndexOptions::new(root.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_, _session) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
+    let artifact = hex::decode(WIRE).unwrap();
+    let (descriptor, pages) =
+        single_artifact_batch(&capture, "scip-typescript", "javascript", &artifact).unwrap();
+    // The batch files are written after the capture, so they are not part of the revision.
+    fs::write(root.join("artifact.scip"), &artifact).unwrap();
+    fs::write(root.join("descriptor.json"), &descriptor).unwrap();
+    fs::write(root.join("source-00000.json"), &pages[0]).unwrap();
+    fs::write(root.join("coverage-00000.json"), &pages[1]).unwrap();
+    let digest = crate::scip_raw::sha(&descriptor);
+    let stage = |limits: &BatchLimits| {
+        stage_batch(
+            &store,
+            &root,
+            StageOwner {
+                request_id: "budget",
+                incarnation: "claim-1",
+            },
+            &root.join("descriptor.json"),
+            &digest,
+            limits,
+            &mut BatchCounters::default(),
+            &cancel,
+        )
+        .unwrap()
+    };
+    let join = |admitted: &mut crate::semantic_batch::AdmittedBatch,
+                limits: &BatchLimits,
+                budget: &mut LookupBudget| {
+        join_staged(
+            admitted,
+            &store,
+            store.index_baseline().unwrap(),
+            limits,
+            budget,
+            &mut BatchCounters::default(),
+            DestinationMutations::default(),
+            &cancel,
+        )
+    };
+    let mut limits = BatchLimits::PRODUCTION;
+    let mut admitted = stage(&limits);
+    let mut budget = LookupBudget::new(&limits);
+    join(&mut admitted, &limits, &mut budget).unwrap();
+    let one_join = budget.used();
+    assert!(one_join > 1, "a join charges lookup work: {one_join}");
+    join(&mut admitted, &limits, &mut budget).unwrap();
+    assert_eq!(
+        budget.used(),
+        2 * one_join,
+        "the retry spends the same budget"
+    );
+    drop(admitted);
+    // A limit that admits one join but not two fails the retry, not the first attempt.
+    limits.lookup_steps = one_join + one_join / 2;
+    let mut admitted = stage(&limits);
+    let mut budget = LookupBudget::new(&limits);
+    join(&mut admitted, &limits, &mut budget).unwrap();
+    let error = join(&mut admitted, &limits, &mut budget).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ScipCaptureError>(),
+        Some(ScipCaptureError::LimitExceeded(name)) if name == "lookup steps"
+    ));
+}

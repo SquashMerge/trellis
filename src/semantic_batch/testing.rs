@@ -37,6 +37,13 @@ thread_local! {
     static BEFORE_ROW: std::cell::RefCell<Option<RowHook>> = const { std::cell::RefCell::new(None) };
     static WHOLE_SNAPSHOT_READS: Cell<u64> = const { Cell::new(0) };
     static BEFORE_CLOSURE: std::cell::RefCell<Option<ClosureHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_COVERAGE: std::cell::RefCell<Option<ClosureHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once on this thread, with the stage connection, after the next in-memory
+/// admission has staged its sources and before it stages coverage.
+pub fn before_coverage_pass(hook: impl FnOnce(&Connection) + 'static) {
+    BEFORE_COVERAGE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Runs `hook` once on this thread, with the stage connection, after the next staged join has
@@ -208,6 +215,9 @@ fn admit(
         let conn = stage.conn()?;
         passes.begin(conn, descriptor_bytes, &sha)?;
         passes.source_pass(conn, &mut inputs, &mut native, &mut counters)?;
+        if let Some(hook) = BEFORE_COVERAGE.with(|slot| slot.borrow_mut().take()) {
+            hook(conn);
+        }
         passes.coverage_pass(conn, &mut inputs, &mut counters)?;
         passes.artifact_pass(&dir, conn, &mut inputs, &mut native, &mut counters)?;
         read_inventories(conn, &descriptor)

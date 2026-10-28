@@ -464,6 +464,14 @@ impl BatchFixture {
     }
 }
 
+/// Decodes artifact `bytes`, applies `edit` and encodes them again, for artifacts that need a
+/// shape the fixture does not generate.
+pub fn edit_scip(bytes: &[u8], edit: impl FnOnce(&mut scip::types::Index)) -> Vec<u8> {
+    let mut index = scip::types::Index::parse_from_bytes(bytes).unwrap();
+    edit(&mut index);
+    index.write_to_bytes().unwrap()
+}
+
 /// Writes `descriptor.json` into `dir`; returns its path and SHA-256.
 pub fn write_descriptor(dir: &Path, descriptor: &Value) -> (PathBuf, String) {
     let bytes = serde_json::to_vec(descriptor).unwrap();
