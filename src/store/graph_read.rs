@@ -220,11 +220,15 @@ impl GraphSource for SnapshotGraphSource<'_> {
         crate::mcp::phase_hook("call_graph_node")?;
         (self.check)()
     }
+
+    fn check_work(&mut self) -> Result<()> {
+        (self.check)()
+    }
 }
 
 impl EvidenceResponse {
-    /// Answers one rooted call-graph query over the admitted head. `check` runs once per
-    /// dequeued node and aborts the query, with no answer, when it fails.
+    /// Answers one rooted call-graph query over the admitted head. `check` runs during
+    /// node and local-call inspection and aborts the query, with no answer, when it fails.
     pub fn graph_query(
         &self,
         query: &GraphQuery,
@@ -253,6 +257,8 @@ impl EvidenceResponse {
             depth: query.depth,
             max_nodes: query.max_nodes,
             max_calls: query.max_calls,
+            include_external: query.include_external,
+            include_tests: query.include_tests,
         };
         let snapshot = GraphSnapshot {
             source_set_id,

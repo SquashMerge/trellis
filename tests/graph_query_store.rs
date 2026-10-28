@@ -29,6 +29,8 @@ fn query(root: &str, producer: bool) -> GraphQuery {
         depth: 2,
         max_nodes: 150,
         max_calls: 500,
+        include_external: true,
+        include_tests: true,
     }
 }
 
@@ -465,10 +467,130 @@ fn high_fanout_syntax_only_store() {
     );
     assert_eq!(result.frontier.len(), 1);
     assert_eq!(result.frontier[0].reason, FrontierReason::CallLimit);
-    assert_eq!(result.frontier[0].next_ordinal, Some(500));
+    assert_eq!(result.frontier[0].next_ordinal, None);
+    assert_eq!(result.omitted.call_limit, 100);
     assert_eq!(result.frontier[0].omitted_calls, 100);
     assert!(result.truncated && result.partial);
     assert_eq!(warning_keys(&result), vec![(WarningCode::SyntaxOnly, None)]);
+}
+
+#[test]
+fn shared_proof_duplicates_group_but_distinct_proofs_do_not() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[("a.rs", "fn a() { b(); b(); b(); }\nfn b() {}\n")]);
+    spec.bindings = vec![
+        bind("a", 0, "b"),
+        Bind {
+            provenance: "call-a-0".into(),
+            ..bind("a", 1, "b")
+        },
+        bind("a", 2, "b"),
+    ];
+    publisher.publish(&spec);
+    let native = publisher.native();
+    let root_id = syntax_id(native, "a");
+    let calls = graph_fixtures::calls_of(native, "a");
+    let result = result(run(&publisher.store, &query(&root_id, true)).unwrap());
+    assert_eq!(result.nodes.len(), 2);
+    assert_eq!(result.edges.len(), 2);
+    assert_eq!(result.edges[0].call_site_count, 2);
+    assert_eq!(result.edges[0].call, *calls[0]);
+    assert_eq!(
+        result.edges[0].binding.as_ref().unwrap().call_id.as_ref(),
+        Some(&calls[0].id)
+    );
+    assert_eq!(result.edges[0].visit, Visit::New);
+    assert_eq!(result.edges[1].call_site_count, 1);
+    assert_eq!(result.edges[1].call, *calls[2]);
+    assert_eq!(result.edges[1].visit, Visit::Seen);
+    assert!(!result.partial && !result.truncated);
+    assert!(result.frontier.is_empty());
+    assert_eq!(
+        result.omitted.filtered
+            + result.omitted.call_limit
+            + result.omitted.depth
+            + result.omitted.response_bytes,
+        0
+    );
+}
+
+#[test]
+fn internal_priority_preserves_closure_and_node_limit_does_not_demote() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[(
+        "a.rs",
+        "fn a() { outside(); b(); unknown(); }\nfn b() { c(); }\nfn c() {}\n",
+    )]);
+    spec.bindings = vec![
+        Bind {
+            resolution: s::Resolution::External,
+            target: None,
+            ..bind("a", 0, "unused")
+        },
+        bind("a", 1, "b"),
+        bind("b", 0, "c"),
+    ];
+    publisher.publish(&spec);
+    let native = publisher.native();
+    let root_id = syntax_id(native, "a");
+    let b_id = syntax_id(native, "b");
+    let c_id = syntax_id(native, "c");
+    let included = result(
+        run(
+            &publisher.store,
+            &GraphQuery {
+                max_calls: 2,
+                ..query(&root_id, true)
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        included
+            .edges
+            .iter()
+            .map(|edge| edge.to.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some(b_id.as_str()), Some(c_id.as_str())]
+    );
+    assert_eq!(
+        included
+            .nodes
+            .iter()
+            .map(|node| (&node.declaration.syntax_id, node.depth))
+            .collect::<Vec<_>>(),
+        vec![(&root_id, 0), (&b_id, 1), (&c_id, 2)]
+    );
+    assert_eq!(included.omitted.call_limit, 2);
+    assert!(
+        included
+            .frontier
+            .iter()
+            .all(|frontier| frontier.node_id == root_id
+                && frontier.reason == FrontierReason::CallLimit
+                && frontier.next_ordinal.is_none())
+    );
+
+    let refused = result(
+        run(
+            &publisher.store,
+            &GraphQuery {
+                max_calls: 1,
+                max_nodes: 1,
+                ..query(&root_id, true)
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(refused.edges.len(), 1);
+    assert_eq!(refused.edges[0].call.spelling.as_deref(), Some("b"));
+    assert_eq!(refused.edges[0].boundary_reason, BoundaryReason::NodeLimit);
+    assert_eq!(refused.omitted.call_limit, 2);
+    assert_eq!(refused.frontier[0].reason, FrontierReason::NodeLimit);
+    assert_eq!(refused.frontier[0].target_id.as_ref(), Some(&b_id));
+    assert_eq!(refused.frontier[0].omitted_calls, 0);
 }
 
 #[test]
@@ -518,7 +640,7 @@ fn duplicate_name_store() {
 }
 
 #[test]
-fn check_closure_runs_once_per_dequeued_node_and_its_error_aborts() {
+fn check_closure_runs_for_nodes_and_local_calls_and_its_error_aborts() {
     let (state, root) = workspace();
     let mut publisher = Publisher::open(state.path(), root.path());
     let mut spec = Spec::new(&[("a.rs", CHAIN)]);
@@ -540,7 +662,7 @@ fn check_closure_runs_once_per_dequeued_node_and_its_error_aborts() {
             },
         )
         .unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 5); // Three nodes and two scanned local calls.
     assert_eq!(result(answer).nodes.len(), 3);
 
     let mut calls = 0;
@@ -639,34 +761,82 @@ fn call_graph_node_hook_fires_once_per_dequeued_node() {
 }
 
 #[test]
-fn answer_facts_replay_every_reduced_max_calls_without_sql() {
+fn frozen_answer_prefixes_preserve_ancestor_closure_without_sql() {
     let (state, root) = workspace();
     let mut publisher = Publisher::open(state.path(), root.path());
-    let mut spec = Spec::new(&[("a.rs", &fanout_source(4))]);
-    spec.states.insert("a.rs".into(), CoverageState::Omitted);
+    let mut spec = Spec::new(&[
+        ("a.rs", "fn a() { b(); }\n"),
+        ("b.rs", "fn b() { c(); }\n"),
+        ("c.rs", "fn c() { d(); }\nfn d() {}\n"),
+    ]);
+    spec.bindings = vec![bind("a", 0, "b"), bind("b", 0, "c"), bind("c", 0, "d")];
     publisher.publish(&spec);
-    let root_id = syntax_id(publisher.native(), "root");
+    let native = publisher.native();
+    let root_id = syntax_id(native, "a");
+    let b_id = syntax_id(native, "b");
+    let c_id = syntax_id(native, "c");
     let mut answer = run(&publisher.store, &query(&root_id, true)).unwrap();
-    let edges = result(answer.clone()).edges.len();
-    assert_eq!(edges, 4);
-    let fresh: Vec<GraphResult> = (0..=edges as u64)
-        .map(|k| {
-            result(
-                run(
-                    &publisher.store,
-                    &GraphQuery {
-                        max_calls: k,
-                        ..query(&root_id, true)
-                    },
-                )
-                .unwrap(),
-            )
-        })
-        .collect();
+    let full = result(answer.clone());
+    assert_eq!(full.edges.len(), 2);
+    assert_eq!(full.omitted.depth, 1);
     drop(publisher);
-    for (k, expected) in fresh.iter().enumerate() {
-        assert_eq!(&answer.reevaluate(k as u64).unwrap(), expected, "k={k}");
+    std::fs::remove_file(root.path().join("a.rs")).unwrap();
+    std::fs::remove_file(root.path().join("b.rs")).unwrap();
+    std::fs::remove_file(root.path().join("c.rs")).unwrap();
+
+    for count in 0..=full.edges.len() {
+        let prefix = answer.prefix(count).unwrap();
+        assert_eq!(prefix, answer.prefix(count).unwrap(), "count={count}");
+        assert_eq!(prefix.request, full.request);
+        assert_eq!(prefix.edges, full.edges[..count]);
+        let ids: Vec<_> = prefix
+            .nodes
+            .iter()
+            .map(|node| node.declaration.syntax_id.as_str())
+            .collect();
+        let expected_ids: Vec<_> = match count {
+            0 => vec![root_id.as_str()],
+            1 => vec![root_id.as_str(), b_id.as_str()],
+            _ => vec![root_id.as_str(), b_id.as_str(), c_id.as_str()],
+        };
+        assert_eq!(ids, expected_ids);
+        assert!(
+            prefix
+                .edges
+                .iter()
+                .all(|edge| ids.contains(&edge.from.as_str())
+                    && edge.to.as_deref().is_none_or(|to| ids.contains(&to)))
+        );
+        assert!(
+            prefix
+                .frontier
+                .iter()
+                .all(|frontier| ids.contains(&frontier.node_id.as_str()))
+        );
+        assert_eq!(
+            prefix.omitted.response_bytes,
+            u64::from(count < full.edges.len())
+        );
+        assert_eq!(prefix.omitted.depth, u64::from(count == full.edges.len()));
+        assert_eq!(prefix.omitted.call_limit, 0);
+        assert_eq!(
+            prefix
+                .provenance
+                .iter()
+                .filter(|proof| proof.producer_id == graph_fixtures::PRODUCER)
+                .count(),
+            count
+        );
+        assert_eq!(
+            prefix
+                .coverage
+                .iter()
+                .filter(|row| row.producer_id == graph_fixtures::PRODUCER)
+                .count(),
+            count + 1
+        );
     }
+    assert_eq!(answer.prefix(full.edges.len()).unwrap(), full);
     let unread = "sid:v1:ffffffffffffffffffffffffffffffff";
     assert!(answer.facts.locate(unread).is_err());
 }

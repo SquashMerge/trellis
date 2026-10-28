@@ -133,6 +133,8 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "depth",
                 "maxNodes",
                 "maxCalls",
+                "includeExternal",
+                "includeTests",
                 "expectedBasis",
                 "workspace",
             ],
@@ -273,6 +275,11 @@ fn call_graph_arguments(o: &serde_json::Map<String, Value>) -> Result<(), &'stat
     in_range("depth", 0..=MAX_DEPTH)?;
     in_range("maxNodes", 1..=MAX_NODES)?;
     in_range("maxCalls", 0..=MAX_CALLS)?;
+    for field in ["includeExternal", "includeTests"] {
+        if o.get(field).is_some_and(|value| !value.is_boolean()) {
+            return Err("invalid_request");
+        }
+    }
     match o.get("semanticProducerId") {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(producer)) if !producer.is_empty() => Ok(()),
@@ -299,6 +306,12 @@ pub fn call_graph_query(args: &Value) -> crate::graph_query::GraphQuery {
         depth: number("depth", DEFAULT_DEPTH),
         max_nodes: number("maxNodes", DEFAULT_MAX_NODES),
         max_calls: number("maxCalls", DEFAULT_MAX_CALLS),
+        include_external: args
+            .get("includeExternal")
+            .is_some_and(|value| value.as_bool().expect("validated call graph flag")),
+        include_tests: args
+            .get("includeTests")
+            .is_some_and(|value| value.as_bool().expect("validated call graph flag")),
     }
 }
 fn details(code: &str) -> (&'static str, bool) {
@@ -1077,7 +1090,29 @@ mod tests {
         let mut v = good(name);
         v["workspace"] = json!("x".repeat(4097));
         check(name, &v, "invalid_request");
+        for field in ["includeExternal", "includeTests"] {
+            for flag in [false, true] {
+                let mut v = good(name);
+                v[field] = json!(flag);
+                assert_eq!(validate(name, Some(&v)), Ok(()));
+                let query = call_graph_query(&v);
+                assert_eq!(
+                    if field == "includeExternal" {
+                        query.include_external
+                    } else {
+                        query.include_tests
+                    },
+                    flag
+                );
+            }
+            for invalid in [json!(null), json!(0), json!("true"), json!([]), json!({})] {
+                let mut v = good(name);
+                v[field] = invalid;
+                check(name, &v, "invalid_request");
+            }
+        }
         let defaults = call_graph_query(&good(name));
+        assert!(!defaults.include_external && !defaults.include_tests);
         assert_eq!(
             (
                 defaults.depth,

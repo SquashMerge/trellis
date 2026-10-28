@@ -13500,8 +13500,8 @@ impl GraphMcp {
         self.record(&reply)
     }
 
-    /// The store reader's answer for the same request, with `maxCalls` optionally replaced.
-    fn store_answer(&self, arguments: &Value, max_calls: Option<u64>) -> Value {
+    /// The store answer, optionally projected to a frozen edge prefix.
+    fn store_answer(&self, arguments: &Value, prefix: Option<usize>) -> Value {
         let number = |field: &str, default: u64| {
             arguments
                 .get(field)
@@ -13515,7 +13515,15 @@ impl GraphMcp {
                 .map(str::to_owned),
             depth: number("depth", 2),
             max_nodes: number("maxNodes", 150),
-            max_calls: max_calls.unwrap_or_else(|| number("maxCalls", 500)),
+            max_calls: number("maxCalls", 500),
+            include_external: arguments
+                .get("includeExternal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            include_tests: arguments
+                .get("includeTests")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
         let store = trellis::store::Store::open_for_tests(self.temp.path(), &self.root).unwrap();
         let answer = store
@@ -13523,7 +13531,11 @@ impl GraphMcp {
             .unwrap()
             .graph_query(&query, None, &mut || Ok(()))
             .unwrap();
-        serde_json::to_value(answer.outcome.unwrap()).unwrap()
+        serde_json::to_value(match prefix {
+            Some(k) => answer.prefix(k).unwrap(),
+            None => answer.outcome.unwrap(),
+        })
+        .unwrap()
     }
 
     fn name(&self, id: &Value) -> String {
@@ -13780,6 +13792,25 @@ async fn call_graph_eight_cases_through_mcp() {
         &[],
         (false, false),
     );
+    // Owner syntax identities include the workspace identity, so compare the actual
+    // stable keys rather than assuming declaration names determine sibling order.
+    let c4_b = mcp
+        .names
+        .iter()
+        .find(|(_, name)| name.as_str() == "c4_b")
+        .unwrap()
+        .0;
+    let c4_c = mcp
+        .names
+        .iter()
+        .find(|(_, name)| name.as_str() == "c4_c")
+        .unwrap()
+        .0;
+    let c4_edges = if c4_b < c4_c {
+        ["c4_d:c4_b>c4_d:new:none", "c4_d:c4_c>c4_d:seen:none"]
+    } else {
+        ["c4_d:c4_c>c4_d:new:none", "c4_d:c4_b>c4_d:seen:none"]
+    };
     // 4. Queued/visited diamond.
     mcp.case(
         "c4_a",
@@ -13788,8 +13819,8 @@ async fn call_graph_eight_cases_through_mcp() {
         &[
             "c4_b:c4_a>c4_b:new:none",
             "c4_c:c4_a>c4_c:new:none",
-            "c4_d:c4_b>c4_d:new:none",
-            "c4_d:c4_c>c4_d:seen:none",
+            c4_edges[0],
+            c4_edges[1],
         ],
         &[],
         (false, false),
@@ -13830,7 +13861,7 @@ async fn call_graph_eight_cases_through_mcp() {
         with(json!({"maxCalls":1})),
         &["c7_a:0", "c7_b:1"],
         &["c7_b:c7_a>c7_b:new:none"],
-        &["callLimit:c7_a:-:-:1:1", "callLimit:c7_b:-:-:0:1"],
+        &["callLimit:c7_a:-:-:-:1", "callLimit:c7_b:-:-:-:1"],
         (true, true),
     );
     mcp.case(
@@ -13838,7 +13869,7 @@ async fn call_graph_eight_cases_through_mcp() {
         with(json!({"maxCalls":0})),
         &["c7_a:0"],
         &[],
-        &["callLimit:c7_a:-:-:0:2"],
+        &["callLimit:c7_a:-:-:-:2"],
         (true, true),
     );
     mcp.case(
@@ -14118,24 +14149,24 @@ async fn call_graph_oversized_answer_is_byte_reduced_and_valid() {
     tool(&reply, None, true);
     let envelope = mcp.record(&reply);
     let result = &envelope["data"]["result"];
-    let k = result["request"]["maxCalls"].as_u64().unwrap();
-    assert!(0 < k && k < 500, "reduced to {k}");
+    let k = result["edges"].as_array().unwrap().len();
+    assert!(0 < k && k < 500, "byte prefix has {k} groups");
+    assert_eq!(result["request"]["maxCalls"], 500);
     assert_eq!(envelope["data"]["requested"]["maxCalls"], 500);
     assert_eq!(envelope["truncationReason"], "response_bytes");
     assert_eq!(envelope["truncated"], true);
     assert_eq!(envelope["partial"], true);
-    assert_eq!(result["edges"].as_array().unwrap().len() as u64, k);
-    let last = result["frontier"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .clone();
-    assert_eq!(last["reason"], "callLimit");
-    assert_eq!(last["nextOrdinal"], k);
-    assert_eq!(last["omittedCalls"], 600 - k);
+    assert_eq!(result["omitted"]["callLimit"], 100);
+    assert_eq!(result["omitted"]["responseBytes"], 500 - k);
     assert_eq!(*result, mcp.store_answer(&arguments, Some(k)));
-    // The prefix is maximal: one more call would not have fit.
+    assert!(
+        result["frontier"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["nextOrdinal"].is_null())
+    );
+    // The next prefix is the first one the forward pass refuses.
     let next = mcp.store_answer(&arguments, Some(k + 1));
     let mut longer = envelope.clone();
     longer["data"]["result"] = next;
@@ -14143,7 +14174,7 @@ async fn call_graph_oversized_answer_is_byte_reduced_and_valid() {
         "result":{"isError":false,"structuredContent":longer,
             "content":[{"type":"text","text":reply["result"]["content"][0]["text"]}],
             "resultType":"complete"}});
-    assert!(serde_json::to_vec(&frame).unwrap().len() + 1 >= trellis::mcp::wire::RESPONSE_BYTES);
+    assert!(serde_json::to_vec(&frame).unwrap().len() + 1 > trellis::mcp::wire::RESPONSE_BYTES);
     // A caller's own smaller cap is honoured and not reported as a byte reduction.
     let envelope = mcp.graph(mcp.args("root", json!({"maxCalls":3})));
     assert_eq!(

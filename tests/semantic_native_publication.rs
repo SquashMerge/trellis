@@ -2208,6 +2208,8 @@ fn selected_case(change_b: &str) {
                     depth: DEFAULT_DEPTH,
                     max_nodes: DEFAULT_MAX_NODES,
                     max_calls: DEFAULT_MAX_CALLS,
+                    include_external: true,
+                    include_tests: true,
                 },
                 None,
                 &mut || Ok(()),

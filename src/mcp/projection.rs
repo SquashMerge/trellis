@@ -1202,7 +1202,7 @@ pub fn call_graph(
     let Ok(full) = &answer.outcome else {
         return Err("store_unavailable: call graph answer is a contract failure");
     };
-    let full = full.clone();
+    let edges = full.edges.len();
     let requested = answer.requested.clone();
     let basis = json!({"indexGeneration":answer.basis.index_generation.to_string(),
         "indexRevision":answer.basis.index_revision});
@@ -1228,33 +1228,18 @@ pub fn call_graph(
             "result":super::tools::result("trellis_call_graph", envelope.clone(), modern)});
         serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() < super::wire::RESPONSE_BYTES)
     };
-    let complete = build(&full, false)?;
-    if fits(&complete) {
-        return Ok(Some(complete));
-    }
-    let edges = full.edges.len();
-    if edges == 0 {
-        return Ok(None);
-    }
-    let mut reduced = |max_calls: u64| -> Result<Value, &'static str> {
+    let mut retained = None;
+    for edge_count in 0..=edges {
         let result = answer
-            .reevaluate(max_calls)
-            .map_err(|_| "store_unavailable: call graph re-evaluation")?;
-        build(&result, true)
-    };
-    if !fits(&reduced(0)?) {
-        return Ok(None);
-    }
-    let (mut low, mut high) = (0, edges as u64 - 1);
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        if fits(&reduced(mid)?) {
-            low = mid;
-        } else {
-            high = mid - 1;
+            .prefix(edge_count)
+            .map_err(|_| "store_unavailable: call graph prefix")?;
+        let envelope = build(&result, edge_count < edges)?;
+        if !fits(&envelope) {
+            break;
         }
+        retained = Some(envelope);
     }
-    reduced(low).map(Some)
+    Ok(retained)
 }
 
 /// Project a name-matched reverse lookup without implying a semantic binding.
@@ -2209,6 +2194,8 @@ mod call_graph_tests {
             depth: 2,
             max_nodes: 150,
             max_calls: 500,
+            include_external: false,
+            include_tests: false,
         };
         let outcome = evaluate(&requested, &mut facts).unwrap();
         GraphAnswer {
@@ -2255,34 +2242,45 @@ mod call_graph_tests {
     }
 
     #[test]
-    fn oversized_answer_reduces_max_calls_to_a_contract_valid_prefix() {
+    fn oversized_answer_fits_a_frozen_prefix_without_changing_limits() {
         for modern in [false, true] {
             let mut big = answer(600, 1);
             let full = big.outcome.clone().unwrap();
             assert_eq!(full.edges.len(), 500);
             let envelope = project(&mut big, modern).unwrap();
             let result = &envelope["data"]["result"];
-            let k = result["request"]["maxCalls"].as_u64().unwrap();
+            let k = result["edges"].as_array().unwrap().len();
             assert!(k < 500);
-            assert_eq!(envelope["data"]["requested"]["maxCalls"], 500);
-            assert_eq!(result["edges"].as_array().unwrap().len() as u64, k);
+            assert_eq!(result["request"]["maxCalls"], 500);
+            assert_eq!(envelope["data"]["requested"], result["request"]);
             assert_eq!(envelope["truncated"], true);
             assert_eq!(envelope["truncationReason"], "response_bytes");
             assert_eq!(envelope["partial"], true);
             let frontier = result["frontier"].as_array().unwrap();
-            let last = frontier.last().unwrap();
-            assert_eq!(last["reason"], json!(FrontierReason::CallLimit));
-            assert_eq!(last["nextOrdinal"], k);
-            assert_eq!(last["omittedCalls"], 600 - k);
+            assert!(frontier.iter().all(|row| row["nextOrdinal"].is_null()));
+            let omitted = |reason| {
+                frontier
+                    .iter()
+                    .filter(|row| row["reason"] == reason)
+                    .map(|row| row["omittedCalls"].as_u64().unwrap())
+                    .sum::<u64>()
+            };
+            assert_eq!(omitted(json!(FrontierReason::CallLimit)), 100);
+            assert_eq!(
+                omitted(json!(FrontierReason::ResponseBytes)),
+                500 - k as u64
+            );
+            assert_eq!(result["omitted"]["callLimit"], 100);
+            assert_eq!(result["omitted"]["responseBytes"], 500 - k as u64);
             assert!(frame_len(&envelope, modern) < crate::mcp::wire::RESPONSE_BYTES);
-            // The reduced answer is the exact contract answer for the effective request.
-            let again = big.reevaluate(k).unwrap();
-            assert_eq!(serde_json::to_value(&again).unwrap(), *result);
-            // `fits(k) && !fits(k + 1)`.
-            let next = big.reevaluate(k + 1).unwrap();
+            assert_eq!(
+                serde_json::to_value(big.prefix(k).unwrap()).unwrap(),
+                *result
+            );
             let mut probe = envelope.clone();
-            probe["data"]["result"] = serde_json::to_value(&next).unwrap();
+            probe["data"]["result"] = serde_json::to_value(big.prefix(k + 1).unwrap()).unwrap();
             assert!(frame_len(&probe, modern) >= crate::mcp::wire::RESPONSE_BYTES);
+            assert_eq!(project(&mut big, modern).unwrap(), envelope);
         }
     }
 

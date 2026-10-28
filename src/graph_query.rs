@@ -2,7 +2,7 @@
 //!
 //! This is a pure core: it reads through [`GraphSource`] and never touches SQLite. The
 //! store reader supplies a source over one admitted snapshot; fixtures and response-byte
-//! re-evaluation use [`GraphFacts`].
+//! prefix projection use [`GraphFacts`].
 use crate::{
     model::IndexPin,
     native_evidence::{self as native, DocumentKey},
@@ -60,6 +60,8 @@ pub enum FrontierReason {
     Depth,
     NodeLimit,
     CallLimit,
+    Filtered,
+    ResponseBytes,
 }
 
 /// Declaration order is the contract enum order and the warning sort order.
@@ -137,6 +139,10 @@ pub struct GraphRequest {
     pub depth: u64,
     pub max_nodes: u64,
     pub max_calls: u64,
+    #[serde(default)]
+    pub include_external: bool,
+    #[serde(default)]
+    pub include_tests: bool,
 }
 
 fn is_syntax_id(id: &str) -> bool {
@@ -184,6 +190,8 @@ pub struct GraphQuery {
     pub depth: u64,
     pub max_nodes: u64,
     pub max_calls: u64,
+    pub include_external: bool,
+    pub include_tests: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +204,7 @@ pub struct GraphNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GraphEdge {
+    pub call_site_count: u64,
     pub call: native::Call,
     pub from: String,
     #[serde(deserialize_with = "nullable")]
@@ -231,6 +240,15 @@ pub struct Warning {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GraphOmitted {
+    pub filtered: u64,
+    pub call_limit: u64,
+    pub response_bytes: u64,
+    pub depth: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GraphResult {
     pub request: GraphRequest,
     pub resolved_revision_id: String,
@@ -242,6 +260,8 @@ pub struct GraphResult {
     pub partial: bool,
     pub truncated: bool,
     pub warnings: Vec<Warning>,
+    pub omitted: GraphOmitted,
+    pub hints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,15 +308,19 @@ pub trait GraphSource {
     fn locate(&mut self, syntax_id: &str) -> Result<Option<DocumentKey>>;
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>>;
     fn history(&mut self, key: &DocumentKey, syntax_id: &str) -> Result<Option<Arc<HistoryFacts>>>;
-    /// Called once per dequeued node; an error aborts the evaluation without a result.
+    /// Called once per expanded node; an error aborts without a result.
     fn check(&mut self) -> Result<()>;
+    /// Deadline and cancellation check during local scanning, without a node-phase hook.
+    fn check_work(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// In-memory record of every fact one query read.
 ///
 /// In complete mode an absent location, producer or history entry means "not there". In
 /// memo mode only a recorded lookup is answered and any other lookup is an error, so a
-/// re-evaluation can never need SQL.
+/// prefix projection can never need SQL.
 #[derive(Debug, Clone)]
 pub struct GraphFacts {
     snapshot: GraphSnapshot,
@@ -328,7 +352,7 @@ impl GraphFacts {
     }
 }
 
-impl GraphSource for GraphFacts {
+impl GraphSource for &GraphFacts {
     fn snapshot(&self) -> &GraphSnapshot {
         &self.snapshot
     }
@@ -369,7 +393,28 @@ impl GraphSource for GraphFacts {
     }
 }
 
-/// One evaluated query with the facts it read, for re-evaluation without SQL.
+impl GraphSource for GraphFacts {
+    fn snapshot(&self) -> &GraphSnapshot {
+        &self.snapshot
+    }
+    fn producer_languages(&mut self, id: &str) -> Result<Option<BTreeSet<String>>> {
+        (&*self).producer_languages(id)
+    }
+    fn locate(&mut self, id: &str) -> Result<Option<DocumentKey>> {
+        (&*self).locate(id)
+    }
+    fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>> {
+        (&*self).document(key)
+    }
+    fn history(&mut self, key: &DocumentKey, id: &str) -> Result<Option<Arc<HistoryFacts>>> {
+        (&*self).history(key, id)
+    }
+    fn check(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// One bounded query answer with its frozen facts, for prefix projection without SQL.
 #[derive(Debug, Clone)]
 pub struct GraphAnswer {
     pub basis: IndexPin,
@@ -379,14 +424,63 @@ pub struct GraphAnswer {
 }
 
 impl GraphAnswer {
-    /// Evaluates the same request over the recorded facts with `maxCalls` replaced.
-    pub fn reevaluate(&mut self, max_calls: u64) -> Result<GraphResult> {
-        let request = GraphRequest {
-            max_calls,
-            ..self.requested.clone()
+    /// Projects an ancestor-closed prefix without traversing or resolving the graph again.
+    pub fn prefix(&self, edge_count: usize) -> Result<GraphResult> {
+        let full = self
+            .outcome
+            .as_ref()
+            .map_err(|e| anyhow!("graph answer rejected: {e}"))?;
+        let count = edge_count.min(full.edges.len());
+        if count == full.edges.len() {
+            return Ok(full.clone());
+        }
+        let edges = full.edges[..count].to_vec();
+        let mut retained = BTreeSet::from([self.requested.root_syntax_id.clone()]);
+        for edge in &edges {
+            if let Some(to) = &edge.to {
+                retained.insert(to.clone());
+            }
+        }
+        let mut nodes: Vec<_> = full
+            .nodes
+            .iter()
+            .filter(|node| retained.contains(&node.declaration.syntax_id))
+            .cloned()
+            .collect();
+        shortest_depths(&mut nodes, &edges);
+        let mut frontier: Vec<_> = full
+            .frontier
+            .iter()
+            .filter(|f| retained.contains(&f.node_id))
+            .filter(|f| {
+                f.reason != FrontierReason::NodeLimit
+                    || edges.iter().any(|e| Some(&e.call.id) == f.call_id.as_ref())
+            })
+            .cloned()
+            .collect();
+        for edge in &full.edges[count..] {
+            if retained.contains(&edge.from) {
+                add_omission(
+                    &mut frontier,
+                    &edge.from,
+                    FrontierReason::ResponseBytes,
+                    edge.call_site_count,
+                );
+            }
+        }
+        let mut facts = &self.facts;
+        let languages = match &self.requested.semantic_producer_id {
+            Some(id) => facts.producer_languages(id)?,
+            None => None,
         };
-        evaluate(&request, &mut self.facts)?
-            .map_err(|e| anyhow!("graph re-evaluation was rejected: {e}"))
+        finish(
+            &self.requested,
+            &mut facts,
+            languages.as_ref(),
+            nodes,
+            edges,
+            frontier,
+        )
     }
 }
 
@@ -536,136 +630,374 @@ pub fn evaluate(
         depth: 0,
     }];
     let mut admitted = BTreeSet::from([request.root_syntax_id.clone()]);
-    let mut edges: Vec<GraphEdge> = Vec::new();
-    let mut frontier: Vec<Frontier> = Vec::new();
-    let mut call_cap = false;
+    let mut edges = Vec::new();
+    let mut frontier = Vec::new();
+    let mut pending: Vec<Candidate> = Vec::new();
     let mut head = 0;
-    while head < nodes.len() {
-        source.check()?;
-        let node_id = nodes[head].declaration.syntax_id.clone();
-        let node_depth = nodes[head].depth;
-        let doc = source.document(&nodes[head].declaration.document)?;
-        head += 1;
-        let mut local: Vec<&native::Call> = doc
-            .calls
-            .get(&node_id)
-            .map(|calls| calls.iter().collect())
-            .unwrap_or_default();
-        if local.is_empty() {
-            continue;
-        }
-        local.sort_by(|a, b| {
-            (&a.document.path, a.range.start, a.range.end, &a.id).cmp(&(
-                &b.document.path,
-                b.range.start,
-                b.range.end,
-                &b.id,
-            ))
-        });
-        if node_depth == request.depth || call_cap {
-            frontier.push(Frontier {
-                reason: if node_depth == request.depth {
-                    FrontierReason::Depth
-                } else {
-                    FrontierReason::CallLimit
-                },
-                node_id,
-                call_id: None,
-                target_id: None,
-                next_ordinal: Some(0),
-                omitted_calls: local.len() as u64,
+    loop {
+        // Each admitted owner is inspected once. Only the best remaining edge groups
+        // are kept; discarded candidates contribute measured-site omissions immediately.
+        while head < nodes.len() {
+            source.check()?;
+            let node = &nodes[head];
+            let node_id = node.declaration.syntax_id.clone();
+            let node_depth = node.depth;
+            let doc = source.document(&node.declaration.document)?;
+            head += 1;
+            let mut local: Vec<_> = doc
+                .calls
+                .get(&node_id)
+                .map(|calls| calls.iter().collect())
+                .unwrap_or_default();
+            local.sort_by_key(|call| {
+                (
+                    &call.document.path,
+                    call.range.start,
+                    call.range.end,
+                    &call.id,
+                )
             });
-            continue;
-        }
-        let semantic = semantic(scope, &doc)?;
-        for (i, call) in local.iter().enumerate() {
-            if edges.len() as u64 == request.max_calls {
-                frontier.push(Frontier {
-                    reason: FrontierReason::CallLimit,
-                    node_id: node_id.clone(),
-                    call_id: None,
-                    target_id: None,
-                    next_ordinal: Some(call.ordinal as u64),
-                    omitted_calls: (local.len() - i) as u64,
-                });
-                call_cap = true;
-                break;
+            if node_depth == request.depth {
+                if !local.is_empty() {
+                    add_omission(
+                        &mut frontier,
+                        &node_id,
+                        FrontierReason::Depth,
+                        local.len() as u64,
+                    );
+                }
+                continue;
             }
-            let selected = select_binding(semantic, call)?;
-            let mut reason = selected.map_or(BoundaryReason::MissingEvidence, |(b, p)| {
-                boundary_reason(b, p)
-            });
-            let mut to = None;
-            let mut visit = Visit::Boundary;
-            if reason == BoundaryReason::None {
-                let target = selected.and_then(|(b, _)| match &b.declared_target {
-                    Some(Target::Internal {
-                        syntax_id,
-                        document,
-                        ..
-                    }) => Some((syntax_id, document)),
-                    _ => None,
+            let semantic = semantic(scope, &doc)?;
+            for call in local {
+                source.check_work()?;
+                let selected = select_binding(semantic, call)?;
+                let mut reason = selected.map_or(BoundaryReason::MissingEvidence, |(b, p)| {
+                    boundary_reason(b, p)
                 });
-                let located = match target {
-                    Some((syntax_id, document)) => {
-                        let found = source.locate(syntax_id)?;
-                        (found.as_ref() == Some(document)).then_some(syntax_id)
+                let external = selected.is_some_and(|(b, _)| b.resolution == Resolution::External);
+                let target = selected.and_then(|(binding, _)| {
+                    if binding.resolution != Resolution::Resolved {
+                        return None;
                     }
-                    None => None,
+                    match &binding.declared_target {
+                        Some(Target::Internal {
+                            syntax_id,
+                            document,
+                            ..
+                        }) => Some((syntax_id, document)),
+                        _ => None,
+                    }
+                });
+                let target_decl = match target {
+                    Some((id, key)) if source.locate(id)?.as_ref() == Some(key) => Some(
+                        source
+                            .document(key)?
+                            .declarations
+                            .get(id)
+                            .cloned()
+                            .ok_or_else(|| integrity("target declaration missing from document"))?,
+                    ),
+                    _ => None,
                 };
-                match located {
-                    None => reason = BoundaryReason::Stale,
-                    Some(target_id) if admitted.contains(target_id) => {
-                        to = Some(target_id.clone());
-                        visit = Visit::Seen;
-                    }
-                    Some(target_id) if nodes.len() as u64 == request.max_nodes => {
-                        reason = BoundaryReason::NodeLimit;
-                        frontier.push(Frontier {
-                            reason: FrontierReason::NodeLimit,
-                            node_id: node_id.clone(),
-                            call_id: Some(call.id.clone()),
-                            target_id: Some(target_id.clone()),
-                            next_ordinal: None,
-                            omitted_calls: 0,
-                        });
-                    }
-                    Some(target_id) => {
-                        let (_, document) = target.expect("located implies an internal target");
-                        let declaration = source
+                if reason == BoundaryReason::None && target_decl.is_none() {
+                    reason = BoundaryReason::Stale;
+                }
+                let test = node.declaration.role == native::DeclarationRole::Test
+                    || target_decl
+                        .as_ref()
+                        .is_some_and(|d| d.role == native::DeclarationRole::Test);
+                if (external && !request.include_external) || (test && !request.include_tests) {
+                    add_omission(&mut frontier, &node_id, FrontierReason::Filtered, 1);
+                    continue;
+                }
+                let group = if target.is_some() {
+                    selected
+                        .map(|(b, proof)| {
+                            serde_json::to_string(&(
+                                &b.resolution,
+                                &b.declared_target,
+                                &b.candidates,
+                                &b.dispatch,
+                                &b.possible_dispatch,
+                                b.possible_dispatch_complete,
+                                b.stale_target,
+                                &b.provenance_id,
+                                &b.join.status,
+                                &b.join.diagnostic,
+                                proof,
+                                external,
+                                test,
+                            ))
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                if let Some(existing) = pending.iter_mut().find(|candidate| {
+                    candidate.edge.from == node_id && group.is_some() && candidate.group == group
+                }) {
+                    existing.edge.call_site_count += 1;
+                    continue;
+                }
+                let rank = if reason == BoundaryReason::None {
+                    0
+                } else if external {
+                    1
+                } else {
+                    2
+                };
+                pending.push(Candidate {
+                    rank,
+                    owner_depth: node_depth,
+                    owner_document: doc.key.clone(),
+                    group,
+                    target: (reason == BoundaryReason::None)
+                        .then_some(target_decl)
+                        .flatten(),
+                    edge: GraphEdge {
+                        call_site_count: 1,
+                        call: call.clone(),
+                        from: node_id.clone(),
+                        to: None,
+                        binding: selected.map(|(b, _)| b.clone()),
+                        visit: Visit::Boundary,
+                        boundary_reason: reason,
+                    },
+                });
+                pending.sort_by(|a, b| a.key().cmp(&b.key()));
+                if pending.len() > (request.max_calls as usize).saturating_sub(edges.len()) {
+                    let discarded = pending.pop().expect("one pending candidate");
+                    add_omission(
+                        &mut frontier,
+                        &discarded.edge.from,
+                        FrontierReason::CallLimit,
+                        discarded.edge.call_site_count,
+                    );
+                }
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        let mut candidate = pending.remove(0);
+        if let Some(target) = candidate.target {
+            let id = target.syntax_id.clone();
+            if admitted.contains(&id) {
+                candidate.edge.to = Some(id);
+                candidate.edge.visit = Visit::Seen;
+            } else if nodes.len() as u64 == request.max_nodes {
+                candidate.edge.boundary_reason = BoundaryReason::NodeLimit;
+                frontier.push(Frontier {
+                    reason: FrontierReason::NodeLimit,
+                    node_id: candidate.edge.from.clone(),
+                    call_id: Some(candidate.edge.call.id.clone()),
+                    target_id: Some(id),
+                    next_ordinal: None,
+                    omitted_calls: 0,
+                });
+            } else {
+                admitted.insert(id.clone());
+                nodes.push(GraphNode {
+                    declaration: target,
+                    depth: candidate.owner_depth + 1,
+                });
+                candidate.edge.to = Some(id);
+                candidate.edge.visit = Visit::New;
+            }
+        }
+        edges.push(candidate.edge);
+    }
+    shortest_depths(&mut nodes, &edges);
+    Ok(Ok(finish(request, source, scope, nodes, edges, frontier)?))
+}
+
+struct Candidate {
+    rank: u8,
+    owner_depth: u64,
+    owner_document: DocumentKey,
+    group: Option<String>,
+    target: Option<native::Declaration>,
+    edge: GraphEdge,
+}
+
+impl Candidate {
+    fn key(&self) -> (u8, u64, &DocumentKey, &str, &str, usize, usize, &str) {
+        (
+            self.rank,
+            self.owner_depth,
+            &self.owner_document,
+            &self.edge.from,
+            &self.edge.call.document.path,
+            self.edge.call.range.start,
+            self.edge.call.range.end,
+            &self.edge.call.id,
+        )
+    }
+}
+
+fn add_omission(frontier: &mut Vec<Frontier>, node_id: &str, reason: FrontierReason, count: u64) {
+    if count == 0 {
+        return;
+    }
+    if let Some(existing) = frontier
+        .iter_mut()
+        .find(|f| f.node_id == node_id && f.reason == reason)
+    {
+        existing.omitted_calls += count;
+    } else {
+        frontier.push(Frontier {
+            reason,
+            node_id: node_id.to_string(),
+            call_id: None,
+            target_id: None,
+            next_ordinal: (reason == FrontierReason::Depth).then_some(0),
+            omitted_calls: count,
+        });
+    }
+}
+
+fn shortest_depths(nodes: &mut [GraphNode], edges: &[GraphEdge]) {
+    let mut depths = BTreeMap::from([(nodes[0].declaration.syntax_id.clone(), 0)]);
+    loop {
+        let mut changed = false;
+        for edge in edges {
+            if let (Some(from), Some(to)) = (depths.get(&edge.from).copied(), &edge.to)
+                && depths.get(to).is_none_or(|depth| *depth > from + 1)
+            {
+                depths.insert(to.clone(), from + 1);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for node in nodes {
+        node.depth = depths[&node.declaration.syntax_id];
+    }
+}
+
+fn finish(
+    request: &GraphRequest,
+    source: &mut dyn GraphSource,
+    scope: Option<&BTreeSet<String>>,
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+    mut frontier: Vec<Frontier>,
+) -> Result<GraphResult> {
+    let order: BTreeMap<_, _> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.declaration.syntax_id.as_str(), i))
+        .collect();
+    let rank = |reason| match reason {
+        FrontierReason::Depth => 0,
+        FrontierReason::NodeLimit => 1,
+        FrontierReason::CallLimit => 2,
+        FrontierReason::Filtered => 3,
+        FrontierReason::ResponseBytes => 4,
+    };
+    frontier.sort_by_key(|f| {
+        (
+            order[f.node_id.as_str()],
+            rank(f.reason),
+            f.call_id.clone(),
+            f.target_id.clone(),
+        )
+    });
+    let mut omitted = GraphOmitted {
+        filtered: 0,
+        call_limit: 0,
+        response_bytes: 0,
+        depth: 0,
+    };
+    for f in &frontier {
+        match f.reason {
+            FrontierReason::Depth => omitted.depth += f.omitted_calls,
+            FrontierReason::CallLimit => omitted.call_limit += f.omitted_calls,
+            FrontierReason::Filtered => omitted.filtered += f.omitted_calls,
+            FrontierReason::ResponseBytes => omitted.response_bytes += f.omitted_calls,
+            FrontierReason::NodeLimit => {}
+        }
+    }
+    let mut hints = BTreeSet::new();
+    if omitted.depth > 0 && request.depth < MAX_DEPTH {
+        hints.insert("depth".to_string());
+    }
+    if omitted.call_limit > 0 && request.max_calls < MAX_CALLS {
+        hints.insert("maxCalls".to_string());
+    }
+    if frontier
+        .iter()
+        .any(|f| f.reason == FrontierReason::NodeLimit)
+        && request.max_nodes < MAX_NODES
+    {
+        hints.insert("maxNodes".to_string());
+    }
+    // Filtered sites are inspected only for returned owners, using the same frozen facts.
+    if omitted.filtered > 0 {
+        for node in &nodes {
+            if !frontier.iter().any(|f| {
+                f.node_id == node.declaration.syntax_id && f.reason == FrontierReason::Filtered
+            }) {
+                continue;
+            }
+            let doc = source.document(&node.declaration.document)?;
+            let semantic = semantic(scope, &doc)?;
+            for call in doc
+                .calls
+                .get(&node.declaration.syntax_id)
+                .into_iter()
+                .flatten()
+            {
+                source.check_work()?;
+                let selected = select_binding(semantic, call)?;
+                if !request.include_external
+                    && selected.is_some_and(|(b, _)| b.resolution == Resolution::External)
+                {
+                    hints.insert("includeExternal".to_string());
+                }
+                if !request.include_tests {
+                    let mut test = node.declaration.role == native::DeclarationRole::Test;
+                    if let Some((b, _)) = selected
+                        && b.resolution == Resolution::Resolved
+                        && let Some(Target::Internal {
+                            syntax_id,
+                            document,
+                            ..
+                        }) = &b.declared_target
+                        && source.locate(syntax_id)?.as_ref() == Some(document)
+                    {
+                        test |= source
                             .document(document)?
                             .declarations
-                            .get(target_id)
-                            .cloned()
-                            .ok_or_else(|| integrity("target declaration missing from document"))?;
-                        admitted.insert(target_id.clone());
-                        nodes.push(GraphNode {
-                            declaration,
-                            depth: node_depth + 1,
-                        });
-                        to = Some(target_id.clone());
-                        visit = Visit::New;
+                            .get(syntax_id)
+                            .is_some_and(|d| d.role == native::DeclarationRole::Test);
+                    }
+                    if test {
+                        hints.insert("includeTests".to_string());
                     }
                 }
             }
-            edges.push(GraphEdge {
-                call: (*call).clone(),
-                from: node_id.clone(),
-                to,
-                binding: selected.map(|(b, _)| b.clone()),
-                visit,
-                boundary_reason: reason,
-            });
         }
     }
-
+    if frontier
+        .iter()
+        .any(|f| f.reason != FrontierReason::Filtered)
+    {
+        hints.insert("rootSyntaxId".to_string());
+    }
     let (coverage, provenance) = select_evidence(source, scope, &nodes, &edges)?;
-    let truncated = !frontier.is_empty();
+    let truncated = frontier
+        .iter()
+        .any(|f| f.reason != FrontierReason::Filtered);
     let partial = truncated
+        || omitted.filtered > 0
         || selected_incomplete(&coverage)
         || edges.iter().any(|edge| edge.visit == Visit::Boundary);
     let warnings = warnings_v1(request, &coverage, &provenance, &edges);
-    Ok(Ok(GraphResult {
+    Ok(GraphResult {
         request: request.clone(),
         resolved_revision_id: request.revision_id.clone(),
         nodes,
@@ -676,7 +1008,9 @@ pub fn evaluate(
         partial,
         truncated,
         warnings,
-    }))
+        omitted,
+        hints: hints.into_iter().collect(),
+    })
 }
 
 /// Coverage and provenance relevant to the returned nodes and calls, deduplicated and sorted.
