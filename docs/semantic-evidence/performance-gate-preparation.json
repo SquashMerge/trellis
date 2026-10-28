@@ -1,0 +1,251 @@
+{
+  "preparationVersion": 1,
+  "status": "prepared-not-measured",
+  "baseCommit": "44320bc84425196e768a73f9e1123e4ade59c058",
+  "methodReviewUrl": "https://github.com/SquashMerge/trellis/issues/61#issuecomment-6411699179",
+  "canonicalManifestSha256": "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259",
+  "artifactStatus": "unboundNotAdmitted",
+  "artifacts": {
+    "small": [
+      {
+        "byteLength": 556545,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 1750,
+          "callableBodies": 1775,
+          "candidateFacts": 7100,
+          "declarations": 1800,
+          "definitionOccurrences": 1800,
+          "documents": 25,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 3500,
+          "relationships": 0,
+          "symbolInformation": 1800
+        },
+        "language": "java",
+        "path": "java.scip",
+        "sha256": "b0dbb8ae40af20f1c7052d1e71c67dc7d3b66d605e6f077461f3daebdea223f9"
+      },
+      {
+        "byteLength": 543122,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 1752,
+          "callableBodies": 1776,
+          "candidateFacts": 7104,
+          "declarations": 1800,
+          "definitionOccurrences": 1800,
+          "documents": 25,
+          "emptyDocuments": 1,
+          "referenceOccurrences": 3504,
+          "relationships": 0,
+          "symbolInformation": 1800
+        },
+        "language": "rust",
+        "path": "rust.scip",
+        "sha256": "814d66ea16cf3da9515638fbd050a5693d1054f3f5292b8813eb3658c1ad9fe9"
+      },
+      {
+        "byteLength": 574170,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 1800,
+          "callableBodies": 1850,
+          "candidateFacts": 7325,
+          "declarations": 1850,
+          "definitionOccurrences": 1850,
+          "documents": 25,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 3625,
+          "relationships": 0,
+          "symbolInformation": 1850
+        },
+        "language": "python",
+        "path": "python.scip",
+        "sha256": "cb1c860c14e41016fa4fc9fbdd1b56f19d4f41ca944de2b23cedde25052d1548"
+      },
+      {
+        "byteLength": 603995,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 1800,
+          "callableBodies": 1850,
+          "candidateFacts": 7325,
+          "declarations": 1850,
+          "definitionOccurrences": 1850,
+          "documents": 25,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 3625,
+          "relationships": 0,
+          "symbolInformation": 1850
+        },
+        "language": "javascript",
+        "path": "javascript.scip",
+        "sha256": "1d072a8a45c10b63a629c08356750df9c40e32d4af9a6c00a75a27819377ed5e"
+      }
+    ],
+    "medium": [
+      {
+        "byteLength": 5707545,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 17500,
+          "callableBodies": 17750,
+          "candidateFacts": 71000,
+          "declarations": 18000,
+          "definitionOccurrences": 18000,
+          "documents": 250,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 35000,
+          "relationships": 0,
+          "symbolInformation": 18000
+        },
+        "language": "java",
+        "path": "java.scip",
+        "sha256": "adbaac72408a153b184fa2c26c5573f69421e346dfcde90c27ed348e7e8318da"
+      },
+      {
+        "byteLength": 5980416,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 17885,
+          "callableBodies": 18130,
+          "candidateFacts": 72520,
+          "declarations": 18375,
+          "definitionOccurrences": 18375,
+          "documents": 250,
+          "emptyDocuments": 5,
+          "referenceOccurrences": 35770,
+          "relationships": 0,
+          "symbolInformation": 18375
+        },
+        "language": "rust",
+        "path": "rust.scip",
+        "sha256": "4cfba9df12574a33c6b433eaa7ed16c934ce46d15105519d8fe3dbe5181cd426"
+      },
+      {
+        "byteLength": 5888295,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 18000,
+          "callableBodies": 18500,
+          "candidateFacts": 73250,
+          "declarations": 18500,
+          "definitionOccurrences": 18500,
+          "documents": 250,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 36250,
+          "relationships": 0,
+          "symbolInformation": 18500
+        },
+        "language": "python",
+        "path": "python.scip",
+        "sha256": "0757f17a286cdf6fe476f4d534a2e650c770e2f4c83bf61ff6a9ac7aa689978b"
+      },
+      {
+        "byteLength": 6186545,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 18000,
+          "callableBodies": 18500,
+          "candidateFacts": 73250,
+          "declarations": 18500,
+          "definitionOccurrences": 18500,
+          "documents": 250,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 36250,
+          "relationships": 0,
+          "symbolInformation": 18500
+        },
+        "language": "javascript",
+        "path": "javascript.scip",
+        "sha256": "687ca7fb7ee75fccf248e24b25a105ca18f3c558d607a77da49ec32c260c1d7d"
+      }
+    ],
+    "large": [
+      {
+        "byteLength": 29647545,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 92500,
+          "callableBodies": 95000,
+          "candidateFacts": 380000,
+          "declarations": 97500,
+          "definitionOccurrences": 97500,
+          "documents": 2500,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 185000,
+          "relationships": 0,
+          "symbolInformation": 97500
+        },
+        "language": "java",
+        "path": "java.scip",
+        "sha256": "1ad034368dc8e2412b37e409b38456ac73007fd96b65a14b46db0499b5a5d702"
+      },
+      {
+        "byteLength": 30741521,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 93480,
+          "callableBodies": 95940,
+          "candidateFacts": 383760,
+          "declarations": 98400,
+          "definitionOccurrences": 98400,
+          "documents": 2500,
+          "emptyDocuments": 40,
+          "referenceOccurrences": 186960,
+          "relationships": 0,
+          "symbolInformation": 98400
+        },
+        "language": "rust",
+        "path": "rust.scip",
+        "sha256": "dfa02ece69516dd899a8d93eb8bdd4519a1707d1828a0c4652c0ca99f9f927be"
+      },
+      {
+        "byteLength": 29795045,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 92500,
+          "callableBodies": 97500,
+          "candidateFacts": 382500,
+          "declarations": 97500,
+          "definitionOccurrences": 97500,
+          "documents": 2500,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 187500,
+          "relationships": 0,
+          "symbolInformation": 97500
+        },
+        "language": "python",
+        "path": "python.scip",
+        "sha256": "b85eeef0d8de78a78014547d2b35220bb26a5ee873d85f16df28a476aebb55ed"
+      },
+      {
+        "byteLength": 31397545,
+        "counters": {
+          "bodiesWithTwoSelectedCalls": 92500,
+          "callableBodies": 97500,
+          "candidateFacts": 382500,
+          "declarations": 97500,
+          "definitionOccurrences": 97500,
+          "documents": 2500,
+          "emptyDocuments": 0,
+          "referenceOccurrences": 187500,
+          "relationships": 0,
+          "symbolInformation": 97500
+        },
+        "language": "javascript",
+        "path": "javascript.scip",
+        "sha256": "e930aac415b6ae7134331c5ca505102802e18c39950ce28a391081a2a24f3be3"
+      }
+    ]
+  },
+  "timedRuns": 0,
+  "lockAcquired": false,
+  "thresholdsChanged": false,
+  "measurementRunner": "not implemented; reuse accepted #90 support after merge",
+  "qualification": "offline arithmetic and declarations only; no authoritative acceptance",
+  "generatorSha256": "4ce1f4c4855bf413cc0a07721ef6942e64ad10305dbe1a47702a02b305ca6044",
+  "preparationManifestHashes": {
+    "small": "14d36c3596bf274ce34adbeb7de9b69ece08451abc8e1c659f71a2a6a43e231d",
+    "medium": "271e71f15880352af8ad2aa85237711a2b8371c4ddd62ad19182e652beff664d",
+    "large": "91394032074432ff6659608b671d45027ed91cb78b69a70fb8d9f031cade7bfa"
+  },
+  "validation": {
+    "pythonTests": 13,
+    "fmt": "pass",
+    "diffCheck": "pass",
+    "independentReview": "no actionable substantive findings",
+    "fullVerify": "deferred until integration",
+    "clippy": "deferred until integration"
+  }
+}

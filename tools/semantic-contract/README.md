@@ -156,3 +156,47 @@ family gap makes native coverage partial with a diagnostic without erasing
 supported/observed roles. It does not by itself falsify complete semantic producer
 coverage. Production reports must be complete and native intents must mirror them;
 missing reports and authored overrides fail closed.
+
+
+## Combined performance-gate preparation (#61)
+
+Method and unresolved launch decisions: [performance-gate-method.md](../../docs/semantic-evidence/performance-gate-method.md).
+This preparation does not collect timings or establish a benchmark pass.
+
+```sh
+python3 tools/semantic-contract/generate-performance-scip.py \
+  --cohort-root /path/to/generated-cohorts \
+  --cohort-manifest tools/synthetic-cohorts/manifest-v2.json \
+  --size large --out /fresh/path/scip-preparation
+python3 tools/semantic-contract/qualify-performance.py \
+  --report /path/to/raw-report.json --out /fresh/path/offline-evaluation.json
+python3 -m unittest discover -s tools/semantic-contract/test -p 'test_performance*.py' -v
+```
+
+The generator verifies the exact selected tier and writes deterministic synthetic
+binary SCIP plus `preparation-manifest.json`. Its inventory is **unbound, not a
+closed admission manifest**. It asserts no native joins or actual reference
+producer execution. Full LARGE output exceeds existing admission document/fact
+bounds and cannot currently be imported as one language artifact. Lower density
+alone cannot fix the complete 10k source-inventory manifest cap. The reviewed
+#90 staged representative import/rejoin alternative also needs an explicit scope
+and interval decision; nothing here bypasses admission or changes caps.
+
+The qualifier checks declared raw samples against the existing policy. Input
+`reportVersion:1` selects `tier`, reviewed `runCount` (no default), all true review
+flags (`methodReviewed`, `dependencies90Merged`, `featureMerged`, `hostRatified`)
+and runner receipt flags (`rawAdmissionValidated`, `provenanceValidated`,
+`canonicalEvidenceValidated`). Every sample needs a unique `sampleId`, positive
+`durationSeconds`, integer `peakRssBytes`, exact `files`/`sourceBytes`,
+`nativeFactsOverall` equal to the four `nativeFactsPerLanguage` counts, plus
+`coherentNativeSemantic:true` and `requestedCoverageSatisfied:true`. MEDIUM/LARGE
+also require integer `steadySqliteBytes`, `peakDatabaseWalShmBytes` and
+`canonicalSerializedEvidenceBytes`. An incomplete/faulted set is `notMeasured`,
+not a partial passing median. Threshold failures remain `failed`.
+
+Flags are declarations of external receipts, not receipt verification. Every
+output says `offlineEvaluationOnly:true` and `authoritativeAcceptance:false`.
+The actual combined measurement adapter, authenticated receipt validation,
+RSS/peak collection and current-schema native+semantic denominator remain
+unfinished pending integration and method review. Reuse accepted #90 support;
+do not duplicate its daemon lifecycle or count its incremental p95 as this gate.
