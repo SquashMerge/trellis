@@ -93,7 +93,7 @@ protocol fixtures with `cargo test --locked --test mcp_protocol`.
 fresh, exact, unambiguous internal direct or constructor bindings expand; every other call is a
 labelled boundary, and frontiers, `partial` and warnings say what was left out. It is static
 evidence, not a runtime trace. An answer over the response cap is reduced to a smaller `maxCalls`
-and says so (`truncationReason:"response_bytes"`).
+and says so (`truncationReason:"response_bytes"`). The current SCIP importer sets `dispatch: unknown` on every call binding, so until dispatch evidence lands (#12, #14), `trellis_call_graph` on imported data stops at the root's direct callees.
 
 [Reviewed architecture rules](docs/rules.md) adds three read-only MCP tools
 (`trellis_references`, `trellis_rules_check`, `trellis_rules_explain`), the no-argument
