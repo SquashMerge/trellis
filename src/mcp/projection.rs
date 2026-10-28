@@ -1186,6 +1186,77 @@ pub fn outgoing(
     Ok(Some(last))
 }
 
+/// Project one rooted call-graph answer inside the response cap (D1, #40).
+///
+/// A complete answer that does not fit is replaced by the exact contract answer for the
+/// largest `maxCalls = k` whose frame fits (`fits(k) && !fits(k + 1)`), re-evaluated over the
+/// facts the query already read. The reduction is disclosed by `data.requested` (the caller's
+/// values) and `truncationReason: "response_bytes"`. `None` means even `k = 0` is too large.
+pub fn call_graph(
+    id: &Value,
+    answer: &mut crate::graph_query::GraphAnswer,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Result<Option<Value>, &'static str> {
+    let Ok(full) = &answer.outcome else {
+        return Err("store_unavailable: call graph answer is a contract failure");
+    };
+    let full = full.clone();
+    let requested = answer.requested.clone();
+    let basis = json!({"indexGeneration":answer.basis.index_generation.to_string(),
+        "indexRevision":answer.basis.index_revision});
+    let build =
+        |result: &crate::graph_query::GraphResult, reduced: bool| -> Result<Value, &'static str> {
+            let reason = if reduced {
+                Some("response_bytes")
+            } else if result.truncated {
+                Some("limit")
+            } else {
+                None
+            };
+            Ok(
+                json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
+            "evidenceBasis":basis,
+            "data":{"requested":requested,"result":result},
+            "warnings":result.warnings,"partial":result.partial,"truncated":result.truncated,
+            "truncationReason":reason}),
+            )
+        };
+    let fits = |envelope: &Value| -> bool {
+        let frame = json!({"jsonrpc":"2.0","id":id,
+            "result":super::tools::result("trellis_call_graph", envelope.clone(), modern)});
+        serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() < super::wire::RESPONSE_BYTES)
+    };
+    let complete = build(&full, false)?;
+    if fits(&complete) {
+        return Ok(Some(complete));
+    }
+    let edges = full.edges.len();
+    if edges == 0 {
+        return Ok(None);
+    }
+    let mut reduced = |max_calls: u64| -> Result<Value, &'static str> {
+        let result = answer
+            .reevaluate(max_calls)
+            .map_err(|_| "store_unavailable: call graph re-evaluation")?;
+        build(&result, true)
+    };
+    if !fits(&reduced(0)?) {
+        return Ok(None);
+    }
+    let (mut low, mut high) = (0, edges as u64 - 1);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(&reduced(mid)?) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    reduced(low).map(Some)
+}
+
 /// Project a name-matched reverse lookup without implying a semantic binding.
 pub fn incoming(
     id: &Value,
@@ -2017,5 +2088,209 @@ mod source_tests {
                 .is_none()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod call_graph_tests {
+    use super::*;
+    use crate::{
+        graph_query::{
+            DocumentFacts, FrontierReason, GraphAnswer, GraphFacts, GraphRequest, GraphSnapshot,
+            evaluate,
+        },
+        model::IndexPin,
+        native_evidence::{self as native, DocumentKey},
+        semantic_evidence as sem,
+    };
+    use std::{collections::BTreeMap, sync::Arc};
+
+    const SS: &str = "source-set:v1:s";
+    const REV: &str = "revision:v2:r";
+
+    fn sid(n: u64) -> String {
+        format!("sid:v1:{n:032x}")
+    }
+
+    /// A syntax-only root whose name is `padding` bytes long and which makes `calls` calls.
+    fn answer(calls: u64, padding: usize) -> GraphAnswer {
+        let key = DocumentKey {
+            source_set_id: SS.into(),
+            language: "rust".into(),
+            path: "src/lib.rs".into(),
+        };
+        let name = "r".repeat(padding.max(1));
+        let declaration = native::Declaration {
+            role: native::DeclarationRole::Production,
+            syntax_id: sid(1),
+            document: key.clone(),
+            revision_id: REV.into(),
+            kind: "function".into(),
+            name: Some(name.clone()),
+            lookup_key: Some(name.clone()),
+            ancestors: vec![],
+            key: native::Key {
+                kind: "function".into(),
+                name: Some(name.clone()),
+                signature: None,
+                ordinal: 0,
+            },
+            range: native::Range { start: 0, end: 1 },
+            name_range: None,
+            header: native::Header {
+                kind: "function".into(),
+                name: Some(name),
+                modifiers: vec![],
+                type_parameters: vec![],
+                parameters: vec![],
+                result_type: None,
+                bases: vec![],
+            },
+            provenance_id: "native:doc".into(),
+        };
+        let owned = (0..calls)
+            .map(|i| native::Call {
+                id: format!("occ:v2:{:032x}", 100 + i),
+                owner_syntax_id: sid(1),
+                ordinal: i as usize,
+                document: key.clone(),
+                revision_id: REV.into(),
+                range: native::Range {
+                    start: 10 + i as usize,
+                    end: 11 + i as usize,
+                },
+                callee_range: None,
+                spelling: Some(format!("f{i}")),
+                region_ids: vec![],
+                provenance_id: "native:doc".into(),
+            })
+            .collect::<Vec<_>>();
+        let document = DocumentFacts {
+            key: key.clone(),
+            declarations: BTreeMap::from([(sid(1), declaration)]),
+            calls: BTreeMap::from([(sid(1), owned)]),
+            native_coverage: sem::Coverage {
+                producer_id: "native".into(),
+                language: sem::Language::Rust,
+                source_set_id: SS.into(),
+                document_path: key.path.clone(),
+                revision_id: REV.into(),
+                requested: true,
+                selected: true,
+                state: sem::CoverageState::Complete,
+                supported_roles: vec![],
+                observed_roles: vec![],
+                diagnostic: None,
+            },
+            native_provenance: sem::Provenance {
+                id: "native:doc".into(),
+                producer_id: "native".into(),
+                document: key.clone(),
+                revision_id: REV.into(),
+                content_hash: "h".into(),
+                evidence_kind: sem::EvidenceKind::MeasuredSyntax,
+                basis: None,
+                freshness: sem::Freshness::Fresh,
+                derived_from: None,
+            },
+            semantic: None,
+        };
+        let mut facts = GraphFacts::complete(GraphSnapshot {
+            source_set_id: SS.into(),
+            revision_id: REV.into(),
+        });
+        facts.locations.insert(sid(1), Some(key.clone()));
+        facts.documents.insert(key, Arc::new(document));
+        let requested = GraphRequest {
+            source_set_id: SS.into(),
+            revision_id: REV.into(),
+            root_syntax_id: sid(1),
+            semantic_producer_id: None,
+            depth: 2,
+            max_nodes: 150,
+            max_calls: 500,
+        };
+        let outcome = evaluate(&requested, &mut facts).unwrap();
+        GraphAnswer {
+            basis: IndexPin {
+                index_generation: uuid::Uuid::from_u128(1),
+                index_revision: 1,
+            },
+            requested,
+            outcome,
+            facts,
+        }
+    }
+
+    fn frame_len(envelope: &Value, modern: bool) -> usize {
+        let frame = json!({"jsonrpc":"2.0","id":"graph",
+            "result":crate::mcp::tools::result("trellis_call_graph", envelope.clone(), modern)});
+        serde_json::to_vec(&frame).unwrap().len()
+    }
+
+    fn project(answer: &mut GraphAnswer, modern: bool) -> Option<Value> {
+        call_graph(
+            &json!("graph"),
+            answer,
+            std::path::Path::new("/w"),
+            false,
+            modern,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fitting_answer_is_unreduced() {
+        for modern in [false, true] {
+            let mut small = answer(3, 1);
+            let envelope = project(&mut small, modern).unwrap();
+            let result = &envelope["data"]["result"];
+            assert_eq!(result["edges"].as_array().unwrap().len(), 3);
+            assert_eq!(result["request"]["maxCalls"], 500);
+            assert_eq!(envelope["data"]["requested"], result["request"]);
+            assert_eq!(envelope["truncated"], false);
+            assert_eq!(envelope["truncationReason"], Value::Null);
+            assert_eq!(envelope["warnings"], result["warnings"]);
+        }
+    }
+
+    #[test]
+    fn oversized_answer_reduces_max_calls_to_a_contract_valid_prefix() {
+        for modern in [false, true] {
+            let mut big = answer(600, 1);
+            let full = big.outcome.clone().unwrap();
+            assert_eq!(full.edges.len(), 500);
+            let envelope = project(&mut big, modern).unwrap();
+            let result = &envelope["data"]["result"];
+            let k = result["request"]["maxCalls"].as_u64().unwrap();
+            assert!(k < 500);
+            assert_eq!(envelope["data"]["requested"]["maxCalls"], 500);
+            assert_eq!(result["edges"].as_array().unwrap().len() as u64, k);
+            assert_eq!(envelope["truncated"], true);
+            assert_eq!(envelope["truncationReason"], "response_bytes");
+            assert_eq!(envelope["partial"], true);
+            let frontier = result["frontier"].as_array().unwrap();
+            let last = frontier.last().unwrap();
+            assert_eq!(last["reason"], json!(FrontierReason::CallLimit));
+            assert_eq!(last["nextOrdinal"], k);
+            assert_eq!(last["omittedCalls"], 600 - k);
+            assert!(frame_len(&envelope, modern) < crate::mcp::wire::RESPONSE_BYTES);
+            // The reduced answer is the exact contract answer for the effective request.
+            let again = big.reevaluate(k).unwrap();
+            assert_eq!(serde_json::to_value(&again).unwrap(), *result);
+            // `fits(k) && !fits(k + 1)`.
+            let next = big.reevaluate(k + 1).unwrap();
+            let mut probe = envelope.clone();
+            probe["data"]["result"] = serde_json::to_value(&next).unwrap();
+            assert!(frame_len(&probe, modern) >= crate::mcp::wire::RESPONSE_BYTES);
+        }
+    }
+
+    #[test]
+    fn root_alone_over_cap_is_range_too_large() {
+        let mut huge = answer(2, 70_000);
+        assert!(project(&mut huge, true).is_none());
+        let mut no_calls = answer(0, 70_000);
+        assert!(project(&mut no_calls, false).is_none());
     }
 }

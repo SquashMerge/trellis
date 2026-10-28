@@ -284,6 +284,33 @@ fn mcp_read_error(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// A rooted call-graph contract failure's wire envelope. The closed failure-code set is shared
+/// with every other tool, so the two `not_found` causes differ only by message.
+fn call_graph_failure(
+    id: &serde_json::Value,
+    error: &crate::graph_query::GraphError,
+) -> serde_json::Value {
+    use crate::graph_query::GraphErrorCode::*;
+    let (code, message) = match error.code {
+        InvalidRequest => ("invalid_request", None),
+        RootMissing => (
+            "not_found",
+            Some("Call graph root not found in the admitted snapshot"),
+        ),
+        ProducerUnavailable => (
+            "not_found",
+            Some("Semantic producer not published for the admitted revision"),
+        ),
+        InvalidRecord | InvalidRange | InvalidDigest | UnsupportedEncoding | SourceSetDenied
+        | RevisionUnavailable => ("store_unavailable", None),
+    };
+    let mut envelope = tools::failure(id, code);
+    if let Some(message) = message {
+        envelope["error"]["message"] = serde_json::json!(message);
+    }
+    envelope
+}
+
 /// A failed evidence read's wire code.
 fn evidence_failure_code(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
@@ -1292,6 +1319,29 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 }
                                 None => tools::failure(id, "not_found"),
                             },
+                        )
+                    }))
+                }
+                ("trellis_call_graph", Some(args)) => {
+                    let query = tools::call_graph_query(&serde_json::Value::Object(args.clone()));
+                    let expected = validated_expected_basis(args);
+                    Some(Box::new(move |runtime, response, sampled, _query| {
+                        let mut check = || {
+                            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                                || runtime.mcp_clock_now() >= deadline
+                            {
+                                anyhow::bail!("deadline_exceeded: MCP call graph deadline");
+                            }
+                            Ok(())
+                        };
+                        let mut answer = response.graph_query(&query, expected, &mut check)?;
+                        if let Err(error) = &answer.outcome {
+                            return Ok(call_graph_failure(id, error));
+                        }
+                        Ok(
+                            projection::call_graph(id, &mut answer, root, sampled, modern)
+                                .map_err(|error| anyhow::anyhow!(error))?
+                                .unwrap_or_else(|| tools::failure(id, "range_too_large")),
                         )
                     }))
                 }

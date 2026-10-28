@@ -54,6 +54,8 @@ pub struct Spec {
     pub bindings: Vec<Bind>,
     /// Declarations that get a declaration binding (history provenance).
     pub declaration_bindings: Vec<String>,
+    /// Provenance IDs for declaration bindings, by declaration name; the default is `decl-<name>`.
+    pub declaration_proofs: BTreeMap<String, String>,
 }
 
 impl Spec {
@@ -69,6 +71,7 @@ impl Spec {
             states: BTreeMap::new(),
             bindings: vec![],
             declaration_bindings: vec![],
+            declaration_proofs: BTreeMap::new(),
         }
     }
     pub fn syntax_only(files: &[(&str, &str)]) -> Self {
@@ -279,7 +282,11 @@ fn evidence(
         content_hash: hash_of(key),
         evidence_kind: kind,
         basis: Some(basis(language_of(&key.path))),
-        freshness: s::Freshness::Fresh,
+        freshness: if spec.requested_version == "v1" {
+            s::Freshness::Fresh
+        } else {
+            s::Freshness::PossiblyStale
+        },
         derived_from: None,
     };
     let mut semantic = s::SemanticPublication {
@@ -307,7 +314,11 @@ fn evidence(
         if !fact_bearing(key) {
             continue;
         }
-        let id = format!("decl-{name}");
+        let id = spec
+            .declaration_proofs
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| format!("decl-{name}"));
         let symbol = s::SymbolKey {
             scheme: s::SymbolScheme::Scip,
             symbol: format!("pkg {name}"),
@@ -347,11 +358,10 @@ fn evidence(
             continue;
         }
         let call = calls_of(native, &b.caller)[b.nth];
-        semantic.provenance.push(proof(
-            &b.provenance,
-            &key,
-            s::EvidenceKind::SemanticReference,
-        ));
+        let shared = proof(&b.provenance, &key, s::EvidenceKind::SemanticReference);
+        if !semantic.provenance.contains(&shared) {
+            semantic.provenance.push(shared);
+        }
         let target = || target_of(native, b.target.as_deref().unwrap());
         let (declared_target, mut candidates) = match b.resolution {
             s::Resolution::Resolved => (Some(target()), vec![]),

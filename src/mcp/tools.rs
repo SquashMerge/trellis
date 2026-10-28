@@ -3,7 +3,7 @@ use super::{IdentityError, OpenedWorkspace, wire};
 use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 10] = super::catalog::NAMES;
+const TOOLS: [&str; 11] = super::catalog::NAMES;
 #[derive(Debug)]
 pub struct PreparedTool {
     pub name: String,
@@ -125,6 +125,19 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             ],
             &["schemaVersion", "symbolId"],
         ),
+        "trellis_call_graph" => (
+            &[
+                "schemaVersion",
+                "symbolId",
+                "semanticProducerId",
+                "depth",
+                "maxNodes",
+                "maxCalls",
+                "expectedBasis",
+                "workspace",
+            ],
+            &["schemaVersion", "symbolId"],
+        ),
         _ => (
             &[
                 "schemaVersion",
@@ -188,7 +201,10 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             limit(o)
         }
-        "trellis_declaration" | "trellis_outgoing_calls" | "trellis_incoming_calls" => {
+        "trellis_declaration"
+        | "trellis_outgoing_calls"
+        | "trellis_incoming_calls"
+        | "trellis_call_graph" => {
             let sid = string(o.get("symbolId")).ok_or("invalid_request")?;
             if sid.len() > 8192
                 || sid.len() != 39
@@ -198,6 +214,9 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             {
                 return Err("invalid_request");
+            }
+            if name == "trellis_call_graph" {
+                return call_graph_arguments(o).and_then(|()| workspace_field(o));
             }
             if name != "trellis_declaration" {
                 limit(o)
@@ -232,12 +251,55 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
         }
     };
     validated?;
+    workspace_field(o)
+}
+fn workspace_field(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
     if o.get("workspace")
         .is_some_and(|value| value.as_str().is_none_or(|path| path.len() > 4096))
     {
         return Err("invalid_request");
     }
     Ok(())
+}
+/// `trellis_call_graph` bounds are the contract's and are never clamped: an out-of-range
+/// or non-integer value is `invalid_request`, not `range_too_large`.
+fn call_graph_arguments(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
+    use crate::graph_query::{MAX_CALLS, MAX_DEPTH, MAX_NODES};
+    let in_range = |field: &str, range: std::ops::RangeInclusive<u64>| match o.get(field) {
+        None => Ok(()),
+        Some(value) if wire::uint(value).is_some_and(|n| range.contains(&n)) => Ok(()),
+        Some(_) => Err("invalid_request"),
+    };
+    in_range("depth", 0..=MAX_DEPTH)?;
+    in_range("maxNodes", 1..=MAX_NODES)?;
+    in_range("maxCalls", 0..=MAX_CALLS)?;
+    match o.get("semanticProducerId") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(producer)) if !producer.is_empty() => Ok(()),
+        Some(_) => Err("invalid_request"),
+    }
+}
+/// The validated request with defaults materialized; the server fills in the snapshot IDs.
+pub fn call_graph_query(args: &Value) -> crate::graph_query::GraphQuery {
+    use crate::graph_query::{DEFAULT_DEPTH, DEFAULT_MAX_CALLS, DEFAULT_MAX_NODES};
+    let number = |field: &str, default: u64| {
+        args.get(field).map_or(default, |v| {
+            wire::uint(v).expect("validated call graph bound")
+        })
+    };
+    crate::graph_query::GraphQuery {
+        root_syntax_id: args["symbolId"]
+            .as_str()
+            .expect("validated call graph root")
+            .to_owned(),
+        semantic_producer_id: args
+            .get("semanticProducerId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        depth: number("depth", DEFAULT_DEPTH),
+        max_nodes: number("maxNodes", DEFAULT_MAX_NODES),
+        max_calls: number("maxCalls", DEFAULT_MAX_CALLS),
+    }
 }
 fn details(code: &str) -> (&'static str, bool) {
     match code {
@@ -396,6 +458,13 @@ pub fn result(name: &str, envelope: Value, modern: bool) -> Value {
                     .len(),
                 "calls",
             ),
+            "trellis_call_graph" => (
+                envelope["data"]["result"]["edges"]
+                    .as_array()
+                    .expect("call graph edges")
+                    .len(),
+                "edges",
+            ),
             "trellis_read_source" => (
                 (envelope["data"]["endLine"]
                     .as_u64()
@@ -545,7 +614,10 @@ mod tests {
             "trellis_references" | "trellis_rules_check" => json!({"schemaVersion":1}),
             "trellis_rules_explain" => json!({"schemaVersion":1,"rule":"rule-a",
                 "target":{"sourceSetId":"app","language":"rust","path":"src/a.rs","sid":sid()}}),
-            "trellis_declaration" | "trellis_outgoing_calls" | "trellis_incoming_calls" => {
+            "trellis_declaration"
+            | "trellis_outgoing_calls"
+            | "trellis_incoming_calls"
+            | "trellis_call_graph" => {
                 json!({"schemaVersion":1,"symbolId":sid()})
             }
             _ => json!({"schemaVersion":1,"path":"src/a.rs","startLine":1,"endLine":1}),
@@ -962,6 +1034,68 @@ mod tests {
             invalid.response["structuredContent"]["error"]["code"],
             "invalid_request"
         );
+    }
+    #[test]
+    fn call_graph_bounds_are_exact_and_unclamped() {
+        let name = "trellis_call_graph";
+        for (field, valid, invalid) in [
+            ("depth", vec![0, 2, 5], vec![json!(6), json!(-1)]),
+            ("maxNodes", vec![1, 150], vec![json!(0), json!(151)]),
+            ("maxCalls", vec![0, 500], vec![json!(501), json!(-1)]),
+        ] {
+            for n in valid {
+                let mut v = good(name);
+                v[field] = json!(n);
+                assert_eq!(validate(name, Some(&v)), Ok(()), "{field} {n}");
+            }
+            for n in invalid.into_iter().chain([
+                json!(null),
+                json!(1.5),
+                json!("2"),
+                json!(9007199254740992_u64),
+            ]) {
+                let mut v = good(name);
+                v[field] = n;
+                check(name, &v, "invalid_request");
+            }
+        }
+        for producer in [json!(""), json!(1), json!(true), json!([])] {
+            let mut v = good(name);
+            v["semanticProducerId"] = producer;
+            check(name, &v, "invalid_request");
+        }
+        for producer in [json!(null), json!("p")] {
+            let mut v = good(name);
+            v["semanticProducerId"] = producer;
+            assert_eq!(validate(name, Some(&v)), Ok(()));
+        }
+        for field in ["view", "limit", "revisionId", "sourceSetId"] {
+            let mut v = good(name);
+            v[field] = json!(1);
+            check(name, &v, "invalid_request");
+        }
+        let mut v = good(name);
+        v["workspace"] = json!("x".repeat(4097));
+        check(name, &v, "invalid_request");
+        let defaults = call_graph_query(&good(name));
+        assert_eq!(
+            (
+                defaults.depth,
+                defaults.max_nodes,
+                defaults.max_calls,
+                defaults.semantic_producer_id
+            ),
+            (2, 150, 500, None)
+        );
+        let mut v = good(name);
+        v["semanticProducerId"] = json!("p");
+        v["depth"] = json!(0);
+        v["maxNodes"] = json!(1);
+        v["maxCalls"] = json!(0);
+        let query = call_graph_query(&v);
+        assert_eq!((query.depth, query.max_nodes, query.max_calls), (0, 1, 0));
+        assert_eq!(query.semantic_producer_id.as_deref(), Some("p"));
+        assert_eq!(query.root_syntax_id, sid());
     }
     #[test]
     fn incoming_is_prepared_and_catalogued() {
