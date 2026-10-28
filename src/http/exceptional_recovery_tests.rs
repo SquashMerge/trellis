@@ -1,6 +1,107 @@
 use super::*;
 use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
 
+fn startup_queue_fixture(old_schema: bool, changed_device: bool) {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+    let state_root = tmp.path().join("state");
+    let roots =
+        TopologyRoots::isolated_for_tests(state_root.join("cache"), state_root.join("data"));
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let old = Store::open_for_tests(&state_root, &root).unwrap();
+    let options = IndexOptions::new(root.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (prior, owner) =
+        crate::index_coordinator::reconcile_workspace(&old, &options, &cancel, |_| {}).unwrap();
+    let accepted = old.enqueue_request(&options, None).unwrap();
+    let queue_path = old.request_db_path();
+    let queue_inode = std::fs::metadata(&queue_path).unwrap().ino();
+    drop(owner);
+    drop(old);
+
+    let index_path = roots.index_db(&identity);
+    let index_inode = std::fs::metadata(&index_path).unwrap().ino();
+    {
+        let db = rusqlite::Connection::open(&index_path).unwrap();
+        if old_schema {
+            // Only the obsolete format marker is read before discarding this index.
+            db.execute_batch("PRAGMA ignore_check_constraints=ON; PRAGMA user_version=10; UPDATE index_metadata SET schema_version=10;").unwrap();
+        }
+        if changed_device {
+            // A reboot may change the device ID while the root inode stays the same.
+            db.execute(
+                "UPDATE index_metadata SET root_device=?1 WHERE singleton=1",
+                [(identity.device ^ 1).to_string()],
+            )
+            .unwrap();
+            let inode: String = db
+                .query_row(
+                    "SELECT root_inode FROM index_metadata WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(inode, identity.inode.to_string());
+        }
+    }
+
+    let store = Store::open_for_tests(&state_root, &root).unwrap();
+    let state = new(
+        store.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.worker_started.store(true, Ordering::Release);
+    // Drive the daemon's mandatory startup reconciliation and FIFO step, not a
+    // direct index command that could bypass the startup gate.
+    let result = state.worker_step();
+    let row = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        "done",
+        "startup={result:?}; error={:?}",
+        state.startup_error()
+    );
+    assert!(result.is_ok());
+    assert_eq!(std::fs::metadata(&queue_path).unwrap().ino(), queue_inode);
+    assert_eq!(row.id, accepted.id);
+    assert_eq!(row.seq, accepted.seq);
+    assert_eq!(row.options_json, accepted.options_json);
+    assert_ne!(std::fs::metadata(&index_path).unwrap().ino(), index_inode);
+    assert_ne!(
+        row.revision.unwrap().index_generation,
+        prior.index_generation
+    );
+    assert_eq!(row.revision.unwrap(), store.status().unwrap().revision);
+    assert!(store.source_at("a.js", None).unwrap().is_some());
+    state.worker_step().unwrap();
+    assert_eq!(
+        store.request_by_id(&accepted.id).unwrap().unwrap().revision,
+        row.revision
+    );
+}
+
+#[test]
+fn old_schema_at_startup_completes_an_existing_queued_request() {
+    startup_queue_fixture(true, false);
+}
+
+#[test]
+fn changed_root_device_with_same_inode_completes_an_existing_queued_request() {
+    startup_queue_fixture(false, true);
+}
+
+#[test]
+fn old_schema_and_changed_root_device_complete_an_existing_queued_request() {
+    startup_queue_fixture(true, true);
+}
+
 pub(super) fn fixture() -> (
     tempfile::TempDir,
     Store,

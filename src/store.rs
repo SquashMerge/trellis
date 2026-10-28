@@ -357,7 +357,7 @@ pub struct Store {
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
     recovery_disposition: Arc<AtomicU8>,
-    obsolete_format_marker: Arc<Mutex<Option<IndexFormatMarker>>>,
+    obsolete_format_marker: Arc<Mutex<Option<ObsoleteIndexFormat>>>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
     aborted_staged_index: Arc<Mutex<Option<StagedIndex>>>,
@@ -553,8 +553,11 @@ impl IndexFormatMarker {
             || self.extractor_version != EXTRACTOR_VERSION
     }
 }
-#[derive(Debug)]
-struct ObsoleteIndexFormat(IndexFormatMarker);
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ObsoleteIndexFormat {
+    EarlierSchema(u32),
+    Metadata(IndexFormatMarker),
+}
 impl std::fmt::Display for ObsoleteIndexFormat {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("recovery_required: obsolete index format")
@@ -3758,13 +3761,18 @@ fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> 
         version <= DATABASE_SCHEMA_VERSION,
         "incompatible_index: unsupported newer schema cannot be rebaselined"
     );
+    // Earlier derived schemas are disposable regardless of their metadata layout
+    // or recorded root identity (Decision 0006 §2).
+    if (1..DATABASE_SCHEMA_VERSION).contains(&version) {
+        return Err(ObsoleteIndexFormat::EarlierSchema(version).into());
+    }
     let marker = read_index_format_marker(&db)?;
     ensure!(
         marker.schema_version <= i64::from(DATABASE_SCHEMA_VERSION),
         "incompatible_index: unsupported newer schema cannot be rebaselined"
     );
     if marker.is_obsolete() {
-        return Err(ObsoleteIndexFormat(marker).into());
+        return Err(ObsoleteIndexFormat::Metadata(marker).into());
     }
     control_ensure!(
         version == DATABASE_SCHEMA_VERSION,
@@ -11674,14 +11682,14 @@ impl Store {
             Ok(()) => Ok(store),
             Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
                 if let Some(obsolete) = error.downcast_ref::<ObsoleteIndexFormat>() {
-                    *store.obsolete_format_marker.lock().unwrap() = Some(obsolete.0.clone());
+                    *store.obsolete_format_marker.lock().unwrap() = Some(obsolete.clone());
                 }
                 store.mark_recovery(RecoveryDisposition::RecreatePending);
                 Ok(store)
             }
             Err(error) if recovery_class(&error) == RecoveryClass::Rebuild => {
                 if let Some(obsolete) = error.downcast_ref::<ObsoleteIndexFormat>() {
-                    *store.obsolete_format_marker.lock().unwrap() = Some(obsolete.0.clone());
+                    *store.obsolete_format_marker.lock().unwrap() = Some(obsolete.clone());
                 }
                 store.mark_recovery(RecoveryDisposition::Rebuild);
                 Ok(store)
@@ -12240,16 +12248,12 @@ impl Store {
             Err(error) => {
                 if let Some(found) = error.downcast_ref::<ObsoleteIndexFormat>() {
                     ensure!(
-                        initial_marker.as_ref() == Some(&found.0),
+                        initial_marker.as_ref() == Some(found),
                         "recovery_required: obsolete marker changed since admission"
                     );
                     let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
-                    self.verify_metadata_root(&db)?;
-                    ensure!(
-                        read_index_format_marker(&db)?.eq(&found.0),
-                        "recovery_required: obsolete marker changed under EX"
-                    );
-                    obsolete = Some(found.0.clone());
+                    self.verify_obsolete_format(&db, found)?;
+                    obsolete = Some(found.clone());
                 }
                 let class = recovery_class(&error);
                 if class == RecoveryClass::Hard
@@ -12353,11 +12357,7 @@ impl Store {
         if let Some(marker) = &obsolete {
             old.verify()?;
             let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
-            self.verify_metadata_root(&db)?;
-            ensure!(
-                read_index_format_marker(&db)?.eq(marker),
-                "recovery_required: obsolete marker changed before stage"
-            );
+            self.verify_obsolete_format(&db, marker)?;
         }
         let mut stage = self.create_staged_index(leader, true)?;
         let result = (|| -> Result<IndexPin> {
@@ -12437,11 +12437,7 @@ impl Store {
                 let recheck = (|| -> Result<()> {
                     old.verify()?;
                     let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
-                    self.verify_metadata_root(&db)?;
-                    ensure!(
-                        read_index_format_marker(&db)?.eq(marker),
-                        "recovery_required: obsolete marker changed before rename"
-                    );
+                    self.verify_obsolete_format(&db, marker)?;
                     stage.verify_path()?;
                     reject_sidecars(&stage.path, true)?;
                     reject_sidecars(&path, true)?;
@@ -12769,6 +12765,26 @@ impl Store {
             RecoveryClass::Hard => {}
         }
         class
+    }
+    fn verify_obsolete_format(&self, db: &Connection, marker: &ObsoleteIndexFormat) -> Result<()> {
+        match marker {
+            ObsoleteIndexFormat::EarlierSchema(expected) => {
+                let version: u32 =
+                    storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+                ensure!(
+                    version == *expected && (1..DATABASE_SCHEMA_VERSION).contains(&version),
+                    "recovery_required: obsolete schema changed since admission"
+                );
+            }
+            ObsoleteIndexFormat::Metadata(expected) => {
+                self.verify_metadata_root(db)?;
+                ensure!(
+                    read_index_format_marker(db)?.eq(expected),
+                    "recovery_required: obsolete marker changed since admission"
+                );
+            }
+        }
+        Ok(())
     }
     fn verify_metadata_root(&self, db: &Connection) -> Result<()> {
         let (count, typed): (i64, bool) = db.query_row(
