@@ -1895,12 +1895,6 @@ impl From<anyhow::Error> for ApiError {
                         "workspace_id_changed",
                     ),
                     ("storage_busy", StatusCode::CONFLICT, "storage_busy"),
-                    ("rules_conflict", StatusCode::CONFLICT, "rules_conflict"),
-                    (
-                        "invalid_request",
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request",
-                    ),
                     (
                         "index_not_ready",
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -4647,6 +4641,36 @@ async fn provisioned_core_answer(
                             false,
                         ));
                     }
+                    for cause in error.chain() {
+                        let text = cause.to_string();
+                        if text.starts_with("invalid_request:") {
+                            let message = if text
+                                .contains("positively witnessed production layer deviation")
+                            {
+                                "Selected pair is not a witnessed production layer deviation"
+                            } else if text.contains("expanded rules exceed 2 MiB") {
+                                "Expanded rules exceed the 2 MiB rules-file limit"
+                            } else if text
+                                .contains("assignment requires an indexed unassigned file")
+                            {
+                                "Assignment requires an indexed unassigned file"
+                            } else {
+                                "Rules change is invalid; check the operation, selections and limits"
+                            };
+                            return Err(ApiError(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                message,
+                            ));
+                        }
+                        if text.starts_with("rules_conflict:") {
+                            return Err(ApiError(
+                                StatusCode::CONFLICT,
+                                "rules_conflict",
+                                "Rules changed on disk; reload rules and preview again",
+                            ));
+                        }
+                    }
                     Err(ApiError::from(error))
                 }
             }
@@ -5102,6 +5126,15 @@ mod browser_core_route_tests {
         let error = super::checkout_list_response(vec![row]).unwrap_err();
         assert_eq!(error.0, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error.1, "response_too_large");
+    }
+
+    #[test]
+    fn rules_edit_request_refusals_do_not_change_global_error_mapping() {
+        let error = super::ApiError::from(anyhow::anyhow!(
+            "invalid_request: malformed external destination identity"
+        ));
+        assert_eq!(error.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.1, "internal_error");
     }
 
     #[test]

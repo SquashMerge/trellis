@@ -338,35 +338,46 @@ test("late apply cannot refresh a successor checkout and failed post-write reche
 });
 
 
-test("non-2xx post-write outcomes stay truthful and require disk inspection/reload rather than retry", async () => {
-  for (const mutationOutcome of ["committed","durability_uncertain"]) {
+test("lost or invalid apply response leaves the write outcome unknown until rules reload", async () => {
+  for (const failure of [new TypeError("Failed to fetch"),Object.assign(new Error("Request timed out"),{name:"TimeoutError"}),new SyntaxError("Invalid JSON"),null]) {
+    const h=harness();let hash="rules-one";
+    h.setResponse(async url=> {
+      if(url.endsWith("/preview")) return editorResponse(hash);
+      if(url.endsWith("/apply")) {hash="rules-proposed";if(failure) throw failure;return {payload:{...pin}};}
+      if(url.includes("/rules?")) return {payload:{...pin,rulesFile:{contentHash:hash},exceptions:[],layers:[]}};
+      return {payload:authoringFixture(hash)};
+    });
+    await h.controller.refresh();await selectTwo(h);h.get("architecture-reason").value="Kept after response loss";
+    await h.get("architecture-preview").fire("click");await h.get("architecture-confirm").fire("click");
+    assert.match(h.get("architecture-edit-state").textContent,/Write outcome unknown.*Reload rules/);
+    assert.equal(h.get("architecture-state").dataset.state,"stale");assert.equal(h.get("architecture-diagram").children.length,0);
+    assert.equal(h.get("architecture-preview-result").hidden,true);assert.equal(h.get("architecture-reason").value,"Kept after response loss");
+    assert.equal(h.conflicts.length,0);
+    const count=h.calls.length;await h.get("architecture-confirm").fire("click");await h.get("architecture-preview").fire("click");assert.equal(h.calls.length,count);
+    await h.get("architecture-rules-reload").fire("click");await h.get("architecture-preview").fire("click");
+    assert.equal(h.calls.at(-1).options.body.baseHash,"rules-proposed");assert.equal(h.get("architecture-reason").value,"Kept after response loss");
+    assert.equal(h.calls.filter(call=>call.url.endsWith("/apply")).length,1,"recovery never retries apply");
+  }
+});
+
+test("typed precommit apply refusals keep their public message without claiming an unknown write", async () => {
+  for (const refusal of [{status:400,code:"invalid_request",message:"Requested pair has no production deviation witness"},
+    {status:422,code:"invalid_rules",diagnostic:{path:".trellis/rules.toml",line:2,column:1,kind:"invalid_value",message:"Reason is too long"}},
+    {status:503,code:"storage_unavailable",message:"Storage is unavailable"}]) {
     const h=harness();
     h.setResponse(async url=> {
       if(url.endsWith("/preview")) return editorResponse();
-      if(url.endsWith("/apply")) throw Object.assign(new Error("Root changed during post-write recheck"),{status:409,code:"root_changed",mutationOutcome});
+      if(url.endsWith("/apply")) throw Object.assign(new Error(refusal.message || "Invalid rules"),refusal);
       return {payload:authoringFixture()};
     });
-    await h.controller.refresh();await selectTwo(h);h.get("architecture-reason").value="Kept after write";
+    await h.controller.refresh();await selectTwo(h);h.get("architecture-reason").value="Kept after refusal";
     await h.get("architecture-preview").fire("click");await h.get("architecture-confirm").fire("click");
-    assert.match(h.get("architecture-edit-state").textContent,mutationOutcome === "committed" ? /Rules were committed/ : /Rules were written, but crash durability is uncertain/);
-    assert.match(h.get("architecture-edit-state").textContent,/Inspect disk and reload rules/);
-    assert.equal(h.get("architecture-state").dataset.state,"stale");assert.equal(h.get("architecture-diagram").children.length,0);
-    assert.equal(h.get("architecture-reason").value,"Kept after write");assert.equal(h.conflicts.length,0,"automatic pin reset cannot erase the written outcome");
-    const count=h.calls.length;await h.get("architecture-confirm").fire("click");await h.get("architecture-preview").fire("click");assert.equal(h.calls.length,count);
+    assert.ok(h.get("architecture-edit-state").textContent.includes(refusal.diagnostic?.message || refusal.message));
+    assert.doesNotMatch(h.get("architecture-edit-state").textContent,/outcome unknown/i);
+    const count=h.calls.length;await h.get("architecture-confirm").fire("click");assert.equal(h.calls.length,count);
+    await h.get("architecture-preview").fire("click");assert.equal(h.calls.length,count+1,"known refusal permits a fresh preview without reload");
   }
 });
-
-test("checkout request adapter carries the mutation outcome header on a non-2xx error", async () => {
-  const app=fs.readFileSync(path.join(__dirname,"../web/app.js"),"utf8");
-  const apiSource=app.slice(app.indexOf("async function api("),app.indexOf("async function perform("));
-  for(const outcome of ["committed","durability_uncertain"]) {
-    const context={epoch:1,token:"test-token",selectedRootKey:"checkout",sourceSerial:0,pendingRequests:new Set(),selectedUrl:path=>path,operationGuard:()=>()=>true,
-      AbortController,setTimeout,clearTimeout,fetch:async()=>({ok:false,status:409,headers:{get:name=>name==="X-Trellis-Mutation-Outcome" ? outcome : null},json:async()=>({error:{code:"root_changed",message:"Post-write root changed"}})})};
-    vm.createContext(context);vm.runInContext(apiSource,context);
-    await assert.rejects(context.api("/api/architecture/rules/apply","POST",{}),error=>error.code==="root_changed" && error.mutationOutcome===outcome);
-  }
-});
-
 
 test("no_layers keeps a rules-hash-qualified authoring basis for orphan edits and removal without a graph", async () => {
   for (const mode of ["Edit reason","Remove"]) {

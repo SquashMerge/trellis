@@ -2278,7 +2278,7 @@ impl CheckoutRuntime {
         let _owner = self
             .rules_edit_owner
             .lock()
-            .map_err(|_| anyhow::anyhow!("internal_error: rules owner"))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         check()?;
         let resources = self.resources()?;
         let root = Path::new(resources.store.workspace_root());

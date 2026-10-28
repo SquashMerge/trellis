@@ -158,7 +158,6 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     error.status = response.status;
     error.code = data?.error?.code;
     error.reason = data?.error?.reason;
-    error.mutationOutcome = response.headers?.get?.("X-Trellis-Mutation-Outcome") || null;
     if (error.code === "invalid_rules") error.diagnostic = data.error;
     error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
     if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);

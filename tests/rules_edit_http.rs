@@ -211,11 +211,22 @@ fn assert_rejected(status: StatusCode, error: &Value) {
         "{status}: {error}"
     );
     assert!(error["error"]["code"].is_string(), "{error}");
+    assert_ne!(
+        error["error"]["message"], "Storage is unavailable",
+        "{error}"
+    );
     assert!(error.get("payload").is_none(), "{error}");
 }
 fn assert_conflict(status: StatusCode, error: &Value) {
     assert_eq!(status, StatusCode::CONFLICT, "{error}");
     assert_eq!(error["error"]["code"], "rules_conflict", "{error}");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reload rules"),
+        "{error}"
+    );
     assert!(error.get("payload").is_none(), "{error}");
 }
 
@@ -351,6 +362,15 @@ async fn add_requires_positive_deviating_pair_and_nonblank_reason() {
         let body = f.body(hash, operations);
         let (status, _, error) = call(&app, "POST", &f.route("/preview"), Some(&body)).await;
         assert_rejected(status, &error);
+        if body["operations"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.trim().is_empty())
+        {
+            assert_eq!(
+                error["error"]["message"],
+                "Selected pair is not a witnessed production layer deviation"
+            );
+        }
         assert_eq!(fs::read(f.rules_path()).unwrap(), original);
     }
     let mut body = f.body(

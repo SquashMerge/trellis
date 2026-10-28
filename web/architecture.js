@@ -376,15 +376,6 @@
     }
     function invalidatePreview() { editSerial++; preview = null; get("architecture-preview-result").hidden = true; }
     function editError(error) {
-      if (["committed", "durability_uncertain"].includes(error.mutationOutcome)) {
-        if (draft) draft.needsReload = true;
-        const message = error.mutationOutcome === "durability_uncertain" ? "Rules were written, but crash durability is uncertain." : "Rules were committed.";
-        const detail = `${message} The response failed after the write: ${error.message || error.code || "unknown error"}. Inspect disk and reload rules before any new preview. No retry was made.`;
-        renderSerial++; clearInspection(); view = null;
-        get("architecture-diagram").replaceChildren(); get("architecture-legend").replaceChildren();
-        editState(detail, "error"); state(detail, "stale");
-        return;
-      }
       if (error.code === "rules_conflict" && draft) draft.needsReload = true;
       const d = error.diagnostic;
       editState(error.code === "rules_conflict" ? "Rules changed on disk. Draft kept. Reload rules, review the new base, then generate a new preview. Nothing was automatically retried." :
@@ -467,7 +458,19 @@
         if (now.rootKey !== c.rootKey || now.session !== c.session || !window.TrellisIndexPin.equal(now.pin, c.pin)) return;
         if (usable() && basis.rulesHash === p.rulesFile.contentHash) { state(message + "Rechecked at the same code snapshot."); }
         else { state(message + "Recheck failed or rules changed again. Refresh before reviewing; no old graph is current.", "stale"); }
-      } catch (error) { if (active()) { invalidatePreview(); editError(error); } }
+      } catch (error) {
+        if (active()) {
+          invalidatePreview();
+          if (Number.isInteger(error.status)) editError(error);
+          else {
+            draft.needsReload = true;
+            const detail = `Write outcome unknown. The apply response was not received or could not be verified: ${error.message || "unknown error"}. Reload rules and inspect the current rules before any new preview. No retry was made.`;
+            renderSerial++; clearInspection(); view = null;
+            get("architecture-diagram").replaceChildren(); get("architecture-legend").replaceChildren();
+            editState(detail, "error"); state(detail, "stale");
+          }
+        }
+      }
       finally { setBusy(false, busy); }
     }
     async function reloadRules() {
