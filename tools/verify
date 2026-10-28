@@ -5,6 +5,10 @@
 # first failed lane's status.
 set -eu
 
+# User daemon settings must not make tests load local models or change diagnostics.
+# Tests that need these settings set them explicitly on their own child commands.
+unset TRELLIS_SEARCH_MODEL TRELLIS_SEARCH_BACKEND TRELLIS_INDEX_DIAGNOSTICS
+
 # Record the toolchain (pinned by rust-toolchain.toml) in every verify log.
 rustc --version
 

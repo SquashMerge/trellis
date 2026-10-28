@@ -94,6 +94,8 @@ function isolatedEnv(paths) {
     RUST_LOG:"trellis=info",
   };
   delete env.RUST_SRC_PATH; delete env.JEV_KEY;
+  delete env.TRELLIS_SEARCH_MODEL; delete env.TRELLIS_SEARCH_BACKEND;
+  delete env.TRELLIS_INDEX_DIAGNOSTICS;
   return env;
 }
 function fixture(source = SOURCE_P, filename = "flow.rs") {
