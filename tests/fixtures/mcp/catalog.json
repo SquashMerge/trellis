@@ -8014,6 +8014,14 @@
           "minimum": 0,
           "maximum": 500,
           "default": 500
+        },
+        "includeExternal": {
+          "type": "boolean",
+          "default": false
+        },
+        "includeTests": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -9407,6 +9415,12 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 500
+            },
+            "includeExternal": {
+              "type": "boolean"
+            },
+            "includeTests": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -9416,7 +9430,9 @@
             "semanticProducerId",
             "depth",
             "maxNodes",
-            "maxCalls"
+            "maxCalls",
+            "includeExternal",
+            "includeTests"
           ],
           "type": "object"
         },
@@ -9483,6 +9499,11 @@
                 "nodeLimit",
                 "missingEvidence"
               ]
+            },
+            "callSiteCount": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -9491,7 +9512,8 @@
             "to",
             "binding",
             "visit",
-            "boundaryReason"
+            "boundaryReason",
+            "callSiteCount"
           ],
           "type": "object"
         },
@@ -9502,7 +9524,9 @@
               "enum": [
                 "depth",
                 "nodeLimit",
-                "callLimit"
+                "callLimit",
+                "filtered",
+                "responseBytes"
               ]
             },
             "nodeId": {
@@ -9602,6 +9626,44 @@
                 "$ref": "#/$defs/Warning"
               },
               "type": "array"
+            },
+            "omitted": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "filtered": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "callLimit": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "responseBytes": {
+                  "$ref": "#/$defs/UInt"
+                },
+                "depth": {
+                  "$ref": "#/$defs/UInt"
+                }
+              },
+              "required": [
+                "filtered",
+                "callLimit",
+                "responseBytes",
+                "depth"
+              ]
+            },
+            "hints": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "includeExternal",
+                  "includeTests",
+                  "depth",
+                  "maxNodes",
+                  "maxCalls",
+                  "rootSyntaxId"
+                ]
+              },
+              "uniqueItems": true
             }
           },
           "required": [
@@ -9614,7 +9676,9 @@
             "provenance",
             "partial",
             "truncated",
-            "warnings"
+            "warnings",
+            "omitted",
+            "hints"
           ],
           "type": "object"
         }

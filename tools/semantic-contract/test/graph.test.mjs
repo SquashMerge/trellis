@@ -121,6 +121,8 @@ function specimen({ state = "complete", old = false, changed = false } = {}) {
     depth: 2,
     maxNodes: 150,
     maxCalls: 500,
+    includeExternal: false,
+    includeTests: false,
   };
   let counter = 0;
   function add(
@@ -227,6 +229,14 @@ function specimen({ state = "complete", old = false, changed = false } = {}) {
         })),
         edges,
         frontier,
+        omitted: Object.fromEntries(["filtered", "callLimit", "responseBytes", "depth"].map((reason) =>
+          [reason, frontier.filter((f) => f.reason === reason).reduce((sum, f) => sum + f.omittedCalls, 0)])),
+        hints: [
+          ...(frontier.some((f) => f.reason === "depth") && req.depth < 5 ? ["depth"] : []),
+          ...(frontier.some((f) => f.reason === "callLimit") && req.maxCalls < 500 ? ["maxCalls"] : []),
+          ...(frontier.some((f) => f.reason === "nodeLimit") && req.maxNodes < 150 ? ["maxNodes"] : []),
+          ...(truncated ? ["rootSyntaxId"] : []),
+        ].sort(),
         coverage: [
           records.coverage[0],
           ...extraCoverage,
@@ -262,6 +272,7 @@ function specimen({ state = "complete", old = false, changed = false } = {}) {
     } = {},
   ) => ({
     call: pair.call,
+    callSiteCount: 1,
     from: sid(from),
     to: reason === "none" ? to : null,
     binding,
@@ -280,7 +291,7 @@ function specimen({ state = "complete", old = false, changed = false } = {}) {
     nodeId: sid(node),
     callId,
     targetId,
-    nextOrdinal,
+    nextOrdinal: reason === "callLimit" ? null : nextOrdinal,
     omittedCalls,
   });
   return { records, loaded, checked, request, authored, add, edge, front };
@@ -288,7 +299,7 @@ function specimen({ state = "complete", old = false, changed = false } = {}) {
 const verify = (s, entry) =>
   checkGraphAnswer(s.loaded, s.records, s.checked, entry);
 
-test("eight hand-authored pinned FIFO, cycle, diamond, callback, depth, node and call cap cases", () => {
+test("eight hand-authored priority, cycle, diamond, callback, depth, node and call cap cases", () => {
   {
     const s = specimen();
     assert.equal(verify(s, s.authored()), true);
@@ -306,8 +317,8 @@ test("eight hand-authored pinned FIFO, cycle, diamond, callback, depth, node and
       edges: [
         s.edge(c, 1),
         s.edge(b, 1),
-        s.edge(d, 3),
-        s.edge(diamond, 2, { visit: "seen" }),
+        s.edge(diamond, 2),
+        s.edge(d, 3, { visit: "seen" }),
         s.edge(cycle, 4, { visit: "seen" }),
       ],
       proofIds: [
@@ -353,6 +364,7 @@ test("eight hand-authored pinned FIFO, cycle, diamond, callback, depth, node and
       truncated: true,
     });
     e.attemptedRequest.depth = e.answer.result.request.depth = 1;
+    e.answer.result.hints = ["depth", "rootSyntaxId"];
     assert.equal(verify(s, e), true);
   }
   {
@@ -378,6 +390,7 @@ test("eight hand-authored pinned FIFO, cycle, diamond, callback, depth, node and
       truncated: true,
     });
     e.attemptedRequest.maxNodes = e.answer.result.request.maxNodes = 2;
+    e.answer.result.hints = ["maxNodes", "rootSyntaxId"];
     assert.equal(verify(s, e), true);
   }
   {
@@ -398,6 +411,7 @@ test("eight hand-authored pinned FIFO, cycle, diamond, callback, depth, node and
       truncated: true,
     });
     e.attemptedRequest.maxCalls = e.answer.result.request.maxCalls = 1;
+    e.answer.result.hints = ["maxCalls", "rootSyntaxId"];
     assert.equal(verify(s, e), true);
   }
   {
@@ -409,6 +423,7 @@ test("eight hand-authored pinned FIFO, cycle, diamond, callback, depth, node and
       truncated: true,
     });
     e.attemptedRequest.maxCalls = e.answer.result.request.maxCalls = 0;
+    if (e.answer.result.frontier.length) e.answer.result.hints = ["maxCalls", "rootSyntaxId"];
     assert.equal(verify(s, e), true);
   }
   {
@@ -1280,6 +1295,8 @@ const callId = occurrenceId({
       depth: 2,
       maxNodes: 150,
       maxCalls: 500,
+    includeExternal: false,
+    includeTests: false,
     };
     const proofIds = [
       `native:r2:${callId}`,
@@ -1335,6 +1352,7 @@ const callId = occurrenceId({
           edges: [
             {
               call,
+              callSiteCount: 1,
               from: rootId,
               to: null,
               binding: null,
@@ -1343,6 +1361,8 @@ const callId = occurrenceId({
             },
           ],
           frontier: [],
+          omitted: { filtered: 0, callLimit: 0, responseBytes: 0, depth: 0 },
+          hints: [],
           coverage,
           provenance,
           partial: true,
@@ -1409,6 +1429,8 @@ test("captured current binding: selected complete/partial self-call and failed l
       depth: 2,
       maxNodes: 150,
       maxCalls: 500,
+    includeExternal: false,
+    includeTests: false,
     };
     const proofIds = [
       declaration.provenanceId,
@@ -1454,6 +1476,7 @@ test("captured current binding: selected complete/partial self-call and failed l
     ];
     const edge = {
       call,
+      callSiteCount: 1,
       from: declaration.syntaxId,
       to: usable ? declaration.syntaxId : null,
       binding: usable ? binding : null,
@@ -1471,6 +1494,8 @@ test("captured current binding: selected complete/partial self-call and failed l
           nodes: [{ declaration, depth: 0 }],
           edges: [edge],
           frontier: [],
+          omitted: { filtered: 0, callLimit: 0, responseBytes: 0, depth: 0 },
+          hints: [],
           coverage,
           provenance,
           partial: !usable || state === "partial",
@@ -1597,6 +1622,8 @@ test("exact callee binding survives independently unsupported invocation measure
     depth: 2,
     maxNodes: 150,
     maxCalls: 500,
+    includeExternal: false,
+    includeTests: false,
   };
   const coverage = records.coverage
     .filter((row) => row.revisionId === "r2")
@@ -1622,6 +1649,7 @@ test("exact callee binding survives independently unsupported invocation measure
         edges: [
           {
             call,
+            callSiteCount: 1,
             from: declaration.syntaxId,
             to: declaration.syntaxId,
             binding,
@@ -1630,6 +1658,8 @@ test("exact callee binding survives independently unsupported invocation measure
           },
         ],
         frontier: [],
+        omitted: { filtered: 0, callLimit: 0, responseBytes: 0, depth: 0 },
+        hints: [],
         coverage,
         provenance,
         partial: false,
@@ -1674,6 +1704,8 @@ test("selected partial unsupported non-exact call stays diagnostic-only without 
     depth: 2,
     maxNodes: 150,
     maxCalls: 500,
+    includeExternal: false,
+    includeTests: false,
   };
   const coverage = records.coverage
     .filter((row) => row.revisionId === "r2")
@@ -1695,6 +1727,7 @@ test("selected partial unsupported non-exact call stays diagnostic-only without 
         edges: [
           {
             call,
+            callSiteCount: 1,
             from: declaration.syntaxId,
             to: null,
             binding: null,
@@ -1703,6 +1736,8 @@ test("selected partial unsupported non-exact call stays diagnostic-only without 
           },
         ],
         frontier: [],
+        omitted: { filtered: 0, callLimit: 0, responseBytes: 0, depth: 0 },
+        hints: [],
         coverage,
         provenance,
         partial: true,
@@ -1765,6 +1800,7 @@ test("finite graph boundaries: cap with no work, defaults, syntax-only, resoluti
     const s = specimen(),
       e = s.authored();
     e.attemptedRequest.maxCalls = e.answer.result.request.maxCalls = 0;
+    if (e.answer.result.frontier.length) e.answer.result.hints = ["maxCalls", "rootSyntaxId"];
     assert.equal(verify(s, e), true);
     assert.equal(e.answer.result.frontier.length, 0);
     assert.equal(e.answer.result.truncated, false);
@@ -1784,6 +1820,8 @@ test("finite graph boundaries: cap with no work, defaults, syntax-only, resoluti
       depth: 2,
       maxNodes: 150,
       maxCalls: 500,
+    includeExternal: false,
+    includeTests: false,
     };
     assert.equal(verify(s, e), true);
   }
@@ -1833,9 +1871,9 @@ test("finite graph boundaries: cap with no work, defaults, syntax-only, resoluti
     });
     const e = s.authored({
       edges: [
+        s.edge(external, 1, { reason: "external" }),
         s.edge(ambiguous, 1, { reason: "ambiguous" }),
         s.edge(unresolved, 1, { reason: "unresolved" }),
-        s.edge(external, 1, { reason: "external" }),
         s.edge(stale, 1, { reason: "stale" }),
       ],
       proofIds: [
@@ -1863,10 +1901,11 @@ test("finite graph boundaries: cap with no work, defaults, syntax-only, resoluti
         },
       ],
     });
+    e.attemptedRequest.includeExternal = e.answer.result.request.includeExternal = true;
     assert.equal(verify(s, e), true);
     assert.deepEqual(
       e.answer.result.edges.map((edge) => edge.boundaryReason),
-      ["ambiguous", "unresolved", "external", "stale"],
+      ["external", "ambiguous", "unresolved", "stale"],
     );
   }
 });
@@ -2088,4 +2127,95 @@ test("graph assembly controls reject old occurrence, promoted and foreign facts,
   ]);
   for (const control of rows)
     await t.test(control.id, () => runControl(control));
+});
+
+
+test("#379 test root caller role is exempt, while test callees and external calls stay filtered", () => {
+  const s = specimen();
+  s.records.declarations[0].role = "test";
+  s.records.declarations[2].role = "test";
+  const external = s.add(1, 2, { resolution: "external", staleTarget: null, freshness: "stale" });
+  const internal = s.add(1, 2);
+  s.add(1, 3);
+  const entry = s.authored({ names: ["A", "B"], depths: [0, 1],
+    edges: [s.edge(internal, 1)], proofIds: [internal.binding.provenanceId], partial: true });
+  entry.answer.result.frontier = [s.front("filtered", 1, null, null, null, 2)];
+  entry.answer.result.omitted.filtered = 2;
+  entry.answer.result.hints = ["includeExternal", "includeTests"];
+  assert.equal(verify(s, entry), true);
+  assert.equal(entry.answer.result.truncated, false);
+  assert.equal(entry.answer.result.provenance.some((p) => p.id === external.binding.provenanceId), false);
+
+  const unknown = specimen();
+  unknown.records.declarations[0].role = "test";
+  const call = unknown.add(1, 2);
+  unknown.records.callBindings = [];
+  const visible = unknown.authored({ edges: [unknown.edge(call, 1,
+    { reason: "missingEvidence", binding: null })], partial: true });
+  assert.equal(verify(unknown, visible), true);
+  assert.equal(visible.answer.result.omitted.filtered, 0);
+});
+
+test("#379 resolved test callee filtering does not follow ambiguous candidates and depth wins", () => {
+  const s = specimen();
+  s.records.declarations[1].role = "test";
+  const exact = s.add(1, 2);
+  const ambiguous = s.add(1, 2, { resolution: "ambiguous", staleTarget: null });
+  ambiguous.binding.candidates = [exact.binding.declaredTarget];
+  const entry = s.authored({ edges: [s.edge(ambiguous, 1, { reason: "ambiguous" })],
+    proofIds: [ambiguous.binding.provenanceId], partial: true,
+    warnings: [{ code: "bindingAmbiguous", provenanceId: ambiguous.binding.provenanceId, message: "ambiguous" }] });
+  entry.answer.result.frontier = [s.front("filtered", 1, null, null, null, 1)];
+  entry.answer.result.omitted.filtered = 1;
+  entry.answer.result.hints = ["includeTests"];
+  assert.equal(verify(s, entry), true);
+  s.request.depth = 0;
+  const depth = s.authored({ frontier: [s.front("depth", 1, null, null, 0, 2)], partial: true, truncated: true });
+  assert.equal(verify(s, depth), true);
+  assert.deepEqual(depth.answer.result.omitted, { filtered: 0, callLimit: 0, responseBytes: 0, depth: 2 });
+});
+
+test("#379 duplicate groups preserve earliest occurrence, exact proof and group call units", () => {
+  const s = specimen();
+  s.request.maxCalls = 1;
+  const first = s.add(1, 2, { start: 1 });
+  const second = s.add(1, 2, { start: 10 });
+  second.binding.provenanceId = first.binding.provenanceId;
+  const edge = { ...s.edge(first, 1), callSiteCount: 2 };
+  const grouped = s.authored({ names: ["A", "B"], depths: [0, 1], edges: [edge], proofIds: [first.binding.provenanceId] });
+  assert.equal(verify(s, grouped), true);
+  assert.equal(grouped.answer.result.edges[0].call.id, first.call.id);
+  assert.equal(grouped.answer.result.truncated, false);
+  assert.throws(() => verify(s, { ...grouped, answer: { ok: true, result: {
+    ...grouped.answer.result, edges: [{ ...edge, callSiteCount: 1 }] } } }), /result.edges/);
+  second.binding.provenanceId = "P:2";
+  const distinct = s.authored({ names: ["A", "B"], depths: [0, 1], edges: [s.edge(first, 1)],
+    proofIds: [first.binding.provenanceId], frontier: [s.front("callLimit", 1, null, null, null, 1)],
+    partial: true, truncated: true });
+  assert.equal(verify(s, distinct), true);
+});
+
+test("#379 internal rank wins before external source order, and node refusal keeps rank", () => {
+  const s = specimen();
+  s.request.includeExternal = true;
+  s.request.maxNodes = 2;
+  const external = s.add(1, 2, { resolution: "external", staleTarget: null, start: 0 });
+  const b = s.add(1, 2, { start: 10 });
+  const c = s.add(1, 3, { start: 20 });
+  const entry = s.authored({ names: ["A", "B"], depths: [0, 1],
+    edges: [s.edge(b, 1), s.edge(c, 1, { reason: "nodeLimit" }), s.edge(external, 1, { reason: "external" })],
+    proofIds: [b.binding.provenanceId, c.binding.provenanceId, external.binding.provenanceId],
+    frontier: [s.front("nodeLimit", 1, c.call.id, sid(3))], partial: true, truncated: true });
+  assert.equal(verify(s, entry), true);
+  assert.equal(verify(s, structuredClone(entry)), true);
+});
+
+test("#379 invalid filter types and unknown fields are closed request failures", () => {
+  for (const [override, field] of [[{ includeExternal: null }, "includeExternal"],
+    [{ includeTests: "true" }, "includeTests"], [{ utilities: true }, "request"]]) {
+    const s = specimen();
+    const entry = { id: "invalid-filter", attemptedRequest: { ...s.request, ...override }, answer: {
+      ok: false, error: { code: "invalidRequest", field, message: "invalid request" } } };
+    assert.equal(verify(s, entry), true);
+  }
 });

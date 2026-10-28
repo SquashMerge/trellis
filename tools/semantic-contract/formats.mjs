@@ -41,6 +41,8 @@ function walk(spec, value, path) {
       )
         fail(`${path}.request`, "request limits outside v1");
     }
+    if ((spec === "GraphEdge" || spec === "GraphEdgeTemplate") && value.callSiteCount < 1)
+      fail(`${path}.callSiteCount`, "positive site count required");
     return;
   }
   if (typeof spec === "string") {

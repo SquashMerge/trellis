@@ -100,6 +100,8 @@ const request = {
   depth: 2,
   maxNodes: 150,
   maxCalls: 500,
+  includeExternal: false,
+  includeTests: false,
 };
 const result = {
   request: { ...request },
@@ -108,6 +110,7 @@ const result = {
   edges: [
     {
       call: { recordRef: "measured-invocation" },
+      callSiteCount: 1,
       from: { ref: "source-function" },
       to: null,
       binding: null,
@@ -125,6 +128,8 @@ const result = {
       omittedCalls: 0,
     },
   ],
+  omitted: { filtered: 0, callLimit: 0, responseBytes: 0, depth: 0 },
+  hints: [],
   coverage: [{ recordRef: "captured-coverage" }],
   provenance: [{ recordRef: "captured-proof" }],
   partial: true,
