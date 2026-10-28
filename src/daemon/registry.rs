@@ -626,6 +626,7 @@ impl CheckoutRegistry {
             }))),
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing,
+            rules_edit_owner: std::sync::Mutex::new(()),
             search: self.search.clone(),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1701,6 +1702,7 @@ pub struct CheckoutRuntime {
     /// Released because its root was lost: a stale handle answers root_changed.
     root_lost: std::sync::atomic::AtomicBool,
     initial_indexing: bool,
+    rules_edit_owner: std::sync::Mutex<()>,
 }
 
 /// Startup reconciliation is due or running (not waiting out a backoff).
@@ -2261,6 +2263,89 @@ impl CheckoutRuntime {
         self.projected_response(check, hooks, max_bytes, |response, check| {
             response.metrics_at(options, &mut || check())
         })
+    }
+
+    pub(crate) fn rules_edit_response(
+        &self,
+        request: &crate::rules_edit::Request,
+        apply: bool,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+        max_bytes: usize,
+        before_commit: &mut impl FnMut(),
+    ) -> anyhow::Result<(Vec<u8>, bool, Option<&'static str>)> {
+        request.validate(apply)?;
+        // The blocking request owns this lock, never the registry or an actor.
+        let _owner = self
+            .rules_edit_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("internal_error: rules owner"))?;
+        check()?;
+        let resources = self.resources()?;
+        let root = Path::new(resources.store.workspace_root());
+        resources.store.verify_root()?;
+        let (response, catching_up) = self.evidence_response()?;
+        let prepared = (|| {
+            let base = crate::rules_edit::load_base(root, &request.base_hash)?;
+            let proposal = crate::rules_edit::propose(&base.config, request, check)?;
+            Ok::<_, anyhow::Error>((base, proposal))
+        })();
+        let (base, proposal) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                    crate::metrics::serialize_checked(
+                        &serde_json::json!({"error":diagnostic}),
+                        max_bytes,
+                        check,
+                    )?;
+                }
+                check()?;
+                response.finish(())?;
+                return Err(error);
+            }
+        };
+        let pin = request.pin()?;
+        if let Err(error) =
+            response.validate_rules_edit(pin, &base.config, &proposal.config, request, check)
+        {
+            if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                crate::metrics::serialize_checked(
+                    &serde_json::json!({"error":diagnostic}),
+                    max_bytes,
+                    check,
+                )?;
+            }
+            check()?;
+            response.finish(())?;
+            return Err(error);
+        }
+        let preview = serde_json::json!({"payload":proposal.preview(pin, &request.base_hash),"catchingUp":catching_up});
+        let preview_bytes = crate::metrics::serialize_checked(&preview, max_bytes, check)?;
+        response.finish(())?;
+        if !apply {
+            return Ok((preview_bytes, catching_up, None));
+        }
+        anyhow::ensure!(
+            request.proposed_hash.as_deref() == Some(proposal.config.content_hash.as_str()),
+            "rules_conflict: proposed bytes changed; preview again"
+        );
+        let mut committed = serde_json::json!({"payload":{"indexGeneration":pin.index_generation.to_string(),"indexRevision":pin.index_revision,"rulesFile":crate::rules::descriptor(&proposal.config),"mutationOutcome":"committed"},"catchingUp":catching_up});
+        // Bound both possible post-rename replies before touching the file.
+        let committed_bytes = crate::metrics::serialize_checked(&committed, max_bytes, check)?;
+        committed["payload"]["mutationOutcome"] = serde_json::json!("durability_uncertain");
+        let uncertain_bytes = crate::metrics::serialize_checked(&committed, max_bytes, check)?;
+        let outcome = crate::rules_edit::commit(root, &base, &proposal.config, || {
+            before_commit();
+            check()?;
+            resources.store.verify_root()?;
+            response.finish(())
+        })?;
+        let bytes = if outcome == "committed" {
+            committed_bytes
+        } else {
+            uncertain_bytes
+        };
+        Ok((bytes, catching_up, Some(outcome)))
     }
 
     pub fn architecture_response(

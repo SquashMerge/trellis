@@ -17,7 +17,7 @@ use toml::Spanned;
 mod glob_language;
 
 pub const RULES_PATH: &str = ".trellis/rules.toml";
-const CONFIG_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const COLLECTION_LIMIT: usize = 1024;
 const PATTERN_LIMIT: usize = 8192;
 const AST_VISITS: usize = 1_000_000;

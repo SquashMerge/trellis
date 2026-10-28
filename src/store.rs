@@ -1608,6 +1608,34 @@ impl EvidenceResponse {
         Ok(payload)
     }
 
+    /// Browser rule authoring validates the entire proposal against one admitted
+    /// snapshot. Nothing here publishes or changes index state.
+    pub(crate) fn validate_rules_edit(
+        &self,
+        pin: IndexPin,
+        base: &crate::rules::Config,
+        proposed: &crate::rules::Config,
+        request: &crate::rules_edit::Request,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<()> {
+        let snapshot = self
+            .architecture_snapshot(Some(pin), check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let references = crate::references::project(&snapshot, &[], 5, check)?;
+        let evaluated =
+            crate::rules::evaluate_with_layers(base, &snapshot, &references, &[], check)?;
+        crate::rules_edit::validate_selection(request, &evaluated.data, &evaluated.layers, check)?;
+        crate::rules::evaluate(proposed, &snapshot, &references, &[], check)?;
+        Ok(())
+    }
+
+    pub(crate) fn rules_edit_inventory(&self, pin: IndexPin) -> Result<serde_json::Value> {
+        self.selected(Some(pin))?;
+        let config = crate::rules::load(Path::new(self.store.workspace_root()))?
+            .context("not_found: rules file missing")?;
+        crate::rules_edit::inventory(&config, pin)
+    }
+
     /// Read each selected native document once; never reopen source from the checkout.
     fn architecture_snapshot(
         &self,
