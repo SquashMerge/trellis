@@ -29,7 +29,7 @@ struct AdmissionState {
 
 impl PublishedAdmission {
     pub(super) fn invalidate(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.epoch = state.epoch.wrapping_add(1);
         state.entry = None;
     }
@@ -87,10 +87,18 @@ impl Store {
         };
         #[cfg(test)]
         self.published_admission.before_lookup.run();
-        let _validator = self.published_admission.validator.lock().unwrap();
+        let _validator = self
+            .published_admission
+            .validator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.check_admission_readiness(pre_startup)?;
         let epoch = {
-            let state = self.published_admission.state.lock().unwrap();
+            let state = self
+                .published_admission
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some((cached, status)) = &state.entry
                 && *cached == key
             {
@@ -102,7 +110,11 @@ impl Store {
         #[cfg(test)]
         self.published_admission.before_remember.run();
         self.check_admission_readiness(pre_startup)?;
-        let mut state = self.published_admission.state.lock().unwrap();
+        let mut state = self
+            .published_admission
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if state.epoch == epoch {
             state.entry = Some((key, status.clone()));
         }
