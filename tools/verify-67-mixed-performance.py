@@ -23,11 +23,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
+SCHEMA_VERSION = 25
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
+BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
 TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
 if not TARGET_DIR.is_absolute():
     TARGET_DIR = REPO / TARGET_DIR
@@ -74,7 +77,31 @@ def stop_child(proc, grace=20):
         raise interrupted
 
 
-def command(args, *, env=None, timed=False):
+def maxrss_bytes(usage):
+    # ru_maxrss is KiB on Linux and bytes on macOS.
+    return usage.ru_maxrss * 1024 if sys.platform.startswith("linux") else usage.ru_maxrss
+
+
+def reap_with_rusage(proc, grace=20):
+    """Terminate and reap `proc` with wait4 so its resource usage is kept."""
+    usage = None
+    status = None
+    killed = False
+    deadline = time.monotonic() + grace
+    proc.terminate()
+    while True:
+        pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
+        if pid:
+            break
+        if time.monotonic() >= deadline and not killed:
+            proc.kill()
+            killed = True
+        time.sleep(.02)
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    return {"maxRssBytes": maxrss_bytes(usage)}
+
+
+def command(args, *, env=None, timed=False, rusage=None):
     global COMMAND_NUMBER
     remain = DEADLINE - time.monotonic()
     require(remain > 10, "global 1700-second budget exhausted")
@@ -87,7 +114,19 @@ def command(args, *, env=None, timed=False):
         proc = subprocess.Popen(args, cwd=REPO, env=env, stdout=stdout, stderr=stderr,
                                 stdin=subprocess.DEVNULL)
         try:
-            proc.wait(timeout=min(remain, 1700))
+            if rusage is None:
+                proc.wait(timeout=min(remain, 1700))
+            else:
+                limit = start + min(remain, 1700)
+                while True:
+                    pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
+                    if pid:
+                        break
+                    if time.monotonic() >= limit:
+                        raise subprocess.TimeoutExpired(args, min(remain, 1700))
+                    time.sleep(.01)
+                proc.returncode = os.waitstatus_to_exitcode(status)
+                rusage["maxRssBytes"] = maxrss_bytes(usage)
             ended = time.monotonic()
             ended_wall_ms = time.time_ns() / 1_000_000
             duration = ended - start
@@ -184,10 +223,12 @@ def stop_home_processes(home, binary):
 
 class Daemon:
     """Own only the production release daemon; CLI attaches to its listening socket."""
-    def __init__(self, binary, home, label):
+    def __init__(self, binary, home, label, record_rusage=False):
         self.binary, self.home = binary, home
         self.path = EVIDENCE / f"{label}-daemon.stderr.log"
         self.proc = self.log = None
+        self.record_rusage = record_rusage
+        self.rusage = None
 
     def start(self):
         self.log = self.path.open("ab", buffering=0)
@@ -219,7 +260,10 @@ class Daemon:
         try:
             try:
                 if self.proc is not None:
-                    stop_child(self.proc)
+                    if self.record_rusage:
+                        self.rusage = reap_with_rusage(self.proc)
+                    else:
+                        stop_child(self.proc)
             except BaseException as exc:
                 errors.append(exc)
             try:
@@ -251,8 +295,8 @@ def db_for(home):
 
 
 def published(db, output, size):
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 25,
-            "mixed performance requires schema25")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION,
+            f"mixed performance requires schema{SCHEMA_VERSION}")
     index_result = json.loads(output)
     pin = index_result["publishedRevision"]
     revision = f"pin:v1:{pin['indexGeneration']}:{pin['indexRevision']}"
@@ -640,7 +684,8 @@ def typed_cells(value):
 
 def parity_digest(db, revision, physical_root):
     view = SelectedView(db, revision, physical_root)
-    require(db.execute("PRAGMA user_version").fetchone()[0] == 25, "selected parity requires schema25")
+    require(db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION,
+            f"selected parity requires schema{SCHEMA_VERSION}")
     generation, number = revision.removeprefix("pin:v1:").rsplit(":", 1)
     require(db.execute("SELECT index_generation,index_revision FROM index_metadata WHERE singleton=1").fetchone()
             == (generation, int(number)), "parity pin is not frozen head")
@@ -803,7 +848,7 @@ def scip_anchor(anchor, relative):
     return field(2, document)
 
 
-def capture_r1(db, revision):
+def capture_header(db, revision, expected_rows=None):
     header = db.execute("""SELECT source_set_id,toolchain_hash,config_hash,dependency_hash,
         native_revision_id,source_inventory FROM native_revisions WHERE id=?""", (revision,)).fetchone()
     require(header is not None, "missing retained r1 header")
@@ -811,7 +856,9 @@ def capture_r1(db, revision):
     rows = json.loads(inventory)
     source_rows = [{"language": item["key"]["language"], "relativePath": item["key"]["path"],
                     "contentHash": item["contentHash"]} for item in rows]
-    require(len(source_rows) == 4, f"small r1 must contain exactly four sources: {source_rows}")
+    if expected_rows is not None:
+        require(len(source_rows) == expected_rows,
+                f"r1 must contain exactly {expected_rows} sources: {source_rows}")
     manifest_rows = [{"document": {"sourceSetId": source_set, "language": row["language"],
                                     "path": row["relativePath"]}, "contentHash": row["contentHash"]}
                      for row in source_rows]
@@ -823,6 +870,10 @@ def capture_r1(db, revision):
             "native_id": native_id, "source_rows": source_rows,
             "manifest_hash": hashlib.sha256(canonical(manifest_rows)).hexdigest(),
             "components": {"toolchainHash": toolchain, "configHash": config, "dependencyHash": dependency}}
+
+
+def capture_r1(db, revision):
+    return capture_header(db, revision, 4)
 
 
 def selected_proof(db, revision, anchor_path, artifact_hash):
@@ -852,6 +903,60 @@ def selected_proof(db, revision, anchor_path, artifact_hash):
     result = {"pin": revision, "producer": rows[0][0], "artifact_hash": artifact_hash,
               "captured_pin": rows[0][2], "proof_count": len({r[3] for r in rows}), "raw_proof_ids": sorted({r[3] for r in rows})}
     record("selected_proof", **result)
+    return result
+
+
+def load_batch_module():
+    spec = importlib.util.spec_from_file_location("semantic_batch", BATCH_MODULE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_import_batch(root, header, artifact_bytes, covered):
+    """Write a one-artifact batch under root/.trellis-semantic-batch/.
+
+    `header` is the `capture_header` result; `covered` is the list of its source
+    rows that the artifact covers. Source byte lengths come from the files in `root`.
+    Returns (descriptor_path, descriptor_sha256).
+    """
+    profile = json.loads((REPO / "docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json").read_text())
+    producer = next(p for p in profile["semanticProducers"] if p["name"] == "scip-typescript")
+    batch = load_batch_module()
+    descriptor_header = {
+        "trustOrigin": "referenceProfile", "profileId": profile["profileId"],
+        "decoderVersion": DECODER_VERSION,
+        "producer": {"name": producer["name"], "version": producer["version"],
+                     "identityKind": "executable", "executableHash": producer["executableHash"],
+                     "positionEncoding": 2, "languages": ["javascript"]},
+        "sourceSet": header["source_set"], "sourceRevision": header["native_id"],
+        "sourceManifestHash": header["manifest_hash"], "components": header["components"],
+        "metadata": {"protocolVersion": 0, "projectRoot": Path(root).as_uri(),
+                     "textDocumentEncoding": 1},
+    }
+    sources = sorted(({"byteLength": (Path(root) / row["relativePath"]).stat().st_size, **row}
+                      for row in header["source_rows"]), key=batch.sort_key)
+    covered_keys = {(row["language"], row["relativePath"]) for row in covered}
+    coverage = [{"artifact": 0 if (row["language"], row["relativePath"]) in covered_keys else None,
+                 "exclusion": None if (row["language"], row["relativePath"]) in covered_keys
+                 else "notRequested",
+                 "language": row["language"], "relativePath": row["relativePath"]}
+                for row in sources]
+    return batch.write_batch(Path(root) / ".trellis-semantic-batch", descriptor_header, sources, coverage,
+                             [{"language": "javascript", "data": artifact_bytes}], root=Path(root))
+
+
+def run_semantic_import(binary, root, daemon, descriptor, sha, env, timed=False, rusage=None):
+    before = request_rows(daemon.home)
+    result = command([str(binary), "semantic", "import", "--workspace", str(root),
+                      "--batch", str(descriptor), "--batch-sha256", sha],
+                     env=env, timed=timed, rusage=rusage)
+    output = result[1] if timed else result
+    reply = json.loads(output)
+    require("publishedRevision" in reply, f"semantic import reply lacks publishedRevision: {output[-500:]}")
+    added = {key: value for key, value in request_rows(daemon.home).items() if key not in before}
+    require(len(added) == 1 and next(iter(added.values()))[0] == "done",
+            f"expected exactly one completed durable semantic import request row: {added}")
     return result
 
 
@@ -895,15 +1000,23 @@ def import_fixture(binary, root, daemon, size, r1):
     return digest, selected
 
 
+def copy_cohort(source_dir, root, relatives=None):
+    """Create `root` and copy `relatives` (default: the whole cohort) from `source_dir`."""
+    root.mkdir()
+    if relatives is None:
+        shutil.copytree(source_dir, root, dirs_exist_ok=True)
+        return
+    for relative in relatives:
+        dest = root / relative
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_dir / relative, dest)
+
+
 def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
     anchor = Path("javascript") / f"C{size}0010.js"
     sentinels = [anchor, Path("java") / f"C{size}0010.java",
                  Path("python") / f"C{size}0010.py", Path("rust/g00") / f"C{size}0010.rs"]
-    workspace.mkdir()
-    for relative in sentinels:
-        dest = workspace / relative
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(corpus / size / relative, dest)
+    copy_cohort(corpus / size, workspace, sentinels)
     anchor_digest = sha_file(workspace / anchor)
     expected = {"medium": "7b08f0b2aad6ef5e309cb480fdb17d83539e2273d45aa74c83fe9bd58084c08b",
                 "large": "e061783a302f0007e0f05881570f1041697516a22bb357a09df5eeebc71d724d"}[size]
