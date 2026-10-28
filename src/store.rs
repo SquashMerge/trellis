@@ -4260,7 +4260,7 @@ fn presentation_class(
     db: &Connection,
     id: &str,
     selected: &ReadRevision,
-) -> Result<Option<(crate::classes::ClassDefinition, usize, bool)>> {
+) -> Result<Option<(crate::model::ClassDefinition, usize, bool)>> {
     use crate::class_diagram::CLASS_BYTES;
     let size: Option<i64> = db
         .query_row(
@@ -4397,7 +4397,7 @@ fn resolve_class(
     db: &Connection,
     id: &str,
     selected: &ReadRevision,
-) -> Result<(crate::classes::ClassDefinition, bool)> {
+) -> Result<(crate::model::ClassDefinition, bool)> {
     let id = resolve_class_id(store, db, id, selected)?;
     let (class, _, clipped) = presentation_class(store, db, &id, selected)?.ok_or(
         crate::class_diagram::InvalidRequest("Class metadata exceeds the presentation byte limit."),
@@ -4427,8 +4427,8 @@ struct PublicationRows<'a> {
     nodes: Vec<&'a Symbol>,
     calls: Vec<&'a CallSite>,
     regions: Vec<&'a ControlRegion>,
-    classes: Vec<&'a crate::classes::ClassDefinition>,
-    relations: Vec<&'a crate::classes::ClassRelation>,
+    classes: Vec<&'a crate::model::ClassDefinition>,
+    relations: Vec<&'a crate::model::ClassRelation>,
     native_declarations: Vec<&'a crate::native_evidence::Declaration>,
     native_calls: Vec<&'a crate::native_evidence::Call>,
     native_regions: Vec<&'a crate::native_evidence::ControlRegion>,
@@ -9128,7 +9128,7 @@ fn write_native(
         &crate::capture::Capture,
         &Graph,
         &crate::classes::Catalog,
-        &BTreeMap<String, crate::classes::FileExtraction>,
+        &BTreeMap<String, crate::model::FileExtraction>,
     ),
     revision: IndexPin,
     stats: &IndexStats,
@@ -13437,7 +13437,7 @@ impl Store {
     }
     fn compose_selected_class_catalog(
         graph: &Graph,
-        extractions: &BTreeMap<String, crate::classes::FileExtraction>,
+        extractions: &BTreeMap<String, crate::model::FileExtraction>,
         limits: crate::classes::Limits,
     ) -> Result<crate::classes::Catalog> {
         // The local graph materializes only the changed document's nodes.
@@ -15887,7 +15887,7 @@ impl Store {
         db: &Connection,
         ids: &V8DocumentProjection,
         reuse: ReusedFamilies,
-        extraction: Option<&crate::classes::FileExtraction>,
+        extraction: Option<&crate::model::FileExtraction>,
     ) -> Result<()> {
         if reuse.graph {
             let (version, hash, state, class_state, stored_f):
@@ -16077,7 +16077,7 @@ impl Store {
         &self,
         graph: &Graph,
         native: &crate::native_evidence::Artifact,
-        extractions: &BTreeMap<String, crate::classes::FileExtraction>,
+        extractions: &BTreeMap<String, crate::model::FileExtraction>,
         expected: &ExpectedPublication,
         rows: &BTreeMap<&str, PublicationRows<'_>>,
     ) -> Result<PreflightReuse> {
@@ -16242,7 +16242,7 @@ impl Store {
         prepared: &LocalPrepared,
         paths: &BTreeSet<String>,
         cancel: &CancelFlag,
-    ) -> Result<BTreeMap<String, crate::classes::FileExtraction>> {
+    ) -> Result<BTreeMap<String, crate::model::FileExtraction>> {
         if paths.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -16641,7 +16641,7 @@ impl Store {
                         .push(node.clone());
                 }
             }
-            let mut extractions: BTreeMap<String, crate::classes::FileExtraction> = graph
+            let mut extractions: BTreeMap<String, crate::model::FileExtraction> = graph
                 .files
                 .iter()
                 .filter(|file| {
@@ -16651,7 +16651,7 @@ impl Store {
                 .map(|file| {
                     Ok((
                         file.path.clone(),
-                        crate::classes::FileExtraction::extract_file(
+                        crate::model::FileExtraction::extract_file(
                             file,
                             class_symbols
                                 .get(file.path.as_str())

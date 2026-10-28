@@ -2112,7 +2112,7 @@ fn local_class_only_refresh_writes_new_class_rows_and_rolls_back_atomically() {
     let changed_file = graph.files.iter().find(|file| file.path == "a.py").unwrap();
     extractions.insert(
         "a.py".into(),
-        crate::classes::FileExtraction::extract_file(
+        crate::model::FileExtraction::extract_file(
             changed_file,
             &graph.nodes,
             &cancel,

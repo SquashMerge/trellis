@@ -1,7 +1,6 @@
 use std::{fs, os::unix::fs::symlink, path::Path, process::Command};
-use trellis::daemon::registry::{
-    CheckoutOptions, CheckoutRegistry, MAX_ACTIVE_CHECKOUTS, SelectionError,
-};
+use trellis::daemon::registry::{CheckoutOptions, CheckoutRegistry, SelectionError};
+use trellis::model::MAX_ACTIVE_CHECKOUTS;
 use trellis::store::topology::WorkspaceIdentity;
 
 fn git(args: &[&str], dir: &Path) {

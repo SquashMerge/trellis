@@ -1,5 +1,6 @@
 //! In-memory checkout admission. Retained entries never own checkout resources.
 use crate::http::RuntimePhase;
+use crate::model::MAX_ACTIVE_CHECKOUTS;
 use crate::store::{
     Store,
     topology::{TopologyRoots, WorkspaceIdentity},
@@ -14,7 +15,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const MAX_ACTIVE_CHECKOUTS: usize = 64;
 pub const BROWSER_IDLE_DELAY: Duration = Duration::from_secs(15 * 60);
 pub const CHECKOUT_RELEASE_DELAY: Duration = Duration::from_secs(15 * 60);
 pub const DAEMON_IDLE_DELAY: Duration = Duration::from_secs(30 * 60);

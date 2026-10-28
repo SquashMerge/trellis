@@ -1366,7 +1366,7 @@ impl FullDocumentSpool {
     fn write_extraction(
         &self,
         index: usize,
-        extraction: &crate::classes::FileExtraction,
+        extraction: &crate::model::FileExtraction,
     ) -> Result<()> {
         ensure!(
             index < self.len(),
@@ -1382,7 +1382,7 @@ impl FullDocumentSpool {
         )?;
         Ok(())
     }
-    pub(crate) fn read_extraction(&self, index: usize) -> Result<crate::classes::FileExtraction> {
+    pub(crate) fn read_extraction(&self, index: usize) -> Result<crate::model::FileExtraction> {
         ensure!(
             index < self.len(),
             "native spool extraction index out of range"
@@ -1392,7 +1392,7 @@ impl FullDocumentSpool {
             rusqlite::params![i64::try_from(index)?],
             |row| row.get(0),
         )?;
-        let extraction: crate::classes::FileExtraction = serde_json::from_slice(&payload)?;
+        let extraction: crate::model::FileExtraction = serde_json::from_slice(&payload)?;
         ensure!(
             extraction.path == self.header.revision.documents[index].key.path,
             "native spool extraction path mismatch"
@@ -1421,7 +1421,7 @@ fn validate_spooled_document(
 struct PreparedSpoolDocument {
     facts: Vec<u8>,
     graph: Vec<u8>,
-    extraction: Option<crate::classes::FileExtraction>,
+    extraction: Option<crate::model::FileExtraction>,
     stats: IndexStats,
     diagnostics: Vec<Diagnostic>,
 }
@@ -1437,7 +1437,7 @@ fn prepare_spooled_document(
     file: &SourceFile,
     cancel: &CancelFlag,
     before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
-    after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
+    after_class: &(dyn Fn(&Document, &crate::model::FileExtraction) -> Result<()> + Sync),
 ) -> Result<PreparedSpoolDocument> {
     before_validate(document, &mut facts)?;
     validate_spooled_document(&mut facts, document, file)?;
@@ -1464,7 +1464,7 @@ fn prepare_spooled_document(
             })
             .cloned()
             .collect();
-        let extraction = crate::classes::FileExtraction::extract_file(
+        let extraction = crate::model::FileExtraction::extract_file(
             file,
             &symbols,
             cancel,
@@ -1528,7 +1528,7 @@ fn spool_full_capture_with(
     after_extract: &(dyn Fn(&SourceFile, &IdentityRegistry) -> Result<()> + Sync),
     before_validate: &(dyn Fn(&Document, &mut Artifact) -> Result<()> + Sync),
     before_admit: &dyn Fn(&Document, &mut IdentityRegistry, &IdentityRegistry) -> Result<()>,
-    after_class: &(dyn Fn(&Document, &crate::classes::FileExtraction) -> Result<()> + Sync),
+    after_class: &(dyn Fn(&Document, &crate::model::FileExtraction) -> Result<()> + Sync),
     spool_dir: &Path,
 ) -> Result<FullDocumentSpool> {
     capture.verify(cancel)?;

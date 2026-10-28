@@ -6112,7 +6112,8 @@ async fn continuous_invalid_calls_stay_bounded_and_a_due_reply_is_decided() {
         assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
     }
     let sent = flood.join().unwrap();
-    assert!(sent > 2_000);
+    // The reader proves exactly 2,000 replies; the flood may stop at that count.
+    assert!(sent >= 2_000);
     let largest = largest.load(std::sync::atomic::Ordering::Acquire);
     assert!(
         largest <= 66,

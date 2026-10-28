@@ -1186,7 +1186,7 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_serve_it() {
     ).unwrap();
     assert_eq!(state, "ready");
     let file = graph.files.iter().find(|f| f.path == "Types.java").unwrap();
-    let expected = trellis::classes::FileExtraction::extract_file(
+    let expected = trellis::model::FileExtraction::extract_file(
         file,
         &graph.nodes,
         &cancel(),
@@ -1194,7 +1194,7 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_serve_it() {
     )
     .unwrap();
     assert_eq!(
-        serde_json::from_str::<trellis::classes::FileExtraction>(&stored).unwrap(),
+        serde_json::from_str::<trellis::model::FileExtraction>(&stored).unwrap(),
         expected
     );
     let source = format!("/api/source?path=Types.java&{}", pin_query(pin));
@@ -1210,8 +1210,9 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_serve_it() {
 #[tokio::test]
 async fn normal_size_captured_java_python_cold_oracle_attests_full_published_catalog() {
     use trellis::{
-        classes::{Catalog, FileExtraction, Limits},
+        classes::{Catalog, Limits},
         indexer::index_workspace_bundle,
+        model::FileExtraction,
     };
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -1488,8 +1489,9 @@ async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
     .unwrap();
     assert_ne!(old, new_pin);
     use trellis::{
-        classes::{Catalog, FileExtraction, Limits},
+        classes::{Catalog, Limits},
         indexer::index_workspace_bundle,
+        model::FileExtraction,
     };
     // The r1 bytes come from an authenticated selected source, NOT the old
     // persisted F, graph projection, class rows or earlier HTTP response.

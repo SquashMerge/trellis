@@ -10,6 +10,7 @@ where
 use std::sync::{Arc, atomic::AtomicBool};
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const MAX_ACTIVE_CHECKOUTS: usize = 64;
 pub type CancelFlag = Arc<AtomicBool>;
 
 /// Identity of one published disposable index snapshot. Numeric revisions are local to a generation.
@@ -119,6 +120,64 @@ pub struct Symbol {
     pub parent: Option<String>,
     pub accessor: bool,
     pub provenance: Provenance,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassMember {
+    pub name: String,
+    pub type_hint: Option<String>,
+    pub symbol_id: Option<String>,
+    pub path: String,
+    pub range: SourceRange,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassDefinition {
+    pub symbol: Symbol,
+    pub qualified_name: String,
+    pub language: String,
+    pub declaration_kind: String,
+    pub fields: Vec<ClassMember>,
+    pub methods: Vec<ClassMember>,
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassRelation {
+    pub id: String,
+    pub owner: String,
+    pub target: Option<String>,
+    pub type_name: String,
+    pub kind: String,
+    pub path: String,
+    pub range: SourceRange,
+    pub candidate_ids: Vec<String>,
+    pub match_kind: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DetailValue {
+    Field(ClassMember),
+    Method(ClassMember),
+    Relation(ClassRelation),
+    ScopeText,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetailItem {
+    pub class_index: usize,
+    pub records: usize,
+    pub text: usize,
+    pub value: DetailValue,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileExtraction {
+    pub path: String,
+    pub source_bytes: usize,
+    pub registry_bytes: usize,
+    pub warnings: Vec<String>,
+    pub truncated: bool,
+    pub registry_incomplete: bool,
+    pub classes: Vec<ClassDefinition>,
+    pub items: Vec<DetailItem>,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

@@ -1,8 +1,7 @@
 //! Revision-bound navigation from cached, measured declarations and scoped type evidence.
 //! This is line navigation, not token go-to-definition or global name resolution.
 use crate::{
-    classes::ClassMember,
-    model::{IndexPin, Symbol, SymbolKind},
+    model::{ClassMember, IndexPin, Symbol, SymbolKind},
     store::id_codec,
 };
 use anyhow::{Result, ensure};
