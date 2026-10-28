@@ -570,7 +570,10 @@ fn selected_fact_corruption_is_typed_and_atomic() {
         "{error:#}"
     );
     assert!(store.recovery_pending_for_tests());
-    assert!(response.finish(()).is_err());
+    // The fence no longer re-validates the index (#261, owner decision B): it
+    // compares the pin only. The in-body read already returned the typed
+    // corruption and scheduled recovery above.
+    response.finish(()).unwrap();
 }
 
 #[test]
@@ -1115,7 +1118,10 @@ fn missing_stored_file_module_is_typed_corruption_for_an_empty_file() {
         "{error:#}"
     );
     assert!(store.recovery_pending_for_tests());
-    assert!(response.finish(()).is_err());
+    // The fence no longer re-validates the index (#261, owner decision B): it
+    // compares the pin only. The in-body read already returned the typed
+    // corruption and scheduled recovery above.
+    response.finish(()).unwrap();
 }
 
 #[test]
@@ -1144,5 +1150,8 @@ fn invalid_stored_role_is_corruption_even_when_role_selection_would_exclude_the_
         "{error:#}"
     );
     assert!(store.recovery_pending_for_tests());
-    assert!(response.finish(()).is_err());
+    // The fence no longer re-validates the index (#261, owner decision B): it
+    // compares the pin only. The in-body read already returned the typed
+    // corruption and scheduled recovery above.
+    response.finish(()).unwrap();
 }
