@@ -1,3 +1,4 @@
+#![cfg(feature = "test-support")]
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -8,13 +9,28 @@ use trellis::{
     capture::Capture,
     indexer::IndexOptions,
     native_evidence as native, native_ids,
-    scip_admission::{
-        CapturedScipInventory, ReferenceProfileAdmission, TrustedSelection,
-        decode_reference_profile,
-    },
+    scip_raw::CapturedScipInventory,
+    semantic_batch::testing,
     semantic_evidence as semantic,
     semantic_import::{MeasuredFacts, join_inventory},
 };
+
+fn admit(
+    capture: &Capture,
+    producer: &str,
+    language: &str,
+    artifact: &[u8],
+    cancel: &Arc<AtomicBool>,
+) -> CapturedScipInventory {
+    let (descriptor, pages) =
+        testing::single_artifact_batch(capture, producer, language, artifact).unwrap();
+    let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+    let mut inventories =
+        testing::admit_in_memory_from_capture(capture, &descriptor, &pages, &[artifact], cancel)
+            .unwrap();
+    assert_eq!(inventories.len(), 1);
+    inventories.remove(0)
+}
 
 const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
 
@@ -32,59 +48,16 @@ fn fixture() -> (
     fs::write(physical.join("artifact.scip"), hex::decode(WIRE).unwrap()).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(physical.clone());
-    let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
-    let first_native =
-        native::from_capture(&first, &physical, &identity.record_id, &cancel).unwrap();
-    let (set, rev) = (first_native.source_set, first_native.revision);
-    let file = &first.files[0];
-    let doc = json!({"language":"javascript","relativePath":"src/A.js","contentHash":file.hash});
-    let source_manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(
-            &json!([{"document":{"sourceSetId":set.id,"language":"javascript","path":"src/A.js"},"contentHash":file.hash}]),
-        ),
-    );
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let producer = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "scip-typescript")
-        .unwrap();
-    let bytes = hex::decode(WIRE).unwrap();
-    let uri = format!("file://{}", physical.display());
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
-        "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
-        "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,
-        "components":{"toolchainHash":rev.toolchain_hash,"configHash":rev.config_hash,"dependencyHash":rev.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":uri,"textDocumentEncoding":1},
-        "sourceDocuments":[doc],"documents":[doc],"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"", &bytes),"language":"javascript","documents":["src/A.js"]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let selection = TrustedSelection {
-        expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-        profile_id: "mac-mini-m5-pro-v1".into(),
-        producer_name: "scip-typescript".into(),
-    };
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
+    let inventory = admit(
         &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &selection,
+        "scip-typescript",
+        "javascript",
+        &hex::decode(WIRE).unwrap(),
         &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    );
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture
         .files
@@ -445,58 +418,10 @@ fn admitted_case_with_calls(
     fs::write(physical.join("artifact.scip"), &bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(physical.clone());
-    let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
-    let first_native =
-        native::from_capture(&first, &physical, &identity.record_id, &cancel).unwrap();
-    let set = &first_native.source_set;
-    let rev = &first_native.revision;
-    let f = &first.files[0];
-    let doc = json!({"language":language,"relativePath":path,"contentHash":f.hash});
-    let manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(
-            &json!([{"document":{"sourceSetId":set.id,"language":language,"path":path},"contentHash":f.hash}]),
-        ),
-    );
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let producer = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == producer_name)
-        .unwrap();
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":encoding},
-        "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
-        "sourceRevision":rev.id,"sourceManifestHash":manifest_hash,
-        "components":{"toolchainHash":rev.toolchain_hash,"configHash":rev.config_hash,"dependencyHash":rev.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",physical.display()),"textDocumentEncoding":1},
-        "sourceDocuments":[doc],"documents":[doc],"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":language,"documents":[path]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let selection = TrustedSelection {
-        expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-        profile_id: "mac-mini-m5-pro-v1".into(),
-        producer_name: producer_name.into(),
-    };
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &selection,
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let inventory = admit(&capture, producer_name, language, &bytes, &cancel);
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture
         .files
@@ -2104,4 +2029,422 @@ fn nested_javascript_runtime_values_inside_type_expression_are_not_types() {
         reference.roles,
         vec![semantic::Role::Read, semantic::Role::Type]
     );
+}
+
+mod batch_admission {
+    use super::*;
+    use serde_json::Value;
+    use trellis::{
+        scip_raw::{
+            AuthenticatedArtifact, CapturedClaim, DocumentSource, ScipCaptureError, VecSink,
+            decode_streaming,
+        },
+        semantic_batch::{BatchCounters, BatchLimits, descriptor::Descriptor},
+    };
+
+    struct World {
+        _root: tempfile::TempDir,
+        physical: std::path::PathBuf,
+        capture: Capture,
+        artifact: Vec<u8>,
+        cancel: Arc<AtomicBool>,
+    }
+
+    /// Three JavaScript documents covered by one artifact.
+    fn world() -> World {
+        use protobuf::{EnumOrUnknown, Message};
+        let root = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir(physical.join("src")).unwrap();
+        let mut index = scip::types::Index::new();
+        for (path, name) in [("src/A.js", "a"), ("src/B.js", "b"), ("src/C.js", "c")] {
+            fs::write(physical.join(path), format!("function {name}(){{}}\n")).unwrap();
+            let mut document = scip::types::Document::new();
+            document.language = "javascript".into();
+            document.relative_path = path.into();
+            document.position_encoding = EnumOrUnknown::from_i32(2);
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = vec![0, 9, 10];
+            occurrence.symbol = format!("pkg {name}.");
+            occurrence.symbol_roles = 1;
+            document.occurrences.push(occurrence);
+            let mut info = scip::types::SymbolInformation::new();
+            info.symbol = format!("pkg {name}.");
+            info.kind = EnumOrUnknown::from_i32(17);
+            info.display_name = name.into();
+            document.symbols.push(info);
+            index.documents.push(document);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture =
+            Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
+        World {
+            _root: root,
+            physical,
+            capture,
+            artifact: index.write_to_bytes().unwrap(),
+            cancel,
+        }
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    type Batch = (Value, Vec<Value>);
+    type HeaderEdit = fn(&mut Value);
+
+    fn batch(world: &World) -> Batch {
+        let (descriptor, pages) = testing::single_artifact_batch(
+            &world.capture,
+            "scip-typescript",
+            "javascript",
+            &world.artifact,
+        )
+        .unwrap();
+        (
+            serde_json::from_slice(&descriptor).unwrap(),
+            pages
+                .iter()
+                .map(|page| serde_json::from_slice(page).unwrap())
+                .collect(),
+        )
+    }
+
+    /// Admits `batch` with the entries' lengths and digests re-derived from the page values, so
+    /// an edit exercises the rule under test rather than the page digest.
+    fn admit_batch(
+        world: &World,
+        (mut descriptor, pages): Batch,
+        artifacts: &[&[u8]],
+    ) -> Result<Vec<trellis::scip_raw::CapturedScipInventory>, String> {
+        let bytes: Vec<Vec<u8>> = pages
+            .iter()
+            .map(|page| serde_json::to_vec(page).unwrap())
+            .collect();
+        for (entry, page) in descriptor["pages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&bytes)
+        {
+            entry["byteLength"] = page.len().into();
+            entry["sha256"] = sha(page).into();
+        }
+        descriptor["totals"]["pageBytes"] = bytes.iter().map(Vec::len).sum::<usize>().into();
+        let refs: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+        testing::admit_in_memory_from_capture(
+            &world.capture,
+            &serde_json::to_vec(&descriptor).unwrap(),
+            &refs,
+            artifacts,
+            &world.cancel,
+        )
+        .map_err(|error| match error {
+            ScipCaptureError::InvalidAdmission(detail) => detail,
+            other => format!("{other:?}"),
+        })
+    }
+
+    fn detail(world: &World, batch: Batch) -> String {
+        admit_batch(world, batch, &[&world.artifact]).expect_err("admission must fail")
+    }
+
+    #[test]
+    fn admission_equals_the_streaming_decoder_on_the_same_artifact() {
+        let world = world();
+        let inventories = admit_batch(&world, batch(&world), &[&world.artifact]).unwrap();
+        assert_eq!(inventories.len(), 1);
+        let admitted = &inventories[0];
+        let hash = sha(&world.artifact);
+        let uri = format!("file://{}", world.physical.display());
+        let mut sink = VecSink::default();
+        let mut resolve = |path: &str, _language: &str| {
+            let file = world.capture.files.iter().find(|f| f.path == path).unwrap();
+            Ok(DocumentSource {
+                bytes: std::borrow::Cow::Owned(file.text.as_bytes().to_vec()),
+                content_hash: file.hash.clone(),
+            })
+        };
+        decode_streaming(
+            world.artifact.as_slice(),
+            world.artifact.len() as u64,
+            &AuthenticatedArtifact {
+                artifact_hash: &hash,
+                producer_id: "scip-typescript",
+                producer_version: &admitted_version(),
+                source_set_id: &admitted_source_set(&world),
+                source_revision: &admitted_revision(&world),
+                position_encoding: 2,
+                protocol_version: 0,
+                text_document_encoding: 1,
+                project_root_uri: &uri,
+                assigned_documents: 3,
+            },
+            &mut resolve,
+            &mut BatchCounters::default(),
+            &BatchLimits::PRODUCTION,
+            &mut sink,
+            &world.cancel,
+        )
+        .unwrap();
+        let direct: Vec<CapturedClaim> = sink.finish().unwrap();
+        assert_eq!(admitted.claims.len(), direct.len());
+        let key = |claim: &CapturedClaim| {
+            (
+                claim.envelope.relative_path.clone(),
+                claim.canonical_bytes.clone(),
+            )
+        };
+        let mut left: Vec<_> = admitted.claims.iter().collect();
+        let mut right: Vec<_> = direct.iter().collect();
+        left.sort_by_key(|claim| key(claim));
+        right.sort_by_key(|claim| key(claim));
+        for (a, b) in left.into_iter().zip(right) {
+            assert_eq!(a, b);
+        }
+        assert_eq!(admitted.artifact_hashes, vec![hash]);
+    }
+
+    fn header(world: &World) -> trellis::native_evidence::Artifact {
+        let identity = trellis::store::topology::WorkspaceIdentity::discover(
+            Some(&world.physical),
+            &world.physical,
+        )
+        .unwrap();
+        native::from_capture(
+            &world.capture,
+            &world.physical,
+            &identity.record_id,
+            &world.cancel,
+        )
+        .unwrap()
+    }
+    fn admitted_source_set(world: &World) -> String {
+        header(world).source_set.id
+    }
+    fn admitted_revision(world: &World) -> String {
+        header(world).revision.id
+    }
+    fn admitted_version() -> String {
+        let profile: Value = serde_json::from_str(include_str!(
+            "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
+        ))
+        .unwrap();
+        profile["semanticProducers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "scip-typescript")
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn header_binding_faults_fail_typed_through_admission() {
+        let world = world();
+        let cases: [(&str, HeaderEdit); 4] = [
+            ("native revision components", |d| {
+                d["sourceRevision"] = "x".into()
+            }),
+            ("native revision components", |d| {
+                d["components"]["configHash"] = "0".repeat(64).into()
+            }),
+            ("metadata binding", |d| {
+                d["metadata"]["projectRoot"] = "file:///elsewhere".into()
+            }),
+            ("source manifest hash", |d| {
+                d["sourceManifestHash"] = "not-a-hash".into()
+            }),
+        ];
+        for (expected, edit) in cases {
+            let (mut descriptor, pages) = batch(&world);
+            edit(&mut descriptor);
+            assert_eq!(detail(&world, (descriptor, pages)), expected);
+        }
+    }
+
+    #[test]
+    fn page_and_artifact_entry_faults_fail_typed_through_admission() {
+        let world = world();
+        let (descriptor, pages) = batch(&world);
+        let mut repeated = (descriptor.clone(), pages.clone());
+        repeated.0["pages"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, descriptor["pages"][0].clone());
+        repeated.1.insert(1, pages[0].clone());
+        assert_eq!(detail(&world, repeated), "page ordinals");
+        let mut missing = (descriptor.clone(), pages.clone());
+        missing.0["pages"].as_array_mut().unwrap().remove(1);
+        missing.1.remove(1);
+        assert_eq!(detail(&world, missing), "page ordinals");
+        let mut duplicate = descriptor.clone();
+        let mut second = duplicate["artifacts"][0].clone();
+        second["ordinal"] = 1.into();
+        second["sha256"] = sha(b"another artifact").into();
+        duplicate["artifacts"].as_array_mut().unwrap().push(second);
+        duplicate["totals"]["artifactBytes"] =
+            (duplicate["totals"]["artifactBytes"].as_u64().unwrap() * 2).into();
+        assert_eq!(detail(&world, (duplicate, pages)), "duplicate artifact");
+    }
+
+    #[test]
+    fn source_inventory_faults_fail_typed_through_admission() {
+        let world = world();
+        let (mut descriptor, pages) = batch(&world);
+        descriptor["sourceManifestHash"] = "0".repeat(64).into();
+        assert_eq!(detail(&world, (descriptor, pages)), "source manifest hash");
+
+        let native = header(&world);
+        let sources: BTreeMap<_, _> = world
+            .capture
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    native::DocumentKey {
+                        source_set_id: native.revision.source_set_id.clone(),
+                        language: f.language.clone(),
+                        path: f.path.clone(),
+                    },
+                    f.text.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let (descriptor, pages) = testing::single_artifact_batch(
+            &world.capture,
+            "scip-typescript",
+            "javascript",
+            &world.artifact,
+        )
+        .unwrap();
+        let page_refs: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let admit_with = |native: &native::Artifact| {
+            testing::admit_in_memory(
+                &world.physical,
+                native,
+                &sources,
+                &descriptor,
+                &page_refs,
+                &[&world.artifact],
+                &world.cancel,
+            )
+            .unwrap_err()
+        };
+        let mut fewer = native.clone();
+        fewer.revision.documents.remove(0);
+        assert_eq!(
+            admit_with(&fewer),
+            ScipCaptureError::InvalidAdmission("extra captured source".into())
+        );
+        let mut more = native.clone();
+        let mut phantom = more.revision.documents[1].clone();
+        phantom.key.path = "src/C.js".into();
+        more.revision.documents.push(phantom);
+        assert_eq!(
+            admit_with(&more),
+            ScipCaptureError::InvalidAdmission("missing captured source".into())
+        );
+    }
+
+    #[test]
+    fn a_coverage_page_that_omits_a_requested_document_fails_completion() {
+        let world = world();
+        let (mut descriptor, mut pages) = batch(&world);
+        pages[1]["rows"].as_array_mut().unwrap().pop();
+        descriptor["pages"][1]["rowCount"] = 2.into();
+        descriptor["totals"]["coveredDocuments"] = 2.into();
+        assert_eq!(detail(&world, (descriptor, pages)), "coverage completion");
+    }
+
+    #[test]
+    fn excluded_documents_attach_to_one_artifact_of_their_language() {
+        use protobuf::Message;
+        let world = world();
+        let (mut descriptor, mut pages) = batch(&world);
+        let index = scip::types::Index::parse_from_bytes(&world.artifact).unwrap();
+        let split = |documents: &[usize]| {
+            let mut part = index.clone();
+            part.documents = documents
+                .iter()
+                .map(|d| index.documents[*d].clone())
+                .collect();
+            part.write_to_bytes().unwrap()
+        };
+        let (first, second) = (split(&[0]), split(&[1]));
+        let entry = descriptor["artifacts"][0].clone();
+        descriptor["artifacts"] = serde_json::json!([entry.clone(), entry]);
+        descriptor["artifacts"][1]["ordinal"] = 1.into();
+        descriptor["artifacts"][1]["relativePath"] = "artifact-1.scip".into();
+        for (ordinal, bytes) in [&first, &second].into_iter().enumerate() {
+            descriptor["artifacts"][ordinal]["byteLength"] = bytes.len().into();
+            descriptor["artifacts"][ordinal]["sha256"] = sha(bytes).into();
+        }
+        descriptor["totals"]["artifactBytes"] = (first.len() + second.len()).into();
+        pages[1]["rows"][1]["artifact"] = 1.into();
+        pages[1]["rows"][2]["artifact"] = Value::Null;
+        pages[1]["rows"][2]["exclusion"] = "unsupported".into();
+        descriptor["completion"] = "partial".into();
+        descriptor["totals"]["coveredDocuments"] = 2.into();
+        descriptor["totals"]["excludedDocuments"] = 1.into();
+        let inventories = admit_batch(&world, (descriptor, pages), &[&first, &second]).unwrap();
+        let excluded: Vec<_> = inventories
+            .iter()
+            .map(|inventory| {
+                inventory
+                    .exclusions
+                    .iter()
+                    .map(|e| e.relative_path.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(excluded, vec![vec!["src/C.js"], vec![]]);
+    }
+
+    #[test]
+    fn role_paths_must_exist_under_the_root_without_symlinks() {
+        let world = world();
+        let (descriptor, pages) = batch(&world);
+        let parsed = Descriptor::parse(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        assert_eq!(
+            parsed.check_paths(&world.physical),
+            Err(ScipCaptureError::InvalidAdmission(
+                "selected role absent".into()
+            ))
+        );
+        for (name, page) in ["source-00000.json", "coverage-00000.json"]
+            .iter()
+            .zip(&pages)
+        {
+            fs::write(world.physical.join(name), serde_json::to_vec(page).unwrap()).unwrap();
+        }
+        fs::write(world.physical.join("artifact.scip"), &world.artifact).unwrap();
+        parsed.check_paths(&world.physical).unwrap();
+
+        fs::remove_file(world.physical.join("artifact.scip")).unwrap();
+        std::os::unix::fs::symlink(
+            world.physical.join("src/A.js"),
+            world.physical.join("artifact.scip"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.check_paths(&world.physical),
+            Err(ScipCaptureError::InvalidAdmission(
+                "symlinked selected role".into()
+            ))
+        );
+        let mut escaping = descriptor.clone();
+        escaping["artifacts"][0]["relativePath"] = "../artifact.scip".into();
+        let escaping = Descriptor::parse(&serde_json::to_vec(&escaping).unwrap()).unwrap();
+        assert_eq!(
+            escaping.check_paths(&world.physical),
+            Err(ScipCaptureError::InvalidAdmission(
+                "invalid role path".into()
+            ))
+        );
+    }
 }

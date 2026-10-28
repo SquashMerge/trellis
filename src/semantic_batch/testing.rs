@@ -2,7 +2,9 @@
 use super::{
     AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
     admit::{BatchInputs, NativeSource, Passes, StageOwner, stage_batch},
-    descriptor::{ArtifactEntry, Descriptor, PageEntry},
+    descriptor::{
+        ArtifactEntry, Descriptor, PageEntry, SourceManifestHasher, basis_artifact_ordinal,
+    },
     staging::Stage,
 };
 use crate::{
@@ -10,7 +12,7 @@ use crate::{
     index_coordinator::CopiedInput,
     model::CancelFlag,
     native_evidence::{self as native, captured_revision_header},
-    scip_admission::{admission, path},
+    scip_admission::{admission, file_uri, order, path, pinned_producer_by_id},
     scip_raw::{
         self, CapturedClaim, CapturedScipFactV1, CapturedScipInventory, Exclusion, ScipCaptureError,
     },
@@ -221,6 +223,24 @@ fn read_inventories(
     descriptor: &Descriptor,
 ) -> Result<Vec<CapturedScipInventory>> {
     let mut inventories = vec![];
+    let mut statement = conn.prepare(
+        "SELECT s.language, s.path, c.exclusion FROM coverage c JOIN sources s ON s.ord=c.source_ord \
+         WHERE c.exclusion IS NOT NULL ORDER BY s.ord",
+    )?;
+    let exclusions = statement
+        .query_map([], |row| {
+            let exclusion = Exclusion {
+                language: row.get(0)?,
+                relative_path: row.get(1)?,
+                reason: row.get(2)?,
+            };
+            Ok((
+                basis_artifact_ordinal(&descriptor.artifacts, &exclusion.language, None),
+                exclusion,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
     for artifact in &descriptor.artifacts {
         let mut statement = conn.prepare(
             "SELECT canonical_bytes, fact_digest, proof_id FROM claims WHERE artifact=?1 \
@@ -256,19 +276,11 @@ fn read_inventories(
                 artifact_hash: artifact.sha256.clone(),
             });
         }
-        let mut statement = conn.prepare(
-            "SELECT s.language, s.path, c.exclusion FROM coverage c JOIN sources s ON s.ord=c.source_ord \
-             WHERE c.exclusion IS NOT NULL AND s.language=?1 ORDER BY s.ord",
-        )?;
-        let exclusions = statement
-            .query_map([&artifact.language], |row| {
-                Ok(Exclusion {
-                    language: row.get(0)?,
-                    relative_path: row.get(1)?,
-                    reason: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let exclusions = exclusions
+            .iter()
+            .filter(|(assigned, _)| *assigned == artifact.ordinal)
+            .map(|(_, exclusion)| exclusion.clone())
+            .collect();
         inventories.push(CapturedScipInventory {
             artifact_hashes: vec![artifact.sha256.clone()],
             decoder_version: descriptor.decoder_version.clone(),
@@ -342,6 +354,97 @@ pub fn admit_in_memory_from_capture(
         artifacts,
         cancel,
     )
+}
+
+/// Builds the descriptor and page bytes of a batch with one artifact that covers every source
+/// of `language` in `capture`. Sources of the producer's other languages are excluded as
+/// `notRequested`. The artifact is named `artifact.scip` and the pages `source-00000.json` and
+/// `coverage-00000.json`; pass the returned pages and the artifact to `admit_in_memory_from_capture`.
+pub fn single_artifact_batch(
+    capture: &Capture,
+    producer: &str,
+    language: &str,
+    artifact: &[u8],
+) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    let root = capture.physical_root();
+    let identity = crate::store::topology::WorkspaceIdentity::discover(Some(root), root)?;
+    let (source_set, revision) = captured_revision_header(capture, root, &identity.record_id)?;
+    let pinned = pinned_producer_by_id(producer).ok_or_else(|| anyhow!("unpinned producer"))?;
+    let mut files: Vec<_> = capture.files.iter().collect();
+    files.sort_by(|a, b| {
+        (order(&a.language), a.path.as_bytes()).cmp(&(order(&b.language), b.path.as_bytes()))
+    });
+    let mut hasher = SourceManifestHasher::new(&source_set.id);
+    let mut source_rows = vec![];
+    let mut coverage_rows = vec![];
+    let mut excluded = 0u64;
+    for file in &files {
+        hasher.push(&file.language, &file.path, &file.hash);
+        source_rows.push(serde_json::json!({
+            "byteLength": file.text.len(), "contentHash": file.hash,
+            "language": file.language, "relativePath": file.path,
+        }));
+        if !pinned.languages.contains(&file.language) {
+            continue;
+        }
+        coverage_rows.push(if file.language == language {
+            serde_json::json!({"artifact": 0, "exclusion": null,
+                "language": file.language, "relativePath": file.path})
+        } else {
+            excluded += 1;
+            serde_json::json!({"artifact": null, "exclusion": "notRequested",
+                "language": file.language, "relativePath": file.path})
+        });
+    }
+    let mut pages = vec![];
+    let mut entries = vec![];
+    for (kind, rows) in [("source", &source_rows), ("coverage", &coverage_rows)] {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "formatVersion": 1, "kind": kind, "ordinal": 0, "rows": rows,
+        }))?;
+        entries.push(serde_json::json!({
+            "kind": kind, "ordinal": 0, "relativePath": format!("{kind}-00000.json"),
+            "byteLength": bytes.len(), "sha256": scip_raw::sha(&bytes), "rowCount": rows.len(),
+        }));
+        pages.push(bytes);
+    }
+    let page_bytes: usize = pages.iter().map(Vec::len).sum();
+    let descriptor = serde_json::json!({
+        "formatVersion": 1,
+        "trustOrigin": pinned.trust_origin,
+        "profileId": pinned.profile_id,
+        "decoderVersion": scip_raw::DECODER_VERSION,
+        "producer": {
+            "name": pinned.name, "version": pinned.version,
+            "identityKind": pinned.identity_kind.as_str(),
+            "executableHash": pinned.executable_hash,
+            "positionEncoding": pinned.position_encoding, "languages": pinned.languages,
+        },
+        "sourceSet": {
+            "id": source_set.id, "rootId": source_set.root_id,
+            "languages": source_set.languages, "dependencies": source_set.dependencies,
+        },
+        "sourceRevision": revision.id,
+        "sourceManifestHash": hasher.finish(),
+        "components": {
+            "toolchainHash": revision.toolchain_hash, "configHash": revision.config_hash,
+            "dependencyHash": revision.dependency_hash,
+        },
+        "metadata": {"protocolVersion": 0, "projectRoot": file_uri(root)?, "textDocumentEncoding": 1},
+        "completion": if excluded == 0 { "complete" } else { "partial" },
+        "totals": {
+            "sourceDocuments": source_rows.len(),
+            "coveredDocuments": coverage_rows.len() as u64 - excluded,
+            "excludedDocuments": excluded,
+            "pageBytes": page_bytes, "artifactBytes": artifact.len(),
+        },
+        "pages": entries,
+        "artifacts": [{
+            "ordinal": 0, "relativePath": "artifact.scip", "byteLength": artifact.len(),
+            "sha256": scip_raw::sha(artifact), "language": language,
+        }],
+    });
+    Ok((serde_json::to_vec(&descriptor)?, pages))
 }
 
 static NEXT_JOIN: AtomicU64 = AtomicU64::new(0);

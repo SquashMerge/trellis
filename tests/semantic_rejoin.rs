@@ -1,20 +1,31 @@
-use serde_json::json;
+#![cfg(feature = "test-support")]
 use std::{
     collections::BTreeMap,
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
 use trellis::{
-    capture::Capture,
-    indexer::IndexOptions,
-    native_evidence as native, native_ids,
-    scip_admission::{
-        CapturedScipInventory, ReferenceProfileAdmission, TrustedSelection,
-        decode_reference_profile,
-    },
-    semantic_evidence as semantic,
+    capture::Capture, indexer::IndexOptions, native_evidence as native, native_ids,
+    scip_raw::CapturedScipInventory, semantic_batch::testing, semantic_evidence as semantic,
     semantic_import::rejoin_inventory,
 };
+
+fn admit(
+    capture: &Capture,
+    producer: &str,
+    language: &str,
+    artifact: &[u8],
+    cancel: &Arc<AtomicBool>,
+) -> CapturedScipInventory {
+    let (descriptor, pages) =
+        testing::single_artifact_batch(capture, producer, language, artifact).unwrap();
+    let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+    let mut inventories =
+        testing::admit_in_memory_from_capture(capture, &descriptor, &pages, &[artifact], cancel)
+            .unwrap();
+    assert_eq!(inventories.len(), 1);
+    inventories.remove(0)
+}
 
 const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
 
@@ -64,58 +75,10 @@ fn fixture_with_extra_occurrences(
     fs::write(physical.join("artifact.scip"), &bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(physical.clone());
-    let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
-    let first_native =
-        native::from_capture(&first, &physical, &identity.record_id, &cancel).unwrap();
-    let (set, rev) = (first_native.source_set, first_native.revision);
-    let file = &first.files[0];
-    let doc = json!({"language":"javascript","relativePath":"src/A.js","contentHash":file.hash});
-    let source_manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(
-            &json!([{"document":{"sourceSetId":set.id,"language":"javascript","path":"src/A.js"},"contentHash":file.hash}]),
-        ),
-    );
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let producer = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "scip-typescript")
-        .unwrap();
-    let uri = format!("file://{}", physical.display());
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
-        "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
-        "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,
-        "components":{"toolchainHash":rev.toolchain_hash,"configHash":rev.config_hash,"dependencyHash":rev.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":uri,"textDocumentEncoding":1},
-        "sourceDocuments":[doc],"documents":[doc],"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"", &bytes),"language":"javascript","documents":["src/A.js"]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let selection = TrustedSelection {
-        expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-        profile_id: "mac-mini-m5-pro-v1".into(),
-        producer_name: "scip-typescript".into(),
-    };
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &selection,
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture
         .files
@@ -286,58 +249,7 @@ fn two_document_fixture_for_language(
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
-    let docs: Vec<_> = capture
-        .files
-        .iter()
-        .map(|f| json!({"language":f.language,"relativePath":f.path,"contentHash":f.hash}))
-        .collect();
-    let manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(&json!(
-            native
-                .revision
-                .documents
-                .iter()
-                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
-                .collect::<Vec<_>>()
-        )),
-    );
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let pinned = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == producer_name)
-        .unwrap();
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":trellis::scip_raw::DECODER_VERSION,"profileId":profile["profileId"],
-        "producer":{"name":pinned["name"],"version":pinned["version"],"executableHash":pinned["executableHash"],"positionEncoding":2},
-        "sourceSet":{"id":native.source_set.id,"rootId":native.source_set.root_id,"languages":native.source_set.languages,"dependencies":native.source_set.dependencies},
-        "sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
-        "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",physical.display()),"textDocumentEncoding":1},
-        "sourceDocuments":docs,"documents":docs,"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":language,"documents":[a_path,b_path]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
-    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &TrustedSelection {
-            expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-            profile_id: "mac-mini-m5-pro-v1".into(),
-            producer_name: producer_name.into(),
-        },
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let inventory = admit(&capture, producer_name, language, &bytes, &cancel);
     let sources = capture
         .files
         .iter()
@@ -475,30 +387,9 @@ fn two_distinct_raw_claims_on_one_declaration_rejoin_as_separate_proofs() {
     binary.documents[0].occurrences.push(second);
     let bytes = binary.write_to_bytes().unwrap();
     fs::write(&artifact_path, &bytes).unwrap();
-    let manifest_path = physical.join("manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(&manifest_path, &manifest_bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let options = IndexOptions::new(physical.clone());
-    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &TrustedSelection {
-            expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-            profile_id: "mac-mini-m5-pro-v1".into(),
-            producer_name: "scip-typescript".into(),
-        },
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let capture = Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
+    let inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
     let result = rejoin_inventory(
         &inventory,
         &captured,
@@ -929,30 +820,10 @@ fn same_anchor_use_and_definition_claims_have_one_declaration_site_in_both_order
         binary.documents[0].occurrences.push(use_claim);
         let bytes = binary.write_to_bytes().unwrap();
         fs::write(&artifact_path, &bytes).unwrap();
-        let manifest_path = physical.join("manifest.json");
-        let mut manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        fs::write(&manifest_path, &manifest_bytes).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let capture =
             Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
-        let admission = ReferenceProfileAdmission::from_trusted_selection(
-            &capture,
-            &artifact_path,
-            &bytes,
-            &manifest_path,
-            &manifest_bytes,
-            &TrustedSelection {
-                expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-                profile_id: "mac-mini-m5-pro-v1".into(),
-                producer_name: "scip-typescript".into(),
-            },
-            &cancel,
-        )
-        .unwrap();
-        let mut inventory = decode_reference_profile(&admission, &cancel).unwrap();
+        let mut inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
         inventory.claims.sort_by_key(|claim| {
             let definition = claim.envelope.raw["symbolRoles"]
                 .as_u64()
@@ -1127,29 +998,9 @@ fn unresolved_claim_does_not_make_one_exact_internal_target_ambiguous() {
     document.symbols.push(info);
     let bytes = binary.write_to_bytes().unwrap();
     fs::write(&artifact_path, &bytes).unwrap();
-    let manifest_path = physical.join("manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(&manifest_path, &manifest_bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &artifact_path,
-        &bytes,
-        &manifest_path,
-        &manifest_bytes,
-        &TrustedSelection {
-            expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-            profile_id: "mac-mini-m5-pro-v1".into(),
-            producer_name: "scip-typescript".into(),
-        },
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
     let result = rejoin_inventory(
         &inventory,
         &captured,
