@@ -240,26 +240,167 @@ class ReuseWiring(unittest.TestCase):
 
     def test_measure_stops_each_cohort_before_the_next(self):
         events = []
-        with tempfile.TemporaryDirectory() as scratch, \
-                patch.object(H.platform, "system", return_value="Darwin"), \
-                patch.object(H.tempfile, "mkdtemp", return_value=scratch), \
-                patch.object(H, "configure_reuse"), \
-                patch.object(H, "load_policy", return_value={}), \
-                patch.object(H, "load_floors", return_value={"medium": (1, "x"), "large": (1, "x")}), \
-                patch.object(H, "init_checkout"), \
-                patch.object(H.shutil, "copytree"), \
-                patch.object(H, "pin_of", return_value="pin"), \
-                patch.object(H, "build_report", return_value={"pass": True}), \
-                patch.object(H, "measure_cohort",
-                             side_effect=lambda *a: events.append(("measure", a[4])) or {}), \
-                patch.object(H.V67, "command", return_value="Mac17,16"), \
-                patch.object(H.V67, "env_for", return_value={}), \
-                patch.object(H.V67, "stop_home_processes",
-                             side_effect=lambda home, binary: events.append(("stop", home.name))), \
-                patch.object(Path, "read_bytes", return_value=b""):
+        with self.measure_patches(events):
             self.assertEqual(H.measure(False), 0)
-        self.assertEqual(events, [("measure", "medium"), ("stop", "medium-private-home"),
-                                  ("measure", "large"), ("stop", "large-private-home")])
+        self.assertEqual(events, [("start", "medium"), ("measure", "medium"), ("stop", "medium"),
+                                  ("safety-net", "medium-private-home"),
+                                  ("start", "large"), ("measure", "large"), ("stop", "large"),
+                                  ("safety-net", "large-private-home")])
+
+    def test_measure_failure_stops_daemon_before_safety_net(self):
+        events = []
+        with self.measure_patches(events, measure_error=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                H.measure(False)
+        self.assertEqual(events, [("start", "medium"), ("measure", "medium"), ("stop", "medium"),
+                                  ("safety-net", "medium-private-home")])
+
+    def test_measure_fails_when_safety_net_found_processes(self):
+        events = []
+        with self.measure_patches(events, observe_unexpected=True):
+            with self.assertRaisesRegex(RuntimeError, "private HOME processes"):
+                H.measure(False)
+
+    def test_finally_stops_every_live_daemon_and_raises_first_failure(self):
+        events = []
+        with self.measure_patches(events, measure_error=RuntimeError("boom"), stop_error=RuntimeError("stuck")):
+            with self.assertRaisesRegex(RuntimeError, "stuck"):
+                H.measure(False)
+        self.assertEqual(events, [("start", "medium"), ("measure", "medium"), ("stop", "medium")])
+
+    def measure_patches(self, events, measure_error=None, observe_unexpected=False, stop_error=None):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+
+        class FakeDaemon:
+            def __init__(self, binary, home, label):
+                self.home, self.proc, self.log, self.label = home, None, None, label
+
+            def start(self):
+                events.append(("start", self.label))
+
+        def stop(daemon, binary):
+            events.append(("stop", daemon.label))
+            if stop_error:
+                raise stop_error
+
+        def measure_cohort(*a):
+            events.append(("measure", a[4]))
+            if measure_error:
+                raise measure_error
+            return {}
+
+        def safety_net(home, binary):
+            events.append(("safety-net", home.name))
+
+        patches = [
+            patch.object(H.platform, "system", return_value="Darwin"),
+            patch.object(H.tempfile, "mkdtemp", return_value=scratch.name),
+            patch.object(H, "load_policy", return_value={}),
+            patch.object(H, "load_floors", return_value={"medium": (1, "x"), "large": (1, "x")}),
+            patch.object(H, "init_checkout"),
+            patch.object(H.shutil, "copytree"),
+            patch.object(H, "pin_of", return_value="pin"),
+            patch.object(H, "build_report", return_value={"pass": True}),
+            patch.object(H, "measure_cohort", side_effect=measure_cohort),
+            patch.object(H.V67, "Daemon", FakeDaemon),
+            patch.object(H.V67, "command", return_value="Mac17,16"),
+            patch.object(H.V67, "env_for", return_value={}),
+            patch.object(H.V67, "election_free", return_value=True),
+            patch.object(H.V67, "stop_home_processes", side_effect=safety_net),
+            patch.object(H.V67, "record"),
+            patch.object(Path, "read_bytes", return_value=b""),
+        ]
+        if stop_error is None:
+            patches.append(patch.object(H, "stop_cohort_daemon", side_effect=lambda d, b: (
+                events.append(("stop", d.label)), H.V67.stop_home_processes(d.home, b),
+                observe_unexpected and H.OBSERVED.append("unexpected_home_processes"))))
+        else:
+            patches.append(patch.object(H, "stop_cohort_daemon", side_effect=stop))
+        from contextlib import ExitStack
+        stack = ExitStack()
+        for item in patches:
+            stack.enter_context(item)
+        saved = (V67.EVIDENCE, V67.DEADLINE, V67.scip_anchor, V67.record)
+        stack.callback(lambda: setattr(V67, "EVIDENCE", saved[0]))
+        stack.callback(lambda: setattr(V67, "DEADLINE", saved[1]))
+        stack.callback(lambda: setattr(V67, "scip_anchor", saved[2]))
+        stack.callback(H.OBSERVED.clear)
+        return stack
+
+
+class CohortTeardown(unittest.TestCase):
+    def daemon(self, proc=object()):
+        return types.SimpleNamespace(home=Path("/h"), proc=proc, log=None)
+
+    def test_stops_daemon_then_election_then_safety_net(self):
+        events = []
+        with patch.object(H.V67, "stop_child", side_effect=lambda proc, grace: events.append("stop_child")), \
+                patch.object(H.V67, "election_free", side_effect=lambda home: events.append("election") or True), \
+                patch.object(H.V67, "stop_home_processes", side_effect=lambda h, b: events.append("safety-net")), \
+                patch.object(H.V67, "record"):
+            H.stop_cohort_daemon(self.daemon(), Path("/b"))
+        self.assertEqual(events, ["stop_child", "election", "safety-net"])
+
+    def test_waits_for_election_release(self):
+        answers = iter([False, False, True])
+        with patch.object(H.V67, "stop_child"), patch.object(H.time, "sleep"), \
+                patch.object(H.V67, "election_free", side_effect=lambda home: next(answers)), \
+                patch.object(H.V67, "stop_home_processes") as net, patch.object(H.V67, "record"):
+            H.stop_cohort_daemon(self.daemon(), Path("/b"))
+        net.assert_called_once()
+
+    def test_election_wait_is_bounded_and_typed(self):
+        clock = iter(range(0, 10000, 50))
+        with patch.object(H.V67, "stop_child"), patch.object(H.time, "sleep"), \
+                patch.object(H.time, "monotonic", side_effect=lambda: next(clock)), \
+                patch.object(H.V67, "election_free", return_value=False), \
+                patch.object(H.V67, "stop_home_processes") as net, \
+                patch.object(H.V67, "DEADLINE", 10 ** 6):
+            with self.assertRaisesRegex(RuntimeError, "election not released"):
+                H.stop_cohort_daemon(self.daemon(), Path("/b"))
+        net.assert_not_called()
+
+    def test_election_wait_is_capped_by_the_global_deadline(self):
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += 1.0
+
+        with patch.object(H.V67, "stop_child"), patch.object(H.time, "sleep", side_effect=sleep), \
+                patch.object(H.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(H.V67, "election_free", return_value=False), \
+                patch.object(H.V67, "DEADLINE", 5.0):
+            with self.assertRaisesRegex(RuntimeError, "election not released"):
+                H.stop_cohort_daemon(self.daemon(), Path("/b"))
+        self.assertLess(now[0], 10)
+
+    def test_is_idempotent_for_a_stopped_daemon(self):
+        log = types.SimpleNamespace(closed=True, close=lambda: self.fail("closed twice"))
+        with patch.object(H.V67, "election_free", return_value=True), \
+                patch.object(H.V67, "stop_home_processes"), patch.object(H.V67, "record"):
+            H.stop_cohort_daemon(types.SimpleNamespace(home=Path("/h"), proc=None, log=log), Path("/b"))
+
+    def test_unexpected_home_processes_fail_the_run(self):
+        saved = (V67.EVIDENCE, V67.DEADLINE, V67.scip_anchor)
+        try:
+            with patch.object(H, "_RECORD"):
+                H.configure_reuse(Path("/tmp/scratch"), 12345.0)
+                H.require_clean_teardown()
+                V67.record("unexpected_home_processes", pids=[1])
+                with self.assertRaisesRegex(RuntimeError, "private HOME processes"):
+                    H.require_clean_teardown()
+        finally:
+            V67.EVIDENCE, V67.DEADLINE, V67.scip_anchor = saved
+            V67.record = H._RECORD
+            H.OBSERVED.clear()
+
+    def test_response_backstop_is_capped_by_the_deadline(self):
+        mcp = H.Mcp.__new__(H.Mcp)
+        mcp.buffer, mcp.proc = b"", types.SimpleNamespace(stdout=None)
+        with patch.object(H.V67, "DEADLINE", H.time.monotonic() - 1):
+            with self.assertRaisesRegex(RuntimeError, "did not arrive"):
+                mcp.readline()
 
     def test_usage_errors(self):
         for argv in (["--smoke", "--semantic", "--binary", "x"], ["--smoke"], ["--binary", "x"]):
