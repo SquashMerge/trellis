@@ -1,6 +1,9 @@
 //! Cached-source, declaration-only class projection. Links are scoped syntax candidates,
 //! never compiler resolution. No source reads, body inference, or dependency loading.
-use crate::model::{CancelFlag, SourceFile, SourceRange, Symbol, SymbolKind};
+use crate::model::{
+    CancelFlag, ClassDefinition, ClassMember, ClassRelation, DetailItem, DetailValue,
+    FileExtraction, SourceFile, SourceRange, Symbol, SymbolKind,
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,39 +25,6 @@ const TEXT: usize = 2_048;
 const OUTPUT_TEXT: usize = 64 * 1024 * 1024;
 const REGISTRY_TEXT: usize = 32 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ClassMember {
-    pub name: String,
-    pub type_hint: Option<String>,
-    pub symbol_id: Option<String>,
-    pub path: String,
-    pub range: SourceRange,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ClassDefinition {
-    pub symbol: Symbol,
-    pub qualified_name: String,
-    pub language: String,
-    pub declaration_kind: String,
-    pub fields: Vec<ClassMember>,
-    pub methods: Vec<ClassMember>,
-    pub truncated: bool,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ClassRelation {
-    pub id: String,
-    pub owner: String,
-    pub target: Option<String>,
-    pub type_name: String,
-    pub kind: String,
-    pub path: String,
-    pub range: SourceRange,
-    pub candidate_ids: Vec<String>,
-    pub match_kind: String,
-}
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Catalog {
@@ -100,31 +70,6 @@ impl Default for Limits {
             symbols: 2_000_000,
         }
     }
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DetailValue {
-    Field(ClassMember),
-    Method(ClassMember),
-    Relation(ClassRelation),
-    ScopeText,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DetailItem {
-    pub class_index: usize,
-    pub records: usize,
-    pub text: usize,
-    pub value: DetailValue,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FileExtraction {
-    pub path: String,
-    pub source_bytes: usize,
-    pub registry_bytes: usize,
-    pub warnings: Vec<String>,
-    pub truncated: bool,
-    pub registry_incomplete: bool,
-    pub classes: Vec<ClassDefinition>,
-    pub items: Vec<DetailItem>,
 }
 /// Charges and intrinsic metadata for one extraction, before workspace limits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

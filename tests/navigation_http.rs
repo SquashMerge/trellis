@@ -1225,8 +1225,9 @@ async fn retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_p
         (StatusCode::OK, baseline_member.clone())
     );
     use trellis::{
-        classes::{Catalog, FileExtraction, Limits},
+        classes::{Catalog, Limits},
         indexer::index_workspace_bundle,
+        model::FileExtraction,
     };
     let authenticated = store.source_at("A.java", Some(old_pin)).unwrap().unwrap().1;
     assert_eq!(authenticated.text, JAVA);

@@ -278,7 +278,7 @@ fn read_only(kind: EventKind) -> bool {
 }
 
 /// One per active checkout, plus 4 for replacement and stuck teardown.
-pub const MAX_NATIVE_WATCHERS: usize = crate::daemon::registry::MAX_ACTIVE_CHECKOUTS + 4;
+pub const MAX_NATIVE_WATCHERS: usize = crate::model::MAX_ACTIVE_CHECKOUTS + 4;
 
 /// The native-watcher budget (Decision 0009 §§2, 5, as amended 2026-10-15).
 /// A slot is reserved before a native watcher is created and freed only when

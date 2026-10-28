@@ -2,9 +2,10 @@
 use super::*;
 use crate::{
     capture::Capture,
-    classes::{Catalog, FileExtraction, Limits},
+    classes::{Catalog, Limits},
     index_coordinator::IndexJobCoordinator,
     indexer::IndexOptions,
+    model::FileExtraction,
 };
 use std::{fs, sync::atomic::AtomicBool};
 

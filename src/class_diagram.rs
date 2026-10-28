@@ -1,6 +1,5 @@
 //! Bounded, presentation-only class diagrams. Stored relation certainty is never changed.
-use crate::classes::{ClassDefinition, ClassRelation};
-use crate::model::IndexPin;
+use crate::model::{ClassDefinition, ClassRelation, IndexPin};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

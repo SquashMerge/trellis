@@ -54,7 +54,7 @@ fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     golden(&catalog);
     (graph, catalog)
 }
-fn class<'a>(c: &'a Catalog, name: &str) -> &'a trellis::classes::ClassDefinition {
+fn class<'a>(c: &'a Catalog, name: &str) -> &'a trellis::model::ClassDefinition {
     c.classes
         .iter()
         .find(|c| c.qualified_name == name)
@@ -592,15 +592,15 @@ fn cap_file(
     source_bytes: usize,
     registry_bytes: usize,
     class: bool,
-) -> trellis::classes::FileExtraction {
-    let mut definition: trellis::classes::ClassDefinition = serde_json::from_value(
+) -> trellis::model::FileExtraction {
+    let mut definition: trellis::model::ClassDefinition = serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][0].clone()
     ).unwrap();
     definition.symbol.path = path.into();
     definition.symbol.id = format!("class-{path}");
     definition.symbol.name = path.trim_end_matches(".java").into();
     definition.qualified_name = definition.symbol.name.clone();
-    trellis::classes::FileExtraction {
+    trellis::model::FileExtraction {
         path: path.into(),
         source_bytes,
         registry_bytes,
@@ -611,8 +611,8 @@ fn cap_file(
         items: if class { vec![cap_ref(path)] } else { vec![] },
     }
 }
-fn cap_ref(path: &str) -> trellis::classes::DetailItem {
-    use trellis::classes::{ClassRelation, DetailItem, DetailValue};
+fn cap_ref(path: &str) -> trellis::model::DetailItem {
+    use trellis::model::{ClassRelation, DetailItem, DetailValue};
     DetailItem {
         class_index: 0,
         records: 0,
@@ -632,7 +632,7 @@ fn cap_ref(path: &str) -> trellis::classes::DetailItem {
 }
 fn cap_expected(
     name: &str,
-    files: &[trellis::classes::FileExtraction],
+    files: &[trellis::model::FileExtraction],
     count: usize,
     symbols: usize,
     limits: trellis::classes::Limits,
@@ -648,12 +648,15 @@ fn cap_expected(
 }
 #[test]
 fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
-    use trellis::classes::{DetailItem, DetailValue, Limits};
+    use trellis::{
+        classes::Limits,
+        model::{DetailItem, DetailValue},
+    };
     let ordinary = Limits::default();
     let a = cap_file("A.java", 1, 1, true);
     let b = cap_file("B.java", 1, 1, true);
     let empty = cap_file("0.java", 1, 1, false);
-    let warned = trellis::classes::FileExtraction {
+    let warned = trellis::model::FileExtraction {
         warnings: vec!["excluded warning".into()],
         truncated: true,
         ..b.clone()
@@ -683,7 +686,7 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     limits.classes = 1;
     cap_expected("classes-equal", std::slice::from_ref(&a), 1, 1, limits);
     cap_expected("classes-over", &[a.clone(), b.clone()], 2, 2, limits);
-    let member: trellis::classes::ClassMember=serde_json::from_value(
+    let member: trellis::model::ClassMember=serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
     ).unwrap();
     let mut first = member.clone();
@@ -741,7 +744,7 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     limits.output_text = 1;
     cap_expected("output-over", &[detailed_a, detailed_b], 2, 2, limits);
     let mut inside = cap_file("A.java", 1, 1, true);
-    let original: trellis::classes::ClassMember = serde_json::from_value(
+    let original: trellis::model::ClassMember = serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
     ).unwrap();
     inside.items = std::iter::once(cap_ref("A.java"))
@@ -785,8 +788,8 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     );
     #[derive(serde::Serialize)]
     struct LaterProjection<'a> {
-        classes: Vec<&'a trellis::classes::ClassDefinition>,
-        relations: Vec<&'a trellis::classes::ClassRelation>,
+        classes: Vec<&'a trellis::model::ClassDefinition>,
+        relations: Vec<&'a trellis::model::ClassRelation>,
     }
     let later_projection = |catalog: &Catalog| {
         serde_json::to_vec(&LaterProjection {
@@ -931,7 +934,7 @@ fn class_registry_import_charge_tiny_native_pilot() {
                 .unwrap();
             assert_eq!(document.content_hash, sha);
             assert_eq!(document.byte_length, size);
-            let f = trellis::classes::FileExtraction::extract_file(
+            let f = trellis::model::FileExtraction::extract_file(
                 file,
                 &graph.nodes,
                 &cancel,
@@ -977,7 +980,10 @@ fn production_class_limits_are_fixed_at_decision_0004_values() {
 
 #[test]
 fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details() {
-    use trellis::classes::{DetailValue, FileExtraction, Limits};
+    use trellis::{
+        classes::Limits,
+        model::{DetailValue, FileExtraction},
+    };
     let extract = |path: &str, source: &str, limits: Limits| {
         let work = tempfile::tempdir().unwrap();
         fs::write(work.path().join(path), source).unwrap();
@@ -1076,7 +1082,7 @@ fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details
 
 #[test]
 fn decision_0004_per_file_f_is_independent_of_other_workspace_documents() {
-    use trellis::classes::{FileExtraction, Limits};
+    use trellis::{classes::Limits, model::FileExtraction};
     let temp = tempfile::tempdir().unwrap();
     let a = temp.path().join("A.java");
     let b = temp.path().join("B.java");

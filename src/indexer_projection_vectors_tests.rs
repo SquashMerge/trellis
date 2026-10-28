@@ -2,8 +2,9 @@
 //! these vectors from `project_document` or the candidate writer.
 use crate::{
     capture::Capture,
-    classes::{Catalog, FileExtraction, Limits},
+    classes::{Catalog, Limits},
     indexer::{IndexOptions, NativeDocument, project_document},
+    model::FileExtraction,
     native_evidence::{Call, ControlRegion, Declaration},
     native_ids,
 };
