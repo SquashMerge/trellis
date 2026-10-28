@@ -190,7 +190,7 @@ fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
   try {
-    for (const name of ["cargo", "node"]) {
+    for (const name of ["cargo", "node", "python3"]) {
       const command = join(fakeDir, name);
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
@@ -247,6 +247,11 @@ exec "${realPython}" "$@"
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
       checks: [
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
+        ["python3", "tools/stage3-watcher-runner-test.py"],
+        ["python3", "tools/verify-67-mixed-performance-test.py"],
+        ["python3", "tools/verify-61-combined-gate-test.py"],
+        ["python3", "-m", "unittest", "discover", "-s", "tools/semantic-contract/test", "-p", "test_*.py"],
+        ["python3", "-m", "unittest", "discover", "-s", "tools/release", "-p", "test_*.py"],
         ["node", "--test", "tests/factory-config.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],

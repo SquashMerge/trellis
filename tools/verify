@@ -116,6 +116,8 @@ checks() {
   python3 tools/stage3-watcher-runner-test.py
   python3 tools/verify-67-mixed-performance-test.py
   python3 tools/verify-40-query-performance-test.py
+  python3 tools/verify-61-combined-gate-test.py
+  python3 -m unittest discover -s tools/semantic-contract/test -p 'test_*.py'
   python3 -m unittest discover -s tools/release -p 'test_*.py'
   node --test tests/factory-config.test.cjs
   node docs/semantic-evidence/check-policy.mjs --self-test
