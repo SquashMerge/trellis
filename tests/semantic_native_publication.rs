@@ -2185,6 +2185,67 @@ fn selected_case(change_b: &str) {
             "{snapshot:?}"
         );
     }
+    if change_b == "regular" {
+        use trellis::graph_query::{
+            BoundaryReason, DEFAULT_DEPTH, DEFAULT_MAX_CALLS, DEFAULT_MAX_NODES, GraphQuery, Visit,
+            WarningCode,
+        };
+        // The rejoined importer binding is attached to its edge by the engine's candidate
+        // rule, and its possiblyStale freshness is the published one, not recomputed.
+        let (r2_native, _) = store.retained_native_snapshot_at(next).unwrap();
+        let run = r2_native
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name.as_deref() == Some("run"))
+            .unwrap();
+        let answer = store
+            .evidence_response()
+            .unwrap()
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: run.syntax_id.clone(),
+                    semantic_producer_id: Some(snapshot.producers[0].id.clone()),
+                    depth: DEFAULT_DEPTH,
+                    max_nodes: DEFAULT_MAX_NODES,
+                    max_calls: DEFAULT_MAX_CALLS,
+                },
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap();
+        let result = answer.outcome.unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.edges.len(), 1);
+        let edge = &result.edges[0];
+        assert_eq!(edge.call.spelling.as_deref(), Some("target"));
+        assert_eq!(edge.visit, Visit::Boundary);
+        assert_eq!(edge.boundary_reason, BoundaryReason::Stale);
+        let binding = edge.binding.as_ref().expect("rejoined binding is attached");
+        assert_eq!(binding.call_id.as_deref(), Some(edge.call.id.as_str()));
+        assert_eq!(binding.stale_target, Some(false));
+        let proof = result
+            .provenance
+            .iter()
+            .find(|proof| proof.id == binding.provenance_id)
+            .unwrap();
+        assert_eq!(
+            proof.freshness,
+            trellis::semantic_evidence::Freshness::PossiblyStale
+        );
+        assert!(proof.derived_from.is_some());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::StaleEvidence && w.provenance_id.is_none())
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| w.code != WarningCode::StaleTarget)
+        );
+    }
 }
 
 #[test]
