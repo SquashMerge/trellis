@@ -6860,18 +6860,18 @@ async fn mcp_deadline_before_read_admission_uses_the_pre_resolution_shape() {
     assert!(envelope.get("catchingUp").is_none(), "{reply}");
 }
 
-/// #156: find still validates every searched coverage tuple, although only
-/// counts leave the store. A corrupt row in an unrelated document fails a
-/// zero-hit query, and a query whose hit lies elsewhere, as store_unavailable,
-/// never a successful answer with counts.
+/// #156, relaxed by #261: find validates the coverage tuple of each hydrated
+/// hit only. A corrupt row in a document no hit reaches no longer fails a
+/// zero-hit query or a hit elsewhere; a hit on the corrupt document fails as
+/// store_unavailable, never a successful answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits() {
+async fn mcp_find_corrupt_scope_row_fails_only_when_hydrated() {
     use trellis::daemon::registry::CheckoutRegistry;
     use trellis::store::{
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
     };
-    for query in ["no_such_name", "Alpha"] {
+    for query in ["no_such_name", "Alpha", "Beta"] {
         let temp = tempfile::tempdir().unwrap();
         let root = checkout(temp.path());
         fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
@@ -6943,6 +6943,19 @@ async fn mcp_find_unrelated_corrupt_scope_row_fails_zero_hit_and_elsewhere_hits(
             .unwrap();
         drop(writer);
         let response = store.evidence_response().unwrap();
+        if query != "Beta" {
+            let found = response
+                .mcp_find(query, 20, None)
+                .unwrap_or_else(|error| panic!("{query}: {error:#}"));
+            assert_eq!(
+                found.symbols.len(),
+                usize::from(query == "Alpha"),
+                "{query}"
+            );
+            assert_eq!(found.scope[3], [1, 1, 0, 0, 1], "{query}");
+            response.finish(()).unwrap();
+            continue;
+        }
         let error = response.mcp_find(query, 20, None).map(|_| ()).unwrap_err();
         let reason = format!("{error:#}");
         assert!(

@@ -581,11 +581,17 @@ impl EvidenceResponse {
 
 pub(super) struct McpFindScope {
     pub counts: [[u64; 5]; 4],
-    coverage: BTreeMap<String, crate::native_evidence::Coverage>,
     scopes: BTreeMap<String, V8NativeScope>,
 }
 
 impl EvidenceResponse {
+    /// Scope counts and per-document scopes from one grouped read of the
+    /// selected manifest, whatever the document count.
+    ///
+    /// Coverage tuples are validated per hydrated hit in `mcp_hydrate_find`,
+    /// not here. Under #261 selected reads trust what the indexer published,
+    /// so corruption in a document that no hit reaches no longer fails the
+    /// call; it is found when that document is next hydrated or re-indexed.
     pub(super) fn mcp_find_scope(
         &self,
         selected: &ReadRevision,
@@ -593,81 +599,29 @@ impl EvidenceResponse {
     ) -> Result<McpFindScope> {
         use crate::native_evidence::DocumentKey;
         // Include manifest rows without native declarations, including failed and unselected rows.
-        let keys = self
-            .db
-            .prepare(
-                "SELECT s.id,m.language,m.path FROM revision_documents m
-            JOIN native_source_sets s ON 1=1
+        let mut stmt = self.db.prepare(
+            "SELECT s.id,m.language,m.path,m.coverage_selected,m.coverage_state,
+                    d.id,d.vid,r.native_revision_id,d.producer_id
+            FROM revision_documents m
+            JOIN native_revisions r ON r.id=m.revision_id
+            JOIN native_source_sets s ON s.id=r.source_set_id
+            LEFT JOIN document_versions d ON d.vid=m.vid
+              AND d.language=m.language AND d.path=m.path
             WHERE m.revision_id=?1 ORDER BY s.id,m.language,m.path",
-            )?
-            .query_map([&selected.key], |row| {
-                Ok(DocumentKey {
-                    source_set_id: row.get(0)?,
-                    language: row.get(1)?,
-                    path: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        // Every searched tuple is still validated: corrupt required scope
-        // evidence fails closed, even though only counts leave this layer.
-        let mut coverage = BTreeMap::new();
-        let mut scopes = BTreeMap::new();
-        for key in keys {
-            check()?;
-            let scope = v8_native_scope_for(&self.db, &key, selected)?.ok_or_else(|| {
-                self.corrupt_evidence("store_unavailable: missing native coverage scope")
-            })?;
-            let row = read_native_coverage_v8(&self.db, &scope)?;
-            if !(row.revision_id == scope.native_revision_id
-                && row.producer_id == scope.producer_id
-                && row.language == key.language
-                && row.source_set_id == key.source_set_id
-                && row.document_path == key.path)
-            {
-                return Err(
-                    self.corrupt_evidence("store_unavailable: native coverage identity mismatch")
-                );
-            }
-            let valid_state = match row.state.as_str() {
-                "notRequested" => !row.requested && !row.selected && row.diagnostic.is_none(),
-                "omitted" | "unsupported" => {
-                    row.requested && !row.selected && row.diagnostic.is_some()
-                }
-                "failed" | "partial" => row.requested && row.selected && row.diagnostic.is_some(),
-                "complete" => row.requested && row.selected && row.diagnostic.is_none(),
-                _ => false,
-            };
-            let ordered_roles = |roles: &[String]| {
-                roles.windows(2).all(|pair| {
-                    matches!((pair[0].as_str(), pair[1].as_str()), ("definition", "call"))
-                })
-            };
-            if !(valid_state
-                && ordered_roles(&row.supported_roles)
-                && ordered_roles(&row.observed_roles)
-                && row
-                    .observed_roles
-                    .iter()
-                    .all(|role| row.supported_roles.contains(role))
-                && row
-                    .supported_roles
-                    .iter()
-                    .all(|role| matches!(role.as_str(), "definition" | "call"))
-                && row
-                    .observed_roles
-                    .iter()
-                    .all(|role| matches!(role.as_str(), "definition" | "call")))
-            {
-                return Err(
-                    self.corrupt_evidence("store_unavailable: inconsistent native coverage tuple")
-                );
-            }
-            coverage.insert(scope.version_id.clone(), row);
-            scopes.insert(scope.version_id.clone(), scope);
-        }
+        )?;
+        let mut rows = stmt.query([&selected.key])?;
         let mut scope_counts = [[0_u64; 5]; 4];
-        for row in coverage.values() {
-            let language = match row.language.as_str() {
+        let mut scopes = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            check()?;
+            let key = DocumentKey {
+                source_set_id: row.get(0)?,
+                language: row.get(1)?,
+                path: row.get(2)?,
+            };
+            let chosen: bool = row.get(3)?;
+            let state: String = row.get(4)?;
+            let language = match key.language.as_str() {
                 "java" => 0,
                 "rust" => 1,
                 "python" => 2,
@@ -678,9 +632,9 @@ impl EvidenceResponse {
                 }
             };
             let counts = &mut scope_counts[language];
-            if row.selected {
+            if chosen {
                 counts[0] += 1;
-                counts[match row.state.as_str() {
+                counts[match state.as_str() {
                     "complete" => 1,
                     "partial" => 2,
                     _ => 3,
@@ -688,12 +642,77 @@ impl EvidenceResponse {
             } else {
                 counts[4] += 1;
             }
+            let version_id: Option<String> = row.get(5)?;
+            if let Some(version_id) = version_id {
+                scopes.insert(
+                    version_id.clone(),
+                    V8NativeScope {
+                        revision_key: selected.key.clone(),
+                        version_id,
+                        vid: row.get(6)?,
+                        key,
+                        native_revision_id: row.get(7)?,
+                        producer_id: row.get(8)?,
+                    },
+                );
+            }
         }
         Ok(McpFindScope {
             counts: scope_counts,
-            coverage,
             scopes,
         })
+    }
+
+    /// Read and validate one hydrated document's native coverage tuple.
+    fn mcp_validated_coverage(
+        &self,
+        scope: &V8NativeScope,
+    ) -> Result<crate::native_evidence::Coverage> {
+        let key = &scope.key;
+        let row = read_native_coverage_v8(&self.db, scope)?;
+        if !(row.revision_id == scope.native_revision_id
+            && row.producer_id == scope.producer_id
+            && row.language == key.language
+            && row.source_set_id == key.source_set_id
+            && row.document_path == key.path)
+        {
+            return Err(
+                self.corrupt_evidence("store_unavailable: native coverage identity mismatch")
+            );
+        }
+        let valid_state = match row.state.as_str() {
+            "notRequested" => !row.requested && !row.selected && row.diagnostic.is_none(),
+            "omitted" | "unsupported" => row.requested && !row.selected && row.diagnostic.is_some(),
+            "failed" | "partial" => row.requested && row.selected && row.diagnostic.is_some(),
+            "complete" => row.requested && row.selected && row.diagnostic.is_none(),
+            _ => false,
+        };
+        let ordered_roles = |roles: &[String]| {
+            roles
+                .windows(2)
+                .all(|pair| matches!((pair[0].as_str(), pair[1].as_str()), ("definition", "call")))
+        };
+        if !(valid_state
+            && ordered_roles(&row.supported_roles)
+            && ordered_roles(&row.observed_roles)
+            && row
+                .observed_roles
+                .iter()
+                .all(|role| row.supported_roles.contains(role))
+            && row
+                .supported_roles
+                .iter()
+                .all(|role| matches!(role.as_str(), "definition" | "call"))
+            && row
+                .observed_roles
+                .iter()
+                .all(|role| matches!(role.as_str(), "definition" | "call")))
+        {
+            return Err(
+                self.corrupt_evidence("store_unavailable: inconsistent native coverage tuple")
+            );
+        }
+        Ok(row)
     }
 
     pub(super) fn mcp_hydrate_find(
@@ -706,7 +725,6 @@ impl EvidenceResponse {
     ) -> Result<McpFind> {
         use crate::native_evidence::Provenance;
         let scopes = &scope.scopes;
-        let coverage = &scope.coverage;
         let mut symbols = Vec::new();
         let mut provenance = Vec::new();
         let mut loaded: BTreeMap<
@@ -714,14 +732,16 @@ impl EvidenceResponse {
             (
                 BTreeMap<String, crate::native_evidence::Declaration>,
                 String,
+                crate::native_evidence::Coverage,
             ),
         > = BTreeMap::new();
         for (version, id) in hits {
             check()?;
-            let scope = scopes
-                .get(&version)
-                .ok_or_else(|| self.corrupt_evidence("store_unavailable: find scope absent"))?;
+            let scope = scopes.get(&version).ok_or_else(|| {
+                self.corrupt_evidence("store_unavailable: missing native coverage scope")
+            })?;
             if !loaded.contains_key(&version) {
+                let row = self.mcp_validated_coverage(scope)?;
                 let declarations = read_native_declarations_v8(&self.db, scope, None, true)?
                     .into_iter()
                     .map(|d| (d.syntax_id.clone(), d))
@@ -730,7 +750,7 @@ impl EvidenceResponse {
                     "SELECT content_hash FROM document_versions d JOIN native_source_sets s ON s.id=?2 WHERE d.id=?1 AND d.language=?3 AND d.path=?4",
                     params![scope.version_id, scope.key.source_set_id, scope.key.language, scope.key.path],
                     |r| r.get(0))?;
-                loaded.insert(version.clone(), (declarations, hash.clone()));
+                loaded.insert(version.clone(), (declarations, hash.clone(), row));
                 provenance.push(Provenance {
                     id: scope.proof_id(),
                     producer_id: scope.producer_id.clone(),
@@ -743,7 +763,7 @@ impl EvidenceResponse {
                     derived_from: None,
                 });
             }
-            let (declarations, hash) = &loaded[&version];
+            let (declarations, hash, row) = &loaded[&version];
             let declaration = declarations
                 .get(&id)
                 .ok_or_else(|| {
@@ -758,12 +778,7 @@ impl EvidenceResponse {
             symbols.push(McpFindSymbol {
                 declaration,
                 content_hash: hash.clone(),
-                coverage: coverage
-                    .get(&version)
-                    .ok_or_else(|| {
-                        self.corrupt_evidence("store_unavailable: find coverage absent")
-                    })?
-                    .clone(),
+                coverage: row.clone(),
             });
         }
         provenance.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3247,5 +3262,210 @@ mod source_range_tests {
         assert!(mcp_lf_range(two_hundred.as_bytes(), 1, 201).is_err());
         assert!(mcp_lf_range(b"x", 2, 1).is_err());
         assert!(mcp_lf_range(b"x", 0, 1).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod find_scope_tests {
+    use super::*;
+    use crate::indexer::IndexOptions;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    thread_local! {
+        static STATEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe extern "C" fn count_statement(
+        _mask: std::ffi::c_uint,
+        _context: *mut std::ffi::c_void,
+        _statement: *mut std::ffi::c_void,
+        _sql: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        STATEMENTS.with(|count| count.set(count.get() + 1));
+        0
+    }
+
+    /// Run `body` and return how many SQL statements the connection started.
+    fn statements<T>(db: &Connection, body: impl FnOnce() -> T) -> (T, u64) {
+        STATEMENTS.with(|count| count.set(0));
+        // SAFETY: the callback only touches thread-local state, and the trace
+        // is removed before the connection is used again.
+        let handle = unsafe { db.handle() };
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                handle,
+                rusqlite::ffi::SQLITE_TRACE_STMT,
+                Some(count_statement),
+                std::ptr::null_mut(),
+            );
+        }
+        let out = body();
+        unsafe { rusqlite::ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+        (out, STATEMENTS.with(std::cell::Cell::get))
+    }
+
+    /// `per_language` filler documents in each language, plus `a.js` (Alpha).
+    fn fixture(per_language: usize) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::write(root.join("a.js"), "function Alpha() {}\n").unwrap();
+        for i in 0..per_language {
+            std::fs::write(
+                root.join(format!("f{i}.js")),
+                format!("function F{i}() {{}}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("p{i}.py")),
+                format!("def p{i}():\n    pass\n"),
+            )
+            .unwrap();
+            std::fs::write(root.join(format!("r{i}.rs")), format!("fn r{i}() {{}}\n")).unwrap();
+            std::fs::write(
+                root.join(format!("J{i}.java")),
+                format!("class J{i} {{ void m{i}() {{}} }}\n"),
+            )
+            .unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), root).unwrap();
+        let (pin, _) = crate::index_coordinator::reconcile_workspace(
+            &store,
+            &IndexOptions::new(root.to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        (state, workspace, store, pin)
+    }
+
+    #[test]
+    fn scope_statement_count_is_independent_of_document_count() {
+        let measure = |per_language| {
+            let (_state, _workspace, store, pin) = fixture(per_language);
+            let read = store.evidence_response().unwrap();
+            let selected = store.read_revision_for(&read.db, None, true).unwrap();
+            let (scope, scope_statements) = statements(&read.db, || {
+                read.mcp_find_scope(&selected, &mut || Ok(())).unwrap()
+            });
+            let documents = scope.scopes.len() as u64;
+            let (found, find_statements) =
+                statements(&read.db, || read.mcp_find("Alpha", 20, Some(pin)).unwrap());
+            assert_eq!(found.symbols.len(), 1);
+            read.finish(()).unwrap();
+            (documents, scope_statements, find_statements)
+        };
+        let (small_docs, small_scope, small_find) = measure(2);
+        let (large_docs, large_scope, large_find) = measure(10);
+        assert!(large_docs >= small_docs * 4, "{small_docs} vs {large_docs}");
+        assert_eq!(small_scope, large_scope);
+        assert!(small_scope <= 3, "scope statements: {small_scope}");
+        assert_eq!(small_find, large_find);
+    }
+
+    /// The previous per-document implementation, kept as the oracle.
+    fn reference(
+        read: &EvidenceResponse,
+        selected: &ReadRevision,
+    ) -> (
+        [[u64; 5]; 4],
+        BTreeMap<String, crate::native_evidence::Coverage>,
+    ) {
+        use crate::native_evidence::DocumentKey;
+        let keys = read
+            .db
+            .prepare(
+                "SELECT s.id,m.language,m.path FROM revision_documents m
+            JOIN native_source_sets s ON 1=1
+            WHERE m.revision_id=?1 ORDER BY s.id,m.language,m.path",
+            )
+            .unwrap()
+            .query_map([&selected.key], |row| {
+                Ok(DocumentKey {
+                    source_set_id: row.get(0)?,
+                    language: row.get(1)?,
+                    path: row.get(2)?,
+                })
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut counts = [[0_u64; 5]; 4];
+        let mut coverage = BTreeMap::new();
+        for key in keys {
+            let scope = v8_native_scope_for(&read.db, &key, selected)
+                .unwrap()
+                .unwrap();
+            let row = read_native_coverage_v8(&read.db, &scope).unwrap();
+            let language = ["java", "rust", "python", "javascript"]
+                .iter()
+                .position(|name| *name == row.language)
+                .unwrap();
+            if row.selected {
+                counts[language][0] += 1;
+                counts[language][match row.state.as_str() {
+                    "complete" => 1,
+                    "partial" => 2,
+                    _ => 3,
+                }] += 1;
+            } else {
+                counts[language][4] += 1;
+            }
+            coverage.insert(scope.version_id.clone(), row);
+        }
+        (counts, coverage)
+    }
+
+    #[test]
+    fn grouped_scope_matches_the_per_document_reference() {
+        let (_state, _workspace, store, pin) = fixture(2);
+        let read = store.evidence_response().unwrap();
+        let selected = store.read_revision_for(&read.db, None, true).unwrap();
+        let (counts, coverage) = reference(&read, &selected);
+        let scope = read.mcp_find_scope(&selected, &mut || Ok(())).unwrap();
+        assert_eq!(scope.counts, counts);
+        assert!(counts.iter().all(|language| language[0] > 0));
+        assert_eq!(
+            scope.scopes.keys().collect::<Vec<_>>(),
+            coverage.keys().collect::<Vec<_>>()
+        );
+        for (version, expected) in &coverage {
+            let validated = read.mcp_validated_coverage(&scope.scopes[version]).unwrap();
+            assert_eq!(&validated, expected);
+        }
+        let found = read.mcp_find("Alpha", 20, Some(pin)).unwrap();
+        assert_eq!(found.scope, counts);
+        assert_eq!(found.symbols.len(), 1);
+        assert_eq!(found.symbols[0].coverage.document_path, "a.js");
+        read.finish(()).unwrap();
+    }
+
+    fn set_coverage(store: &Store, path: &str) {
+        let writer = store.publication_for_tests().unwrap();
+        store
+            .mcp_set_coverage_for_tests(&writer, path, false, "failed")
+            .unwrap();
+    }
+
+    #[test]
+    fn coverage_defect_fails_typed_only_for_hydrated_documents() {
+        let (_state, _workspace, store, pin) = fixture(1);
+        set_coverage(&store, "f0.js");
+        let read = store.evidence_response().unwrap();
+        let found = read
+            .mcp_find("Alpha", 20, Some(pin))
+            .expect("a defect in a document no hit reaches does not fail the call");
+        assert_eq!(found.symbols.len(), 1);
+        let error = read.mcp_find("F0", 20, Some(pin)).err().unwrap();
+        assert!(
+            error.downcast_ref::<SelectedIntegrity>().is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("inconsistent native coverage tuple"));
+        drop(read);
+        set_coverage(&store, "a.js");
+        let read = store.evidence_response().unwrap();
+        let error = read.mcp_find("Alpha", 20, Some(pin)).err().unwrap();
+        assert!(error.downcast_ref::<SelectedIntegrity>().is_some());
     }
 }
