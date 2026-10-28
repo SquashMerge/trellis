@@ -26,7 +26,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import types
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -48,6 +47,7 @@ SAMPLES = 200
 WARMUPS = 20
 LANGUAGES = ("java", "javascript", "python", "rust")
 HANG_BACKSTOP = 120  # seconds; a liveness backstop for one MCP response, not a gate
+ELECTION_RELEASE_WAIT = 120  # seconds; the daemon may be busy in background fill when stopped
 
 GRAPH_KINDS = ("defaultBoundedQuery", "maximumBoundedQuery",
                "semanticDefaultBoundedQuery", "semanticMaximumBoundedQuery")
@@ -114,11 +114,77 @@ class CheckoutPath(type(Path())):
             init_checkout(self)
 
 
+_RECORD = V67.record
+OBSERVED = []
+
+
+def _observing_record(kind, **fields):
+    OBSERVED.append(kind)
+    _RECORD(kind, **fields)
+
+
 def configure_reuse(scratch, deadline):
-    """Point the reused #90 helpers at this run; call before any of them runs."""
+    """Point the reused #90 helpers at this run; call before any of them runs.
+
+    Also notes every V67 event name in OBSERVED so a run can assert that the
+    teardown safety net found nothing (no unexpected_home_processes).
+    """
     V67.EVIDENCE = scratch
     V67.DEADLINE = deadline
     V67.scip_anchor = call_site_anchor
+    V67.record = _observing_record
+    OBSERVED.clear()
+
+
+def remaining():
+    return V67.DEADLINE - time.monotonic()
+
+
+def stop_all(daemons, binary):
+    """Stop every daemon, even if one stop fails; call from a finally block.
+
+    A failure raises only when the body succeeded. When the body already raised, that
+    original exception propagates and teardown failures are recorded and noted on it.
+    """
+    in_flight = sys.exc_info()[1]
+    errors = []
+    for daemon in daemons:
+        try:
+            stop_cohort_daemon(daemon, binary)
+        except BaseException as exc:
+            errors.append(exc)
+    if errors and in_flight is None:
+        raise errors[0]
+    for exc in errors:
+        V67.record("teardown_failed", error=str(exc))
+        if hasattr(in_flight, "add_note"):
+            in_flight.add_note(f"teardown also failed: {exc}")
+
+
+def require_clean_teardown():
+    require("unexpected_home_processes" not in OBSERVED,
+            "teardown found private HOME processes after the daemon stopped")
+
+
+def stop_cohort_daemon(daemon, binary):
+    """Stop the owned daemon, then prove its election is released; idempotent.
+
+    Trellis's daemon registers no signal handler, so SIGTERM ends it at once and the
+    kernel drops its daemon.lock flock. V67.stop_home_processes runs last, only as a
+    safety net that must find nothing: it assumes the known daemon has already stopped.
+    """
+    if daemon.proc is not None:
+        # TERM gets the whole generous bound; KILL only follows if it lapses.
+        V67.stop_child(daemon.proc, grace=max(1, min(ELECTION_RELEASE_WAIT, remaining())))
+    if daemon.log is not None and not daemon.log.closed:
+        daemon.log.close()
+    end = time.monotonic() + max(0, min(ELECTION_RELEASE_WAIT, remaining()))
+    while not V67.election_free(daemon.home):
+        require(time.monotonic() < end,
+                f"daemon election not released within the remaining budget: {daemon.home}")
+        time.sleep(.05)
+    V67.stop_home_processes(daemon.home, binary)
+    V67.record("daemon_stopped", home=str(daemon.home), election_free=True)
 
 
 # --- call-site artifact -------------------------------------------------
@@ -305,7 +371,7 @@ class Mcp:
         self.proc.stdin.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
 
     def readline(self):
-        end = time.monotonic() + HANG_BACKSTOP
+        end = time.monotonic() + max(0, min(HANG_BACKSTOP, remaining()))
         while b"\n" not in self.buffer:
             wait = end - time.monotonic()
             require(wait > 0 and select.select([self.proc.stdout], [], [], wait)[0],
@@ -356,7 +422,7 @@ class Mcp:
 
 
 def wait_settled(mcp):
-    end = time.monotonic() + HANG_BACKSTOP
+    end = time.monotonic() + max(0, min(HANG_BACKSTOP, remaining()))
     while True:
         envelope, _ = mcp.call("trellis_workspace_describe", {}, catching_up_ok=True)
         if not envelope["catchingUp"]:
@@ -479,9 +545,10 @@ def smoke(binary):
         path = workspace / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    daemon = types.SimpleNamespace(home=home)
-    ok = False
+    daemon = V67.Daemon(binary, home, "smoke")
+    stopped = ok = False
     try:
+        daemon.start()
         r1 = pin_of(V67.command([str(binary), "index", "--workspace", str(workspace)],
                                 env=V67.env_for(home)))
         artifact, pin = V67.import_fixture(binary, workspace, daemon, "smoke", r1)
@@ -493,19 +560,55 @@ def smoke(binary):
             raise RuntimeError("smoke floor accepted a zero-fact input")
         cohort = measure_cohort(binary, home, workspace, pin, "smoke", 1, "perLanguage", True,
                                 ("javascript/Csmoke0010.js", artifact), 0, 3, load_policy())
+        stop_cohort_daemon(daemon, binary)
+        stopped = True
+        require_clean_teardown()
         ok = True
         print("SMOKE_40_RESULT=" + json.dumps(
-            {"pin": pin, "producer": cohort["producer"], "facts": cohort["facts"],
+            {"pin": pin, "unexpectedHomeProcesses": False, "producer": cohort["producer"], "facts": cohort["facts"],
              "coveredRoots": cohort["coveredRoots"],
              "kinds": cohort["kinds"],
              "edgeCounts": {k: cohort["kinds"][k]["edgeCounts"] for k in GRAPH_KINDS}},
             sort_keys=True), flush=True)
     finally:
-        V67.stop_home_processes(home, binary)
-        if ok:
-            shutil.rmtree(scratch, ignore_errors=True)
-        else:
-            print(f"smoke evidence retained at {scratch}", file=sys.stderr, flush=True)
+        try:
+            if not stopped:
+                stop_all([daemon], binary)
+        finally:
+            if ok:
+                shutil.rmtree(scratch, ignore_errors=True)
+            else:
+                print(f"smoke evidence retained at {scratch}", file=sys.stderr, flush=True)
+
+
+def teardown_check(binary):
+    """Untimed: seed and import the medium cohort as --semantic does, then tear it down."""
+    require(binary.exists(), f"missing binary: {binary}")
+    scratch = Path(tempfile.mkdtemp(prefix="trellis-40-teardown-")).resolve()
+    configure_reuse(scratch, DEADLINE)
+    corpus = scratch / "canonical"
+    V67.command(["node", str(GENERATOR), "--out", str(corpus)])
+    workspace, home = CheckoutPath(scratch / "medium-workspace"), scratch / "medium-private-home"
+    home.mkdir(mode=0o700)
+    daemon = V67.Daemon(binary, home, "medium")
+    stopped = False
+    try:
+        daemon.start()
+        pin, _, _, _ = V67.seed_workspace(binary, corpus, workspace, daemon, "medium")
+        mcp = Mcp(binary, workspace, home, scratch / "medium-mcp.stderr.log")
+        try:
+            mcp.handshake()
+            wait_settled(mcp)
+        finally:
+            mcp.stop()
+        stop_cohort_daemon(daemon, binary)
+        stopped = True
+        require_clean_teardown()
+    finally:
+        if not stopped:
+            stop_all([daemon], binary)
+    print("TEARDOWN_40_RESULT=" + json.dumps({"pin": pin, "unexpectedHomeProcesses": False}), flush=True)
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def measure(semantic):
@@ -521,13 +624,14 @@ def measure(semantic):
     require((corpus / "manifest.json").read_bytes() == pinned,
             "generator output does not exactly match pinned manifest bytes/hashes")
     policy, floors = load_policy(), load_floors()
-    sizes, homes = {}, []
+    sizes, live = {}, []
     try:
         for size in ("medium", "large"):
             workspace, home = CheckoutPath(scratch / f"{size}-workspace"), scratch / f"{size}-private-home"
             home.mkdir(mode=0o700)
-            homes.append(home)
-            daemon = types.SimpleNamespace(home=home)
+            daemon = V67.Daemon(RELEASE_BINARY, home, size)
+            live.append(daemon)
+            daemon.start()
             proof = None
             if semantic:
                 pin, artifact, anchor, _ = V67.seed_workspace(RELEASE_BINARY, corpus, workspace, daemon, size)
@@ -542,13 +646,13 @@ def measure(semantic):
                                          semantic, proof, WARMUPS, SAMPLES, policy)
             sizes[size]["anchorPath"] = proof[0] if proof else None
             sizes[size]["artifactSha256"] = proof[1] if proof else None
-            # Stop this cohort's daemon and home processes before the next one is timed.
-            homes.remove(home)
-            V67.stop_home_processes(home, RELEASE_BINARY)
+            # Stop this cohort's daemon before the next one is timed.
+            stop_cohort_daemon(daemon, RELEASE_BINARY)
+            live.remove(daemon)
     finally:
-        # Safety net for an interrupted cohort; stopped homes were already removed.
-        for home in homes:
-            V67.stop_home_processes(home, RELEASE_BINARY)
+        # Interrupted cohorts only: stopped daemons were already removed.
+        stop_all(live, RELEASE_BINARY)
+    require_clean_teardown()
     report = build_report(model, hashlib.sha256(pinned).hexdigest(), semantic, sizes, policy)
     print("REFERENCE_40_RESULT=" + json.dumps(report, sort_keys=True), flush=True)
     if not report["pass"]:
@@ -588,16 +692,23 @@ def build_report(host, manifest_sha, semantic, sizes, policy):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke", action="store_true", help="untimed semantic-path proof")
-    parser.add_argument("--binary", help="trellis binary, required with --smoke")
+    parser.add_argument("--teardown-check", action="store_true",
+                        help="untimed medium-cohort seed, MCP session and teardown; no gates")
+    parser.add_argument("--binary", help="trellis binary, required with --smoke or --teardown-check")
     parser.add_argument("--semantic", action="store_true", help="also measure imported SCIP evidence")
     args = parser.parse_args(argv)
     if args.smoke and args.semantic:
         parser.error("--semantic cannot be combined with --smoke: the smoke always runs the semantic path")
-    if args.smoke != (args.binary is not None):
-        parser.error("--binary is required with --smoke, and only valid with it")
+    if args.teardown_check and (args.smoke or args.semantic):
+        parser.error("--teardown-check cannot be combined with --smoke or --semantic")
+    if (args.smoke or args.teardown_check) != (args.binary is not None):
+        parser.error("--binary is required with --smoke or --teardown-check, and only valid with them")
     try:
         if args.smoke:
             smoke(Path(args.binary).resolve())
+            return 0
+        if args.teardown_check:
+            teardown_check(Path(args.binary).resolve())
             return 0
         return measure(args.semantic)
     except (RuntimeError, subprocess.TimeoutExpired, sqlite3.Error, KeyError) as exc:
