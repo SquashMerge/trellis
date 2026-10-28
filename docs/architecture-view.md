@@ -1,6 +1,7 @@
 # Architecture view
 
-Architecture is a read-only tab in Diagrams. It shows authored layer bands and directed
+Architecture is a tab in Diagrams for reviewing dependencies and authoring reviewed
+exceptions in the checkout. It shows authored layer bands and directed
 **structural references · syntax evidence**, not compiler-resolved calls. A module is one
 indexed file with its full `(sourceSetId, language, path, sid)` identity. Paths are labels,
 not inferred package names or identities.
@@ -14,7 +15,10 @@ layers stay visible. Unassigned modules are explicitly **Unassigned / unknown** 
 the stack; Trellis does not guess membership.
 
 Missing rules or a configuration without layers shows setup help for the existing
-`trellis_propose_layers` MCP prompt. The browser does not call a model or write rules.
+`trellis_propose_layers` MCP prompt. The browser does not call a model. Authoring
+requires an existing valid rules file. Editing or removing authored exceptions does not
+require layers or current matching instances; new layer-pair exceptions require
+positively witnessed production deviations.
 Invalid or ambiguous rules show the located `invalid_rules` diagnostic, including the
 fixed path, line and column, without a partial diagram.
 
@@ -39,6 +43,38 @@ summary edge to inspect its exact contributing module pairs, production/test cou
 verdicts, exceptions and source-site samples. Omitted sample counts stay visible;
 sampling never changes totals. Explicit source actions read cached indexed text at
 the displayed revision. They never fall back to the live file.
+
+## Review and authoring
+
+The review list shows rule instances with source/destination files, layers, production or
+test role, underlying verdict and exception reason. Filters do not change the indexed
+metric population. Evidence remains syntax-tier: captured source-owner identities and
+spellings are not resolved destination-symbol bindings. Site samples and omitted counts
+stay explicit. The Unassigned list includes files with no observed references.
+
+An exception needs a nonblank reason. Select one pair or several witnessed pairs and apply
+one reason in **one preview and one apply**. File-to-layer and glob controls select an
+explicit finite list of current pairs; they do not persist wildcard exceptions or waive
+future files. The portable format remains literal language/path endpoints under #365.
+Unknown destinations and external packages cannot become portable pair exceptions.
+Existing authored exceptions can be edited or removed even when no current pair matches.
+An unassigned file can be assigned to an existing layer by adding its exact path.
+
+Every operation shows the exact prospective `.trellis/rules.toml` diff before confirmation.
+The editor preserves unrelated TOML formatting and comments. Confirm writes those exact
+preview bytes atomically, without a Git commit, restart or index publication. The view
+then checks the new rules against its indexed code pin. MCP remains read-only.
+
+The browser-only checkout routes are `GET architecture/rules`,
+`POST architecture/rules/preview` and `POST architecture/rules/apply`. Existing Bearer,
+Host/Origin, request/response and rules limits apply. Writes are restricted to the fixed
+checkout rules path. Each edit uses the loaded rules hash as well as the complete code pin.
+If the file changed since load, HTTP 409 `rules_conflict` preserves the draft and requires
+reload and a new preview; saving never retries or overwrites silently. Trellis serializes
+its own writes, stages and syncs a temporary file, compares the current original immediately
+before atomic rename, then syncs the parent. This is optimistic conflict detection, not
+an OS transaction against arbitrary external editors in the final compare/rename interval.
+Post-rename durability uncertainty is reported as a changed-file outcome, not “not written.”
 
 ## Metrics
 

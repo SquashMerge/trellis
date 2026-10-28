@@ -118,7 +118,8 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "git", "git/diff", "metrics", "architecture", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  const simple = new Set(["status", "git", "git/diff", "metrics", "architecture", "architecture/rules", "architecture/rules/preview", "architecture/rules/apply", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  if (route === "architecture/rules" && method !== "GET" || ["architecture/rules/preview", "architecture/rules/apply"].includes(route) && method !== "POST") throw new Error("Invalid rules request method.");
   if (route === "syntax-matches" && method !== "POST") throw new Error("Syntax match requests must be POST.");
   if (["git", "git/diff", "metrics", "architecture", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
   const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route);
@@ -157,6 +158,7 @@ async function api(path, method = "GET", body, callerCurrent = () => true) {
     error.status = response.status;
     error.code = data?.error?.code;
     error.reason = data?.error?.reason;
+    error.mutationOutcome = response.headers?.get?.("X-Trellis-Mutation-Outcome") || null;
     if (error.code === "invalid_rules") error.diagnostic = data.error;
     error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
     if (error.status === 401 || error.status === 403) disconnect(`Authentication failed (${error.code || error.status}). Connect with a daemon token again.`);
@@ -1195,7 +1197,7 @@ const treemap = window.TrellisTreemap?.create({
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
 });
 const architecture = window.TrellisArchitecture?.create({
-  request: (path, current) => api(path, "GET", undefined, current),
+  request: (path, current, options = {}) => api(path, options.method || "GET", options.body, current),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   onConflict: () => unexpectedPair("Architecture snapshot changed. Refresh status before reopening Architecture."),

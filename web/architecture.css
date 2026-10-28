@@ -28,3 +28,20 @@
 #architecture-diagram [role="button"] { cursor: pointer; }
 #architecture-diagram [role="button"]:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 #architecture-diagram [role="button"]:hover > rect, #architecture-diagram [role="button"]:focus-visible > rect { stroke: var(--focus); stroke-width: 2; }
+
+#architecture-review-panel { flex: none; max-height: 52vh; overflow: auto; border-block: 1px solid var(--line); }
+#architecture-review-panel[hidden], #architecture-editor[hidden], #architecture-preview-result[hidden] { display: none; }
+.architecture-review-list, #architecture-exceptions { padding: 0 18px; }
+.architecture-rule-row { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.architecture-rule-row p { margin: 4px 0; }
+.architecture-rule-row button { text-align: left; overflow-wrap: anywhere; white-space: normal; }
+.architecture-rule-row input[type="checkbox"] { margin-right: 8px; }
+.architecture-rule-row label { margin-inline: 8px; }
+#architecture-source-glob { width: 150px; }
+#architecture-editor { padding: 0 18px 14px; font-size: 12px; }
+#architecture-edit-scope, #architecture-preview-result pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+#architecture-editor textarea { display: block; width: 100%; box-sizing: border-box; margin: 6px 0; background: var(--surface); color: var(--ink); border: 1px solid var(--sm-control); font: inherit; padding: 8px; }
+#architecture-editor .architecture-controls { padding: 4px 0; }
+#architecture-edit-state[data-state="error"] { color: var(--error); }
+#architecture-confirm { min-height: 44px; background: var(--primary); color: var(--sm-ink); }
+#architecture-preview-result pre { max-height: 30vh; overflow: auto; font-size: 12px; }
