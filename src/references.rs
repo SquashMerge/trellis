@@ -539,24 +539,42 @@ fn map_batch<T: Sync, R: Send>(
         .collect()
 }
 
-/// Map every item in one parallel pass. After a failure no later item
-/// starts; items are claimed in input order, so every earlier item has already
-/// started and completes, and the error returned is the first in input order.
+/// Map every item in one parallel pass. After a failure no later item starts;
+/// every earlier item still runs, so the error returned is the first in input
+/// order whatever the schedule.
 fn map_all<T: Sync, R: Send>(
     items: &[T],
     workers: usize,
     request: &parallel_check::RequestCheck<'_>,
     f: impl Fn(&T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
+    map_all_hooked(items, workers, request, &|_| {}, &|_| {}, f)
+}
+
+/// `map_all` with test hooks: `entered` runs after an index is claimed and
+/// before it may be skipped; `failed` runs after a failure is recorded.
+fn map_all_hooked<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    request: &parallel_check::RequestCheck<'_>,
+    entered: &(dyn Fn(usize) + Sync),
+    failed: &(dyn Fn(usize) + Sync),
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
     request.check()?;
-    let failed = std::sync::atomic::AtomicBool::new(false);
-    let results = crate::parallel::map_ordered(items, workers, &request.stopped, |_, item| {
-        if failed.load(std::sync::atomic::Ordering::Acquire) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Lowest failed index so far. Only items after it are skipped, so a skipped
+    // slot always follows an actual error in input order.
+    let first_failure = AtomicUsize::new(usize::MAX);
+    let results = crate::parallel::map_ordered(items, workers, &request.stopped, |index, item| {
+        entered(index);
+        if index > first_failure.load(Ordering::Acquire) {
             return None;
         }
         let result = f(item);
         if result.is_err() {
-            failed.store(true, std::sync::atomic::Ordering::Release);
+            first_failure.fetch_min(index, Ordering::AcqRel);
+            failed(index);
         }
         Some(result)
     });
@@ -1092,6 +1110,49 @@ mod parallel_tests {
         assert_eq!(started, vec![0, 1]);
         let all = map_all(&[0usize, 1, 2, 3], 2, &request, |&index| Ok(index * 10));
         assert_eq!(all.unwrap(), vec![0, 10, 20, 30]);
+    }
+
+    /// An earlier index claimed before a later failure, but not yet past the
+    /// skip check, still runs: the later typed failure is never masked.
+    #[test]
+    fn a_claimed_earlier_item_runs_after_a_later_typed_failure() {
+        for message in [
+            "invalid_source_syntax",
+            "bounded_work: reference owner lookup",
+        ] {
+            let mut check = || Ok(());
+            let request = parallel_check::RequestCheck::new(&mut check);
+            let (failed_tx, failed_rx) = std::sync::mpsc::channel();
+            let failed_rx = Mutex::new(failed_rx);
+            let entered = |index: usize| {
+                if index == 0 {
+                    failed_rx.lock().unwrap().recv().unwrap();
+                }
+            };
+            let failed = |index: usize| {
+                if index == 1 {
+                    failed_tx.send(()).unwrap();
+                }
+            };
+            let ran = Mutex::new(Vec::new());
+            let result = map_all_hooked(
+                &[0usize, 1, 2],
+                2,
+                &request,
+                &entered,
+                &failed,
+                |&index| -> Result<usize> {
+                    ran.lock().unwrap().push(index);
+                    anyhow::ensure!(index != 1, "{message}");
+                    Ok(index)
+                },
+            );
+            assert_eq!(result.unwrap_err().to_string(), message);
+            let mut ran = ran.into_inner().unwrap();
+            ran.sort();
+            assert_eq!(ran, vec![0, 1]);
+            assert!(request.result(Ok(())).is_ok());
+        }
     }
 
     #[test]

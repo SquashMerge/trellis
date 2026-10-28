@@ -1677,7 +1677,7 @@ impl EvidenceResponse {
             pending.push((key, std::sync::Mutex::new(Some(fetched))));
         }
         // SQLite reads stay on this connection; decoding needs no connection, so
-        // it runs in parallel. The first failure in document order is reported.
+        // it runs in parallel. The first decode failure in document order is reported.
         {
             let stopped = std::sync::atomic::AtomicBool::new(false);
             let progress_failure = Mutex::new(None);
