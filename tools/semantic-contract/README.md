@@ -158,3 +158,37 @@ family gap makes native coverage partial with a diagnostic without erasing
 supported/observed roles. It does not by itself falsify complete semantic producer
 coverage. Production reports must be complete and native intents must mirror them;
 missing reports and authored overrides fail closed.
+
+
+## Synthetic SCIP for the combined performance gate (#61)
+
+```sh
+node tools/synthetic-cohorts/generate.mjs --out /fresh/cohort --size large
+python3 tools/semantic-contract/generate-performance-scip.py \
+  --cohort /fresh/cohort --size large --out /fresh/scip
+python3 -m unittest discover -s tools/semantic-contract/test -p 'test_*.py'
+```
+
+The generator verifies the cohort against the checked-in `manifest-v2.json`
+(bytes, lengths and SHA-256 hashes) and writes `<language>.scip` for the four
+languages plus `inventory.json`. Document paths are relative to the size
+directory (`java/Clarge0000.java`), so they match the captured source root.
+The artifacts are deterministic synthetic SCIP: `tool_info` is
+`trellis-synthetic-scip` version `1`, positions are UTF-8, there is no project
+root and no relationships. Each callable gets a definition and
+SymbolInformation, and each body gets at most two provable direct calls.
+
+The producer identity is the generator's source SHA-256, pinned by
+`docs/semantic-evidence/synthetic-profiles/trellis-synthetic-scip-v1.json`
+(`identityKind: generatorSource`). It is not a real producer executable and
+nothing here qualifies one. Editing the generator changes that SHA: regenerate
+the profile and `docs/semantic-evidence/performance-gate-preparation.json`
+(`test_profile_pins_generator_source_sha256` fails on drift).
+
+The generator writes no descriptor or pages. `semantic_batch.py` is the importable
+batch emitter the runner uses after probing the workspace:
+`write_batch(out_dir, header, sources, coverage, artifacts)` writes the source and
+coverage pages (a page closes before the next row would exceed 1,000 rows or
+1 MiB), any inline artifacts and `descriptor.json`, and returns the descriptor path
+and SHA-256. `canonical`, `source_manifest_hash` and `DESCRIPTOR_KEYS` are shared
+with the runner and its tests.

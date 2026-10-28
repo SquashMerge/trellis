@@ -7,6 +7,10 @@ node tools/synthetic-cohorts/generate.mjs --out /tmp/trellis-cohorts
 node --test tools/synthetic-cohorts/test/cohorts.test.mjs
 ```
 
+Pass `--size small|medium|large` to write only that size. Its files are
+byte-identical to the full run, and `manifest.json` lists only that size's
+totals and files. Without `--size` the output is unchanged.
+
 The destination must not exist. The pinned `manifest-v2.json` records every source
 path, byte length and SHA-256 hash. Manifest version 2 replaces only the LARGE
 source cohort; the seed and SMALL/MEDIUM source bytes stay unchanged. Earlier
