@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Class view</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="width: 1200px; height: 800px; box-sizing: border-box; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column; overflow: hidden">
+
+<div style="display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Trellis</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">squashmerge/trellis ⎇ main</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">rev 412</span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">Mermaid → Pele 1.6.0</span>
+</div>
+<nav aria-label="Diagram views" style="display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Architecture.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Class</a>
+<a href="Libraries.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Libraries</a>
+<a href="C4.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">C4</a>
+</nav>
+
+<div style="flex: 1; display: flex; min-height: 0">
+<section aria-labelledby="cl-h" style="flex: 1; min-width: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 12px">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px">
+<h2 id="cl-h" style="margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 400">WatcherWitness · 1 hop</h2>
+<span style="padding: 4px 8px; border: 1px solid #777A8E; border-radius: 8px; font-size: 12px; color: #F7F7FB">Measured declarations</span>
+<span style="font-size: 12px; color: #B8BAC8">Relations are scoped syntax candidates, not compiler-resolved</span>
+</div>
+<div style="position: relative; width: 860px; height: 620px">
+<sc-for list="{{groups}}" as="g" hint-placeholder-count="4">
+<div style="position: absolute; left: {{g.x}}px; top: {{g.y}}px; width: {{g.w}}px; height: {{g.h}}px; box-sizing: border-box; border: 1px dashed #777A8E; border-radius: 12px"></div>
+<div style="position: absolute; left: {{g.lx}}px; top: {{g.ly}}px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{g.name}}</div>
+</sc-for>
+<sc-for list="{{edges}}" as="e" hint-placeholder-count="4">
+<svg width="860" height="620" viewBox="0 0 860 620" aria-hidden="true" style="position: absolute; left: 0; top: 0; pointer-events: none"><path d="{{e.d}}" fill="none" stroke="{{e.color}}" stroke-width="1.6" stroke-dasharray="{{e.dash}}"></path><polygon points="{{e.arrow}}" fill="{{e.color}}"></polygon></svg>
+<div style="position: absolute; left: {{e.lx}}px; top: {{e.ly}}px; padding: 1px 8px; border-radius: 4px; background: #0B0C10; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: {{e.color}}">{{e.label}}</div>
+</sc-for>
+<sc-for list="{{nodes}}" as="n" hint-placeholder-count="6">
+<button onClick="{{n.pick}}" aria-pressed="{{n.pressed}}" style="position: absolute; left: {{n.x}}px; top: {{n.y}}px; width: {{n.w}}px; box-sizing: border-box; padding: 0; border-radius: 8px; border: 1.5px solid {{n.border}}; background: #1D1E2A; color: #F7F7FB; font: inherit; text-align: left; cursor: pointer; overflow: hidden">
+<span style="display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: {{n.headBg}}; color: {{n.headColor}}; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 400"><span>{{n.name}}</span><span style="font-size: 12px; font-weight: 600">{{n.kind}}</span></span>
+<sc-for list="{{n.rows}}" as="r" hint-placeholder-count="3"><span style="display: block; padding: 1px 12px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 16px; color: {{r.color}}; white-space: nowrap">{{r.text}}</span></sc-for>
+<span style="display: block; height: 6px"></span>
+</button>
+</sc-for>
+</div>
+</section>
+
+<aside aria-labelledby="ci-h" style="width: 300px; flex: none; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 12px">
+<h2 id="ci-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">{{sel.name}}</h2>
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #ABA5FF; text-decoration: underline">{{sel.loc}}</div>
+<p style="margin: 0; font-size: 12px; color: #B8BAC8; line-height: 1.5">{{sel.note}}</p>
+<div style="font-size: 12px; color: #B8BAC8">Related · expand one hop</div>
+<sc-for list="{{related}}" as="r" hint-placeholder-count="3">
+<button onClick="{{r.pick}}" style="display: flex; justify-content: space-between; min-height: 32px; align-items: center; padding: 0 8px; border-radius: 8px; border: 1px solid #777A8E; background: #1D1E2A; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer"><span style="font-family: 'JetBrains Mono', monospace">{{r.name}}</span><span style="color: {{r.color}}">{{r.rel}}</span></button>
+</sc-for>
+<div style="margin-top: auto; display: flex; flex-direction: column; gap: 8px">
+<button style="min-height: 40px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 13px; cursor: pointer">Read declaration</button>
+<a href="Handoff.dc.html" style="display: flex; align-items: center; justify-content: center; min-height: 44px; border-radius: 8px; background: #FFAA10; color: #0B0C10; text-decoration: none; font-weight: 600; font-size: 13px">Edit as proposal</a>
+</div>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1200,"height":800}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { sel: 'WatcherWitness' }; }
+  renderVals() {
+    const groups = [
+      { name: 'mod model · Shared', x: 20, y: 20, w: 290, h: 560 },
+      { name: 'mod watch · Indexing', x: 340, y: 20, w: 290, h: 350 },
+      { name: 'mod native_evidence · Indexing', x: 340, y: 400, w: 290, h: 180 },
+      { name: 'mod http · Entry', x: 660, y: 20, w: 190, h: 160 }
+    ].map(g => ({ ...g, lx: g.x + 12, ly: g.y + 10 }));
+    const N = [
+      { id: 'IndexStatus', kind: 'struct', x: 36, y: 56, w: 258, rows: ['+workspace_root: String', '+catching_up: bool', '+revision: IndexPin', '+indexed_at: Option<String>', '+evidence_format: Option<String>', '+stats: IndexStats', '+diagnostics: Vec<Diagnostic>', '+watcher: Option<WatcherWitness>'], loc: 'src/model.rs:214', note: 'Status DTO served to the browser and MCP describe.' },
+      { id: 'DurableAnchor', kind: 'struct', x: 36, y: 330, w: 258, rows: ['+syntax_id: String', '+document: DocumentKey', '+captured_revision_id: String', '+header_hash: String', '+sibling_group_hash: String', '+sibling_count: usize', '+identical_header_count: usize'], loc: 'src/model.rs:314', note: 'Pins saved views and notes to a declaration across revisions.' },
+      { id: 'WatcherHealth', kind: 'struct', x: 356, y: 56, w: 258, rows: ['−state: AtomicU64', '−degradations: AtomicU64', '+degraded() bool', '+witness() WatcherWitness', '+reset()'], loc: 'src/watch.rs:27', note: 'Health shared by every watcher one owner creates, read without a lock.' },
+      { id: 'WatcherWitness', kind: 'struct · Copy', x: 356, y: 236, w: 258, rows: ['+epoch: u64', '+native: bool', '+degraded: bool', '+degradations: u64'], loc: 'src/watch.rs:47', note: 'One coherent reading of watcher health, for measurement (Decision 0009 §5).' },
+      { id: 'DocumentKey', kind: 'struct', x: 356, y: 436, w: 258, rows: ['+source_set_id: String', '+language: String', '+path: String'], loc: 'src/native_evidence.rs:292', note: 'Identity of an indexed document within a source set.' },
+      { id: 'checkout_watcher_witness', kind: 'fn', x: 672, y: 56, w: 166, rows: ['() WatcherWitness'], loc: 'src/http.rs:720', note: 'Serving-side accessor for the checkout worker’s watcher reading.' }
+    ];
+    const sel = this.state.sel;
+    const rel = { WatcherWitness: ['IndexStatus', 'WatcherHealth', 'checkout_watcher_witness'], IndexStatus: ['WatcherWitness'], DurableAnchor: ['DocumentKey'], WatcherHealth: ['WatcherWitness'], DocumentKey: ['DurableAnchor'], checkout_watcher_witness: ['WatcherWitness'] };
+    const nodes = N.map(n => {
+      const on = n.id === sel;
+      const near = (rel[sel] || []).includes(n.id);
+      return { ...n, name: n.id, rows: n.rows.map(t => ({ text: t, color: t.includes('WatcherWitness') || t.includes('DocumentKey') ? '#ABA5FF' : '#F7F7FB' })),
+        border: on ? '#7770DC' : near ? '#ABA5FF' : '#777A8E', headBg: on ? '#7770DC' : '#343644', headColor: on ? '#0B0C10' : '#F7F7FB', pressed: on ? 'true' : 'false', pick: () => this.setState({ sel: n.id }) };
+    });
+    const E = [
+      { d: 'M294 204 C326 204 326 290 352 290', arrow: '345,286 353,290 345,294', color: '#FF8E9A', dash: 'none', label: 'watcher · model → watch ↑', lx: 40, ly: 230 },
+      { d: 'M294 382 C326 382 326 480 352 480', arrow: '345,476 353,480 345,484', color: '#FF8E9A', dash: 'none', label: 'document · model → indexing ↑', lx: 40, ly: 492 },
+      { d: 'M485 172 L485 230', arrow: '481,224 485,232 489,224', color: '#F7F7FB', dash: '4 3', label: 'witness() returns', lx: 494, ly: 200 },
+      { d: 'M755 92 C755 160 680 270 618 270', arrow: '625,266 617,270 625,274', color: '#F7F7FB', dash: '4 3', label: 'returns · entry → watch', lx: 650, ly: 196 }
+    ];
+    const sn = N.find(n => n.id === sel) || N[3];
+    const related = (rel[sel] || []).map(id => {
+      const up = (sel === 'IndexStatus' && id === 'WatcherWitness') || (sel === 'DurableAnchor' && id === 'DocumentKey') || (id === 'IndexStatus' && sel === 'WatcherWitness') || (id === 'DurableAnchor' && sel === 'DocumentKey');
+      return { name: id, rel: up ? 'upward ref' : 'reference', color: up ? '#FF8E9A' : '#B8BAC8', pick: () => this.setState({ sel: id }) };
+    });
+    return { groups, nodes, edges: E, sel: { name: sn.id, loc: sn.loc, note: sn.note }, related };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Treemap view</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="width: 1200px; height: 800px; box-sizing: border-box; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column; overflow: hidden">
+
+<div style="display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Trellis</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">squashmerge/trellis ⎇ main</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">0acaba1</span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">Mermaid treemap-beta → Pele 1.6.0</span>
+</div>
+<nav aria-label="Diagram views" style="display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Architecture.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Architecture</a>
+<a href="Treemap.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Class</a>
+<a href="Libraries.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Libraries</a>
+<a href="C4.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">C4</a>
+</nav>
+
+<div role="toolbar" aria-label="Color by complexity" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid #777A8E">
+<span style="font-size: 12px; color: #B8BAC8">Area: lines · Color by</span>
+<div role="group" aria-label="Metric" style="display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{metrics}}" as="m" hint-placeholder-count="7">
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" style="min-height: 28px; padding: 0 9px; border-radius: 8px; border: 0; background: {{m.bg}}; color: {{m.color}}; font: inherit; font-size: 12px; cursor: pointer">{{m.label}}</button>
+</sc-for>
+</div>
+<div role="group" aria-label="Aggregation" style="display: flex; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{aggs}}" as="a" hint-placeholder-count="3">
+<button onClick="{{a.pick}}" aria-pressed="{{a.pressed}}" disabled="{{a.disabled}}" style="min-height: 28px; padding: 0 9px; border-radius: 8px; border: 0; background: {{a.bg}}; color: {{a.color}}; font: inherit; font-size: 12px; cursor: {{a.cursor}}">{{a.label}}</button>
+</sc-for>
+</div>
+<label style="margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; color: #F7F7FB; cursor: pointer"><input type="checkbox" checked="{{hideTests}}" onChange="{{toggleTests}}"> Hide test files</label>
+</div>
+
+<div style="flex: 1; display: flex; min-height: 0">
+<section aria-labelledby="tm-h" style="flex: 1; min-width: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px">
+<h2 id="tm-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">{{title}}</h2>
+<div style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: #B8BAC8">
+<span>{{legendLow}}</span>
+<sc-for list="{{legend}}" as="l" hint-placeholder-count="5"><span title="{{l.range}}" style="width: 26px; height: 10px; border-radius: 4px; background: {{l.c}}; border: 1px {{l.bstyle}} {{l.border}}; box-sizing: border-box"></span></sc-for>
+<span>{{legendHigh}}</span>
+</div>
+<span style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #B8BAC8"><span aria-hidden="true" style="width: 14px; height: 10px; border-radius: 4px; border: 1px dashed #F7F7FB; box-sizing: border-box"></span>test file</span>
+</div>
+<div style="position: relative; width: 860px; height: 580px; border-radius: 12px; overflow: hidden; background: #0B0C10">
+<sc-for list="{{sections}}" as="s" hint-placeholder-count="7">
+<div style="position: absolute; left: {{s.x}}px; top: {{s.y}}px; width: {{s.w}}px; height: {{s.h}}px; box-sizing: border-box; border: 1px solid #777A8E; border-radius: 8px; background: #14151D; padding: 4px 8px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB; overflow: hidden; white-space: nowrap">{{s.label}}</div>
+</sc-for>
+<sc-for list="{{tiles}}" as="t" hint-placeholder-count="40">
+<button onClick="{{t.pick}}" title="{{t.tip}}" aria-label="{{t.tip}}" style="position: absolute; left: {{t.x}}px; top: {{t.y}}px; width: {{t.w}}px; height: {{t.h}}px; box-sizing: border-box; padding: 4px 8px; border-radius: 4px; border: {{t.bw}}px {{t.bstyle}} {{t.border}}; background: {{t.bg}}; color: {{t.fg}}; font: inherit; text-align: left; cursor: pointer; overflow: hidden; display: block">
+<sc-if value="{{t.showLabel}}" hint-placeholder-val="{{true}}"><span style="display: block; font-family: 'JetBrains Mono', monospace; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{t.name}}</span><span style="display: block; font-size: 12px; color: {{t.fg}}">{{t.val}}</span></sc-if>
+</button>
+</sc-for>
+</div>
+</section>
+
+<aside aria-labelledby="tmi-h" style="width: 300px; flex: none; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 8px">
+<h2 id="tmi-h" style="margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 400; word-break: break-all">{{sel.path}}</h2>
+<div style="display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; color: #B8BAC8"><span>{{sel.lines}} lines</span><span>· {{sel.n}} callables</span><span>· {{sel.kind}}</span></div>
+<sc-for list="{{sel.rows}}" as="r" hint-placeholder-count="8">
+<div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 8px; background: {{r.bg}}; font-size: 12px"><span style="color: #F7F7FB">{{r.label}}</span><span style="display: flex; align-items: center; gap: 8px; font-family: 'JetBrains Mono', monospace"><span style="width: 10px; height: 10px; border-radius: 4px; background: {{r.c}}"></span>{{r.v}}</span></div>
+</sc-for>
+<div style="margin-top: auto; font-size: 12px; color: #B8BAC8; line-height: 1.5">Metric names follow Trellis metrics:v1 (sum, max and mean over a file's callables). Values are an approximate scan at 0acaba1. Colors are quartiles of the files shown, on the brand's warm gold-to-orange range; “—” means no callables were measured.</div>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"defaultMetric":{"editor":"enum","options":["testSplit","cyclomatic","cognitive","maxNesting","maintainabilityIndex","halsteadVolume","fanOut"],"default":"cognitive"},"$preview":{"width":1200,"height":800}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { sel: 'src/store.rs', hide: false, metric: null, agg: 'max' }; }
+  squarify(items, x, y, w, h) {
+    const total = items.reduce((s, i) => s + i.v, 0);
+    if (!total || w <= 0 || h <= 0) return [];
+    const k = (w * h) / total;
+    const rest = items.map(i => ({ ...i, a: i.v * k }));
+    const out = []; let r = { x, y, w, h }; let row = [];
+    const worst = (rw, side) => { const s = rw.reduce((t, i) => t + i.a, 0); const mx = Math.max(...rw.map(i => i.a)); const mn = Math.min(...rw.map(i => i.a)); return Math.max(side * side * mx / (s * s), (s * s) / (side * side * mn)); };
+    const lay = (rw) => {
+      const s = rw.reduce((t, i) => t + i.a, 0);
+      if (r.w >= r.h) { const cw = s / r.h; let cy = r.y; rw.forEach(i => { const ih = i.a / cw; out.push({ ...i, x: r.x, y: cy, w: cw, h: ih }); cy += ih; }); r = { x: r.x + cw, y: r.y, w: r.w - cw, h: r.h }; }
+      else { const rh = s / r.w; let cx = r.x; rw.forEach(i => { const iw = i.a / rh; out.push({ ...i, x: cx, y: r.y, w: iw, h: rh }); cx += iw; }); r = { x: r.x, y: r.y + rh, w: r.w, h: r.h - rh }; }
+    };
+    while (rest.length) { const side = Math.min(r.w, r.h); const c = rest[0]; if (!row.length || worst([...row, c], side) <= worst(row, side)) { row.push(c); rest.shift(); } else { lay(row); row = []; } }
+    if (row.length) lay(row);
+    return out;
+  }
+  renderVals() {
+    const hide = this.state.hide;
+    const metric = this.state.metric ?? this.props.defaultMetric ?? 'cognitive';
+    // items: [name, lines, callables, cycSum, cycMax, cogSum, cogMax, nestMax, miMean, halsteadVolumeSum, fanOutSum]; rest: [files, lines, callables, …]
+    const T = {"src":{"total":45277,"files":40,"items":[["store.rs",14160,438,1821,86,1492,110,5,60.5,317450,6242],["http.rs",5194,38,338,179,314,189,4,56.2,85666,1198],["native_evidence.rs",4499,106,505,91,368,80,5,55.6,99440,2220],["indexer.rs",1959,55,415,58,382,51,5,52.5,52387,1047],["main.rs",1797,18,88,25,76,30,5,54.7,23622,465],["classes.rs",1651,46,252,30,379,71,7,56.0,32854,656],["index_coordinator.rs",1492,64,216,37,165,59,4,64.1,32387,631],["capture.rs",1456,53,185,18,163,27,3,59.7,28760,853],["watch.rs",1266,35,87,16,62,23,3,64.0,10926,344],["metrics.rs",1108,28,182,72,215,117,4,59.9,20847,399],["live_jev.rs",886,15,26,5,17,7,2,55.2,11295,407],["dependency_rust.rs",879,0,0,0,0,0,0,null,0,0],["acp.rs",834,33,80,9,51,10,3,59.3,17521,547],["behavior_python.rs",803,5,23,18,29,28,2,64.5,9494,31],["behavior_rust.rs",741,33,172,39,183,29,6,60.1,15824,378],["model.rs",655,31,69,14,26,8,1,69.1,4203,156],["behavior_js.rs",645,20,128,38,146,38,5,58.9,13161,290],["behavior_java.rs",581,22,126,33,138,43,4,59.0,13254,290],["navigation.rs",503,17,78,13,55,12,2,55.6,9181,209],["native_ids.rs",496,27,73,12,48,14,3,63.0,7636,284],["planning.rs",468,12,46,17,40,21,4,57.9,9162,220],["indexer_projection_vectors_tests.rs",383,6,16,9,22,20,4,48.2,10946,295],["behavior_bindings.rs",380,10,84,43,133,95,9,57.4,5071,157],["extractor_inputs_tests.rs",373,9,24,13,22,19,2,64.6,3763,72],["dependency_rust_symbols.rs",339,8,63,27,57,22,3,52.8,6249,148],["indexer_rust.rs",309,7,32,15,21,17,2,52.4,6595,189],["file_tree.rs",304,6,37,16,37,23,3,51.3,6305,107]],"rest":[13,1116,38,131,10,78,10,3,60.0,16845,442]},"src/store":{"total":15239,"files":29,"items":[["mcp_read.rs",3105,54,381,90,347,134,4,50.7,72401,1450],["topology.rs",2840,148,448,32,366,55,6,65.2,60021,1743],["rebaseline_fault_tests.rs",1920,28,125,24,86,22,3,43.3,55947,1566],["requests.rs",1687,60,297,23,239,30,4,58.9,32345,823],["sqlite_schema_race_tests.rs",705,15,32,5,16,3,1,44.5,17427,495],["symbol_trigrams.rs",496,20,44,5,28,5,2,60.5,7287,249],["requests/foreign_root_settlement_tests.rs",496,13,20,2,7,1,1,47.9,11049,462],["sqlite_contention_type_tests.rs",460,20,46,5,27,5,2,54.0,11238,403],["selected_manifest_query_plan_tests.rs",408,8,18,4,10,3,1,44.1,11420,407],["corruption_recovery_tests.rs",402,16,39,7,21,6,2,53.6,8874,318],["sqlite_deleted_witness_tests.rs",387,9,26,8,22,10,2,48.1,12239,379],["preflight_hash_reuse_tests.rs",340,12,21,6,6,3,2,55.4,7727,257]],"rest":[17,1993,76,174,14,91,15,2,55.4,45173,1549]},"src/mcp":{"total":6528,"files":7,"items":[["mod.rs",1927,44,295,91,385,183,5,59.1,44389,762],["projection.rs",1719,39,163,33,137,32,3,48.1,46741,1003],["tools.rs",861,30,138,29,82,24,2,63.6,12391,277],["session.rs",812,46,126,25,115,35,4,66.0,15417,467],["wire.rs",515,14,47,12,50,14,3,56.3,9988,278],["find_trigram_tests.rs",362,6,31,12,40,19,4,40.7,10059,297],["catalog.rs",332,10,44,19,46,24,3,59.7,6214,162]],"rest":[0,0,0,0,0,0,0,0,null,0,0]},"src/http":{"total":5861,"files":10,"items":[["exceptional_recovery_tests.rs",2403,14,58,21,64,35,4,41.6,35527,848],["serving_holder_tests.rs",977,10,21,4,11,3,1,47.6,18135,541],["worker.rs",866,49,168,14,103,13,3,65.2,12371,362],["live_tests.rs",564,14,32,8,21,10,1,61.9,9617,204]],"rest":[6,1051,21,57,15,64,32,3,50.5,26747,745]},"src/daemon":{"total":5627,"files":5,"items":[["registry.rs",2412,117,420,53,307,50,4,63.6,42491,1053],["client.rs",2182,71,360,33,420,32,4,54.3,46705,1007],["mod.rs",456,17,70,14,51,13,2,58.8,8750,195],["causal_witness.rs",389,17,31,5,20,8,2,59.7,5614,158]],"rest":[1,188,12,28,7,24,11,3,61.9,3063,81]},"web":{"total":3231,"files":6,"items":[["app.js",1838,17,205,36,192,44,3,57.2,97960,110],["classes.js",439,6,23,7,20,8,2,66.2,8546,25],["sequence.js",302,3,45,24,46,34,0,61.8,12437,15]],"rest":[3,652,32,355,41,263,37,2,59.9,22214,355]},"src/index_coordinator":{"total":1520,"files":3,"items":[["tests.rs",988,19,53,10,29,6,2,42.6,31211,1044],["queue_completion_retry_tests.rs",509,15,23,5,13,8,2,48.5,14605,486]],"rest":[1,23,1,1,1,0,0,0,51.3,657,25]}};
+    const MET = {
+      testSplit: { label: 'Prod / test', aggs: [] },
+      cyclomatic: { label: 'Cyclomatic', aggs: ['max', 'sum', 'mean'] },
+      cognitive: { label: 'Cognitive', aggs: ['max', 'sum', 'mean'] },
+      maxNesting: { label: 'Max nesting', aggs: ['max'] },
+      maintainabilityIndex: { label: 'Maintainability', aggs: ['mean'], invert: true },
+      halsteadVolume: { label: 'Halstead volume', aggs: ['sum', 'mean'] },
+      fanOut: { label: 'Fan-out', aggs: ['sum', 'mean'] }
+    };
+    const m = MET[metric];
+    const agg = m.aggs.includes(this.state.agg) ? this.state.agg : (m.aggs[0] || 'max');
+    const value = (r, met, ag) => {
+      const n = r.n; if (!n) return null;
+      if (met === 'cyclomatic') return ag === 'max' ? r.cycMax : ag === 'sum' ? r.cycSum : r.cycSum / n;
+      if (met === 'cognitive') return ag === 'max' ? r.cogMax : ag === 'sum' ? r.cogSum : r.cogSum / n;
+      if (met === 'maxNesting') return r.nest;
+      if (met === 'maintainabilityIndex') return r.mi;
+      if (met === 'halsteadVolume') return ag === 'sum' ? r.vol : r.vol / n;
+      if (met === 'fanOut') return ag === 'sum' ? r.fo : r.fo / n;
+      return null;
+    };
+    const fmt = (v) => v == null ? '—' : v >= 10000 ? Math.round(v / 1000) + 'k' : v >= 1000 ? (v / 1000).toFixed(1) + 'k' : (Number.isInteger(v) ? String(v) : v.toFixed(1));
+    const isTest = (n) => /(^|_)tests?\.rs$/.test(n.split('/').pop());
+    const rec = (dir, a, other) => ({ path: dir + '/' + (other ? '…' : a[0]), name: other ? a[0] + ' smaller files' : a[0], lines: a[1], n: a[2], cycSum: a[3], cycMax: a[4], cogSum: a[5], cogMax: a[6], nest: a[7], mi: a[8], vol: a[9], fo: a[10], test: !other && isTest(a[0]), other: !!other });
+    const folders = Object.keys(T).map(dir => {
+      const f = T[dir];
+      const leaves = f.items.map(a => rec(dir, a));
+      if (f.rest[0] > 0) leaves.push(rec(dir, [f.rest[0]].concat(f.rest.slice(1)), true));
+      return { dir, leaves: leaves.filter(l => !(hide && l.test)) };
+    });
+    const all = folders.flatMap(f => f.leaves);
+    const SCALE = ['#343644', '#FFC20A', '#FFAA10', '#FF7A00']; const fgOn = (c) => (c === '#FFC20A' || c === '#FFAA10' || c === '#FF7A00') ? '#0B0C10' : '#F7F7FB';
+    const vals = all.map(l => value(l, metric, agg)).filter(v => v != null).sort((a, b) => a - b);
+    const q = (p) => vals.length ? vals[Math.min(vals.length - 1, Math.floor(p * vals.length))] : 0;
+    const cuts = [q(0.25), q(0.5), q(0.75)];
+    const colorOf = (v) => { if (v == null) return '#1D1E2A'; const b = cuts.filter(c => v > c).length; return SCALE[m.invert ? 3 - b : b]; };
+    const W = 860, H = 580, strip = 18;
+    const sections = [], tiles = [];
+    const selPath = this.state.sel;
+    const secItems = folders.map(f => ({ f, v: f.leaves.reduce((s, l) => s + l.lines, 0) })).sort((a, b) => b.v - a.v);
+    this.squarify(secItems, 0, 0, W, H).forEach(r => {
+      sections.push({ x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2, label: r.f.dir + '/ · ' + r.v.toLocaleString('en-US') + ' lines' });
+      const leaves = [...r.f.leaves].sort((a, b) => b.lines - a.lines);
+      this.squarify(leaves.map(l => ({ l, v: l.lines })), r.x + 4, r.y + strip + 2, Math.max(0, r.w - 8), Math.max(0, r.h - strip - 6)).forEach(t => {
+        const l = t.l, on = l.path === selPath;
+        const v = value(l, metric, agg);
+        const split = metric === 'testSplit';
+        const bg = split ? (on ? '#7770DC' : l.test ? '#14151D' : l.other ? '#1D1E2A' : '#343644') : colorOf(v);
+        tiles.push({ fg: split ? (on ? '#0B0C10' : '#F7F7FB') : fgOn(bg), x: t.x + 1, y: t.y + 1, w: Math.max(0, t.w - 2), h: Math.max(0, t.h - 2), name: l.name, val: split ? l.lines.toLocaleString('en-US') + ' lines' : (m.label + ' ' + fmt(v)),
+          tip: l.path + ' · ' + l.lines + ' lines' + (split ? '' : ' · ' + m.label + ' ' + agg + ' ' + fmt(v)) + (l.test ? ' · test file' : ''),
+          showLabel: t.w > 70 && t.h > 30, bg, border: on ? '#ABA5FF' : l.test ? '#F7F7FB' : (split ? '#ABA5FF' : '#0B0C10'), bstyle: l.test && !on ? 'dashed' : 'solid', bw: on ? 3 : 1, pick: () => this.setState({ sel: l.path }) });
+      });
+    });
+    const s = all.find(a => a.path === selPath) || all[0];
+    const rowsDef = [['Cyclomatic · max', 'cyclomatic', 'max'], ['Cyclomatic · sum', 'cyclomatic', 'sum'], ['Cognitive · max', 'cognitive', 'max'], ['Cognitive · sum', 'cognitive', 'sum'], ['Max nesting', 'maxNesting', 'max'], ['Maintainability · mean', 'maintainabilityIndex', 'mean'], ['Halstead volume · sum', 'halsteadVolume', 'sum'], ['Fan-out · sum', 'fanOut', 'sum']];
+    const sel = { path: s.path, lines: s.lines.toLocaleString('en-US'), n: s.n, kind: s.test ? 'test file' : s.other ? 'grouped' : 'production',
+      rows: rowsDef.map(([label, met, ag]) => { const v = value(s, met, ag); const active = met === metric && ag === agg; return { label, v: fmt(v), c: active ? colorOf(v) : 'transparent', bg: active ? '#1D1E2A' : 'transparent' }; }) };
+    const metrics = Object.keys(MET).map(k => ({ label: MET[k].label, pressed: metric === k ? 'true' : 'false', bg: metric === k ? '#1D1E2A' : 'transparent', color: metric === k ? '#F7F7FB' : '#B8BAC8', pick: () => this.setState({ metric: k }) }));
+    const aggs = ['max', 'sum', 'mean'].map(a => { const ok = m.aggs.includes(a); return { label: a, pressed: agg === a ? 'true' : 'false', disabled: !ok, bg: agg === a && ok ? '#1D1E2A' : 'transparent', color: ok ? (agg === a ? '#F7F7FB' : '#B8BAC8') : '#777A8E', cursor: ok ? 'pointer' : 'not-allowed', pick: () => ok && this.setState({ agg: a }) }; });
+    const split = metric === 'testSplit';
+    const legend = split ? [{ c: '#343644', border: '#ABA5FF', bstyle: 'solid', range: 'production' }, { c: '#14151D', border: '#F7F7FB', bstyle: 'dashed', range: 'test' }] : SCALE.map((c, i) => ({ c, border: c, bstyle: 'solid', range: 'quartile ' + (i + 1) }));
+    return { sections, tiles, sel, metrics, aggs, legend, hideTests: hide, toggleTests: () => this.setState({ hide: !hide }),
+      title: split ? 'Lines by folder · production vs test' : 'Lines by folder · ' + m.label.toLowerCase() + ' ' + agg,
+      legendLow: split ? 'prod' : (m.invert ? 'high MI' : 'low'), legendHigh: split ? 'test' : (m.invert ? 'low MI' : 'high') };
+  }
+}
+</script>
+</body>
+</html>

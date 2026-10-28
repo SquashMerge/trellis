@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Design-first handoff</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 12px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<a href="Main.dc.html" style="display: flex; align-items: baseline; gap: 8px; text-decoration: none"><img src="/_blob/bb617e698602304f1df1c66e9906ef30" alt="" aria-hidden="true" style="width: 16px; height: 20px; flex: none; align-self: center"><span style="font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 750; color: #F7F7FB">Trellis</span><span style="font-size: 12px; color: #B8BAC8">by SquashMerge</span></a>
+<span aria-hidden="true" style="width: 1px; height: 20px; background: #343644"></span>
+<nav aria-label="App" style="display: flex; gap: 4px">
+<a href="Main.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Workbench</a>
+<a href="Files.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Files</a>
+<a href="Handoff.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-weight: 600">Design handoff</a>
+</nav>
+<span style="margin-left: auto; padding: 4px 8px; border: 1px dashed #ABA5FF; border-radius: 8px; font-size: 12px; color: #ABA5FF">Planned · SPEC §11 · not scheduled</span>
+</header>
+
+<ol aria-label="Handoff steps" style="list-style: none; margin: 0; padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid #343644">
+<sc-for list="{{steps}}" as="s" hint-placeholder-count="4">
+<li><button onClick="{{s.pick}}" aria-current="{{s.current}}" style="display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid {{s.border}}; background: {{s.bg}}; color: {{s.color}}; font: inherit; font-size: 13px; cursor: pointer"><span style="display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: {{s.numBg}}; color: {{s.numColor}}; font-size: 12px; font-weight: 700">{{s.n}}</span>{{s.label}}</button></li>
+</sc-for>
+</ol>
+
+<div style="display: flex; flex-wrap: wrap; flex: 1; min-height: 0">
+
+<section aria-labelledby="ed-h" style="flex: 999 1 640px; min-width: 0; display: flex; flex-direction: column; background: #0B0C10">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<h2 id="ed-h" style="margin: 0; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Class · WatcherWitness</h2>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">base: trellis ⎇ main · rev 431</span>
+<div role="group" aria-label="Diff display" style="margin-left: auto; display: flex; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{modes}}" as="m" hint-placeholder-count="3">
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" style="min-height: 30px; padding: 0 10px; border-radius: 8px; border: 0; background: {{m.bg}}; color: {{m.color}}; font: inherit; font-size: 12px; cursor: pointer">{{m.label}}</button>
+</sc-for>
+</div>
+</div>
+<div role="toolbar" aria-label="Edit tools" style="display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 8px 16px; border-bottom: 1px solid #777A8E">
+<button style="min-height: 32px; padding: 0 10px; border: 1px solid #7770DC; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer">Move</button>
+<button style="min-height: 32px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer">Add</button>
+<button style="min-height: 32px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer">Connect</button>
+<button style="min-height: 32px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer">Rename</button>
+<button style="min-height: 32px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer">Remove</button>
+<span style="margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; color: #F7F7FB">
+<span style="display: flex; align-items: center; gap: 8px"><span aria-hidden="true" style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: #57D6A0; color: #0B0C10; font-weight: 700; font-size: 12px">+</span>added</span>
+<span style="display: flex; align-items: center; gap: 8px"><span aria-hidden="true" style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: #FF8E9A; color: #0B0C10; font-weight: 700; font-size: 12px">−</span>removed</span>
+<span style="display: flex; align-items: center; gap: 8px"><span aria-hidden="true" style="display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: #FFC20A; color: #0B0C10; font-weight: 700; font-size: 12px">~</span>changed</span>
+</span>
+</div>
+
+<div style="flex: 1; overflow: auto; padding: 16px">
+<div style="position: relative; width: 680px; height: 460px; margin: 0 auto">
+<sc-for list="{{groups}}" as="g" hint-placeholder-count="3">
+<div style="position: absolute; left: {{g.x}}px; top: {{g.y}}px; width: {{g.w}}px; height: {{g.h}}px; box-sizing: border-box; border: 1px dashed #777A8E; border-radius: 12px"></div>
+<div style="position: absolute; left: {{g.lx}}px; top: {{g.ly}}px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{g.name}}</div>
+</sc-for>
+<sc-for list="{{edges}}" as="e" hint-placeholder-count="5">
+<svg width="680" height="460" viewBox="0 0 680 460" aria-hidden="true" style="position: absolute; left: 0; top: 0; pointer-events: none; opacity: {{e.opacity}}"><path d="{{e.d}}" fill="none" stroke="{{e.color}}" stroke-width="{{e.w}}" stroke-dasharray="{{e.dash}}"></path><polygon points="{{e.arrow}}" fill="{{e.color}}"></polygon></svg>
+<sc-if value="{{e.hasBadge}}" hint-placeholder-val="{{false}}"><span aria-label="{{e.aria}}" style="position: absolute; left: {{e.bx}}px; top: {{e.by}}px; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 4px; background: {{e.color}}; color: #0B0C10; font-size: 12px; font-weight: 700">{{e.sym}}</span></sc-if>
+</sc-for>
+<sc-for list="{{cards}}" as="c" hint-placeholder-count="6">
+<button onClick="{{c.pick}}" aria-pressed="{{c.pressed}}" aria-label="{{c.aria}}" style="position: absolute; left: {{c.x}}px; top: {{c.y}}px; width: 268px; box-sizing: border-box; padding: 0; border-radius: 8px; border: {{c.bw}}px {{c.bstyle}} {{c.border}}; background: {{c.bg}}; color: #F7F7FB; font: inherit; text-align: left; cursor: pointer; overflow: visible; opacity: {{c.opacity}}; box-shadow: {{c.ring}}">
+<span style="display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-radius: 7px 7px 0 0; background: #343644; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 400"><span style="text-decoration: {{c.strike}}">{{c.name}}</span><span style="font-size: 12px; font-weight: 600; color: #B8BAC8">{{c.mod}}</span></span>
+<sc-for list="{{c.rows}}" as="r" hint-placeholder-count="3"><span style="display: flex; gap: 8px; padding: 1px 12px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 16px; white-space: nowrap; background: {{r.bg}}; color: {{r.color}}"><span style="width: 8px; flex: none; font-weight: 700">{{r.sym}}</span><span style="text-decoration: {{r.strike}}">{{r.text}}</span></span></sc-for>
+<span style="display: block; height: 6px"></span>
+<sc-if value="{{c.hasBadge}}" hint-placeholder-val="{{false}}"><span aria-hidden="true" style="position: absolute; right: -8px; top: -8px; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 4px; background: {{c.border}}; color: #0B0C10; font-size: 13px; font-weight: 700">{{c.sym}}</span></sc-if>
+</button>
+</sc-for>
+</div>
+</div>
+</section>
+
+<aside aria-labelledby="df-h" style="flex: 1 1 340px; min-width: 0; max-width: 420px; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 12px">
+<div>
+<h2 id="df-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">Changes in this diagram</h2>
+<div style="margin-top: 4px; font-size: 12px; color: #B8BAC8">{{summary}}</div>
+</div>
+<sc-for list="{{changes}}" as="o" hint-placeholder-count="5">
+<button onClick="{{o.pick}}" aria-pressed="{{o.pressed}}" style="display: flex; align-items: flex-start; gap: 12px; padding: 8px 12px; border-radius: 8px; border: 1px solid {{o.border}}; background: {{o.bg}}; color: #F7F7FB; font: inherit; text-align: left; cursor: pointer">
+<span aria-hidden="true" style="flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 4px; background: {{o.color}}; color: #0B0C10; font-size: 12px; font-weight: 700">{{o.sym}}</span>
+<span style="display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1"><span style="font-size: 13px">{{o.label}}</span><span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{o.detail}}</span></span>
+<sc-if value="{{o.hasResult}}" hint-placeholder-val="{{false}}"><span style="flex: none; font-size: 12px; color: {{o.resultColor}}">{{o.result}}</span></sc-if>
+</button>
+</sc-for>
+
+<sc-if value="{{isSend}}" hint-placeholder-val="{{true}}">
+<div style="border: 1px solid #343644; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px">
+<div style="font-size: 12px; font-weight: 600">The agent receives</div>
+<div style="font-size: 12px; color: #F7F7FB; line-height: 1.5">A typed change request: the structural changes between the generated diagram at rev 431 and your edit, each anchored to its indexed source location. Not a text diff.</div>
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">classDiagram · 5 structural changes · 4 source anchors</div>
+</div>
+<fieldset style="margin: 0; border: 1px solid #343644; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 4px">
+<legend style="padding: 0 4px; font-size: 12px; font-weight: 600">Send to a tab in trellis</legend>
+<sc-for list="{{targets}}" as="t" hint-placeholder-count="3">
+<label style="display: flex; align-items: flex-start; gap: 8px; padding: 8px; border-radius: 8px; background: {{t.bg}}; cursor: pointer"><input type="radio" name="target" checked="{{t.on}}" onChange="{{t.pick}}" style="margin-top: 4px"><span style="display: flex; flex-direction: column; gap: 4px"><span style="font-family: 'JetBrains Mono', monospace; font-size: 12px">{{t.label}}</span><span style="font-size: 12px; color: #B8BAC8">{{t.note}}</span></span></label>
+</sc-for>
+</fieldset>
+<button onClick="{{send}}" style="min-height: 44px; border: 0; border-radius: 8px; background: #FFAA10; color: #0B0C10; font: inherit; font-weight: 600; cursor: pointer">Send change request to agent</button>
+<div style="font-size: 12px; color: #B8BAC8; line-height: 1.5">Trellis never edits the repository. The agent implements the change; Trellis re-indexes and compares.</div>
+</sc-if>
+
+<sc-if value="{{isVerify}}" hint-placeholder-val="{{false}}">
+<div style="border: 1px solid #343644; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; justify-content: space-between; font-size: 12px"><span style="font-weight: 600">Re-indexed and compared</span><span style="font-family: 'JetBrains Mono', monospace; color: #B8BAC8">rev 437 · Claude 2</span></div>
+<div style="font-size: 12px; color: #F7F7FB">4 match the design · 1 differs</div>
+<div style="font-size: 12px; color: #B8BAC8; line-height: 1.5">The regenerated diagram also has an edge you didn't draw: checkout_watcher_witness → model::WatcherWitness. Review it in the After view.</div>
+<a href="Main.dc.html" style="display: flex; align-items: center; justify-content: center; min-height: 40px; border: 1px solid #777A8E; border-radius: 8px; color: #F7F7FB; text-decoration: none; font-size: 13px">Open the agent's tab</a>
+</div>
+</sc-if>
+</aside>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { step: 2, mode: 'overlay', target: 'new', focus: null }; }
+  renderVals() {
+    const { step, mode, focus } = this.state;
+    const verify = step === 4;
+    const C = { add: '#57D6A0', del: '#FF8E9A', chg: '#FFC20A', same: '#777A8E' };
+    const SYM = { add: '+', del: '−', chg: '~' };
+    const steps = ['Edit diagram', 'Review changes', 'Send to agent', 'Verify'].map((label, i) => {
+      const n = i + 1, on = n === step, done = n < step;
+      return { n, label, current: on ? 'step' : 'false', border: on ? '#7770DC' : '#343644', bg: on ? '#1D1E2A' : 'transparent', color: on || done ? '#F7F7FB' : '#B8BAC8', numBg: on ? '#7770DC' : done ? '#57D6A0' : '#343644', numColor: on || done ? '#0B0C10' : '#F7F7FB', pick: () => this.setState({ step: n }) };
+    });
+    const modes = [['overlay', 'Overlay'], ['before', 'Before'], ['after', 'After']].map(([k, l]) => ({ label: l, pressed: mode === k ? 'true' : 'false', bg: mode === k ? '#1D1E2A' : 'transparent', color: mode === k ? '#F7F7FB' : '#B8BAC8', pick: () => this.setState({ mode: k }) }));
+    const visible = (d) => mode === 'overlay' || (mode === 'before' ? d !== 'add' : d !== 'del');
+    const groups = [
+      { name: 'mod model', x: 16, y: 16, w: 300, h: 428 },
+      { name: 'mod watch', x: 356, y: 16, w: 300, h: 250 },
+      { name: 'mod native_evidence', x: 356, y: 290, w: 300, h: 154 }
+    ].map(g => ({ ...g, lx: g.x + 12, ly: g.y + 10 }));
+    const R = (text, d) => ({ text, d: d || 'same' });
+    const K = [
+      { id: 'IndexStatus', name: 'IndexStatus', mod: 'model', x: 32, y: 52, d: 'chg', rows: [R('workspace_root: String'), R('revision: IndexPin'), R('watcher: Option<watch::WatcherWitness>', 'del'), R('watcher: Option<WatcherWitness>', 'add'), R('…')] },
+      { id: 'WW_model', name: 'WatcherWitness', mod: 'model', x: 32, y: 196, d: 'add', rows: [R('epoch: u64'), R('native: bool'), R('degraded: bool'), R('degradations: u64')] },
+      { id: 'DurableAnchor', name: 'DurableAnchor', mod: 'model', x: 32, y: 322, d: 'same', rows: [R('syntax_id: String'), R('document: DocumentKey'), R('…')] },
+      { id: 'WW_watch', name: 'WatcherWitness', mod: 'watch', x: 372, y: 52, d: 'del', rows: [R('epoch: u64'), R('native: bool'), R('degraded: bool'), R('degradations: u64')] },
+      { id: 'WatcherHealth', name: 'WatcherHealth', mod: 'watch', x: 372, y: 176, d: 'chg', rows: [R('witness() WatcherWitness', 'del'), R('witness() model::WatcherWitness', 'add'), R('degraded() bool')] },
+      { id: 'DocumentKey', name: 'DocumentKey', mod: 'native_evidence', x: 372, y: 326, d: 'same', rows: [R('source_set_id: String'), R('language: String'), R('path: String')] }
+    ];
+    const cards = K.filter(k => visible(k.d)).map(k => {
+      const over = mode === 'overlay';
+      const shown = k.rows.filter(r => visible(r.d));
+      const on = focus === k.id;
+      const color = over ? C[k.d] : C.same;
+      return { ...k, aria: k.name + (over && k.d !== 'same' ? ' · ' + ({ add: 'added', del: 'removed', chg: 'changed' })[k.d] : ''),
+        rows: shown.map(r => ({ text: r.text, sym: over && r.d !== 'same' ? SYM[r.d] : '', color: over && r.d === 'del' ? '#FF8E9A' : over && r.d === 'add' ? '#57D6A0' : '#F7F7FB', bg: over && r.d === 'del' ? '#14151D' : over && r.d === 'add' ? '#14151D' : 'transparent', strike: over && r.d === 'del' ? 'line-through' : 'none' })),
+        border: color, bw: over && k.d !== 'same' ? 2 : 1, bstyle: over && k.d === 'del' ? 'dashed' : 'solid', bg: over && k.d === 'del' ? '#14151D' : '#1D1E2A', opacity: over && k.d === 'del' ? 0.75 : 1,
+        strike: over && k.d === 'del' ? 'line-through' : 'none', hasBadge: over && k.d !== 'same', sym: SYM[k.d] || '', ring: on ? '0 0 0 3px #7770DC' : 'none', pressed: on ? 'true' : 'false', pick: () => this.setState({ focus: k.id }) };
+    });
+    const E = [
+      { id: 'e1', d: 'del', path: 'M300 116 C336 116 336 100 368 100', arrow: '361,96 369,100 361,104', bx: 326, by: 84, aria: 'removed reference IndexStatus to watch::WatcherWitness' },
+      { id: 'e2', d: 'add', path: 'M166 168 L166 190', arrow: '162,183 166,191 170,183', bx: 174, by: 170, aria: 'added reference IndexStatus to WatcherWitness' },
+      { id: 'e3', d: 'del', path: 'M506 176 L506 154', arrow: '502,161 506,153 510,161', bx: 514, by: 156, aria: 'removed return WatcherHealth to watch::WatcherWitness' },
+      { id: 'e4', d: 'add', path: 'M372 214 C340 214 336 240 304 240', arrow: '311,236 303,240 311,244', bx: 330, by: 236, aria: 'added return WatcherHealth to model::WatcherWitness' },
+      { id: 'e5', d: 'same', path: 'M300 370 C336 370 336 378 368 378', arrow: '361,374 369,378 361,382', bx: 0, by: 0, aria: '' }
+    ];
+    const edges = E.filter(e => visible(e.d)).map(e => {
+      const over = mode === 'overlay';
+      const color = over ? C[e.d] : '#777A8E';
+      return { ...e, d: e.path, color, w: over && e.d !== 'same' ? 2.2 : 1.4, dash: over && e.d === 'del' ? '5 4' : 'none', opacity: 1, hasBadge: over && e.d !== 'same', sym: SYM[e.d] || '' };
+    });
+    const results = verify ? ['matches', 'matches', 'matches', 'matches', 'differs'] : [];
+    const changes = [
+      { k: 'WW_model', d: 'add', label: 'WatcherWitness added to model', detail: 'moved from watch' },
+      { k: 'WW_watch', d: 'del', label: 'WatcherWitness removed from watch', detail: 'src/watch.rs:47' },
+      { k: 'IndexStatus', d: 'chg', label: 'IndexStatus.watcher points into model', detail: 'src/model.rs:227' },
+      { k: 'WatcherHealth', d: 'chg', label: 'witness() returns model::WatcherWitness', detail: 'src/watch.rs:71' },
+      { k: 'extra', d: 'chg', label: 'checkout_watcher_witness updated', detail: 'src/http.rs:720 · not in your design', onlyVerify: true }
+    ].filter(c => !c.onlyVerify || verify).map((c, i) => ({ ...c, sym: SYM[c.d], color: C[c.d], border: focus === c.k ? '#7770DC' : (verify && results[i] === 'differs' ? '#FFC20A' : '#343644'), bg: focus === c.k ? '#1D1E2A' : 'transparent', pressed: focus === c.k ? 'true' : 'false',
+      hasResult: !!results[i], result: results[i] === 'differs' ? '≠ differs' : '✓ matches', resultColor: results[i] === 'differs' ? '#FFC20A' : '#57D6A0', pick: () => this.setState({ focus: c.k }) }));
+    const target = this.state.target;
+    const targets = [
+      { k: 'new', label: 'New tab · Claude 2 in a new worktree', note: 'Recommended · keeps the coordinator tab free' },
+      { k: 'claude', label: 'Claude', note: 'Working · the request waits for its current turn' },
+      { k: 'prime', label: 'Prime', note: 'Busy with #118 in worktree issue-118' }
+    ].map(t => ({ ...t, on: target === t.k, bg: target === t.k ? '#1D1E2A' : 'transparent', pick: () => this.setState({ target: t.k }) }));
+    return { steps, modes, groups, cards, edges, changes, targets, isSend: !verify, isVerify: verify, send: () => this.setState({ step: 4 }),
+      summary: mode === 'overlay' ? '1 added · 1 removed · 2 changed, against the diagram generated from rev 431' : mode === 'before' ? 'Before: generated from the indexed code' : 'After: your edited diagram' };
+  }
+}
+</script>
+</body>
+</html>

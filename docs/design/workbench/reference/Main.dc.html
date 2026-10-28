@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trellis workbench</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600;700&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 12px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<a href="Main.dc.html" style="display: flex; align-items: baseline; gap: 8px; text-decoration: none"><img src="/_blob/bb617e698602304f1df1c66e9906ef30" alt="" aria-hidden="true" style="width: 16px; height: 20px; flex: none; align-self: center"><span style="font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 750; color: #F7F7FB">Trellis</span><span style="font-size: 12px; color: #B8BAC8">by SquashMerge</span></a>
+<span aria-hidden="true" style="width: 1px; height: 20px; background: #343644"></span>
+<nav aria-label="App" style="display: flex; gap: 4px">
+<a href="Main.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-weight: 600">Workbench</a>
+<a href="Files.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Files</a>
+<a href="Handoff.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Design handoff</a>
+</nav>
+<div style="margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 12px; color: #B8BAC8">
+<span style="display: flex; align-items: center; gap: 8px"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 50%; background: #57D6A0"></span>Trellis daemon on workstation</span>
+<span>Herdr session attached</span>
+<button style="min-height: 32px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; cursor: pointer">Detach</button>
+</div>
+</header>
+
+<div style="display: flex; flex-wrap: wrap; flex: 1; min-height: 0">
+
+<aside aria-label="Machines and files" style="flex: 0 1 236px; min-width: 210px; box-sizing: border-box; border-right: 1px solid #343644; background: #14151D; display: flex; flex-direction: column">
+<section aria-labelledby="mc-h" style="padding: 12px 12px; display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid #343644">
+<h2 id="mc-h" style="margin: 0 6px 2px; font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 400; color: #B8BAC8">ssh machines</h2>
+<p style="margin: 0 6px 8px; font-size: 12px; color: #B8BAC8; line-height: 1.5">Herdr's saved SSH machines. Trellis lists the same ones.</p>
+<sc-for list="{{machines}}" as="m" hint-placeholder-count="3">
+<button onClick="{{m.toggle}}" aria-expanded="{{m.expanded}}" style="display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 6px; border: 0; border-radius: 8px; background: transparent; color: #F7F7FB; font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 400; text-align: left; cursor: pointer">
+<span aria-hidden="true" style="width: 10px; color: #B8BAC8">{{m.caret}}</span><span style="flex: 1">{{m.name}}</span>
+<sc-if value="{{m.online}}" hint-placeholder-val="{{false}}"><span title="online" style="width: 8px; height: 8px; border-radius: 50%; background: #57D6A0"></span></sc-if>
+</button>
+<sc-if value="{{m.open}}" hint-placeholder-val="{{true}}">
+<sc-for list="{{m.spaces}}" as="w" hint-placeholder-count="3">
+<button onClick="{{w.pick}}" aria-pressed="{{w.pressed}}" style="display: flex; flex-direction: column; gap: 1px; padding: 4px 8px 4px 24px; border: 0; border-radius: 8px; background: {{w.bg}}; color: {{w.fg}}; font-family: 'JetBrains Mono', monospace; text-align: left; cursor: pointer">
+<span style="display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: {{w.weight}}"><span title="{{w.stateWord}}" style="flex: none; width: 8px; height: 8px; border-radius: {{w.dotRadius}}; background: {{w.dot}}"></span><span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{w.name}}</span></span>
+<sc-if value="{{w.hasBranch}}" hint-placeholder-val="{{false}}"><span style="padding-left: 16px; font-size: 12px; color: {{w.sub}}">{{w.branch}} <span style="color: #FF8E9A">{{w.behind}}</span></span></sc-if>
+</button>
+</sc-for>
+</sc-if>
+</sc-for>
+<div style="display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 8px 0; font-size: 12px; color: #B8BAC8">
+<span style="display: flex; align-items: center; gap: 4px"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: 50%; background: #85C7FF"></span>working</span>
+<span style="display: flex; align-items: center; gap: 4px"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: 1px; background: #FFC20A"></span>needs input</span>
+<span style="display: flex; align-items: center; gap: 4px"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: 50%; border: 1px solid #B8BAC8; box-sizing: border-box"></span>idle</span>
+</div>
+</section>
+<section aria-labelledby="ex-h" style="padding: 12px 12px; display: flex; flex-direction: column; gap: 4px; flex: 1">
+<div style="display: flex; justify-content: space-between; align-items: baseline; padding: 0 6px">
+<h2 id="ex-h" style="margin: 0; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Files</h2>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{tab.checkoutShort}}</span>
+</div>
+<ul style="list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; font-family: 'JetBrains Mono', monospace; font-size: 12px">
+<sc-for list="{{tree}}" as="t" hint-placeholder-count="10">
+<li><a href="Files.dc.html" style="display: flex; justify-content: space-between; gap: 8px; padding: 4px 8px; padding-left: {{t.indent}}px; border-radius: 8px; color: {{t.color}}; text-decoration: none"><span>{{t.label}}</span><span style="color: #FFC20A">{{t.mark}}</span></a></li>
+</sc-for>
+</ul>
+</section>
+</aside>
+
+<section aria-labelledby="tui-h" style="flex: 1 1 480px; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid #343644; background: #0B0C10">
+<h2 id="tui-h" style="position: absolute; width: 1px; height: 1px; overflow: hidden">Workspace {{space}} tabs</h2>
+<div role="tablist" aria-label="Tabs in {{space}}" style="display: flex; align-items: center; gap: 4px; padding: 8px 8px; border-bottom: 1px solid #777A8E; background: #14151D">
+<sc-for list="{{tabs}}" as="t" hint-placeholder-count="4">
+<button role="tab" onClick="{{t.pick}}" aria-selected="{{t.selected}}" style="display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 14px; border: 0; border-radius: 4px; background: {{t.bg}}; color: {{t.color}}; font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 400; cursor: pointer"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: {{t.dotRadius}}; background: {{t.dot}}"></span>{{t.name}}</button>
+</sc-for>
+<button aria-label="New tab" style="min-width: 32px; min-height: 32px; border: 0; border-radius: 4px; background: transparent; color: #B8BAC8; font-family: 'JetBrains Mono', monospace; font-size: 16px; cursor: pointer">+</button>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8; padding-right: 8px">{{tab.cwd}}</span>
+</div>
+<div role="log" aria-label="{{tab.name}} terminal" style="flex: 1; padding: 16px 16px; display: flex; flex-direction: column; gap: 8px; font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.55; overflow: auto">
+<sc-for list="{{lines}}" as="l" hint-placeholder-count="14">
+<div style="display: flex; gap: 12px; padding: {{l.pad}}; color: {{l.color}}; background: {{l.bg}}; font-weight: {{l.weight}}">
+<span aria-hidden="true" style="flex: none; width: 10px; color: {{l.glyphColor}}">{{l.glyph}}</span>
+<span style="min-width: 0; white-space: pre-wrap">{{l.text}}</span>
+</div>
+</sc-for>
+</div>
+<div style="padding: 8px 12px; border-top: 1px solid #343644; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">
+<span>Keyboard goes to {{tab.name}} · Herdr owns this pane</span><span>{{tab.mcp}}</span>
+</div>
+</section>
+
+<section aria-labelledby="tr-h" style="flex: 1.15 1 520px; min-width: 0; display: flex; flex-direction: column; background: #0B0C10">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<h2 id="tr-h" style="margin: 0; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Trellis</h2>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">{{tab.repo}} ⎇ {{tab.checkoutShort}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{tab.rev}}</span>
+<span title="Git · as of last fetch" style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{tab.git}}</span>
+<span style="margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; color: {{tab.indexColor}}"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 4px; border: 1.5px solid {{tab.indexColor}}"></span>{{tab.index}}</span>
+</div>
+<nav aria-label="Diagram views" style="display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Architecture.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Class</a>
+<a href="Libraries.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Libraries</a>
+<a href="C4.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">C4</a>
+<label style="margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; color: #F7F7FB; cursor: pointer"><input type="checkbox" checked="{{follow}}" onChange="{{toggleFollow}}"> Follow active tab</label>
+</nav>
+
+<sc-if value="{{notAgent}}" hint-placeholder-val="{{false}}">
+<div style="margin: 12px 16px 0; padding: 12px 12px; border: 1px solid #343644; border-radius: 8px; font-size: 12px; color: #F7F7FB">{{tab.name}} isn't a coding agent. Trellis keeps showing trellis ⎇ main.</div>
+</sc-if>
+<sc-if value="{{tab.catching}}" hint-placeholder-val="{{false}}">
+<div style="margin: 12px 16px 0; padding: 8px 12px; border: 1px dashed #FFC20A; border-radius: 8px; display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px">
+<span style="font-weight: 600; color: #FFC20A">Catching up</span><span>{{tab.name}} edited {{tab.editCount}} files after {{tab.rev}}. Highlights show where; the diagram stays on measured state until the watcher publishes.</span>
+</div>
+</sc-if>
+
+<div style="flex: 1; overflow: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; justify-content: space-between; font-size: 12px; color: #B8BAC8"><span>Layers · production references</span><span>Changed in this checkout</span></div>
+<sc-for list="{{bands}}" as="b" hint-placeholder-count="5">
+<div style="display: flex; gap: 12px; align-items: flex-start; padding: 12px; border-radius: 12px; border: 1px solid #343644; background: #14151D">
+<div style="flex: 0 0 96px; display: flex; flex-direction: column; gap: 4px"><span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">{{b.name}}</span><sc-if value="{{b.hasUp}}" hint-placeholder-val="{{false}}"><span style="align-self: flex-start; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 1px 4px; border: 1px solid #FF8E9A; border-radius: 4px; color: #FF8E9A">↑ {{b.up}}</span></sc-if></div>
+<div style="flex: 1; display: flex; flex-wrap: wrap; gap: 4px">
+<sc-for list="{{b.mods}}" as="m" hint-placeholder-count="5">
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" style="min-height: 28px; padding: 0 8px; border-radius: 8px; border: 1.5px {{m.bstyle}} {{m.border}}; background: {{m.bg}}; color: {{m.color}}; font-family: 'JetBrains Mono', monospace; font-size: 12px; cursor: pointer">{{m.name}}</button>
+</sc-for>
+</div>
+</div>
+</sc-for>
+</div>
+
+<div style="border-top: 1px solid #343644; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; background: #14151D">
+<div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px"><span style="font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 400">{{selMod.name}}</span><span style="font-size: 12px; color: #B8BAC8">{{selMod.note}}</span></div>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<sc-for list="{{selMod.files}}" as="f" hint-placeholder-count="2"><a href="Files.dc.html" style="padding: 4px 8px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-family: 'JetBrains Mono', monospace; font-size: 12px">{{f.path}} <span style="color: #B8BAC8">{{f.stat}}</span></a></sc-for>
+</div>
+<div style="display: flex; gap: 8px; justify-content: flex-end">
+<a href="Architecture.dc.html" style="display: inline-flex; align-items: center; min-height: 36px; padding: 0 12px; border: 1px solid #777A8E; border-radius: 8px; color: #F7F7FB; text-decoration: none; font-size: 13px">Open diagram</a>
+<a href="Handoff.dc.html" style="display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 8px; background: #FFAA10; color: #0B0C10; text-decoration: none; font-size: 13px; font-weight: 600">Design a change</a>
+</div>
+</div>
+</section>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { tab: 'prime', space: 'trellis', open: { local: true, workstation: true, work: false }, follow: true, mod: null }; }
+  renderVals() {
+    const ST = { working: ['#85C7FF', '50%', 'working'], blocked: ['#FFC20A', '1px', 'needs input'], idle: ['transparent', '50%', 'idle'] };
+    const open = this.state.open;
+    const space = this.state.space;
+    const M = [
+      { id: 'local', name: 'Local', online: false, spaces: [{ name: '~', st: 'idle' }] },
+      { id: 'workstation', name: 'workstation · ssh', online: true, spaces: [{ name: 'service-a', st: 'blocked', branch: 'main', behind: '↓12' }, { name: 'tooling-…', st: 'working', branch: 'main' }, { name: 'trellis', st: 'working' }] },
+      { id: 'work', name: 'work · ssh', online: true, spaces: [] }
+    ];
+    const machines = M.map(m => ({ name: m.name, online: m.online, open: !!open[m.id], expanded: open[m.id] ? 'true' : 'false', caret: open[m.id] ? '▾' : '▸',
+      toggle: () => this.setState({ open: { ...open, [m.id]: !open[m.id] } }),
+      spaces: m.spaces.map(w => { const s = ST[w.st]; const on = w.name === space; return { ...w, hasBranch: !!w.branch, behind: w.behind || '', dot: s[0] === 'transparent' ? '#777A8E' : s[0], dotRadius: s[1], stateWord: s[2], bg: on ? '#7770DC' : 'transparent', fg: on ? '#0B0C10' : '#F7F7FB', sub: on ? '#0B0C10' : '#B8BAC8', weight: on ? 700 : 500, pressed: on ? 'true' : 'false', pick: () => this.setState({ space: w.name }) }; }) }));
+    const T = [
+      { id: 'claude', name: 'Claude', st: 'working', cwd: '~/projects/squashmerge/trellis', repo: 'trellis', checkoutShort: 'main', rev: '066c6cc · rev 431', index: 'Fresh', indexColor: '#57D6A0', git: '↑0 ↓0 · clean', mcp: 'trellis mcp · this checkout', touched: {}, editCount: 0 },
+      { id: 'prime', name: 'Prime', st: 'working', cwd: '…/trellis/.factory-sandboxes/118', repo: 'trellis', checkoutShort: 'issue-118', rev: '066c6cc · rev 431', index: 'Catching up · 3 files', indexColor: '#FFC20A', git: '↑4 ↓0 · 3 uncommitted', mcp: 'trellis mcp · worktree issue-118', catching: true, editCount: 3,
+        touched: { daemon: [['src/daemon/client.rs', '+14 −3']], mcp: [['src/mcp/tools.rs', '+6 −2'], ['src/mcp/wire.rs', '+2 −1']] } },
+      { id: 'prime2', name: 'Prime2', st: 'working', cwd: '…/trellis/.factory-sandboxes/197', repo: 'trellis', checkoutShort: 'issue-197', rev: '066c6cc · rev 431', index: 'Fresh', indexColor: '#57D6A0', git: '↑2 ↓1 · 2 uncommitted', mcp: 'trellis mcp · worktree issue-197', touched: { http: [['src/http/live_tests.rs', '+21 −9']], index_coordinator: [['src/index_coordinator/tests.rs', '+5 −5']] }, editCount: 2 },
+      { id: 'gotop', name: 'Gotop', st: 'idle', cwd: 'gotop', repo: 'trellis', checkoutShort: 'main', rev: '066c6cc · rev 431', index: 'Fresh', indexColor: '#57D6A0', git: '↑0 ↓0 · clean', mcp: 'no MCP · not an agent', touched: {}, editCount: 0, notAgent: true }
+    ];
+    const tabCur = T.find(t => t.id === this.state.tab) || T[0];
+    const tabs = T.map(t => { const on = t.id === tabCur.id, s = ST[t.st]; return { name: t.name, selected: on ? 'true' : 'false', bg: on ? '#7770DC' : '#1D1E2A', color: on ? '#0B0C10' : '#B8BAC8', dot: on ? '#0B0C10' : (s[0] === 'transparent' ? '#777A8E' : s[0]), dotRadius: s[1], pick: () => this.setState({ tab: t.id, mod: null }) }; });
+    const L = (k, text) => ({ k, text });
+    const scripts = {
+      claude: [
+        L('b', 'These should wait:'),
+        L('t', '– #174 (10k metrics performance) needs locked measurements, and #87\'s factory verifies don\'t take…'),
+        L('t', '– #225, #101 and #163 all go through store.rs or the publication code, so they\'d conflict with #8…'),
+        L('t', '– #279 waits for #87 to merge, as you asked.'),
+        L('t', '– The corpora #27–#30 need the native references that native-v9 adds before they can get past dra…'),
+        L('t', '– Example agent note.'),
+        L('t', 'Want me to hand out #97 and #118 now?'),
+        L('meta', '✻ Churned for 30s · done 10:07 PM · 1 shell still running'),
+        L('you', 'Let\'s do 118 and 197. Let\'s leave 97 for now. We need to redesign the web app.'),
+        L('dim', 'Ran 1 shell command'),
+        L('ok', 'Background command "Merge PR #290 once CI is green on head" completed (exit code 0)'),
+        L('ok', 'Background command "Watch non-Dependabot PRs with a persisted baseline" completed (exit code 0)'),
+        L('dim', 'Ran 2 shell commands'),
+        L('say', '#290 is merged (066c6cc), so Amendment 3 is on main. Now briefing both Primes.'),
+        L('dim', 'Ran 4 shell commands'),
+        L('say', 'Both tasks are handed out, and #290 (Amendment 3) merged on main as 066c6cc after CI passed.')
+      ],
+      prime: [
+        L('you', 'Brief: #118 · daemon, MCP and browser polish from PR #117.'),
+        L('say', 'Reading the status table in #118 first.'),
+        L('tool', 'trellis_find_symbols("connect_or_start")'),
+        L('dim', '└ src/daemon/client.rs · 1 declaration'),
+        L('tool', 'Update(src/daemon/client.rs)'),
+        L('dim', '└ +14 −3'),
+        L('tool', 'Update(src/mcp/tools.rs)'),
+        L('dim', '└ +6 −2'),
+        L('meta', '✻ Running ./tools/verify…')
+      ],
+      prime2: [
+        L('you', 'Brief: #197 · known flaky tests, live entries and the one-rerun ruling.'),
+        L('tool', 'Read(src/http/live_tests.rs)'),
+        L('tool', 'Update(src/http/live_tests.rs)'),
+        L('dim', '└ +21 −9'),
+        L('meta', '✻ Running cargo nextest run --test pins_http…')
+      ],
+      gotop: [L('dim', 'CPU ▁▂▃▅▃▂▁▂▃▅▇▅  42%   MEM 18.2 / 64 GiB'), L('dim', 'trellis serve   3.1%   412 MiB'), L('dim', 'claude          1.8%   288 MiB')]
+    };
+    const S = {
+      b: { glyph: '', glyphColor: '#F7F7FB', color: '#F7F7FB', bg: 'transparent', weight: 700, pad: '0' },
+      t: { glyph: '', glyphColor: '#F7F7FB', color: '#F7F7FB', bg: 'transparent', weight: 400, pad: '0' },
+      meta: { glyph: '', glyphColor: '#B8BAC8', color: '#B8BAC8', bg: 'transparent', weight: 400, pad: '0' },
+      you: { glyph: '❯', glyphColor: '#B8BAC8', color: '#F7F7FB', bg: '#343644', weight: 600, pad: '4px 6px' },
+      dim: { glyph: '', glyphColor: '#B8BAC8', color: '#B8BAC8', bg: 'transparent', weight: 400, pad: '0' },
+      ok: { glyph: '●', glyphColor: '#57D6A0', color: '#F7F7FB', bg: 'transparent', weight: 400, pad: '0' },
+      say: { glyph: '●', glyphColor: '#F7F7FB', color: '#F7F7FB', bg: 'transparent', weight: 400, pad: '0' },
+      tool: { glyph: '●', glyphColor: '#57D6A0', color: '#F7F7FB', bg: 'transparent', weight: 400, pad: '0' }
+    };
+    const lines = (scripts[tabCur.id] || []).map(l => ({ ...S[l.k], text: l.text }));
+    const touched = tabCur.touched;
+    const selName = this.state.mod;
+    const bandsDef = [['2 · Entry', ['http', 'daemon', 'mcp', 'acp', 'main'], 0], ['3 · Services', ['classes', 'navigation', 'class_diagram', 'planning', 'behavior', 'file_tree', 'live_jev'], 0], ['4 · Indexing', ['native_evidence', 'index_coordinator', 'indexer', 'capture', 'watch', 'native_ids'], 1], ['5 · Storage', ['store'], 252], ['Shared · any', ['model', 'testing'], 2]];
+    const bands = bandsDef.map(([name, mods, up]) => ({ name, up, hasUp: up > 0, mods: mods.map(m => {
+      const t = !!touched[m], on = m === selName;
+      return { name: m, pressed: on ? 'true' : 'false', bstyle: t ? 'dashed' : 'solid', border: on ? '#7770DC' : t ? '#FFC20A' : '#343644', bg: on ? '#7770DC' : t ? '#343644' : '#1D1E2A', color: on ? '#0B0C10' : '#F7F7FB', pick: () => this.setState({ mod: m }) };
+    }) }));
+    const firstTouched = Object.keys(touched)[0];
+    const mName = selName || firstTouched || 'store';
+    const selMod = { name: mName, note: touched[mName] ? 'Edited by ' + tabCur.name + ' · not yet indexed' : (mName === 'store' ? '252 upward production references (#163)' : 'No changes in this checkout'), files: (touched[mName] || []).map(([path, stat]) => ({ path, stat })) };
+    const tree = [['src/', 8, 'open'], ['daemon/', 22, touched.daemon ? 'M' : ''], ['http/', 22, touched.http ? 'M' : ''], ['index_coordinator/', 22, touched.index_coordinator ? 'M' : ''], ['mcp/', 22, touched.mcp ? 'M' : ''], ['store/', 22], ['model.rs', 22], ['store.rs', 22], ['watch.rs', 22], ['… 30 more', 22, '', 'muted'], ['web/', 8], ['tests/', 8], ['docs/', 8]]
+      .map(([label, indent, mark, s]) => ({ label: (label.endsWith('/') ? (s === 'open' || mark === 'open' ? '▾ ' : '▸ ') : '  ') + label, indent, mark: mark === 'open' ? '' : (mark || ''), color: s === 'muted' ? '#B8BAC8' : '#F7F7FB' }));
+    return { machines, space, tabs, tab: { ...tabCur, catching: !!tabCur.catching }, lines, bands, selMod, tree, notAgent: !!tabCur.notAgent,
+      follow: this.state.follow, toggleFollow: () => this.setState({ follow: !this.state.follow }) };
+  }
+}
+</script>
+</body>
+</html>

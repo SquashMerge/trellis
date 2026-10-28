@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Connect to Trellis</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;650&amp;family=JetBrains+Mono:wght@400&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 16px; line-height: 24px; display: flex; flex-direction: column">
+
+<main style="flex: 1; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 48px 64px; padding: 48px 24px; box-sizing: border-box">
+
+<div role="img" aria-label="Trellis by SquashMerge" style="width: 360px; height: 456px; overflow: hidden; position: relative; flex: none">
+<img src="/_blob/9816573ce6f3e7fe9c727f636981b6ca" alt="" style="position: absolute; left: -124px; top: -76px; width: 608px; height: 608px">
+</div>
+
+<section aria-labelledby="cn-h" style="flex: 0 1 440px; min-width: 0; display: flex; flex-direction: column; gap: 24px">
+<sc-if value="{{notConnected}}" hint-placeholder-val="{{true}}">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<h1 id="cn-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 32px; line-height: 40px; font-weight: 700">Connect to Trellis</h1>
+<p style="margin: 0; color: #B8BAC8">Trellis reads the indexes on this machine. Connecting sends nothing to a model provider and starts no agent.</p>
+</div>
+<form style="display: flex; flex-direction: column; gap: 16px; padding: 24px; border: 1px solid #343644; border-radius: 12px; background: #14151D">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<label for="tok" style="font-size: 14px; line-height: 20px; font-weight: 600">Daemon token</label>
+<input id="tok" type="password" autocomplete="off" placeholder="{{tokenPlaceholder}}" style="min-height: 44px; padding: 0 12px; border: 1px solid #777A8E; border-radius: 8px; background: #0B0C10; color: #F7F7FB; font-family: 'JetBrains Mono', monospace; font-size: 13px">
+<span style="font-size: 12px; line-height: 18px; color: #B8BAC8">The path is printed by <span style="font-family: 'JetBrains Mono', monospace">trellis serve --token-file</span>.</span>
+</div>
+<button type="button" onClick="{{loadFile}}" style="align-self: flex-start; min-height: 44px; padding: 0 16px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer">{{loadLabel}}</button>
+<label style="display: flex; align-items: flex-start; gap: 8px; font-size: 14px; line-height: 20px; cursor: pointer"><input type="checkbox" checked="{{remember}}" onChange="{{toggleRemember}}" style="margin-top: 4px; width: 16px; height: 16px">
+<span style="display: flex; flex-direction: column; gap: 4px"><span style="font-weight: 600">Remember token on this browser</span><span style="font-size: 12px; line-height: 18px; color: #B8BAC8">Stores this credential for this address. Use only on a trusted device. Disconnect forgets it.</span></span></label>
+<button type="button" onClick="{{connect}}" style="min-height: 44px; padding: 0 16px; border: 0; border-radius: 8px; background: #FFAA10; color: #0B0C10; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer">Connect</button>
+</form>
+</sc-if>
+
+<sc-if value="{{connected}}" hint-placeholder-val="{{false}}">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<span style="align-self: flex-start; display: flex; align-items: center; gap: 8px; font-size: 14px; color: #57D6A0"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 50%; background: #57D6A0"></span>Connected to the daemon on workstation</span>
+<h1 style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 32px; line-height: 40px; font-weight: 700">How do you want to work?</h1>
+<p style="margin: 0; color: #B8BAC8">6 checkouts are indexed. You can switch modes later from the header.</p>
+</div>
+<div style="display: flex; flex-direction: column; gap: 12px">
+<a href="Main.dc.html" style="display: flex; flex-direction: column; gap: 4px; padding: 16px; border: 1px solid #777A8E; border-radius: 12px; background: #14151D; color: #F7F7FB; text-decoration: none">
+<span style="display: flex; justify-content: space-between; align-items: center; gap: 8px"><span style="font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; line-height: 26px; font-weight: 700">With Herdr</span><span style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #57D6A0"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 50%; background: #57D6A0"></span>Session found</span></span>
+<span style="font-size: 14px; line-height: 20px; color: #B8BAC8">Attach to your Herdr session. One agent tab at a time; Trellis follows the tab's checkout.</span>
+</a>
+<a href="Viewer.dc.html" style="display: flex; flex-direction: column; gap: 4px; padding: 16px; border: 1px solid #777A8E; border-radius: 12px; background: #14151D; color: #F7F7FB; text-decoration: none">
+<span style="font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; line-height: 26px; font-weight: 700">Diagrams only</span>
+<span style="font-size: 14px; line-height: 20px; color: #B8BAC8">Browse indexed checkouts and diagrams without a terminal. Agents can still use trellis mcp.</span>
+</a>
+</div>
+<button type="button" onClick="{{disconnect}}" style="align-self: flex-start; min-height: 44px; padding: 0 16px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer">Disconnect</button>
+</sc-if>
+</section>
+</main>
+
+<footer style="display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; padding: 16px 24px; border-top: 1px solid #343644; font-size: 12px; line-height: 18px; color: #B8BAC8">
+<span>Trellis by SquashMerge · local inspection</span>
+<span>Loopback only · bearer token · no automatic indexing</span>
+</footer>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { connected: false, loaded: false, remember: false }; }
+  renderVals() {
+    const { connected, loaded, remember } = this.state;
+    return {
+      connected, notConnected: !connected, remember,
+      tokenPlaceholder: loaded ? '•••••••••••• loaded from ~/.trellis-private/token' : 'Paste from the token file',
+      loadLabel: loaded ? 'Token file loaded' : 'Load token file instead',
+      loadFile: () => this.setState({ loaded: true }),
+      toggleRemember: () => this.setState({ remember: !remember }),
+      connect: () => this.setState({ connected: true }),
+      disconnect: () => this.setState({ connected: false, loaded: false })
+    };
+  }
+}
+</script>
+</body>
+</html>

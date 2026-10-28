@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Files and source</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 12px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<a href="Main.dc.html" style="display: flex; align-items: baseline; gap: 8px; text-decoration: none"><img src="/_blob/bb617e698602304f1df1c66e9906ef30" alt="" aria-hidden="true" style="width: 16px; height: 20px; flex: none; align-self: center"><span style="font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 750; color: #F7F7FB">Trellis</span><span style="font-size: 12px; color: #B8BAC8">by SquashMerge</span></a>
+<span aria-hidden="true" style="width: 1px; height: 20px; background: #343644"></span>
+<nav aria-label="App" style="display: flex; gap: 4px">
+<a href="Main.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Workbench</a><a href="Files.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-weight: 600">Files</a>
+<a href="Handoff.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Design handoff</a>
+</nav>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">squashmerge/trellis ⎇ main · rev 412</span>
+<span title="Git · as of last fetch" style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">↑0 ↓0 · 2 uncommitted</span>
+</header>
+
+<div style="display: flex; flex-wrap: wrap; flex: 1; min-height: 0">
+
+<aside aria-labelledby="ft-h" style="flex: 0 1 260px; min-width: 220px; box-sizing: border-box; padding: 16px 12px; border-right: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 8px">
+<h2 id="ft-h" style="margin: 0 4px; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Files</h2>
+<label for="ffilter" style="position: absolute; width: 1px; height: 1px; overflow: hidden">Filter files</label>
+<input id="ffilter" type="search" placeholder="Filter path…" style="min-height: 36px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: #0B0C10; color: #F7F7FB; font: inherit; font-size: 13px">
+<ul style="list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; font-family: 'JetBrains Mono', monospace; font-size: 12px">
+<sc-for list="{{tree}}" as="t" hint-placeholder-count="16">
+<li><button onClick="{{t.pick}}" style="width: 100%; display: flex; justify-content: space-between; gap: 8px; padding: 4px 8px; padding-left: {{t.indent}}px; border: 0; border-radius: 8px; background: {{t.bg}}; color: {{t.color}}; font: inherit; text-align: left; cursor: pointer"><span>{{t.label}}</span><span style="color: {{t.metaColor}}">{{t.meta}}</span></button></li>
+</sc-for>
+</ul>
+</aside>
+
+<section aria-labelledby="src-h" style="flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<h2 id="src-h" style="margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 400">src/watch.rs</h2>
+<span style="font-size: 12px; color: #B8BAC8">Rust · 1,339 lines</span>
+<div role="group" aria-label="Source basis" style="margin-left: auto; display: flex; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{bases}}" as="b" hint-placeholder-count="2">
+<button onClick="{{b.pick}}" aria-pressed="{{b.pressed}}" style="min-height: 30px; padding: 0 10px; border-radius: 8px; border: 0; background: {{b.bg}}; color: {{b.color}}; font: inherit; font-size: 12px; cursor: pointer">{{b.label}}</button>
+</sc-for>
+</div>
+</div>
+<div style="padding: 8px 16px; font-size: 12px; color: {{basisColor}}; border-bottom: 1px solid #343644">{{basisNote}}</div>
+<div role="region" aria-label="Source" style="flex: 1; overflow: auto; padding: 8px 0; font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 20px">
+<sc-for list="{{code}}" as="c" hint-placeholder-count="30">
+<div style="display: flex; background: {{c.bg}}; box-shadow: {{c.bar}}">
+<span style="flex: none; width: 52px; padding-right: 12px; text-align: right; color: #B8BAC8; user-select: none">{{c.n}}</span>
+<span aria-hidden="true" style="flex: none; width: 14px; color: {{c.markColor}}">{{c.mark}}</span>
+<span style="white-space: pre; color: {{c.color}}">{{c.text}}</span>
+</div>
+</sc-for>
+</div>
+</section>
+
+<aside aria-labelledby="sym-h" style="flex: 1 1 320px; min-width: 0; max-width: 400px; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 12px">
+<div>
+<div style="font-size: 12px; color: #B8BAC8; text-transform: uppercase; letter-spacing: 0.6px">Selected method</div>
+<h2 id="sym-h" style="margin: 4px 0 0; font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 400">WatcherHealth::witness</h2>
+<div style="margin-top: 4px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">src/watch.rs:71–79 · → WatcherWitness</div>
+</div>
+<section aria-label="Sequence preview" style="border: 1px solid #343644; border-radius: 12px; background: #0B0C10; padding: 12px">
+<div style="display: flex; justify-content: space-between; font-size: 12px; color: #B8BAC8; margin-bottom: 8px"><span>Sequence · measured</span><a href="Sequence.dc.html">Open full</a></div>
+<div style="position: relative; height: 150px">
+<div style="position: absolute; left: 6px; top: 0; width: 104px; padding: 4px 0; text-align: center; border: 1px solid #7770DC; border-radius: 8px; background: #1D1E2A; font-family: 'JetBrains Mono', monospace; font-size: 12px">witness</div>
+<div style="position: absolute; left: 150px; top: 0; width: 140px; padding: 4px 0; text-align: center; border: 1px solid #777A8E; border-radius: 8px; background: #1D1E2A; font-family: 'JetBrains Mono', monospace; font-size: 12px">AtomicU64</div>
+<div aria-hidden="true" style="position: absolute; left: 58px; top: 28px; width: 0; height: 118px; border-left: 1px dashed #777A8E"></div>
+<div aria-hidden="true" style="position: absolute; left: 220px; top: 28px; width: 0; height: 118px; border-left: 1px dashed #777A8E"></div>
+<div style="position: absolute; left: 58px; top: 44px; width: 162px; border-top: 1.5px solid #F7F7FB"></div>
+<div style="position: absolute; left: 70px; top: 28px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">state.load(Acquire)</div>
+<div style="position: absolute; left: 58px; top: 92px; width: 162px; border-top: 1.5px solid #F7F7FB"></div>
+<div style="position: absolute; left: 66px; top: 76px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">degradations.load(Acquire)</div>
+<div style="position: absolute; left: 12px; top: 116px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">→ WatcherWitness { epoch, native, degraded, degradations }</div>
+</div>
+</section>
+<section aria-labelledby="ref-h" style="display: flex; flex-direction: column; gap: 4px">
+<h3 id="ref-h" style="margin: 0 0 2px; font-size: 12px; font-weight: 600; color: #B8BAC8">References to WatcherWitness · 4</h3>
+<sc-for list="{{refs}}" as="r" hint-placeholder-count="4">
+<a href="#" style="display: flex; flex-direction: column; gap: 4px; padding: 8px 8px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none"><span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #ABA5FF; text-decoration: underline">{{r.loc}}</span><span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{r.text}}</span></a>
+</sc-for>
+<span style="font-size: 12px; color: #B8BAC8">Syntax matches in the indexed revision. Not compiler-resolved.</span>
+</section>
+<section aria-labelledby="ag2-h" style="margin-top: auto; border: 1px solid #343644; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; justify-content: space-between; align-items: center"><h3 id="ag2-h" style="margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 12px">claude ⎇ main</h3><span style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: #85C7FF"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: 50%; background: #85C7FF"></span>working</span></div>
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">◐ cargo check --locked…</div>
+<label for="ask" style="font-size: 12px; color: #B8BAC8">Send selection to agent</label>
+<input id="ask" placeholder="› Ask about src/watch.rs:71–79…" style="min-height: 36px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: #0B0C10; color: #F7F7FB; font-family: 'JetBrains Mono', monospace; font-size: 12px">
+</section>
+</aside>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { basis: 'indexed', file: 'watch.rs' }; }
+  renderVals() {
+    const basis = this.state.basis;
+    const src = [
+      [41, '/// One coherent reading of watcher health, for measurement (Decision 0009'],
+      [42, '/// §5): watching stayed healthy between two readings only if they are equal'],
+      [43, '/// and the first is native and not degraded. The current bit alone can'],
+      [44, '/// return to healthy unseen, with a new epoch or between readings.'],
+      [45, '#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]'],
+      [46, '#[serde(rename_all = "camelCase")]'],
+      [47, 'pub struct WatcherWitness {', 'del'],
+      [48, '    pub epoch: u64,', 'del'],
+      [49, '    pub native: bool,', 'del'],
+      [50, '    pub degraded: bool,', 'del'],
+      [51, '    pub degradations: u64,', 'del'],
+      [52, '}', 'del'],
+      [53, ''],
+      [54, 'impl std::fmt::Debug for WatcherHealth {'],
+      [55, '    fn fmt(&self, formatter: &mut std::fmt::Formatter<\'_>) -> std::fmt::Result {'],
+      [56, '        formatter'],
+      [57, '            .debug_struct("WatcherHealth")'],
+      [58, '            .field("degraded", &self.degraded())'],
+      [59, '            .finish()'],
+      [60, '    }'],
+      [61, '}'],
+      [62, ''],
+      [63, 'impl WatcherHealth {'],
+      [64, '    pub fn degraded(&self) -> bool {'],
+      [65, '        self.state.load(Ordering::Acquire) & 1 == 1'],
+      [66, '    }'],
+      [67, ''],
+      [68, '    /// The state, then the count: every state change is a release'],
+      [69, '    /// read-modify-write, so the count of any transition visible in the state'],
+      [70, '    /// is visible too.'],
+      [71, '    pub fn witness(&self) -> WatcherWitness {', 'sel'],
+      [72, '        let state = self.state.load(Ordering::Acquire);', 'sel'],
+      [73, '        WatcherWitness {', 'sel'],
+      [74, '            epoch: state >> 2,', 'sel'],
+      [75, '            native: state & 2 != 0,', 'sel'],
+      [76, '            degraded: state & 1 != 0,', 'sel'],
+      [77, '            degradations: self.degradations.load(Ordering::Acquire),', 'sel'],
+      [78, '        }', 'sel'],
+      [79, '    }', 'sel']
+    ];
+    const color = (t) => t.trim().startsWith('///') ? '#B8BAC8' : t.trim().startsWith('#[') ? '#FFC20A' : '#F7F7FB';
+    let rows = [];
+    if (basis === 'working') {
+      // git diff HEAD -- src/watch.rs: hunks only, not the whole file.
+      rows.push({ n: '', text: '@@ -45,8 +45,3 @@ impl WatcherHealth', color: '#85C7FF', bg: '#14151D', mark: '', markColor: '#777A8E', bar: 'none' });
+      src.filter(([n]) => n >= 45 && n <= 54).forEach(([n, text, kind]) => {
+        if (kind === 'del') { rows.push({ n, text, color: '#FF8E9A', bg: '#14151D', mark: '−', markColor: '#FF8E9A', bar: 'none' }); if (n === 52) rows.push({ n: '', text: 'pub use crate::model::WatcherWitness;', color: '#57D6A0', bg: '#14151D', mark: '+', markColor: '#57D6A0', bar: 'none' }); return; }
+        rows.push({ n, text, color: color(text), bg: 'transparent', mark: '', markColor: '#777A8E', bar: 'none' });
+      });
+      rows.push({ n: '', text: '@@ -71,9 +66,9 @@ impl WatcherHealth', color: '#85C7FF', bg: '#14151D', mark: '', markColor: '#777A8E', bar: 'none' });
+      src.filter(([n]) => n >= 71 && n <= 79).forEach(([n, text]) => {
+        if (n === 72) { rows.push({ n, text, color: '#FF8E9A', bg: '#14151D', mark: '−', markColor: '#FF8E9A', bar: 'none' }); rows.push({ n: '', text: '        let state = self.state.load(Ordering::SeqCst);', color: '#57D6A0', bg: '#14151D', mark: '+', markColor: '#57D6A0', bar: 'none' }); return; }
+        rows.push({ n, text, color: color(text), bg: 'transparent', mark: '', markColor: '#777A8E', bar: 'none' });
+      });
+    } else {
+      src.forEach(([n, text, kind]) => {
+        const sel = kind === 'sel';
+        rows.push({ n, text, color: color(text), bg: sel ? '#1D1E2A' : 'transparent', mark: '', markColor: '#777A8E', bar: sel ? 'inset 3px 0 0 #7770DC' : 'none' });
+      });
+    }
+    const bases = [['indexed', 'Indexed · rev 412'], ['working', 'Working tree · uncommitted vs HEAD']].map(([k, label]) => ({ label, pressed: basis === k ? 'true' : 'false', bg: basis === k ? '#1D1E2A' : 'transparent', color: basis === k ? '#F7F7FB' : '#B8BAC8', pick: () => this.setState({ basis: k }) }));
+    const basisNote = basis === 'working' ? 'git diff HEAD · 2 hunks. Not indexed. Navigation and diagrams use rev 412.' : 'Cached source from revision 412 · navigation and diagrams use this basis';
+    const basisColor = basis === 'working' ? '#FFC20A' : '#B8BAC8';
+    const fileSel = this.state.file;
+    const tree = [
+      ['src/', 8, 'dir-open'], ['daemon/', 22, 'dir'], ['http/', 22, 'dir'], ['mcp/', 22, 'dir'], ['store/', 22, 'dir'],
+      ['model.rs', 22, 'file', 'M'], ['watch.rs', 22, 'file', 'M'],
+      ['WatcherHealth', 40, 'sym', 'struct'], ['WatcherWitness', 40, 'sym', 'struct'], ['degraded', 40, 'sym', 'fn L64'], ['witness', 40, 'sym-sel', 'fn L71'], ['begin_epoch', 40, 'sym', 'fn L83'], ['reset', 40, 'sym', 'fn L146'],
+      ['native_evidence.rs', 22, 'file'], ['store.rs', 22, 'file'], ['… 31 more', 22, 'muted'], ['web/', 8, 'dir'], ['tests/', 8, 'dir'], ['docs/', 8, 'dir']
+    ].map(([label, indent, kind, meta]) => {
+      const sel = kind === 'sym-sel';
+      const prefix = kind === 'dir-open' ? '▾ ' : kind === 'dir' ? '▸ ' : kind.startsWith('sym') ? '◇ ' : '  ';
+      return { label: prefix + label, indent, meta: meta || '', metaColor: meta === 'M' ? '#FFC20A' : '#B8BAC8', color: kind === 'muted' ? '#B8BAC8' : sel ? '#0B0C10' : '#F7F7FB', bg: sel ? '#7770DC' : (label === fileSel && kind === 'file' ? '#1D1E2A' : 'transparent'), pick: () => this.setState({ file: label }) };
+    });
+    const refs = [
+      { loc: 'src/model.rs:227', text: 'pub watcher: Option<crate::watch::WatcherWitness>,' },
+      { loc: 'src/http.rs:720', text: 'pub fn checkout_watcher_witness(&self) -> crate::watch::WatcherWitness' },
+      { loc: 'src/watch.rs:71', text: 'pub fn witness(&self) -> WatcherWitness {' },
+      { loc: 'src/watch.rs:73', text: 'WatcherWitness {' }
+    ];
+    return { code: rows, bases, basisNote, basisColor, tree, refs };
+  }
+}
+</script>
+</body>
+</html>

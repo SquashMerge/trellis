@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>C4 container view</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="width: 1200px; height: 800px; box-sizing: border-box; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column; overflow: hidden">
+
+<div style="display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Trellis</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">squashmerge/trellis ⎇ main</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">rev 412</span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">Mermaid → Pele 1.6.0</span>
+</div>
+<nav aria-label="Diagram views" style="display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Architecture.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Class</a>
+<a href="Libraries.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Libraries</a>
+<a href="C4.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">C4</a>
+</nav>
+
+<div style="flex: 1; display: flex; min-height: 0">
+<section aria-labelledby="c4-h" style="flex: 1; min-width: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 12px">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px">
+<h2 id="c4-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">Containers · agent integration</h2>
+<span style="padding: 4px 8px; border: 1px dashed #ABA5FF; border-radius: 8px; font-size: 12px; color: #ABA5FF">Authored diagram</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">docs/architecture/agent-integration-containers.md</span>
+</div>
+<div style="position: relative; width: 860px; height: 620px">
+<div style="position: absolute; left: 176px; top: 106px; width: 500px; height: 500px; box-sizing: border-box; border: 1.5px dashed #ABA5FF; border-radius: 14px"></div>
+<div style="position: absolute; left: 190px; top: 112px; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600; color: #ABA5FF">Trellis · system boundary</div>
+<sc-for list="{{edges}}" as="e" hint-placeholder-count="10">
+<svg width="860" height="620" viewBox="0 0 860 620" aria-hidden="true" style="position: absolute; left: 0; top: 0; pointer-events: none; opacity: {{e.opacity}}"><path d="{{e.d}}" fill="none" stroke="{{e.color}}" stroke-width="1.5" stroke-dasharray="{{e.dash}}"></path><polygon points="{{e.arrow}}" fill="{{e.color}}"></polygon></svg>
+<div style="position: absolute; left: {{e.lx}}px; top: {{e.ly}}px; max-width: 150px; padding: 1px 4px; border-radius: 4px; background: #0B0C10; font-size: 12px; line-height: 13px; color: {{e.labelColor}}; opacity: {{e.opacity}}">{{e.label}}</div>
+</sc-for>
+<sc-for list="{{nodes}}" as="n" hint-placeholder-count="12">
+<button onClick="{{n.pick}}" aria-pressed="{{n.pressed}}" style="position: absolute; left: {{n.x}}px; top: {{n.y}}px; width: {{n.w}}px; height: {{n.h}}px; box-sizing: border-box; padding: 8px 8px; border-radius: {{n.radius}}; border: 1.5px {{n.bstyle}} {{n.border}}; background: {{n.bg}}; color: {{n.color}}; font: inherit; text-align: center; cursor: pointer; display: flex; flex-direction: column; justify-content: center; gap: 4px; opacity: {{n.opacity}}">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">{{n.name}}</span>
+<span style="font-size: 12px; color: {{n.subColor}}">[{{n.tech}}]</span>
+<span style="font-size: 12px; font-weight: 600; color: {{n.statusColor}}">{{n.status}}</span>
+</button>
+</sc-for>
+</div>
+</section>
+
+<aside aria-labelledby="c4i-h" style="width: 300px; flex: none; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 12px">
+<h2 id="c4i-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">{{sel.name}}</h2>
+<div style="font-size: 12px; color: #B8BAC8">{{sel.tech}}</div>
+<span style="align-self: flex-start; padding: 4px 8px; border-radius: 8px; border: 1px {{sel.bstyle}} {{sel.statusColor}}; font-size: 12px; color: {{sel.statusColor}}">{{sel.status}}</span>
+<p style="margin: 0; font-size: 12px; color: #F7F7FB; line-height: 1.5">{{sel.desc}}</p>
+<div style="font-size: 12px; color: #B8BAC8">Relationships</div>
+<sc-for list="{{selRels}}" as="r" hint-placeholder-count="3">
+<div style="padding: 8px 8px; border-radius: 8px; background: #1D1E2A; font-size: 12px; line-height: 1.4"><span style="font-family: 'JetBrains Mono', monospace; color: #ABA5FF">{{r.dir}} {{r.other}}</span><br><span style="color: #F7F7FB">{{r.label}}</span></div>
+</sc-for>
+<div style="margin-top: auto; font-size: 12px; color: #B8BAC8; line-height: 1.5">Authored C4 is labelled as a proposal. It is not checked against indexed code.</div>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1200,"height":800}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { sel: 'core' }; }
+  renderVals() {
+    const ST = { shipped: ['Shipped', '#57D6A0', 'solid'], partial: ['Shipped · terminals planned', '#85C7FF', 'solid'], proposed: ['Proposed', '#ABA5FF', 'dashed'], external: ['External', '#B8BAC8', 'solid'] };
+    const N = [
+      { id: 'user', name: 'Developer', tech: 'Person', x: 330, y: 8, w: 200, h: 64, type: 'person', st: 'external', desc: 'Chooses what to inspect and which agent to direct.' },
+      { id: 'agent', name: 'Agent client', tech: 'Claude Code, Codex, OpenCode…', x: 6, y: 150, w: 156, h: 84, type: 'ext', st: 'external', desc: 'Existing coding-agent harness. Calls Trellis tools directly over MCP.' },
+      { id: 'proxy', name: 'Service A local proxy', tech: 'ACP proxy + provider', x: 6, y: 320, w: 156, h: 74, type: 'ext', st: 'external', desc: 'Mediates local tool permissions for Service A agents.' },
+      { id: 'service-a', name: 'Service A runtime', tech: 'daemon + ACP', x: 6, y: 470, w: 156, h: 74, type: 'ext', st: 'external', desc: 'Runs Service A agent turns.' },
+      { id: 'herdr', name: 'Herdr server', tech: 'Optional terminal service', x: 696, y: 150, w: 158, h: 84, type: 'ext', st: 'external', desc: 'Owns panes and agent lifecycle metadata. Trellis attaches; it never takes ownership.' },
+      { id: 'ui', name: 'Workbench', tech: 'Local browser UI', x: 196, y: 150, w: 200, h: 84, type: 'int', st: 'partial', desc: 'Source, diagrams, terminal and ACP tabs.' },
+      { id: 'core', name: 'Browser daemon', tech: 'Rust', x: 456, y: 150, w: 200, h: 84, type: 'int', st: 'shipped', desc: 'Serves the workbench, reads per-checkout indexes and stores artifacts.' },
+      { id: 'mcp', name: 'trellis mcp', tech: 'stdio MCP · one per agent', x: 196, y: 314, w: 200, h: 84, type: 'int', st: 'shipped', desc: 'Serves the checkout it was launched in; read-only tools.' },
+      { id: 'registry', name: 'Project registry', tech: 'Local durable store', x: 456, y: 314, w: 200, h: 84, type: 'db', st: 'proposed', desc: 'Lists checkouts for the browser picker; agents don’t need it.' },
+      { id: 'stores', name: 'Per-checkout index', tech: 'SQLite cache', x: 192, y: 470, w: 148, h: 92, type: 'db', st: 'shipped', desc: 'Disposable evidence, written only by the leader.' },
+      { id: 'facts', name: 'Shared fact cache', tech: 'SQLite · by hash', x: 352, y: 470, w: 148, h: 92, type: 'db', st: 'shipped', desc: 'Per-file extraction reused by content hash.' },
+      { id: 'durable', name: 'Durable state', tech: 'SQLite outside checkout', x: 512, y: 470, w: 148, h: 92, type: 'db', st: 'shipped', desc: 'Views, notes, artifacts, tokens and ledgers.' }
+    ];
+    const R = [
+      { a: 'user', b: 'ui', label: 'Inspects code, operates agent tabs', d: 'M380 72 L320 146', arrow: '318,138 319,148 326,142', lx: 360, ly: 96 },
+      { a: 'ui', b: 'core', label: 'Authenticated local API', d: 'M396 192 L452 192', arrow: '445,188 453,192 445,196', lx: 400, ly: 166 },
+      { a: 'core', b: 'agent', label: 'Launches owned child · real PTY', d: 'M556 150 L556 126 L84 126 L84 146', arrow: '80,139 84,147 88,139', lx: 250, ly: 100, dash: '5 4' },
+      { a: 'core', b: 'herdr', label: 'Discovers metadata · optional', d: 'M656 192 L692 192', arrow: '685,188 693,192 685,196', lx: 690, ly: 240, dash: '5 4' },
+      { a: 'agent', b: 'mcp', label: 'MCP stdio', d: 'M162 210 C180 210 180 340 192 340', arrow: '185,336 193,340 185,344', lx: 120, ly: 254 },
+      { a: 'proxy', b: 'mcp', label: 'Provider adapter · proposed', d: 'M162 370 L192 370', arrow: '185,366 193,370 185,374', lx: 40, ly: 400, dash: '5 4' },
+      { a: 'service-a', b: 'proxy', label: 'ACP tool bridge', d: 'M84 470 L84 398', arrow: '80,405 84,397 88,405', lx: 92, ly: 438 },
+      { a: 'mcp', b: 'stores', label: 'Reads; writes when leader', d: 'M266 398 L266 466', arrow: '262,459 266,467 270,459', lx: 190, ly: 420 },
+      { a: 'mcp', b: 'facts', label: 'Reuses extraction', d: 'M346 398 C346 430 426 440 426 466', arrow: '422,459 426,467 430,459', lx: 350, ly: 420 },
+      { a: 'core', b: 'registry', label: 'Looks up bindings', d: 'M556 234 L556 310', arrow: '552,303 556,311 560,303', lx: 564, ly: 264, dash: '5 4' },
+      { a: 'core', b: 'durable', label: 'Persists views, artifacts', d: 'M640 234 C680 300 680 430 600 466', arrow: '603,458 599,467 609,463', lx: 664, ly: 380 },
+      { a: 'core', b: 'stores', label: 'Reads snapshots', d: 'M470 234 C430 300 420 420 330 466', arrow: '334,458 329,467 339,464', lx: 410, ly: 292 }
+    ];
+    const sel = this.state.sel;
+    const nodes = N.map(n => {
+      const on = n.id === sel, s = ST[n.st];
+      const near = R.some(r => (r.a === sel && r.b === n.id) || (r.b === sel && r.a === n.id));
+      const base = n.type === 'int' ? { bg: '#343644', border: '#ABA5FF', color: '#F7F7FB', sub: '#F7F7FB' } : n.type === 'db' ? { bg: '#1D1E2A', border: '#ABA5FF', color: '#F7F7FB', sub: '#F7F7FB' } : n.type === 'person' ? { bg: '#1D1E2A', border: '#F7F7FB', color: '#F7F7FB', sub: '#B8BAC8' } : { bg: '#1D1E2A', border: '#777A8E', color: '#F7F7FB', sub: '#B8BAC8' };
+      return { ...n, bg: on ? '#7770DC' : base.bg, border: on ? '#7770DC' : base.border, color: on ? '#0B0C10' : base.color, subColor: on ? '#0B0C10' : base.sub,
+        bstyle: n.st === 'proposed' ? 'dashed' : 'solid', radius: n.type === 'db' ? '50% / 14px' : n.type === 'person' ? '32px 32px 10px 10px' : '10px',
+        status: s[0], statusColor: on ? '#0B0C10' : s[1], opacity: sel && !on && !near ? 0.5 : 1, pressed: on ? 'true' : 'false', pick: () => this.setState({ sel: n.id }) };
+    });
+    const edges = R.map(r => {
+      const hot = r.a === sel || r.b === sel;
+      return { ...r, color: hot ? '#ABA5FF' : '#777A8E', labelColor: hot ? '#F7F7FB' : '#B8BAC8', dash: r.dash || 'none', opacity: hot ? 1 : 0.55 };
+    });
+    const sn = N.find(n => n.id === sel) || N[6];
+    const s = ST[sn.st];
+    const nameOf = (id) => N.find(n => n.id === id).name;
+    const selRels = R.filter(r => r.a === sel || r.b === sel).map(r => ({ dir: r.a === sel ? '→' : '←', other: nameOf(r.a === sel ? r.b : r.a), label: r.label }));
+    return { nodes, edges, sel: { ...sn, status: s[0], statusColor: s[1], bstyle: s[2] }, selRels };
+  }
+}
+</script>
+</body>
+</html>

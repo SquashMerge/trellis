@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sequence view</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="width: 1200px; height: 800px; box-sizing: border-box; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column; overflow: hidden">
+
+<div style="display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Trellis</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">squashmerge/trellis ⎇ main</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">rev 412</span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">Mermaid → Pele 1.6.0</span>
+</div>
+<nav aria-label="Diagram views" style="display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Architecture.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Class</a>
+<a href="Libraries.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Libraries</a>
+<a href="C4.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">C4</a>
+</nav>
+
+<div style="flex: 1; display: flex; min-height: 0">
+<section aria-labelledby="sq-h" style="flex: 1; min-width: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 12px">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px">
+<h2 id="sq-h" style="margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 400">Store::navigation_at</h2>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">src/store.rs:1732</span>
+<span style="padding: 4px 8px; border: 1px solid #777A8E; border-radius: 8px; font-size: 12px; color: #F7F7FB">Measured source steps</span>
+<span style="font-size: 12px; color: #B8BAC8">Not a runtime trace</span>
+</div>
+<div style="position: relative; width: 860px; height: 610px">
+<sc-for list="{{lanes}}" as="l" hint-placeholder-count="4">
+<div style="position: absolute; left: {{l.left}}px; top: 0; width: 170px; padding: 8px 0; box-sizing: border-box; text-align: center; border-radius: 8px; border: 1px solid {{l.border}}; background: #1D1E2A">
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 400">{{l.name}}</div>
+<div style="font-size: 12px; color: #B8BAC8">{{l.sub}}</div>
+</div>
+<div aria-hidden="true" style="position: absolute; left: {{l.x}}px; top: 46px; height: 560px; border-left: 1px dashed #777A8E"></div>
+</sc-for>
+<sc-for list="{{frames}}" as="f" hint-placeholder-count="3">
+<div style="position: absolute; left: {{f.x}}px; top: {{f.y}}px; width: {{f.w}}px; height: {{f.h}}px; box-sizing: border-box; border: 1px solid #777A8E; border-radius: 8px"></div>
+<div style="position: absolute; left: {{f.x}}px; top: {{f.y}}px; display: flex; align-items: center; gap: 8px">
+<span style="padding: 4px 8px; background: #343644; border-radius: 6px 0 6px 0; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 400; color: #F7F7FB">{{f.kind}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">[{{f.guard}}]</span>
+</div>
+<sc-if value="{{f.hasElse}}" hint-placeholder-val="{{false}}">
+<div style="position: absolute; left: {{f.x}}px; top: {{f.elseY}}px; width: {{f.w}}px; border-top: 1px dashed #777A8E"></div>
+<div style="position: absolute; left: {{f.elseLx}}px; top: {{f.elseLy}}px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">[{{f.elseGuard}}]</div>
+</sc-if>
+</sc-for>
+<sc-for list="{{msgs}}" as="m" hint-placeholder-count="7">
+<svg width="860" height="610" viewBox="0 0 860 610" aria-hidden="true" style="position: absolute; left: 0; top: 0; pointer-events: none"><path d="{{m.d}}" fill="none" stroke="{{m.color}}" stroke-width="{{m.w}}" stroke-dasharray="{{m.dash}}"></path><polygon points="{{m.arrow}}" fill="{{m.color}}"></polygon></svg>
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" style="position: absolute; left: {{m.lx}}px; top: {{m.ly}}px; padding: 4px 8px; border-radius: 4px; border: 1px solid {{m.labelBorder}}; background: {{m.labelBg}}; color: {{m.labelColor}}; font-family: 'JetBrains Mono', monospace; font-size: 12px; cursor: pointer; white-space: nowrap">{{m.label}}</button>
+</sc-for>
+<button style="position: absolute; left: 20px; top: 556px; width: 820px; min-height: 36px; border: 1px dashed #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer">▸ 11 more measured steps · decode, class lookup, source selector · Expand one level</button>
+</div>
+</section>
+
+<aside aria-labelledby="si-h" style="width: 300px; flex: none; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 12px">
+<h2 id="si-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">Selected step</h2>
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 400; word-break: break-all">{{sel.label}}</div>
+<div style="display: flex; flex-direction: column; gap: 8px; font-size: 12px">
+<div style="display: flex; justify-content: space-between"><span style="color: #B8BAC8">Source</span><span style="font-family: 'JetBrains Mono', monospace; color: #ABA5FF; text-decoration: underline">{{sel.loc}}</span></div>
+<div style="display: flex; justify-content: space-between"><span style="color: #B8BAC8">Target</span><span style="font-family: 'JetBrains Mono', monospace">{{sel.target}}</span></div>
+<div style="display: flex; justify-content: space-between"><span style="color: #B8BAC8">Resolution</span><span>{{sel.resolution}}</span></div>
+<div style="display: flex; justify-content: space-between"><span style="color: #B8BAC8">Control</span><span style="font-family: 'JetBrains Mono', monospace">{{sel.control}}</span></div>
+</div>
+<p style="margin: 0; font-size: 12px; color: #B8BAC8; line-height: 1.5">{{sel.note}}</p>
+<button style="min-height: 40px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 13px; cursor: pointer">Read call site</button>
+<details style="margin-top: auto; font-size: 12px; color: #F7F7FB">
+<summary style="cursor: pointer; min-height: 32px">Mermaid source</summary>
+<div style="margin-top: 8px; padding: 8px; border-radius: 8px; background: #0B0C10; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 17px; white-space: pre; color: #F7F7FB">sequenceDiagram
+  participant H as navigation_at
+  participant S as Store
+  participant T as tx
+  H->>S: navigation_in(db, request, true)
+  S->>S: read_revision_for(tx, …)
+  alt Member(s)
+    S->>T: query_row(graph_nodes ⋈ …)
+  end
+  opt Some(path)
+    S->>T: query_row(length(source_bytes))
+    …</div>
+</details>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1200,"height":800}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { sel: 3 }; }
+  renderVals() {
+    const X = { H: 105, S: 395, T: 685 };
+    const lanes = [['H', 'navigation_at', 'StoreReader · store.rs:1732'], ['S', 'Store', 'src/store.rs'], ['T', 'tx', 'rusqlite::Connection · library']].map(([k, name, sub]) => ({ name, sub, x: X[k], left: X[k] - 85, border: k === 'T' ? '#777A8E' : '#777A8E' }));
+    const frames = [
+      { kind: 'alt', guard: 'request is Source(s)', x: 300, y: 166, w: 500, h: 120, hasElse: true, elseY: 210, elseGuard: 'Member(s)', elseLx: 312, elseLy: 214 },
+      { kind: 'opt', guard: 'selected_path is Some(path)', x: 300, y: 304, w: 500, h: 230, hasElse: false },
+      { kind: 'alt', guard: 'graph_len or native_len > 2 MiB', x: 320, y: 392, w: 460, h: 120, hasElse: false }
+    ];
+    const steps = [
+      { from: 'H', to: 'S', y: 78, label: 'navigation_in(&self.db, request, true)', loc: 'src/store.rs:1736', target: 'Store::navigation_in', resolution: 'same impl · syntax', control: 'straight-line', note: 'The reader delegates with pre_startup = true.' },
+      { from: 'S', to: 'S', y: 118, label: 'read_revision_for(tx, expected, pre_startup)', loc: 'src/store.rs:12841', target: 'Store::read_revision_for', resolution: 'same impl · syntax', control: 'straight-line', note: 'Pins the revision the request expects before any read.' },
+      { from: 'S', to: 'S', y: 194, label: 'path = s.path.clone()', loc: 'src/store.rs:12848', target: '—', resolution: 'no call', control: 'alt · Source', note: 'No call on this branch; shown so the alternative stays visible.', quiet: true },
+      { from: 'S', to: 'T', y: 252, label: 'query_row(graph_nodes ⋈ revision_documents)', loc: 'src/store.rs:12852', target: 'rusqlite::Connection::query_row', resolution: 'library · terminal', control: 'alt · Member', note: 'Locates the selected document by identity, not by the materialized kind.' },
+      { from: 'S', to: 'T', y: 350, label: 'query_row(length(source_bytes)…)', loc: 'src/store.rs:12866', target: 'rusqlite::Connection::query_row', resolution: 'library · terminal', control: 'opt · Some(path)', note: 'Reads only SQLite byte lengths before decoding, never every document.' },
+      { from: 'S', to: 'S', y: 440, label: 'report_index_failure(SelectedIntegrity(…))', loc: 'src/store.rs:12875', target: 'Store::report_index_failure', resolution: 'same impl · syntax', control: 'alt · over budget', note: 'Over-budget selections fail closed as incompatible_index.' },
+      { from: 'S', to: 'H', y: 490, label: 'return Err(…)', loc: 'src/store.rs:12875', target: 'early return', resolution: 'measured exit', control: 'alt · over budget', note: 'Early exit inside the budget guard.', ret: true }
+    ];
+    const sel = this.state.sel;
+    const msgs = steps.map((s, i) => {
+      const on = i === sel;
+      const color = on ? '#ABA5FF' : s.quiet ? '#777A8E' : '#F7F7FB';
+      let d, arrow, lx, ly;
+      if (s.from === s.to) {
+        const x = X[s.from];
+        d = 'M' + x + ' ' + (s.y - 8) + ' h36 v16 h-30';
+        arrow = (x + 6) + ',' + (s.y + 4) + ' ' + (x + 12) + ',' + (s.y + 8) + ' ' + (x + 12) + ',' + s.y;
+        arrow = (x + 1) + ',' + (s.y + 8) + ' ' + (x + 9) + ',' + (s.y + 4) + ' ' + (x + 9) + ',' + (s.y + 12);
+        lx = x + 44; ly = s.y - 10;
+      } else {
+        const x1 = X[s.from], x2 = X[s.to], dir = x2 > x1 ? 1 : -1;
+        d = 'M' + x1 + ' ' + s.y + ' L' + (x2 - dir * 2) + ' ' + s.y;
+        arrow = (x2 - dir * 9) + ',' + (s.y - 4) + ' ' + x2 + ',' + s.y + ' ' + (x2 - dir * 9) + ',' + (s.y + 4);
+        lx = Math.min(x1, x2) + 14; ly = s.y - 22;
+      }
+      return { d, arrow, lx, ly, color, w: on ? 2 : 1.4, dash: s.ret || s.quiet ? '4 3' : 'none', label: s.label,
+        labelBorder: on ? '#7770DC' : 'transparent', labelBg: on ? '#7770DC' : '#0B0C10', labelColor: on ? '#0B0C10' : (s.quiet ? '#B8BAC8' : '#F7F7FB'),
+        pressed: on ? 'true' : 'false', pick: () => this.setState({ sel: i }) };
+    });
+    return { lanes, frames, msgs, sel: steps[sel] || steps[0] };
+  }
+}
+</script>
+</body>
+</html>
