@@ -4107,8 +4107,9 @@ fn incoming_read_rejects_mismatched_indexed_call_language() {
         "{reported:#}"
     );
     assert!(store.recovery_pending_for_tests());
-    // The fence compares the pin only (#261): the corruption was already
-    // returned typed by the in-body reads and has scheduled recovery.
+    // The fence compares the pin only (#261): the in-body read already
+    // returned the typed corruption, and the separate native read above
+    // scheduled recovery.
     read.finish(()).unwrap();
 }
 
@@ -4235,8 +4236,9 @@ fn incoming_read_invalid_role_after_limited_valid_hits_fails_typed() {
         "{reported:#}"
     );
     assert!(store.recovery_pending_for_tests());
-    // The fence compares the pin only (#261): the corruption was already
-    // returned typed by the in-body reads and has scheduled recovery.
+    // The fence compares the pin only (#261): the in-body read already
+    // returned the typed corruption, and the separate native read above
+    // scheduled recovery.
     read.finish(()).unwrap();
 }
 

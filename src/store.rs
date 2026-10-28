@@ -3231,8 +3231,10 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
 type CacheObject = (String, String, String, Option<String>);
 
 #[cfg(test)]
-static EXPECTED_CACHE_SHAPE_BUILDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Expected-shape builds started on this thread.
+    static EXPECTED_CACHE_SHAPE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The expected shape is process-wide and immutable. A failed build is
 /// returned to the caller and not cached, so the next call retries.
@@ -3241,14 +3243,12 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     if let Some(objects) = EXPECTED.get() {
         return Ok(objects);
     }
+    #[cfg(test)]
+    EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(CACHE_SCHEMA_V25)?;
     let built = cache_objects(&expected)?;
-    Ok(EXPECTED.get_or_init(|| {
-        #[cfg(test)]
-        EXPECTED_CACHE_SHAPE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        built
-    }))
+    Ok(EXPECTED.get_or_init(|| built))
 }
 
 fn cache_objects(db: &Connection) -> Result<Vec<CacheObject>> {
@@ -3278,15 +3278,17 @@ mod cache_shape_once_tests {
 
     #[test]
     fn expected_shape_is_built_once_across_calls() {
-        use std::sync::atomic::Ordering;
         let first = expected_cache_objects().unwrap();
-        let builds = EXPECTED_CACHE_SHAPE_BUILDS.load(Ordering::SeqCst);
+        let builds = EXPECTED_CACHE_SHAPE_BUILDS.with(std::cell::Cell::get);
         assert!(builds <= 1, "built {builds} times");
         for _ in 0..3 {
             validate_cache_shape(&current_schema_db()).unwrap();
         }
         assert!(std::ptr::eq(first, expected_cache_objects().unwrap()));
-        assert_eq!(EXPECTED_CACHE_SHAPE_BUILDS.load(Ordering::SeqCst), builds);
+        assert_eq!(
+            EXPECTED_CACHE_SHAPE_BUILDS.with(std::cell::Cell::get),
+            builds
+        );
     }
 
     #[test]
