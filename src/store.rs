@@ -1,5 +1,6 @@
 //! SQLite index snapshots and request queues. Connections are never shared between threads.
 pub mod anchors;
+mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
 pub mod requests;
