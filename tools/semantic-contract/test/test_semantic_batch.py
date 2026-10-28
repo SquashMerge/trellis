@@ -128,6 +128,26 @@ class WriteBatchTests(unittest.TestCase):
             self.assertGreater(entry["byteLength"] + row_length + 1, limit)
         self.assertEqual(sum(p["rowCount"] for p in source_pages), 12)
 
+    def test_every_page_fits_the_byte_bound_across_multi_digit_ordinals(self):
+        rows = sources(600)
+        # Exactly two rows fit at a one-digit ordinal; wider ordinals leave room for only one.
+        limit = len(batch.canonical({"formatVersion": 1, "kind": "source", "ordinal": 0, "rows": rows[:2]}))
+        pages = batch.paginate("source", rows, 1000, limit)
+        self.assertGreater(len(pages), 100)
+        self.assertEqual(sum(len(page_rows) for _, page_rows, _ in pages), 600)
+        for _, _, data in pages:
+            self.assertLessEqual(len(data), limit)
+
+    def test_non_empty_output_directory_and_empty_rows_are_refused_before_writing(self):
+        with self.assertRaisesRegex(ValueError, "new or empty"):
+            self.dir.mkdir()
+            (self.dir / "stale").write_text("x")
+            emit(self.dir, sources(1))
+        empty = Path(self.temp.name) / "other"
+        with self.assertRaisesRegex(ValueError, "at least one source and one coverage"):
+            emit(empty, [], [])
+        self.assertFalse(empty.exists())
+
     def test_a_row_larger_than_the_page_bound_is_refused(self):
         with self.assertRaisesRegex(ValueError, "single source row"):
             emit(self.dir, sources(1), max_page_bytes=50)

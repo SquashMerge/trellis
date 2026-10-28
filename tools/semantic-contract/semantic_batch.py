@@ -55,7 +55,10 @@ def check_strictly_sorted(rows, label):
 def paginate(kind, rows, rows_per_page, max_page_bytes):
     """Split rows so that a page closes before the next row would exceed a bound."""
     pages, current, size = [], [], 0
-    overhead = len(canonical({"formatVersion": FORMAT_VERSION, "kind": kind, "ordinal": 0, "rows": []}))
+    base = len(canonical({"formatVersion": FORMAT_VERSION, "kind": kind, "ordinal": 0, "rows": []}))
+
+    def overhead():
+        return base + len(str(len(pages))) - 1
 
     def close():
         ordinal = len(pages)
@@ -64,13 +67,15 @@ def paginate(kind, rows, rows_per_page, max_page_bytes):
 
     for row in rows:
         length = len(canonical(row))
-        if overhead + length > max_page_bytes:
+        if overhead() + length > max_page_bytes:
             raise ValueError(f"a single {kind} row exceeds the page byte bound")
         grown = size + length + (1 if current else 0)
-        if current and (len(current) == rows_per_page or overhead + grown > max_page_bytes):
+        if current and (len(current) == rows_per_page or overhead() + grown > max_page_bytes):
             close()
             current, size = [], 0
             grown = length
+            if overhead() + length > max_page_bytes:
+                raise ValueError(f"a single {kind} row exceeds the page byte bound")
         current.append(row)
         size = grown
     if current:
@@ -106,6 +111,10 @@ def write_batch(out_dir, header, sources, coverage, artifacts, rows_per_page=MAX
             raise ValueError(f"unknown exclusion {row['exclusion']!r}")
         if row["artifact"] is not None and not 0 <= row["artifact"] < len(artifacts):
             raise ValueError("coverage artifact ordinal out of range")
+    if not sources or not coverage:
+        raise ValueError("at least one source and one coverage row are required")
+    if out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir())):
+        raise ValueError("the output directory must be new or empty")
     prefix = out_dir.resolve().relative_to(root.resolve()).as_posix()
 
     def relative(name):
@@ -120,8 +129,6 @@ def write_batch(out_dir, header, sources, coverage, artifacts, rows_per_page=MAX
             page_entries.append({"kind": kind, "ordinal": ordinal, "relativePath": relative(name),
                                  "byteLength": len(data), "sha256": sha256(data),
                                  "rowCount": len(page_rows)})
-    if not page_entries or not sources or not coverage:
-        raise ValueError("at least one source and one coverage row are required")
     artifact_entries = []
     for ordinal, artifact in enumerate(artifacts):
         if "data" in artifact:

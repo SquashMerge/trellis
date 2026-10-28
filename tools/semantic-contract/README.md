@@ -190,5 +190,7 @@ batch emitter the runner uses after probing the workspace:
 `write_batch(out_dir, header, sources, coverage, artifacts)` writes the source and
 coverage pages (a page closes before the next row would exceed 1,000 rows or
 1 MiB), any inline artifacts and `descriptor.json`, and returns the descriptor path
-and SHA-256. `canonical`, `source_manifest_hash` and `DESCRIPTOR_KEYS` are shared
+and SHA-256. It requires a new or empty `out_dir` and non-empty source and coverage
+rows (checked before anything is written); the optional `root` keyword names the
+workspace root that descriptor paths are relative to (default `out_dir`). `canonical`, `source_manifest_hash` and `DESCRIPTOR_KEYS` are shared
 with the runner and its tests.
