@@ -19,6 +19,7 @@ mod extractor_inputs_tests;
 pub mod file_tree;
 pub mod files_view;
 pub mod git_status;
+pub mod graph_query;
 pub mod http;
 pub mod index_coordinator;
 pub mod indexer;
