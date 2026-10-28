@@ -575,9 +575,17 @@ fn commit_contention_requeues_the_request_instead_of_rejoining_or_failing() {
     let marker = home_marker.path().join("commit-busy.marker");
     // The first COMMIT fails from contention and rolls back; the request is requeued typed
     // `storage_busy` instead of being re-joined (which would charge the lookup budget again).
+    // One join costs 144 lookup steps; a limit of 200 admits one join but not two, so an
+    // in-request re-join after the failed COMMIT would fail with `limit_exceeded`.
     let world = World::new(
         four_language_workspace,
-        &[("TRELLIS_TEST_SEMANTIC_COMMIT_BUSY", &marker)],
+        &[
+            ("TRELLIS_TEST_SEMANTIC_COMMIT_BUSY", marker.as_path()),
+            (
+                "TRELLIS_TEST_SEMANTIC_LIMITS",
+                Path::new(r#"{"lookup_steps":200}"#),
+            ),
+        ],
     );
     let (descriptor, sha) = four_language_batch(&world);
     let before = world.head();
@@ -702,6 +710,7 @@ fn claim_time_causes_map_to_stable_terminal_codes() {
 fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_completes() {
     let world = World::new(four_language_workspace, &[]);
     world.stop_daemon();
+    let log = world._temp.path().join("daemon.log");
     // A durable version-one row, as an older build would have queued it.
     let v1 = world
         .store
@@ -719,6 +728,7 @@ fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_comp
         fixture.artifact(language, docs);
     }
     let (descriptor, sha) = world.write_unwatched(&fixture);
+    let _daemon = LoggedDaemon::start(&world.home, &log, &[]);
     // The new daemon reads the FIFO head at startup without decoding it, claims it, fails it
     // typed, and only then reaches the later request.
     let imported = succeeded(&world.import(&descriptor, &sha));
@@ -731,6 +741,11 @@ fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_comp
         (old.1.as_str(), old.2.as_deref()),
         ("failed", Some("index_failed"))
     );
+    trellis::testing::wait_until("v1 diagnostic cause", || {
+        fs::read_to_string(&log).is_ok_and(|text| {
+            text.contains("request_failure=invalid_request: semantic import options")
+        })
+    });
     let last = queue.last().unwrap();
     assert_ne!(last.0, v1.id);
     assert_eq!((last.1.as_str(), last.2.as_deref()), ("done", None));

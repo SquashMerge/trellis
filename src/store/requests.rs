@@ -512,7 +512,7 @@ impl Request {
         );
         ensure!(
             self.options_json.len() <= MAX_SEMANTIC_OPTIONS_BYTES,
-            "invalid request options length"
+            "invalid_request: invalid request options length"
         );
         let options: SemanticImportOptions = serde_json::from_str(&self.options_json)
             .map_err(|_| anyhow::anyhow!("invalid_request: semantic import options"))?;
@@ -1300,7 +1300,7 @@ impl Store {
         let encoded = serde_json::to_string(&options)?;
         ensure!(
             encoded.len() <= MAX_SEMANTIC_OPTIONS_BYTES,
-            "invalid request options length"
+            "invalid_request: invalid request options length"
         );
         // Retry only queue admission. No request has been inserted yet; once
         // IMMEDIATE begins, even an ambiguous COMMIT must never be re-enqueued.
@@ -2233,7 +2233,9 @@ mod tests {
             .enqueue_semantic_options_json_for_tests(&root, &oversized)
             .unwrap_err();
         assert!(
-            error.to_string().contains("invalid request options length"),
+            error
+                .to_string()
+                .contains("invalid_request: invalid request options length"),
             "{error:#}"
         );
         assert_eq!(rows(&store), before);

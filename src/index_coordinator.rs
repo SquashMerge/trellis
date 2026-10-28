@@ -1844,8 +1844,9 @@ fn run_semantic_batch_request(
         )
         .map_err(batch_error)?;
         #[cfg(all(feature = "test-support", unix))]
-        if joined.captured_pin() != destination_pin
-            && let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET")
+        if store.with_native_reader(destination_pin, |reader| {
+            Ok(reader.header()?.revision.id != admitted.descriptor().source_revision)
+        })? && let Some(path) = std::env::var_os("TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET")
         {
             use std::os::unix::net::UnixListener;
             let path = std::path::PathBuf::from(path);
