@@ -64,7 +64,7 @@ struct Search<'a> {
     source: &'a str,
     names: &'a str,
     ids: &'a str,
-    joins: &'a str,
+    joins: &'a [&'a str],
     name: &'a str,
     id: &'a str,
     query_parameter: usize,
@@ -87,8 +87,11 @@ impl Search<'_> {
         let mut values = values.to_vec();
         values.push(&expression);
         // Open FTS even on misses, so corruption never becomes an empty answer.
-        // Probe only one row beyond the requested result count, not all matches.
-        let probe_limit = limit.saturating_add(1);
+        // Keep small candidate sets on the FTS-driven join-and-sort path.
+        // This is a global (retained-history) count, not revision density.
+        const ORDERED_THRESHOLD: i64 = 4096;
+        let threshold = ORDERED_THRESHOLD.max(limit);
+        let probe_limit = threshold.saturating_add(1);
         let count: i64 = storage_result(db.query_row(
             &format!(
                 "SELECT count(*) FROM (SELECT rowid FROM {names} WHERE {names} MATCH ?1 LIMIT ?2)",
@@ -97,7 +100,9 @@ impl Search<'_> {
             rusqlite::params![expression, probe_limit],
             |row| row.get(0),
         ))?;
-        if limit > 0 && count > limit {
+        if limit > 0 && count > threshold {
+            #[cfg(test)]
+            ORDERED_SEARCHES.set(ORDERED_SEARCHES.get() + 1);
             return self
                 .ordered_hits(db, query, limit, id_shaped, &values)
                 .map(unranked);
@@ -143,12 +148,21 @@ impl Search<'_> {
         )
     }
 
+    fn joins(&self, ordered: bool) -> String {
+        let keyword = if ordered { "CROSS JOIN" } else { "JOIN" };
+        self.joins
+            .iter()
+            .map(|join| format!("{keyword} {join}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn sql(&self, from: &str) -> String {
         format!(
             "SELECT {columns} FROM {from} {joins} WHERE {literal}
                 ORDER BY 3,{name} COLLATE BINARY,{id} LIMIT ?{limit}",
             columns = self.columns,
-            joins = self.joins,
+            joins = self.joins(false),
             literal = self.literal(),
             name = self.name,
             id = self.id,
@@ -172,6 +186,8 @@ impl Search<'_> {
                 format!("lower({name})=lower(?{q}) AND {membership}"),
             ),
             1 => {
+                // The folded range narrows the input, but lower(name) order
+                // is not binary name order. SQLite sorts these prefix hits.
                 let end = if upper {
                     format!("AND lower({name}) < ?{}", self.match_parameter + 1)
                 } else {
@@ -212,7 +228,7 @@ impl Search<'_> {
             source = self.source,
             // Keep the ordered source outermost; sparse/literal queries retain
             // their ordinary joins and SQLite's original planning freedom.
-            joins = self.joins.replace("JOIN ", "CROSS JOIN "),
+            joins = self.joins(true),
             id = self.id,
             limit = self.limit_parameter,
         )
@@ -304,8 +320,10 @@ fn w2_search() -> Search<'static> {
         ids: "SELECT d.rowid FROM revision_documents m
             JOIN native_version_declarations d ON d.vid=m.vid
             WHERE m.revision_id=?1 AND instr('sid:v1:'||lower(hex(d.syntax_id)),lower(?2))>0",
-        joins: "JOIN revision_documents m ON m.vid=d.vid AND m.revision_id=?1
-            JOIN document_versions v ON v.vid=d.vid",
+        joins: &[
+            "revision_documents m ON m.vid=d.vid AND m.revision_id=?1",
+            "document_versions v ON v.vid=d.vid",
+        ],
         name: "d.name",
         id: "d.syntax_id",
         query_parameter: 2,
@@ -333,7 +351,7 @@ fn graph_search() -> Search<'static> {
             JOIN graph_nodes n ON n.gid=m.gid
             WHERE m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1)
             AND instr('sid:v1:'||lower(hex(n.id)),lower(?1))>0",
-        joins: "JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.gid=n.gid",
+        joins: &["revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.gid=n.gid"],
         name: "n.name",
         id: "n.id",
         query_parameter: 1,
@@ -378,6 +396,7 @@ fn ranked(
 thread_local! {
     static FORCE_LITERAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ID_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ORDERED_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many ID scans this thread has run, so a test can see the shortcut.
@@ -529,6 +548,241 @@ mod tests {
                 assert!(format!("{prefix}tail") < end);
             } else {
                 assert_eq!(prefix, "\u{10ffff}");
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_scattered_matches_keep_the_fts_driven_query() {
+        for count in [22, 100, 200] {
+            let db = ranking_fixture();
+            let query = format!("sparse{count}q");
+            for at in 1..=3200 {
+                // Spread hits across the entire binary-name range, including
+                // retained rows that cannot answer the selected revision.
+                let spacing = 3200 / count;
+                let hit = at % spacing == 0 && at / spacing <= count;
+                let name = format!("{at:04}_{}", if hit { &query } else { "other" });
+                let owner = if hit && at / spacing % 3 == 0 { 2 } else { 1 };
+                insert_ranked(&db, at, owner, Some(&name));
+            }
+            for search in [w2_search(), graph_search()] {
+                let before = ORDERED_SEARCHES.get();
+                let limit = 21;
+                let revision = "pin:v1:test:1";
+                let mut values: Vec<&dyn rusqlite::ToSql> = vec![&query, &limit];
+                if search.query_parameter == 2 {
+                    values.insert(0, &revision);
+                }
+                let hits = search.hits(&db, &query, limit, &values).unwrap();
+                let literal =
+                    with_literal_scan(|| search.hits(&db, &query, limit, &values)).unwrap();
+                assert_eq!(hits, literal, "{} {count}", search.source);
+                assert_eq!(
+                    ORDERED_SEARCHES.get(),
+                    before,
+                    "{}: {count} scattered FTS matches must not select an ordered walk",
+                    search.source,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_dispatch_requires_more_than_the_global_threshold_and_limit() {
+        let db = ranking_fixture();
+        for rowid in 1..=4096 {
+            let owner = if rowid % 2 == 0 { 2 } else { 1 };
+            insert_ranked(&db, rowid, owner, Some("a_thresholdq"));
+        }
+        for (count, limit, ordered_expected) in
+            [(4096, 21, false), (4097, 21, true), (4097, 4097, false)]
+        {
+            if count == 4097 && limit == 21 {
+                insert_ranked(&db, 4097, 1, Some("a_thresholdq"));
+            }
+            for search in [w2_search(), graph_search()] {
+                let before = ORDERED_SEARCHES.get();
+                let query = "thresholdq";
+                let revision = "pin:v1:test:1";
+                let mut values: Vec<&dyn rusqlite::ToSql> = vec![&query, &limit];
+                if search.query_parameter == 2 {
+                    values.insert(0, &revision);
+                }
+                let hits = search.hits(&db, query, limit, &values).unwrap();
+                let literal =
+                    with_literal_scan(|| search.hits(&db, query, limit, &values)).unwrap();
+                assert_eq!(hits, literal);
+                assert_eq!(
+                    ORDERED_SEARCHES.get() - before,
+                    usize::from(ordered_expected),
+                    "{} count={count} limit={limit}",
+                    search.source
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_tier_uses_a_folded_range_and_sorts_binary_names() {
+        use rusqlite::StatementStatus;
+        let db = ranking_fixture();
+        // Folded order is ocaa, ocaz, but binary order is OCAz, ocaa.
+        for (at, name) in ["ocaa", "OCAz", "oca", "a_oca", "other"].iter().enumerate() {
+            insert_ranked(&db, at as i64 + 1, 1, Some(name));
+        }
+        for search in [w2_search(), graph_search()] {
+            let query = "oca";
+            let expression = match_expression(query).unwrap();
+            let upper = prefix_end(query).unwrap();
+            let limit = 21;
+            let revision = "pin:v1:test:1";
+            let mut values: Vec<&dyn rusqlite::ToSql> = vec![&query, &limit, &expression, &upper];
+            if search.query_parameter == 2 {
+                values.insert(0, &revision);
+            }
+            let sql = search.ordered_sql(1, true, false);
+            let plan: Vec<String> = db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(values.as_slice(), |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|p| p.contains("USING COVERING INDEX")
+                    && p.contains("_search_folded")
+                    && p.contains("<expr>>?")
+                    && p.contains("<expr><?")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().any(|p| p.contains("TEMP B-TREE FOR ORDER BY")),
+                "{plan:?}"
+            );
+            let mut statement = db.prepare(&sql).unwrap();
+            let ids: Vec<Vec<u8>> = statement
+                .query_map(values.as_slice(), |r| r.get(1))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                ids,
+                [2, 1].map(
+                    |id| super::super::id_codec::encode_sid(&format!("sid:v1:{id:032x}")).unwrap()
+                )
+            );
+            assert_eq!(statement.get_status(StatementStatus::Sort), 1);
+        }
+    }
+
+    #[test]
+    fn seeded_differential_search_matches_literal_for_native_and_graph() {
+        use rand::{RngExt, SeedableRng};
+        const SEED: u64 = 0x0038_2384_0013;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+        let db = ranking_fixture();
+        let fragments = [
+            "Needle",
+            "nEEdLe",
+            "abc",
+            "aBc",
+            "Éab",
+            "éab",
+            "東京名",
+            "😀ab",
+            "\"hi\"",
+            "a\0b",
+            "short",
+            "aßZ",
+            "\u{d7ff}ab",
+            "\u{10ffff}ab",
+        ];
+        let mut queries: Vec<String> = [
+            "needle",
+            "NEEDLE",
+            "abc",
+            "AbC",
+            "Éab",
+            "éab",
+            "東京名",
+            "😀ab",
+            "\"hi\"",
+            "a\0b",
+            "a",
+            "ab",
+            "sid:v1:",
+            "SID",
+            "v1:",
+            "absent",
+            "\u{d7ff}ab",
+            "\u{10ffff}ab",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for rowid in 1..=768 {
+            let first = fragments[rng.random_range(0..fragments.len())];
+            let second = fragments[rng.random_range(0..fragments.len())];
+            // Duplicates, exact names, prefixes and interior hits; rowids do
+            // not correlate with binary-name order or revision membership.
+            let name = match rng.random_range(0..4) {
+                0 => first.to_owned(),
+                1 => format!("{first}_{second}"),
+                _ => format!("{:03}_{first}_{second}", rng.random_range(0..128)),
+            };
+            let owner = if rng.random_ratio(1, 3) { 2 } else { 1 };
+            let named = !rng.random_ratio(1, 16);
+            insert_ranked(&db, rowid, owner, named.then_some(name.as_str()));
+            let id = format!("sid:v1:{:032x}", rng.random::<u128>());
+            let encoded = super::super::id_codec::encode_sid(&id).unwrap();
+            db.execute(
+                "UPDATE native_version_declarations SET syntax_id=?1 WHERE rowid=?2",
+                rusqlite::params![encoded, rowid],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE graph_nodes SET id=?1 WHERE rowid=?2",
+                rusqlite::params![encoded, rowid],
+            )
+            .unwrap();
+            if rowid % 64 == 0 {
+                queries.push(id[28..].to_ascii_uppercase());
+                let start = rng.random_range(0..name.chars().count() - 2);
+                queries.push(name.chars().skip(start).take(3).collect());
+            }
+        }
+        for query in &queries {
+            for limit in [0, 1, 7, 21, 1000] {
+                for search in [w2_search(), graph_search()] {
+                    let revision = "pin:v1:test:1";
+                    let mut values: Vec<&dyn rusqlite::ToSql> = vec![query, &limit];
+                    if search.query_parameter == 2 {
+                        values.insert(0, &revision);
+                    }
+                    let literal =
+                        with_literal_scan(|| search.hits(&db, query, limit, &values)).unwrap();
+                    let actual = search.hits(&db, query, limit, &values).unwrap();
+                    assert_eq!(
+                        actual, literal,
+                        "seed={SEED:x} {} {query:?} limit={limit}",
+                        search.source
+                    );
+                    if let Some(expression) = match_expression(query) {
+                        values.push(&expression);
+                        // Exercise all ordered tiers directly at normal size,
+                        // independent of the production density heuristic.
+                        let ordered = search
+                            .ordered_hits(&db, query, limit, can_match_an_id(query), &values)
+                            .unwrap();
+                        assert_eq!(
+                            unranked(ordered),
+                            literal,
+                            "ordered seed={SEED:x} {} {query:?} limit={limit}",
+                            search.source
+                        );
+                    }
+                }
             }
         }
     }
