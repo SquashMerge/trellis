@@ -67,6 +67,7 @@ fn snapshot(files: &[(&str, &str)]) -> Snapshot {
 }
 // Snapshot construction is outside the deadline. Each run covers references and
 // rules with one shared absolute deadline, including the final serialization.
+// The deadline is a hang backstop only; check speed is measured separately (#377).
 fn scaled_checkout_projection(input: &Snapshot, sample_limit: usize) -> Value {
     let config = trellis::rules::parse(
         r#"version=1
@@ -85,7 +86,7 @@ require=[{calls="any"}]
     )
     .unwrap();
     let run = |workers: usize| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut check = || {
             anyhow::ensure!(std::time::Instant::now() < deadline, "deadline_exceeded");
             Ok(())
