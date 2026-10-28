@@ -32,17 +32,16 @@ There are two app modes and one shared diagram set:
 ## Rules for implementing this (from the repo; they win over the mockup)
 
 1. **Read `CLAUDE.md`, `AGENTS.md`, `SPEC.md` §9 and §11, `DESIGN.md`, and `docs/terminal-workbench-contract.md` first.** If the mockup and a ratified contract disagree, the contract wins. Flag the conflict; don't silently pick.
-2. **Brand conflict to resolve first.** `DESIGN.md` and `docs/design-refresh-contract.md` still specify the old warm-charcoal / flame-orange palette and Space Grotesk. This mockup uses the SquashMerge brand (`brand/tokens.css`: Inter, Manrope, JetBrains Mono). An owner amendment to those two docs is the first slice. Until then, don't restyle.
+2. **Brand: already amended.** `DESIGN.md` and `docs/design-refresh-contract.md` carry the owner-approved SquashMerge brand amendment (commit `85c027d`; Inter, Manrope, JetBrains Mono per `brand/tokens.css`), and the running workbench is restyled. Those two documents are the authority; this packet's brand notes are background.
 3. **No placeholder capabilities.** Per `DESIGN.md`, don't ship controls that imply something works when it doesn't. That covers three things:
    - Herdr attach, embedded agent terminals and the design handoff are each **gated on their own contract and acceptance**.
    - Build them only when that slice is scheduled.
    - Until then, hide them; never show a disabled fake.
 4. **Stack stays as is.** Vanilla JS/CSS in `web/`, no framework, no CDN.
-   - Fonts are served locally from `web/fonts/` with their OFL licenses.
-   - Inter and Manrope need adding there, and Space Grotesk removing.
+   - Fonts are served locally from `web/fonts/` with their OFL licenses (already done with the brand amendment).
    - The mockup's Google Fonts link is a mockup convenience only.
    - Keep the existing Host/Origin/CSP checks.
-5. **Diagrams render as Mermaid → Pele 1.6.0** (`web/vendor/pele-1.6.0.js`; `docs/semantic-evidence/decisions/0014-pele-structure-rendering.md`).
+5. **Diagrams render as Mermaid → Pele** using the vendored renderer in `web/vendor/` (currently `pele-1.10.0-trellis.2.js`; see `web/vendor/README.md` and `docs/semantic-evidence/decisions/0014-pele-structure-rendering.md`). The mockup's "Pele 1.6.0" labels are historical.
    - Project each view from its measured, revision-bound DTO. Map rendered elements back to Trellis IDs, never Pele's `data-id`.
    - Don't infer anything the model doesn't contain.
    - Respect the diagram size cap in SPEC §9.
@@ -82,7 +81,7 @@ There are two app modes and one shared diagram set:
 - **Selection:** purple fill, ink text.
 - **Links:** lavender, underlined.
 - **Focus ring:** 2px lavender, 3px offset.
-- **Heat ramp:** line, gold, amber, orange by quartile of the visible modules, with ink text on warm fills. It reverses for Maintainability. Always show a legend ("low … high").
+- **Heat ramp:** line, gold, amber, orange by **fixed per-metric thresholds** (#395; the mockup's quartile binning is superseded), with ink text on warm fills. It reverses for Maintainability. Always show a legend stating the bands.
 - **Logo:**
   - The full lockup only appears on Connect, at about 280px of visible artwork with clear space.
   - App headers use the small symbol and the text "Trellis by SquashMerge". The symbol is provisional (see above).
@@ -111,7 +110,7 @@ Reviewed in the running app at `localhost:8877` on 2026-10-28, at 1440×900, che
    - Show only non-zero counts as compact chips, with upward deviations in the error color (e.g. storage ↑56, indexing ↑7).
    - Draw the arrows between bands with those counts.
 4. **Exclude vendored code from metrics.**
-   - The web layer's max cognitive (582) is almost certainly `web/vendor/pele-1.6.0.js`, which also sets the Sequence legend's top bin to ">181".
+   - The web layer's max cognitive (582) is almost certainly the vendored Pele bundle in `web/vendor/`, which also sets the Sequence legend's top bin to ">181".
    - Leave vendored files out of metrics, or at least out of the heat scale.
 
 ### Treemap
@@ -170,7 +169,7 @@ Item numbers in brackets refer to the gap list above.
 1. **Metrics hygiene** [4, 2, 6].
    - Exclude vendored code from metrics and heat scales.
    - Hide test and fixture files and layers unless "Include tests" is on.
-   - Compute heat bins from what's visible.
+   - Use **fixed per-metric thresholds** for heat colors (owner ruling 2026-10-28, #395), not quartiles of the visible set; an optional, clearly labelled "Relative" toggle may show visible-set quartiles.
    - Small change, and it makes every colored view readable.
 2. **Architecture at module level** [1, 3].
    - One chip per module in each band; files on click.
@@ -204,7 +203,7 @@ Item numbers in brackets refer to the gap list above.
 ## Open questions for the owner
 
 - ~~Where does the layer map live?~~ Settled: `.trellis/rules.toml` (#129), proposed by the agent, approved by PR.
-- Should the metric color ramp be quartiles of the visible set (as drawn) or fixed thresholds?
+- ~~Should the metric color ramp be quartiles of the visible set (as drawn) or fixed thresholds?~~ Settled 2026-10-28: fixed per-metric thresholds (#395). The mockup's quartile coloring is superseded.
 - In Without-Herdr mode, what does "Design a change" produce: a saved request picked up via `trellis mcp`, or copy-to-clipboard?
 - How does the "Follow active tab" toggle in With-Herdr mode behave when the tab's cwd isn't an indexed checkout?
 

@@ -10,7 +10,7 @@ Then read `CLAUDE.md`, `AGENTS.md`, `DESIGN.md`, `docs/design-refresh-contract.m
 
 Don't write code yet. Report back with:
 
-1. Where the mockup conflicts with a ratified contract or decision (including the brand palette/fonts conflict), and which side you think should change.
+1. Where the mockup conflicts with a ratified contract or decision, and which side you think should change. (The brand palette/fonts are already amended in `DESIGN.md` and `docs/design-refresh-contract.md`; the heat scale is fixed per-metric thresholds per #395.)
 2. For each screen in `SCREENS.md`, which daemon endpoints and DTOs already exist, and what's missing. In particular:
    - the metrics:v1 API
    - prod/test reference counts between modules
@@ -21,6 +21,6 @@ Don't write code yet. Report back with:
 Constraints:
 
 - Stack: vanilla JS in `web/`, no framework, no CDN. Fonts are served locally.
-- Pele 1.6.0 is vendored. Label text from the repository is untrusted.
+- Pele is vendored (`web/vendor/pele-1.10.0-trellis.2.js`). Label text from the repository is untrusted.
 - Mockup values are illustrative; don't hard-code them.
 - Don't build placeholder UI for capabilities that don't exist.
