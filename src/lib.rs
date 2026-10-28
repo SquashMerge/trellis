@@ -39,6 +39,7 @@ pub mod navigation;
 mod parallel;
 pub mod references;
 pub mod rules;
+mod rules_edit;
 mod rust_sources;
 pub mod scip_admission;
 mod scip_raw;

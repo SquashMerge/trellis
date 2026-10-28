@@ -1,7 +1,10 @@
 # Reviewed architecture rules
 
 Trellis checks human-reviewed architecture in the fixed checkout file
-`.trellis/rules.toml`. It does not infer layers during a check or write rules.
+`.trellis/rules.toml`. Checks do not infer layers or write rules. The
+[Architecture workbench](architecture-view.md#review-and-authoring) can author reviewed
+exceptions and exact file assignments through an explicit diff preview and confirmation.
+MCP and CLI rules operations remain read-only.
 Layers select indexed **native file modules by path** and proved **external package
 identities**. Package targets are not native modules or resolved library symbols. It exposes
 read-only references, rule check/explain tools, a proposal prompt and

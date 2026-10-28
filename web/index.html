@@ -123,6 +123,46 @@
               <label><input id="architecture-metric-tests" type="checkbox"> Include tests in metrics</label>
               <label><input id="architecture-tests" type="checkbox"> Test-only edges</label>
             </div>
+            <div class="architecture-controls architecture-review-actions">
+              <button id="architecture-review" type="button">Review deviations</button>
+              <button id="architecture-unassigned" type="button">Unassigned files</button>
+              <button id="architecture-authored" type="button">Authored exceptions</button>
+            </div>
+            <section id="architecture-review-panel" aria-label="Architecture review" hidden>
+              <div class="architecture-controls">
+                <strong id="architecture-review-scope">All rule instances</strong>
+                <label for="architecture-review-role">References</label><select id="architecture-review-role"><option value="all">Production and test</option><option value="production">Production</option><option value="test">Test only</option></select>
+                <label for="architecture-review-state">Verdict</label><select id="architecture-review-state"><option value="deviates">Deviates</option><option value="unknown">Unknown</option><option value="excepted">Excepted</option><option value="all">All verdicts</option></select>
+                <button id="architecture-review-close" type="button">Close review</button>
+              </div>
+              <div id="architecture-review-list" class="architecture-review-list"></div>
+              <div class="architecture-controls">
+                <label for="architecture-source-glob">Source glob</label><input id="architecture-source-glob" value="**" maxlength="8192" placeholder="src/**">
+                <label for="architecture-destination-layer">Destination layer</label><select id="architecture-destination-layer"><option value="">All layers</option></select>
+                <button id="architecture-select-scope" type="button">Select witnessed pairs</button>
+                <button id="architecture-add-selected" type="button">Add selected exceptions</button>
+              </div>
+              <p id="architecture-review-selection-state" role="status" aria-live="polite"></p>
+              <div id="architecture-exceptions"></div>
+              <section id="architecture-editor" aria-label="Rules change" hidden>
+                <h3 id="architecture-edit-title">Rules change</h3>
+                <p id="architecture-edit-scope"></p>
+                <label id="architecture-reason-label" for="architecture-reason">Exception reason</label><textarea id="architecture-reason" rows="3" required></textarea>
+                <p id="architecture-edit-state" role="status" aria-live="polite"></p>
+                <div class="architecture-controls">
+                  <button id="architecture-preview" type="button">Preview change</button>
+                  <button id="architecture-rules-reload" type="button">Reload rules</button>
+                  <button id="architecture-cancel" type="button">Cancel change</button>
+                </div>
+                <section id="architecture-preview-result" hidden>
+                  <h3>Exact rules diff</h3><pre id="architecture-diff"></pre>
+                  <details><summary>Exact proposed rules text</summary><pre id="architecture-proposed-text"></pre></details>
+                  <details><summary>Resolved finite pair list</summary><pre id="architecture-preview-pairs"></pre></details>
+                  <p>Only these literal file pairs are approved. Future files and layer members are not waived.</p>
+                  <button id="architecture-confirm" type="button">Confirm rules change</button>
+                </section>
+              </section>
+            </section>
             <p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent.</p>
             <p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p>
             <div id="architecture-legend" class="metric-legend" aria-label="Architecture metric heat legend"></div>

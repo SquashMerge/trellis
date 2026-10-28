@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {mkdirSync, writeFileSync, rmSync} = require("node:fs");
+const {mkdirSync, readFileSync, writeFileSync, rmSync} = require("node:fs");
 const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
@@ -83,7 +83,7 @@ async function published(config, callback) {
     });
     page.on("request", request => {
       const url = new URL(request.url());
-      if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method()});
+      if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method(), body:request.postDataJSON()});
     });
     await H.connect(page, server, paths.token);
     await page.locator("#view-architecture").click();
@@ -96,6 +96,16 @@ async function published(config, callback) {
       assert.equal(row.url.searchParams.get("indexGeneration"), pin.indexGeneration);
       assert.equal(row.url.searchParams.get("indexRevision"), String(pin.indexRevision));
       assert.ok(row.url.pathname.startsWith(`/api/checkouts/${server.rootKey}/`));
+    }
+    for (const row of requests.filter(row => row.url.pathname.includes("/architecture/rules"))) {
+      assert.ok(row.url.pathname.startsWith(`/api/checkouts/${server.rootKey}/`), "rules requests remain checkout scoped");
+      const selectedPin = row.method === "GET" ? Object.fromEntries(row.url.searchParams) : row.body;
+      assert.equal(selectedPin.indexGeneration, pin.indexGeneration);
+      assert.equal(String(selectedPin.indexRevision), String(pin.indexRevision));
+      if (row.method === "POST") {
+        assert.equal(typeof row.body.baseHash, "string");
+        assert.ok(Array.isArray(row.body.operations));
+      }
     }
     for (const row of requests.filter(row => row.url.pathname.endsWith("/source"))) {
       assert.equal(row.url.searchParams.get("indexGeneration"), pin.indexGeneration);
@@ -378,6 +388,285 @@ test("Architecture rejects a route-gated production response after all-callable 
   }
 }));
 
+
+
+const rulesPath = paths => join(paths.workspace, ".trellis/rules.toml");
+const rulesPosts = (selected, action) => selected.requests.filter(row => row.method === "POST" && row.url.pathname.endsWith(`/architecture/rules/${action}`));
+const rulesResponse = (page, action) => page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname.endsWith(`/architecture/rules/${action}`));
+async function previewChange(selected) {
+  const before = readFileSync(rulesPath(selected.paths), "utf8");
+  const response = rulesResponse(selected.page, "preview");
+  await selected.page.locator("#architecture-preview").click();
+  const received = await response, data = await received.json();
+  assert.equal(received.status(), 200, JSON.stringify(data));
+  await selected.page.locator("#architecture-preview-result").waitFor({state:"visible"});
+  assert.equal(await selected.page.locator("#architecture-proposed-text").textContent(), data.payload.text);
+  assert.equal(await selected.page.locator("#architecture-diff").textContent(), data.payload.diff);
+  assert.equal(readFileSync(rulesPath(selected.paths), "utf8"), before, "preview never changes disk");
+  assert.notEqual(data.payload.text, before);
+  assert.ok(data.payload.diff.includes("@@"), "preview includes an actual unified diff");
+  return data.payload;
+}
+async function confirmChange(selected, preview) {
+  const response = rulesResponse(selected.page, "apply");
+  await selected.page.locator("#architecture-confirm").click();
+  const received = await response, data = await received.json();
+  assert.equal(received.status(), 200, JSON.stringify(data));
+  assert.equal(data.payload.mutationOutcome, "committed");
+  assert.equal(data.payload.rulesFile.contentHash, preview.proposedHash);
+  assert.equal(readFileSync(rulesPath(selected.paths), "utf8"), preview.text, "apply writes exactly the preview text");
+  await selected.page.waitForFunction(hash => document.querySelector("#architecture-notice-content")?.textContent.includes(hash), preview.proposedHash);
+  await ready(selected.page);
+  const refreshed = await architecture(selected);
+  assert.equal(refreshed.status, 200, JSON.stringify(refreshed.data));
+  assert.equal(refreshed.data.payload.indexGeneration, selected.pin.indexGeneration);
+  assert.equal(refreshed.data.payload.indexRevision, selected.pin.indexRevision, "rules authoring never publishes a new code snapshot");
+  assert.equal(refreshed.data.payload.rulesFile.contentHash, preview.proposedHash);
+  return refreshed.data.payload;
+}
+const reviewPair = (page, source, destination) => page.locator("#architecture-review-list [data-rule]")
+  .filter({has:page.getByRole("checkbox", {name:`Select ${source} → ${destination}`, exact:true})});
+
+test("Architecture review keeps exact evidence, independent filters and all unassigned files", {timeout:240000}, async () => published(rules, async selected => {
+  const {page} = selected;
+  await ready(page);
+  const dto = (await architecture(selected)).data.payload;
+  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites\s+deviation$/});
+  await edge.click();
+  await page.locator("#architecture-review-panel").waitFor({state:"visible"});
+  const row = reviewPair(page, "src/low.rs", "src/top.rs");
+  assert.equal(await row.count(), 1);
+  assert.match(await row.textContent(), /\$layers.*src\/low\.rs.*src\/top\.rs.*deviates/is);
+  assert.match(await row.textContent(), /2/);
+  const pair = page.locator("#architecture-inspector-content > details").filter({has:page.locator("summary", {hasText:/src\/low\.rs → src\/top\.rs/})}).first();
+  await pair.locator(":scope > summary").click();
+  assert.match(await pair.textContent(), /2 sampled sites.*0 omitted sites/is);
+  const sample = pair.locator(":scope > details").filter({has:page.locator("summary", {hasText:/production · reference/})}).first();
+  await sample.locator(":scope > summary").click();
+  const sampleText = await sample.textContent();
+  assert.match(sampleText, /crate::top::target/);
+  assert.match(sampleText, /ownerSyntaxId/);
+  await sample.getByRole("button", {name:"Read indexed reference source", exact:true}).click();
+  await page.waitForFunction(() => document.querySelector("#source .source-line.highlight"));
+  assert.match(await page.locator("#source-path").textContent(), /src\/low\.rs.*cached snapshot/is);
+  const reference = dto.references.production.find(value => value.source.path === "src/low.rs" && value.target.path === "src/top.rs");
+  assert.equal(await page.locator("#source .source-line.highlight .line-number").first().textContent(), String(reference.sites[0].lines.start));
+
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-review-role").selectOption("production");
+  await page.locator("#architecture-review-state").selectOption("deviates");
+  const production = await page.locator("#architecture-review-list").textContent();
+  assert.match(production, /src\/low\.rs.*src\/top\.rs/is);
+  assert.match(production, /src\/mid\.rs.*src\/peer\.rs/is);
+  await page.locator("#architecture-review-role").selectOption("test");
+  const tests = await page.locator("#architecture-review-list").textContent();
+  assert.match(tests, /src\/low\.rs.*src\/top\.rs/is);
+  assert.doesNotMatch(tests, /src\/mid\.rs.*src\/peer\.rs/is);
+  assert.equal(await page.locator("#architecture-metric-tests").isChecked(), false, "review role never changes the heat population");
+  assert.equal(await page.locator("#architecture-tests").isChecked(), false, "review role never changes the reference overlay");
+  await page.locator("#architecture-review-role").selectOption("all");
+  await page.locator("#architecture-review-state").selectOption("unknown");
+  assert.match(await page.locator("#architecture-review-list").textContent(), /unknown/i);
+  assert.equal(await page.locator("#architecture-review-list input[type=checkbox]:enabled").count(), 0, "unknown destinations cannot be waived");
+  await page.locator("#architecture-unassigned").click();
+  const unassigned = await page.locator("#architecture-review-list").textContent();
+  assert.ok(dto.modules.filter(module => module.layer === null).every(module => unassigned.includes(module.identity.path)));
+  assert.ok(unassigned.includes("src/only.rs"), "a no-edge file is still listed for assignment");
+  assert.ok(unassigned.includes("src/unassigned.rs"));
+  await page.setViewportSize({width:390, height:844});
+  await noOverflow(page);
+}));
+
+test("Architecture groups two witnessed pairs in one reason, previews once and adds/edits/removes exact bytes", {timeout:240000}, async () => published(`# preserved rules header\n${rules}`, async selected => {
+  const {page} = selected;
+  await ready(page);
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-review-role").selectOption("production");
+  await page.locator("#architecture-review-state").selectOption("deviates");
+  for (const [source, destination] of [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]]) {
+    await reviewPair(page, source, destination).getByRole("checkbox").check();
+  }
+  await page.locator("#architecture-add-selected").click();
+  await page.locator("#architecture-reason").fill("   ");
+  await page.locator("#architecture-preview").click();
+  assert.equal(rulesPosts(selected, "preview").length, 0, "blank reason is rejected before any preview request");
+  const reason = '<img src=x onerror="globalThis.ruleReasonExecuted=true"> reviewed two concrete pairs';
+  await page.locator("#architecture-reason").fill(reason);
+  const preview = await previewChange(selected);
+  assert.equal(preview.pairs.length, 2);
+  assert.equal(rulesPosts(selected, "preview").length, 1);
+  const body = rulesPosts(selected, "preview")[0].body;
+  assert.equal(body.operations.length, 1);
+  assert.equal(body.operations[0].type, "addExceptions");
+  assert.equal(body.operations[0].reason, reason);
+  assert.deepEqual(body.operations[0].pairs.map(pair => [pair.source.path, pair.destination.path]).sort(), [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]].sort());
+  assert.ok(preview.text.startsWith("# preserved rules header\n"), "unrelated authored text is preserved");
+  await page.locator("#architecture-editor").scrollIntoViewIfNeeded();
+  await capture(page, "architecture-grouped-preview-desktop");
+  await page.setViewportSize({width:390, height:844});
+  await page.locator("#architecture-preview-result").scrollIntoViewIfNeeded();
+  await capture(page, "architecture-grouped-preview-mobile");
+  await page.setViewportSize({width:1440, height:1000});
+  const dto = await confirmChange(selected, preview);
+  assert.equal(rulesPosts(selected, "apply").length, 1, "grouped authoring is one apply, never one save per pair");
+  const applied = rulesPosts(selected, "apply")[0].body;
+  assert.deepEqual(applied.operations, body.operations);
+  assert.equal(applied.baseHash, body.baseHash);
+  assert.equal(applied.proposedHash, preview.proposedHash);
+  for (const [source, destination] of [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]]) {
+    const instance = dto.rules.instances.find(row => row.rule === "$layers" && row.target.path === source && row.destination?.path === destination);
+    assert.equal(instance.excepted, true);
+    assert.equal(instance.status, "deviates", "excepted keeps the underlying verdict");
+    assert.equal(instance.exceptionReason, reason);
+  }
+  assert.equal(await page.evaluate(() => globalThis.ruleReasonExecuted), undefined);
+  assert.equal(await page.locator("#architecture-review-panel img, #architecture-editor img").count(), 0);
+
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-review-state").selectOption("excepted");
+  assert.ok((await page.locator("#architecture-review-list").textContent()).includes(reason));
+  await page.locator("#architecture-authored").click();
+  const exception = page.locator("#architecture-exceptions").getByRole("button", {name:"Edit reason", exact:true}).first();
+  await exception.click();
+  await page.locator("#architecture-reason").fill("Updated reviewed reason");
+  const edited = await previewChange(selected);
+  const editedDto = await confirmChange(selected, edited);
+  assert.ok(editedDto.rules.instances.some(row => row.excepted && row.exceptionReason === "Updated reviewed reason"));
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-authored").click();
+  await page.locator("#architecture-exceptions").getByRole("button", {name:"Remove", exact:true}).first().click();
+  const removed = await previewChange(selected);
+  const removedDto = await confirmChange(selected, removed);
+  assert.equal(removedDto.rules.instances.filter(row => row.rule === "$layers" && row.excepted).length, 1, "removal changes only the chosen entry");
+}));
+
+
+
+test("Architecture preserves a conflicted draft, reloads explicitly and requires a new preview", {timeout:240000}, async () => published(rules, async selected => {
+  const {page, paths} = selected;
+  await ready(page);
+  await page.locator("#architecture-review").click();
+  await page.locator("#architecture-review-role").selectOption("production");
+  await reviewPair(page, "src/low.rs", "src/top.rs").getByRole("checkbox").check();
+  await page.locator("#architecture-add-selected").click();
+  const reason = "Keep this draft through an ordinary editor conflict";
+  await page.locator("#architecture-reason").fill(reason);
+  const initial = await previewChange(selected);
+  const external = `${rules}\n# ordinary external editor changed disk after preview\n`;
+  writeFileSync(rulesPath(paths), external);
+  const response = rulesResponse(page, "apply");
+  await page.locator("#architecture-confirm").click();
+  const received = await response, data = await received.json();
+  assert.equal(received.status(), 409, JSON.stringify(data));
+  assert.equal(data.error.code, "rules_conflict");
+  assert.equal(readFileSync(rulesPath(paths), "utf8"), external, "conflict never overwrites the external edit");
+  assert.equal(await page.locator("#architecture-reason").inputValue(), reason);
+  assert.match(await page.locator("#architecture-editor").textContent(), /rules_conflict|changed|conflict/i);
+  assert.equal(rulesPosts(selected, "apply").length, 1, "conflict does not auto-retry");
+  await page.locator("#architecture-rules-reload").click();
+  await page.waitForFunction(hash => {
+    const notice = document.querySelector("#architecture-notice-content")?.textContent;
+    return notice && !notice.includes(hash);
+  }, initial.baseHash);
+  await ready(page);
+  assert.equal(await page.locator("#architecture-reason").inputValue(), reason, "Reload keeps the reason but invalidates the old preview");
+  assert.equal(await page.locator("#architecture-confirm").isVisible(), false);
+  const rebased = await previewChange(selected);
+  assert.notEqual(rebased.baseHash, initial.baseHash);
+  assert.ok(rebased.text.includes("# ordinary external editor changed disk after preview"));
+  assert.equal(rulesPosts(selected, "preview").length, 2, "the retained draft needs a new explicit preview");
+  const dto = await confirmChange(selected, rebased);
+  assert.equal(rulesPosts(selected, "apply").length, 2);
+  assert.ok(dto.rules.instances.some(row => row.target.path === "src/low.rs" && row.destination?.path === "src/top.rs" && row.excepted));
+}));
+
+
+
+test("Architecture assigns a no-edge unassigned file through exact preview without indexing", {timeout:240000}, async () => published(rules, async selected => {
+  const {page} = selected;
+  await ready(page);
+  await page.locator("#architecture-unassigned").click();
+  const row = page.locator("#architecture-review-list .architecture-rule-row").filter({has:page.getByRole("combobox", {name:"Layer for src/only.rs", exact:true})});
+  await page.getByRole("combobox", {name:"Layer for src/only.rs", exact:true}).selectOption("top");
+  await row.getByRole("button", {name:"Assign file", exact:true}).click();
+  const preview = await previewChange(selected);
+  const operation = rulesPosts(selected, "preview")[0].body.operations;
+  assert.deepEqual(operation, [{type:"assignFile", path:"src/only.rs", layer:"top"}]);
+  const dto = await confirmChange(selected, preview);
+  assert.equal(dto.modules.find(module => module.identity.path === "src/only.rs").layer, "top");
+  assert.equal(rulesPosts(selected, "preview").length, 1);
+  assert.equal(rulesPosts(selected, "apply").length, 1);
+  await page.locator("#architecture-unassigned").click();
+  assert.equal(await page.getByRole("combobox", {name:"Layer for src/only.rs", exact:true}).count(), 0);
+  assert.equal(await page.getByRole("combobox", {name:"Layer for src/unassigned.rs", exact:true}).count(), 1, "other unassigned modules are untouched");
+}));
+
+
+
+test("Architecture edits and removes an orphan named-rule exception without any layers", {timeout:240000}, async () => {
+  const config = `version = 1
+# Keep this named rule even though no current declaration selects it.
+[roles.orphan]
+select = { paths = ["src/absent.rs"] }
+[[rules]]
+id = "orphan-review"
+for_each = "orphan"
+require = [{ calls = "orphan" }]
+[[exceptions]]
+rule = "orphan-review"
+target = { source_set = "orphan-source-set", language = "rust", path = "src/absent.rs", sid = "sid:v1:00000000000000000000000000000000" }
+reason = "Original orphan reason" # keep reason comment
+`;
+  await published(config, async selected => {
+    const {page, paths} = selected;
+    await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("No authored layers"));
+    const before = await architecture(selected);
+    assert.equal(before.status, 200, JSON.stringify(before.data));
+    assert.equal(before.data.payload.state, "no_layers");
+    assert.equal(await page.locator("#architecture-diagram svg").count(), 0);
+    await page.locator("#architecture-authored").click();
+    const entry = page.locator("#architecture-exceptions [data-exception-index='0']");
+    await entry.waitFor({state:"visible"});
+    assert.match(await entry.textContent(), /orphan-review.*src\/absent\.rs.*Original orphan reason/is);
+    await entry.getByRole("button", {name:"Edit reason", exact:true}).click();
+    await page.locator("#architecture-reason").fill("Reviewed orphan reason remains editable");
+    const edited = await previewChange(selected);
+    assert.ok(edited.text.includes("# keep reason comment"), "reason edit keeps the attached comment");
+    assert.ok(edited.text.includes("# Keep this named rule"));
+    async function applyWithoutDiagram(preview) {
+      const response = rulesResponse(page, "apply");
+      await page.locator("#architecture-confirm").click();
+      const received = await response, data = await received.json();
+      assert.equal(received.status(), 200, JSON.stringify(data));
+      assert.equal(data.payload.mutationOutcome, "committed");
+      assert.equal(readFileSync(rulesPath(paths), "utf8"), preview.text);
+      await page.locator("#architecture-editor").waitFor({state:"hidden"});
+      await page.waitForFunction(hash => document.querySelector("#architecture-notice-content")?.textContent.includes(hash), preview.proposedHash);
+      await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Rules committed. Rechecked"));
+      const refreshed = await architecture(selected);
+      assert.equal(refreshed.status, 200, JSON.stringify(refreshed.data));
+      assert.equal(refreshed.data.payload.state, "no_layers");
+      assert.equal(refreshed.data.payload.rulesFile.contentHash, preview.proposedHash);
+      assert.equal(refreshed.data.payload.indexGeneration, selected.pin.indexGeneration);
+      assert.equal(refreshed.data.payload.indexRevision, selected.pin.indexRevision);
+      assert.equal(await page.locator("#architecture-diagram svg").count(), 0);
+    }
+    await applyWithoutDiagram(edited);
+    await page.locator("#architecture-authored").click();
+    await entry.waitFor({state:"visible"});
+    assert.match(await entry.textContent(), /Reviewed orphan reason remains editable/);
+    await entry.getByRole("button", {name:"Remove", exact:true}).click();
+    const removed = await previewChange(selected);
+    assert.ok(!removed.text.includes("[[exceptions]]"));
+    assert.ok(removed.text.includes('id = "orphan-review"'), "removing an orphan exception keeps the named rule");
+    await applyWithoutDiagram(removed);
+    await page.locator("#architecture-authored").click();
+    await page.waitForFunction(() => document.querySelector("#architecture-exceptions")?.textContent.includes("No authored exceptions"));
+    assert.equal(rulesPosts(selected, "preview").length, 2);
+    assert.equal(rulesPosts(selected, "apply").length, 2);
+  });
+});
+
 // Setup/error states use separate pre-start configurations, never racing live edits.
 
 for (const [name, config, state] of [["missing", null, "missing_rules"], ["empty", "version = 1\n", "no_layers"]]) {
@@ -386,9 +675,10 @@ for (const [name, config, state] of [["missing", null, "missing_rules"], ["empty
     assert.equal(response.status, 200, JSON.stringify(response.data));
     assert.equal(response.data.payload.state, state);
     assert.deepEqual(response.data.payload.modules, []); assert.deepEqual(response.data.payload.edges, []);
-    await selected.page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("trellis_propose_layers"));
+    await selected.page.waitForFunction(expected => document.querySelector("#architecture-state")?.textContent.includes(expected), state === "no_layers" ? "No authored layers" : "trellis_propose_layers");
     const message = await selected.page.locator("#architecture-panel").textContent();
-    assert.match(message, /\.trellis\/rules\.toml/); assert.match(message, /trellis_propose_layers/);
+    assert.match(message, /\.trellis\/rules\.toml/);
+    assert.match(message, state === "no_layers" ? /Existing authored exceptions/ : /trellis_propose_layers/);
     assert.equal(await selected.page.locator("#architecture-diagram svg").count(), 0);
     assert.equal(selected.requests.some(row => row.url.pathname.endsWith("/source")), false, "setup does not read a source");
   }));

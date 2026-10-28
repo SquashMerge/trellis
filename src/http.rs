@@ -3766,6 +3766,9 @@ enum BrowserCoreRoute {
     GitDiff,
     Metrics,
     Architecture,
+    RulesInventory,
+    RulesPreview,
+    RulesApply,
     RefreshDependencies,
     Dependencies,
     DependencySymbols,
@@ -3797,6 +3800,9 @@ impl BrowserCoreRoute {
             (&Method::GET, "git/diff") => Some(Self::GitDiff),
             (&Method::GET, "metrics") => Some(Self::Metrics),
             (&Method::GET, "architecture") => Some(Self::Architecture),
+            (&Method::GET, "architecture/rules") => Some(Self::RulesInventory),
+            (&Method::POST, "architecture/rules/preview") => Some(Self::RulesPreview),
+            (&Method::POST, "architecture/rules/apply") => Some(Self::RulesApply),
             (&Method::POST, "dependencies/refresh") => Some(Self::RefreshDependencies),
             (&Method::GET, "dependencies") => Some(Self::Dependencies),
             (&Method::GET, "dependencies/symbols") => Some(Self::DependencySymbols),
@@ -4482,6 +4488,193 @@ async fn provisioned_core_answer(
                 catching_up,
             ))
         }
+        BrowserCoreRoute::RulesInventory
+        | BrowserCoreRoute::RulesPreview
+        | BrowserCoreRoute::RulesApply => {
+            let apply = matches!(route, BrowserCoreRoute::RulesApply);
+            let inventory = matches!(route, BrowserCoreRoute::RulesInventory);
+            let pin = if inventory {
+                let options = architecture_query(uri)?;
+                if uri.query().is_some_and(|query| {
+                    query.split('&').any(|pair| {
+                        !matches!(
+                            pair.split_once('=').map(|(name, _)| name),
+                            Some("indexGeneration" | "indexRevision")
+                        )
+                    })
+                }) {
+                    return Err(invalid());
+                }
+                Some(options.pin.ok_or_else(invalid)?)
+            } else {
+                if uri.query().is_some() {
+                    return Err(invalid());
+                }
+                None
+            };
+            let request = if inventory {
+                None
+            } else {
+                let request: crate::rules_edit::Request =
+                    serde_json::from_slice(&body).map_err(|_| invalid())?;
+                request.validate(apply).map_err(|_| invalid())?;
+                Some(request)
+            };
+            struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let guard = CancelOnDrop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            let cancellation = guard.0.clone();
+            let runtime = runtime.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let duration = if metrics.deadline_ms != 0 {
+                    Duration::from_millis(metrics.deadline_ms)
+                } else {
+                    Duration::from_secs(300)
+                };
+                let deadline = metrics.now() + duration;
+                let mut check = || {
+                    anyhow::ensure!(
+                        !cancellation.load(std::sync::atomic::Ordering::Acquire)
+                            && !metrics
+                                .test_cancel
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        "cancelled"
+                    );
+                    anyhow::ensure!(
+                        metrics.now()
+                            + Duration::from_millis(
+                                metrics
+                                    .clock_skew_ms
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                            )
+                            < deadline,
+                        "deadline_exceeded"
+                    );
+                    Ok(())
+                };
+                let result = if let Some(request) = request {
+                    if let Some(hook) = &hook {
+                        hook("before_work");
+                    }
+                    runtime.rules_edit_response(
+                        &request,
+                        apply,
+                        &mut check,
+                        metrics.limit,
+                        &mut || {
+                            if let Some(hook) = &hook {
+                                hook("rules_before_rename");
+                            }
+                        },
+                    )
+                } else {
+                    let (response, catching_up) = runtime.evidence_response()?;
+                    if let Some(hook) = &hook {
+                        hook("before_work");
+                    }
+                    check()?;
+                    let payload = match response.rules_edit_inventory(pin.expect("inventory pin")) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                                crate::metrics::serialize_checked(
+                                    &json!({"error":diagnostic}),
+                                    metrics.limit,
+                                    &mut check,
+                                )?;
+                            }
+                            check()?;
+                            response.finish(())?;
+                            return Err(error);
+                        }
+                    };
+                    let bytes = crate::metrics::serialize_checked(
+                        &json!({"payload":payload,"catchingUp":catching_up}),
+                        metrics.limit,
+                        &mut check,
+                    )?;
+                    if let Some(hook) = &hook {
+                        hook("before_read_finish");
+                    }
+                    check()?;
+                    response.finish(())?;
+                    Ok((bytes, catching_up, None))
+                };
+                if let Some(hook) = &hook {
+                    hook("metrics_worker_done");
+                }
+                result
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })?;
+            drop(guard);
+            match result {
+                Ok((bytes, catching_up, outcome)) => {
+                    let mut response =
+                        ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+                    if let Some(outcome) = outcome {
+                        response.headers_mut().insert(
+                            "X-Trellis-Mutation-Outcome",
+                            outcome.parse().expect("static outcome"),
+                        );
+                    }
+                    Ok((response, catching_up))
+                }
+                Err(error) => {
+                    if let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                        return Ok((
+                            (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                Json(json!({"error":diagnostic})),
+                            )
+                                .into_response(),
+                            false,
+                        ));
+                    }
+                    for cause in error.chain() {
+                        let text = cause.to_string();
+                        if text.starts_with("invalid_request:") {
+                            let message = if text
+                                .contains("positively witnessed production layer deviation")
+                            {
+                                "Selected pair is not a witnessed production layer deviation"
+                            } else if text.contains("expanded rules exceed 2 MiB") {
+                                "Expanded rules exceed the 2 MiB rules-file limit"
+                            } else if text
+                                .contains("assignment requires an indexed unassigned file")
+                            {
+                                "Assignment requires an indexed unassigned file"
+                            } else {
+                                "Rules change is invalid; check the operation, selections and limits"
+                            };
+                            return Err(ApiError(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                message,
+                            ));
+                        }
+                        if text.starts_with("rules_conflict:") {
+                            return Err(ApiError(
+                                StatusCode::CONFLICT,
+                                "rules_conflict",
+                                "Rules changed on disk; reload rules and preview again",
+                            ));
+                        }
+                    }
+                    Err(ApiError::from(error))
+                }
+            }
+        }
         BrowserCoreRoute::RefreshDependencies => {
             let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
             if !request.as_object().is_some_and(|object| object.is_empty()) {
@@ -4933,6 +5126,15 @@ mod browser_core_route_tests {
         let error = super::checkout_list_response(vec![row]).unwrap_err();
         assert_eq!(error.0, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error.1, "response_too_large");
+    }
+
+    #[test]
+    fn rules_edit_request_refusals_do_not_change_global_error_mapping() {
+        let error = super::ApiError::from(anyhow::anyhow!(
+            "invalid_request: malformed external destination identity"
+        ));
+        assert_eq!(error.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.1, "internal_error");
     }
 
     #[test]
