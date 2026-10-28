@@ -238,6 +238,29 @@ class ReuseWiring(unittest.TestCase):
             (root / "sub").mkdir(parents=True, exist_ok=True)
         init.assert_called_once()
 
+    def test_measure_stops_each_cohort_before_the_next(self):
+        events = []
+        with tempfile.TemporaryDirectory() as scratch, \
+                patch.object(H.platform, "system", return_value="Darwin"), \
+                patch.object(H.tempfile, "mkdtemp", return_value=scratch), \
+                patch.object(H, "configure_reuse"), \
+                patch.object(H, "load_policy", return_value={}), \
+                patch.object(H, "load_floors", return_value={"medium": (1, "x"), "large": (1, "x")}), \
+                patch.object(H, "init_checkout"), \
+                patch.object(H.shutil, "copytree"), \
+                patch.object(H, "pin_of", return_value="pin"), \
+                patch.object(H, "build_report", return_value={"pass": True}), \
+                patch.object(H, "measure_cohort",
+                             side_effect=lambda *a: events.append(("measure", a[4])) or {}), \
+                patch.object(H.V67, "command", return_value="Mac17,16"), \
+                patch.object(H.V67, "env_for", return_value={}), \
+                patch.object(H.V67, "stop_home_processes",
+                             side_effect=lambda home, binary: events.append(("stop", home.name))), \
+                patch.object(Path, "read_bytes", return_value=b""):
+            self.assertEqual(H.measure(False), 0)
+        self.assertEqual(events, [("measure", "medium"), ("stop", "medium-private-home"),
+                                  ("measure", "large"), ("stop", "large-private-home")])
+
     def test_usage_errors(self):
         for argv in (["--smoke", "--semantic", "--binary", "x"], ["--smoke"], ["--binary", "x"]):
             with self.assertRaises(SystemExit) as caught:

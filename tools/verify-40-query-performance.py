@@ -542,7 +542,11 @@ def measure(semantic):
                                          semantic, proof, WARMUPS, SAMPLES, policy)
             sizes[size]["anchorPath"] = proof[0] if proof else None
             sizes[size]["artifactSha256"] = proof[1] if proof else None
+            # Stop this cohort's daemon and home processes before the next one is timed.
+            homes.remove(home)
+            V67.stop_home_processes(home, RELEASE_BINARY)
     finally:
+        # Safety net for an interrupted cohort; stopped homes were already removed.
         for home in homes:
             V67.stop_home_processes(home, RELEASE_BINARY)
     report = build_report(model, hashlib.sha256(pinned).hexdigest(), semantic, sizes, policy)
