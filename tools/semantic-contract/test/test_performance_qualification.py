@@ -74,6 +74,43 @@ class QualificationTests(unittest.TestCase):
     def test_passed_is_unreachable_with_constant_flags(self):
         self.assertNotEqual(qualify(report())["status"], "passed")
         self.assertEqual(qualify(report(), ALL_FLAGS)["status"], "passed")
+        forced = dict(ALL_FLAGS)
+        for sizes in (("small",), ("large",), ("small", "medium")):
+            for flags in (None, forced):
+                result = qualify(report(sizes=sizes), flags)
+                self.assertNotEqual(result["status"], "passed")
+        self.assertEqual(qualify(report(sizes=("small",)), forced)["status"], "notMeasured")
+        self.assertIn("missing size medium", qualify(report(sizes=("small",)), forced)["statusReasons"])
+
+    def test_duplicate_size_is_unqualified(self):
+        for flags in (None, ALL_FLAGS):
+            result = qualify(report(sizes=("small", "small", "small")), flags)
+            self.assertEqual(result["status"], "unqualified")
+            self.assertIn("duplicate size small", result["statusReasons"])
+        result = qualify(report(sizes=("small", "medium", "large", "large")), ALL_FLAGS)
+        self.assertEqual(result["status"], "unqualified")
+
+    def test_preflight_failure_is_unqualified(self):
+        rep = report()
+        rep["statusReasons"] = ["preflight: workspace probe failed"]
+        result = qualify(rep, ALL_FLAGS)
+        self.assertEqual(result["status"], "unqualified")
+        self.assertIn("preflight: workspace probe failed", result["statusReasons"])
+
+    def test_requalifying_does_not_relabel_fault_as_preflight(self):
+        rep = report()
+        rep["sizes"][0]["repetitions"][1] = {"ordinal": 2, "status": "fault"}
+        first = qualify(rep, ALL_FLAGS)
+        second = qualify(first, ALL_FLAGS)
+        self.assertEqual(second["status"], "unqualified")
+        self.assertFalse(any(r.startswith("preflight") for r in second["statusReasons"]))
+
+    def test_runner_policy_is_preserved(self):
+        rep = report()
+        rep["policy"] = {"includedStages": ["a"], "cohortFloors": {"small": 1}}
+        result = qualify(rep)
+        self.assertEqual(result["policy"], rep["policy"])
+        self.assertEqual(set(result["qualification"]["limits"]), {"small", "medium", "large"})
 
     def test_smoke_is_not_measured(self):
         result = qualify(report(smoke=True), ALL_FLAGS)
@@ -130,7 +167,8 @@ class QualificationTests(unittest.TestCase):
         peak = storage["publicationPeakToSteadyMaxMultiplier"]
         at_limit = report(sizes=("medium",), steady=100 * ratio, denominator=100, peak=100 * ratio * peak)
         result = qualify(at_limit, ALL_FLAGS)
-        self.assertEqual(result["status"], "passed")
+        for criterion in ("steadyAbsolute", "steadyRatio", "peakRatio"):
+            self.assertEqual(evaluation(result, "medium", criterion)["status"], "passed")
         over = report(sizes=("medium",), steady=100 * ratio + 1, denominator=100, peak=100 * ratio)
         self.assertEqual(evaluation(qualify(over, ALL_FLAGS), "medium", "steadyRatio")["status"], "failed")
         over = report(sizes=("medium",), steady=100, denominator=100, peak=100 * peak + 1)
@@ -175,6 +213,10 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(json.loads(done.stdout)["status"], "notMeasured")
             path.write_text("[]")
+            done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--report", str(path)],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 2)
+            path.write_text("{not json")
             done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--report", str(path)],
                                   capture_output=True, text=True)
             self.assertEqual(done.returncode, 2)

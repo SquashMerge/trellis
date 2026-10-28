@@ -217,3 +217,13 @@ steady ratio needs `denominatorRatified`, the peak ratio needs
 `sqlitePeakMethodReviewed`). Status precedence is `unqualified` > `failed` >
 `notMeasured` > `passed`; `passed` is unreachable with the constant flags. The
 output always carries `authoritativeAcceptance: false` and `issue11: "open"`.
+
+The report must contain `small`, `medium` and `large` exactly once. A missing size
+is `notMeasured` (reason `missing size <size>`); a duplicate is `unqualified`. The
+runner's `policy` object is preserved; the derived per-size limits are written to
+`qualification.limits`. A preflight failure is input with a `statusReasons` string
+starting with `preflight`; it yields `unqualified`, and re-qualifying qualifier
+output never adds that label to a fault. Malformed JSON or an unexpected policy
+shape exits 2. Small-size storage evaluations carry status `notApplicable` (not
+`passed`/`failed`/`notMeasured`); the report renderer must accept it and it does
+not affect the campaign status.

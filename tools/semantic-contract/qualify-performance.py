@@ -4,7 +4,11 @@
 Thresholds are read from the pinned policy and cohort files and are never
 changed here. The result is never authoritative acceptance and leaves #11 open.
 Status precedence is unqualified > failed > notMeasured > passed; `passed` is
-unreachable with the constant qualification flags below.
+unreachable with the constant qualification flags below. The report must hold
+small, medium and large exactly once: a duplicate is `unqualified`, a missing
+size is `notMeasured`, each with a reason naming the size. The runner's `policy`
+object is preserved; derived limits go under `qualification.limits`. Preflight
+failure input: a `statusReasons` string starting with "preflight".
 """
 
 import argparse
@@ -143,16 +147,15 @@ def qualify(report, policy, cohorts, flags=None):
     flags = {**FLAGS, **(flags or {})}
     smoke = bool(result.get("smoke"))
     host_ok = dig(result, "campaign", "host", "reference") is True
-    qualification = {"referenceHost": host_ok, **flags, "smoke": smoke}
+    qualification = {"referenceHost": host_ok, **flags, "smoke": smoke, "limits": {}}
     unqualified, failed, not_measured = [], [], []
-    if result.get("status") == "unqualified":
-        unqualified.append("preflight failure")
     for reason in result.get("statusReasons") or []:
         if isinstance(reason, str) and reason.startswith("preflight"):
             unqualified.append(reason)
     sizes = result.get("sizes")
     known = list(cohorts["synthetic"])
     policy_read = {}
+    seen = []
     if not isinstance(sizes, list) or not sizes:
         unqualified.append("report has no sizes")
         sizes = []
@@ -161,6 +164,9 @@ def qualify(report, policy, cohorts, flags=None):
         if size not in ("small", "medium", "large") or size not in known:
             unqualified.append(f"unknown size {size!r}")
             continue
+        if size in seen:
+            unqualified.append(f"duplicate size {size}")
+        seen.append(size)
         limit = limits(policy, size)
         policy_read[size] = limit
         for rep in entry.get("repetitions") or []:
@@ -172,6 +178,10 @@ def qualify(report, policy, cohorts, flags=None):
                 failed.append(f"{size} {criterion}: exceeds policy")
             elif outcome["status"] == "notMeasured":
                 not_measured.append(f"{size} {criterion}: {outcome.get('reason', 'not measured')}")
+    if sizes:
+        for size in ("small", "medium", "large"):
+            if size not in seen:
+                not_measured.append(f"missing size {size}")
     if smoke:
         not_measured.insert(0, "smoke")
     if unqualified:
@@ -182,8 +192,9 @@ def qualify(report, policy, cohorts, flags=None):
         status, reasons = "notMeasured", not_measured
     else:
         status, reasons = "passed", []
+    qualification["limits"] = policy_read
     result.update(status=status, statusReasons=reasons, authoritativeAcceptance=False,
-                  issue11="open", qualification=qualification, policy=policy_read)
+                  issue11="open", qualification=qualification)
     return result
 
 
@@ -202,7 +213,7 @@ def main(argv=None):
         if not isinstance(report, dict):
             raise ValueError("report must be an object")
         result = qualify(report, policy, cohorts)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"qualify-performance: {error}", file=sys.stderr)
         return 2
     sys.stdout.write(json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n")
