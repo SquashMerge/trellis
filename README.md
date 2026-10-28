@@ -87,6 +87,14 @@ on-demand indexing, enroll grants, expose an HTTP listener or accept authenticat
 See the [MCP contract](docs/mcp-readonly-pilot-contract.md) for limits and schemas. Run the native
 protocol fixtures with `cargo test --locked --test mcp_protocol`.
 
+`trellis_call_graph` (#40) answers a rooted, revision-pinned outgoing call graph from one
+`symbolId`: a pinned breadth-first traversal bounded by `depth` (0-5), `maxNodes` (1-150) and
+`maxCalls` (0-500), optionally using one selected semantic producer (`semanticProducerId`). Only
+fresh, exact, unambiguous internal direct or constructor bindings expand; every other call is a
+labelled boundary, and frontiers, `partial` and warnings say what was left out. It is static
+evidence, not a runtime trace. An answer over the response cap is reduced to a smaller `maxCalls`
+and says so (`truncationReason:"response_bytes"`).
+
 [Reviewed architecture rules](docs/rules.md) adds three read-only MCP tools
 (`trellis_references`, `trellis_rules_check`, `trellis_rules_explain`), the no-argument
 `trellis_propose_layers` proposal prompt, and CLI JSON references/rules checks.
