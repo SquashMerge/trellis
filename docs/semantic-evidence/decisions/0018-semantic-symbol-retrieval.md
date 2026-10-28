@@ -258,6 +258,22 @@ partial flag or truncation reason. Only optional-cache contention may consume th
 and fall back on its expiry; BUSY itself does not authorize fallback. Observed database
 faults, mandatory index/FTS contention, cancellation and root checks retain their typed rules.
 
+## Model availability diagnostics (user-directed #393 amendment, 2026-10-28)
+
+`unavailableReason` additionally reports `model_not_configured` when the daemon has no
+configured model path, and `model_load_failed` after verification/loading fails. A successful
+load clears the failure reason. Cancellation and vector-budget expiry alone do not create
+a model-load failure. Temporary loading, idle residency and missing matrices alone keep null;
+this diagnostic is not a readiness guarantee. Query-specific `vector_budget_exceeded` and
+its lexical fallback behavior remain unchanged and take precedence for that query.
+
+Workspace describe and CLI status add `searchIndex:{backend,unavailableReason}` with these
+model diagnostics (not the query-specific budget reason). This pair is daemon-wide, not
+query-pinned coverage, and includes no state, model identity or declaration/vector counts.
+A standalone registry without a search service has null backend and reason. This amends
+the earlier null-only model-unavailability wording; no evidence semantics or release-build
+Metal defaults change.
+
 ## Retrieval is not evidence
 
 A hit’s syntax Evidence proves only the measured declaration, not relevance. There is no

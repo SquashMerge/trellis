@@ -47,6 +47,54 @@ its generation's pins ([Decision 0006](docs/semantic-evidence/decisions/0006-rev
 retained revisions are protected only within a live index. Reporting eligibility alone must
 never trigger removal.
 
+## Local semantic search
+
+`trellis_search_symbols` can combine lexical results with local voyage-4-nano embeddings.
+Weights are optional and must be downloaded explicitly. On macOS, build with Metal support
+for acceleration (the default build remains CPU-only):
+
+```sh
+cargo install --path . --locked --features metal
+```
+
+For CPU-only installation, use `cargo install --path . --locked`. With Hugging Face's `hf`
+CLI installed separately, download the supported revision and all nine required files to
+an absolute directory outside your checkouts:
+
+```sh
+export TRELLIS_SEARCH_MODEL="$HOME/.local/share/trellis/models/voyage-4-nano/5fb34e870f49f19e79c94d5e118f5ee730133279"
+hf download voyageai/voyage-4-nano \
+  --revision 5fb34e870f49f19e79c94d5e118f5ee730133279 \
+  --local-dir "$TRELLIS_SEARCH_MODEL" \
+  1_Pooling/config.json config.json config_sentence_transformers.json \
+  model.safetensors modeling_qwen3_bidirectional.py modules.json \
+  sentence_bert_config.json tokenizer.json tokenizer_config.json
+export TRELLIS_SEARCH_BACKEND=auto
+trellis status --workspace /absolute/path/to/checkout
+```
+
+This weights location is recommended, not automatically discovered. Trellis verifies the
+pinned files and never executes the downloaded Python file. `TRELLIS_SEARCH_BACKEND` accepts
+`auto` (Metal on a supported macOS Metal build, otherwise CPU), `cpu`, or `metal`. Explicit
+Metal selection never silently falls back to CPU.
+
+Set these variables in your shell startup file or editor/agent MCP launcher environment.
+There is no persistent model configuration file. The shared daemon inherits the environment
+of the first CLI or MCP process that auto-starts it; later callers' variables and a newly
+installed binary do not reconfigure an existing daemon. To change settings, stop clients,
+terminate the inspected `trellis daemon` PID with `kill -TERM <pid>`, then run the status
+command above from the configured environment before reconnecting clients. There is no
+CLI restart command. See the [model and daemon setup guide](docs/semantic-search-local-cache.md)
+for PID discovery and restart details.
+
+Search, workspace describe and CLI status report `searchIndex.unavailableReason` as
+`model_not_configured` when the model variable was unset, or `model_load_failed` when the
+configured files could not be verified or loaded. Both preserve lexical retrieval. Describe
+and CLI status expose only `{backend, unavailableReason}`, not search readiness or coverage.
+An untried/loading model or missing resident matrix still has a `null` reason; this is not
+proof of vector readiness. Search's existing `vector_budget_exceeded` reason is unchanged.
+See the [local model/cache guide](docs/semantic-search-local-cache.md) for readiness and cache behavior.
+
 ## What works
 
 - Native tree-sitter JavaScript (`.js`, `.mjs`, `.cjs`), Rust (`.rs`), Java (`.java`) and Python (`.py`) extraction.

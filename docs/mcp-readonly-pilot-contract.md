@@ -70,7 +70,7 @@ Find, search, declaration, outgoing-call and incoming-call data objects contain 
 
 ### `trellis_workspace_describe` (W1)
 
-Input exactly `{schemaVersion:1,workspace?:string}`; no pins or indexing flags. Data exactly `{workspaceLabel:Text,indexState:"indexing"|"reconciling"|"ready"|"unavailable",progress:{completed:UInt,total:UInt|null}|null,watcherDegraded:boolean,languages:LanguageStatus[],toolVersion:2,schemaVersion:1,limits:Limits}`. Label is not an absolute path. `completed<=total` when total known; progress null if ready, unavailable or unmeasured. `LanguageStatus={language:Language,evidenceTier:"syntax",coverage:{selected:UInt,complete:UInt,partial:UInt,failed:UInt,unselected:UInt}}`; these count native coverage tuples, **not** universal language capabilities, and complete+partial+failed=selected. When ready return exactly four languages in #22 order (java, rust, python, javascript), even with zero counts. Otherwise `languages:[]`, null basis, no previous coverage advertised as current. Describe warnings=[], truncated=false, truncationReason=null; partial iff not ready or any selected partial/failed count is nonzero.
+Input exactly `{schemaVersion:1,workspace?:string}`; no pins or indexing flags. Data exactly `{workspaceLabel:Text,indexState:"indexing"|"reconciling"|"ready"|"unavailable",progress:{completed:UInt,total:UInt|null}|null,watcherDegraded:boolean,languages:LanguageStatus[],toolVersion:2,schemaVersion:1,limits:Limits,searchIndex:SearchAvailability}`. `SearchAvailability={backend:"cpu"|"metal"|null,unavailableReason:null|"model_not_configured"|"model_load_failed"}` is daemon-wide diagnostics, not query-pinned readiness or coverage. The same pair appears under `searchIndex` in CLI status. A missing model configuration reports `model_not_configured`; verification/loading failures report `model_load_failed` until a successful load clears the reason. No failure is inferred from an untried, loading or idle model. Standalone registries without a search service have null backend and reason because configuration is unknown. Label is not an absolute path. `completed<=total` when total known; progress null if ready, unavailable or unmeasured. `LanguageStatus={language:Language,evidenceTier:"syntax",coverage:{selected:UInt,complete:UInt,partial:UInt,failed:UInt,unselected:UInt}}`; these count native coverage tuples, **not** universal language capabilities, and complete+partial+failed=selected. When ready return exactly four languages in #22 order (java, rust, python, javascript), even with zero counts. Otherwise `languages:[]`, null basis, no previous coverage advertised as current. Describe warnings=[], truncated=false, truncationReason=null; partial iff not ready or any selected partial/failed count is nonzero.
 
 ### `trellis_find_symbols` (W2)
 
@@ -106,23 +106,25 @@ it never enters card hashes, lookup, ranking, ordering or joins.
 `SearchIndexStatus` is exactly:
 `{state:"complete"|"building"|"partial"|"unavailable",modelId:Hash|null,
 modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
-lexical:"complete"|"unavailable",unavailableReason:null|"vector_budget_exceeded"}`.
+lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
 `embedded<=declarations`. These are admitted-head counts, independent of the role filter;
 `scopeCoverage` also remains unfiltered. No configured/verified/ready model, or no matching admitted
 resident matrix (including first search, eviction, head-change races or an oversized head),
 gives `unavailable`, null `modelId`, null `modelName`, and `embedded:0`. The zero is an
-unavailable sentinel, not a measured vector count; `unavailableReason` remains null for
-these cases. Backend selection is independent: report the
+unavailable sentinel, not a measured vector count. `unavailableReason` is
+`model_not_configured` when no model path is configured, or `model_load_failed` after a
+verification/loading failure, cleared by a successful load. Loading, idle residency or a
+missing matrix alone leave the reason null. Backend selection is independent: report the
 backend actually selected whenever known, including while loading/building or when the model
 is unavailable; `backend:null` means only that no backend has been selected. With a ready
 model and an admitted matching resident matrix, `complete` means
 all candidates have vectors, `building` means vectors are missing and a background job is
 running, and `partial` means vectors are missing and no job is running. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
-can still be returned by the lexical arm. `unavailableReason` is null except when this call
-exhausts its optional vector budget. Then the complete vector arm is discarded, state is
+can still be returned by the lexical arm. If this call exhausts its optional vector budget,
+that query-specific reason takes precedence over model diagnostics. Then the complete vector arm is discarded, state is
 `unavailable`, model identity is null and `embedded:0` is an unavailable sentinel, not an
 observed cache count. `declarations` remains the exact eligible head count and backend remains
 the selected backend. The reason is `vector_budget_exceeded`, all returned hits are lexical,

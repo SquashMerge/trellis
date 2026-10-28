@@ -660,6 +660,8 @@ fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) 
         let mut envelope = fixture["expected"]["describe"].clone();
         envelope["requestId"] = id.clone();
         envelope["data"]["workspaceLabel"] = json!(label);
+        envelope["data"]["searchIndex"] =
+            json!({"backend":"cpu","unavailableReason":"model_not_configured"});
         envelope["workspace"] = root.clone();
         envelope["catchingUp"] = json!(true);
         envelope
@@ -11781,6 +11783,103 @@ async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_model_configuration_reasons_reach_describe_and_status() {
+    use trellis::{
+        daemon::search::SearchService, search_embed::EmbedError, search_model::SearchConfig,
+    };
+    for configured in [false, true] {
+        let (fixture, service, _) = SearchMcpFixture::with_optional_search(
+            &[("a.js", "function orchard() {}\n")],
+            false,
+            |roots| {
+                Some(std::sync::Arc::new(
+                    SearchService::new(
+                        roots.clone(),
+                        SearchConfig::from_values(
+                            configured.then(|| roots.cache.join("missing-model")),
+                            Some("cpu"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ))
+            },
+            false,
+        )
+        .await;
+        let service = service.unwrap();
+        if configured {
+            let result: Result<(), EmbedError> = service.with_model_job(
+                &std::sync::atomic::AtomicBool::new(false),
+                |_| unreachable!(),
+            );
+            assert!(matches!(result, Err(EmbedError::ModelUnavailable(_))));
+        }
+        let reason = if configured {
+            "model_load_failed"
+        } else {
+            "model_not_configured"
+        };
+        let runtime = fixture
+            .registry
+            .lock()
+            .await
+            .runtime(&fixture.identity.root_key)
+            .unwrap();
+        let cli_status = runtime.cli_status().unwrap();
+        assert_eq!(
+            cli_status["searchIndex"],
+            json!({"backend":"cpu","unavailableReason":reason})
+        );
+        let mut pairs = Vec::new();
+        for legacy in [false, true] {
+            let (mut client, mut reader, session) =
+                socket_session(&fixture.identity, &fixture.registry, 211, None);
+            search_socket_initialize(&mut client, &mut reader, legacy);
+            let reply = search_socket_ask(
+                &mut client,
+                &mut reader,
+                legacy,
+                1,
+                json!({"schemaVersion":1,"query":"orchard"}),
+            );
+            let envelope = &reply["result"]["structuredContent"];
+            assert_eq!(
+                envelope["data"]["searchIndex"]["unavailableReason"], reason,
+                "{reply}"
+            );
+            assert_eq!(envelope["data"]["hits"][0]["matchedBy"], json!(["lexical"]));
+            assert_eq!(envelope["data"]["searchIndex"]["embedded"], 0);
+            assert!(envelope["data"]["searchIndex"]["modelId"].is_null());
+            pairs.push(search_schema_pair(&reply));
+            writeln!(
+                client,
+                "{}",
+                call(
+                    legacy,
+                    json!(2),
+                    "trellis_workspace_describe",
+                    json!({"schemaVersion":1})
+                )
+            )
+            .unwrap();
+            let describe = next_reply(&mut reader);
+            assert_eq!(
+                describe["result"]["structuredContent"]["data"]["searchIndex"],
+                cli_status["searchIndex"],
+                "{describe}"
+            );
+            pairs.push(json!({"name":"trellis_workspace_describe","structuredContent":describe["result"]["structuredContent"]}));
+            drop(reader);
+            drop(client);
+            session.join().unwrap().unwrap();
+        }
+        assert!(!fixture.vectors.exists());
+        validate_structured_content(&pairs);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_search_role_filters_stored_inline_roles_before_limit_and_keeps_exact_names() {
     // Both roles share a normal path: the test role comes from the inline marker.
     let source = r#"
@@ -12300,7 +12399,7 @@ async fn mcp_search_without_model_ignores_stale_and_corrupt_optional_cache() {
                 json!({
                     "state":"unavailable", "modelId":null, "modelName":null,
                     "backend":backend, "declarations":1, "embedded":0, "lexical":"complete",
-                    "unavailableReason":null
+                    "unavailableReason":if configured_service { json!("model_not_configured") } else { Value::Null }
                 })
             );
             assert_eq!(envelope["partial"], false);

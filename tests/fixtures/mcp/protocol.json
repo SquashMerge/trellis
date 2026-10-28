@@ -73,6 +73,10 @@
           "hintWorkMs": 1000,
           "deadlineMs": 5000,
           "concurrency": 4
+        },
+        "searchIndex": {
+          "backend": null,
+          "unavailableReason": null
         }
       },
       "warnings": [],
