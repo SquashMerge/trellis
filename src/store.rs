@@ -3202,21 +3202,6 @@ impl StagedIndex {
 /// Match every cache object, including type, name, owning table, SQL, and
 /// autoindexes. Unknown views and triggers cannot run during a publication.
 fn validate_cache_shape(db: &Connection) -> Result<()> {
-    type Object = (String, String, String, Option<String>);
-    fn objects(db: &Connection) -> Result<Vec<Object>> {
-        // sqlite_master preparation also reads the schema. With journal_mode
-        // DELETE it can meet the owner's write transaction before a follower
-        // has elected or read its accepted request's DONE pin. Only direct
-        // SQLite BUSY/LOCKED is typed for the coordinator's bounded retry.
-        let mut statement = storage_result(
-            db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"),
-        )?;
-        let rows = storage_result(statement.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        }))?;
-        storage_result(rows.collect::<rusqlite::Result<Vec<_>>>())
-    }
-    let expected = Connection::open_in_memory()?;
     let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     ensure!(
         version <= DATABASE_SCHEMA_VERSION,
@@ -3226,13 +3211,93 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V25)?;
+    let expected = expected_cache_objects()?;
     control_ensure!(
-        objects(db)? == objects(&expected)?,
+        &cache_objects(db)? == expected,
         "incompatible_index: unknown cache object type, name or shape"
     );
     Ok(())
 }
+
+type CacheObject = (String, String, String, Option<String>);
+
+#[cfg(test)]
+static EXPECTED_CACHE_SHAPE_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The expected shape is process-wide and immutable. A failed build is
+/// returned to the caller and not cached, so the next call retries.
+fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
+    static EXPECTED: std::sync::OnceLock<Vec<CacheObject>> = std::sync::OnceLock::new();
+    if let Some(objects) = EXPECTED.get() {
+        return Ok(objects);
+    }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(CACHE_SCHEMA_V25)?;
+    let built = cache_objects(&expected)?;
+    #[cfg(test)]
+    EXPECTED_CACHE_SHAPE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(EXPECTED.get_or_init(|| built))
+}
+
+fn cache_objects(db: &Connection) -> Result<Vec<CacheObject>> {
+    // sqlite_master preparation also reads the schema. With journal_mode
+    // DELETE it can meet the owner's write transaction before a follower
+    // has elected or read its accepted request's DONE pin. Only direct
+    // SQLite BUSY/LOCKED is typed for the coordinator's bounded retry.
+    let mut statement = storage_result(
+        db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"),
+    )?;
+    let rows = storage_result(statement.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }))?;
+    storage_result(rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+#[cfg(test)]
+mod cache_shape_once_tests {
+    use super::*;
+
+    fn current_schema_db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V25).unwrap();
+        db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn expected_shape_is_built_once_across_calls() {
+        use std::sync::atomic::Ordering;
+        let first = expected_cache_objects().unwrap();
+        let builds = EXPECTED_CACHE_SHAPE_BUILDS.load(Ordering::SeqCst);
+        assert!(builds <= 1, "built {builds} times");
+        for _ in 0..3 {
+            validate_cache_shape(&current_schema_db()).unwrap();
+        }
+        assert!(std::ptr::eq(first, expected_cache_objects().unwrap()));
+        assert_eq!(EXPECTED_CACHE_SHAPE_BUILDS.load(Ordering::SeqCst), builds);
+    }
+
+    #[test]
+    fn drifted_schema_is_still_rejected() {
+        for drift in [
+            "ALTER TABLE revision_documents ADD COLUMN drift_extra TEXT",
+            "CREATE INDEX drift_extra_idx ON revision_documents(path)",
+            "DROP INDEX native_revisions_header_cover",
+        ] {
+            let db = current_schema_db();
+            db.execute_batch(drift).unwrap();
+            let failure = validate_cache_shape(&db).unwrap_err();
+            assert!(
+                failure
+                    .to_string()
+                    .contains("incompatible_index: unknown cache object type, name or shape"),
+                "{drift}: {failure:#}"
+            );
+        }
+    }
+}
+
 fn publication_second() -> Result<i64> {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     ensure!(
