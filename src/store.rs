@@ -3,6 +3,7 @@ pub mod anchors;
 mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
+mod published_admission;
 pub mod requests;
 mod search;
 mod search_startup;
@@ -371,6 +372,7 @@ pub struct Store {
     /// header values. A later read of the same pin in the response shares
     /// them after repeating its own status and pin checks.
     admitted: Option<(IndexPin, Arc<SelectedHeaders>)>,
+    published_admission: Arc<published_admission::PublishedAdmission>,
     #[cfg(feature = "test-support")]
     test_after_claim_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -3861,6 +3863,8 @@ pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod admit_once_tests;
+#[cfg(test)]
+mod published_admission_tests;
 #[cfg(test)]
 mod terminal_status_contention_tests;
 #[cfg(test)]
@@ -11694,6 +11698,7 @@ impl Store {
                 64 * 1024 * 1024,
             ))),
             admitted: None,
+            published_admission: Arc::default(),
             retention_clock: Arc::new(Mutex::new(RetentionClock {
                 origin_wall: publication_second()?,
                 origin_mono: 0,
@@ -12446,6 +12451,7 @@ impl Store {
                 std::fs::remove_file(backup)?;
                 std::fs::File::open(&dir)?.sync_all()?;
             }
+            self.published_admission.invalidate();
             self.validate_replacement_index(&path, &stage, leader, pin)?;
             leader.downgrade_use_to_shared()?;
             leader.belongs_to(&self.identity)?;
@@ -12576,6 +12582,7 @@ impl Store {
         let writer = self.writer()?;
         // startup reconciliation must commit and attest a selected head before this local session
         // may claim a durable request. Reads admit the validated prior head.
+        self.published_admission.invalidate();
         self.recovery_required.store(true, Ordering::Release);
         Ok(Arc::new(topology::WriterSession::writer(writer)))
     }
@@ -12597,6 +12604,7 @@ impl Store {
         if !index_path_present(&journal)? {
             return Ok(());
         }
+        self.published_admission.invalidate();
         for suffix in ["-wal", "-shm"] {
             let sidecar = path.with_file_name(format!("index.db{suffix}"));
             ensure!(
@@ -12634,6 +12642,7 @@ impl Store {
             !index_path_present(&journal)?,
             "{HOT_INDEX_JOURNAL}: rollback left the journal in place"
         );
+        self.published_admission.invalidate();
         drop(exclusive);
         Ok(())
     }
@@ -12687,7 +12696,9 @@ impl Store {
     fn mark_recovery(&self, disposition: RecoveryDisposition) {
         self.recovery_disposition
             .fetch_max(disposition as u8, Ordering::AcqRel);
-        if !self.recovery_required.swap(true, Ordering::AcqRel) {
+        let wake = !self.recovery_required.swap(true, Ordering::AcqRel);
+        self.published_admission.invalidate();
+        if wake {
             self.wake_queue_workers();
         }
     }
@@ -13110,6 +13121,10 @@ impl Store {
         self.read_status_for(db, false)
     }
     fn read_status_for(&self, db: &Connection, pre_startup: bool) -> Result<IndexStatus> {
+        self.cached_read_status_for(db, pre_startup)
+            .map_err(|error| self.report_index_failure(error))
+    }
+    fn read_status_uncached(&self, db: &Connection, pre_startup: bool) -> Result<IndexStatus> {
         #[cfg(test)]
         STATUS_VALIDATIONS.with(|count| count.set(count.get() + 1));
         let status = if pre_startup {
@@ -15544,6 +15559,7 @@ impl Store {
         leader.verify()?;
         self.identity.verify()?;
         storage_result(tx.commit())?;
+        self.published_admission.invalidate();
         self.recovery_disposition
             .store(RecoveryDisposition::Ready as u8, Ordering::Release);
         self.recovery_required.store(false, Ordering::Release);
@@ -17348,6 +17364,7 @@ impl Store {
                 return Err(SqliteContention(()).into());
             }
             storage_result(tx.commit())?;
+            self.published_admission.invalidate();
             // COMMIT released the lock; later failures are not a held rebuild.
             drop(readers_blocked);
             #[cfg(test)]

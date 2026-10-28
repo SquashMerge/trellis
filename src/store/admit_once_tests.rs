@@ -26,6 +26,9 @@ fn validations() -> usize {
 #[test]
 fn a_response_validates_the_index_once() {
     let (_state, _workspace, store, pin) = fixture();
+    // Reconciliation may already have admitted this publication. Exercise the
+    // cold response path here; published_admission_tests covers warm reuse.
+    store.published_admission.invalidate();
     let before = validations();
     let response = store.evidence_response().unwrap();
     assert_eq!(validations() - before, 1, "admission validates the head");
