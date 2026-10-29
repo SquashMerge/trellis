@@ -299,6 +299,7 @@ impl Peer {
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("TRELLIS_SEARCH_BACKEND", "cpu")
             .env(
                 "TRELLIS_TEST_DAEMON_PID_FILE",
                 home.path().join("auto-daemon.pid"),
