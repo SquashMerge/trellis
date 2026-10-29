@@ -697,6 +697,21 @@ impl Drop for LoggedDaemon {
     }
 }
 
+/// Asserts the last queue row failed with the typed code of the logged `cause`: the code starts
+/// with the cause's class, and the CLI's stderr carries the row's code.
+fn assert_typed_failure(world: &World, output: &std::process::Output, cause: &str) {
+    let class = cause.split(':').next().unwrap();
+    let row = world.queue().pop().unwrap();
+    assert_eq!(row.1, "failed", "{cause}");
+    let code = row.2.as_deref().unwrap();
+    assert!(
+        code == class || code.starts_with(&format!("{class}: ")),
+        "{cause}: row code {code}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(code), "{cause}: {stderr}");
+}
+
 #[test]
 fn claim_time_causes_map_to_stable_terminal_codes() {
     // (cause logged by the diagnostics, daemon env, how the batch is made bad)
@@ -745,17 +760,7 @@ fn claim_time_causes_map_to_stable_terminal_codes() {
         let _daemon = LoggedDaemon::start(&world.home, &log, env);
         let output = world.import(&descriptor, &sha);
         assert!(!output.status.success(), "{cause}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-            "{cause}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let row = world.queue().pop().unwrap();
-        assert_eq!(
-            (row.1.as_str(), row.2.as_deref()),
-            ("failed", Some("index_failed")),
-            "{cause}"
-        );
+        assert_typed_failure(&world, &output, cause);
         assert_eq!(
             world.count("SELECT count(*) FROM semantic_raw_batches"),
             0,
@@ -769,7 +774,7 @@ fn claim_time_causes_map_to_stable_terminal_codes() {
 }
 
 #[test]
-fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_completes() {
+fn queued_version_one_row_at_startup_settles_invalid_request_and_later_request_completes() {
     let world = World::new(four_language_workspace, &[]);
     world.stop_daemon();
     let log = world._temp.path().join("daemon.log");
@@ -801,7 +806,7 @@ fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_comp
     let old = queue.iter().find(|row| row.0 == v1.id).unwrap();
     assert_eq!(
         (old.1.as_str(), old.2.as_deref()),
-        ("failed", Some("index_failed"))
+        ("failed", Some("invalid_request: semantic import options"))
     );
     trellis::testing::wait_until("v1 diagnostic cause", || {
         fs::read_to_string(&log).is_ok_and(|text| {
@@ -834,7 +839,7 @@ fn four_language_fixture(world: &World) -> BatchFixture {
 }
 
 /// Imports the batch on a fresh daemon with `env` and asserts the claim fails typed: terminal
-/// `index_failed`, the diagnostic `cause`, nothing published and no stage left.
+/// typed code of the diagnostic `cause`, nothing published and no stage left.
 fn assert_claim_fails(
     world: &World,
     log: &Path,
@@ -845,17 +850,7 @@ fn assert_claim_fails(
     let daemon = LoggedDaemon::start(&world.home, log, env);
     let output = world.import(&batch.0, &batch.1);
     assert!(!output.status.success(), "{cause}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{cause}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed")),
-        "{cause}"
-    );
+    assert_typed_failure(world, &output, cause);
     assert_eq!(
         world.count("SELECT count(*) FROM semantic_raw_batches"),
         0,
@@ -1647,16 +1642,7 @@ fn lookup_budget_spans_the_rejoin_after_a_cutoff_edit() {
         },
     );
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed"))
-    );
+    assert_typed_failure(&world, &output, "limit_exceeded");
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
     // The request can fail on a watcher generation change before the watcher has published the
     // late edit; the watcher publishes it afterwards, and the durable head shows when it has.

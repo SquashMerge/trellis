@@ -1548,7 +1548,7 @@ fn open_semantic_input_before_open(
     before_open: impl FnOnce(),
 ) -> Result<(std::fs::File, u64)> {
     crate::scip_admission::validate_selected_role(root, path)
-        .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("invalid_request: {}", error.detail()))?;
     let metadata = std::fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_file(),
@@ -1672,6 +1672,16 @@ mod semantic_input_tests {
     }
 
     #[test]
+    fn input_outside_root_reports_bare_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = elsewhere.path().join("selected.scip");
+        std::fs::write(&path, b"abc").unwrap();
+        let error = super::open_semantic_input(root.path(), &path).unwrap_err();
+        assert_eq!(error.to_string(), "invalid_request: role outside root");
+    }
+
+    #[test]
     fn selected_input_replaced_by_symlink_before_open_is_rejected() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("selected.scip");
@@ -1772,8 +1782,8 @@ mod semantic_input_tests {
     }
 }
 
-/// Maps a typed admission failure to the internal diagnostic spelling. Every spelling settles as
-/// terminal `index_failed`; only the diagnostics show the cause.
+/// Maps a typed admission failure to the `<class>: <reason>` spelling that
+/// `store::requests::semantic_import_code` turns into the terminal error code.
 fn batch_error(error: anyhow::Error) -> anyhow::Error {
     use crate::scip_raw::ScipCaptureError;
     match error.downcast_ref::<ScipCaptureError>() {

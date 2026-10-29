@@ -1285,7 +1285,7 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
         .output()
         .unwrap();
     assert!(!oversized.status.success());
-    assert!(String::from_utf8_lossy(&oversized.stderr).contains("index_failed"));
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("limit_exceeded"));
     let after_rows = queue_rows();
     assert_eq!(
         after_rows.len(),
@@ -1297,7 +1297,14 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
         .request_by_id(&after_rows.last().unwrap().0)
         .unwrap()
         .unwrap();
-    assert_eq!(failed_row.error_code.as_deref(), Some("index_failed"));
+    assert!(
+        failed_row
+            .error_code
+            .as_deref()
+            .is_some_and(|code| code.starts_with("limit_exceeded")),
+        "{:?}",
+        failed_row.error_code
+    );
     assert!(store.earliest_unfinished_request().unwrap().is_none());
     let baseline = store.index_baseline().unwrap();
     assert!(store.semantic_at(baseline).unwrap().provenance.is_empty());
@@ -1857,7 +1864,7 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                     );
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     assert!(
-                        stderr.contains("index_failed"),
+                        stderr.contains("invalid_artifact"),
                         "{language} case {invalid_case}: {stderr}"
                     );
                     assert!(
