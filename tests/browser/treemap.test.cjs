@@ -553,6 +553,22 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
     assert.ok(renders >= 1 && renders < 5, `bounded relayout: ${renders} renders for 5 resizes`);
     await page.evaluate(() => { document.querySelector("#treemap-diagram").style.flex = ""; });
     assert.ok(fills(await filled(page)));
+    // A delivered observer callback whose layout size is unchanged keeps the published SVG's
+    // real adapter controls live: click and keyboard still select through its owner gate.
+    const kept = await page.evaluate(() => window.treemapRenders.count);
+    await page.evaluate(() => new Promise(resolveResize => {
+      const node = document.querySelector("#treemap-diagram");
+      let calls = 0;
+      const observer = new ResizeObserver(() => {
+        if (++calls === 1) { node.style.width = `${node.getBoundingClientRect().width - 0.2}px`; return; }
+        observer.disconnect(); setTimeout(resolveResize, 400);
+      });
+      observer.observe(node);
+    }));
+    assert.equal(await page.evaluate(() => window.treemapRenders.count), kept, "same layout size: no new render");
+    await selectFile(page, rowAt(dto, "src/a/same.rs"));
+    await selectFile(page, mixed, {keyboard:"Enter"});
+    await page.evaluate(() => { document.querySelector("#treemap-diagram").style.width = ""; });
   } finally {
     await page.evaluate(() => { window.pele = window.treemapRenders.original; delete window.treemapRenders; });
   }

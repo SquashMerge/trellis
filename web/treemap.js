@@ -19,7 +19,7 @@
   function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, navigationSerial = 0, view = null, basis = null, selectedKey = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, hideTests = true, path = "", language = "", scope = null;
-    let layoutSerial = 0, relayout = null, resizeTimer = null;
+    let relayout = null, resizeTimer = null;
     const population = () => role === "all" ? "all indexed callables" : "production callables";
     const state = (message, kind = "ready") => { get("treemap-state").textContent = message; get("treemap-state").dataset.state = kind; };
     const paragraph = (target, message) => target.append(make("p", message));
@@ -152,32 +152,41 @@
       try {
         if (files.some(file => file.physicalLines > 0)) {
           if (!window.TrellisTreemapPele) throw new Error("Treemap renderer unavailable. Nothing displayed.");
-          const paint = (selectedKey, isCurrent) => window.TrellisTreemapPele.render(get("treemap-diagram"), files, {
-            metric, aggregate, selectedKey, isCurrent, viewport:viewport(), rootLabel,
-            fileValue:file => metric === "role" ? undefined : metricValue(file.metrics, metric),
-            fileBand:file => metric === "role" ? classification(file) : scale.band(metricValue(file.metrics, metric)),
-            onSelectFile:file => { if (interactive() && files.includes(file)) inspect(file, interactive); },
-            onSelectDirectory:directory => {
-              if (!interactive() || !directory || !files.some(file => file.sourceSetId === directory.sourceSetId && (!directory.path || file.path.startsWith(directory.path + "/")))) return;
-              navigationSerial++; scope = {sourceSetId:directory.sourceSetId, path:directory.path}; return render();
-            },
-          });
-          const outcome = await paint(select, active);
-          if (!active()) return;
+          // Each paint owns its SVG while it is the pending request or the published one. Cancelling a
+          // pending paint never touches the published owner, so a kept SVG stays interactive.
+          let paints = 0, requested = 0, published = 0;
+          const paint = selectedKey => {
+            const id = requested = ++paints;
+            const owner = () => active() && (id === requested || id === published);
+            return window.TrellisTreemapPele.render(get("treemap-diagram"), files, {
+              metric, aggregate, selectedKey, isCurrent:owner, viewport:viewport(), rootLabel,
+              fileValue:file => metric === "role" ? undefined : metricValue(file.metrics, metric),
+              fileBand:file => metric === "role" ? classification(file) : scale.band(metricValue(file.metrics, metric)),
+              onSelectFile:file => { if (interactive() && files.includes(file)) inspect(file, interactive); },
+              onSelectDirectory:directory => {
+                if (!interactive() || !directory || !files.some(file => file.sourceSetId === directory.sourceSetId && (!directory.path || file.path.startsWith(directory.path + "/")))) return;
+                navigationSerial++; scope = {sourceSetId:directory.sourceSetId, path:directory.path}; return render();
+              },
+            }).then(result => ({id, result}));
+          };
+          const first = await paint(select), outcome = first.result;
+          if (!active() || first.id !== requested) return;
           if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Treemap mapping failed. Nothing displayed.");
+          published = first.id; requested = 0;
           // Resizes relayout the same admitted files; only a changed layout size renders again.
           let laidOut = outcome.projection;
           const area = files.filter(file => file.physicalLines > 0).length;
           relayout = async () => {
-            // Every newer desired size supersedes pending relayouts, even when it is the committed size again.
-            const layout = ++layoutSerial, latest = () => interactive() && layout === layoutSerial;
+            // A newer desired size cancels any pending paint, even when it is the published size again.
+            requested = 0;
             const next = interactive() && laidOut ? viewport() : undefined;
             if (!next) return;
             const size = window.TrellisTreemapPele.layoutSize(area, next);
             if (size.width === laidOut.width && size.height === laidOut.height) return;
-            const result = await paint(selectedKey, latest);
-            if (!latest()) return;
-            if (result?.status === "ready") { laidOut = result.projection; markSelection(); return; }
+            const {id, result} = await paint(selectedKey);
+            if (!interactive() || id !== requested) return;
+            requested = 0;
+            if (result?.status === "ready") { published = id; laidOut = result.projection; markSelection(); return; }
             ready = false; relayout = null; clearInspection();
             for (const id of ["treemap-files", "treemap-legend"]) get(id).replaceChildren();
             state(result?.error?.message || "Treemap rendering failed. Nothing displayed.", "error");
@@ -194,6 +203,8 @@
         const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.";
         state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
+        // Resizes during the first paint had no relayout to call; reconcile with the box once.
+        void relayout?.();
       } catch (error) {
         if (!active()) return;
         ready = false; clearInspection();
