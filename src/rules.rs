@@ -104,6 +104,8 @@ struct Policy {
 struct RawLayer {
     order: Option<i64>,
     shared: Option<bool>,
+    /// Browser presentation hint only (#391); never affects evaluation.
+    display: Option<Spanned<String>>,
     #[serde(default)]
     paths: Vec<Spanned<String>>,
     #[serde(default)]
@@ -208,6 +210,7 @@ struct LayerPattern {
 }
 struct Layer {
     order: Option<i64>,
+    display: Option<String>,
     patterns: Vec<LayerPattern>,
     external: BTreeSet<ExternalSelector>,
     span: std::ops::Range<usize>,
@@ -459,6 +462,22 @@ pub fn parse(text: &str) -> Result<Config> {
                 "layer requires nonempty paths or external and exactly one integer order or shared=true",
             ));
         }
+        let display = layer
+            .display
+            .map(|v| {
+                if matches!(v.get_ref().as_str(), "expanded" | "collapsed" | "hidden") {
+                    Ok(v.into_inner())
+                } else {
+                    Err(error(
+                        text,
+                        v.span(),
+                        "schema",
+                        "token",
+                        "layer display must be expanded, collapsed or hidden",
+                    ))
+                }
+            })
+            .transpose()?;
         let mut globs = layer
             .paths
             .iter()
@@ -490,6 +509,7 @@ pub fn parse(text: &str) -> Result<Config> {
             name,
             Layer {
                 order: layer.order,
+                display,
                 patterns: globs,
                 external,
                 span,
@@ -752,7 +772,7 @@ fn glob_matches(patterns: &[GlobSet], path: &str) -> bool {
 /// Browser-only authored inventory; does not change the closed rules payload.
 pub fn view_layers(config: &Config) -> Vec<Value> {
     config.layers.iter().map(|(name, layer)| {
-        json!({"name": name, "order": layer.order, "shared": layer.order.is_none()})
+        json!({"name": name, "order": layer.order, "shared": layer.order.is_none(), "display": layer.display})
     }).collect()
 }
 
@@ -1986,5 +2006,61 @@ mod document_parallel_tests {
         )
         .unwrap_err();
         assert!(error.downcast_ref::<Deadline>().is_some());
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn layer_display_hint_is_optional_and_passed_to_the_browser_inventory() {
+        let config = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay='expanded'\n[layers.b]\norder=2\npaths=['b/**']\ndisplay='collapsed'\n[layers.c]\nshared=true\npaths=['c/**']\ndisplay='hidden'\n[layers.d]\norder=3\npaths=['d/**']\n").unwrap();
+        let layers = view_layers(&config);
+        let display: Vec<_> = layers.iter().map(|l| l["display"].clone()).collect();
+        assert_eq!(
+            display,
+            [
+                json!("expanded"),
+                json!("collapsed"),
+                json!("hidden"),
+                Value::Null
+            ]
+        );
+    }
+
+    #[test]
+    fn layer_display_hint_leaves_assignment_inputs_unchanged() {
+        let plain = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\n").unwrap();
+        let hinted =
+            parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay='hidden'\n").unwrap();
+        let shape = |c: &Config| {
+            c.layers
+                .iter()
+                .map(|(n, l)| (n.clone(), l.order, l.patterns.len(), l.external.len()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&plain), shape(&hinted));
+    }
+
+    #[test]
+    fn unknown_layer_display_value_is_a_located_typed_error() {
+        let text = "version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay='folded'\n";
+        let Err(error) = parse(text) else {
+            panic!("unknown display value must be refused")
+        };
+        let found = diagnostic(&error).expect("typed rules diagnostic");
+        assert_eq!(found["code"], "invalid_rules");
+        assert_eq!(found["kind"], "schema");
+        assert_eq!(found["line"], 5);
+        assert_eq!(
+            found["message"],
+            "layer display must be expanded, collapsed or hidden"
+        );
+        let Err(error) = parse("version=1\n[layers.a]\norder=1\npaths=['a/**']\ndisplay=true\n")
+        else {
+            panic!("non-string display value must be refused")
+        };
+        assert_eq!(diagnostic(&error).expect("typed")["code"], "invalid_rules");
     }
 }

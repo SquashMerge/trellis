@@ -54,7 +54,7 @@ test("init is inert; one owned pin/digest supplies metric values and explicit sa
   assert.equal(query.get("role"),"production");assert.equal(h.get("architecture-metric-tests").checked,false);
   assert.equal(query.get("aggregate"),"max");assert.equal(query.get("indexGeneration"),pin.indexGeneration);assert.equal(query.get("indexRevision"),"1");
   const {view,options} = h.renders[0];assert.equal(options.moduleValue(view.modules[0]),3);assert.equal(options.moduleValue(view.modules[1]),null);
-  assert.match(options.layerLabel(view.layers[0]),/Max module cognitive \(max\)\n3/);
+  assert.match(options.layerLabel(view.layers[0]),/^1 · UI · 1 files · max cognitive \(max\) 3\nUp deviation: 0 · /);
   assert.equal(h.reads.length,0);options.onSelectModule(view.modules[0]);
   assert.match(text(h.get("architecture-inspector-content")),/4 physical file lines · 2 production callables/);
   assert.match(text(h.get("architecture-inspector-content")),/not-measured/);

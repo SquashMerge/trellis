@@ -259,6 +259,7 @@ async function refreshStatus(followup = false) {
   const stats = status.stats || {};
   $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
+  if (job && !activeJob(job)) showJob();
   $("stale").hidden = true;
   if (!nextPin) stale("Index not ready. Retry status after this checkout finishes indexing.");
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
@@ -625,9 +626,24 @@ async function refreshView() {
 $("refresh").addEventListener("click", () => perform(refreshView, $("refresh")));
 $("reload-head").addEventListener("click", () => perform(refreshView, $("reload-head")));
 function activeJob(value) { return ["queued", "running"].includes(value.state); }
+// Progress is shown only while it means something; a finished index states its result.
+function jobText(value) {
+  const progress = value.progress, total = progress?.total;
+  if (value.state === "done") {
+    const pin = status?.revision, files = status?.stats?.files;
+    return `Indexed${pin ? ` · rev ${IndexPin.label(pin)}` : ""}${Number.isSafeInteger(files) ? ` · ${files} files` : ""}`;
+  }
+  if (value.state === "failed") return `Index failed${value.error ? ` · ${describe(value.error)}` : ""}`;
+  const parts = [value.state === "queued" ? "Index queued · accepted" : "Indexing"];
+  if (progress?.phase) parts.push(progress.phase);
+  if (Number.isSafeInteger(total) && total > 0) parts.push(`${progress.completed ?? 0}/${total}`);
+  if (!waitingForJob) parts.push("no longer waiting here");
+  if (value.error) parts.push(describe(value.error));
+  return parts.join(" · ");
+}
 function showJob() {
   if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }
-  $("job").textContent = `Index ${job.state}${job.state === "queued" ? " · accepted" : ""}${activeJob(job) && !waitingForJob ? " · no longer waiting here" : ""} · ${job.progress?.phase || ""} · ${job.progress?.completed ?? 0}/${job.progress?.total ?? "?"}${job.error ? ` · ${describe(job.error)}` : ""}`;
+  $("job").textContent = jobText(job);
   $("cancel").hidden = !waitingForJob || !activeJob(job);
   $("index").disabled = waitingForJob && activeJob(job);
 }
@@ -973,12 +989,31 @@ async function loadFiles(reset = false) {
   }, current, "files-state");
   if (current()) $("retry-files").hidden = loaded;
 }
+// Dot-entries and folders without indexed files stay out of the way unless asked for (#391).
+const hiddenFilesKey = () => `trellis.files.showHidden.v1:${selectedRootKey}`;
+let hiddenFilesRoot, hiddenFilesShown = false;
+function showHiddenFiles() {
+  if (hiddenFilesRoot !== selectedRootKey) {
+    hiddenFilesRoot = selectedRootKey;
+    try { hiddenFilesShown = window.localStorage.getItem(hiddenFilesKey()) === "true"; } catch { hiddenFilesShown = false; }
+  }
+  return hiddenFilesShown;
+}
+function dotPath(path) { return path.split("/").some(part => part.startsWith(".")); }
+function hiddenTreeEntry(item) {
+  if (item.name.startsWith(".")) return true;
+  if (item.kind !== "directory" || !treeRoot || !indexedWorkspace) return false;
+  // Only inside the index workspace does the indexed snapshot prove a folder has no indexed files.
+  const selection = metricDirectorySelection(item.path);
+  return !!selection && viewerMetrics?.indexedDirectory(selection.path) === false;
+}
 function renderFiles() {
+  $("show-hidden-files").checked = showHiddenFiles();
   if (section !== "files" && treeMode) { renderDirectoryTree(); return; }
   const generation = ++treeSerial;
   const tree = $("file-tree"); tree.replaceChildren();
   const filter = $("file-filter").value.toLowerCase();
-  const visible = files.filter(f => f.path.toLowerCase().includes(filter));
+  const visible = files.filter(f => f.path.toLowerCase().includes(filter) && (showHiddenFiles() || !dotPath(f.path)));
   const metricRows = [];
   const dirs = new Map([["", tree]]);
   for (const file of visible) {
@@ -1092,6 +1127,11 @@ async function loadSequence(admitted = null, preserveSource = false) {
   }, current, "sequence-state");
 }
 $("file-filter").addEventListener("input", renderFiles);
+$("show-hidden-files").addEventListener("change", event => {
+  showHiddenFiles(); hiddenFilesShown = event.target.checked;
+  try { window.localStorage.setItem(hiddenFilesKey(), String(hiddenFilesShown)); } catch { /* Not remembered; this page still applies it. */ }
+  renderFiles();
+});
 $("all-methods").addEventListener("change", renderFiles);
 $("all-steps").addEventListener("change", () => loadSequence());
 $("more-files").addEventListener("click", () => perform(() => loadFiles(), $("more-files")));
@@ -1343,12 +1383,13 @@ function renderDirectoryTree() {
     return !filter || item.path.toLowerCase().includes(filter) ||
       (item.kind === "directory" && directories.get(item.path)?.items?.some(matches));
   }
-  let count = 0;
-  const metricRows = [];
+  let count = 0, hidden = 0;
+  const metricRows = [], showHidden = showHiddenFiles();
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
     if (!state) return;
     for (const item of (state.items || []).filter(matches)) {
+      if (!showHidden && hiddenTreeEntry(item)) { hidden++; continue; }
       count++;
       const row = element("li");
       if (item.kind === "directory") {
@@ -1395,7 +1436,8 @@ function renderDirectoryTree() {
   }
   rows("", tree);
   viewerMetrics?.renderLegend(metricRows.filter(Boolean));
-  $("files-state").textContent = filter ? `${count} matching loaded entries · unopened folders are not searched` : "Expand folders to browse. Choose an indexed file to see methods.";
+  $("files-state").textContent = (filter ? `${count} matching loaded entries · unopened folders are not searched` : "Expand folders to browse. Choose an indexed file to see methods.")
+    + (hidden ? ` ${hidden} hidden or unindexed ${hidden === 1 ? "entry" : "entries"} not shown.` : "");
   if (filter && !count) tree.append(element("li", "No loaded entries match. Clear the filter to browse folders.", "detail"));
 }
 

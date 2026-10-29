@@ -89,7 +89,7 @@
             <ul id="indexed-checkouts" class="plain" aria-label="Indexed checkouts"></ul>
             <p class="detail">Agents can use these indexes through <code>trellis mcp</code>.</p>
           </section>
-          <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
+          <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><label class="file-hidden-toggle"><input id="show-hidden-files" type="checkbox"/> Show hidden/ignored</label><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
         <div class="canvas-area">
           <nav id="diagram-tabs" class="view-tabs" aria-label="Workspace views" role="tablist">
             <button id="view-architecture" role="tab" type="button" aria-selected="false" aria-controls="architecture-panel" tabindex="-1">Architecture</button>
@@ -116,17 +116,20 @@
             <p id="metrics-state" role="status" aria-live="polite"></p>
           </div>
           <section id="architecture-panel" class="view-panel" role="tabpanel" aria-labelledby="view-architecture" hidden>
-            <div class="sequence-toolbar"><h2>Architecture</h2><button id="architecture-refresh" type="button">Refresh architecture</button></div>
-            <div class="architecture-controls">
-              <label for="architecture-color">Color by</label><select id="architecture-color"><option value="layer">Layer</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
-              <label for="architecture-aggregate">Aggregation</label><select id="architecture-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
-              <label><input id="architecture-metric-tests" type="checkbox"> Include tests in metrics</label>
-              <label><input id="architecture-tests" type="checkbox"> Test-only edges</label>
-            </div>
-            <div class="architecture-controls architecture-review-actions">
-              <button id="architecture-review" type="button">Review deviations</button>
-              <button id="architecture-unassigned" type="button">Unassigned files</button>
-              <button id="architecture-authored" type="button">Authored exceptions</button>
+            <div class="sequence-toolbar architecture-toolbar"><h2>Architecture</h2>
+              <div class="architecture-controls">
+                <label for="architecture-color">Color by</label><select id="architecture-color"><option value="layer">Layer</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
+                <label for="architecture-aggregate">Aggregation</label><select id="architecture-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
+                <label><input id="architecture-metric-tests" type="checkbox"> Include tests in metrics</label>
+                <label><input id="architecture-tests" type="checkbox"> Test-only edges</label>
+                <label><input id="architecture-deviations-only" type="checkbox"> Deviations only</label>
+              </div>
+              <div class="architecture-controls architecture-review-actions">
+                <button id="architecture-review" type="button">Review deviations</button>
+                <button id="architecture-unassigned" type="button">Unassigned files</button>
+                <button id="architecture-authored" type="button">Authored exceptions</button>
+                <button id="architecture-refresh" type="button">Refresh architecture</button>
+              </div>
             </div>
             <section id="architecture-review-panel" aria-label="Architecture review" hidden>
               <div class="architecture-controls">
@@ -163,12 +166,15 @@
                 </section>
               </section>
             </section>
-            <p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent.</p>
-            <p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p>
+            <div class="architecture-status"><p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p>
+            <p id="architecture-focus-state" class="architecture-display-note" role="status" aria-live="polite"></p></div>
             <div id="architecture-legend" class="metric-legend" aria-label="Architecture metric heat legend"></div>
-            <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Scroll to explore; select a module or summary for evidence."></div>
+            <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Select a layer band or directory to expand it; select a module or edge for evidence."></div>
+            <div class="architecture-display-footers">
+            <div id="architecture-quiet" class="architecture-display-footer" hidden><button id="architecture-quiet-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-quiet-names" class="detail"></span></div>
+            <div id="architecture-hidden" class="architecture-display-footer" hidden><button id="architecture-hidden-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-hidden-names" class="detail"></span></div></div>
             <p class="architecture-edge-legend">Solid: production · Dashed: test-only (never production violations) · Down: allowed · Up / peer / shared outbound: policy verdict shown · Exceptions and unknowns remain explicit.</p>
-            <details id="architecture-notices" class="warning-disclosure"><summary>Architecture coverage &amp; notices</summary><div id="architecture-notice-content"></div></details>
+            <details id="architecture-notices" class="warning-disclosure"><summary>Architecture coverage &amp; notices</summary><p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent.</p><div id="architecture-notice-content"></div></details>
           </section>
           <section id="treemap-panel" class="view-panel" role="tabpanel" aria-labelledby="view-treemap" hidden>
             <div class="sequence-toolbar"><h2>Treemap</h2><button id="treemap-refresh" type="button">Refresh treemap</button></div>
@@ -210,14 +216,14 @@
           </section>
         </div>
         <aside id="call-inspector" class="call-inspector" aria-labelledby="inspector-heading">
-          <div class="inspector-header"><h2 id="inspector-heading">Inspector</h2><button id="inspector-clear" type="button" disabled>Clear</button></div>
+          <div class="inspector-header"><h2 id="inspector-heading">Inspector</h2><div class="bar"><button id="inspector-clear" type="button" disabled>Clear</button><button id="inspector-collapse" type="button" aria-controls="call-inspector">Hide</button></div></div>
           <section id="files-inspector" hidden aria-label="Indexed symbol evidence">
             <p id="files-symbol-kind" class="detail">Indexed symbol</p><h3 id="files-symbol-title">Choose a symbol</h3>
             <p id="files-symbol-location" class="detail"></p><pre id="files-symbol-header"></pre><p id="files-symbol-return" class="detail"></p>
             <section aria-labelledby="files-mini-title"><div class="bar"><h4 id="files-mini-title">Sequence · measured</h4><button id="files-open-full" type="button" disabled>Open full</button></div><p id="files-mini-state" role="status">Select a callable to preview its measured sequence.</p><div id="files-mini-sequence" class="sequence-scroll" tabindex="0" aria-label="Measured sequence preview"></div></section>
             <section aria-labelledby="files-matches-title"><h4 id="files-matches-title">Syntax matches · same spelling, not compiler-resolved</h4><p class="detail">Matches concern the selected declaration. Homonyms and shadowing may refer to other declarations.</p><p id="files-matches-state" role="status"></p><ul id="files-matches" class="plain"></ul><button id="files-matches-more" type="button" hidden>More syntax matches</button><button id="files-matches-retry" type="button" hidden>Retry syntax matches</button></section>
           </section>
-          <div id="inspector-empty" class="inspector-empty"><span class="inspector-symbol" aria-hidden="true">↗</span><h3>Inspect a source step</h3><p>Select a call or control to inspect measured source text. Targets are unverified.</p><p class="detail">Source text does not prove a path or runtime behavior.</p></div>
+          <div id="inspector-empty" class="inspector-empty"><span class="inspector-symbol" aria-hidden="true">↗</span><h3>Nothing selected</h3><p>Select a call, module, edge or file to inspect its measured evidence.</p></div>
           <div id="inspector-content" hidden>
             <span id="inspector-kind" class="badge"></span><h3 id="inspector-title"></h3>
             <dl class="inspector-fields"><dt>Relationship</dt><dd id="inspector-target"></dd><dt>Source location</dt><dd id="inspector-location"></dd><dt>Evidence</dt><dd id="inspector-evidence"></dd></dl>
@@ -234,11 +240,10 @@
             <h4>Highest cognitive complexity</h4>
             <ul id="metric-inspector-top" class="plain"></ul>
           </section>
-          <p class="inspector-footnote">Only measured source opens at a matched snapshot. Candidate types and calls do not prove dispatch.</p>
         </aside>
       </div>
     </div>
   </main>
-  <footer><span class="local-indicator">Local inspection</span><span class="connection-footer-brand">Trellis by SquashMerge · local inspection</span><span class="connection-footer-topology">Loopback only · bearer token · no automatic indexing</span><details><summary>Privacy &amp; evidence limits</summary><p>Local code inspection. Measured syntax is not a runtime trace or semantic proof. Candidate and callback relationships cannot be traversed.</p></details></footer>
+  <footer><span class="local-indicator">Local inspection</span><span class="connection-footer-brand">Trellis by SquashMerge · local inspection</span><span class="connection-footer-topology">Loopback only · bearer token · no automatic indexing</span><details><summary>Privacy &amp; evidence limits</summary><p>Local code inspection. Measured syntax is not a runtime trace or semantic proof. Candidate and callback relationships cannot be traversed.</p><p>Only measured source opens at a matched snapshot. Candidate types and calls do not prove dispatch. Inspected targets are unverified: source text does not prove a path or runtime behavior.</p></details></footer>
 </body>
 </html>

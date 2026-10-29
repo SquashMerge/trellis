@@ -178,6 +178,10 @@
         failure(error, "metric-inspector-state");
       }
     }
+    // true/false once the indexed snapshot is known; null while unknown.
+    function indexedDirectory(path) {
+      return usable() ? projection.directories.some(row => row.path === path) : null;
+    }
     function decorate(pick, selection) {
       if (metric === "none") return;
       // Tree rendering replaces picks. Re-decoration of the same pick is idempotent.
@@ -229,7 +233,7 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || aggregate === event.target.value) return;
       aggregate = event.target.value; void refresh();
     });
-    return {reset, refresh, inspect, clearInspection, decorate, renderLegend};
+    return {reset, refresh, inspect, clearInspection, decorate, renderLegend, indexedDirectory};
   }
   window.TrellisMetrics = {create, quartiles, band, metricValue};
 })();

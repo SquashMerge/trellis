@@ -279,6 +279,17 @@ test("Treemap native identities drill and return, Architecture selects exactly, 
   assert.equal(sourceRequest.url.searchParams.get("path"), mixed.path);
   await page.locator("#view-architecture").click();
   await page.locator("#architecture-state[data-state=ready]").waitFor();
+  // Summary-first Architecture (#391): the only layer is quiet; show it, then open band and folders.
+  const opened = async action => {
+    await page.evaluate(() => { document.querySelector("#architecture-diagram svg").__old = true; });
+    await action();
+    await page.waitForFunction(() => { const svg = document.querySelector("#architecture-diagram svg"); return svg && !svg.__old; });
+  };
+  await opened(() => page.locator("#architecture-quiet-toggle").click());
+  for (let round = 0; round < 20 && await page.locator('#architecture-diagram [role=button][aria-expanded="false"]').count(); round++) {
+    await page.locator('#architecture-diagram [role=button][aria-expanded="false"]').first().focus();
+    await opened(() => page.keyboard.press("Enter"));
+  }
   await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/b\/same\.rs(?:\s|$)/}).click();
   await page.locator("#architecture-inspector").getByRole("button", {name:"Open in Treemap", exact:true}).click();
   await ready(page);
