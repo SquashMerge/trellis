@@ -228,6 +228,10 @@ pub struct DaemonState {
     #[cfg(feature = "test-support")]
     maintenance_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     dependencies: Mutex<DependencyIndex>,
+    #[cfg(test)]
+    dependency_idle: tokio::sync::Notify,
+    #[cfg(test)]
+    dependency_build_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, feature = "test-support"))]
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(all(test, feature = "test-support"))]
@@ -444,6 +448,10 @@ pub fn new_with_config(
             catalog: None,
             warnings: Vec::new(),
         }),
+        #[cfg(test)]
+        dependency_idle: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        dependency_build_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
         dependency_capture_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
@@ -1421,6 +1429,7 @@ impl DaemonState {
             if self.runtime.lock().unwrap().session().is_none() {
                 return Ok(());
             }
+            self.start_dependency_index();
         }
         let retained = self.runtime.lock().unwrap().session().cloned();
         if let Some(ref session) = retained
@@ -1704,26 +1713,35 @@ impl DaemonState {
         let state = self.clone();
         tokio::spawn(async move {
             loop {
-                let (generation, cancel) = {
+                let (generation, cancel, config) = {
                     let mut index = state.dependencies.lock().unwrap();
-                    if index.stopped {
+                    let config = state.config();
+                    if index.stopped || config.dependency_options.is_none() {
                         index.worker_running = false;
+                        #[cfg(test)]
+                        state.dependency_idle.notify_one();
                         return;
                     }
-                    (index.generation, index.cancel.clone())
+                    (index.generation, index.cancel.clone(), config)
                 };
                 let worker = state.clone();
                 let worker_cancel = cancel.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let result = (|| {
-                        // Each generation builds with the configuration current
-                        // when it starts; a replaced one bumps the generation.
-                        let config = worker.config();
+                        // Configuration, generation and cancellation were captured
+                        // together before this blocking build was admitted.
                         let options = config
                             .dependency_options
                             .clone()
                             .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
                         let revision = worker.store.status()?.revision;
+                        #[cfg(test)]
+                        {
+                            let hook = worker.dependency_build_hook.lock().unwrap().take();
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                        }
                         Catalog::build(
                             &config.options.workspace_root,
                             revision,
@@ -1745,6 +1763,8 @@ impl DaemonState {
                 let mut index = state.dependencies.lock().unwrap();
                 if index.stopped || index.generation == generation {
                     index.worker_running = false;
+                    #[cfg(test)]
+                    state.dependency_idle.notify_one();
                     return;
                 }
                 // Refresh bursts coalesce to the latest generation. Only this driver
