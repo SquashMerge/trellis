@@ -550,3 +550,153 @@ fn producer_spawn_reachable_only_from_run() {
         "start_run is called from the run owner and the registry's run handler only"
     );
 }
+
+/// The leading identifier of `text`.
+fn leading_ident(text: &str) -> &str {
+    let text = text.trim_start();
+    let end = text
+        .char_indices()
+        .find(|(_, c)| !is_word_char(*c))
+        .map_or(text.len(), |(end, _)| end);
+    &text[..end]
+}
+
+/// The sibling modules of `src/producer/` that `text` names through `super::`,
+/// `self::super::` or `crate::producer::`, including the members of a `use` tree.
+fn sibling_references(text: &str, siblings: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+    for prefix in [
+        "super::",
+        "producer::",
+        "crate::producer::",
+        "trellis::producer::",
+    ] {
+        for (at, _) in text.match_indices(prefix) {
+            let before = text[..at].chars().next_back();
+            // `super::super::` and `self::super::` still end in one of the prefixes.
+            if before.is_some_and(|c| is_word_char(c) && !text[..at].ends_with("self::")) {
+                continue;
+            }
+            let rest = &text[at + prefix.len()..];
+            let members: Vec<&str> = match rest.trim_start().strip_prefix('{') {
+                Some(tree) => {
+                    let mut depth = 0_usize;
+                    let mut start = 0;
+                    let mut parts = Vec::new();
+                    for (i, c) in tree.char_indices() {
+                        match c {
+                            '{' => depth += 1,
+                            '}' if depth == 0 => {
+                                parts.push(&tree[start..i]);
+                                break;
+                            }
+                            '}' => depth -= 1,
+                            ',' if depth == 0 => {
+                                parts.push(&tree[start..i]);
+                                start = i + 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    parts
+                }
+                None if rest.trim_start().starts_with('*') => vec!["*"],
+                None => vec![rest],
+            };
+            for member in members {
+                // A glob or an alias of the parent brings siblings in without naming them.
+                let member = member.trim();
+                if member == "*" || member.starts_with("self ") || member == "self" {
+                    found.push(member.to_owned());
+                    continue;
+                }
+                let ident = leading_ident(member);
+                if siblings.iter().any(|s| s == ident) {
+                    found.push(ident.to_owned());
+                }
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[test]
+fn sibling_scanner_reads_paths_and_use_trees() {
+    let siblings: Vec<String> = ["state", "exec", "run", "batch"].map(String::from).into();
+    let seen = |text| sibling_references(text, &siblings);
+    assert_eq!(
+        seen("use super::state::X; super::exec::f()"),
+        ["exec", "state"]
+    );
+    assert_eq!(
+        seen("use super::{INVALID_REQUEST, batch::{self, A}, run};"),
+        ["batch", "run"]
+    );
+    assert_eq!(seen("use crate::producer::run::Run;"), ["run"]);
+    assert_eq!(seen("use self::super::exec;"), ["exec"]);
+    assert!(seen("use super::{NOT_FOUND, ProducerName}; super::TrustProfile").is_empty());
+    assert_eq!(seen("use super::*;"), ["*"]);
+    assert_eq!(seen("use crate::{producer::run};"), ["run"]);
+    assert_eq!(seen("use super::{self as p, NOT_FOUND};"), ["self as p"]);
+    assert_eq!(seen("use crate::producer::*;"), ["*"]);
+}
+
+#[test]
+fn pickup_reaches_only_allowed_producer_modules() {
+    const ALLOWED: [&str; 5] = ["state", "batch", "import", "pickup", "pickup_watch"];
+    let module_list = production(|f| f == "src/producer/mod.rs", false);
+    let siblings: Vec<String> = module_list[0]
+        .1
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("pub mod ")
+                .or_else(|| line.strip_prefix("mod "))?;
+            Some(rest.trim_end_matches(';').trim().to_owned())
+        })
+        .collect();
+    for name in ALLOWED {
+        assert!(siblings.iter().any(|s| s == name), "{name} is declared");
+    }
+    assert!(siblings.iter().any(|s| s == "exec") && siblings.iter().any(|s| s == "run"));
+
+    let files = production(
+        |f| f.starts_with("src/producer/") && !f.ends_with("/mod.rs"),
+        false,
+    );
+    let text_of = |name: &str| {
+        files
+            .iter()
+            .find(|(file, _)| file == &format!("src/producer/{name}.rs"))
+            .unwrap_or_else(|| panic!("src/producer/{name}.rs"))
+            .1
+            .clone()
+    };
+    for name in ["pickup", "pickup_watch"] {
+        let text = text_of(name);
+        let reached = sibling_references(&text, &siblings);
+        let extra: Vec<_> = reached
+            .iter()
+            .filter(|m| !ALLOWED.contains(&m.as_str()))
+            .collect();
+        assert!(extra.is_empty(), "{name}.rs reaches {extra:?}");
+        for word in ["spawn_producer", "start_run", "ProducerOwner"] {
+            assert_eq!(whole_words(&text, word), 0, "{name}.rs names {word}");
+        }
+    }
+    // What pickup may reach must itself never reach execution.
+    for name in ["state", "batch", "import", "pickup", "pickup_watch"] {
+        let text = text_of(name);
+        let reached = sibling_references(&text, &siblings);
+        assert!(
+            !reached.iter().any(|m| m == "exec" || m == "run"),
+            "{name}.rs reaches execution: {reached:?}"
+        );
+        for word in ["spawn_producer", "start_run"] {
+            assert_eq!(whole_words(&text, word), 0, "{name}.rs names {word}");
+        }
+    }
+}

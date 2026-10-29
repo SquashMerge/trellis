@@ -1,4 +1,6 @@
-use super::pickup::{Decision, PickupRequest, TRANSIENT_RETRY_MILLIS, decide};
+use super::pickup::{
+    Decision, PickupOwner, PickupRequest, TRANSIENT_RETRY_MILLIS, decide, decide_with_retry,
+};
 use super::state::{LastImported, PickupEntry};
 use serde_json::json;
 
@@ -101,4 +103,41 @@ fn pickup_request_is_closed_and_needs_one_action() {
     ] {
         assert!(ok(bad.clone()).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn decide_honours_a_shorter_retry_interval() {
+    let failed = entry(Some((SHA, "failed", Some("stale_basis"))));
+    assert_eq!(
+        decide_with_retry(&failed, SHA, HEAD, THEN + 199, 200),
+        Decision::Skip
+    );
+    assert_eq!(
+        decide_with_retry(&failed, SHA, HEAD, THEN + 200, 200),
+        Decision::Import
+    );
+}
+
+#[test]
+fn shutdown_waits_for_an_import_in_flight() {
+    let owner = PickupOwner::default();
+    let held = owner.hold_workflow();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = {
+        let owner = owner.clone();
+        std::thread::spawn(move || {
+            owner.shutdown();
+            tx.send(()).unwrap();
+        })
+    };
+    crate::testing::wait_until("shutdown to mark the owner closed", || owner.is_closed());
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "shutdown returned while an import held the workflow"
+    );
+    drop(held);
+    rx.recv_timeout(crate::testing::HANG_BACKSTOP)
+        .expect("shutdown returns once the import ends");
+    handle.join().unwrap();
 }

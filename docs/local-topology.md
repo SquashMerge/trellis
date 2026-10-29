@@ -172,7 +172,7 @@ Every request records the `(device,inode)` of its submitted root. A worker detec
 
 **Diagnostics.** A terminal row keeps only a stable error code (for example `index_failed`). Setting `TRELLIS_INDEX_DIAGNOSTICS=1` in the daemon's environment makes it write best-effort `index-phase …` lines to stderr: phase markers, and the cause behind a failed request. It is opt-in, off by default, and changes no outcome; a closed stderr is ignored. It is a production troubleshooting switch, not test instrumentation, so it is not behind `test-support`.
 
-**Diagnostics classes.** For a semantic import request only, the terminal error code is `<class>` or `<class>: <reason>`. The class comes from the closed list `invalid_request`, `invalid_artifact`, `limit_exceeded`, `capture_unavailable`, `stale_basis`, `revision_conflict`, `root_changed` and `index_failed`. The reason is kept only when it is a short stable phrase (`^[a-z0-9][a-z0-9 ._/-]{0,63}$`); any other message is the class alone, and a message outside the closed list is `index_failed`. An index request keeps `index_failed`. The code never carries a path, a count or a message that varies between runs. A pickup that fails before its import request is queued reports `producer_output_missing` or `producer_output_invalid` instead.
+**Diagnostics classes.** For a semantic import request only, the terminal error code is `<class>` or `<class>: <reason>`. The class comes from the closed list `invalid_request`, `invalid_artifact`, `limit_exceeded`, `capture_unavailable`, `stale_basis`, `revision_conflict`, `root_changed` and `index_failed`. The reason is kept only when it is a short stable phrase (`^[a-z0-9][a-z0-9 ._/-]{0,63}$`); any other message is the class alone, and a message outside the closed list is `index_failed`. An index request keeps `index_failed`. The code never carries a path, a count or a message that varies between runs. A pickup that fails before its import request is queued keeps its typed code (`producer_output_missing`, `producer_output_invalid`, `limit_exceeded` or `invalid_request`, with the same short reason rule) instead.
 
 **Producer runs (#21).** A producer run is an explicit owner request (`trellis producer run --plan-sha256`) and never enters the FIFO. The checkout's producer owner runs at most one at a time (`producer_busy` otherwise) and holds an admission lease for the run. Only its generated import enters the FIFO, with a generated origin (T09). The watcher, the MCP server and daemon launch never start a producer. A client that disconnects does not cancel its run. `producer cancel` stops a run while it is materializing, running or writing its batch; once the import request is enqueued it answers `not_cancellable`, and the import's own request row is the outcome. Retirement or loss of the checkout's root cancels the active run, which finishes as `root_changed`.
 
@@ -247,6 +247,23 @@ The labels here are fixture placeholders, **not #22 identity vectors**. For each
 **Crash recovery.** A daemon that crashed mid-run leaves a non-terminal `run.json`. The next activation sweeps it (T06): the recorded process group is killed only when its leader still has the recorded start time, the run is marked `failed/abandoned`, and its directory is stripped to `run.json` unless a queued or running generated import still names it. The sweep also runs before every new run, where it leaves pickup directories alone because this daemon may be importing one.
 
 **Limits.** A trusted profile's builds are not sandboxed. A run whose artifact `project_root` is neither empty nor one of the two spellings of its worktree fails as `producer_output_invalid: project root`. Real producers cannot run in restricted mode where they need network or interpreter access Trellis withholds, and then fail with their stderr tail in the diagnostics.
+
+### Pickup
+
+`trellis producer pickup --producer <name> --artifact <abs path>` configures one artifact per producer in `pickup.json` and imports it at once, as an explicit owner action, replying with the typed import outcome. `--clear` removes the entry. The path must be absolute, UTF-8, at most 4096 bytes, have an existing parent directory and lie outside `<cache>` and `<data>`. Pickup never runs a producer: `pickup.rs` and `pickup_watch.rs` reach only the state, batch, import, pickup and pickup_watch modules, and a static check and the runtime tripwire proof enforce it.
+
+**Triggers.** Each checkout's pickup owner arms a non-recursive `notify` watcher on the artifact's parent directory, filtered to its file name. An event starts a 2 s debounce, after which the file's `(len, mtime, inode)` must stay unchanged for 1 s before an import is attempted. One check runs after startup reconciliation (the activation check), so a sweep of pickup directories cannot race an import. A stat check every 60 s re-reads the artifact only when its stat changed; otherwise it asks only whether a failed outcome is due again. Watcher events are hints and the 60 s check is the liveness backstop (T05). `producer status` reports `pickup.watch` as `active` while the watcher is armed, or `degraded` when it could not be armed (for example the directory is missing) or the pickup configuration cannot be read; a degraded pickup is still covered by the 60 s check, which also re-reads the configuration and re-arms the watcher. The owner stops with the runtime, and `--clear` stops the watch. In a test-support build, `TRELLIS_TEST_PICKUP_INTERVALS` (a JSON object with `debounceMs`, `stableMs`, `checkMs` and `retryMs`) overrides the intervals.
+
+**Decision table.** An automatic trigger hashes the artifact and decides from the last outcome recorded for the same `sha256`:
+
+| Last outcome for the same `sha256` | Action |
+|---|---|
+| none, or a different `sha256` | import |
+| `done` | skip |
+| failed with class `invalid_artifact`, `invalid_request`, `limit_exceeded` or `producer_output_invalid` | skip while the head revision equals the recorded `sourceRevision`; import once the head changes |
+| failed with any other class (`stale_basis`, `revision_conflict`, `capture_unavailable`, `root_changed`, `index_failed`, local I/O) | import once 60 s have passed since the attempt |
+
+A transient retry therefore happens at most once per 60 s and a deterministic retry at most once per head change. A skip writes no batch. The explicit `--artifact` command ignores the table.
 
 ## #64 one-capture admission boundary (intermediate, not a rebuild lifecycle)
 
