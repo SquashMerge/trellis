@@ -37,6 +37,7 @@ pub mod native_evidence;
 pub mod native_ids;
 pub mod navigation;
 mod parallel;
+pub mod producer;
 pub mod references;
 pub mod rules;
 mod rules_edit;

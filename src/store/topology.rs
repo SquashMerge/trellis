@@ -134,6 +134,11 @@ impl TopologyRoots {
     pub fn index_dir(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.cache.join("indexes").join(&identity.root_key)
     }
+    /// Private producer state of one checkout (`<cache>/producers/<root-key>`),
+    /// keyed like its index. Path only; `producer::state` creates it lazily.
+    pub fn producer_state_dir(&self, identity: &WorkspaceIdentity) -> PathBuf {
+        self.cache.join("producers").join(&identity.root_key)
+    }
     pub fn index_use_lock(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.cache
             .join("indexes")
@@ -1154,6 +1159,17 @@ fn managed_existing(base: &Path, child: &str) -> Result<Option<PathBuf>> {
     }
     Ok(Some(base.join(child)))
 }
+/// Remove one checkout's producer state. Absent is fine. The caller holds the
+/// key's exclusive use lock, so no activation can recreate it meanwhile.
+fn remove_producer_state(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::remove_dir_all(path)
+            .with_context(|| format!("remove producer state {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    sync_directory(path.parent().context("producer state parent missing")?)
+}
 fn lower_hex(text: &str, length: usize) -> bool {
     text.len() == length
         && text
@@ -1288,8 +1304,10 @@ fn old_index_schema(version: i64) -> bool {
 /// Only an earlier schema or the exact current layout can reach the unlink boundary.
 /// Validation failures skip the candidate. An unlink/sync failure is returned
 /// as an error, including when an earlier derived file was already removed.
+#[allow(clippy::too_many_arguments)]
 fn gc_remove_candidate(
     dir: &Path,
+    cache: &Path,
     key: &str,
     now: i64,
     guard: UseGuard,
@@ -1297,9 +1315,16 @@ fn gc_remove_candidate(
     writer: &WriterGuard,
     hook: &mut dyn FnMut(GcStage) -> Result<()>,
 ) -> Result<bool> {
+    let producer_state = cache.join("producers").join(key);
     let admit = (|| -> Result<Vec<(PathBuf, (u64, u64))>> {
         guard.verify_exclusive_path(&dir.with_extension("lock"))?;
         private_dir(dir)?;
+        // Unsafe producer state is never removed: skip the candidate.
+        match fs::symlink_metadata(&producer_state) {
+            Ok(_) => private_dir(&producer_state)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let mut names = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -1434,6 +1459,8 @@ fn gc_remove_candidate(
     hook(GcStage::AfterParentSync)?;
     current.verify()?;
     writer.verify()?;
+    // Still under the candidate's exclusive use lock.
+    remove_producer_state(&producer_state)?;
     // Lock path is the final name removed, after the directory is gone.
     guard.remove_last()?;
     Ok(true)
@@ -1559,11 +1586,65 @@ impl TopologyRoots {
                     Err(_) => continue,
                 };
             // Refuse unknown and unsafe entries without creating or recovering files.
-            if gc_remove_candidate(&path, &key, now_secs, guard, current, writer, hook)? {
+            if gc_remove_candidate(
+                &path,
+                &self.cache,
+                &key,
+                now_secs,
+                guard,
+                current,
+                writer,
+                hook,
+            )? {
                 removed += 1;
             }
         }
+        self.collect_orphan_producer_state(current, writer)?;
         Ok(removed)
+    }
+    /// Producer state whose index is gone: a crash after the index was removed,
+    /// or a removal failure past the unlink boundary. The current key is never
+    /// an orphan, and an existing index is collected by its own candidate pass.
+    /// Without an `indexes/` directory nothing is collected.
+    fn collect_orphan_producer_state(
+        &self,
+        current: &WorkspaceIdentity,
+        writer: &WriterGuard,
+    ) -> Result<()> {
+        let Some(producers) = managed_existing(&self.cache, "producers")? else {
+            return Ok(());
+        };
+        let Some(indexes) = managed_existing(&self.cache, "indexes")? else {
+            return Ok(());
+        };
+        for entry in fs::read_dir(&producers)? {
+            writer.verify()?;
+            current.verify()?;
+            let entry = entry?;
+            let Ok(key) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !lower_hex(&key, 64) || key == current.root_key {
+                continue;
+            }
+            // Creates the lock when absent, so an orphan whose lock was
+            // removed is still excluded from a concurrent activation.
+            let Ok(guard) = UseGuard::acquire(&indexes.join(format!("{key}.lock")), true, true)
+            else {
+                continue;
+            };
+            if indexes.join(&key).exists() {
+                continue;
+            }
+            let state = entry.path();
+            if private_dir(&state).is_err() {
+                guard.remove_last()?;
+                continue;
+            }
+            remove_producer_state(&state)?;
+            guard.remove_last()?;
+        }
+        Ok(())
     }
     pub fn gc_report(&self) -> Result<GcReport> {
         let now_secs = std::time::SystemTime::now()
@@ -1777,6 +1858,7 @@ mod gc_schema_race_tests {
                         .unwrap();
                 gc_remove_candidate(
                     &dir,
+                    &roots.cache,
                     &identity.root_key,
                     now,
                     guard,
@@ -1885,6 +1967,7 @@ mod gc_schema_race_tests {
         assert!(
             !gc_remove_candidate(
                 &dir,
+                &roots.cache,
                 &candidate.root_key,
                 now,
                 guard,
@@ -1905,6 +1988,7 @@ mod gc_schema_race_tests {
         assert!(
             !gc_remove_candidate(
                 &dir,
+                &roots.cache,
                 &candidate.root_key,
                 now,
                 guard,
