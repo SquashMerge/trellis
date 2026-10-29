@@ -461,5 +461,9 @@ test("Files syntax colouring classifies whole lines by prefix and leaves large f
   assert.equal(lineClass("javascript", "#private = 1;", 10), "");
   assert.equal(lineClass("javascript", "// <script>alert(1)</script>", 10), "syntax-comment");
   assert.equal(lineClass("rust", " ".repeat(100) + "// deep", 10), "", "the prefix scan is bounded");
+  assert.equal(lineClass("markdown", "* bullet", 10), "", "Markdown bullets are not comments");
+  assert.equal(lineClass("yaml", "# key note", 10), "", "unknown comment syntax stays plain");
+  assert.equal(lineClass("python", "// not a comment", 10), "");
+  assert.equal(lineClass("go", "// comment", 10), "syntax-comment");
   assert.equal(lineClass("rust", "// comment", SYNTAX_LINE_LIMIT + 1), "", "large files stay plain");
 });

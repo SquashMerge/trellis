@@ -221,7 +221,7 @@ async function assertOneLineRows(page, items) {
     assert.equal(row.icon.hidden, "true", where);
     assert.equal(row.name.text, item.symbol.name); assert.equal(row.name.title, item.symbol.name); assert.equal(row.name.elements, 0);
     assert.equal(row.kind.text, item.nativeKind); assert.equal(row.line.text, `L${item.symbol.range.startLine}`);
-    assert.equal(row.label, `${item.symbol.name} · ${item.nativeKind} · line ${item.symbol.range.startLine}`);
+    assert.equal(row.label, `${item.symbol.name} · ${item.nativeKind} · L${item.symbol.range.startLine}`, `${where} accessible name contains the visible line label`);
     assert.ok(row.icon.right <= row.name.left && row.name.right <= row.kind.left + 0.5 && row.kind.right <= row.line.left, `${where} reads icon, name, kind, line`);
     assert.ok(Math.abs(row.line.right - row.contentRight) <= 1, `${where} line is right-aligned`);
     for (const key of ["icon", "name", "kind", "line"]) assert.ok(Math.abs(row[key].top - row.name.top) <= 2, `${where} ${key} shares the name's line`);

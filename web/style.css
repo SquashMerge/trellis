@@ -185,6 +185,7 @@ body:not(.daemon-connected) > main {
 /* Crop the lockup's built-in margin with CSS (artwork spans 26–572 × 23–755 of
    the 600×780 asset) so about 280px of artwork shows, and lighten-blend its
    near-black backdrop into the page background so no darker box appears. */
+/* Blend kept: the asset backdrop is rgb(7,9,10) vs page rgb(11,12,16), so a plain crop or matching frame fill still shows a box. */
 .connection-logo-frame { position: relative; width: 280px; max-width: 100%; aspect-ratio: 547 / 733; overflow: hidden; }
 .connection-logo { position: absolute; left: calc(-100% * 26 / 547); top: calc(-100% * 23 / 733); display: block; width: calc(100% * 600 / 547); max-width: none; height: auto; mix-blend-mode: lighten; }
 .connection-content { display: flex; flex-direction: column; gap: 24px; }
