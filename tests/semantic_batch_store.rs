@@ -2482,6 +2482,61 @@ fn invalid_empty_or_reversed_occurrences_reject_typed_without_partial_publicatio
     }
 }
 
+/// Owner ruling 2026-10-29 (#439): `relative_path` on a signature `Document` (as scip-java writes
+/// it) is presentation-only through batch admission, publication and stored reauthentication.
+#[test]
+fn signature_relative_path_is_presentation_only_in_batch_and_stored_rejoin() {
+    let publish = |signature_path: Option<&[u8]>| {
+        let world = definitions_world();
+        let (a, b) = definitions_docs();
+        let docs = vec![a, b];
+        let mut fixture = world.fixture();
+        let ordinal = fixture.artifact("javascript", docs.clone());
+        let mut index =
+            scip::types::Index::parse_from_bytes(&fixture.scip_bytes("javascript", &docs)).unwrap();
+        let mut signature = scip::types::Signature::new();
+        signature.text = "function run()".into();
+        if let Some(path) = signature_path {
+            // The pinned crate's `Signature` has no field 1; carry it as the raw wire field.
+            signature
+                .special_fields
+                .mut_unknown_fields()
+                .add_length_delimited(1, path.to_vec());
+        }
+        index.documents[0].symbols[0].signature_documentation = Some(signature).into();
+        fixture.override_artifact_raw(ordinal, index.write_to_bytes().unwrap());
+        let descriptor = world.write(&fixture);
+        (world, descriptor)
+    };
+    let digests = |world: &World| {
+        stored_proofs(world)
+            .into_iter()
+            .map(|(_, kind, digest, language, path)| (kind, digest, language, path))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let (without, descriptor) = publish(None);
+    without.publish(&descriptor).unwrap();
+    let (world, descriptor) = publish(Some(b"src/A.js"));
+    world.publish(&descriptor).unwrap();
+    let proofs = stored_proofs(&world);
+    assert_eq!(proofs.len(), 5);
+    assert_eq!(digests(&world), digests(&without));
+    // Native recovery authenticates the stored original, field 1 included, again.
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(stored_proofs(&world), proofs);
+
+    let (malformed, descriptor) = publish(Some(&[0x73, 0xff, 0xfe]));
+    let error = expect_err(malformed.admit(&descriptor));
+    assert_eq!(
+        error.downcast_ref::<ScipCaptureError>(),
+        Some(&ScipCaptureError::InvalidArtifact(
+            "signature relative path".into()
+        ))
+    );
+}
+
 #[test]
 fn nonempty_document_language_mismatch_still_fails_typed_in_batch_admission() {
     let world = definitions_world();

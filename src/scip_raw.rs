@@ -277,7 +277,9 @@ fn field(node: Node, n: u64) -> Option<(u8, Wire, usize)> {
         (Symbol, 7) => (2, Message(Signature), 1),
         (Relationship, 1) => (2, Bytes, 1),
         (Relationship, 2..=5) => (0, Scalar, 1),
-        (Signature, 4 | 5) => (2, Bytes, 1),
+        // Signature `relative_path` (scip-java writes it) is presentation-only, like `language`
+        // and `text` (owner ruling 2026-10-29, #439); see `signature_unknown`.
+        (Signature, 1 | 4 | 5) => (2, Bytes, 1),
         (Signature, 2) => (2, Message(Occurrence), 10000),
         (Occurrence, 1 | 7) => (0, Packed, 1000000),
         (Occurrence, 2) => (2, Bytes, 1),
@@ -442,6 +444,21 @@ fn unknown(f: &protobuf::SpecialFields) -> Result<(), ScipCaptureError> {
     } else {
         Ok(())
     }
+}
+/// The pinned `scip` crate's `Signature` message omits the SCIP `Document.relative_path`
+/// (field 1) that scip-java writes on `signature_documentation`, so it parses as an unknown field.
+/// By owner ruling 2026-10-29 (#439) it is presentation-only: it must be well-formed UTF-8 and is
+/// never read for identity, binding, path or digests. Every other unknown field still rejects.
+fn signature_unknown(f: &protobuf::SpecialFields) -> Result<(), ScipCaptureError> {
+    for (number, value) in f.unknown_fields().iter() {
+        match (number, value) {
+            (1, protobuf::UnknownValueRef::LengthDelimited(path)) => {
+                std::str::from_utf8(path).map_err(|_| invalid("signature relative path"))?;
+            }
+            _ => return Err(invalid("unknown protobuf field")),
+        }
+    }
+    Ok(())
 }
 fn range(
     o: &types::Occurrence,
@@ -748,7 +765,7 @@ fn symbol(
     unknown(&s.special_fields)?;
     let kind = known(s.kind)?;
     if let Some(sig) = s.signature_documentation.as_ref() {
-        unknown(&sig.special_fields)?;
+        signature_unknown(&sig.special_fields)?;
         if sig.occurrences.len() > 10000 {
             return Err(limit("signature occurrences"));
         }
@@ -2383,5 +2400,159 @@ mod tests {
                 .expect("48-byte fact");
             assert_eq!(claim.captured_proof_id, proof);
         }
+    }
+    /// Owner ruling 2026-10-29 (#439): scip-java writes `relative_path` (field 1) on the
+    /// `Document` under `signature_documentation`; it is presentation-only.
+    fn with_signature_path(wire_hex: &str, path: &str) -> Vec<u8> {
+        let mut index = types::Index::parse_from_bytes(&hex::decode(wire_hex).unwrap()).unwrap();
+        let signature = index.documents[0].symbols[0]
+            .signature_documentation
+            .as_mut()
+            .expect("signature fixture");
+        if !path.is_empty() {
+            // The pinned crate's `Signature` lacks field 1; scip-java writes it first.
+            signature
+                .special_fields
+                .mut_unknown_fields()
+                .add_length_delimited(1, path.as_bytes().to_vec());
+        }
+        index.write_to_bytes().unwrap()
+    }
+    #[test]
+    fn signature_relative_path_is_presentation_only() {
+        let without = decoded(SIGNATURE).unwrap();
+        for path in ["src/A.js", "src/Other.java", "../outside", ""] {
+            let bytes = with_signature_path(SIGNATURE, path);
+            if !path.is_empty() {
+                assert_ne!(bytes, hex::decode(SIGNATURE).unwrap());
+            }
+            let with = custom(&bytes, b"function f(){g();}\n", 1).expect(path);
+            assert_eq!(with.artifact_hashes, [sha(&bytes)]);
+            assert_eq!(with.claims.len(), without.claims.len());
+            for (claim, expected) in with.claims.iter().zip(&without.claims) {
+                assert_eq!(claim.canonical_bytes, expected.canonical_bytes, "{path}");
+                assert_eq!(claim.fact_digest, expected.fact_digest, "{path}");
+                assert_eq!(claim.envelope.relative_path, "src/A.js");
+            }
+        }
+    }
+    #[test]
+    fn signature_document_other_unknown_fields_still_reject() {
+        let occ = hex::decode("0a0300090a120241231801").unwrap();
+        let sig_with = |extra: Vec<u8>| {
+            let mut sig = message(1, b"src/A.js");
+            sig.extend(message(5, b"f()"));
+            sig.extend(extra);
+            base_doc(
+                [
+                    message(2, &occ),
+                    message(3, &[message(1, b"A#"), message(7, &sig)].concat()),
+                ]
+                .concat(),
+                1,
+            )
+        };
+        let accepted = sig_with(vec![]);
+        custom(&accepted, b"function f(){g();}\n", 1).expect("relative_path admits");
+        for (name, extra) in [
+            ("document symbols", message(3, &message(1, b"A#"))),
+            ("position encoding", vec![0x30, 0x01]),
+            ("unknown", vec![0xf8, 0x07, 0x01]),
+            ("relative_path wire type", vec![0x08, 0x01]),
+        ] {
+            assert!(
+                matches!(
+                    custom(&sig_with(extra), b"function f(){g();}\n", 1),
+                    Err(ScipCaptureError::InvalidArtifact(_))
+                ),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            custom(
+                &sig_with(message(1, b"src/A.js")),
+                b"function f(){g();}\n",
+                1
+            )
+            .unwrap_err(),
+            limit("repeated field"),
+            "repeated relative_path"
+        );
+    }
+    #[test]
+    fn signature_relative_path_invalid_utf8_rejects() {
+        let occ = hex::decode("0a0300090a120241231801").unwrap();
+        let mut sig = message(1, &[0x73, 0xff, 0xfe]);
+        sig.extend(message(5, b"f()"));
+        let symbol = [message(1, b"A#"), message(7, &sig)].concat();
+        let document = base_doc([message(2, &occ), message(3, &symbol)].concat(), 1);
+        assert_eq!(
+            custom(&document, b"function f(){g();}\n", 1).unwrap_err(),
+            invalid("signature relative path")
+        );
+        assert_eq!(
+            custom(&message(3, &symbol), b"function f(){g();}\n", 1).unwrap_err(),
+            invalid("signature relative path"),
+            "external symbol signature"
+        );
+    }
+    /// A minimal scip-java-shaped Java document: the signature `Document` carries
+    /// `relative_path`, `language` and `text` with a signature-relative occurrence.
+    #[test]
+    fn scip_java_shaped_signature_document_admits() {
+        let source: &[u8] = b"class A { void f() {} }\n";
+        let path = "src/main/java/A.java";
+        let class = "semanticdb maven . . A#";
+        let method = "semanticdb maven . . A#f().";
+        // Wire order as protobuf-java (scip-java) emits it: fields in number order, so the
+        // signature `Document` starts with `relative_path` (1), then occurrences, language, text.
+        let occurrence = |range: &[u8], symbol: &str| {
+            [
+                message(1, range),
+                message(2, symbol.as_bytes()),
+                vec![0x18, 0x01],
+            ]
+            .concat()
+        };
+        let artifact = |sig_path: &str| {
+            let mut signature = Vec::new();
+            if !sig_path.is_empty() {
+                signature.extend(message(1, sig_path.as_bytes()));
+            }
+            signature.extend(message(2, &occurrence(&[0, 5, 6], method)));
+            signature.extend(message(4, b"java"));
+            signature.extend(message(5, b"void f()"));
+            let info = [
+                message(1, method.as_bytes()),
+                vec![0x28, 26],
+                message(6, b"f"),
+                message(7, &signature),
+                message(8, class.as_bytes()),
+            ]
+            .concat();
+            let document = [
+                message(1, path.as_bytes()),
+                message(2, &occurrence(&[0, 6, 7], class)),
+                message(2, &occurrence(&[0, 15, 16], method)),
+                message(3, &info),
+                message(4, b"java"),
+            ]
+            .concat();
+            message(2, &document)
+        };
+        let with = custom_document(&artifact(path), source, 1, path, "java").unwrap();
+        let without = custom_document(&artifact(""), source, 1, path, "java").unwrap();
+        assert_eq!(with.claims.len(), 3);
+        assert_eq!(
+            with.claims
+                .iter()
+                .map(|c| (&c.canonical_bytes, &c.fact_digest))
+                .collect::<Vec<_>>(),
+            without
+                .claims
+                .iter()
+                .map(|c| (&c.canonical_bytes, &c.fact_digest))
+                .collect::<Vec<_>>()
+        );
     }
 }
