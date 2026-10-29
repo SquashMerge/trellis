@@ -3386,7 +3386,6 @@ pub(crate) fn rejoin_inventory_with_original_witness(
     inventory: &crate::scip_raw::ProofInventory,
     captured_native: &native::Artifact,
     destination_native: &native::Artifact,
-    _changed_sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
     producer: semantic::Producer,
     basis: &BTreeMap<native::DocumentKey, semantic::SemanticBasis>,
     original: &semantic::SemanticSnapshot,

@@ -4122,9 +4122,6 @@ thread_local! {
     static STATUS_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Publication contention only. A cached-claim mismatch or unresolved
-/// completion also uses the `storage_busy` prefix, but is not a retryable
-/// SQLite/lock conflict and must never be silently requeued.
 /// A SQLite error from a full disk or a failed read or write.
 fn storage_fault(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -4135,6 +4132,9 @@ fn storage_fault(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Publication contention only. A cached-claim mismatch or unresolved
+/// completion also uses the `storage_busy` prefix, but is not a retryable
+/// SQLite/lock conflict and must never be silently requeued.
 pub(crate) fn transient_storage_contention(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| {
         cause.downcast_ref::<topology::StorageBusy>().is_some()
@@ -8304,7 +8304,6 @@ fn try_original_witness_rejoin(
         inventory,
         original_native,
         &measured,
-        &changed_sources,
         producer.clone(),
         &basis,
         &original,
