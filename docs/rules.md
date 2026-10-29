@@ -104,9 +104,14 @@ Any other value, or a non-string, is a located `invalid_rules` schema error.
 Without the field the browser chooses: bands start collapsed, and a layer with no
 cross-layer production references is collapsed into the "quiet layers" footer.
 That automatic collapsing never applies to a layer with an explicit `display`.
-The hint is presentation only. Assignment, verdicts, counts, exceptions and every
-check, explain, references and MCP result are unchanged; only the browser
-Architecture layer inventory (`layers[].display`, `null` when absent) carries it.
+Assignment, verdicts, reference counts, exceptions and every check, explain,
+references and MCP result are unchanged. The Architecture layer inventory carries
+`layers[].display` (`null` when absent). Under the explicit #395 browser
+[`workbench=true` metrics population](metrics.md#workbench-population), authored
+`display="hidden"` also excludes that layer's files from default production heat.
+Include tests and fixtures restores those contributions. This scoped heat rule does
+not change stored roles or policy. Client-side expansion, quiet layers and automatic
+collapsing do not change metric population.
 Rules edits preserve the field like any other authored text.
 
 ## External package policy

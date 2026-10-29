@@ -776,6 +776,36 @@ pub fn view_layers(config: &Config) -> Vec<Value> {
     }).collect()
 }
 
+/// Resolve authored hidden membership for the explicit workbench metrics population.
+/// Uses the same exact-match, specificity and ambiguity rules as architecture policy.
+pub(crate) fn hidden_layer_paths(
+    config: &Config,
+    paths: &[&str],
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeSet<String>> {
+    let mut work = Work::new(work::rules_limit(paths.len(), 0));
+    let patterns: usize = config
+        .layers
+        .values()
+        .map(|layer| layer.patterns.len())
+        .sum();
+    ensure!(
+        work.charge(paths.len().saturating_mul(patterns)),
+        "bounded_work: layer assignment pattern budget"
+    );
+    let mut matcher = LayerMatcher::new(config);
+    let mut hidden = BTreeSet::new();
+    for path in paths {
+        check()?;
+        if let Some(layer) = matcher.select(path, &mut work, check)?
+            && config.layers[layer].display.as_deref() == Some("hidden")
+        {
+            hidden.insert((*path).to_owned());
+        }
+    }
+    Ok(hidden)
+}
+
 struct LayerMatcher<'a> {
     config: &'a Config,
     relations: BTreeMap<(&'a str, &'a str), glob_language::Relation>,

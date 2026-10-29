@@ -353,3 +353,45 @@ async fn architecture_bounds_cancellation_deadline_and_final_root_fences() {
     assert_eq!(changed["error"]["code"], "root_changed");
     assert!(changed["error"].get("kind").is_none());
 }
+
+#[tokio::test]
+async fn workbench_architecture_option_forwards_hidden_layer_population() {
+    let (base, _runtime, browser, key) = fixture().await;
+    write_rules(
+        &base,
+        "version=1\n[layers.quiet]\norder=1\npaths=['**/*.js']\ndisplay='hidden'",
+    );
+    let app = browser.router();
+    let (status, baseline) = request(app.clone(), &key, "?role=production&workbench=false").await;
+    assert_eq!(status, StatusCode::OK, "{baseline}");
+    assert_eq!(baseline["payload"]["workbench"], false);
+    for role in ["production", "all"] {
+        let (status, data) =
+            request(app.clone(), &key, &format!("?role={role}&workbench=true")).await;
+        assert_eq!(status, StatusCode::OK, "{data}");
+        assert_eq!(data["payload"]["workbench"], true);
+        assert_eq!(
+            data["payload"]["references"],
+            baseline["payload"]["references"]
+        );
+        let sample = data["payload"]["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["identity"]["path"] == "sample.js")
+            .unwrap();
+        assert_eq!(sample["declarationCount"], usize::from(role == "all"));
+        if role == "production" {
+            assert_eq!(sample["excludedReason"], "hidden_layer");
+        }
+    }
+    for query in [
+        "?workbench=",
+        "?workbench=1",
+        "?workbench=True",
+        "?workbench=false&workbench=true",
+    ] {
+        let (status, data) = request(app.clone(), &key, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {data}");
+    }
+}

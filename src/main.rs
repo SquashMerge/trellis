@@ -1927,6 +1927,7 @@ fn metrics_options_from_request(
         "invalid_argument: empty metrics selection"
     );
     let options = trellis::store::MetricsOptions {
+        workbench: false,
         scope: args["scope"]
             .as_str()
             .context("invalid_argument: scope")?

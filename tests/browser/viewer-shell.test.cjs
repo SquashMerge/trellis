@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal, {library = false} = {}) {
+async function published(callback, signal, {library = false, rules = null} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -67,6 +67,10 @@ async function published(callback, signal, {library = false} = {}) {
   mkdirSync(join(paths.workspace, "roles"));
   writeFileSync(join(paths.workspace, "roles", "mixed.rs"), mixedSource);
   writeFileSync(join(paths.workspace, "roles", "only.rs"), testOnlySource);
+  for (const relative of ["tests/fixtures/input.js", "tools/synthetic-cohorts/templates/input.js", "web/vendor/pele-1.10.0-trellis.2.js"]) {
+    const target = join(paths.workspace, relative); mkdirSync(require("node:path").dirname(target), {recursive:true});
+    writeFileSync(target, "function capturedInput(value) { if (value) { return 1; } return 0; }\n");
+  }
   // Noise the explorer hides by default: a dot-directory and a folder with no indexed files.
   mkdirSync(join(paths.workspace, ".tool-cache"));
   writeFileSync(join(paths.workspace, ".tool-cache", "state.txt"), "cache\n");
@@ -78,6 +82,10 @@ async function published(callback, signal, {library = false} = {}) {
     writeFileSync(join(paths.workspace, "Cargo.lock"), "version=4\n[[package]]\nname='browser-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\n");
     writeFileSync(join(paths.workspace, "vendor", "local-library", "Cargo.toml"), "[package]\nname='local-library'\nversion='0.1.0'\n");
     writeFileSync(join(paths.workspace, "vendor", "local-library", "src", "lib.rs"), "// <img src=x onerror='globalThis.libraryExecuted=true'>\npub fn candidate_only() { unknown_external(); }\n");
+  }
+  if (rules !== null) {
+    mkdirSync(join(paths.workspace, ".trellis"), {recursive:true});
+    writeFileSync(join(paths.workspace, ".trellis/rules.toml"), rules);
   }
   let server, browser, context;
   try {
@@ -113,7 +121,7 @@ async function published(callback, signal, {library = false} = {}) {
     const metricsRequests = requests.filter(row => row.url.pathname.endsWith("/metrics"));
     assert.ok(metricsRequests.length > 0);
     for (const {url, method} of metricsRequests) {
-      assert.equal(method, "GET");
+      assert.equal(method, "GET"); assert.equal(url.searchParams.get("workbench"), "true");
       assert.equal(url.pathname, H.scoped(server.rootKey, "metrics"));
       assert.ok(observedPins.some(value => url.searchParams.get("indexGeneration") === value.indexGeneration &&
         url.searchParams.get("indexRevision") === String(value.indexRevision)), "metrics use a complete displayed pin");
@@ -127,14 +135,14 @@ async function published(callback, signal, {library = false} = {}) {
   }
 }
 async function metrics(server, paths, pin, aggregate, scope = "revision", row, role = "production") {
-  const query = new URLSearchParams({...pin, aggregate, scope, role});
+  const query = new URLSearchParams({...pin, aggregate, scope, role, workbench:"true"});
   if (row) {
     query.set("sourceSetId", row.sourceSetId); query.set("path", row.path); query.set("topCognitive", "3");
     if (scope === "file") query.set("language", row.language);
   }
   const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `metrics?${query}`));
   assert.equal(response.status, 200, JSON.stringify(response.data));
-  assert.equal(response.data.payload.role, role);
+  assert.equal(response.data.payload.workbench, true); assert.equal(response.data.payload.role, role);
   assert.equal(response.data.payload.indexGeneration, pin.indexGeneration);
   assert.equal(response.data.payload.indexRevision, pin.indexRevision);
   return response.data.payload;
@@ -203,20 +211,29 @@ async function assertLegend(page, payload, metric) {
     const indexed = payload[row.directory ? "directories" : "files"].find(item => item.path === path);
     assert.ok(indexed, path);
     const value = valueAt(indexed.metrics);
-    assert.equal(row.value, String(value), `${metric} for ${path} is from the selected snapshot`);
+    assert.equal(row.value, value === null ? "—" : String(value), `${metric} for ${path} is from the selected snapshot`);
     return value;
   });
-  const sorted = [...values].sort((a, b) => a - b);
-  const cuts = [.25, .5, .75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]);
-  assert.deepEqual(legend.map(row => row.text), [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`]);
-  assert.equal(new Set(legend.map(row => row.background)).size, 4, "legend shows four actual, distinct heat colors");
-  assert.ok(legend.every(row => row.background !== "rgba(0, 0, 0, 0)"), "heat is painted, not only class names");
+  const relative = await page.locator("#metric-relative").isChecked();
+  const neutral = payload.aggregate === "sum" && !relative;
+  const fixed = {cognitive:[5,15,30],cyclomatic:[5,10,20],maxNesting:[2,3,4],"halstead.volume":[500,1000,2000],fanOut:[7,15,30]};
+  const sorted = values.filter(value => typeof value === "number").sort((a, b) => a - b);
+  const cuts = relative ? [.25,.5,.75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]) : fixed[metric];
+  const ranges = metric === "maintainabilityIndex" && !relative ? ["≥40","≥20–<40","≥10–<20","<10"] :
+    [`≤${cuts?.[0]}`, `>${cuts?.[0]}–${cuts?.[1]}`, `>${cuts?.[1]}–${cuts?.[2]}`, `>${cuts?.[2]}`];
+  if (neutral) {
+    assert.match(await page.locator("#metric-legend").textContent(), /relative totals; no callable risk bands/);
+    assert.deepEqual(legend, []); assert.ok(rows.every(row => row.band.includes("neutral"))); return values;
+  }
+  assert.deepEqual(legend.map(row => row.text), ranges);
+  assert.equal(new Set(legend.map(row => row.background)).size, 4, "four painted severity colors");
   for (let index = 0; index < rows.length; index++) {
-    const rank = cuts.filter(cut => values[index] > cut).length;
-    const severity = metric === "maintainabilityIndex" ? 3 - rank : rank;
+    if (values[index] === null) { assert.ok(rows[index].band.includes("neutral")); continue; }
+    const severity = metric === "maintainabilityIndex" && !relative ? [40,20,10].filter(cut => values[index] < cut).length :
+      metric === "maintainabilityIndex" ? 3 - cuts.filter(cut => values[index] > cut).length : cuts.filter(cut => values[index] > cut).length;
     assert.ok(rows[index].band.includes(`heat-${severity}`), `${metric}: ${values[index]} severity ${severity}`);
-    assert.ok(legend[rank].band.includes(`heat-${severity}`));
-    assert.equal(rows[index].background, legend[rank].background, "tree heat matches the numeric legend interval");
+    const entry = legend.find(row => row.band.includes(`heat-${severity}`));
+    assert.equal(rows[index].background, entry.background, "tree heat matches the active legend interval");
   }
   return values;
 }
@@ -249,6 +266,17 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   await expandSources(page);
   let payload = await metrics(server, paths, pin, "max");
   await assertLegend(page, payload, "cognitive");
+  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true", "Sequence shares the explorer heat surface");
+  assert.equal(await page.locator("#metric-relative").isChecked(), false);
+  const heatBefore = await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class");
+  await page.locator("#file-filter").fill("src/flow.js");
+  assert.equal(await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class"), heatBefore, "same file keeps fixed color when explorer filtering changes");
+  await page.locator("#file-filter").fill("");
+  const readsBefore = requests.filter(row => row.url.pathname.endsWith("/metrics")).length;
+  await page.locator("#metric-relative").check(); await assertLegend(page, payload, "cognitive");
+  assert.match(await page.locator("#metric-legend").textContent(), /Relative to visible set/);
+  assert.equal(requests.filter(row => row.url.pathname.endsWith("/metrics")).length, readsBefore);
+  await page.locator("#metric-relative").uncheck(); await assertLegend(page, payload, "cognitive");
   const file = payload.files.find(row => row.path === "src/flow.js");
   await page.locator('.file-pick[title="src/flow.js"]').click();
   const selectedFile = await metrics(server, paths, pin, "max", "file", file);
@@ -735,3 +763,78 @@ test("explorer hides dot and unindexed folders, status says what was indexed, an
   await page.locator("#inspector-clear").click();
   await page.locator("#call-inspector").waitFor({state:"hidden"});
 }));
+
+test("Sequence explorer excludes fixtures and vendored inputs from heat while Files keeps them visible", {timeout:240000}, async () => published(async ({page, paths, server, pin}) => {
+  const payload = await metrics(server, paths, pin, "max");
+  const inputs = ["tests/fixtures/input.js", "tools/synthetic-cohorts/templates/input.js", "web/vendor/pele-1.10.0-trellis.2.js"];
+  for (const path of inputs) {
+    const row = payload.files.find(row => row.path === path); assert.ok(row, path);
+    assert.equal(row.excludedReason, path.startsWith("web/") ? "vendored" : "fixture");
+    assert.equal(row.declarationCount, 0); assert.equal(row.metrics.cognitive, null);
+    assert.ok(row.roleCounts.production + row.roleCounts.test > 0);
+  }
+  assert.match(await page.locator("#metrics-state").textContent(), /callables excluded from heat.*2 fixture files, 1 vendored files/);
+  await page.locator("#section-files").click();
+  for (const path of inputs) {
+    // Files uses indexed-catalog details, not the live explorer's directory buttons.
+    await page.locator("#file-filter").fill(path);
+    const pick = page.locator("#file-tree .file-pick").filter({hasText:path.split("/").at(-1)});
+    await pick.waitFor(); assert.equal(await pick.count(), 1, path);
+    assert.equal(await pick.getAttribute("title"), path);
+    assert.equal(await pick.locator(".metric-swatch").count(), 0, "Files does not hide or heat excluded files");
+  }
+  await page.locator("#file-filter").fill("");
+  await page.locator("#section-diagrams").click();
+  await page.locator("#metric-include-tests").check();
+  await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
+  const included = await metrics(server, paths, pin, "max", "revision", undefined, "all");
+  for (const path of inputs) {
+    const row = included.files.find(row => row.path === path);
+    assert.equal(row.metrics.cognitive === null, path.startsWith("web/"), "Include tests restores fixtures, never vendor inputs");
+  }
+}));
+
+
+test("invalid rules keep Explorer and Treemap heat with a warning while Architecture keeps its typed error", {timeout:240000}, async () => published(async ({page, paths, server, pin}) => {
+  const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
+  const payload = await metrics(server, paths, pin, "max");
+  assert.equal(payload.layerExclusionsWarning, warning);
+  assert.ok(await page.locator("#metrics-state").isVisible());
+  assert.ok((await page.locator("#metrics-state").textContent()).includes(warning));
+  const measured = payload.files.find(row => row.path === "src/flow.js");
+  assert.ok(measured.metrics.cognitive > 0);
+  const fixture = payload.files.find(row => row.path === "tests/fixtures/input.js");
+  assert.equal(fixture.excludedReason, "fixture"); assert.equal(fixture.metrics.cognitive, null);
+  const vendored = payload.files.find(row => row.path.startsWith("web/vendor/"));
+  assert.equal(vendored.excludedReason, "vendored"); assert.equal(vendored.metrics.cognitive, null);
+  await expandSources(page); await assertLegend(page, payload, "cognitive");
+  assert.doesNotMatch(await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class"), /neutral/);
+
+  await page.locator("#view-treemap").click();
+  await page.locator("#treemap-state[data-state=ready]").waitFor();
+  assert.ok(await page.locator("#treemap-state").isVisible());
+  assert.ok((await page.locator("#treemap-state").textContent()).includes(warning));
+  const tiles = page.locator("#treemap-diagram [data-trellis-file-id]");
+  const key = JSON.stringify([measured.sourceSetId, measured.language, measured.path]);
+  const keys = await tiles.evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-file-id")));
+  assert.equal(keys.filter(value => value === key).length, 1);
+  const tile = tiles.nth(keys.indexOf(key));
+  assert.ok(await tile.locator("rect").first().isVisible());
+  const band = [5, 15, 30].filter(cut => measured.metrics.cognitive > cut).length;
+  assert.equal(await tile.locator("rect").first().getAttribute("fill"), ["#343644", "#FFC20A", "#FFAA10", "#FF7A00"][band]);
+  await tile.click();
+  assert.equal(await page.locator("#treemap-inspector-content dt").filter({hasText:/^cognitive$/}).evaluate(node => node.nextElementSibling.textContent), String(measured.metrics.cognitive));
+  await page.locator("#treemap-path").fill("no-matching-files");
+  await page.locator("#treemap-state[data-state=empty]").waitFor();
+  assert.ok((await page.locator("#treemap-state").textContent()).includes(warning));
+
+  const query = new URLSearchParams({...pin, workbench:"true",aggregate:"max",role:"production"});
+  const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `architecture?${query}`));
+  assert.equal(response.status, 422, JSON.stringify(response.data));
+  assert.equal(response.data.error.code, "invalid_rules"); assert.equal(Object.hasOwn(response.data, "payload"), false);
+  await page.locator("#view-architecture").click();
+  await page.locator("#architecture-state[data-state=error]").waitFor();
+  assert.match(await page.locator("#architecture-state").textContent(), /invalid_rules.*\.trellis\/rules\.toml/);
+  assert.ok(!(await page.locator("#architecture-panel").textContent()).includes(warning));
+  assert.equal(await page.locator("#architecture-diagram svg, #architecture-diagram [data-trellis-module-id]").count(), 0);
+}, undefined, {rules:'version = 1\n[layers.broken]\norder = "not an integer"\npaths = ["src/**"]\n'}));

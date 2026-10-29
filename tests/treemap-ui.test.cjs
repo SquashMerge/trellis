@@ -21,7 +21,7 @@ function fixture(aggregate = "max", role = "production") {
     file("empty.rs", 0, 0, 0), file("tests/empty.rs", 0, 0, 0, "test"), file("src/no-callables.rs", 0, 0, 3),
     file("src/main.rs", 1, 0, 4, "production", "dependency"), file("lib.py", 1, 0, 2, "production", "workspace", "python")];
   if (role === "all") for (const row of files) { row.declarationCount += row.roleCounts.test; if (row.declarationCount) row.metrics.cognitive = 7; }
-  return {...pin, aggregate, role, metricsVersion:"metrics:v1", scope:"revision", files, directories:[]};
+  return {...pin, aggregate, role, workbench:true,metricsVersion:"metrics:v1", scope:"revision", files, directories:[]};
 }
 function harness() {
   const elements = new Map(), calls = [], renders = [], reads = [], conflicts = [];
@@ -50,7 +50,7 @@ function harness() {
     clearTreemapInspector:() => { get("treemap-inspector").hidden = true; get("treemap-inspector-content").replaceChildren(); },
     showTreemapInspector:() => { get("treemap-inspector").hidden = false; },
   }};
-  vm.runInNewContext(pinSource + "\n" + source, {window, document, URLSearchParams, console});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console});
   const controller = window.TrellisTreemap.create({request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
     readSource:(site, revision, current) => reads.push({site, revision, current}), onConflict:error => conflicts.push(error)});
   const button = label => { const result = descendants(get("treemap-inspector-content")).find(item => item.tagName === "button" && item.textContent === label); assert.ok(result, `Missing ${label}`); return result; };
@@ -62,7 +62,7 @@ test("inert defaults request one complete revision pin and use physical lines in
   assert.equal(h.get("treemap-color").value, "cognitive"); assert.equal(h.get("treemap-hide-tests").checked, true);
   assert.equal(h.get("treemap-metric-tests").checked, false); await h.controller.refresh();
   const query = new URL(h.calls[0].url, "http://local").searchParams;
-  for (const [key, expected] of Object.entries({scope:"revision", aggregate:"max", role:"production", indexGeneration:pin.indexGeneration, indexRevision:"1"})) assert.equal(query.get(key), expected);
+  for (const [key, expected] of Object.entries({scope:"revision", aggregate:"max", role:"production", workbench:"true", indexGeneration:pin.indexGeneration, indexRevision:"1"})) assert.equal(query.get(key), expected);
   const {files, options} = h.renders[0]; assert.equal(files.length, 5); assert.ok(files.some(file => file.physicalLines === 0));
   const mixed = files.find(file => file.path === "src/main.rs" && file.sourceSetId === "workspace");
   assert.equal(options.fileValue(mixed), 3); assert.match(h.get("treemap-state").textContent, /17 physical file lines/);
@@ -123,7 +123,11 @@ test("recolor uses visible quartiles, ties stay together, only MI inverts and un
   const h = harness(), api = h.window.TrellisTreemap, cuts = api.quartiles([1,1,1,9,null,NaN,Infinity]);
   assert.deepEqual(Array.from(cuts), [1,1,9]); assert.equal(api.band(1,cuts,"cognitive"),0); assert.equal(api.band(1,cuts,"maintainabilityIndex"),3); assert.equal(api.band(null,cuts,"cognitive"),null);
   await h.controller.refresh(); h.get("treemap-color").value = "maintainabilityIndex"; await h.get("treemap-color").fire("change");
-  assert.equal(h.calls.length, 1); assert.match(text(h.get("treemap-legend")), /higher is better; heat inverted/); assert.match(text(h.get("treemap-legend")), /≤80/);
+  assert.equal(h.calls.length, 1); assert.match(text(h.get("treemap-legend")), /higher is better; heat inverted/); assert.match(text(h.get("treemap-legend")), /≥40/);
+  assert.equal(h.renders.at(-1).options.fileBand(h.renders.at(-1).files.find(file => file.declarationCount)), 0);
+  h.get("treemap-relative").checked = true; await h.get("treemap-relative").fire("change");
+  assert.match(text(h.get("treemap-legend")), /[Rr]elative to visible set.*≤80/);
+  assert.equal(h.calls.length, 1);
   h.get("treemap-color").value = "halstead.volume"; await h.get("treemap-color").fire("change");
   assert.equal(h.renders.at(-1).options.fileValue(h.renders.at(-1).files.find(file => file.declarationCount)), 12);
   assert.notEqual(api.identity(file("same.rs",1,0,1,"production","one")), api.identity(file("same.rs",1,0,1,"production","two")));
@@ -212,4 +216,54 @@ test("pending Architecture entry cannot override a newer local filter or a later
   const h2=harness(), old=deferred();h2.setResponse(() => old.promise);const first=h2.controller.openFile(wanted,pin);
   h2.setResponse(async () => ({payload:fixture()}));assert.equal(await h2.controller.openFile({...wanted,sourceSetId:"dependency"},pin),true);
   old.resolve({payload:fixture()});assert.equal(await first,false);assert.match(text(h2.get("treemap-inspector-content")),/dependency · rust/);
+});
+
+
+test("fixed heat survives filters; sum is neutral until Relative and never refetches on local controls", async () => {
+  const h = harness(); await h.controller.refresh();
+  assert.equal(h.get("treemap-relative").checked, false);
+  const measured = h.renders.at(-1).files.find(row => row.declarationCount);
+  assert.equal(h.renders.at(-1).options.fileBand(measured), 0);
+  h.get("treemap-path").value = measured.path; await h.get("treemap-path").fire("input");
+  assert.equal(h.renders.at(-1).options.fileBand(measured), 0); assert.equal(h.calls.length, 1);
+  h.get("treemap-path").value = ""; await h.get("treemap-path").fire("input");
+  h.setResponse(async () => ({payload:fixture("sum")})); h.get("treemap-aggregate").value = "sum"; await h.get("treemap-aggregate").fire("change");
+  const rendered = h.renders.at(-1); assert.equal(rendered.options.fileBand(rendered.files.find(row => row.declarationCount)), null);
+  assert.match(text(h.get("treemap-legend")), /relative totals/);
+  h.get("treemap-relative").checked = true; await h.get("treemap-relative").fire("change");
+  assert.equal(h.renders.at(-1).options.fileBand(h.renders.at(-1).files.find(row => row.declarationCount)), 0); assert.equal(h.calls.length, 2);
+});
+
+test("excluded file rows retain physical area, exact reasons, raw populations and selection", async () => {
+  const h = harness(), dto = fixture(), excluded = file("fixtures/input.rs", 3, 2, 9);
+  excluded.declarationCount = 0; excluded.metrics = {cognitive:null}; excluded.excludedReason = "fixture"; dto.files.push(excluded);
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  h.get("treemap-path").value = "fixtures/"; await h.get("treemap-path").fire("input");
+  const rendered = h.renders.at(-1); assert.equal(rendered.files[0], excluded); assert.equal(rendered.options.fileBand(excluded), null);
+  rendered.options.onSelectFile(excluded);
+  assert.match(text(h.get("treemap-inspector-content")), /Excluded from heat: fixture/);
+  assert.match(h.get("treemap-state").textContent, /9 physical file lines.*8 callables excluded from heat.*1 fixture files/);
+});
+
+
+test("layer exclusions warning preserves measured paint and stays visible in empty scopes", async () => {
+  const h = harness(), dto = fixture();
+  const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
+  dto.layerExclusionsWarning = warning;
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  assert.equal(h.get("treemap-state").dataset.state, "ready");
+  assert.ok(h.get("treemap-state").textContent.endsWith(warning));
+  const rendered = h.renders.at(-1), measured = rendered.files.find(row => row.declarationCount > 0);
+  assert.equal(rendered.options.fileValue(measured), 3); assert.equal(rendered.options.fileBand(measured), 0);
+  assert.ok(h.get("treemap-files").children.length > 0); assert.ok(h.get("treemap-diagram").children.length > 0);
+  assert.equal(h.get("treemap-state").children.length, 0, "warning is plain state text");
+  h.get("treemap-path").value = "no-matching-files"; await h.get("treemap-path").fire("input");
+  assert.equal(h.get("treemap-state").dataset.state, "empty");
+  assert.match(h.get("treemap-state").textContent, /No indexed files match/);
+  assert.ok(h.get("treemap-state").textContent.endsWith(warning));
+  h.setResponse(async () => ({payload:{...dto,files:[]}})); await h.controller.refresh();
+  assert.equal(h.get("treemap-state").dataset.state, "empty");
+  assert.ok(h.get("treemap-state").textContent.endsWith(warning));
+  h.setResponse(async () => ({payload:fixture()})); await h.controller.refresh();
+  assert.ok(!h.get("treemap-state").textContent.includes(warning), "a normal payload clears the warning");
 });

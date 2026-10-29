@@ -35,7 +35,10 @@ function harness(windowOptions = {}, withMetrics = false) {
     document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text,children:[]}), body: node()},
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
-  if (withMetrics) run(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"));
+  if (withMetrics) {
+    run(fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8"));
+    run(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"));
+  }
   run(source);
   run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   // The app receives the production scoped URL; legacy suffixes below remain the
@@ -884,7 +887,7 @@ test("shared source rejects missing, empty, inverted and noninteger witnessed ra
 
 const metricPin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const metricFile = {path:"src/a.js",sourceSetId:"main",language:"javascript",declarationCount:1,roleCounts:{production:1,test:0},metrics:{cognitive:7}};
-const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,metricsVersion:"metrics:v1",scope,aggregate:"max",role:"production",files,directories,topCognitive:[]},catchingUp:false});
+const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,workbench:true,metricsVersion:"metrics:v1",scope,aggregate:"max",role:"production",files,directories,topCognitive:[]},catchingUp:false});
 
 test("selecting a sequence step fences an already pending file metrics inspection", async () => {
   const h = harness({}, true), pending = deferred();

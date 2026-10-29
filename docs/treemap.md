@@ -24,7 +24,7 @@ Defaults are Cognitive / max, production heat, and **Hide test files** enabled.
 Hide test files removes a file with stored test role or a test-only callable
 population (`production=0,test>0`). Mixed files remain visible. Zero/zero does not
 imply production: the stored root role determines empty-file eligibility.
-**Include tests in metrics** independently requests all callables. It neither
+**Include tests and fixtures in metrics** independently requests all callables. It neither
 reveals hidden files nor changes the area units. Showing test files leaves their
 production heat unavailable, not zero.
 
@@ -32,9 +32,14 @@ production heat unavailable, not zero.
 
 Color choices are Prod/test, Cyclomatic, Cognitive, Max nesting, Maintainability,
 Halstead volume and Fan-out. Max/sum/mean are the existing raw callable folds.
-Visible finite file values determine quartile cuts; ties remain together.
-Maintainability alone reverses severity because higher is better. The legend
-shows the actual cuts. “—” means unavailable, not zero. Test files have dashed
+The shared [fixed bands](metrics.md#workbench-heat-395) apply to max/mean; sum is neutral
+and labelled relative totals. **Relative**, off by default, uses visible finite file quartiles;
+ties remain together. Maintainability reverses severity because higher is better. The legend
+always names the scale. Browser `workbench=true` excludes stored tests, fixture roots, authored
+hidden layers and `web/vendor/` from default heat, with hidden counts. Include tests and fixtures
+restores tests/fixtures/hidden-layer metrics, not vendor metrics. All file rows and physical area
+remain; excluded files are still reachable through Files.
+“—” means unavailable, not zero. Test files have dashed
 outlines; full role/count evidence remains in the inspector.
 
 Directories drill down and breadcrumbs go up. Path and language filters act on

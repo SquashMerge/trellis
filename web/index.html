@@ -16,6 +16,7 @@
   <script src="/shell.js" defer></script>
   <script src="/classes.js" defer></script>
   <script src="/navigation.js" defer></script>
+  <script src="/metric-heat.js" defer></script>
   <script src="/viewer-metrics.js" defer></script>
   <script src="/files.js" defer></script>
   <script src="/architecture-pele.js" defer></script>
@@ -111,7 +112,8 @@
             </select>
             <label for="metric-aggregate">Aggregation</label>
             <select id="metric-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
-            <label><input id="metric-include-tests" type="checkbox"> Include tests in metrics</label>
+            <label><input id="metric-include-tests" type="checkbox"> Include tests and fixtures in metrics</label>
+            <label><input id="metric-relative" type="checkbox"> Relative</label>
             <div id="metric-legend" class="metric-legend" aria-label="Metric heat legend"></div>
             <p id="metrics-state" role="status" aria-live="polite"></p>
           </div>
@@ -120,7 +122,8 @@
               <div class="architecture-controls">
                 <label for="architecture-color">Color by</label><select id="architecture-color"><option value="layer">Layer</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
                 <label for="architecture-aggregate">Aggregation</label><select id="architecture-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
-                <label><input id="architecture-metric-tests" type="checkbox"> Include tests in metrics</label>
+                <label><input id="architecture-metric-tests" type="checkbox"> Include tests and fixtures in metrics</label>
+                <label><input id="architecture-relative" type="checkbox"> Relative</label>
                 <label><input id="architecture-tests" type="checkbox"> Test-only edges</label>
                 <label><input id="architecture-deviations-only" type="checkbox"> Deviations only</label>
               </div>
@@ -181,7 +184,8 @@
             <div class="treemap-controls">
               <label for="treemap-color">Color by</label><select id="treemap-color"><option value="role">Prod/test</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
               <label for="treemap-aggregate">Aggregation</label><select id="treemap-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
-              <label><input id="treemap-metric-tests" type="checkbox"> Include tests in metrics</label>
+              <label><input id="treemap-metric-tests" type="checkbox"> Include tests and fixtures in metrics</label>
+              <label><input id="treemap-relative" type="checkbox"> Relative</label>
               <label><input id="treemap-hide-tests" type="checkbox" checked> Hide test files</label>
               <label for="treemap-path">Path contains</label><input id="treemap-path" type="search" placeholder="Filter indexed paths…">
               <label for="treemap-language">Language</label><select id="treemap-language"><option value="">All languages</option><option value="rust">Rust</option><option value="java">Java</option><option value="python">Python</option><option value="javascript">JavaScript</option></select>

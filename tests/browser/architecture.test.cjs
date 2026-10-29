@@ -91,7 +91,7 @@ async function published(config, callback) {
     assert.deepEqual(errors, [], "real local assets and repository text obey the unchanged CSP");
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "browsing does not index");
     for (const row of requests.filter(row => row.url.pathname.endsWith("/architecture"))) {
-      assert.equal(row.method, "GET");
+      assert.equal(row.method, "GET"); assert.equal(row.url.searchParams.get("workbench"), "true");
       assert.ok(["production", "all"].includes(row.url.searchParams.get("role")), "browser explicitly selects its metric population");
       assert.equal(row.url.searchParams.get("indexGeneration"), pin.indexGeneration);
       assert.equal(row.url.searchParams.get("indexRevision"), String(pin.indexRevision));
@@ -117,7 +117,7 @@ async function published(config, callback) {
   }
 }
 async function architecture(selected, aggregate = "max", role = "production") {
-  const query = new URLSearchParams({aggregate, role, indexGeneration:selected.pin.indexGeneration, indexRevision:selected.pin.indexRevision});
+  const query = new URLSearchParams({aggregate, role, workbench:"true", indexGeneration:selected.pin.indexGeneration, indexRevision:selected.pin.indexRevision});
   return H.api(selected.server.base, selected.paths.token, "GET", H.scoped(selected.server.rootKey, `architecture?${query}`));
 }
 const identityKey = identity => JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
@@ -254,6 +254,13 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   const beforeProduction = await page.locator('#architecture-diagram [role=button][aria-label*="production sites"]').evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")).sort());
   assert.equal(beforeProduction.length, dto.edges.filter(edge => edge.role === "production").length);
   assert.equal(await page.locator('#architecture-diagram [role=button][aria-label*="test sites"]').count(), 0);
+  assert.equal(await page.locator("#architecture-relative").isChecked(), false);
+  assert.match(await page.locator("#architecture-legend").textContent(), /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
+  const metricReads = selected.requests.filter(row => row.url.pathname.endsWith("/architecture")).length;
+  await rerendered(page, () => page.locator("#architecture-relative").check());
+  assert.match(await page.locator("#architecture-legend").textContent(), /Relative to visible set/);
+  assert.equal(selected.requests.filter(row => row.url.pathname.endsWith("/architecture")).length, metricReads);
+  await rerendered(page, () => page.locator("#architecture-relative").uncheck());
   const heat = await module.locator("rect").first().getAttribute("fill"), legend = await page.locator("#architecture-legend").textContent();
   await page.locator("#architecture-tests").check();
   await page.waitForFunction(count => [...document.querySelectorAll('#architecture-diagram [role=button]')].filter(node => node.getAttribute("aria-label")?.includes("test sites")).length === count, dto.edges.filter(edge => edge.role === "test").length);
@@ -295,7 +302,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await expandAll(page);
   assert.equal(await page.locator("#architecture-tests").isChecked(), true, "metric inclusion does not alter the independent reference overlay");
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), dto.edges.map(summaryKey).sort());
-  assert.notEqual(await module.locator("rect").first().getAttribute("fill"), heat, "real higher-complexity tests visibly change the low module's heat");
+  assert.equal(await module.locator("rect").first().getAttribute("fill"), heat, "0 and 3 remain in the same fixed cognitive band");
   assert.match(await page.locator("#architecture-legend").textContent(), /all indexed callables/);
   assert.doesNotMatch(await onlyModule.textContent(), /Unavailable/, "test-only module becomes measured only when tests are included");
   await module.click();
@@ -349,6 +356,11 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await page.locator("#architecture-color").selectOption("maintainabilityIndex");
   await page.waitForFunction(() => document.querySelector("#architecture-legend")?.textContent.includes("higher is better; heat inverted"));
   await ready(page);
+  assert.match(await page.locator("#architecture-legend").textContent(), /≥40.*≥20–<40.*≥10–<20.*<10/);
+  await page.locator("#architecture-aggregate").selectOption("sum");
+  await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: sum")); await ready(page);
+  assert.match(await page.locator("#architecture-legend").textContent(), /relative totals; no callable risk bands/);
+  assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-module-id] rect").evaluateAll(nodes => [...new Set(nodes.map(node => node.getAttribute("fill")))]), ["#14151D"]);
   await page.locator("#architecture-aggregate").selectOption("mean");
   await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: mean"));
   await ready(page);
@@ -492,6 +504,9 @@ test("Architecture applies authored display hints without changing evaluation", 
     const dto = (await architecture(selected)).data.payload;
     assert.deepEqual(Object.fromEntries(dto.layers.map(layer => [layer.name, layer.display])),
       {low:null, mid:null, peer:"hidden", shared:null, top:"expanded", [hostileLayer]:"collapsed"});
+    const hiddenModule = dto.modules.find(row => row.layer === "peer");
+    assert.equal(hiddenModule.excludedReason, "hidden_layer"); assert.equal(hiddenModule.metrics.cognitive, null);
+    assert.match(await page.locator("#architecture-state").textContent(), /1 authored hidden-layer files/);
     assert.equal(siteTotal(dto.edges.filter(edge => edge.role === "production")), 8, "the hint never changes summary counts");
     assert.equal(siteTotal(dto.references.production), 10);
     assert.equal(dto.edges.find(edge => edge.role === "production" && edge.sourceLayer === "mid" && edge.destinationLayer === "peer").status, "deviates");
@@ -502,6 +517,9 @@ test("Architecture applies authored display hints without changing evaluation", 
     assert.ok((await bandStates(page)).some(([name, expanded]) => name === hostileLayer && expanded === "false"), "collapsed draws a summary band");
     await rerendered(page, () => page.locator("#architecture-hidden-toggle").click());
     assert.ok((await bandStates(page)).some(([name]) => name === "peer"), "a hidden layer is shown from the footer");
+    const revealed = (await architecture(selected)).data.payload.modules.find(row => row.layer === "peer");
+    assert.equal(revealed.excludedReason, "hidden_layer", "display reveal does not override the metrics population");
+    assert.equal(revealed.metrics.cognitive, null);
     assert.ok((await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => JSON.parse(node.getAttribute("data-trellis-edge-id"))))).some(([source, destination]) => source === "mid" && destination === "peer"));
   });
 });

@@ -2088,7 +2088,7 @@ async fn guard_common(
 }
 #[cfg(feature = "test-support")]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route(
             "/",
             get(|| async {
@@ -2113,6 +2113,15 @@ pub fn router(state: Arc<DaemonState>) -> Router {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     include_str!("../web/viewer-metrics.js"),
+                )
+            }),
+        )
+        .route(
+            "/metric-heat.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/metric-heat.js"),
                 )
             }),
         )
@@ -2277,7 +2286,8 @@ pub fn router(state: Arc<DaemonState>) -> Router {
                     include_str!("../web/style.css"),
                 )
             }),
-        )
+        );
+    router
         .route(
             "/healthz",
             get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }),
@@ -3379,7 +3389,7 @@ impl ProvisionedBrowser {
 
     pub fn router(self) -> Router {
         let state = Arc::new(self);
-        Router::new()
+        let router = Router::new()
             .route(
                 "/",
                 get(|| async {
@@ -3404,6 +3414,15 @@ impl ProvisionedBrowser {
                     (
                         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                         include_str!("../web/viewer-metrics.js"),
+                    )
+                }),
+            )
+            .route(
+                "/metric-heat.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/metric-heat.js"),
                     )
                 }),
             )
@@ -3631,7 +3650,8 @@ impl ProvisionedBrowser {
                         &include_bytes!("../web/brand/trellis-logo-dark-v1.webp")[..],
                     )
                 }),
-            )
+            );
+        router
             .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
             .route(
                 "/healthz",
@@ -4188,7 +4208,7 @@ fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOpti
             let name = pair.split_once('=').ok_or_else(invalid)?.0;
             if !matches!(
                 name,
-                "indexGeneration" | "indexRevision" | "aggregate" | "role"
+                "indexGeneration" | "indexRevision" | "aggregate" | "role" | "workbench"
             ) {
                 return Err(invalid());
             }
@@ -4253,6 +4273,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
                     | "role"
                     | "metrics"
                     | "topCognitive"
+                    | "workbench"
             ) || fields.insert(name, decode(value)?).is_some()
             {
                 return Err(invalid());
@@ -4272,6 +4293,13 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
     }
     if let Some(value) = fields.remove("role") {
         options.role = value;
+    }
+    if let Some(value) = fields.remove("workbench") {
+        options.workbench = match value.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(invalid()),
+        };
     }
     if let Some(value) = fields.remove("topCognitive") {
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -4503,7 +4531,7 @@ async fn provisioned_core_answer(
             let (body, catching_up) = match result {
                 Ok(answer) => answer,
                 Err(error) => {
-                    if architecture && let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                    if let Some(diagnostic) = crate::rules::diagnostic(&error) {
                         return Ok((
                             (
                                 StatusCode::UNPROCESSABLE_ENTITY,

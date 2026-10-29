@@ -50,7 +50,7 @@ async function capture(page, name) {
   await page.screenshot({path:join(process.env.TRELLIS_BROWSER_SCREENSHOTS, `${name}.png`), fullPage:true});
 }
 async function metrics(selected, aggregate = "max", role = "production") {
-  const query = new URLSearchParams({...selected.pin, scope:"revision", aggregate, role});
+  const query = new URLSearchParams({...selected.pin, scope:"revision", aggregate, role, workbench:"true"});
   const response = await H.api(selected.server.base, selected.paths.token, "GET", H.scoped(selected.server.rootKey, `metrics?${query}`));
   assert.equal(response.status, 200, JSON.stringify(response.data));
   return response.data.payload;
@@ -108,7 +108,7 @@ async function published(callback) {
     assert.deepEqual(await page.evaluate(() => window.treemapCspViolations), []);
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "browsing never indexes");
     for (const row of metricRequests({requests})) {
-      assert.equal(row.method, "GET"); assert.ok(["production", "all"].includes(row.url.searchParams.get("role")));
+      assert.equal(row.method, "GET"); assert.equal(row.url.searchParams.get("workbench"), "true"); assert.ok(["production", "all"].includes(row.url.searchParams.get("role")));
       assert.equal(row.url.searchParams.get("indexGeneration"), pin.indexGeneration);
       assert.equal(row.url.searchParams.get("indexRevision"), String(pin.indexRevision));
       assert.ok(row.url.pathname.startsWith(`/api/checkouts/${server.rootKey}/`));
@@ -154,11 +154,28 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   const native = await page.locator("#treemap-diagram g.pele-leaf[data-trellis-file-id]").evaluateAll(nodes => nodes.map(node => ({key:node.getAttribute("data-trellis-file-id"), fill:node.querySelector("rect").getAttribute("fill"), label:node.getAttribute("aria-label")})));
   for (const leaf of native) {
     const row = visible.find(candidate => fileKey(candidate) === leaf.key), value = row.metrics.cognitive;
-    assert.equal(leaf.fill, value === null ? "#343644" : colors[quartiles.filter(cut => value > cut).length], row.path);
+    assert.equal(leaf.fill, value === null ? "#343644" : colors[[5, 15, 30].filter(cut => value > cut).length], row.path);
     assert.ok(leaf.label.includes(row.path));
   }
   const legend = await page.locator("#treemap-legend").textContent();
-  for (const cut of quartiles) assert.ok(legend.includes(String(cut)), "legend reports real visible cuts");
+  assert.match(legend, /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
+  assert.equal(await page.locator("#treemap-relative").isChecked(), false);
+  const beforeRelative = metricRequests(selected).length;
+  await page.locator("#treemap-relative").check(); await ready(page);
+  assert.equal(metricRequests(selected).length, beforeRelative);
+  const relativeLegend = await page.locator("#treemap-legend").textContent();
+  assert.match(relativeLegend, /Relative to visible set/);
+  for (const cut of quartiles) assert.ok(relativeLegend.includes(String(cut)), "explicit Relative reports visible cuts");
+  const relativeLeaves = await page.locator("#treemap-diagram g.pele-leaf[data-trellis-file-id]").evaluateAll(nodes => nodes.map(node => ({key:node.getAttribute("data-trellis-file-id"),fill:node.querySelector("rect").getAttribute("fill")})));
+  for (const leaf of relativeLeaves) {
+    const value = visible.find(row => fileKey(row) === leaf.key).metrics.cognitive;
+    assert.equal(leaf.fill, value === null ? "#343644" : colors[quartiles.filter(cut => value > cut).length]);
+  }
+  await page.locator("#treemap-relative").uncheck(); await ready(page);
+  await page.locator("#treemap-path").fill("src/mixed.rs"); await ready(page);
+  const filtered = await page.locator("#treemap-diagram g.pele-leaf[data-trellis-file-id] rect").first().getAttribute("fill");
+  assert.equal(filtered, native.find(leaf => JSON.parse(leaf.key)[2] === "src/mixed.rs").fill, "fixed heat survives path filtering");
+  await page.locator("#treemap-path").fill(""); await ready(page);
   const directories = await page.locator("#treemap-diagram [data-trellis-directory-id]").evaluateAll(nodes => nodes.map(node => ({key:JSON.parse(node.getAttribute("data-trellis-directory-id")), label:node.getAttribute("aria-label")})));
   for (const directory of directories) {
     const [sourceSetId, path] = directory.key;
@@ -216,6 +233,10 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
     await page.locator("#treemap-aggregate").selectOption(aggregate); await ready(page);
     assert.equal(metricRequests(selected).at(-1).url.searchParams.get("aggregate"), aggregate);
     assert.equal(metricRequests(selected).at(-1).url.searchParams.get("role"), "all");
+    if (aggregate === "sum") {
+      assert.match(await page.locator("#treemap-legend").textContent(), /relative totals; no callable risk bands/);
+      assert.deepEqual(await page.locator("#treemap-diagram g.pele-leaf rect").evaluateAll(nodes => [...new Set(nodes.map(node => node.getAttribute("fill")))]), ["#343644"]);
+    }
   }
   assert.equal(await page.locator("#treemap-diagram img, #treemap-diagram script, #treemap-diagram foreignObject").count(), 0);
   assert.equal(await page.evaluate(() => globalThis.treemapExecuted), undefined);
@@ -270,6 +291,17 @@ test("Treemap native identities drill and return, Architecture selects exactly, 
   await page.locator("#treemap-language").selectOption("rust"); await ready(page);
   assert.deepEqual(await listKeys(page), visible.filter(row => row.language === "rust").map(fileKey).sort());
   await page.locator("#treemap-language").selectOption(""); await ready(page);
+  const mixedTile = await selectFile(page, mixed);
+  const treemapHeat = await mixedTile.locator("rect").first().evaluate(node => getComputedStyle(node).fill);
+  await page.locator("#view-sequence").click();
+  assert.equal(await page.locator("#metric-aggregate").inputValue(), "max");
+  assert.equal(await page.locator("#metric-include-tests").isChecked(), false);
+  const explorerFile = page.locator('.file-pick[title="src/mixed.rs"]');
+  if (!await explorerFile.count()) await page.locator('.directory-pick[title="src/"]').click();
+  await page.waitForFunction(value => document.querySelector('.file-pick[title="src/mixed.rs"] .metric-value > span:last-child')?.textContent === String(value), mixed.metrics.cognitive);
+  const explorerHeat = await explorerFile.locator(".metric-swatch").evaluate(node => getComputedStyle(node).backgroundColor);
+  assert.equal(explorerHeat, treemapHeat, "same pinned production/max file has identical painted heat in Treemap and Sequence's explorer");
+  await page.locator("#view-treemap").click(); await ready(page);
   await selectFile(page, mixed);
   await page.locator("#treemap-inspector").getByRole("button", {name:"Read indexed file source", exact:true}).click();
   await page.waitForFunction(() => document.querySelector("#source-path")?.textContent.includes("src/mixed.rs") && document.querySelector("#source .source-line"));
@@ -290,6 +322,11 @@ test("Treemap native identities drill and return, Architecture selects exactly, 
     await page.locator('#architecture-diagram [role=button][aria-expanded="false"]').first().focus();
     await opened(() => page.keyboard.press("Enter"));
   }
+  const architectureMixed = page.locator("#architecture-diagram").getByRole("button", {name:/^src\/mixed\.rs(?:\s|$)/});
+  assert.equal(await page.locator("#architecture-aggregate").inputValue(), "max");
+  assert.equal(await page.locator("#architecture-metric-tests").isChecked(), false);
+  assert.equal(await architectureMixed.locator("rect").first().evaluate(node => getComputedStyle(node).fill), treemapHeat,
+    "same pinned production/max file has identical painted heat across Architecture, Treemap and Sequence's explorer");
   await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/b\/same\.rs(?:\s|$)/}).click();
   await page.locator("#architecture-inspector").getByRole("button", {name:"Open in Treemap", exact:true}).click();
   await ready(page);
