@@ -479,8 +479,7 @@ const SEMANTIC_IMPORT_CLASSES: [&str; 8] = [
 fn stable_reason(reason: &str) -> bool {
     let bytes = reason.as_bytes();
     (1..=64).contains(&bytes.len())
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes[0].is_ascii_lowercase() | bytes[0].is_ascii_digit()
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
         && bytes.iter().all(|b| {
             b.is_ascii_lowercase()
                 || b.is_ascii_digit()
@@ -1298,7 +1297,7 @@ impl Store {
             "invalid_request: semantic import options"
         );
         crate::scip_admission::validate_selected_role(root, Path::new(&options.descriptor))
-            .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid_request: {}", error.detail()))?;
         self.enqueue_typed_request(
             root,
             options,

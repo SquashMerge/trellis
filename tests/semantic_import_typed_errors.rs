@@ -246,7 +246,10 @@ fn input_outside_root_reports_reason() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid_request: "), "{stderr}");
-    assert!(stderr.contains("role outside root"), "{stderr}");
+    assert!(
+        stderr.contains("invalid_request: role outside root"),
+        "{stderr}"
+    );
     assert_eq!(world.rows(), before, "nothing was queued");
 }
 
