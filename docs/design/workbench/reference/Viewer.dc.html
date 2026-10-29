@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trellis diagrams</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 12px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<a href="Viewer.dc.html" style="display: flex; align-items: baseline; gap: 8px; text-decoration: none"><img src="/_blob/bb617e698602304f1df1c66e9906ef30" alt="" aria-hidden="true" style="width: 16px; height: 20px; flex: none; align-self: center"><span style="font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 750; color: #F7F7FB">Trellis</span><span style="font-size: 12px; color: #B8BAC8">by SquashMerge</span></a>
+<span aria-hidden="true" style="width: 1px; height: 20px; background: #343644"></span>
+<nav aria-label="App" style="display: flex; gap: 4px">
+<a href="Viewer.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-weight: 600">Diagrams</a>
+<a href="Files.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Files</a>
+<a href="Handoff.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none">Design handoff</a>
+</nav>
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px">
+<label for="co" style="font-size: 12px; color: #B8BAC8">Checkout</label>
+<select id="co" onChange="{{pickCheckout}}" style="min-height: 34px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: #0B0C10; color: #F7F7FB; font-family: 'JetBrains Mono', monospace; font-size: 12px">
+<sc-for list="{{checkoutOptions}}" as="o" hint-placeholder-count="4"><option value="{{o.id}}" selected="{{o.selected}}">{{o.label}}</option></sc-for>
+</select>
+</div>
+<div style="margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 12px; color: #B8BAC8">
+<span title="Git · as of last fetch" style="font-family: 'JetBrains Mono', monospace; color: #B8BAC8">{{co.git}}</span>
+<span style="display: flex; align-items: center; gap: 8px; color: {{co.indexColor}}"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 4px; border: 1.5px solid {{co.indexColor}}"></span>{{co.index}}</span>
+<a href="Main.dc.html" style="display: inline-flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; color: #F7F7FB; text-decoration: none">Attach Herdr…<span style="padding: 0 6px; border: 1px dashed #777A8E; border-radius: 4px; font-size: 12px; font-weight: 400; color: #B8BAC8">Later</span></a>
+</div>
+</header>
+
+<div style="display: flex; flex-wrap: wrap; flex: 1; min-height: 0">
+
+<aside aria-label="Checkouts and files" style="flex: 0 1 240px; min-width: 210px; box-sizing: border-box; border-right: 1px solid #343644; background: #14151D; display: flex; flex-direction: column">
+<section aria-labelledby="ck-h" style="padding: 12px 12px; display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid #343644">
+<h2 id="ck-h" style="margin: 0 6px 6px; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Indexed checkouts</h2>
+<sc-for list="{{machines}}" as="mc" hint-placeholder-count="3">
+<div style="display: flex; align-items: center; gap: 8px; margin: 8px 6px 2px; font-size: 12px"><span style="font-family: 'JetBrains Mono', monospace; color: #F7F7FB">{{mc.name}}</span><span style="margin-left: auto; display: flex; align-items: center; gap: 6px; color: {{mc.color}}"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: {{mc.radius}}; border: 1.5px solid {{mc.color}}; box-sizing: border-box"></span>{{mc.state}}</span></div>
+<sc-for list="{{mc.checkouts}}" as="c" hint-placeholder-count="3">
+<button onClick="{{c.pick}}" aria-pressed="{{c.pressed}}" style="display: flex; flex-direction: column; gap: 1px; padding: 8px 8px; border: 0; border-radius: 8px; background: {{c.bg}}; color: {{c.fg}}; text-align: left; cursor: pointer; font: inherit">
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: {{c.weight}}">{{c.repo}} ⎇ {{c.name}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: {{c.gitColor}}">{{c.git}}</span>
+<span style="font-size: 12px; color: {{c.indexColor}}">{{c.index}}</span>
+</button>
+</sc-for>
+</sc-for>
+<p style="margin: 8px 8px 0; font-size: 12px; color: #B8BAC8; line-height: 1.5">Machines are the saved SSH machines Herdr uses. Read-only; any agent can still use these indexes through trellis mcp.</p>
+</section>
+<section aria-labelledby="fl-h" style="padding: 12px 12px; display: flex; flex-direction: column; gap: 4px; flex: 1">
+<h2 id="fl-h" style="margin: 0 6px 4px; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Files</h2>
+<label for="vf" style="position: absolute; width: 1px; height: 1px; overflow: hidden">Filter files</label>
+<input id="vf" type="search" placeholder="Filter path…" style="min-height: 34px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: #0B0C10; color: #F7F7FB; font: inherit; font-size: 13px">
+<ul style="list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 1px; font-family: 'JetBrains Mono', monospace; font-size: 12px">
+<sc-for list="{{tree}}" as="t" hint-placeholder-count="12">
+<li><a href="Files.dc.html" style="display: flex; justify-content: space-between; gap: 8px; padding: 4px 8px; padding-left: {{t.indent}}px; border-radius: 8px; color: {{t.color}}; text-decoration: none"><span>{{t.label}}</span><span style="display: flex; align-items: center; gap: 4px; color: #B8BAC8; font-size: 12px"><span style="width: 8px; height: 8px; border-radius: 4px; background: {{t.c}}"></span>{{t.v}}</span></a></li>
+</sc-for>
+</ul>
+</section>
+</aside>
+
+<section aria-labelledby="dg-h" style="flex: 999 1 640px; min-width: 0; display: flex; flex-direction: column; background: #0B0C10">
+<nav aria-label="Diagram views" style="display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Viewer.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Class</a>
+<a href="Libraries.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Libraries</a>
+<a href="C4.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">C4</a>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">Mermaid → Pele 1.6.0</span>
+</nav>
+<div role="toolbar" aria-label="Color by complexity" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid #777A8E">
+<h2 id="dg-h" style="margin: 0; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Layers</h2>
+<span style="font-size: 12px; color: #B8BAC8">Color by</span>
+<div role="group" aria-label="Metric" style="display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{metrics}}" as="m" hint-placeholder-count="7">
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" style="min-height: 28px; padding: 0 9px; border-radius: 8px; border: 0; background: {{m.bg}}; color: {{m.color}}; font: inherit; font-size: 12px; cursor: pointer">{{m.label}}</button>
+</sc-for>
+</div>
+<div role="group" aria-label="Aggregation" style="display: flex; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{aggs}}" as="a" hint-placeholder-count="3">
+<button onClick="{{a.pick}}" aria-pressed="{{a.pressed}}" disabled="{{a.disabled}}" style="min-height: 28px; padding: 0 9px; border-radius: 8px; border: 0; background: {{a.bg}}; color: {{a.color}}; font: inherit; font-size: 12px; cursor: {{a.cursor}}">{{a.label}}</button>
+</sc-for>
+</div>
+<div style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: #B8BAC8"><span>{{legendLow}}</span><sc-for list="{{legend}}" as="l" hint-placeholder-count="5"><span style="width: 22px; height: 10px; border-radius: 4px; background: {{l}}"></span></sc-for><span>{{legendHigh}}</span></div>
+</div>
+
+<div style="flex: 1; overflow: auto; padding: 16px; display: flex; gap: 8px; align-items: stretch">
+<div style="flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 8px">
+<sc-for list="{{rows}}" as="row" hint-placeholder-count="5">
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<sc-for list="{{row.bands}}" as="b" hint-placeholder-count="2">
+<div style="flex: 1 1 300px; min-width: 0; display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: flex-start; padding: 12px; border-radius: 12px; border: 1px solid #343644; background: #14151D">
+<div style="flex: 0 0 130px; display: flex; flex-direction: column; gap: 4px">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">{{b.name}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">{{b.metric}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{b.flow}}</span>
+<sc-if value="{{b.hasUp}}" hint-placeholder-val="{{false}}"><span style="align-self: flex-start; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 1px 4px; border: 1px solid #FF8E9A; border-radius: 4px; color: #FF8E9A">{{b.upLabel}}</span></sc-if>
+</div>
+<div style="flex: 1 1 160px; min-width: 0; display: flex; flex-wrap: wrap; gap: 8px">
+<sc-for list="{{b.mods}}" as="m" hint-placeholder-count="6">
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" title="{{m.tip}}" style="display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: {{m.minW}}px; padding: 8px 8px; border-radius: 8px; border: {{m.bw}}px solid {{m.border}}; background: {{m.fill}}; color: {{m.fg}}; font: inherit; cursor: pointer; text-align: left">
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 400">{{m.name}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: {{m.fg}}">{{m.val}}</span>
+</button>
+</sc-for>
+</div>
+</div>
+</sc-for>
+</div>
+</sc-for>
+<div role="list" aria-label="Edge legend" style="display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 4px 4px 0; font-size: 12px; color: #B8BAC8">
+<span role="listitem" style="font-family: 'JetBrains Mono', monospace">↓ downward · allowed</span>
+<span role="listitem" style="font-family: 'JetBrains Mono', monospace; color: #FF8E9A">↑ upward · deviation</span>
+<span role="listitem" style="font-family: 'JetBrains Mono', monospace; color: #FF8E9A">← cross-peer or shared → ordered · deviation</span>
+<span role="listitem" style="font-family: 'JetBrains Mono', monospace">┄ test-only (dashed)</span>
+</div>
+</div>
+<div aria-label="Shared layer" style="flex: 0 0 150px; box-sizing: border-box; display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 12px; border: 1px dashed #777A8E; background: #14151D">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">{{shared.name}}</span>
+<span style="font-size: 12px; color: #B8BAC8">any layer may use</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">{{shared.metric}}</span>
+<span style="align-self: flex-start; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 1px 4px; border: 1px solid #FF8E9A; border-radius: 4px; color: #FF8E9A">{{shared.upLabel}}</span>
+<sc-for list="{{shared.mods}}" as="m" hint-placeholder-count="3">
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" title="{{m.tip}}" style="display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 8px 8px; border-radius: 8px; border: {{m.bw}}px solid {{m.border}}; background: {{m.fill}}; color: {{m.fg}}; font: inherit; cursor: pointer; text-align: left">
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 400">{{m.name}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: {{m.fg}}">{{m.val}}</span>
+</button>
+</sc-for>
+</div>
+</div>
+</section>
+
+<aside aria-labelledby="vi-h" style="flex: 1 1 290px; min-width: 0; max-width: 360px; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 8px">
+<h2 id="vi-h" style="margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 400">{{mod.name}}</h2>
+<div style="font-size: 12px; color: #B8BAC8">{{mod.layer}} · {{mod.sloc}} lines · {{mod.n}} callables</div>
+<sc-for list="{{mod.rows}}" as="r" hint-placeholder-count="8">
+<div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 8px; background: {{r.bg}}; font-size: 12px"><span style="color: #F7F7FB">{{r.label}}</span><span style="display: flex; align-items: center; gap: 8px; font-family: 'JetBrains Mono', monospace"><span style="width: 10px; height: 10px; border-radius: 4px; background: {{r.c}}"></span>{{r.v}}</span></div>
+</sc-for>
+<h3 style="margin: 8px 0 0; font-size: 12px; font-weight: 600; color: #B8BAC8">Highest cognitive complexity</h3>
+<sc-for list="{{mod.hot}}" as="h" hint-placeholder-count="3">
+<a href="Sequence.dc.html" style="display: flex; flex-direction: column; gap: 4px; padding: 8px 8px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none">
+<span style="display: flex; justify-content: space-between; gap: 8px; font-family: 'JetBrains Mono', monospace; font-size: 12px"><span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{h.name}}</span><span style="color: #FFC20A">{{h.cog}}</span></span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{h.path}} · cyclomatic {{h.cyc}} · nesting {{h.nest}}</span>
+</a>
+</sc-for>
+<div style="margin-top: auto; display: flex; flex-direction: column; gap: 8px">
+<a href="Handoff.dc.html" style="display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; border-radius: 8px; background: #FFAA10; color: #0B0C10; text-decoration: none; font-weight: 600">Design a change<span style="padding: 0 6px; border: 1px dashed #0B0C10; border-radius: 4px; font-size: 12px; font-weight: 400; color: #0B0C10">Later</span></a>
+<span style="font-size: 12px; color: #B8BAC8; line-height: 1.5">Without Herdr, the design diff is copied or saved for an agent to pick up through trellis mcp. Values are an approximate scan at 0acaba1.</span>
+</div>
+</aside>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { co: 'main', metric: 'cognitive', agg: 'max', mod: 'store' }; }
+  renderVals() {
+    const CO = [
+      { id: 'main', mc: 'mac', repo: 'trellis', name: 'main', label: 'trellis ⎇ main · 0acaba1 · ↑0 ↓0', git: '↑0 ↓0 · clean', index: 'Fresh · rev 431', indexColor: '#57D6A0' },
+      { id: '118', mc: 'mac', repo: 'trellis', name: 'issue-118', label: 'trellis ⎇ issue-118 (worktree) · ↑4 ↓0', git: '↑4 ↓0 · 3 uncommitted', index: 'Catching up · 3 files', indexColor: '#FFC20A' },
+      { id: '197', mc: 'mac', repo: 'trellis', name: 'issue-197', label: 'trellis ⎇ issue-197 (worktree) · ↑2 ↓1', git: '↑2 ↓1 · 2 uncommitted', index: 'Fresh · rev 433', indexColor: '#57D6A0' },
+      { id: 'service-a', mc: 'workstation', repo: 'service-a', name: 'main', label: 'workstation · service-a ⎇ main · ↑0 ↓12', git: '↑0 ↓12 · clean', index: 'Fresh · rev 96', indexColor: '#57D6A0' },
+      { id: 'notes', mc: 'workstation', repo: 'notes', name: 'no branch', label: 'workstation · notes (no Git)', git: 'Git unavailable · not a repository', gitColor: '#B8BAC8', index: 'Fresh · rev 12', indexColor: '#57D6A0' }
+    ];
+    const MC = [
+      { id: 'mac', name: 'This Mac', state: 'Online', color: '#57D6A0', radius: '50%' },
+      { id: 'workstation', name: 'workstation · ssh', state: 'Online', color: '#57D6A0', radius: '50%' },
+      { id: 'work', name: 'work · ssh', state: 'Unreachable', color: '#FF8E9A', radius: '1px' }
+    ];
+    const co0 = CO.find(c => c.id === this.state.co) || CO[0];
+    const co = { ...co0, git: co0.git + ' · as of last fetch' };
+    const item = (c) => ({ ...c, gitColor: c.gitColor || '#B8BAC8', pressed: c.id === co.id ? 'true' : 'false', bg: c.id === co.id ? '#7770DC' : 'transparent', fg: c.id === co.id ? '#0B0C10' : '#F7F7FB', weight: c.id === co.id ? 700 : 500, pick: () => this.setState({ co: c.id }) });
+    const machines = MC.map(x => ({ ...x, checkouts: CO.filter(c => c.mc === x.id).map(c => { const it = item(c); return c.id === co.id ? { ...it, gitColor: '#0B0C10', indexColor: '#0B0C10' } : it; }) }));
+    const checkouts = CO.map(item);
+    const checkoutOptions = CO.map(c => ({ id: c.id, label: c.label, selected: c.id === co.id }));
+    const D = {"web":[3231,58,628,41,521,44,3,59.9,141157,505],"http":[6134,90,511,179,420,189,4,61.3,99024,1577],"daemon":[5627,234,909,53,822,50,4,60.1,106623,2494],"mcp":[6166,183,813,91,815,183,5,59.0,135140,2949],"acp":[834,33,80,9,51,10,3,59.3,17521,547],"main":[1797,18,88,25,76,30,5,54.7,23622,465],"auth":[57,2,11,8,7,5,2,54.9,1255,36],"classes":[1651,46,252,30,379,71,7,56.0,32854,656],"navigation":[503,17,78,13,55,12,2,55.6,9181,209],"class_diagram":[139,5,12,5,7,5,2,66.1,952,25],"planning":[468,12,46,17,40,21,4,57.9,9162,220],"metrics":[1108,28,182,72,215,117,4,59.9,20847,399],"behavior":[57,1,6,6,1,1,1,55.5,377,6],"behavior_*":[3150,90,533,43,629,95,9,59.5,56804,1146],"dependencies":[80,2,2,1,0,0,0,68.3,159,5],"dependency_*":[1223,9,64,27,57,22,3,57.3,6249,148],"file_tree":[304,6,37,16,37,23,3,51.3,6305,107],"live_jev":[886,15,26,5,17,7,2,55.2,11295,407],"jev":[282,11,43,10,27,8,2,57.3,6455,170],"answer":[151,3,10,7,9,7,2,50.6,2646,68],"rust_sources":[109,2,11,6,7,5,1,44.2,2037,55],"native_evidence":[4499,106,505,91,368,80,5,55.6,99440,2220],"index_coordinator":[1492,64,216,37,165,59,4,64.1,32387,631],"indexer":[1959,55,415,58,382,51,5,52.5,52387,1047],"indexer_*":[348,9,45,15,25,17,2,53.8,6859,194],"capture":[1456,53,185,18,163,27,3,59.7,28760,853],"watch":[1266,35,87,16,62,23,3,64.0,10926,344],"native_ids":[496,27,73,12,48,14,3,63.0,7636,284],"store":[22612,738,3047,90,2507,134,6,60.7,495810,10646],"model":[655,31,69,14,26,8,1,69.1,4203,156],"testing":[57,5,9,3,4,2,1,66.7,729,24]};
+    const HOT = {"store":[["mcp_outgoing","src/store/mcp_read.rs",90,134,4],["publish_inner_checked_target_with_local","src/store.rs",86,110,4],["write_native","src/store.rs",54,90,4]],"http":[["provisioned_core_answer","src/http.rs",179,189,4],["metrics_query","src/http.rs",32,31,3],["new_with_config","src/http.rs",21,20,1]],"mcp":[["coordinate","src/mcp/mod.rs",91,183,5],["run_call","src/mcp/mod.rs",61,78,5],["evidence_read","src/mcp/mod.rs",26,38,4]],"daemon":[["validate_browser_options","src/daemon/registry.rs",53,50,3],["handle","src/daemon/client.rs",33,32,2],["call","src/daemon/client.rs",21,31,3]],"native_evidence":[["validate_structure","src/native_evidence.rs",91,80,3],["rust_test_attribute","src/native_evidence.rs",20,27,4],["header","src/native_evidence.rs",19,26,4]],"indexer":[["proved_body_only","src/indexer.rs",58,51,3],["measured_display_labels_prepared","src/indexer.rs",19,41,4],["native_js_kind","src/indexer.rs",22,38,5]],"classes":[["module","src/classes.rs",24,71,7],["class","src/classes.rs",30,47,4],["types","src/classes.rs",27,43,5]],"metrics":[["score","src/metrics.rs",72,117,4],["fold_numeric","src/metrics.rs",12,18,3],["callable_body","src/metrics.rs",16,17,3]],"index_coordinator":[["drain_requests_observed_with_cancel","src/index_coordinator.rs",37,59,4],["reconcile_due_with_mode","src/index_coordinator.rs",25,28,2],["diagnostics","src/index_coordinator.rs",15,14,2]],"behavior_*":[["new","src/behavior_bindings.rs",43,95,9],["loop_step","src/behavior_java.rs",20,43,4],["loop_step","src/behavior_js.rs",14,38,5]],"web":[["describe","web/app.js",36,44,2],["aborted","web/app.js",35,43,2],["open","web/navigation.js",37,37,2]],"main":[["dispatch_cli","src/main.rs",25,30,5],["serve_via_daemon","src/main.rs",13,13,1],["send_daemon","src/main.rs",7,10,2]],"capture":[["native_input_fingerprints","src/capture.rs",18,27,3],["persisted_inputs","src/capture.rs",16,26,3],["admit_with_image","src/capture.rs",17,19,2]],"watch":[["certainly_excluded","src/watch.rs",16,23,3],["set","src/watch.rs",9,8,2]],"model":[["validate","src/model.rs",14,8,0],["try_from","src/model.rs",5,3,1]]};
+    const MET = {
+      cyclomatic: { label: 'Cyclomatic', aggs: ['max', 'sum', 'mean'] },
+      cognitive: { label: 'Cognitive', aggs: ['max', 'sum', 'mean'] },
+      maxNesting: { label: 'Max nesting', aggs: ['max'] },
+      maintainabilityIndex: { label: 'Maintainability', aggs: ['mean'], invert: true },
+      halsteadVolume: { label: 'Halstead volume', aggs: ['sum', 'mean'] },
+      fanOut: { label: 'Fan-out', aggs: ['sum', 'mean'] },
+      none: { label: 'None', aggs: [] }
+    };
+    const metric = this.state.metric; const m = MET[metric];
+    const agg = m.aggs.includes(this.state.agg) ? this.state.agg : (m.aggs[0] || 'max');
+    const value = (k, met, ag) => {
+      const r = D[k]; if (!r) return null; const n = r[1];
+      if (met === 'cyclomatic') return ag === 'max' ? r[3] : ag === 'sum' ? r[2] : (n ? r[2] / n : null);
+      if (met === 'cognitive') return ag === 'max' ? r[5] : ag === 'sum' ? r[4] : (n ? r[4] / n : null);
+      if (met === 'maxNesting') return n ? r[6] : null;
+      if (met === 'maintainabilityIndex') return r[7];
+      if (met === 'halsteadVolume') return ag === 'sum' ? r[8] : (n ? r[8] / n : null);
+      if (met === 'fanOut') return ag === 'sum' ? r[9] : (n ? r[9] / n : null);
+      return null;
+    };
+    const fmt = (v) => v == null ? '—' : v >= 10000 ? Math.round(v / 1000) + 'k' : v >= 1000 ? (v / 1000).toFixed(1) + 'k' : (Number.isInteger(v) ? String(v) : v.toFixed(1));
+    const SCALE = ['#343644', '#FFC20A', '#FFAA10', '#FF7A00']; const fgOn = (c) => (c === '#FFC20A' || c === '#FFAA10' || c === '#FF7A00') ? '#0B0C10' : '#F7F7FB';
+    const vals = Object.keys(D).map(k => value(k, metric, agg)).filter(v => v != null).sort((a, b) => a - b);
+    const q = (p) => vals.length ? vals[Math.min(vals.length - 1, Math.floor(p * vals.length))] : 0;
+    const cuts = [q(0.25), q(0.5), q(0.75)];
+    const colorOf = (v) => { if (v == null || metric === 'none') return '#1D1E2A'; const b = cuts.filter(c => v > c).length; return SCALE[m.invert ? 3 - b : b]; };
+    // [order, name, mods, flow, deviation label] from .trellis/rules.toml (#129); equal order numbers are peers.
+    const B = [
+      [1, '1 · UI', ['web'], 'HTTP JSON → entry', ''],
+      [2, '2 · HTTP & daemon', ['http', 'daemon', 'main', 'auth'], '↓ 82 refs down', ''],
+      [2, '2 · MCP & ACP', ['mcp', 'acp'], '↓ 30 refs down', '← 3 to peer'],
+      [3, '3 · Query services', ['classes', 'metrics', 'navigation', 'class_diagram', 'planning', 'behavior', 'behavior_*', 'dependencies', 'dependency_*', 'file_tree', 'live_jev', 'jev', 'answer', 'rust_sources'], '↓ 11 refs down', ''],
+      [4, '4 · Indexing', ['native_evidence', 'index_coordinator', 'indexer', 'indexer_*', 'capture', 'watch', 'native_ids'], '↓ 34 refs down', '↑ 1 refs up'],
+      [5, '5 · Storage', ['store'], '↓ 0 refs down', '↑ 252 refs up']
+    ];
+    const SH = ['Shared', ['model', 'testing'], '← 2 up · deviation'];
+    const layerOf = {}; B.forEach(b => b[2].forEach(x => { layerOf[x] = b[1]; })); SH[1].forEach(x => { layerOf[x] = 'Shared'; });
+    const selMod = this.state.mod;
+    const levelOf = (mods) => { const vs = mods.map(x => value(x, metric, agg)).filter(v => v != null); const lv = !vs.length || metric === 'none' ? '' : (agg === 'sum' ? vs.reduce((a, b) => a + b, 0) : agg === 'mean' && metric !== 'maxNesting' ? vs.reduce((a, b) => a + b, 0) / vs.length : Math.max(...vs)); return lv === '' ? '' : m.label.toLowerCase() + ' · ' + agg + ' ' + fmt(lv); };
+    const tile = (x) => { const v = value(x, metric, agg); const on = x === selMod; const fill = colorOf(v);
+      return { fg: metric === 'none' ? '#F7F7FB' : fgOn(fill), name: x, val: metric === 'none' ? (D[x] ? D[x][0].toLocaleString('en-US') + ' lines' : '') : fmt(v), fill, minW: Math.round(Math.min(220, 64 + Math.sqrt(D[x] ? D[x][0] : 0) * 0.9)), border: on ? '#ABA5FF' : (metric === 'none' ? '#ABA5FF' : 'transparent'), bw: on ? 2 : 1, pressed: on ? 'true' : 'false', tip: x + ' · ' + m.label + ' ' + agg + ' ' + fmt(v), pick: () => this.setState({ mod: x }) }; };
+    const orders = [...new Set(B.map(b => b[0]))];
+    const rows = orders.map(o => ({ bands: B.filter(b => b[0] === o).map(([, name, mods, flow, up]) => ({ name, flow, upLabel: up, hasUp: !!up, metric: levelOf(mods), mods: mods.map(tile) })) }));
+    const shared = { name: SH[0], upLabel: SH[2], metric: levelOf(SH[1]), mods: SH[1].map(tile) };
+    const metrics = Object.keys(MET).map(k => ({ label: MET[k].label, pressed: metric === k ? 'true' : 'false', bg: metric === k ? '#1D1E2A' : 'transparent', color: metric === k ? '#F7F7FB' : '#B8BAC8', pick: () => this.setState({ metric: k }) }));
+    const aggs = ['max', 'sum', 'mean'].map(a => { const ok = m.aggs.includes(a); return { label: a, pressed: agg === a ? 'true' : 'false', disabled: !ok, bg: agg === a && ok ? '#1D1E2A' : 'transparent', color: ok ? (agg === a ? '#F7F7FB' : '#B8BAC8') : '#777A8E', cursor: ok ? 'pointer' : 'not-allowed', pick: () => ok && this.setState({ agg: a }) }; });
+    const r = D[selMod] || D.store;
+    const rowsDef = [['Cyclomatic · max', 'cyclomatic', 'max'], ['Cyclomatic · sum', 'cyclomatic', 'sum'], ['Cognitive · max', 'cognitive', 'max'], ['Cognitive · sum', 'cognitive', 'sum'], ['Max nesting', 'maxNesting', 'max'], ['Maintainability · mean', 'maintainabilityIndex', 'mean'], ['Halstead volume · sum', 'halsteadVolume', 'sum'], ['Fan-out · sum', 'fanOut', 'sum']];
+    const mod = { name: selMod, layer: layerOf[selMod], sloc: r[0].toLocaleString('en-US'), n: r[1],
+      rows: rowsDef.map(([label, met, ag]) => { const v = value(selMod, met, ag); const active = met === metric && ag === agg; return { label, v: fmt(v), c: active ? colorOf(v) : 'transparent', bg: active ? '#1D1E2A' : 'transparent' }; }),
+      hot: (HOT[selMod] || []).map(([name, path, cyc, cog, nest]) => ({ name, path, cyc, cog, nest })) };
+    const fileV = (k) => { const v = value(k, metric, agg); return { v: metric === 'none' ? '' : fmt(v), c: metric === 'none' ? 'transparent' : colorOf(v) }; };
+    const tree = [['src/', 8, null, 'open'], ['daemon/', 22, 'daemon'], ['http/', 22, 'http'], ['mcp/', 22, 'mcp'], ['store/', 22, 'store'], ['classes.rs', 22, 'classes'], ['indexer.rs', 22, 'indexer'], ['model.rs', 22, 'model'], ['native_evidence.rs', 22, 'native_evidence'], ['watch.rs', 22, 'watch'], ['… 30 more', 22, null, 'muted'], ['web/', 8, 'web'], ['tests/', 8, null]]
+      .map(([label, indent, k, s]) => ({ label: (label.endsWith('/') ? (s === 'open' ? '▾ ' : '▸ ') : '  ') + label, indent, color: s === 'muted' ? '#B8BAC8' : '#F7F7FB', ...(k ? fileV(k) : { v: '', c: 'transparent' }) }));
+    return { co, checkouts, machines, checkoutOptions, pickCheckout: (e) => this.setState({ co: e.target.value }), metrics, aggs, rows, shared, mod, tree,
+      legend: metric === 'none' ? [] : SCALE, legendLow: metric === 'none' ? '' : (m.invert ? 'high MI' : 'low'), legendHigh: metric === 'none' ? '' : (m.invert ? 'low MI' : 'high') };
+  }
+}
+</script>
+</body>
+</html>

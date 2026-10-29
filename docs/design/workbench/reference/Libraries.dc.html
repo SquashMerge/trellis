@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Libraries view</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="width: 1200px; height: 800px; box-sizing: border-box; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column; overflow: hidden">
+
+<div style="display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Trellis</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">squashmerge/trellis ⎇ main</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">0acaba1</span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">Local declaration catalog · Rust/Cargo first</span>
+</div>
+<nav aria-label="Diagram views" style="display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Architecture.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Class</a>
+<a href="Libraries.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Libraries</a>
+<a href="C4.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">C4</a>
+</nav>
+
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid #343644">
+<h2 style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">Libraries</h2>
+<span style="font-size: 12px; color: #B8BAC8">No downloads or project commands. Libraries stay separate from workspace evidence.</span>
+<button style="margin-left: auto; min-height: 32px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: transparent; color: #F7F7FB; font: inherit; font-size: 13px; cursor: pointer">Refresh library status</button>
+</div>
+
+<div style="flex: 1; display: flex; min-height: 0">
+<section aria-labelledby="pk-h" style="width: 300px; flex: none; box-sizing: border-box; padding: 12px; border-right: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 4px">
+<h3 id="pk-h" style="margin: 0 6px 6px; font-size: 14px; font-weight: 600">Packages <span style="font-weight: 400; color: #B8BAC8">· {{pkgCount}}</span></h3>
+<sc-for list="{{packages}}" as="p" hint-placeholder-count="8">
+<button onClick="{{p.pick}}" aria-pressed="{{p.pressed}}" style="display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 8px; border: 0; border-radius: 8px; background: {{p.bg}}; color: {{p.fg}}; font: inherit; text-align: left; cursor: pointer">
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: {{p.weight}}">{{p.name}} <span style="color: {{p.sub}}">{{p.version}}</span></span>
+<span style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: {{p.stateColor}}"><span aria-hidden="true" style="width: 8px; height: 8px; border-radius: {{p.radius}}; border: 1.5px solid {{p.stateColor}}; box-sizing: border-box"></span>{{p.state}}</span>
+</button>
+</sc-for>
+<details style="margin-top: auto; font-size: 12px; color: #B8BAC8"><summary style="cursor: pointer">Library diagnostics · 1</summary><p style="margin: 6px 0 0; line-height: 1.5">openssl-sys 0.9.104: source not in the Cargo cache; run cargo fetch yourself to index it.</p></details>
+</section>
+
+<section aria-labelledby="df-h" style="flex: 1; min-width: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px">
+<h3 id="df-h" style="margin: 0; font-size: 14px; font-weight: 600">Indexed definitions · {{pkg.name}}</h3>
+<span style="font-size: 12px; color: #B8BAC8">{{defCount}} of {{pkg.defs}}</span>
+<label for="lf" style="position: absolute; width: 1px; height: 1px; overflow: hidden">Filter definitions</label>
+<input id="lf" type="search" value="{{filter}}" onInput="{{setFilter}}" placeholder="Class, type or method…" style="margin-left: auto; width: 260px; min-height: 34px; padding: 0 10px; border: 1px solid #777A8E; border-radius: 8px; background: #0B0C10; color: #F7F7FB; font: inherit; font-size: 13px">
+</div>
+<div role="list" style="flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 4px">
+<sc-for list="{{defs}}" as="d" hint-placeholder-count="12">
+<a role="listitem" href="Files.dc.html" style="display: flex; align-items: baseline; gap: 12px; padding: 8px 8px; border-radius: 8px; background: #14151D; color: #F7F7FB; text-decoration: none">
+<span style="flex: none; width: 56px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{d.kind}}</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 13px">{{d.name}}</span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">{{d.path}}</span>
+</a>
+</sc-for>
+</div>
+<p style="margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; color: #B8BAC8; line-height: 1.5"><span style="padding: 1px 6px; border: 1px solid #777A8E; border-radius: 4px; color: #F7F7FB">Syntax candidates</span><span style="padding: 1px 6px; border: 1px solid #777A8E; border-radius: 4px; color: #F7F7FB">Terminal library boundary</span>Declarations don't prove resolved types, callees or dispatch. Source opens only when you select a definition.</p>
+</section>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1200,"height":800}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { pkg: 'rusqlite', filter: '' }; }
+  renderVals() {
+    const P = [
+      { name: 'rusqlite', version: '0.37.0', defs: 1184, state: 'Indexed', ok: true },
+      { name: 'tokio', version: '1.47.1', defs: 6310, state: 'Indexed', ok: true },
+      { name: 'axum', version: '0.8.4', defs: 942, state: 'Indexed', ok: true },
+      { name: 'serde', version: '1.0.219', defs: 611, state: 'Indexed', ok: true },
+      { name: 'tree-sitter', version: '0.27.1', defs: 403, state: 'Indexed', ok: true },
+      { name: 'sha2', version: '0.10.9', defs: 88, state: 'Indexed', ok: true },
+      { name: 'openssl-sys', version: '0.9.104', defs: 0, state: 'Not cached', ok: false }
+    ];
+    const D = {
+      rusqlite: [['struct', 'Connection', 'src/lib.rs:362'], ['fn', 'Connection::open', 'src/lib.rs:422'], ['fn', 'Connection::prepare_cached', 'src/cache.rs:62'], ['fn', 'Connection::execute', 'src/lib.rs:588'], ['struct', 'Transaction', 'src/transaction.rs:61'], ['enum', 'TransactionBehavior', 'src/transaction.rs:8'], ['fn', 'Transaction::commit', 'src/transaction.rs:140'], ['struct', 'Statement', 'src/statement.rs:21'], ['fn', 'Statement::query_map', 'src/statement.rs:446'], ['trait', 'OptionalExtension', 'src/lib.rs:156'], ['macro', 'params!', 'src/lib.rs:215'], ['enum', 'Error', 'src/error.rs:13']],
+      tokio: [['fn', 'spawn', 'src/task/spawn.rs:166'], ['fn', 'task::spawn_blocking', 'src/task/blocking.rs:191'], ['struct', 'sync::Mutex', 'src/sync/mutex.rs:130'], ['struct', 'sync::Notify', 'src/sync/notify.rs:217'], ['fn', 'time::sleep_until', 'src/time/sleep.rs:64']],
+      axum: [['struct', 'Router', 'src/routing/mod.rs:66'], ['fn', 'Router::route', 'src/routing/mod.rs:205'], ['fn', 'routing::get', 'src/routing/method_routing.rs:378']],
+      serde: [['trait', 'Serialize', 'src/ser/mod.rs:254'], ['trait', 'Deserialize', 'src/de/mod.rs:552']],
+      'tree-sitter': [['struct', 'Parser', 'binding_rust/lib.rs:118'], ['fn', 'Parser::parse', 'binding_rust/lib.rs:610'], ['struct', 'Node', 'binding_rust/lib.rs:94']],
+      sha2: [['type', 'Sha256', 'src/lib.rs:50'], ['fn', 'Digest::digest', 'digest/src/digest.rs:72']],
+      'openssl-sys': []
+    };
+    const cur = P.find(p => p.name === this.state.pkg) || P[0];
+    const f = this.state.filter.trim().toLowerCase();
+    const defs = (D[cur.name] || []).filter(([, n]) => !f || n.toLowerCase().includes(f)).map(([kind, name, path]) => ({ kind, name, path }));
+    const packages = P.map(p => { const on = p.name === cur.name; return { ...p, pressed: on ? 'true' : 'false', bg: on ? '#7770DC' : 'transparent', fg: on ? '#0B0C10' : '#F7F7FB', sub: on ? '#0B0C10' : '#B8BAC8', weight: on ? 700 : 400, stateColor: on ? '#0B0C10' : (p.ok ? '#57D6A0' : '#FFC20A'), radius: p.ok ? '50%' : '1px', pick: () => this.setState({ pkg: p.name }) }; });
+    return { packages, pkgCount: P.length, pkg: { name: cur.name, defs: cur.defs.toLocaleString('en-US') }, defs, defCount: defs.length, filter: this.state.filter, setFilter: (e) => this.setState({ filter: e.target.value }) };
+  }
+}
+</script>
+</body>
+</html>

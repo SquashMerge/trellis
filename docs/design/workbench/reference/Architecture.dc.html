@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Architecture view</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Manrope:wght@600;700;750&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0B0C10}
+a{color:#ABA5FF}a:hover{color:#F7F7FB}
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #ABA5FF;outline-offset:3px}
+</style>
+</helmet>
+<div style="width: 1200px; height: 800px; box-sizing: border-box; background: #0B0C10; color: #F7F7FB; font-family: 'Inter', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column; overflow: hidden">
+
+<div style="display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid #343644; background: #14151D">
+<span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">Trellis</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">squashmerge/trellis ⎇ main</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">0acaba1</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">↑0 ↓0 · clean</span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #B8BAC8">Mermaid architecture-beta → Pele 1.6.0</span>
+</div>
+<nav aria-label="Diagram views" style="display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #343644">
+<a href="Architecture.dc.html" aria-current="page" style="padding: 8px 12px; border-radius: 8px; background: #1D1E2A; color: #F7F7FB; text-decoration: none; font-size: 13px; font-weight: 600; box-shadow: inset 0 -2px 0 #7770DC">Architecture</a>
+<a href="Treemap.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Treemap</a>
+<a href="Sequence.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Sequence</a>
+<a href="Class.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Class</a>
+<a href="Libraries.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">Libraries</a>
+<a href="C4.dc.html" style="padding: 8px 12px; border-radius: 8px; color: #B8BAC8; text-decoration: none; font-size: 13px">C4</a>
+</nav>
+
+<div role="toolbar" aria-label="Color by complexity" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid #777A8E">
+<span style="font-size: 12px; color: #B8BAC8">Color by</span>
+<div role="group" aria-label="Metric" style="display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{metrics}}" as="m" hint-placeholder-count="7">
+<button onClick="{{m.pick}}" aria-pressed="{{m.pressed}}" style="min-height: 28px; padding: 0 9px; border-radius: 8px; border: 0; background: {{m.bg}}; color: {{m.color}}; font: inherit; font-size: 12px; cursor: pointer">{{m.label}}</button>
+</sc-for>
+</div>
+<div role="group" aria-label="Aggregation" style="display: flex; gap: 4px; padding: 4px; border: 1px solid #777A8E; border-radius: 12px">
+<sc-for list="{{aggs}}" as="a" hint-placeholder-count="3">
+<button onClick="{{a.pick}}" aria-pressed="{{a.pressed}}" disabled="{{a.disabled}}" style="min-height: 28px; padding: 0 9px; border-radius: 8px; border: 0; background: {{a.bg}}; color: {{a.color}}; font: inherit; font-size: 12px; cursor: {{a.cursor}}">{{a.label}}</button>
+</sc-for>
+</div>
+<div style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: #B8BAC8">
+<span>{{legendLow}}</span>
+<sc-for list="{{legend}}" as="l" hint-placeholder-count="5"><span title="{{l.range}}" style="width: 26px; height: 10px; border-radius: 4px; background: {{l.c}}"></span></sc-for>
+<span>{{legendHigh}}</span>
+</div>
+</div>
+
+<div style="flex: 1; display: flex; min-height: 0">
+<section aria-labelledby="ar-h" style="flex: 1; min-width: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px">
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px">
+<h2 id="ar-h" style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">Layers · production references</h2>
+<span style="font-size: 12px; color: #B8BAC8">Order from .trellis/rules.toml · equal numbers are peers</span>
+<button onClick="{{toggleTest}}" aria-pressed="{{testPressed}}" style="margin-left: auto; min-height: 28px; padding: 0 9px; border-radius: 8px; border: 1px solid #777A8E; background: {{testBg}}; color: #F7F7FB; font: inherit; font-size: 12px; cursor: pointer">{{testLabel}}</button>
+</div>
+<div style="position: relative; width: 860px; height: 550px">
+<sc-for list="{{groups}}" as="g" hint-placeholder-count="6">
+<div style="position: absolute; left: {{g.x}}px; top: {{g.y}}px; width: {{g.w}}px; height: {{g.h}}px; box-sizing: border-box; border: 1px {{g.style}} {{g.border}}; border-radius: 12px; background: #14151D"></div>
+<div style="position: absolute; left: {{g.lx}}px; top: {{g.ly}}px; width: {{g.lw}}px; display: flex; flex-wrap: {{g.wrap}}; gap: 2px 8px; align-items: baseline"><span style="font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600">{{g.name}}</span><span style="font-size: 12px; color: #B8BAC8">{{g.sub}}</span><span style="margin-left: {{g.ml}}; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #F7F7FB">{{g.metric}}</span></div>
+<sc-if value="{{g.hasBadge}}" hint-placeholder-val="{{false}}"><span style="position: absolute; left: {{g.lx}}px; top: {{g.by}}px; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 1px 4px; border: 1px solid #FF8E9A; border-radius: 4px; color: #FF8E9A">{{g.badge}}</span></sc-if>
+<sc-for list="{{g.tiles}}" as="t" hint-placeholder-count="6">
+<button onClick="{{t.pick}}" aria-pressed="{{t.pressed}}" title="{{t.tip}}" style="position: absolute; left: {{t.x}}px; top: {{t.y}}px; width: 40px; padding: 0; border: 0; background: transparent; color: #F7F7FB; font: inherit; display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer">
+<span style="width: 34px; height: 30px; box-sizing: border-box; border-radius: 8px; border: {{t.bw}}px solid {{t.border}}; background: {{t.fill}}; display: flex; align-items: center; justify-content: center; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 400; color: {{t.valColor}}">{{t.val}}</span>
+<span style="max-width: 46px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #F7F7FB; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{t.name}}</span>
+</button>
+</sc-for>
+</sc-for>
+<sc-for list="{{edges}}" as="e" hint-placeholder-count="10">
+<svg width="860" height="550" viewBox="0 0 860 550" aria-hidden="true" style="position: absolute; left: 0; top: 0; pointer-events: none; opacity: {{e.opacity}}"><path d="{{e.d}}" fill="none" stroke="{{e.color}}" stroke-width="{{e.w}}" stroke-dasharray="{{e.dash}}" stroke-linejoin="round"></path><polygon points="{{e.arrow}}" fill="{{e.color}}"></polygon></svg>
+<button onClick="{{e.pick}}" aria-pressed="{{e.pressed}}" style="position: absolute; left: {{e.lx}}px; top: {{e.ly}}px; min-width: 28px; padding: 1px 4px; border-radius: 4px; border: 1px solid {{e.labelBorder}}; background: {{e.labelBg}}; color: {{e.labelColor}}; font-family: 'JetBrains Mono', monospace; font-size: 12px; cursor: pointer">{{e.label}}</button>
+</sc-for>
+</div>
+<div role="list" aria-label="Edge legend" style="display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: #B8BAC8">
+<sc-for list="{{edgeLegend}}" as="k" hint-placeholder-count="4"><span role="listitem" style="display: flex; align-items: center; gap: 6px"><svg width="28" height="10" viewBox="0 0 28 10" aria-hidden="true"><line x1="1" y1="5" x2="27" y2="5" stroke="{{k.c}}" stroke-width="2" stroke-dasharray="{{k.dash}}"></line></svg><span style="font-family: 'JetBrains Mono', monospace; color: {{k.c}}">{{k.mark}}</span>{{k.label}}</span></sc-for>
+</div>
+</section>
+
+<aside aria-labelledby="ai-h" style="width: 300px; flex: none; box-sizing: border-box; padding: 16px; border-left: 1px solid #343644; background: #14151D; display: flex; flex-direction: column; gap: 12px">
+<sc-if value="{{isMod}}" hint-placeholder-val="{{true}}">
+<h2 id="ai-h" style="margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 400">{{mod.name}}</h2>
+<div style="font-size: 12px; color: #B8BAC8">{{mod.layer}} · {{mod.sloc}} lines · {{mod.n}} callables</div>
+<div style="display: flex; flex-direction: column; gap: 4px">
+<sc-for list="{{mod.rows}}" as="r" hint-placeholder-count="8">
+<div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 8px; background: {{r.bg}}; font-size: 12px"><span style="color: #F7F7FB">{{r.label}}</span><span style="display: flex; align-items: center; gap: 8px; font-family: 'JetBrains Mono', monospace"><span style="width: 10px; height: 10px; border-radius: 4px; background: {{r.c}}"></span>{{r.v}}</span></div>
+</sc-for>
+</div>
+<a href="Treemap.dc.html" style="font-size: 12px">Open its files in the treemap</a>
+</sc-if>
+<sc-if value="{{isEdge}}" hint-placeholder-val="{{false}}">
+<h2 style="margin: 0; font-family: 'Manrope', system-ui, sans-serif; font-size: 18px; font-weight: 700">{{sel.title}}</h2>
+<span style="align-self: flex-start; padding: 4px 8px; border-radius: 8px; border: 1px solid {{sel.color}}; color: {{sel.color}}; font-size: 12px">{{sel.kind}}</span>
+<div style="display: flex; justify-content: space-between; font-size: 13px"><span style="color: #B8BAC8">Production references</span><span style="font-weight: 650">{{sel.count}}</span></div>
+<sc-for list="{{sel.pairs}}" as="p" hint-placeholder-count="3">
+<div style="display: flex; justify-content: space-between; padding: 4px 8px; border-radius: 8px; background: #1D1E2A; font-family: 'JetBrains Mono', monospace; font-size: 12px"><span>{{p.a}}</span><span style="color: #B8BAC8">{{p.n}}</span></div>
+</sc-for>
+<p style="margin: 0; font-size: 12px; color: #F7F7FB; line-height: 1.5">{{sel.note}}</p>
+</sc-if>
+<div style="margin-top: auto; font-size: 12px; color: #B8BAC8; line-height: 1.5">Metric names follow Trellis metrics:v1 over production files. Values here are an approximate scan at 0acaba1; the view would read exact results from the metrics API. Colors are quartiles of the visible modules, on the brand's warm gold-to-orange range.</div>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"defaultMetric":{"editor":"enum","options":["none","cyclomatic","cognitive","maxNesting","maintainabilityIndex","halsteadVolume","fanOut"],"default":"cyclomatic"},"$preview":{"width":1200,"height":800}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { metric: null, agg: 'max', sel: { kind: 'mod', id: 'store' } }; }
+  renderVals() {
+    const metric = this.state.metric ?? this.props.defaultMetric ?? 'cyclomatic';
+    // module: [sloc, callables, cycSum, cycMax, cogSum, cogMax, nestMax, miMean, halsteadVolumeSum, fanOutSum]
+    const D = {"web":[3231,58,628,41,521,44,3,59.9,141157,505],"http":[6134,90,511,179,420,189,4,61.3,99024,1577],"daemon":[5627,234,909,53,822,50,4,60.1,106623,2494],"mcp":[6166,183,813,91,815,183,5,59.0,135140,2949],"acp":[834,33,80,9,51,10,3,59.3,17521,547],"main":[1797,18,88,25,76,30,5,54.7,23622,465],"auth":[57,2,11,8,7,5,2,54.9,1255,36],"classes":[1651,46,252,30,379,71,7,56.0,32854,656],"navigation":[503,17,78,13,55,12,2,55.6,9181,209],"class_diagram":[139,5,12,5,7,5,2,66.1,952,25],"planning":[468,12,46,17,40,21,4,57.9,9162,220],"metrics":[1108,28,182,72,215,117,4,59.9,20847,399],"behavior":[57,1,6,6,1,1,1,55.5,377,6],"behavior_*":[3150,90,533,43,629,95,9,59.5,56804,1146],"dependencies":[80,2,2,1,0,0,0,68.3,159,5],"dependency_*":[1223,9,64,27,57,22,3,57.3,6249,148],"file_tree":[304,6,37,16,37,23,3,51.3,6305,107],"live_jev":[886,15,26,5,17,7,2,55.2,11295,407],"jev":[282,11,43,10,27,8,2,57.3,6455,170],"answer":[151,3,10,7,9,7,2,50.6,2646,68],"rust_sources":[109,2,11,6,7,5,1,44.2,2037,55],"native_evidence":[4499,106,505,91,368,80,5,55.6,99440,2220],"index_coordinator":[1492,64,216,37,165,59,4,64.1,32387,631],"indexer":[1959,55,415,58,382,51,5,52.5,52387,1047],"indexer_*":[348,9,45,15,25,17,2,53.8,6859,194],"capture":[1456,53,185,18,163,27,3,59.7,28760,853],"watch":[1266,35,87,16,62,23,3,64.0,10926,344],"native_ids":[496,27,73,12,48,14,3,63.0,7636,284],"store":[22612,738,3047,90,2507,134,6,60.7,495810,10646],"model":[655,31,69,14,26,8,1,69.1,4203,156],"testing":[57,5,9,3,4,2,1,66.7,729,24]};
+    const MET = {
+      none: { label: 'Layer', aggs: [] },
+      cyclomatic: { label: 'Cyclomatic', aggs: ['max', 'sum', 'mean'] },
+      cognitive: { label: 'Cognitive', aggs: ['max', 'sum', 'mean'] },
+      maxNesting: { label: 'Max nesting', aggs: ['max'] },
+      maintainabilityIndex: { label: 'Maintainability', aggs: ['mean'], invert: true },
+      halsteadVolume: { label: 'Halstead volume', aggs: ['sum', 'mean'] },
+      fanOut: { label: 'Fan-out', aggs: ['sum', 'mean'] }
+    };
+    const m = MET[metric];
+    const agg = m.aggs.includes(this.state.agg) ? this.state.agg : (m.aggs[0] || 'max');
+    const value = (k, met, ag) => {
+      const r = D[k]; if (!r) return null; const n = r[1];
+      if (met === 'cyclomatic') return ag === 'max' ? r[3] : ag === 'sum' ? r[2] : (n ? r[2] / n : null);
+      if (met === 'cognitive') return ag === 'max' ? r[5] : ag === 'sum' ? r[4] : (n ? r[4] / n : null);
+      if (met === 'maxNesting') return n ? r[6] : null;
+      if (met === 'maintainabilityIndex') return r[7];
+      if (met === 'halsteadVolume') return ag === 'sum' ? r[8] : (n ? r[8] / n : null);
+      if (met === 'fanOut') return ag === 'sum' ? r[9] : (n ? r[9] / n : null);
+      return null;
+    };
+    const fmt = (v) => v == null ? '—' : v >= 10000 ? Math.round(v / 1000) + 'k' : v >= 1000 ? (v / 1000).toFixed(1) + 'k' : (Number.isInteger(v) ? String(v) : v.toFixed(1));
+    const SCALE = ['#343644', '#FFC20A', '#FFAA10', '#FF7A00']; const fgOn = (c) => (c === '#FFC20A' || c === '#FFAA10' || c === '#FF7A00') ? '#0B0C10' : '#F7F7FB';
+    const keys = Object.keys(D).filter(k => value(k, metric, agg) != null);
+    const vals = keys.map(k => value(k, metric, agg)).sort((a, b) => a - b);
+    const q = (p) => vals.length ? vals[Math.min(vals.length - 1, Math.floor(p * vals.length))] : 0;
+    const cuts = [q(0.25), q(0.5), q(0.75)];
+    const bin = (v) => { let b = cuts.filter(c => v > c).length; return m.invert ? 3 - b : b; };
+    const colorOf = (v) => v == null ? '#1D1E2A' : SCALE[bin(v)];
+    const legend = SCALE.map((c, i) => ({ c, range: 'quartile ' + (i + 1) }));
+    // Layers from .trellis/rules.toml (#129): an explicit order, equal numbers are peers, and one shared layer beside the stack.
+    const G = [
+      { k: 'U', name: '1 · UI', sub: 'web/', x: 110, w: 470, y: 6, h: 72, mods: ['web'] },
+      { k: 'E1', name: '2 · HTTP & daemon', sub: '', x: 110, w: 215, y: 96, h: 98, mods: ['http', 'daemon', 'main', 'auth'] },
+      { k: 'E2', name: '2 · MCP & ACP', sub: '', x: 365, w: 215, y: 96, h: 98, mods: ['mcp', 'acp'] },
+      { k: 'S', name: '3 · Query services', sub: '', x: 110, w: 470, y: 212, h: 130, mods: ['classes', 'metrics', 'navigation', 'class_diagram', 'planning', 'behavior', 'behavior_*', 'dependencies', 'dependency_*', 'file_tree', 'live_jev', 'jev', 'answer', 'rust_sources'] },
+      { k: 'I', name: '4 · Indexing', sub: '', x: 110, w: 470, y: 360, h: 80, mods: ['native_evidence', 'index_coordinator', 'indexer', 'indexer_*', 'capture', 'watch', 'native_ids'] },
+      { k: 'St', name: '5 · Storage', sub: '', x: 110, w: 470, y: 458, h: 80, mods: ['store'] },
+      { k: 'K', name: 'Shared', sub: 'any layer may use', x: 712, w: 138, y: 6, h: 532, mods: ['model', 'testing'], shared: true, badge: '← 2 deviation' }
+    ];
+    const layerOf = {}; G.forEach(g => g.mods.forEach(x => { layerOf[x] = g.name; }));
+    const sel = this.state.sel;
+    const layerAgg = (mods) => {
+      if (metric === 'none') return '';
+      const vs = mods.map(x => value(x, metric, agg)).filter(v => v != null);
+      if (!vs.length) return '';
+      const v = agg === 'sum' ? vs.reduce((a, b) => a + b, 0) : agg === 'max' || metric === 'maxNesting' ? Math.max(...vs) : vs.reduce((a, b) => a + b, 0) / vs.length;
+      return m.label.toLowerCase() + ' · ' + agg + ' ' + fmt(v);
+    };
+    const groups = G.map(g => ({ ...g, ly: g.y + 7, lx: g.x + 14, lw: g.w - 28, wrap: g.shared || g.w < 300 ? 'wrap' : 'nowrap', ml: g.shared || g.w < 300 ? '0' : 'auto', style: g.shared ? 'dashed' : 'solid', border: g.shared ? '#777A8E' : '#343644', hasBadge: !!g.badge, by: g.y + g.h - 30, metric: layerAgg(g.mods), tiles: g.mods.map((x, i) => {
+      const per = g.shared ? 1 : Math.floor((g.w - 20) / 41); const tx = g.x + 10 + (i % per) * 41, ty = g.y + (g.shared ? 96 : g.w < 300 ? 46 : 26) + Math.floor(i / per) * 52;
+      const v = value(x, metric, agg); const on = sel.kind === 'mod' && sel.id === x;
+      const fill = metric === 'none' ? '#1D1E2A' : colorOf(v);
+      return { name: x, x: tx, y: ty, val: metric === 'none' ? '' : fmt(v), fill, valColor: metric === 'none' ? '#F7F7FB' : fgOn(fill), border: on ? '#ABA5FF' : (metric === 'none' ? '#ABA5FF' : 'transparent'), bw: on ? 2 : 1, pressed: on ? 'true' : 'false', tip: x + (metric === 'none' ? '' : ' · ' + m.label + ' ' + agg + ' ' + fmt(v)), pick: () => this.setState({ sel: { kind: 'mod', id: x } }) };
+    }) }));
+    const mid = {}; G.forEach(g => { mid[g.k] = g.y + g.h / 2; });
+    const R = 580; // right edge of the ordered stack
+    const showTest = this.state.test !== false;
+    // [id, from, to, count, lane, pairs, note, labelY, kind] · kind: down | up | peer | shared | test
+    const E = [
+      ['E>S', 'E1', 'S', 25, 92, [['http → file_tree', 9], ['http → class_diagram', 2], ['daemon → acp', 2]], 'Entry calling services is the intended path.', 248, 'down'],
+      ['E>I', 'E1', 'I', 27, 78, [['http → index_coordinator', 15], ['http → indexer', 3], ['http → watch', 3]], 'Skips the service layer.', 318, 'down'],
+      ['E>St', 'E1', 'St', 60, 64, [['http → store', 33], ['daemon → store', 15], ['mcp → store', 12]], 'Skips two layers. May be intended: the daemon owns the store (Decision 0008).', 488, 'down'],
+      ['S>I', 'S', 'I', 1, 50, [['rust_sources → indexer_*', 1]], 'Services barely depend on indexing.', 378, 'down'],
+      ['S>St', 'S', 'St', 10, 36, [['classes → store', 8], ['planning → store', 2]], 'Skips indexing to read snapshots.', 428, 'down'],
+      ['I>St', 'I', 'St', 34, 22, [['native_evidence → store', 15], ['indexer → store', 13], ['index_coordinator → store', 6]], 'Indexing publishes into storage: the intended direction.', 466, 'down'],
+      ['St>S', 'St', 'S', 69, 600, [['store → classes', 35], ['store → class_diagram', 17], ['store → navigation', 9]], 'Storage speaks query-service types (#163 finding 1).', 0, 'up'],
+      ['St>I', 'St', 'I', 183, 616, [['store → native_evidence', 103], ['store → capture', 48], ['store → indexer', 18]], 'Storage depends on indexing (#163 finding 2).', 0, 'up'],
+      ['I>E', 'I', 'E2', 1, 632, [['watch → daemon', 1]], 'Only a capacity constant.', 0, 'up'],
+      ['E2>E1', 'E2', 'E1', 3, 0, [['mcp → http', 3]], 'Peer layers share an order number; a call between them is a deviation unless rules.toml lists an exception.', 0, 'peer'],
+      ['K>I', 'K', 'I', 2, 0, [['model → watch', 1], ['model → native_evidence', 1]], 'Shared code calling into an ordered layer is a deviation by default (#163 finding 5).', 0, 'shared'],
+      ['T:I>E', 'I', 'E1', 4, 648, [['index_coordinator → daemon', 4]], 'Test-only (cfg(test) / test-support). Dashed; hide with the toggle.', 0, 'test'],
+      ['T:St>E', 'St', 'E2', 6, 664, [['store → mcp', 6]], 'Test-only (cfg(test) / test-support). Dashed; hide with the toggle.', 0, 'test']
+    ].filter(e => showTest || e[8] !== 'test');
+    const names = { E1: '2 · HTTP & daemon', E2: '2 · MCP & ACP', S: '3 · Services', I: '4 · Indexing', St: '5 · Storage', K: 'Shared' };
+    const KIND = { down: ['Downward · allowed', '#777A8E'], up: ['Upward · deviation', '#FF8E9A'], peer: ['Cross-peer · deviation', '#FF8E9A'], shared: ['Shared → ordered · deviation', '#FF8E9A'], test: ['Test-only · upward', '#B8BAC8'] };
+    const edges = E.map(([id, a, b, n, lane, pairs, note, ly, kind]) => {
+      const on = sel.kind === 'edge' && sel.id === id; const bad = kind !== 'down' && kind !== 'test';
+      const color = on ? '#ABA5FF' : KIND[kind][1];
+      let d, arrow, lx, lyy;
+      if (kind === 'peer') {
+        const y = mid[a] + 22; d = 'M365 ' + y + ' H327'; arrow = '335,' + (y - 4) + ' 326,' + y + ' 335,' + (y + 4); lx = 330; lyy = y + 4;
+      } else if (kind === 'shared') {
+        const y = mid[b] + 26; d = 'M712 ' + y + ' H' + (R + 2); arrow = (R + 10) + ',' + (y - 4) + ' ' + (R + 1) + ',' + y + ' ' + (R + 10) + ',' + (y + 4); lx = 678; lyy = y - 22;
+      } else {
+        const up = kind !== 'down'; const sideX = up ? R : 110; const y1 = mid[a] + (up ? -8 : 8), y2 = mid[b] + (up ? 8 : -8);
+        d = 'M' + sideX + ' ' + y1 + ' H' + lane + ' V' + y2 + ' H' + (up ? sideX + 2 : sideX - 2);
+        arrow = up ? (sideX + 9) + ',' + (y2 - 4) + ' ' + (sideX + 1) + ',' + y2 + ' ' + (sideX + 9) + ',' + (y2 + 4) : (sideX - 9) + ',' + (y2 - 4) + ' ' + (sideX - 1) + ',' + y2 + ' ' + (sideX - 9) + ',' + (y2 + 4);
+        lx = up ? lane + 4 : lane + 2; lyy = up ? (y1 + y2) / 2 - 8 + (kind === 'test' ? 14 : 0) : ly;
+      }
+      const mark = kind === 'down' ? '↓' : kind === 'peer' ? '←' : kind === 'shared' ? '←' : '↑';
+      return { d, arrow, color, dash: kind === 'test' ? '5 4' : 'none', w: Math.min(6, 1 + Math.log2(n + 1) * 0.7).toFixed(1), label: mark + n, lx, ly: lyy,
+        labelBorder: on ? '#7770DC' : (kind === 'test' ? '#777A8E' : 'transparent'), labelBg: on ? '#7770DC' : '#0B0C10', labelColor: on ? '#0B0C10' : (bad ? '#FF8E9A' : '#B8BAC8'), opacity: metric !== 'none' && !on ? 0.5 : 1, pressed: on ? 'true' : 'false', pick: () => this.setState({ sel: { kind: 'edge', id } }) };
+    });
+    const edgeLegend = [{ mark: '↓', label: 'downward · allowed', c: '#777A8E', dash: 'none' }, { mark: '↑', label: 'upward · deviation', c: '#FF8E9A', dash: 'none' }, { mark: '←', label: 'cross-peer or shared → ordered · deviation', c: '#FF8E9A', dash: 'none' }, { mark: '┄', label: 'test-only (dashed)', c: '#B8BAC8', dash: '5 4' }];
+    const metrics = Object.keys(MET).map(k => ({ label: MET[k].label, pressed: metric === k ? 'true' : 'false', bg: metric === k ? '#1D1E2A' : 'transparent', color: metric === k ? '#F7F7FB' : '#B8BAC8', pick: () => this.setState({ metric: k }) }));
+    const aggs = ['max', 'sum', 'mean'].map(a => { const ok = m.aggs.includes(a); return { label: a, pressed: agg === a ? 'true' : 'false', disabled: !ok, bg: agg === a && ok ? '#1D1E2A' : 'transparent', color: ok ? (agg === a ? '#F7F7FB' : '#B8BAC8') : '#777A8E', cursor: ok ? 'pointer' : 'not-allowed', pick: () => ok && this.setState({ agg: a }) }; });
+    let mod = {};
+    if (sel.kind === 'mod' && D[sel.id]) {
+      const r = D[sel.id];
+      const rowsDef = [['Cyclomatic · max', 'cyclomatic', 'max'], ['Cyclomatic · sum', 'cyclomatic', 'sum'], ['Cognitive · max', 'cognitive', 'max'], ['Cognitive · sum', 'cognitive', 'sum'], ['Max nesting', 'maxNesting', 'max'], ['Maintainability · mean', 'maintainabilityIndex', 'mean'], ['Halstead volume · sum', 'halsteadVolume', 'sum'], ['Fan-out · sum', 'fanOut', 'sum']];
+      mod = { name: sel.id, layer: layerOf[sel.id], sloc: r[0].toLocaleString('en-US'), n: r[1], rows: rowsDef.map(([label, met, ag]) => { const v = value(sel.id, met, ag); const active = met === metric && ag === agg; return { label, v: fmt(v), c: active ? colorOf(v) : 'transparent', bg: active ? '#1D1E2A' : 'transparent' }; }) };
+    }
+    let selE = {};
+    if (sel.kind === 'edge') { const e = E.find(x => x[0] === sel.id); if (e) { const kd = KIND[e[8]]; selE = { title: names[e[1]] + ' → ' + names[e[2]], kind: kd[0], color: e[8] === 'down' ? '#B8BAC8' : kd[1], count: e[3], pairs: e[5].map(([a, n]) => ({ a, n })), note: e[6] }; } }
+    return { metrics, aggs, legend, legendLow: metric === 'none' ? '' : (m.invert ? 'high MI' : 'low'), legendHigh: metric === 'none' ? '' : (m.invert ? 'low MI' : 'high'), groups, edges, edgeLegend, testLabel: showTest ? 'Test-only edges · shown' : 'Test-only edges · hidden', testPressed: showTest ? 'true' : 'false', testBg: showTest ? '#1D1E2A' : 'transparent', toggleTest: () => this.setState({ test: !showTest }), isMod: sel.kind === 'mod', isEdge: sel.kind === 'edge' && !!selE.title, mod, sel: selE };
+  }
+}
+</script>
+</body>
+</html>
