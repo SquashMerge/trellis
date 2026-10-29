@@ -62,6 +62,7 @@ struct DependencyIndex {
     cancel: Arc<AtomicBool>,
     stopped: bool,
     worker_running: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
     state: &'static str,
     catalog: Option<Arc<Catalog>>,
     warnings: Vec<String>,
@@ -232,6 +233,8 @@ pub struct DaemonState {
     dependency_idle: tokio::sync::Notify,
     #[cfg(test)]
     dependency_build_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    dependency_stop_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, feature = "test-support"))]
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(all(test, feature = "test-support"))]
@@ -440,6 +443,7 @@ pub fn new_with_config(
             cancel: Arc::new(AtomicBool::new(false)),
             stopped: false,
             worker_running: false,
+            worker: None,
             state: if config.dependency_options.is_some() {
                 "loading"
             } else {
@@ -452,6 +456,8 @@ pub fn new_with_config(
         dependency_idle: tokio::sync::Notify::new(),
         #[cfg(test)]
         dependency_build_hook: Mutex::new(None),
+        #[cfg(test)]
+        dependency_stop_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
         dependency_capture_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
@@ -1701,77 +1707,84 @@ impl DaemonState {
         self: &Arc<Self>,
         config: &Arc<BrowserConfig>,
     ) -> bool {
-        {
-            let mut index = self.dependencies.lock().unwrap();
-            if !Arc::ptr_eq(&self.config(), config) || config.dependency_options.is_none() {
-                return false;
-            }
-            if !index.request_build() {
-                return !index.stopped;
-            }
+        let mut index = self.dependencies.lock().unwrap();
+        if !Arc::ptr_eq(&self.config(), config) || config.dependency_options.is_none() {
+            return false;
+        }
+        if !index.request_build() {
+            return !index.stopped;
         }
         let state = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let (generation, cancel, config) = {
-                    let mut index = state.dependencies.lock().unwrap();
-                    let config = state.config();
-                    if index.stopped || config.dependency_options.is_none() {
-                        index.worker_running = false;
-                        #[cfg(test)]
-                        state.dependency_idle.notify_one();
-                        return;
-                    }
-                    (index.generation, index.cancel.clone(), config)
-                };
-                let worker = state.clone();
-                let worker_cancel = cancel.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let result = (|| {
-                        // Configuration, generation and cancellation were captured
-                        // together before this blocking build was admitted.
-                        let options = config
-                            .dependency_options
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
-                        let revision = worker.store.status()?.revision;
-                        #[cfg(test)]
-                        {
-                            let hook = worker.dependency_build_hook.lock().unwrap().take();
-                            if let Some(hook) = hook {
-                                hook();
-                            }
-                        }
-                        Catalog::build(
-                            &config.options.workspace_root,
-                            revision,
-                            &options,
-                            &worker_cancel,
-                        )
-                    })();
-                    worker.publish_dependency_index(generation, &worker_cancel, result);
-                })
-                .await;
-                if result.is_err() {
-                    // Error publication does not access the database.
-                    state.publish_dependency_index(
-                        generation,
-                        &cancel,
-                        Err(anyhow::anyhow!("worker failed")),
-                    );
-                }
-                let mut index = state.dependencies.lock().unwrap();
-                if index.stopped || index.generation == generation {
+        // Install the handle under the admission lock, so close cannot miss a
+        // newly admitted driver. No Tokio progress is needed to join it.
+        match std::thread::Builder::new()
+            .name("trellis-catalog".into())
+            .spawn(move || state.run_dependency_index())
+        {
+            Ok(worker) => {
+                index.worker = Some(worker);
+                true
+            }
+            Err(_) => {
+                index.worker_running = false;
+                index.state = "failed";
+                index.warnings = vec!["Dependency catalog worker could not start".into()];
+                false
+            }
+        }
+    }
+
+    fn run_dependency_index(&self) {
+        loop {
+            let (generation, cancel, config) = {
+                let mut index = self.dependencies.lock().unwrap();
+                let config = self.config();
+                if index.stopped || config.dependency_options.is_none() {
                     index.worker_running = false;
                     #[cfg(test)]
-                    state.dependency_idle.notify_one();
+                    self.dependency_idle.notify_one();
                     return;
                 }
-                // Refresh bursts coalesce to the latest generation. Only this driver
-                // can launch catalog work, and its previous blocking worker has exited.
+                (index.generation, index.cancel.clone(), config)
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = (|| {
+                    // Configuration, generation and cancellation were captured
+                    // together before this blocking build was admitted.
+                    let options = config
+                        .dependency_options
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
+                    let revision = self.store.status()?.revision;
+                    #[cfg(test)]
+                    {
+                        let hook = self.dependency_build_hook.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    Catalog::build(&config.options.workspace_root, revision, &options, &cancel)
+                })();
+                self.publish_dependency_index(generation, &cancel, result);
+            }));
+            if result.is_err() {
+                // Error publication does not access the database.
+                self.publish_dependency_index(
+                    generation,
+                    &cancel,
+                    Err(anyhow::anyhow!("worker failed")),
+                );
             }
-        });
-        true
+            let mut index = self.dependencies.lock().unwrap();
+            if index.stopped || index.generation == generation {
+                index.worker_running = false;
+                #[cfg(test)]
+                self.dependency_idle.notify_one();
+                return;
+            }
+            // Refresh bursts coalesce to the latest generation. Only this driver
+            // can launch catalog work, and its previous build has exited.
+        }
     }
     fn publish_dependency_index(
         &self,
@@ -1817,7 +1830,7 @@ impl DaemonState {
             .cloned()
     }
     pub fn cancel_active(&self) {
-        {
+        let worker = {
             let mut dependencies = self.dependencies.lock().unwrap();
             dependencies.stopped = true;
             dependencies.cancel.store(true, Ordering::Release);
@@ -1828,6 +1841,16 @@ impl DaemonState {
                 dependencies.warnings =
                     vec!["Dependency indexing cancelled during shutdown".into()];
             }
+            dependencies.worker.take()
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.dependency_stop_hook.lock().unwrap().take() {
+            hook();
+        }
+        // The driver needs the catalog lock to finish. Join before close drops
+        // SQLite witnesses, and never while holding that lock.
+        if let Some(worker) = worker {
+            let _ = worker.join();
         }
         self.jobs
             .lock()
