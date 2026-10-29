@@ -2,6 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {rmSync} = require("node:fs");
+const {inflateSync} = require("node:zlib");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
 
@@ -23,6 +24,46 @@ async function connectedWithoutTokenInDom(page, server, token) {
   assert.ok(await page.evaluate(secret => !document.documentElement.outerHTML.includes(secret) && !document.body.textContent.includes(secret), token), "connected DOM does not contain the credential");
   assert.equal(new URL(page.url()).search, "");
   assert.equal(new URL(page.url()).hash, "");
+}
+// Decode Chromium's 8-bit, non-interlaced RGB/RGBA screenshot PNG to read composited pixels.
+function decodePng(buffer) {
+  let offset = 8, width, height, channels;
+  const data = [];
+  while (offset < buffer.length) {
+    const length = buffer.readUInt32BE(offset), type = buffer.toString("ascii", offset + 4, offset + 8), body = buffer.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") {
+      width = body.readUInt32BE(0); height = body.readUInt32BE(4);
+      assert.equal(body[8], 8); assert.equal(body[12], 0); channels = {2:3, 6:4}[body[9]];
+      assert.ok(channels, `unsupported PNG color type ${body[9]}`);
+    } else if (type === "IDAT") data.push(body);
+    offset += 12 + length;
+  }
+  const raw = inflateSync(Buffer.concat(data)), stride = width * channels, pixels = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)], row = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    for (let x = 0; x < stride; x++) {
+      const left = x >= channels ? pixels[y * stride + x - channels] : 0, up = y ? pixels[(y - 1) * stride + x] : 0;
+      const corner = x >= channels && y ? pixels[(y - 1) * stride + x - channels] : 0;
+      const paeth = () => { const p = left + up - corner, a = Math.abs(p - left), b = Math.abs(p - up), c = Math.abs(p - corner); return a <= b && a <= c ? left : b <= c ? up : corner; };
+      pixels[y * stride + x] = (row[x] + [0, left, up, (left + up) >> 1, paeth()][filter]) & 255;
+    }
+  }
+  return {width, height, at:(x, y) => [...pixels.subarray(y * stride + x * channels, y * stride + x * channels + 3)]};
+}
+// #426: the CSS-cropped lockup shows at least 260px of artwork with no box darker than the page.
+async function assertLogo(page, width) {
+  const frame = await page.locator(".connection-logo-frame").boundingBox();
+  assert.ok(frame && frame.width >= 260 && frame.x >= 0 && frame.x + frame.width <= width, `${width}px logo artwork is at least 260px wide: ${JSON.stringify(frame)}`);
+  const background = await page.evaluate(() => getComputedStyle(document.body).backgroundColor.match(/\d+/g).slice(0, 3).map(Number));
+  const shot = decodePng(await page.screenshot({clip:{x:Math.floor(frame.x), y:Math.floor(frame.y), width:Math.floor(frame.width), height:Math.floor(frame.height)}}));
+  for (const [x, y] of [[3, 3], [shot.width - 4, 3], [3, shot.height - 4], [shot.width - 4, shot.height - 4], [3, Math.floor(shot.height / 3)]]) {
+    const pixel = shot.at(x, y);
+    assert.ok(pixel.every((value, i) => Math.abs(value - background[i]) <= 2), `${width}px logo backdrop at ${x},${y} is ${pixel}, page is ${background}`);
+  }
+  let bright = 0;
+  for (let y = 0; y < shot.height; y += 4) for (let x = 0; x < shot.width; x += 4) if (Math.max(...shot.at(x, y)) > 200) bright++;
+  assert.ok(bright > 100, `${width}px logo artwork is visible`);
+  return frame;
 }
 async function hasSavedToken(page, token) {
   return page.evaluate(({key, secret}) => localStorage.getItem(key) === secret, {key:KEY, secret:token});
@@ -63,12 +104,12 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     assert.equal(await page.getByRole("button", {name:"Connect", exact:true}).isVisible(), true);
     assert.equal(await page.getByRole("button", {name:"Load token file instead", exact:true}).isVisible(), true);
     assert.equal(await page.locator("#token-file").isVisible(), false, "native file control stays hidden behind its labelled action");
-    const desktopLogo = await page.locator(".connection-logo").boundingBox();
+    const desktopLogo = await assertLogo(page, 1440);
     const desktopForm = await page.locator("#connect-form").boundingBox();
     assert.ok(desktopLogo && desktopForm && desktopLogo.x + desktopLogo.width < desktopForm.x, "desktop logo and form are side by side");
-    for (const width of [390, 320]) {
+    for (const width of [800, 390, 320]) {
       await page.setViewportSize({width, height:844});
-      const narrowLogo = await page.locator(".connection-logo").boundingBox();
+      const narrowLogo = await assertLogo(page, width);
       const narrowForm = await page.locator("#connect-form").boundingBox();
       assert.ok(narrowLogo && narrowForm && narrowLogo.y + narrowLogo.height <= narrowForm.y, `${width}px layout stacks logo above form`);
       for (const selector of ["#connect-form", "#token", "#load-token-file", "#remember-token", "#connect-form button[type=submit]"]) {

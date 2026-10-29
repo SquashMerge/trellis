@@ -25,6 +25,8 @@ const uses = `class Uses {
     String note = "λ <img src=x onerror='globalThis.snippetExecuted=true'>"; watcher.measured(0); watcher.measured(1);
 ${Array.from({length:53}, (_, i) => `    watcher.measured(${i + 2});`).join("\n")}
   }
+  @Deprecated
+  int aVeryLongMeasuredFieldNameThatMustTruncateInsideTheExplorerColumn = 0;
 }
 `;
 
@@ -199,6 +201,80 @@ test("published Files keeps original all-kind outline, UTF-8 syntax locations an
   await assertNoOverflow(page);
 }));
 
+
+// #426: icon plus name on one line, with kind and line right-aligned.
+async function assertOneLineRows(page, items) {
+  await page.waitForFunction(count => document.querySelectorAll(".files-symbol-pick[data-symbol-id]").length === count, items.length);
+  for (const item of items) {
+    const row = await page.locator(`.files-symbol-pick[data-symbol-id="${item.symbol.id}"]`).evaluate(node => {
+      const style = getComputedStyle(node), box = node.getBoundingClientRect(), part = selector => {
+        const child = node.querySelector(selector), rect = child?.getBoundingClientRect();
+        return child && {text:child.textContent, left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, hidden:child.getAttribute("aria-hidden"),
+          title:child.title, clipped:child.scrollWidth > child.clientWidth, elements:child.children.length};
+      };
+      return {height:box.height, content:parseFloat(style.lineHeight) + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom),
+        contentRight:box.right - parseFloat(style.paddingRight), label:node.getAttribute("aria-label"), html:node.innerHTML.includes("<img"),
+        icon:part(".files-symbol-icon"), name:part(".files-symbol-name"), kind:part(".files-symbol-kind"), line:part(".files-symbol-line")};
+    });
+    const where = `${item.symbol.name} row ${JSON.stringify(row)}`;
+    assert.ok(row.height <= row.content + 1, `${where} is one line`);
+    assert.equal(row.icon.hidden, "true", where);
+    assert.equal(row.name.text, item.symbol.name); assert.equal(row.name.title, item.symbol.name); assert.equal(row.name.elements, 0);
+    assert.equal(row.kind.text, item.nativeKind); assert.equal(row.line.text, `L${item.symbol.range.startLine}`);
+    assert.equal(row.label, `${item.symbol.name} · ${item.nativeKind} · line ${item.symbol.range.startLine}`);
+    assert.ok(row.icon.right <= row.name.left && row.name.right <= row.kind.left + 0.5 && row.kind.right <= row.line.left, `${where} reads icon, name, kind, line`);
+    assert.ok(Math.abs(row.line.right - row.contentRight) <= 1, `${where} line is right-aligned`);
+    for (const key of ["icon", "name", "kind", "line"]) assert.ok(Math.abs(row[key].top - row.name.top) <= 2, `${where} ${key} shares the name's line`);
+    assert.equal(row.html, false);
+  }
+}
+const syntaxClasses = page => page.locator("#source .source-line").evaluateAll(lines => lines.map(line => ({
+  kind:line.classList.contains("syntax-attribute") ? "attribute" : line.classList.contains("syntax-comment") ? "comment" : "",
+  color:getComputedStyle(line).color, nodes:[...line.childNodes].map(node => node.nodeType === Node.TEXT_NODE ? "text" : node.className),
+})));
+
+test("Files symbol rows are one line and source lines get subtle text-only syntax colouring", {timeout:240000}, async () => published({}, async selected => {
+  const {page} = selected;
+  await enterFiles(selected);
+  await openFile(selected, "Uses.java");
+  const dto = await outline(selected, "Uses.java");
+  const long = dto.items.find(item => item.symbol.name.startsWith("aVeryLong"));
+  assert.ok(long, "fixture has a long field name");
+  await assertOneLineRows(page, dto.items);
+  assert.equal(await page.locator(`.files-symbol-pick[data-symbol-id="${long.symbol.id}"] .files-symbol-name`).evaluate(node => node.scrollWidth > node.clientWidth && getComputedStyle(node).textOverflow === "ellipsis"), true, "a long name truncates instead of wrapping");
+
+  const usesText = (await cached(selected, "Uses.java")).text, usesLines = usesText.split("\n");
+  const colours = await page.evaluate(() => { const probe = document.createElement("span"); document.body.append(probe);
+    const read = value => { probe.style.color = value; return getComputedStyle(probe).color; };
+    const out = {gold:read("var(--sm-gold)"), secondary:read("var(--secondary)"), ink:getComputedStyle(document.querySelector("#source")).color}; probe.remove(); return out; });
+  let lines = await syntaxClasses(page);
+  const annotation = usesLines.findIndex(line => line.trim() === "@Deprecated"), comment = usesLines.findIndex(line => line.trim().startsWith("//"));
+  assert.equal(lines[comment].kind, "comment"); assert.equal(lines[comment].color, colours.secondary);
+  assert.equal(lines[annotation].kind, "attribute"); assert.equal(lines[annotation].color, colours.gold);
+  assert.equal(lines[0].kind, ""); assert.equal(lines[0].color, colours.ink);
+  for (const line of lines) assert.deepEqual(line.nodes.filter(node => node === "text" || node === "line-number"), ["line-number", "text"], "colouring never splits or parses repository text");
+  await assertSource(page, usesText);
+  const selectedRow = page.locator(`.files-symbol-pick[data-symbol-id="${long.symbol.id}"]`);
+  await selectSymbol(page, long);
+  await assertSource(page, usesText, long.symbol.range);
+  assert.equal(await selectedRow.getAttribute("aria-pressed"), "true");
+  assert.deepEqual(await selectedRow.evaluate(node => [...node.children].map(child => getComputedStyle(child).color)), Array(4).fill(await selectedRow.evaluate(node => getComputedStyle(node).color)), "selected rows keep ink text on the selection fill");
+  const highlighted = await page.locator("#source .source-line.highlight").evaluateAll(rows => rows.map(row => getComputedStyle(row).color));
+  assert.ok(highlighted.length && highlighted.every(color => color !== colours.gold && color !== colours.secondary), "the selected range keeps its own contrast");
+  assert.equal((await syntaxClasses(page))[annotation].kind, "attribute", "selection keeps the line class and only changes its colour");
+
+  await openFile(selected, hostileName);
+  lines = await syntaxClasses(page);
+  assert.equal(lines[0].kind, "comment", "a script-looking comment is coloured as text");
+  assert.equal(await page.locator("#source script, #source img").count(), 0);
+  assert.equal(await page.evaluate(() => globalThis.sourceExecuted), undefined);
+  await assertSource(page, (await cached(selected, hostileName)).text);
+
+  // Diagrams reuses the cached snapshot without Files colouring.
+  await page.locator("#section-diagrams").click();
+  await page.waitForFunction(() => !document.body.classList.contains("files-section"));
+  assert.equal(await page.locator("#source .syntax-comment, #source .syntax-attribute").count(), 0);
+}));
 
 test("mini Full from Working tree explains Back to an unsaved blank route and Forward restores its pinned sequence", {timeout:240000}, async () => published({git:true}, async selected => {
   const {page, pin, server, requests} = selected;
