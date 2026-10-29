@@ -19,13 +19,22 @@ use trellis::{
         AdmittedBatch, BatchCounters, BatchLimits, LookupBudget, StageOwner,
         descriptor::Descriptor, limits, stage_batch, testing,
     },
-    semantic_evidence::SemanticPublication,
+    semantic_evidence::{Freshness, Resolution, SemanticPublication},
     semantic_import::{DestinationMutations, join_staged, rejoin_inventory},
     store::{
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
     },
 };
+
+struct MemoryAdmission {
+    pin: IndexPin,
+    parsed: Descriptor,
+    r1: trellis::native_evidence::Artifact,
+    r1_sources: std::collections::BTreeMap<trellis::native_evidence::DocumentKey, Vec<u8>>,
+    artifacts: Vec<Vec<u8>>,
+    merged: trellis::scip_raw::CapturedScipInventory,
+}
 
 struct World {
     _state: tempfile::TempDir,
@@ -661,12 +670,67 @@ impl World {
         )
     }
 
-    /// The publication the in-memory join builds from the same batch bytes.
-    fn memory_publication(
+    /// The whole-publication validator the memory path runs, over `publication`: it recomputes
+    /// freshness independently and runs the three cross-row checks the staged join's closure
+    /// queries do not repeat (contradictory resolved call targets, coverage observed roles).
+    fn full_validation(
         &self,
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
-    ) -> SemanticPublication {
+        publication: &SemanticPublication,
+    ) -> anyhow::Result<()> {
+        let MemoryAdmission {
+            pin,
+            parsed,
+            r1,
+            r1_sources,
+            artifacts,
+            merged,
+        } = self.memory_admission(descriptor);
+        let (toolchain, config, dependencies) =
+            self.store.retained_native_components_at(pin).unwrap();
+        let head = self.store.index_baseline().unwrap();
+        let (mut destination, _) = self.store.retained_native_snapshot_at(head).unwrap();
+        if r1.revision.id != destination.revision.id {
+            mutations.apply(&mut destination.declarations, &mut destination.references);
+        }
+        let producer = parsed.check_producer().unwrap().producer();
+        let captured = trellis::semantic_evidence::CapturedComponents {
+            producer_executables: Default::default(),
+            artifacts: artifacts
+                .into_iter()
+                .map(|bytes| {
+                    (
+                        (
+                            producer.id.clone(),
+                            trellis::native_ids::digest(b"", &bytes),
+                        ),
+                        bytes,
+                    )
+                })
+                .collect(),
+            sources: r1_sources,
+            captured_revision: r1.revision.clone(),
+            native_toolchain: toolchain.clone(),
+            native_config: config.clone(),
+            native_dependencies: dependencies.clone(),
+            requested_producers: vec![producer],
+            toolchain: trellis::native_ids::canonical(&toolchain),
+            config: trellis::native_ids::canonical(&json!(config)),
+            dependency: trellis::native_ids::canonical(&json!(dependencies)),
+            native_extraction_components: Default::default(),
+        };
+        trellis::semantic_evidence::validate_evidence_profile_pinned_for_tests(
+            publication,
+            &destination,
+            &captured,
+            &merged,
+        )
+    }
+
+    /// The batch decoded in memory: its descriptor, the captured native revision, the original
+    /// artifact bytes and the merged inventory of every artifact.
+    fn memory_admission(&self, descriptor: &(PathBuf, String)) -> MemoryAdmission {
         let bytes = fs::read(&descriptor.0).unwrap();
         let parsed = Descriptor::parse(&bytes).unwrap();
         let pin = self
@@ -674,12 +738,6 @@ impl World {
             .retained_native_pin_for(&parsed.source_revision, &parsed.source_set.id)
             .unwrap();
         let (r1, r1_sources) = self.store.retained_native_snapshot_at(pin).unwrap();
-        let head = self.store.index_baseline().unwrap();
-        let (mut destination, destination_sources) =
-            self.store.retained_native_snapshot_at(head).unwrap();
-        if r1.revision.id != destination.revision.id {
-            mutations.apply(&mut destination.declarations, &mut destination.references);
-        }
         let pages: Vec<Vec<u8>> = parsed
             .pages
             .iter()
@@ -729,6 +787,43 @@ impl World {
             .flat_map(|inventory| inventory.exclusions.clone())
             .filter(|e| seen.insert((e.language.clone(), e.relative_path.clone())))
             .collect();
+        MemoryAdmission {
+            pin,
+            parsed,
+            r1,
+            r1_sources,
+            artifacts,
+            merged,
+        }
+    }
+
+    /// The publication the in-memory join builds from the same batch bytes.
+    fn memory_publication(
+        &self,
+        descriptor: &(PathBuf, String),
+        mutations: DestinationMutations,
+    ) -> SemanticPublication {
+        self.try_memory_publication(descriptor, mutations).unwrap()
+    }
+
+    fn try_memory_publication(
+        &self,
+        descriptor: &(PathBuf, String),
+        mutations: DestinationMutations,
+    ) -> anyhow::Result<SemanticPublication> {
+        let MemoryAdmission {
+            parsed,
+            r1,
+            r1_sources,
+            merged,
+            ..
+        } = self.memory_admission(descriptor);
+        let head = self.store.index_baseline().unwrap();
+        let (mut destination, destination_sources) =
+            self.store.retained_native_snapshot_at(head).unwrap();
+        if r1.revision.id != destination.revision.id {
+            mutations.apply(&mut destination.declarations, &mut destination.references);
+        }
         let producer = parsed.check_producer().unwrap().producer();
         let basis = r1
             .revision
@@ -774,8 +869,7 @@ impl World {
             &basis,
             parsed.producer.position_encoding,
         )
-        .unwrap()
-        .publication
+        .map(|result| result.publication)
     }
 }
 
@@ -890,6 +984,13 @@ fn staged_and_memory_join_stores_produce_identical_publications() {
         let staged = testing::staged_publication(&mut admitted).unwrap();
         let memory = world.memory_publication(descriptor, mutations);
         assert_same_publication(&staged, &memory, case);
+        let full = world.full_validation(descriptor, mutations, &staged);
+        let reference = world.full_validation(descriptor, mutations, &memory);
+        assert_eq!(
+            full.is_ok(),
+            reference.is_ok(),
+            "{case}: {full:?} {reference:?}"
+        );
         (staged, memory)
     };
     for (separator, name) in [(" ", "single-line"), ("\r\n", "multi-line")] {
@@ -1212,6 +1313,9 @@ fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
             let staged = testing::staged_publication(&mut admitted).unwrap();
             let memory = world.memory_publication(&descriptor, mutations);
             assert_same_publication(&staged, &memory, &case);
+            world
+                .full_validation(&descriptor, mutations, &staged)
+                .unwrap_or_else(|error| panic!("{case}: full validation: {error:#}"));
             if fixture.name.starts_with("local method") {
                 assert!(staged.type_relationships.is_empty(), "{case}");
             } else {
@@ -2770,4 +2874,165 @@ fn whole_publication_validator_runs_over_every_original_of_a_batch() {
     write_files(&world.root, &[("src/D.js", "function more(){ }\n")]);
     world.republish_with_rejoin();
     assert!(world.rejoin_failures() > 0);
+}
+
+/// Two references at one call site that name different symbols.
+fn two_references_one_call() -> (World, (PathBuf, String)) {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", "function target(){ }\nfunction other(){ }\n"),
+            ],
+        )
+    });
+    let descriptor = one_artifact_per_language(
+        &world,
+        vec![(
+            "javascript",
+            vec![
+                DocSpec::new("src/A.js")
+                    .occurrence(&[0, 9, 12], &[], "pkg run.", 1)
+                    .occurrence(&[0, 16, 22], &[0, 16, 24], "pkg target.", 0)
+                    .occurrence(&[0, 16, 22], &[0, 16, 24], "pkg other.", 0)
+                    .symbol("pkg run.", 17, &[]),
+                DocSpec::new("src/B.js")
+                    .occurrence(&[0, 9, 15], &[], "pkg target.", 1)
+                    .occurrence(&[1, 9, 14], &[], "pkg other.", 1)
+                    .symbol("pkg target.", 17, &[])
+                    .symbol("pkg other.", 17, &[]),
+            ],
+        )],
+    );
+    (world, descriptor)
+}
+
+#[test]
+fn two_references_resolving_one_native_call_agree_across_paths() {
+    let (world, descriptor) = two_references_one_call();
+    let mutations = DestinationMutations::default();
+    let memory = world.memory_publication(&descriptor, mutations);
+    let (mut admitted, _, _) = world
+        .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    assert_same_publication(&staged, &memory, "two references, one call");
+    // Both references bind the one native call, and each binding carries the same ambiguous
+    // candidate set, so the join never produces contradictory resolved targets for it.
+    for (name, publication) in [("staged", &staged), ("memory", &memory)] {
+        let bindings = &publication.call_bindings;
+        assert_eq!(bindings.len(), 2, "{name}");
+        assert_eq!(bindings[0].call_id, bindings[1].call_id, "{name}");
+        for binding in bindings {
+            assert_eq!(binding.resolution, Resolution::Ambiguous, "{name}");
+            assert_eq!(binding.candidates.len(), 2, "{name}");
+            assert_eq!(binding.candidates, bindings[0].candidates, "{name}");
+        }
+        world
+            .full_validation(&descriptor, mutations, publication)
+            .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+    }
+}
+
+type PublicationEdit = fn(&mut SemanticPublication);
+
+#[test]
+fn cross_row_defects_are_rejected_by_whole_publication_validation_on_both_paths() {
+    let (world, descriptor) = two_references_one_call();
+    let mutations = DestinationMutations::default();
+    // The join itself guarantees these three families, so no producer input can build them.
+    // Each defect is applied to the staged rows through the closure hook and to the in-memory
+    // publication, and the whole-publication validator must reject both.
+    let cases: [(&str, &str, PublicationEdit, &str); 3] = [
+        (
+            "contradictory resolved call targets",
+            "UPDATE out_call_bindings SET body=json_set(body,'$.resolution','resolved','$.declaredTarget',json(json_extract(body,'$.candidates[0]')),'$.candidates',json('[]'),'$.staleTarget',json('false')) WHERE ord=(SELECT MIN(ord) FROM out_call_bindings)",
+            |publication| {
+                let binding = &mut publication.call_bindings[0];
+                binding.resolution = Resolution::Resolved;
+                binding.declared_target = Some(binding.candidates[0].clone());
+                binding.candidates.clear();
+                binding.stale_target = Some(false);
+            },
+            "contradictory resolved call targets",
+        ),
+        (
+            "freshness differs from the independent recomputation",
+            "UPDATE out_provenance SET body=json_set(body,'$.freshness','stale')",
+            |publication| {
+                for proof in &mut publication.provenance {
+                    proof.freshness = Freshness::Stale;
+                }
+            },
+            "claimed freshness differs from captured basis",
+        ),
+        (
+            "coverage observed roles differ from the emitted evidence",
+            "UPDATE out_coverage SET body=json_set(body,'$.observedRoles',json('[]'))",
+            |publication| {
+                for row in &mut publication.coverage {
+                    row.observed_roles.clear();
+                }
+            },
+            "coverage observed roles differ from admitted evidence",
+        ),
+    ];
+    for (name, sql, edit, message) in cases {
+        testing::before_join_closure(move |conn| {
+            assert!(conn.execute(sql, []).unwrap() > 0, "{name}: nothing edited");
+        });
+        match world.join_with(&descriptor, &BatchLimits::PRODUCTION, mutations) {
+            // A staged join that rejects the defect itself satisfies the differential.
+            Err(_) => {}
+            Ok((mut admitted, _, _)) => {
+                let staged = testing::staged_publication(&mut admitted).unwrap();
+                let error = world
+                    .full_validation(&descriptor, mutations, &staged)
+                    .expect_err(name);
+                assert!(format!("{error:#}").contains(message), "{name}: {error:#}");
+            }
+        }
+        let mut memory = world.memory_publication(&descriptor, mutations);
+        edit(&mut memory);
+        let error = world
+            .full_validation(&descriptor, mutations, &memory)
+            .expect_err(name);
+        assert!(format!("{error:#}").contains(message), "{name}: {error:#}");
+    }
+}
+
+#[test]
+fn an_invalid_destination_is_rejected_for_both_outputs_by_whole_publication_validation() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+    world.republish();
+    // A destination that declares one target twice is invalid. The memory path's validator
+    // rejects the publication built against it, and so must it reject the staged rows.
+    let mutations = DestinationMutations {
+        duplicate_b_target: true,
+        ..Default::default()
+    };
+    let memory = world.memory_publication(&descriptor, mutations);
+    let error = world
+        .full_validation(&descriptor, mutations, &memory)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("duplicate measured declaration ID"),
+        "{error:#}"
+    );
+    if let Ok((mut admitted, _, _)) =
+        world.join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
+    {
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let error = world
+            .full_validation(&descriptor, mutations, &staged)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("duplicate measured declaration ID"),
+            "{error:#}"
+        );
+    }
 }

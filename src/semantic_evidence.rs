@@ -585,6 +585,33 @@ pub fn validate_evidence(
     validate_evidence_inner(semantic, native, captured, None, None, None)
 }
 
+/// The whole-publication validator a profile-pinned batch runs, over an in-memory admission of
+/// the batch instead of a stored raw batch. Every cross-row check runs; the first producer is
+/// the attested profile producer.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn validate_evidence_profile_pinned_for_tests(
+    semantic: &SemanticPublication,
+    native: &native::Artifact,
+    captured: &CapturedComponents,
+    inventory: &crate::scip_raw::CapturedScipInventory,
+) -> Result<()> {
+    let producer = semantic.producers.first().context("no producer")?;
+    let attested = crate::store::AttestedProfileProducer::pinned_for_tests(producer);
+    let raw = ValidatedRaw {
+        producer_id: &producer.id,
+        source_set_id: &captured.captured_revision.source_set_id,
+        captured_revision: &captured.captured_revision.id,
+        binaries: captured
+            .artifacts
+            .iter()
+            .map(|((_, digest), bytes)| (digest.clone(), &bytes[..]))
+            .collect(),
+        inventory: inventory.proof_identities(),
+    };
+    validate_evidence_inner(semantic, native, captured, Some(raw), Some(&attested), None)
+}
+
 struct ValidatedRaw<'a> {
     producer_id: &'a str,
     source_set_id: &'a str,

@@ -5612,6 +5612,19 @@ pub(crate) struct AttestedProfileProducer {
 }
 
 impl AttestedProfileProducer {
+    /// The profile pin of `producer`, for tests that run the whole-publication validator over a
+    /// publication without a stored raw batch.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn pinned_for_tests(producer: &crate::semantic_evidence::Producer) -> Self {
+        Self {
+            id: producer.id.clone(),
+            version: producer.version.clone(),
+            executable_hash: producer.executable_hash.clone(),
+            position_encoding: producer.position_encoding,
+            languages: producer.languages.clone(),
+        }
+    }
+
     pub(crate) fn matches(&self, producer: &crate::semantic_evidence::Producer) -> bool {
         producer.id == self.id
             && producer.version == self.version
