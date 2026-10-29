@@ -50,8 +50,8 @@
         }
       }
       lines.push(`class ${alias}["${encode(label)}"] {`, `<<${encode(annotation)}>>`, ...members.map(item => item.raw), "}");
-      const omitted = Math.max(0, fields.length - MAX_MEMBERS) + Math.max(0, methods.length - MAX_MEMBERS);
-      classes.push({alias, node, label, annotation, members, open:open.has(node.id), omitted});
+      const omittedFields = Math.max(0, fields.length - MAX_MEMBERS), omittedMethods = Math.max(0, methods.length - MAX_MEMBERS);
+      classes.push({alias, node, label, annotation, members, open:open.has(node.id), omittedFields, omittedMethods});
     }
     const source = lines.join("\n") + "\n";
     if (source.length > MAX_SOURCE) unsupported("Class Mermaid source too large");
@@ -76,7 +76,7 @@
     }
     const groups = [...root.querySelectorAll(".pele-node")];
     if (groups.length !== projection.classes.length || root.querySelectorAll("[data-id]").length !== projection.classes.length ||
-        root.querySelectorAll(".pele-edge, .pele-edge-label, .pele-cluster").length) unsupported("Missing, extra or related Pele class node");
+        root.querySelectorAll(".pele-edge, .pele-edge-label, .pele-cluster, .pele-note, .pele-note-edge").length) unsupported("Missing, extra or related Pele class node");
     const controls = [];
     for (const [i, item] of projection.classes.entries()) {
       const group = groups[i];
@@ -576,7 +576,10 @@
           if (event.key === "Enter" || event.key === " ") return activate(event);
         });
       }
-      if (item.omitted) notices.append(el("li", `${fullName}: first 200 fields and first 200 methods shown; ${item.omitted} more omitted. Read class source for more.`));
+      if (item.omittedFields || item.omittedMethods) {
+        const lists = [item.omittedFields ? "first 200 fields" : null, item.omittedMethods ? "first 200 methods" : null].filter(Boolean).join(" and ");
+        notices.append(el("li", `${fullName}: ${lists} shown; ${item.omittedFields + item.omittedMethods} more omitted. Read class source for more.`));
+      }
       if (definition.truncated) notices.append(el("li", `${fullName}: partial declaration · read source for details.`));
     }
     ui.diagram.replaceChildren(outcome.root, ...(notices.children.length ? [notices] : []), relationshipLedger());
