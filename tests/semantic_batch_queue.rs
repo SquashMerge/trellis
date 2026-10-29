@@ -1658,7 +1658,11 @@ fn lookup_budget_spans_the_rejoin_after_a_cutoff_edit() {
         ("failed", Some("index_failed"))
     );
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
-    assert!(world.head().index_revision > advanced.index_revision);
+    // The request can fail on a watcher generation change before the watcher has published the
+    // late edit; the watcher publishes it afterwards, and the durable head shows when it has.
+    trellis::testing::wait_until("late edit published by the watcher", || {
+        world.head().index_revision > advanced.index_revision
+    });
 }
 
 #[test]
