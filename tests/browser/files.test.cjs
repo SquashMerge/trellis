@@ -212,12 +212,12 @@ async function assertOneLineRows(page, items) {
         return child && {text:child.textContent, left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, hidden:child.getAttribute("aria-hidden"),
           title:child.title, clipped:child.scrollWidth > child.clientWidth, elements:child.children.length};
       };
-      return {height:box.height, content:parseFloat(style.lineHeight) + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom),
-        contentRight:box.right - parseFloat(style.paddingRight), label:node.getAttribute("aria-label"), html:node.innerHTML.includes("<img"),
+      // Geometry, not a row height: the shell's button min-height may exceed one text line.
+      return {lineHeight:parseFloat(style.lineHeight), contentRight:box.right - parseFloat(style.paddingRight), label:node.getAttribute("aria-label"), html:node.innerHTML.includes("<img"),
         icon:part(".files-symbol-icon"), name:part(".files-symbol-name"), kind:part(".files-symbol-kind"), line:part(".files-symbol-line")};
     });
     const where = `${item.symbol.name} row ${JSON.stringify(row)}`;
-    assert.ok(row.height <= row.content + 1, `${where} is one line`);
+    for (const key of ["icon", "name", "kind", "line"]) assert.ok(row[key].bottom - row[key].top <= row.lineHeight + 1, `${where} ${key} does not wrap`);
     assert.equal(row.icon.hidden, "true", where);
     assert.equal(row.name.text, item.symbol.name); assert.equal(row.name.title, item.symbol.name); assert.equal(row.name.elements, 0);
     assert.equal(row.kind.text, item.nativeKind); assert.equal(row.line.text, `L${item.symbol.range.startLine}`);
