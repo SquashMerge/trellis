@@ -5866,12 +5866,10 @@ fn authenticate_stored_batch(
             let source = by_path.get(path).ok_or_else(|| {
                 scip_raw::ScipCaptureError::InvalidArtifact("unlisted document".into())
             })?;
-            if source.language != language {
-                return Err(scip_raw::ScipCaptureError::InvalidArtifact(
-                    "document source binding".into(),
-                ));
-            }
+            let language =
+                scip_raw::bind_document_language(language, &source.language, &pinned.languages)?;
             Ok(DocumentSource {
+                language: language.to_owned(),
                 bytes: std::borrow::Cow::Borrowed(source.source_bytes),
                 content_hash: source.content_hash.clone(),
             })
