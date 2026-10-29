@@ -384,7 +384,8 @@ pub struct SinkTotals {
 }
 
 /// Stages one artifact's claims. `UNIQUE(artifact, fact_digest)` deduplicates; an ignored
-/// insert compares the stored canonical bytes so a digest collision stays typed.
+/// insert compares the stored canonical bytes so a digest collision stays typed, and a proof ID
+/// clash with no matching digest is `NonUniqueProof`.
 pub struct StageClaimSink<'c> {
     conn: &'c Connection,
     budget: &'c StageBudget,
@@ -512,8 +513,12 @@ impl ClaimSink for StageClaimSink<'_> {
                     })
                     .optional()
             });
-            if self.record(stored)?.as_deref() != Some(claim.canonical_bytes.as_slice()) {
-                return Err(ScipCaptureError::DigestCollision);
+            // An ignored insert is a repeat of the same claim, a digest collision, or a proof
+            // ID already held by a different claim (`claims_proof`), as the in-memory path types.
+            match self.record(stored)? {
+                Some(bytes) if bytes == claim.canonical_bytes => {}
+                Some(_) => return Err(ScipCaptureError::DigestCollision),
+                None => return Err(ScipCaptureError::NonUniqueProof),
             }
         } else {
             self.totals.claims += 1;

@@ -1787,7 +1787,7 @@ fn batch_error(error: anyhow::Error) -> anyhow::Error {
             anyhow::anyhow!("limit_exceeded: {detail}")
         }
         Some(ScipCaptureError::Cancelled) => anyhow::anyhow!("index publication cancelled"),
-        _ => error,
+        _ => crate::store::typed_storage_full(error),
     }
 }
 

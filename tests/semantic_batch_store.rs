@@ -2497,6 +2497,13 @@ fn failed_publication_leaves_no_partial_rows_and_the_batch_publishes_on_retry() 
     let error = fault(&mut admitted, BatchPublishFault::SqlFault);
     assert!(format!("{error:#}").contains("NOT NULL"), "{error:#}");
     assert_nothing_published(&world, head);
+    let error = fault(&mut admitted, BatchPublishFault::InsertDiskFull);
+    assert!(
+        format!("{error:#}").starts_with("storage_full: database or disk is full"),
+        "{error:#}"
+    );
+    assert!(error.is::<trellis::store::StorageFull>(), "{error:#}");
+    assert_nothing_published(&world, head);
     let error = fault(&mut admitted, BatchPublishFault::PrecommitCancel);
     assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
     world

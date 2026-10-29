@@ -176,6 +176,51 @@ fn claim_sink_dedups_and_types_collisions_and_duplicate_documents() {
 }
 
 #[test]
+fn claim_sink_types_a_proof_id_clash_as_non_unique_proof() {
+    let parent = tempfile::tempdir().unwrap();
+    let mut stage = seeded(parent.path(), "proof-clash");
+    let budget = stage.budget(&BatchLimits::PRODUCTION);
+    let conn = stage.conn().unwrap();
+    let mut sink = StageClaimSink::new(conn, &budget, 0, "java");
+    sink.begin_document(&unit("a.java")).unwrap();
+    sink.claim(claim(b"one", "d1", "p1")).unwrap();
+    assert_eq!(
+        sink.claim(claim(b"other", "d2", "p1")).unwrap_err(),
+        ScipCaptureError::NonUniqueProof,
+        "a different claim under an existing proof ID is not a digest collision"
+    );
+}
+
+#[test]
+fn claim_sink_types_a_full_disk_insert_as_storage_full() {
+    let parent = tempfile::tempdir().unwrap();
+    let mut stage = seeded(parent.path(), "full-disk");
+    let budget = stage.budget(&BatchLimits::PRODUCTION);
+    let conn = stage.conn().unwrap();
+    let pages: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    conn.query_row(&format!("PRAGMA max_page_count={pages}"), [], |_| Ok(()))
+        .unwrap();
+    let mut sink = StageClaimSink::new(conn, &budget, 0, "java");
+    sink.begin_document(&unit("a.java")).unwrap();
+    let big = vec![7u8; 1 << 20];
+    let error = sink.claim(claim(&big, "d1", "p1")).unwrap_err();
+    assert_eq!(
+        error,
+        ScipCaptureError::InvalidArtifact("stage storage".into())
+    );
+    let fault = crate::store::typed_storage_full(sink.take_fault().unwrap());
+    assert!(fault.is::<crate::store::StorageFull>(), "{fault:#}");
+    assert!(
+        format!("{fault:#}").starts_with("storage_full: database or disk is full"),
+        "{fault:#}"
+    );
+    let other = crate::store::typed_storage_full(anyhow::anyhow!("stage write"));
+    assert!(!other.is::<crate::store::StorageFull>());
+}
+
+#[test]
 fn only_documents_assigned_to_the_artifact_resolve() {
     let parent = tempfile::tempdir().unwrap();
     let mut stage = seeded(parent.path(), "assign");

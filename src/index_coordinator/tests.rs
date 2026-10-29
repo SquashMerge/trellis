@@ -1105,3 +1105,17 @@ fn lookup_budget_is_shared_across_destination_retries() {
         Some(ScipCaptureError::LimitExceeded(name)) if name == "lookup steps"
     ));
 }
+
+#[test]
+fn batch_error_types_a_sqlite_full_disk_and_leaves_other_errors_alone() {
+    let full = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+        Some("database or disk is full".into()),
+    ))
+    .context("stage write");
+    let typed = super::batch_error(full);
+    assert!(typed.is::<crate::store::StorageFull>(), "{typed:#}");
+    assert!(format!("{typed:#}").contains("database or disk is full"));
+    let other = super::batch_error(anyhow::anyhow!("stage write"));
+    assert!(!other.is::<crate::store::StorageFull>());
+}

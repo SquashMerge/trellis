@@ -4132,6 +4132,34 @@ fn storage_fault(error: &anyhow::Error) -> bool {
     })
 }
 
+/// SQLite reported a full disk (SQLITE_FULL) while writing staged or published rows. The
+/// request settles `index_failed`; the cause stays in the error chain for diagnostics.
+#[derive(Debug)]
+pub struct StorageFull(());
+
+impl std::fmt::Display for StorageFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage_full: database or disk is full")
+    }
+}
+
+impl std::error::Error for StorageFull {}
+
+/// Types a SQLITE_FULL anywhere in `error`'s chain as `StorageFull`; any other error is returned
+/// unchanged.
+pub(crate) fn typed_storage_full(error: anyhow::Error) -> anyhow::Error {
+    let full = error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(info, _))
+                if info.code == rusqlite::ErrorCode::DiskFull)
+    });
+    if full && !error.is::<StorageFull>() {
+        error.context(StorageFull(()))
+    } else {
+        error
+    }
+}
+
 /// Publication contention only. A cached-claim mismatch or unresolved
 /// completion also uses the `storage_busy` prefix, but is not a retryable
 /// SQLite/lock conflict and must never be silently requeued.
@@ -7232,6 +7260,8 @@ pub enum BatchPublishFault {
     CommitLostBeforeCommit,
     /// COMMIT fails with SQLite contention and the transaction rolls back.
     CommitBusyBeforeCommit,
+    /// An INSERT inside the transaction hits SQLITE_FULL.
+    InsertDiskFull,
 }
 
 /// What a durable re-read says about a batch COMMIT whose result was not seen.
@@ -14543,6 +14573,17 @@ impl Store {
                             [],
                         )?;
                     }
+                    BatchPublishFault::InsertDiskFull => {
+                        db.execute("CREATE TABLE full_probe(payload BLOB)", [])?;
+                        let pages: i64 = db.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+                        let limit: i64 =
+                            db.query_row("PRAGMA max_page_count", [], |row| row.get(0))?;
+                        db.query_row(&format!("PRAGMA max_page_count={pages}"), [], |_| Ok(()))?;
+                        let inserted =
+                            db.execute("INSERT INTO full_probe VALUES (zeroblob(1 << 22))", []);
+                        db.query_row(&format!("PRAGMA max_page_count={limit}"), [], |_| Ok(()))?;
+                        inserted?;
+                    }
                     _ => {}
                 }
                 Ok(())
@@ -14578,6 +14619,29 @@ impl Store {
 
     #[allow(clippy::too_many_arguments)]
     fn publish_semantic_batch_inner(
+        &self,
+        joined: &crate::semantic_batch::JoinedBatch,
+        stage: &mut crate::semantic_batch::staging::Stage,
+        expected: IndexPin,
+        leader: &topology::WriterGuard,
+        cancel: &CancelFlag,
+        before_commit: impl FnMut(&Connection) -> Result<()>,
+        commit_loss: Option<CommitLoss>,
+    ) -> Result<IndexPin> {
+        self.publish_semantic_batch_statements(
+            joined,
+            stage,
+            expected,
+            leader,
+            cancel,
+            before_commit,
+            commit_loss,
+        )
+        .map_err(typed_storage_full)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_semantic_batch_statements(
         &self,
         joined: &crate::semantic_batch::JoinedBatch,
         stage: &mut crate::semantic_batch::staging::Stage,
