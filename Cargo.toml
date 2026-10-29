@@ -52,6 +52,11 @@ uuid = { version = "1", features = ["v4"] }
 name = "semantic_search_parity"
 required-features = ["test-support"]
 
+[[bin]]
+name = "trellis-producer-stub"
+path = "src/bin/trellis-producer-stub.rs"
+required-features = ["test-support"]
+
 [build-dependencies]
 # build.rs hashes the native extraction inputs (build/extractor_inputs.rs).
 sha2 = "0.10"
