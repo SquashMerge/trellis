@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 
 pub(super) const STARTUP_BACKOFF_FIRST: Duration = Duration::from_millis(250);
 const STARTUP_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Fail accepted queued work after this many recovery faults, but keep retrying.
+/// SQLite contention never consumes this allowance.
+const STARTUP_FAILURE_LIMIT: u64 = 5;
 
 /// Decision 0009 §2. The worker and readers share this one value; it replaces
 /// the separate serving-session slot and the registry's phase flags.
@@ -148,6 +151,14 @@ impl DaemonState {
         self.startup_error.lock().unwrap().clone()
     }
 
+    pub(crate) fn recovery_blocker(&self) -> Option<String> {
+        if self.startup_failures.load(Ordering::Acquire) < STARTUP_FAILURE_LIMIT {
+            return None;
+        }
+        self.startup_error()
+            .map(|reason| format!("recovery_blocked: {reason}"))
+    }
+
     /// Deterministically pause startup reconciliation after old-root settlement
     /// and before it captures the workspace.
     #[cfg(feature = "test-support")]
@@ -247,8 +258,11 @@ impl DaemonState {
     ) -> anyhow::Result<Arc<WriterSession>> {
         self.store.settle_foreign_root_requests()?;
         #[cfg(feature = "test-support")]
-        if let Some(hook) = self.startup_hook.lock().unwrap().take() {
-            hook();
+        {
+            let hook = self.startup_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         if let RuntimeState::Reconciling { attempts, .. } = &mut *self.runtime.lock().unwrap() {
             *attempts += 1;
@@ -274,6 +288,15 @@ impl DaemonState {
             Some(&options),
             &Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    fn confirm_recovery_disposition(&self) -> anyhow::Result<()> {
+        let reason = self.recovery_disposition.lock().unwrap().clone();
+        if let Some(reason) = reason {
+            self.store.fail_queued_recovery_blocked(&reason)?;
+            *self.recovery_disposition.lock().unwrap() = None;
+        }
+        Ok(())
     }
 
     /// One startup reconciliation attempt; the worker's highest-priority item.
@@ -310,6 +333,7 @@ impl DaemonState {
         }
         self.note_state_change();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.confirm_recovery_disposition()?;
             self.startup_attempt(retained)
         }))
         .unwrap_or_else(|panic| {
@@ -326,6 +350,7 @@ impl DaemonState {
             Ok(session) => {
                 self.replace_serving_session(Some(session));
                 *self.startup_error.lock().unwrap() = None;
+                self.startup_failures.store(0, Ordering::Release);
                 *self.startup_backoff.lock().unwrap() = STARTUP_BACKOFF_FIRST;
                 *self.recovery_retry_after.lock().unwrap() = None;
                 self.step_progress.store(true, Ordering::Release);
@@ -350,12 +375,25 @@ impl DaemonState {
                 {
                     *waiting = true;
                 }
-                self.note_state_change();
                 if crate::store::transient_storage_contention(&error) {
-                    Ok(())
-                } else {
-                    Err(error)
+                    self.note_state_change();
+                    return Ok(());
                 }
+                let _ = self.startup_failures.try_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |failures| Some(failures.saturating_add(1)),
+                );
+                if self.startup_failures.load(Ordering::Acquire) >= STARTUP_FAILURE_LIMIT {
+                    let reason = format!("{error:#}");
+                    *self.startup_error.lock().unwrap() = Some(reason.clone());
+                    self.note_state_change();
+                    *self.recovery_disposition.lock().unwrap() = Some(reason);
+                    self.confirm_recovery_disposition()?;
+                } else {
+                    self.note_state_change();
+                }
+                Err(error)
             }
         }
     }

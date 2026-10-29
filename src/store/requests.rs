@@ -1458,6 +1458,89 @@ impl Store {
         }
         Ok(())
     }
+    /// Dispose queued work after the worker exhausts recovery attempts. This is
+    /// queue-only ownership: it neither elects a writer nor authorizes publication.
+    pub(crate) fn fail_queued_recovery_blocked(&self, reason: &str) -> Result<usize> {
+        self.fail_queued_recovery_blocked_with_hook(reason, || Ok(()))
+    }
+
+    pub(crate) fn fail_queued_recovery_blocked_with_hook(
+        &self,
+        reason: &str,
+        after_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<usize> {
+        let Some((guard, mut db)) = self
+            .existing_request_connection()
+            .map_err(settlement_open_error)?
+        else {
+            return Ok(0);
+        };
+        let tx =
+            super::storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        self.identity.verify()?;
+        let device = self.identity.device.to_string();
+        let inode = self.identity.inode.to_string();
+        let affected: Vec<Request> = {
+            let mut statement = super::storage_result(tx.prepare(&format!(
+                "SELECT {COLUMNS} FROM requests WHERE state='queued' AND root_device=?1 AND root_inode=?2 ORDER BY seq"
+            )))?;
+            let rows = super::storage_result(statement.query_map(params![device, inode], read))?;
+            super::storage_result(rows.collect::<rusqlite::Result<_>>())?
+        };
+        let incarnation = Uuid::new_v4().to_string();
+        let timestamp = now();
+        let error_code = format!("recovery_blocked: {reason}");
+        let changed = super::storage_result(tx.execute(
+            "UPDATE requests SET state='failed',claim_incarnation=?1,started_at=?2,finished_at=?2,error_code=?3 WHERE state='queued' AND root_device=?4 AND root_inode=?5",
+            params![incarnation, timestamp, error_code, device, inode],
+        ))?;
+        if changed != affected.len() {
+            return Err(super::topology::StorageBusy.into());
+        }
+        self.identity.verify()?;
+        let committed = super::storage_result(tx.commit());
+        // Even an apparent COMMIT success requires a separate protected read.
+        drop(db);
+        drop(guard);
+        let _ = committed.and_then(|()| after_commit());
+        let Some((_guard, reread)) = self
+            .existing_request_connection()
+            .map_err(settlement_open_error)?
+        else {
+            return Err(super::topology::StorageBusy.into());
+        };
+        for prior in &affected {
+            let row = super::storage_result(
+                reread
+                    .query_row(
+                        &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
+                        [prior.seq],
+                        read,
+                    )
+                    .optional(),
+            )?;
+            if !row.is_some_and(|row| {
+                row.seq == prior.seq
+                    && row.id == prior.id
+                    && row.root_device == prior.root_device
+                    && row.root_inode == prior.root_inode
+                    && row.state == "failed"
+                    && row.claim_incarnation.as_deref() == Some(incarnation.as_str())
+                    && row.started_at.as_deref() == Some(timestamp.as_str())
+                    && row.finished_at.as_deref() == Some(timestamp.as_str())
+                    && row.error_code.as_deref() == Some(error_code.as_str())
+                    && row.revision.is_none()
+            }) {
+                return Err(super::topology::StorageBusy.into());
+            }
+        }
+        self.identity.verify()?;
+        // An empty successful retry also wakes waiters for a prior COMMIT whose
+        // protected reread failed. A wake asks them to reread, not assume success.
+        self.notify_terminal_waiters();
+        Ok(affected.len())
+    }
+
     /// Mark old-root rows before replacement work, or fail this holder's rows after root loss.
     /// Settle a lost captured root without retaining an old writer lease.
     /// A separate protected queue open confirms every terminal row after COMMIT.
@@ -2024,6 +2107,9 @@ impl Store {
         counter.store(1, std::sync::atomic::Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod recovery_blocked_tests;
 
 #[cfg(test)]
 mod stale_claim_tests;

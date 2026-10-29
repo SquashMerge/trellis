@@ -1815,6 +1815,11 @@ impl CheckoutRuntime {
     /// CLI calls share the activated checkout's Store and scheduler; they never
     /// reopen a second Store or independently elect a leader.
     pub fn cli_status(&self) -> anyhow::Result<serde_json::Value> {
+        let resources = self.resources()?;
+        resources.store.verify_root()?;
+        if let Some(blocker) = resources.scheduler.recovery_blocker() {
+            anyhow::bail!("{blocker}");
+        }
         let (response, catching_up) = self.evidence_response()?;
         let mut status = response.status()?;
         status.catching_up = catching_up;
@@ -2614,6 +2619,101 @@ mod selection_tests {
     use super::*;
     use anyhow::Context;
     use std::process::Command;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cli_status_names_a_blocked_reconciliation_and_clears_after_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.js"), "function a() {}\n").unwrap();
+        // A standalone scheduler has no background worker; each fault and
+        // recovery transition below is driven explicitly by this test.
+        let store = Store::open_for_tests(&tmp.path().join("state"), &root).unwrap();
+        let scheduler = http::new(
+            store.clone(),
+            IndexOptions::new(root.clone()),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        let resources = Arc::new(ActiveResources { store, scheduler });
+        let runtime = CheckoutRuntime {
+            resources: std::sync::Mutex::new(Some(resources.clone())),
+            search: None,
+            root_lost: std::sync::atomic::AtomicBool::new(false),
+            initial_indexing: true,
+            rules_edit_owner: std::sync::Mutex::new(()),
+            mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
+            mcp_call_clock_origin: std::sync::Mutex::new(None),
+            mcp_hint_clock_origin: std::sync::Mutex::new(None),
+            mcp_read_hook: std::sync::Mutex::new(None),
+            mcp_read_gate: std::sync::Mutex::new(None),
+            mcp_admitted_gate: std::sync::Mutex::new(None),
+        };
+        let queued = resources
+            .store
+            .enqueue_request(&IndexOptions::new(root.clone()), None)
+            .unwrap();
+        for _ in 0..5 {
+            runtime.set_startup_hook_for_tests(Arc::new(|| {
+                panic!("persistent startup capture fault")
+            }));
+            // A new durable request wakes an attempt; no timing/polling is needed.
+            resources
+                .scheduler
+                .enqueue_index(&IndexOptions::new(root.clone()), None)
+                .unwrap();
+            assert!(
+                resources
+                    .scheduler
+                    .force_root_transition_tick_for_tests()
+                    .is_err()
+            );
+        }
+        let blocker = runtime.cli_status().unwrap_err().to_string();
+        assert!(blocker.starts_with("recovery_blocked: "), "{blocker}");
+        assert!(
+            blocker.contains("persistent startup capture fault"),
+            "{blocker}"
+        );
+        assert_eq!(
+            resources
+                .store
+                .request_by_id(&queued.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
+        let next = resources
+            .scheduler
+            .enqueue_index(&IndexOptions::new(root), None)
+            .unwrap();
+        resources
+            .scheduler
+            .force_root_transition_tick_for_tests()
+            .unwrap();
+        assert!(runtime.cli_status().is_ok());
+        assert_eq!(
+            resources
+                .store
+                .request_by_id(&next.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "done"
+        );
+        assert_eq!(
+            resources
+                .store
+                .request_by_id(&queued.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
+    }
 
     #[test]
     fn cli_index_contention_retries_the_same_accepted_request() {
