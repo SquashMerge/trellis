@@ -73,8 +73,9 @@ static ALLOCATOR: RequestedAllocator = RequestedAllocator;
 const ROWS: usize = 75_614 * 10;
 const DIMENSIONS: usize = 1024;
 const CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
-const FILL_BATCH: usize = 16;
-const FILL_SCRATCH_BYTES: usize = FILL_BATCH * (3 * DIMENSIONS + 256);
+const FILL_BATCH: usize = trellis::search_embed::DOCUMENT_BATCH_MAX;
+const FILL_SCRATCH_BYTES: usize =
+    FILL_BATCH * (5 * (DIMENSIONS + 256) + 2048 * size_of::<f32>() + size_of::<Vec<f32>>());
 const CARDS_PER_VERSION: usize = 10;
 
 fn candidate(row: usize) -> SearchCandidate {

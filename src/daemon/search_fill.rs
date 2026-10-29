@@ -1,4 +1,7 @@
 //! One daemon-wide owner for disposable, post-publication vector filling.
+#[cfg(test)]
+#[path = "search_fill_pipeline_tests.rs"]
+mod pipeline_tests;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
@@ -12,13 +15,15 @@ use super::{
     search::SearchService,
     search_head::{HeadSlot, HeadUpdate},
 };
+#[cfg(test)]
+use crate::search_embed::InputKind;
 use crate::{
     http::DaemonState,
     model::IndexPin,
     search_card::CardFormat,
     search_embed::{
-        DIMENSIONS, EmbedError, EmbeddingControl, InputKind, SearchEmbedder,
-        model_id_for_card_format,
+        DIMENSIONS, DOCUMENT_BATCH_MAX, DOCUMENT_BATCH_TOKEN_WORK_MAX, DocumentTokenizer,
+        EmbedError, EmbeddingControl, PreparedDocument, SearchEmbedder, model_id_for_card_format,
     },
     search_vectors::VectorCacheReader,
     store::{HeadSearchCards, SEARCH_CARD_BATCH_SIZE, SearchHeadChanged, topology::StorageBusy},
@@ -29,8 +34,14 @@ const BATCH: usize = SEARCH_CARD_BATCH_SIZE;
 const FAULT_RETRY: Duration = Duration::from_millis(250);
 const MAX_FAULT_RETRIES: usize = 3;
 const MATRIX_RAM_LIMIT: usize = 2 * 1024 * 1024 * 1024;
-// One existing driver reuses this resident reservation for bounded fill batches.
-pub(super) const MATRIX_FILL_SCRATCH: usize = BATCH * (3 * DIMENSIONS + 256);
+const TOKEN_WINDOW: usize = 512;
+// Covers pipelined int8 vectors, publication bookkeeping, and the normalized
+// 2048-f32 host output while quantizing a slice. Model tensors/weights remain
+// outside the matrix cap. Token ids/text are bounded separately by TOKEN_WINDOW.
+pub(super) const MATRIX_FILL_SCRATCH: usize = DOCUMENT_BATCH_MAX
+    * (5 * (DIMENSIONS + 256)
+        + 2048 * std::mem::size_of::<f32>()
+        + std::mem::size_of::<Vec<f32>>());
 
 /// Accounted bytes include unpublished builds, not just query-visible matrices.
 pub(super) struct MatrixBudget(Mutex<BudgetState>);
@@ -379,66 +390,353 @@ impl LocalBackend {
         model: &dyn SearchEmbedder,
         model_id: &str,
         first_page: (HeadSearchCards, Vec<bool>),
-        mut reader: Option<&mut VectorCacheReader>,
+        reader: Option<&mut VectorCacheReader>,
     ) -> Result<()> {
-        let (mut page, mut missing) = first_page;
-        loop {
-            self.0.expire_idle_matrices();
-            self.0.serve_queries(model);
-            check_cancel(cancel)?;
-            let mut hashes = std::collections::BTreeSet::new();
-            let cards: Vec<_> = page
-                .cards
-                .iter()
-                .zip(&missing)
-                .filter(|(card, absent)| **absent && hashes.insert(card.card_hash.as_str()))
-                .map(|(card, _)| card)
-                .collect();
-            if !cards.is_empty() {
-                // The resident head reserves this bounded batch's staging.
-                // Only this driver fills matrices, so batches cannot overlap.
-                let texts = cards
-                    .iter()
-                    .map(|card| card.card_text.clone())
-                    .collect::<Vec<_>>();
-                let vectors =
-                    model.embed(&texts, InputKind::Document, &EmbeddingControl::new(cancel))?;
-                if vectors.len() != cards.len() {
-                    return Err(EmbedError::Runtime(
-                        "document embedding returned the wrong batch size".into(),
+        // Helpers own only source/tokenizer and cache I/O. All inference and
+        // matrix publication stay on the original model/fill owner.
+        let tokenizer = model.document_tokenizer();
+        let pending = Mutex::new(std::collections::BTreeSet::new());
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(1);
+            let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<FilledSlice>(1);
+            let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(1);
+            let pending_ref = &pending;
+            let stop_ref = &stop;
+            let producer = scope.spawn(move || {
+                let result = pipeline_boundary(|| {
+                    prepare_windows(
+                        source,
+                        cancel,
+                        stop_ref,
+                        model_id,
+                        first_page,
+                        reader,
+                        tokenizer,
+                        pending_ref,
+                        |window| {
+                            let sent = prepared_tx.send(Ok(Some(window))).is_ok();
+                            if sent {
+                                self.0.fill_progress();
+                            }
+                            sent
+                        },
                     )
-                    .into());
+                });
+                let _ = prepared_tx.send(result.map(|()| None));
+                self.0.fill_progress();
+            });
+            let writer = scope.spawn(move || {
+                while let Ok(slice) = write_rx.recv() {
+                    let result = pipeline_boundary(|| {
+                        #[cfg(test)]
+                        {
+                            let hook = self.0.before_fill_put.lock().unwrap().take();
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                        }
+                        check_cancel(cancel)?;
+                        self.0.with_vector_writer(|writer| {
+                            let entries = slice
+                                .hashes
+                                .iter()
+                                .zip(&slice.vectors)
+                                .map(|(hash, vector)| {
+                                    (model_id, hash.as_str(), vector.values.as_slice())
+                                })
+                                .collect::<Vec<_>>();
+                            writer.put_many(&entries)
+                        })?;
+                        let mut pending = pending_ref.lock().unwrap();
+                        for hash in &slice.hashes {
+                            pending.remove(hash);
+                        }
+                        Ok(slice)
+                    });
+                    let failed = result.is_err();
+                    if commit_tx.send(result).is_err() {
+                        break;
+                    }
+                    self.0.fill_progress();
+                    if failed {
+                        break;
+                    }
                 }
-                check_cancel(cancel)?;
-                self.0.with_vector_writer(|writer| {
-                    let entries = cards
-                        .iter()
-                        .zip(&vectors)
-                        .map(|(card, vector)| {
-                            (model_id, card.card_hash.as_str(), vector.values.as_slice())
-                        })
-                        .collect::<Vec<_>>();
-                    writer.put_many(&entries)
-                })?;
-                self.0.publish_head_vectors(
-                    model_id,
-                    &cards
-                        .iter()
-                        .zip(&vectors)
-                        .map(|(card, vector)| (card.card_hash.clone(), vector.values.clone()))
-                        .collect::<Vec<_>>(),
-                )?;
-            }
-            self.0.serve_queries(model);
-            let Some(after) = next_cursor(&page) else {
-                return Ok(());
+            });
+            let mut awaiting_commit = false;
+            let commit = || -> Result<()> {
+                let slice: FilledSlice =
+                    self.0
+                        .wait_fill_progress(model, || match commit_rx.try_recv() {
+                            Ok(result) => Some(result),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                Some(Err(EmbedError::Runtime("fill writer stopped".into()).into()))
+                            }
+                        })?;
+                let vectors = slice
+                    .hashes
+                    .into_iter()
+                    .zip(slice.vectors)
+                    .map(|(hash, vector)| (hash, vector.values))
+                    .collect::<Vec<_>>();
+                self.0.publish_head_vectors(model_id, &vectors)
             };
-            check_cancel(cancel)?;
-            page = source.page(Some(page.pin), Some(&after))?;
-            missing = Self::missing(reader.as_deref_mut(), model_id, &page)?;
-        }
+            let result = (|| {
+                loop {
+                    self.0.expire_idle_matrices();
+                    self.0.serve_queries(model);
+                    check_cancel(cancel)?;
+                    let window =
+                        self.0
+                            .wait_fill_progress(model, || match prepared_rx.try_recv() {
+                                Ok(result) => Some(result),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Ok(None)),
+                            })?;
+                    let Some(window) = window else {
+                        break;
+                    };
+                    let mut offset = 0;
+                    while offset < window.documents.len() {
+                        self.0.serve_queries(model);
+                        check_cancel(cancel)?;
+                        let end = slice_end(&window.documents, offset);
+                        let vectors = model.embed_prepared(
+                            &window.documents[offset..end],
+                            &EmbeddingControl::new(cancel),
+                        )?;
+                        if vectors.len() != end - offset {
+                            return Err(EmbedError::Runtime(
+                                "document embedding returned the wrong batch size".into(),
+                            )
+                            .into());
+                        }
+                        self.0.serve_queries(model);
+                        check_cancel(cancel)?;
+                        // Overlap this inference with the previous put_many,
+                        // but publish its acknowledgement before adding work.
+                        if awaiting_commit {
+                            awaiting_commit = false;
+                            commit()?;
+                        }
+                        write_tx
+                            .send(FilledSlice {
+                                hashes: window.hashes[offset..end].to_vec(),
+                                vectors,
+                            })
+                            .map_err(|_| EmbedError::Runtime("fill writer stopped".into()))?;
+                        awaiting_commit = true;
+                        offset = end;
+                    }
+                }
+                Ok(())
+            })();
+            // Drain already-submitted writes on ordinary read/inference faults.
+            // Cancellation still prevents an unfinished write from committing.
+            let committed = if awaiting_commit { commit() } else { Ok(()) };
+            stop.store(true, Ordering::Release);
+            drop(prepared_rx);
+            drop(write_tx);
+            drop(commit_rx);
+            producer
+                .join()
+                .map_err(|_| EmbedError::Runtime("fill reader panicked".into()))?;
+            writer
+                .join()
+                .map_err(|_| EmbedError::Runtime("fill writer panicked".into()))?;
+            result.and(committed)
+        })
     }
 }
+fn pipeline_boundary<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+        .unwrap_or_else(|_| Err(EmbedError::Runtime("fill pipeline stage panicked".into()).into()))
+}
+
+struct PreparedWindow {
+    hashes: Vec<String>,
+    documents: Vec<PreparedDocument>,
+}
+struct FilledSlice {
+    hashes: Vec<String>,
+    vectors: Vec<crate::search_embed::QuantizedVector>,
+}
+
+fn slice_end(documents: &[PreparedDocument], start: usize) -> usize {
+    let mut end = start;
+    let mut longest = 0;
+    while end < documents.len() && end - start < DOCUMENT_BATCH_MAX {
+        longest = longest.max(documents[end].token_len());
+        if (end - start + 1) * longest > DOCUMENT_BATCH_TOKEN_WORK_MAX {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_windows(
+    source: &dyn FillSource,
+    cancel: &AtomicBool,
+    stop: &AtomicBool,
+    model_id: &str,
+    first_page: (HeadSearchCards, Vec<bool>),
+    mut reader: Option<&mut VectorCacheReader>,
+    tokenizer: DocumentTokenizer,
+    pending: &Mutex<std::collections::BTreeSet<String>>,
+    mut publish: impl FnMut(PreparedWindow) -> bool,
+) -> Result<()> {
+    let (mut page, _) = first_page;
+    let mut terminal = None;
+    loop {
+        let mut hashes = Vec::new();
+        let mut documents = Vec::new();
+        let mut scanned = 0;
+        loop {
+            check_cancel(cancel)?;
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // Keep hashes until their writes commit. This bounds deduplication
+            // by pipeline capacity, rather than retaining the entire head.
+            let cards = {
+                let mut pending = pending.lock().unwrap();
+                let missing = LocalBackend::missing(reader.as_deref_mut(), model_id, &page)?;
+                page.cards
+                    .iter()
+                    .zip(&missing)
+                    .filter(|(card, absent)| **absent && pending.insert(card.card_hash.clone()))
+                    .map(|(card, _)| card)
+                    .collect::<Vec<_>>()
+            };
+            let texts = cards
+                .iter()
+                .map(|card| card.card_text.clone())
+                .collect::<Vec<_>>();
+            documents.extend(tokenizer.prepare(&texts, &EmbeddingControl::new(cancel))?);
+            hashes.extend(cards.iter().map(|card| card.card_hash.clone()));
+            scanned += page.cards.len();
+            let Some(after) = next_cursor(&page) else {
+                break;
+            };
+            if scanned >= TOKEN_WINDOW {
+                // Read the following page only after publishing this window.
+                break;
+            }
+            match source.page(Some(page.pin), Some(&after)) {
+                Ok(next) => {
+                    page = next;
+                }
+                Err(error) => {
+                    terminal = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut order = (0..documents.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&index| documents[index].token_len());
+        // Move rather than clone token buffers into sorted order.
+        let mut pairs = hashes
+            .into_iter()
+            .zip(documents)
+            .map(Some)
+            .collect::<Vec<_>>();
+        let mut window = PreparedWindow {
+            hashes: Vec::with_capacity(order.len()),
+            documents: Vec::with_capacity(order.len()),
+        };
+        for index in order {
+            let (hash, document) = pairs[index].take().unwrap();
+            window.hashes.push(hash);
+            window.documents.push(document);
+        }
+        if !window.documents.is_empty() && !publish(window) {
+            return Ok(());
+        }
+        if let Some(error) = terminal {
+            return Err(error);
+        }
+        let Some(after) = next_cursor(&page) else {
+            return Ok(());
+        };
+        check_cancel(cancel)?;
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        page = source.page(Some(page.pin), Some(&after))?;
+    }
+}
+
+/// Diagnostic admission through the production paging, tokenizing and sorting path.
+/// Ordinals travel as card hashes so callers can restore the original row order.
+#[cfg(feature = "test-support")]
+#[allow(clippy::type_complexity)]
+pub fn prepare_document_windows_for_tests(
+    texts: &[String],
+    tokenizer: DocumentTokenizer,
+    cancel: &AtomicBool,
+) -> Result<Vec<(Vec<usize>, Vec<PreparedDocument>)>> {
+    struct Documents<'a>(&'a [String]);
+    impl FillSource for Documents<'_> {
+        fn page(&self, _: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
+            let start = after.map_or(Ok(0), |cursor| cursor.parse::<usize>().map(|n| n + 1))?;
+            Ok(HeadSearchCards {
+                pin: IndexPin {
+                    index_generation: uuid::Uuid::nil(),
+                    index_revision: 1,
+                },
+                cards: self
+                    .0
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(BATCH)
+                    .map(|(ordinal, text)| crate::store::HeadSearchCard {
+                        syntax_id: ordinal.to_string(),
+                        card_hash: ordinal.to_string(),
+                        card_text: text.clone(),
+                    })
+                    .collect(),
+            })
+        }
+    }
+    let source = Documents(texts);
+    let first = source.page(None, None)?;
+    let missing = vec![true; first.cards.len()];
+    let mut windows = Vec::new();
+    prepare_windows(
+        &source,
+        cancel,
+        &AtomicBool::new(false),
+        &model_id_for_card_format(CardFormat::V1.as_str()),
+        (first, missing),
+        None,
+        tokenizer,
+        &Mutex::new(Default::default()),
+        |window| {
+            let ordinals = window
+                .hashes
+                .iter()
+                .map(|hash| hash.parse().unwrap())
+                .collect();
+            windows.push((ordinals, window.documents));
+            true
+        },
+    )?;
+    Ok(windows)
+}
+
+#[cfg(feature = "test-support")]
+pub fn prepared_document_slice_end_for_tests(
+    documents: &[PreparedDocument],
+    start: usize,
+) -> usize {
+    slice_end(documents, start)
+}
+
 fn next_cursor(page: &HeadSearchCards) -> Option<String> {
     (page.cards.len() == BATCH).then(|| page.cards.last().unwrap().syntax_id.clone())
 }
@@ -2352,7 +2650,7 @@ mod tests {
                 .iter()
                 .map(Vec::len)
                 .collect::<Vec<_>>(),
-            [BATCH - 1, 1]
+            [BATCH]
         );
         assert_eq!(service.vector_report().unwrap().entries, BATCH as u64);
         assert_eq!(loads.load(Ordering::Relaxed), 1);
@@ -2373,8 +2671,29 @@ mod tests {
         assert_eq!(loads.load(Ordering::Relaxed), 1);
     }
 
+    struct BoundarySource {
+        source: PagedSource,
+        boundary: Mutex<Option<BatchPause>>,
+    }
+    impl FillSource for BoundarySource {
+        fn page(&self, pin: Option<IndexPin>, after: Option<&str>) -> Result<HeadSearchCards> {
+            if after == Some(format!("sid:v1:{:032x}", TOKEN_WINDOW - 1).as_str()) {
+                let pause = self.boundary.lock().unwrap().take();
+                if let Some((entered, resume)) = pause {
+                    entered.send(()).unwrap();
+                    resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(crate::testing::HANG_BACKSTOP)
+                        .unwrap();
+                }
+            }
+            self.source.page(pin, after)
+        }
+    }
+
     #[test]
-    fn head_change_mid_loaded_fill_keeps_committed_progress_and_resident_model() {
+    fn head_change_at_prefetch_boundary_keeps_committed_progress_and_resident_model() {
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (entered, events) = mpsc::channel();
         let (resume, proceed) = mpsc::channel();
@@ -2384,7 +2703,22 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             pause: Some((entered, Arc::new(Mutex::new(proceed)))),
         });
-        let source = Arc::new(paged_source());
+        let (reading, read) = mpsc::channel();
+        let (advance, release) = mpsc::channel();
+        let source = Arc::new(BoundarySource {
+            source: PagedSource {
+                cards: (0..TOKEN_WINDOW + 3)
+                    .map(|index| HeadSearchCard {
+                        syntax_id: format!("sid:v1:{index:032x}"),
+                        card_text: format!("text-{index}"),
+                        card_hash: format!("{index:064x}"),
+                    })
+                    .collect(),
+                changed: AtomicBool::new(false),
+                pages: std::sync::atomic::AtomicUsize::new(0),
+            },
+            boundary: Mutex::new(Some((reading, Arc::new(Mutex::new(release))))),
+        });
         let job_source = source.clone();
         let job_service = service.clone();
         let job = std::thread::spawn(move || {
@@ -2395,8 +2729,10 @@ mod tests {
                 &|_| {},
             )
         });
+        read.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
         events.recv_timeout(crate::testing::HANG_BACKSTOP).unwrap();
-        source.changed.store(true, Ordering::Release);
+        source.source.changed.store(true, Ordering::Release);
+        advance.send(()).unwrap();
         resume.send(()).unwrap();
         assert!(
             job.join()
@@ -2405,7 +2741,10 @@ mod tests {
                 .unwrap_err()
                 .is::<SearchHeadChanged>()
         );
-        assert_eq!(service.vector_report().unwrap().entries, (BATCH - 1) as u64);
+        assert_eq!(
+            service.vector_report().unwrap().entries,
+            TOKEN_WINDOW as u64
+        );
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         LocalBackend(service.clone())
             .run(source.as_ref(), &AtomicBool::new(false), None, &|_| {})
@@ -2414,7 +2753,7 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         assert_eq!(
             service.vector_report().unwrap().entries,
-            BATCH as u64,
+            (TOKEN_WINDOW + 3) as u64,
             "reconciliation fills only the remaining misses"
         );
     }
