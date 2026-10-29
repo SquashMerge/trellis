@@ -15,7 +15,7 @@ Pins live in [`hardware/mac-mini-m5-pro-v1.json`](hardware/mac-mini-m5-pro-v1.js
 
 A shim launcher (mise, asdf, pyenv) or a shim `node` is refused with `producer_unavailable`: detection reads files and never executes a shim to ask its version.
 
-The scip-java and rust-analyzer rows are filled in by the slices that add their tests and must match their strict runs.
+The scip-java and rust-analyzer rows are confirmed by the strict runs of the slices that add their tests. The scip-java row was confirmed against a strict run that used the cached coursier Temurin 17 `javac` with system OpenJDK 25.0.3 on `PATH`.
 
 ## Declared environment
 
@@ -29,7 +29,7 @@ No shell activation is needed or used.
 
 ## CI
 
-CI provisions none of these producers. Each real-producer test has a default variant that prints `SKIP producer_unavailable: <reason>` and passes when the producer is missing, unverifiable or a shim, so CI and `./tools/verify` skip them.
+CI provisions none of these producers. Each real-producer test has a default variant that prints `SKIP producer_unavailable: <reason>` and passes when the producer is missing, unverifiable or a shim, so CI skips them. `./tools/verify` runs the default real-producer tests, and they exercise the real producers when those are available on the host and skip otherwise.
 
 ## Evidence
 
