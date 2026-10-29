@@ -225,69 +225,463 @@ fn query_view_never_traverses_semantic_bindings() {
     assert!(!view.calls.is_empty());
 }
 
-/// IDs embed the checkout's root ID; rename them by order of first appearance.
-fn normalize_ids(value: &mut serde_json::Value, seen: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(text)
-            if text.starts_with("sid:v1:") || text.starts_with("occ:v2:") =>
-        {
-            let at = seen.iter().position(|id| id == text).unwrap_or_else(|| {
-                seen.push(text.clone());
-                seen.len() - 1
-            });
-            *text = format!("{}#{at}", &text[..7]);
+fn sequence_steps(
+    steps: &[trellis::behavior::SequenceStep],
+) -> Vec<&trellis::behavior::SequenceStep> {
+    let mut out = vec![];
+    for step in steps {
+        if step.call_id.is_some() {
+            out.push(step);
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| normalize_ids(v, seen)),
-        serde_json::Value::Object(map) => map.values_mut().for_each(|v| normalize_ids(v, seen)),
-        _ => {}
+        out.extend(sequence_steps(&step.children));
+        out.extend(sequence_steps(&step.alternate));
     }
+    out
 }
 
 #[test]
-fn sequence_view_unchanged_with_semantic_bindings() {
-    let sequence = |semantic: bool| {
+fn sequence_enriches_every_occurrence_without_graph_grouping() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[
+        (
+            "a.rs",
+            "fn a() { lexical_decoy(); lexical_decoy(); }\nfn lexical_decoy() {}\n",
+        ),
+        ("target.rs", "fn actual_target() {}\n"),
+    ]);
+    spec.bindings = (0..2)
+        .map(|nth| Bind {
+            provenance: "shared-calls".into(),
+            ..bind("a", nth, "actual_target")
+        })
+        .collect();
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let target = syntax_id(publisher.native(), "actual_target");
+    let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
+    assert_eq!(graph.edges.len(), 1);
+    assert_eq!(graph.edges[0].call_site_count, 2);
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert_eq!(steps.len(), 2);
+    assert_ne!(steps[0].call_id, steps[1].call_id);
+    for (step, call) in steps
+        .iter()
+        .zip(graph_fixtures::calls_of(publisher.native(), "a"))
+    {
+        assert_eq!(step.call_id.as_deref(), Some(call.id.as_str()));
+        assert_eq!(step.target.as_deref(), Some(target.as_str()));
+        let evidence = step.call_evidence.as_ref().unwrap();
+        assert_eq!(evidence.boundary_reason, BoundaryReason::None);
+        assert_eq!(evidence.resolution, Some(s::Resolution::Resolved));
+        assert_eq!(evidence.freshness, Some(s::Freshness::Fresh));
+        assert_eq!(evidence.provenance_id.as_deref(), Some("shared-calls"));
+        assert!(step.resolution.is_none());
+    }
+    let participant = view.participants.iter().find(|p| p.id == target).unwrap();
+    assert_eq!(participant.declaration.as_ref().unwrap().path, "target.rs");
+    assert_eq!(view.revision, pin);
+    assert!(view.semantic_warnings.is_empty());
+    let syntax = trellis::behavior::build_sequence(
+        pin,
+        &view.seed,
+        &publisher
+            .store
+            .source_at("a.rs", Some(pin))
+            .unwrap()
+            .unwrap()
+            .1,
+        &publisher.graph.as_ref().unwrap().calls,
+        false,
+    )
+    .unwrap();
+    fn strip(steps: &mut [trellis::behavior::SequenceStep]) {
+        for step in steps {
+            step.target = None;
+            step.call_evidence = None;
+            strip(&mut step.children);
+            strip(&mut step.alternate);
+        }
+    }
+    let mut enriched = view.steps.clone();
+    strip(&mut enriched);
+    assert_eq!(enriched, syntax.steps);
+    std::fs::write(
+        root.path().join("target.rs"),
+        "changed outside published snapshot",
+    )
+    .unwrap();
+    assert_eq!(
+        publisher
+            .store
+            .sequence_at(&seed, pin, false)
+            .unwrap()
+            .unwrap(),
+        view
+    );
+}
+
+#[test]
+fn sequence_uses_engine_boundary_precedence_and_warnings() {
+    for (mode, reason) in [
+        ("ambiguous", BoundaryReason::Ambiguous),
+        ("unresolved", BoundaryReason::Unresolved),
+        ("external", BoundaryReason::External),
+        ("dispatch", BoundaryReason::Dispatch),
+        ("stale", BoundaryReason::Stale),
+        ("missing", BoundaryReason::MissingEvidence),
+        ("failed", BoundaryReason::MissingEvidence),
+    ] {
         let (state, root) = workspace();
         let mut publisher = Publisher::open(state.path(), root.path());
-        let mut spec = if semantic {
-            Spec::new(&[("a.rs", CHAIN)])
-        } else {
-            Spec::syntax_only(&[("a.rs", CHAIN)])
-        };
-        if semantic {
-            spec.bindings = vec![bind("a", 0, "b")];
+        let mut spec = Spec::new(&[("a.rs", "fn a() { b(); b(); }\nfn b() {}\n")]);
+        spec.bindings = (0..2)
+            .map(|nth| Bind {
+                provenance: "shared".into(),
+                ..bind("a", nth, "b")
+            })
+            .collect();
+        match mode {
+            "ambiguous" => {
+                for b in &mut spec.bindings {
+                    b.resolution = s::Resolution::Ambiguous;
+                }
+            }
+            "unresolved" => {
+                for b in &mut spec.bindings {
+                    b.resolution = s::Resolution::Unresolved;
+                }
+            }
+            "external" => {
+                for b in &mut spec.bindings {
+                    b.resolution = s::Resolution::External;
+                }
+            }
+            "dispatch" => {
+                for b in &mut spec.bindings {
+                    b.dispatch = Dispatch::Virtual;
+                    b.possible = vec!["b".into()];
+                }
+            }
+            "stale" => spec.requested_version = "v2".into(),
+            "missing" => spec.bindings.clear(),
+            "failed" => {
+                spec.states.insert("a.rs".into(), CoverageState::Failed);
+            }
+            _ => unreachable!(),
         }
         let pin = publisher.publish(&spec);
-        let seed = publisher
-            .graph
-            .as_ref()
-            .unwrap()
-            .nodes
-            .iter()
-            .find(|node| node.name == "a")
-            .unwrap()
-            .id
-            .clone();
+        let seed = syntax_id(publisher.native(), "a");
         let view = publisher
             .store
             .sequence_at(&seed, pin, false)
             .unwrap()
             .unwrap();
-        assert!(!view.steps.is_empty());
-        fn targetless(steps: &[trellis::behavior::SequenceStep]) -> bool {
-            steps.iter().all(|step| {
-                step.target.is_none()
-                    && step.resolution.is_none()
-                    && targetless(&step.children)
-                    && targetless(&step.alternate)
-            })
+        let steps = sequence_steps(&view.steps);
+        assert_eq!(steps.len(), 2, "{mode}");
+        assert!(
+            steps.iter().all(|step| step.target.is_none()
+                && step.call_evidence.as_ref().unwrap().boundary_reason == reason),
+            "{mode}"
+        );
+        let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
+        assert_eq!(view.semantic_warnings, graph.warnings, "{mode}");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.boundary_reason == reason)
+        );
+    }
+}
+
+#[test]
+fn sequence_retains_exact_selected_snapshot_and_self_target() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[("a.rs", "fn a() { b(); }\nfn b() {}\n")]);
+    spec.bindings = vec![bind("a", 0, "a")];
+    let r1 = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let old = publisher
+        .store
+        .sequence_at(&seed, r1, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sequence_steps(&old.steps)[0].target.as_deref(),
+        Some(seed.as_str())
+    );
+    assert_eq!(
+        old.participants
+            .iter()
+            .filter(|p| p.declaration.is_some())
+            .count(),
+        1
+    );
+    spec.bindings = vec![bind("a", 0, "b")];
+    let r2 = publisher.publish(&spec);
+    let new = publisher
+        .store
+        .sequence_at(&seed, r2, false)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        sequence_steps(&new.steps)[0].target,
+        sequence_steps(&old.steps)[0].target
+    );
+    assert_eq!(
+        publisher
+            .store
+            .sequence_at(&seed, r1, false)
+            .unwrap()
+            .unwrap(),
+        old
+    );
+}
+
+#[test]
+fn sequence_zero_and_multiple_producers_are_syntax_only() {
+    for multiple in [false, true] {
+        let (state, root) = workspace();
+        let (pin, seed) = {
+            let mut publisher = Publisher::open(state.path(), root.path());
+            let mut spec = if multiple {
+                Spec::new(&[("a.rs", CHAIN)])
+            } else {
+                Spec::syntax_only(&[("a.rs", CHAIN)])
+            };
+            if multiple {
+                spec.bindings = vec![bind("a", 0, "b")];
+            }
+            let pin = if multiple {
+                publisher.publish_with_semantic(&spec, graph_fixtures::add_second_producer)
+            } else {
+                publisher.publish(&spec)
+            };
+            (pin, syntax_id(publisher.native(), "a"))
+        };
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let view = store.sequence_at(&seed, pin, false).unwrap().unwrap();
+        assert!(
+            sequence_steps(&view.steps)
+                .iter()
+                .all(|step| step.target.is_none() && step.call_evidence.is_none())
+        );
+        assert_eq!(
+            view.warnings
+                .iter()
+                .any(|warning| warning == "multiple semantic producers; showing syntax"),
+            multiple
+        );
+    }
+}
+
+#[test]
+fn sequence_outside_sole_producer_languages_preserves_plain_syntax() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let files = [
+        ("src/lib.rs", "fn lib() {}\n"),
+        (
+            "web/a.js",
+            "function r(ok) { if (ok) client.send(); other.close(); }\n",
+        ),
+    ];
+    let syntax_pin = publisher.publish(&Spec::syntax_only(&files));
+    let seed = syntax_id(publisher.native(), "r");
+    let syntax: Vec<_> = [false, true]
+        .into_iter()
+        .map(|show_all| {
+            publisher
+                .store
+                .sequence_at(&seed, syntax_pin, show_all)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    assert!(syntax.iter().all(|view| view.participants.len() > 1));
+    // Spec::new publishes a Rust-only producer alongside the JavaScript seed.
+    let semantic_pin = publisher.publish(&Spec::new(&files));
+    for (show_all, mut expected) in [false, true].into_iter().zip(syntax) {
+        expected.revision = semantic_pin;
+        let actual = publisher
+            .store
+            .sequence_at(&seed, semantic_pin, show_all)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+}
+
+#[test]
+fn sequence_same_named_targets_keep_exact_declarations_and_constructor_dispatch() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[
+        ("a.rs", "fn a() { b(); b(); }\nfn b() {}\n"),
+        ("other.rs", "fn b() {}\n"),
+    ]);
+    publisher.publish(&spec);
+    let native = publisher.native();
+    let targets: Vec<_> = native
+        .declarations
+        .iter()
+        .filter(|d| d.name.as_deref() == Some("b") && d.name_range.is_some())
+        .map(|d| s::Target::Internal {
+            syntax_id: d.syntax_id.clone(),
+            document: d.document.clone(),
+            revision_id: native.revision.id.clone(),
+        })
+        .collect();
+    assert_eq!(targets.len(), 2);
+    spec.bindings = vec![
+        bind("a", 0, "b"),
+        Bind {
+            dispatch: Dispatch::Constructor,
+            ..bind("a", 1, "b")
+        },
+    ];
+    let pin = publisher.publish_with_semantic(&spec, |publication, _| {
+        for (binding, target) in publication.call_bindings.iter_mut().zip(targets) {
+            binding.declared_target = Some(target);
         }
-        assert!(targetless(&view.steps));
-        let mut value = serde_json::to_value(&view).unwrap();
-        value["revision"] = serde_json::Value::Null;
-        normalize_ids(&mut value, &mut Vec::new());
-        value
+    });
+    let seed = syntax_id(publisher.native(), "a");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert_ne!(steps[0].target, steps[1].target);
+    assert_eq!(
+        steps[1].call_evidence.as_ref().unwrap().dispatch,
+        Some(Dispatch::Constructor)
+    );
+    let declarations: Vec<_> = view
+        .participants
+        .iter()
+        .filter_map(|p| p.declaration.as_ref())
+        .filter(|d| d.name == "b")
+        .collect();
+    assert_eq!(declarations.len(), 2);
+    assert_ne!(declarations[0].id, declarations[1].id);
+    assert_ne!(declarations[0].path, declarations[1].path);
+}
+
+#[test]
+fn sequence_constructor_can_target_exact_class_declaration() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[("a.py", "class B:\n    pass\ndef a():\n    B()\n")]);
+    spec.languages = vec![s::Language::Python];
+    spec.bindings = vec![Bind {
+        dispatch: Dispatch::Constructor,
+        ..bind("a", 0, "B")
+    }];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let target = syntax_id(publisher.native(), "B");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sequence_steps(&view.steps)[0].target.as_deref(),
+        Some(target.as_str())
+    );
+    let participant = view.participants.iter().find(|p| p.id == target).unwrap();
+    assert_eq!(participant.kind, "class");
+    assert_eq!(
+        participant.declaration.as_ref().unwrap().kind,
+        trellis::model::SymbolKind::Class
+    );
+}
+
+#[test]
+fn sequence_source_hints_do_not_consume_resolved_lane_budget() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let calls: String = (0..21)
+        .map(|n| format!("const v{n}={{}}; v{n}.go();\n"))
+        .collect();
+    let source = format!("function a() {{ {calls} }}\nfunction b() {{}}\n");
+    let mut spec = Spec::new(&[("a.js", &source)]);
+    spec.languages = vec![s::Language::Javascript];
+    spec.bindings = (0..21).map(|nth| bind("a", nth, "b")).collect();
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.participants.len(), 2);
+    assert!(
+        sequence_steps(&view.steps)
+            .iter()
+            .all(|step| step.target.is_some())
+    );
+}
+
+#[test]
+fn sequence_participant_limit_keeps_evidence_without_inventing_target() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = fanout_source(21);
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = (0..21)
+        .map(|nth| bind("root", nth, &format!("f{nth}")))
+        .collect();
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "root");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.participants.len(), 20);
+    assert!(view.truncated);
+    let steps = sequence_steps(&view.steps);
+    assert_eq!(steps.len(), 21);
+    assert!(steps.iter().any(|step| {
+        let evidence = step.call_evidence.as_ref().unwrap();
+        evidence.boundary_reason == BoundaryReason::NodeLimit
+            && step.target.is_none()
+            && evidence.resolution == Some(s::Resolution::Resolved)
+    }));
+}
+
+#[test]
+fn sequence_corrupt_binding_fails_without_partial_result() {
+    let (state, root) = workspace();
+    let (pin, seed) = {
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let mut spec = Spec::new(&[("a.rs", CHAIN)]);
+        spec.bindings = vec![bind("a", 0, "b")];
+        let pin = publisher.publish(&spec);
+        (pin, syntax_id(publisher.native(), "a"))
     };
-    assert_eq!(sequence(true), sequence(false));
+    sql(
+        state.path(),
+        "PRAGMA ignore_check_constraints=ON; UPDATE semantic_provenance SET freshness='bogus'",
+    );
+    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let error = store.sequence_at(&seed, pin, false).unwrap_err();
+    assert!(
+        error.to_string().contains("incompatible_index"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -386,24 +780,30 @@ fn corrupt_stored_row_is_typed_without_partial_result() {
 
 #[test]
 fn in_scope_missing_coverage_row_is_typed_corruption() {
-    let (state, root) = workspace();
-    let root_id = {
-        let mut publisher = Publisher::open(state.path(), root.path());
-        publisher.publish(&Spec::new(&[("a.rs", CHAIN)]));
-        syntax_id(publisher.native(), "a")
-    };
-    sql(
-        state.path(),
-        "PRAGMA foreign_keys=OFF; DELETE FROM semantic_coverage WHERE path='a.rs'",
-    );
-    let store = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let error = run(&store, &query(&root_id, true)).err().unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("missing producer coverage tuple"),
-        "{error:#}"
-    );
+    for sequence in [false, true] {
+        let (state, root) = workspace();
+        let (root_id, pin) = {
+            let mut publisher = Publisher::open(state.path(), root.path());
+            let pin = publisher.publish(&Spec::new(&[("a.rs", CHAIN)]));
+            (syntax_id(publisher.native(), "a"), pin)
+        };
+        sql(
+            state.path(),
+            "PRAGMA foreign_keys=OFF; DELETE FROM semantic_coverage WHERE path='a.rs'",
+        );
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let error = if sequence {
+            store.sequence_at(&root_id, pin, false).unwrap_err()
+        } else {
+            run(&store, &query(&root_id, true)).err().unwrap()
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("missing producer coverage tuple"),
+            "{error:#}"
+        );
+    }
 }
 
 #[test]

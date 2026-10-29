@@ -22,7 +22,7 @@ function harness(withApp = false) {
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(path){requests.push(path);throw new Error("Unexpected request "+path);}});
   const run = code => vm.runInContext(code,context);
-  if(withApp)run(fs.readFileSync("web/sequence.js","utf8"));
+  run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
   if(withApp){run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
@@ -274,7 +274,12 @@ test("inspector keeps raw evidence folded and source action before full details"
   assert.ok(html.indexOf('id="inspector-open-source"') < html.indexOf('id="inspector-detail"'));
   const source = fs.readFileSync(path.join(__dirname, "../web/shell.js"), "utf8");
   assert.doesNotMatch(source, /evidence\(step, detail[^;]+\.open = true/);
-  assert.match(source, /"target", "resolution", "candidateSymbols"/);
+  const h = harness(), step = call();
+  h.shell.selectStep(step, view([step]), () => {});
+  const disclosure = h.get("inspector-detail").children[0];
+  assert.equal(disclosure.tagName, "details");
+  assert.notEqual(disclosure.open, true);
+  assert.match(text(disclosure), /"target": "candidate"/);
 });
 
 
@@ -421,4 +426,62 @@ test("Treemap owns its controls and inspector across view and Files transitions"
   assert.equal(h.get("diagram-metrics").hidden, true);
   h.shell.showView("sequence");
   assert.equal(h.get("diagram-metrics").hidden, false);
+});
+
+function resolvedView() {
+  const step = call("bound", "actual"), data = view([step]);
+  const declaration = {id:"actual",name:"actual_target",kind:"function",path:"target.rs",range};
+  data.participants.push({id:declaration.id,label:declaration.name,kind:"internal",declaration});
+  step.callEvidence = {boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"proof"};
+  return {data,step,declaration};
+}
+test("resolved inspector distinguishes callee action, original call site and engine evidence; detached action is inert", () => {
+  const h = harness(), {data,step,declaration} = resolvedView(), opened = [];
+  let sources = 0;
+  h.shell.selectStep(step,data,()=>++sources,(symbol,call)=>opened.push({symbol,call}));
+  assert.match(h.get("inspector-target").textContent,/Resolved declaration · actual_target · target.rs/);
+  assert.match(h.get("inspector-evidence").textContent,/direct · fresh · proof/);
+  const action = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
+  action.listeners.click(); assert.equal(opened[0].symbol,declaration); assert.equal(opened[0].call,step);
+  assert.equal(sources,0); h.get("inspector-open-source").listeners.click(); assert.equal(sources,1);
+  h.shell.resetInspector(); action.listeners.click(); assert.equal(opened.length,1);
+  h.shell.selectStep(step,data,()=>{},()=>opened.push("wrong"));
+  const replaced = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
+  h.shell.selectStep(call(),view(),()=>{}); replaced.listeners.click(); assert.equal(opened.length,1);
+});
+test("app target callback binds original call object and declaration; same-pin session/root/panel replacement is inert", async () => {
+  for (const change of ["epoch++",`selectedRootKey="other"`,"diagramSerial++","selectedMethod={id:'other'}","sectionSerial++"]) {
+    const h = harness(true), {data,step,declaration} = resolvedView(); let targetAction;
+    h.context.window.TrellisShell.selectStep = (_,__,___,target)=>{targetAction=target;};
+    h.context.fetch = async path => response(path === "/api/status" ? {revision:data.revision,workspaceRoot:"/repo"} : data);
+    await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
+    all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+    assert.equal(typeof targetAction,"function");
+    h.run(change);
+    h.context.fetch = ()=>assert.fail("obsolete target fetched");
+    const admitted = h.run("diagramSequence"), original = admitted.steps[0], symbol = admitted.participants.find(p=>p.id===original.target).declaration;
+    await targetAction(symbol,original);
+    assert.equal(h.run("selectedMethod.id"),change.includes("selectedMethod")?"other":data.seed.id);
+  }
+});
+
+test("noncallable resolved target reads exact declaration source instead of requesting a sequence", async () => {
+  const h = harness(true), {data,step,declaration} = resolvedView(); declaration.kind = "class";
+  const requests = [];
+  h.context.fetch = async path => {
+    requests.push(path);
+    if (path === "/api/status") return response({revision:data.revision,workspaceRoot:"/repo"});
+    if (path === "/api/sequence") return response(data);
+    assert.match(path,/^\/api\/source\?/); assert.match(path,/path=target.rs/);
+    return response({revision:data.revision,file:{path:"target.rs",text:"class actual_target {}"}});
+  };
+  await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
+  all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+  const action = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
+  assert.equal(action.textContent,"Read declaration source");
+  await action.listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests.filter(path=>path === "/api/sequence").length,1);
+  assert.ok(requests.some(path=>path.startsWith("/api/source?") && path.includes("path=target.rs")));
+  assert.equal(h.get("workspace-source-panel").hidden,false);
 });

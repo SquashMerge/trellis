@@ -85,7 +85,12 @@ struct NativeCaptureArgs {
 struct NavigationFixtureArgs {
     #[arg(long)]
     workspace: PathBuf,
-    #[arg(long, value_parser = ["zero", "sole", "multiple", "unresolved"])]
+    #[arg(long, value_parser = [
+        "zero", "sole", "multiple", "unresolved",
+        "sequence-sole", "sequence-zero", "sequence-multiple", "sequence-unresolved",
+        "sequence-ambiguous", "sequence-stale", "sequence-dispatch", "sequence-external",
+        "sequence-missing", "sequence-constructor"
+    ])]
     mode: String,
 }
 #[derive(Args)]

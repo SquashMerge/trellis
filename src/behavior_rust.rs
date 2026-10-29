@@ -84,6 +84,7 @@ impl Builder<'_> {
             call_id: None,
             target: None,
             resolution: None,
+            call_evidence: None,
             children: vec![],
             alternate: vec![],
             hidden: false,
@@ -469,7 +470,7 @@ fn call_label<'a>(n: Node<'_>, file: &'a SourceFile) -> &'a str {
     &file.text[callee.byte_range()]
 }
 fn unresolved_boundary() -> Participant {
-    Participant {
+    Participant { declaration: None,
         id: "boundary:rust-unknown".into(),
         label: "Unresolved calls".into(),
         kind: "boundary".into(),
@@ -479,7 +480,7 @@ fn unresolved_boundary() -> Participant {
 fn source_hint(kind: &str, expression: &str) -> Participant {
     // The full source spelling, not its shortened label, identifies a visual
     // group. Stable across call sites; deliberately not a binding/object ID.
-    Participant {
+    Participant { declaration: None,
         id: format!("rust:source:{kind}:{:x}", Sha256::digest(expression.as_bytes())),
         label: bounded(expression),
         kind: kind.into(),
@@ -529,7 +530,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
             if simple_receiver(receiver) {
                 source_hint("unresolvedReceiver", &file.text[receiver.byte_range()])
             } else if chain_result(receiver) {
-                Participant {
+                Participant { declaration: None,
                     id: "rust:syntax:chain-results".into(),
                     label: "Chain results".into(),
                     kind: "unresolvedReceiver".into(),
@@ -719,8 +720,8 @@ pub fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, count: 0, view: SequenceView {
-        revision, seed: seed.clone(), participants: vec![Participant { id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+    let mut b = Builder { file, seed, calls, count: 0, view: SequenceView { semantic_warnings: vec![],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false,
     }};
     let f = if !callable(node)

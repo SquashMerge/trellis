@@ -1,11 +1,11 @@
 "use strict";
-// Pele is presentation only. Ordinals bind its positional notes to original DTO objects.
+// Pele is presentation only. Statement positions bind notes and messages to original DTO objects.
 (() => {
   const ROOT_STYLE = "max-width:100%;height:auto;--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:16px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
   const SVG_NS = "http://www.w3.org/2000/svg";
   const kinds = new Set(["call", "group", "branch", "loop", "try", "effect", "return", "throw", "await", "note", "boundary", "definition"]);
   const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
-  const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "xml:space"]);
+  const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "fill-opacity", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "stroke-dasharray", "stroke-linecap", "xml:space"]);
   function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
   // Pele decodes numeric entities into SVG text. Escape everything outside
   // a small literal alphabet so repository text cannot become Mermaid grammar.
@@ -22,13 +22,27 @@
   }
   function project(view, expanded = new Set(), options = {}) {
     if (!view || !view.seed || !Array.isArray(view.steps) || !Array.isArray(view.participants) || !view.revision) unsupported("Invalid sequence view");
-    const seen = new Set(), rows = [], frames = [], frameHeaders = [], closeFrames = [], closeHeaders = [], noteOrder = [null], lines = ["sequenceDiagram", `participant S as ${encode(view.seed.name || view.seed.id)}`, "Note over S: Static possible paths - target and timing unknown"];
+    const seen = new Set(), rows = [], frames = [], frameHeaders = [], closeFrames = [], closeHeaders = [], noteOrder = [null];
+    const intro = "Static possible paths - not a runtime trace";
+    const lanes = [{alias:"S", id:view.seed.id, label:view.seed.name || view.seed.id, participant:view.participants.find(p => p.id === view.seed.id), proof:null}];
+    const lines = ["sequenceDiagram", `Note over S: ${intro}`];
     let separators = 1;
+    const targetFor = step => window.TrellisSequence?.target(view, step);
+    const laneFor = (target, proof) => {
+      let lane = lanes.find(item => item.id === target.id);
+      if (!lane) {
+        if (lanes.length >= 20) unsupported("Too many sequence participants");
+        lane = {alias:`P${lanes.length}`, id:target.id, label:target.declaration.name || target.label, participant:target, proof}; lanes.push(lane);
+      } else if (!lane.proof) lane.proof = proof;
+      return lane;
+    };
     const add = (step, preview) => {
       const ordinal = rows.length + 1;
       if (ordinal > 200) unsupported("Too many source notes");
       let label = step.label || step.kind;
-      if (step.kind === "call") label += " - measured syntax; target unverified";
+      if (step.kind === "call" || step.kind === "boundary" && step.callId) label = step.callEvidence
+        ? `${window.TrellisSequence.evidenceLabel(step, view)} - ${label}`
+        : `${label} - ${window.TrellisSequence.evidenceLabel(step, view)}`;
       const shorten = (text, max) => text.length > max ? text.slice(0, Math.max(1, max - 3)) + "..." : text;
       let displayLabel;
       if (preview) {
@@ -42,15 +56,18 @@
         const groupLimit = Math.max(12, Math.floor(room / 2));
         const entryLimit = Math.max(12, room - groupLimit);
         displayLabel = `${shorten(label, groupLimit)} - first measured entry: ${shorten(preview.label, entryLimit)} - call ${entryId} -${suffix}`;
+        if (preview.callEvidence) displayLabel = `${window.TrellisSequence.evidenceLabel(preview, view)} - ${displayLabel}`;
       } else {
         if (!options.showDetails) label = shorten(label, 160);
         displayLabel = label;
       }
       const marker = `[${String(ordinal).padStart(3, "0")}]`;
       const display = `${marker} ${step.kind} ${displayLabel}`;
-      lines.push(`Note right of S: ${encode(display)}`);
-      const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview};
-      rows.push(row); noteOrder.push(row);
+      const evidence = preview || step, target = targetFor(evidence), lane = target && laneFor(target, evidence);
+      const message = lane && evidence.kind === "call", type = message ? "message" : "note";
+      lines.push(message ? `S->>${lane.alias}: ${encode(display)}` : `Note right of S: ${encode(display)}`);
+      const row = {ordinal, marker, display, step, id:step.id, callId:step.callId, path:step.path, range:step.range, revision:view.revision, previewEntryCallId:preview?.callId, preview, evidence, target, type};
+      rows.push(row); if (!message) noteOrder.push(row);
     };
     const visit = (steps, depth) => {
       if (!Array.isArray(steps) || depth > 24) unsupported("Unsupported sequence depth");
@@ -96,26 +113,35 @@
         if (separators > 200) unsupported("Too many separators");
       }
     };
-    // A hidden or collapsed step can carry future measured target evidence.
-    // Refuse the whole view before projecting any subset; legacy fallback
-    // retains the complete DTO but currently draws only the seed lane.
+    // Validate original DTO target evidence even when its row is hidden or folded.
     const pending = [...view.steps];
     let inspected = 0;
     while (pending.length) {
       if (++inspected > 12000) unsupported("Too many sequence members");
       const step = pending.pop();
-      if (step?.target != null) unsupported("Witnessed call target: target links are not shown in either sequence renderer");
+      if (step?.target != null && !targetFor(step)) unsupported("Invalid resolved target evidence");
+      if (step?.callEvidence?.boundaryReason === "none" && !targetFor(step)) unsupported("Missing resolved declaration witness");
       if (Array.isArray(step?.children)) pending.push(...step.children);
       if (Array.isArray(step?.alternate)) pending.push(...step.alternate);
     }
     visit(view.steps, 0);
+    lines.splice(1, 0, ...lanes.map(lane => `participant ${lane.alias} as ${encode(lane.label)}`));
     const source = lines.join("\n") + "\n";
     if (new TextEncoder().encode(source).length > 512 * 1024) unsupported("Mermaid source too large");
-    // Pele numbers every Mermaid statement, including operators and end, but
-    // not the declaration or participant. These gaps are part of the pinned API.
-    const noteIds = lines.slice(2).flatMap((line, i) => line.startsWith("Note ") ? [`i${i}`] : []);
-    return {source, rows, frames, frameHeaders, closeFrames, closeHeaders, noteIds, separators, noteOrder};
+    // Participants do not consume Pele statement IDs. Every note, message,
+    // operator, separator and end does, including statements without a row.
+    let statement = 0, rowIndex = 0;
+    const noteIds = [], messageIds = [];
+    for (const line of lines) {
+      if (line === "sequenceDiagram" || line.startsWith("participant ")) continue;
+      const id = `i${statement++}`;
+      if (line.startsWith("Note ")) noteIds.push(id);
+      if (line.startsWith("S->>")) messageIds.push(id);
+      if (line.startsWith("Note right of S:") || line.startsWith("S->>")) rows[rowIndex++].statementId = id;
+    }
+    return {source, rows, lanes, intro, frames, frameHeaders, closeFrames, closeHeaders, noteIds, messageIds, separators, noteOrder};
   }
+
   function validatedSvg(raw, projection) {
     if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("SVG output too large");
     const start = /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" class="pele pele-sequence"/;
@@ -138,14 +164,28 @@
       }
     }
     const notes = [...root.querySelectorAll(".pele-note")];
-    if (notes.length !== projection.rows.length + projection.separators) unsupported("Missing Pele note");
+    if (notes.length !== projection.noteIds.length) unsupported("Missing Pele note");
     const ids = new Set();
     for (const [i, note] of notes.entries()) {
       const id = note.getAttribute("data-id");
       if (id !== projection.noteIds[i] || ids.has(id)) unsupported("Changed Pele note order");
       ids.add(id);
-      const expected = i === 0 ? "Static possible paths - target and timing unknown" : projection.noteOrder[i]?.display || "handlers / cleanup (see guards)";
+      const expected = i === 0 ? projection.intro : projection.noteOrder[i]?.display || "handlers / cleanup (see guards)";
       if (note.textContent !== expected) unsupported("Changed Pele note text");
+    }
+    const messages = [...root.querySelectorAll(".pele-message")], messageLabels = [...root.querySelectorAll(".pele-edge-label")];
+    const messageRows = projection.rows.filter(row => row.type === "message");
+    if (messages.length !== messageRows.length || messageLabels.length !== messageRows.length) unsupported("Missing Pele message");
+    for (const [i, row] of messageRows.entries()) {
+      if (messages[i].getAttribute("data-id") !== row.statementId || messageLabels[i].getAttribute("data-id") !== row.statementId ||
+          messageLabels[i].textContent !== row.display) unsupported("Changed Pele message identity or text");
+    }
+    const actors = [...root.querySelectorAll(".pele-actor")], lifelines = [...root.querySelectorAll(".pele-lifeline")];
+    if (actors.length !== projection.lanes.length * 2 || lifelines.length !== projection.lanes.length) unsupported("Changed Pele participants");
+    for (const lane of projection.lanes) {
+      const members = actors.filter(actor => actor.getAttribute("data-id") === lane.alias);
+      if (members.length !== 2 || members.some(actor => actor.textContent !== lane.label) ||
+          lifelines.filter(line => line.getAttribute("data-id") === lane.alias).length !== 1) unsupported("Changed Pele participant identity or text");
     }
     const observed = [...root.querySelectorAll(".pele-frame")].map(n => n.classList.contains("pele-frame-alt") ? "alt" : n.classList.contains("pele-frame-opt") ? "opt" : n.classList.contains("pele-frame-loop") ? "loop" : "unknown");
     if (observed.join("|") !== projection.closeFrames.join("|") || root.querySelectorAll(".pele-rect").length !== projection.frames.filter(x => x === "rect").length) unsupported("Changed Pele control frames");
@@ -158,11 +198,13 @@
       if (labels.join("|") !== wanted.join("|")) unsupported("Changed Pele frame header");
     }
     // The alt frame has no native ID; its original header is the numbered note.
-    return {root, notes};
+    return {root, notes, messages, messageLabels, actors};
   }
   async function render(container, view, readSource, expandedGroups = new Set(), options = {}) {
     const current = () => !options.isCurrent || options.isCurrent();
     if (!current()) return {status:"stale"};
+    const renderCurrent = window.TrellisSequence.beginRender(container);
+    const active = () => current() && renderCurrent();
     try {
       const projection = project(view, expandedGroups, options);
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
@@ -170,21 +212,42 @@
       // interrupt it. Output byte/node caps are checked before installation.
       const result = window.pele.render(projection.source, {}).svg;
       if (!current()) return {status:"stale"};
-      const {root, notes} = validatedSvg(result, projection);
+      const {root, notes, messages, messageLabels, actors} = validatedSvg(result, projection);
+      const rowNodes = [...notes, ...messageLabels];
+      for (const lane of projection.lanes) {
+        if (!lane.proof || typeof options.onOpenTarget !== "function") continue;
+        for (const actor of actors.filter(node => node.getAttribute("data-id") === lane.alias)) {
+          actor.setAttribute("role", "button"); actor.setAttribute("tabindex", "0");
+          actor.setAttribute("data-trellis-target-id", lane.id);
+          actor.setAttribute("aria-label", `${window.TrellisSequence.targetActionLabel(lane.participant.declaration)}: ${lane.participant.declaration.name}`);
+          const open = () => {
+            if (active() && window.TrellisSequence.target(view, lane.proof) === lane.participant) options.onOpenTarget(lane.participant.declaration, lane.proof);
+          };
+          actor.addEventListener("click", open);
+          actor.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
+        }
+      }
       const selected = {id:options.selectedId || null};
       const controls = new Map();
       for (const [i, row] of projection.rows.entries()) {
-        const note = notes[projection.noteOrder.indexOf(row)], step = row.step;
+        const note = rowNodes.find(node => node.getAttribute("data-id") === row.statementId), step = row.step;
         note.setAttribute("data-trellis-step-id", row.id);
         if (row.callId) note.setAttribute("data-trellis-call-id", row.callId);
+        if (row.type === "message") {
+          const arrow = messages.find(node => node.getAttribute("data-id") === row.statementId);
+          arrow.setAttribute("data-trellis-step-id", row.id);
+          if (row.evidence.callId) arrow.setAttribute("data-trellis-call-id", row.evidence.callId);
+          if (row.previewEntryCallId) arrow.setAttribute("data-trellis-preview-call-id", row.previewEntryCallId);
+          arrow.setAttribute("data-trellis-target-id", row.target.id);
+        }
         if (row.previewEntryCallId) note.setAttribute("data-trellis-preview-call-id", row.previewEntryCallId);
         note.setAttribute("tabindex", "0"); note.setAttribute("role", "button");
         note.setAttribute("aria-label", `Inspect ${step.kind}: ${step.label}${row.previewEntryCallId ? `; first measured entry ${row.preview.label}, call ${row.previewEntryCallId}; remaining calls collapsed` : ""} (${step.path}:${step.range.startLine})`);
         note.setAttribute("aria-pressed", String(selected.id === row.id));
         const select = () => {
-          if (!current() || !witness(step) || row.id !== step.id || row.callId !== step.callId || row.path !== step.path || row.range !== step.range || projection.rows[i] !== row) return;
+          if (!active() || !witness(step) || row.id !== step.id || row.callId !== step.callId || row.path !== step.path || row.range !== step.range || projection.rows[i] !== row) return;
           selected.id = row.id;
-          for (const n of notes.slice(1)) n.setAttribute("aria-pressed", String(n.getAttribute("data-trellis-step-id") === row.id));
+          for (const n of rowNodes) n.setAttribute("aria-pressed", String(n.getAttribute("data-trellis-step-id") === row.id));
           if (options.onSelect) options.onSelect(step); else if (readSource) readSource(step);
         };
         note.addEventListener("click", select);
@@ -193,9 +256,14 @@
           // Attach the HTML action to its already verified SVG note. Geometry
           // places it only; ordinal/original-object witnesses own identity.
           const rect = note.querySelector("rect");
-          const x = Number(rect?.getAttribute("x")), y = Number(rect?.getAttribute("y"));
-          const width = Number(rect?.getAttribute("width"));
-          if (!rect || ![x, y, width].every(Number.isFinite) || width <= 0) unsupported("Changed Pele group geometry");
+          const text = note.querySelector("text");
+          // Parsed SVG is not connected, so getBBox() is not available. Text
+          // coordinates place this control only; original row evidence owns it.
+          const labelWidth = Math.max(1, row.display.length * 8);
+          const box = rect ? {x:Number(rect.getAttribute("x")), y:Number(rect.getAttribute("y")), width:Number(rect.getAttribute("width"))}
+            : {x:Number(text?.getAttribute("x")) - labelWidth / 2, y:Number(text?.getAttribute("y")) - 20, width:labelWidth};
+          const {x, y, width} = box;
+          if (![x, y, width].every(Number.isFinite) || width <= 0) unsupported("Changed Pele group geometry");
           const foreign = document.createElementNS(SVG_NS, "foreignObject");
           foreign.setAttribute("x", String(x + width + 4)); foreign.setAttribute("y", String(y));
           foreign.setAttribute("width", "126"); foreign.setAttribute("height", "32");
@@ -213,7 +281,7 @@
           toggle.addEventListener("keydown", event => event.stopPropagation());
           toggle.addEventListener("click", async event => {
             event.stopPropagation();
-            if (!current() || projection.rows[i] !== row) return;
+            if (!active() || projection.rows[i] !== row) return;
             const top = container.scrollTop, left = container.scrollLeft;
             if (expandedGroups.has(row.id)) expandedGroups.delete(row.id); else expandedGroups.add(row.id);
             const outcome = await render(container, view, readSource, expandedGroups, {...options, selectedId:selected.id});

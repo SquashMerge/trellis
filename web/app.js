@@ -155,7 +155,9 @@ async function navigateDiagram(symbol, revision, kind = "sequence", admitted = n
   diagramSerial++;
   const source = captureSourceEntry();
   if (source) rememberNavigation(source, true, "#source");
-  else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
+  else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
+    rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked}, true, sequenceHash(selectedMethod.id, revision));
+  } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
   rememberNavigation({kind, symbol, admitted, showAll:false}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
@@ -199,7 +201,7 @@ async function restoreSourceEntry(entry, current) {
       if (navigationCurrent(entry) && sourceInspector === inspector && sourceSerial === serial)
         return perform(() => showSource(inspector.symbol, entry.revision));
     };
-    if (inspector.sequence) window.TrellisShell?.selectStep(inspector.symbol, inspector.sequence, readSource);
+    if (inspector.sequence) window.TrellisShell?.selectStep(inspector.symbol, inspector.sequence, readSource, sequenceTargetAction(inspector.sequence, () => navigationCurrent(entry) && sourceInspector === inspector));
     else window.TrellisShell?.inspectSymbol?.(inspector.symbol, entry.revision, readSource);
   }
   if (!sourceCurrent()) return;
@@ -1044,11 +1046,27 @@ async function loadFilesMini(current) {
     filesMini = data; await renderFilesMini(current);
   } catch (error) { filesFailure(error, "files-mini-state", current); }
 }
+function sequenceTargetAction(data, current) {
+  const context = navigationContext(), revision = IndexPin.copy(data.revision);
+  return (declaration, step) => {
+    if (!current() || !navigationCurrent(context) || !IndexPin.equal(revision, status?.revision)) return;
+    const pending = [...data.steps];
+    let found = false;
+    while (pending.length) {
+      const item = pending.pop();
+      if (item === step) { found = true; break; }
+      pending.push(...(item.children || []), ...(item.alternate || []));
+    }
+    if (!found || window.TrellisSequence?.target(data, step)?.declaration !== declaration) return;
+    if (["function", "method"].includes(declaration.kind)) return perform(() => navigateDiagram(declaration, revision));
+    return perform(() => section === "files" ? openFilesLocation(declaration, revision) : showSource(declaration, revision));
+  };
+}
 async function renderFilesMini(current) {
   if (!filesMini || !filesSymbol) return;
   const data = filesMini, revision = data.revision, expanded = new Set(), container = $("files-mini-sequence");
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
-  const options = {showDetails:false, isCurrent:current};
+  const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
   options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
   const outcome = window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
@@ -1296,6 +1314,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     diagramSequence = data;
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
+    options.onOpenTarget = sequenceTargetAction(data, options.isCurrent);
     // A later group redraw can fail after the initial load succeeded. Preserve
     // the whole pinned DTO rather than leaving an inert, silently folded group.
     options.onUnsupported = reason => {
@@ -1304,7 +1323,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
       $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
-      if (current()) { sourceInspector = {symbol:step, sequence:data}; viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step)); }
+      if (current()) { sourceInspector = {symbol:step, sequence:data}; viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step), options.onOpenTarget); }
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();

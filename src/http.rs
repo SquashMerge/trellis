@@ -3047,8 +3047,20 @@ async fn sequence(
         )
     })?
     .map_err(|e| {
-        if e.chain()
-            .any(|cause| cause.downcast_ref::<crate::store::PinExpired>().is_some())
+        if e.chain().any(|cause| {
+            cause.downcast_ref::<crate::store::PinExpired>().is_some()
+                || cause
+                    .downcast_ref::<crate::store::SelectedIntegrity>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::store::topology::StorageBusy>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::store::RebuildInProgress>()
+                    .is_some()
+                || cause.downcast_ref::<rusqlite::Error>().is_some()
+        }) || e.to_string().starts_with("storage_busy")
+            || e.to_string().starts_with("store_unavailable")
             || e.to_string().starts_with("revision conflict")
             || e.to_string().starts_with("index_not_ready")
             || e.to_string().starts_with("incompatible_index")
