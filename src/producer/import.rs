@@ -81,20 +81,19 @@ fn read_request(store: &Store, id: &str) -> Result<Option<Request>> {
     }
 }
 
-/// Enqueue `options` and block until the request is terminal. A failed import is an
-/// `ImportOutcome` with its typed code; only an error before acceptance or in reading the
-/// queue is an `Err`.
-pub fn submit_and_wait(
-    store: &Store,
-    scheduler: &DaemonState,
-    options: &GeneratedImportOptions,
-) -> Result<ImportOutcome> {
-    let accepted = scheduler.enqueue_generated_semantic_import(options)?;
+/// Enqueue `options` and return the accepted request's ID.
+pub fn submit(scheduler: &DaemonState, options: &GeneratedImportOptions) -> Result<String> {
+    Ok(scheduler.enqueue_generated_semantic_import(options)?.id)
+}
+
+/// Block until request `id`, accepted for `options`, is terminal. A failed import is an
+/// `ImportOutcome` with its typed code; only an error in reading the queue is an `Err`.
+pub fn wait(store: &Store, options: &GeneratedImportOptions, id: String) -> Result<ImportOutcome> {
     loop {
         // Recorded before the read: a terminal commit between the read and the wait is never
         // missed.
         let seen = store.terminal_generation();
-        let row = read_request(store, &accepted.id)?
+        let row = read_request(store, &id)?
             .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
         match row.state.as_str() {
             "done" => {
@@ -109,7 +108,7 @@ pub fn submit_and_wait(
                         )
                     })?;
                 return Ok(ImportOutcome {
-                    request_id: accepted.id,
+                    request_id: id,
                     state: "done",
                     published_revision: Some(pin),
                     report: Some(report),
@@ -118,7 +117,7 @@ pub fn submit_and_wait(
             }
             "failed" => {
                 return Ok(ImportOutcome {
-                    request_id: accepted.id,
+                    request_id: id,
                     state: "failed",
                     published_revision: None,
                     report: None,
@@ -129,4 +128,15 @@ pub fn submit_and_wait(
             _ => anyhow::bail!("store_unavailable: invalid request state"),
         }
     }
+}
+
+/// Enqueue `options` and block until the request is terminal. Only an error before acceptance
+/// or in reading the queue is an `Err`.
+pub fn submit_and_wait(
+    store: &Store,
+    scheduler: &DaemonState,
+    options: &GeneratedImportOptions,
+) -> Result<ImportOutcome> {
+    let id = submit(scheduler, options)?;
+    wait(store, options, id)
 }
