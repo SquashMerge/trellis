@@ -14,6 +14,8 @@ expansion is performed by enrichment.
 The store uses the sole published semantic producer at that selected snapshot. Zero
 producers preserves the syntax-only DTO. Multiple producers preserves syntax and adds
 `multiple semantic producers; showing syntax`; it never picks or merges producers.
+A sole producer that does not cover the seed language also preserves the plain
+syntax-only DTO, including receiver hints, without semantic labels or declarations.
 
 A measured call step may contain `callEvidence`:
 

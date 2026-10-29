@@ -483,6 +483,46 @@ fn sequence_zero_and_multiple_producers_are_syntax_only() {
 }
 
 #[test]
+fn sequence_outside_sole_producer_languages_preserves_plain_syntax() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let files = [
+        ("src/lib.rs", "fn lib() {}\n"),
+        (
+            "web/a.js",
+            "function r(ok) { if (ok) client.send(); other.close(); }\n",
+        ),
+    ];
+    let syntax_pin = publisher.publish(&Spec::syntax_only(&files));
+    let seed = syntax_id(publisher.native(), "r");
+    let syntax: Vec<_> = [false, true]
+        .into_iter()
+        .map(|show_all| {
+            publisher
+                .store
+                .sequence_at(&seed, syntax_pin, show_all)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    assert!(syntax.iter().all(|view| view.participants.len() > 1));
+    // Spec::new publishes a Rust-only producer alongside the JavaScript seed.
+    let semantic_pin = publisher.publish(&Spec::new(&files));
+    for (show_all, mut expected) in [false, true].into_iter().zip(syntax) {
+        expected.revision = semantic_pin;
+        let actual = publisher
+            .store
+            .sequence_at(&seed, semantic_pin, show_all)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+}
+
+#[test]
 fn sequence_same_named_targets_keep_exact_declarations_and_constructor_dispatch() {
     let (state, root) = workspace();
     let mut publisher = Publisher::open(state.path(), root.path());
@@ -777,22 +817,8 @@ fn out_of_scope_root_with_producer_is_missing_evidence() {
             "function r() { f(); g(); }\nfunction f() {}\nfunction g() {}\n",
         ),
     ]);
-    let pin = publisher.publish(&spec);
+    publisher.publish(&spec);
     let root_id = syntax_id(publisher.native(), "r");
-    let sequence = publisher
-        .store
-        .sequence_at(&root_id, pin, false)
-        .unwrap()
-        .unwrap();
-    assert!(
-        sequence_steps(&sequence.steps).iter().all(|step| step
-            .call_evidence
-            .as_ref()
-            .unwrap()
-            .boundary_reason
-            == BoundaryReason::MissingEvidence
-            && step.target.is_none())
-    );
     let result = result(run(&publisher.store, &query(&root_id, true)).unwrap());
     assert_eq!(result.edges.len(), 2);
     assert!(

@@ -479,9 +479,6 @@ pub(super) fn sequence_calls(
         }
         return Ok(());
     }
-    // Syntax receiver groups are display hints, not resolved participant lanes.
-    view.participants
-        .retain(|participant| participant.id == view.seed.id);
     let producer = producers[0].clone();
     let (source_set_id, revision_id): (String, String) = db.query_row(
         "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
@@ -513,7 +510,13 @@ pub(super) fn sequence_calls(
         .get(&view.seed.id)
         .ok_or_else(|| SelectedIntegrity("selected sequence declaration missing".into()))?
         .clone();
-    let semantic = engine::semantic(languages.as_ref(), &document).map_err(engine_error)?;
+    let Some(semantic) = engine::semantic(languages.as_ref(), &document).map_err(engine_error)?
+    else {
+        return Ok(());
+    };
+    // Syntax receiver groups are display hints, not resolved participant lanes.
+    view.participants
+        .retain(|participant| participant.id == view.seed.id);
     let calls: BTreeMap<_, _> = document
         .calls
         .get(&view.seed.id)
@@ -612,7 +615,7 @@ pub(super) fn sequence_calls(
         db,
         selected,
         source: &mut source,
-        semantic,
+        semantic: Some(semantic),
         calls: &calls,
         participants: &mut view.participants,
         edges: vec![],
