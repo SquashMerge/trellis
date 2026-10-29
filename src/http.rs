@@ -176,6 +176,14 @@ pub struct DaemonState {
     /// The first error of the current startup reconciliation run, cleared when
     /// a validated head commits.
     startup_error: Mutex<Option<String>>,
+    /// Failed non-contention recovery attempts in the current reconciliation run.
+    startup_failures: AtomicU64,
+    /// A queue disposition must be confirmed before reconciliation can finish.
+    recovery_disposition: Mutex<Option<String>>,
+    #[cfg(test)]
+    test_worker_now: Mutex<Option<Instant>>,
+    #[cfg(test)]
+    test_startup_error: Mutex<Option<anyhow::Error>>,
     /// The next failed startup reconciliation waits this long (doubling, capped).
     startup_backoff: Mutex<Duration>,
     /// The current browser configuration (Decision 0009 §6), replaced whole.
@@ -416,6 +424,12 @@ pub fn new_with_config(
         maintenance_hook: Mutex::new(None),
         runtime: Mutex::new(RuntimeState::Activating),
         startup_error: Mutex::new(None),
+        startup_failures: AtomicU64::new(0),
+        recovery_disposition: Mutex::new(None),
+        #[cfg(test)]
+        test_worker_now: Mutex::new(None),
+        #[cfg(test)]
+        test_startup_error: Mutex::new(None),
         startup_backoff: Mutex::new(STARTUP_BACKOFF_FIRST),
         dependencies: Mutex::new(DependencyIndex {
             generation: 0,
@@ -1358,7 +1372,7 @@ impl DaemonState {
             .recovery_retry_after
             .lock()
             .unwrap()
-            .is_some_and(|retry| Instant::now() < retry)
+            .is_some_and(|retry| self.worker_now() < retry)
         {
             return Ok(());
         }
@@ -3251,6 +3265,9 @@ mod exceptional_recovery_tests;
 
 #[cfg(test)]
 mod rebuild_recovery_tests;
+
+#[cfg(test)]
+mod recovery_blocked_tests;
 
 #[cfg(all(test, feature = "test-support"))]
 mod normal_post_capture_cancellation_tests;
