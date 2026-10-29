@@ -167,3 +167,18 @@ test("real pinned SVG map rejects mutations before controls; label fitting respe
     assert.equal(boundary[2].anticipated,14007);
   } finally {await browser.close();}
 });
+test("measured viewport sets a non-square native layout; tiny or crowded panels grow within bounds; root shows the checkout name (#425)",()=>{
+  const {adapter,pele}=setup(), files=fixture();
+  const p=adapter.project(files,{viewport:{width:913.6,height:577.2},rootLabel:id=>id==="one"?"trellis":id});
+  assert.equal(p.width,913); assert.equal(p.height,577);
+  assert.match(native(pele,p),/viewBox="0 0 929 593" width="929" height="593"/);
+  const roots=[...p.nodes.values()].filter(n=>n.kind==="directory"&&!n.record.path);
+  assert.deepEqual(roots.map(n=>n.label),["trellis · 100 lines","two · 10 lines"]);
+  assert.equal(roots[0].full,"trellis · one · / · 100 physical file lines","exact source set stays in the full label");
+  assert.equal(roots[1].full,"two · / · 10 physical file lines");
+  assert.deepEqual({...adapter.layoutSize(3,{width:300,height:100})},{width:640,height:360},"readable minimum");
+  const crowded=adapter.layoutSize(1000,{width:1000,height:500});
+  assert.ok(crowded.width*crowded.height>=1000*2500 && Math.abs(crowded.width/crowded.height-2)<0.01,"grows in the panel's aspect ratio");
+  assert.deepEqual({...adapter.layoutSize(12000,{width:1000,height:500})},{width:4000,height:3873},"never beyond 4000 px per side");
+  assert.deepEqual({...adapter.layoutSize(4,undefined)},{width:640,height:640});
+});

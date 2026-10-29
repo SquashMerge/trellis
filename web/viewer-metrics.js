@@ -18,6 +18,8 @@
   const labels = {loc:"LOC (callable ranges)", sloc:"SLOC (callable ranges)", commentLines:"Comment lines (callable ranges)",
     cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
     halstead:"Halstead", fanIn:"Fan-in", fanOut:"Fan-out (call sites)", parameters:"Parameters", exits:"Exits"};
+  const colorNames = {cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability",
+    "halstead.volume":"Halstead volume", fanOut:"Fan-out"};
   function create({request, context, onConflict = () => {}, onChange = () => {}}) {
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, epoch = 0, refreshSerial = 0, inspectionSerial = 0;
     let projection = null, projectionGuard = null, selected = null, loading = false;
@@ -38,7 +40,7 @@
     function clearDecorations() {
       for (const item of decorations) item.node.remove();
       decorations = [];
-      get("metric-legend")?.replaceChildren();
+      get("metric-legend")?.replaceChildren(); get("explorer-metric-legend")?.replaceChildren();
     }
     function clearInspection() {
       inspectionSerial++;
@@ -189,6 +191,16 @@
       decorations.push(decoration);
       return decoration;
     }
+    // Explorer rows carry swatch + number; this legend names what they measure in every Diagrams view.
+    function explorerLegend(scale) {
+      const target = get("explorer-metric-legend"); target?.replaceChildren();
+      if (!target || !decorations.length) return;
+      target.append(make("span", `Numbers: ${colorNames[metric] || metric} · ${aggregate} · ${population()}${scale ? ` · ${scale.label}` : " · No measured values · — unavailable, not zero"}`));
+      for (const {label, band} of scale?.entries || []) {
+        const entry = make("span", undefined, "metric-legend-entry");
+        entry.append(make("span", undefined, `metric-swatch${band === null ? " neutral" : ` heat-${band}`}`), make("span", label)); target.append(entry);
+      }
+    }
     function renderLegend(rendered) {
       const target = get("metric-legend"); target?.replaceChildren();
       if (metric === "none") { clearDecorations(); return; }
@@ -198,7 +210,7 @@
       const values = usable() ? visible.map(item => metricValue(match(item.selection)?.metrics, metric)).filter(finite) : [];
       if (!usable()) {
         for (const item of decorations) item.swatch.className = "metric-swatch neutral";
-        target?.append(make("span", `No measured values · ${population()} · — unavailable, not zero`)); return;
+        target?.append(make("span", `No measured values · ${population()} · — unavailable, not zero`)); explorerLegend(null); return;
       }
       const scale = createScale(metric, aggregate, values, relative);
       for (const item of decorations) {
@@ -211,6 +223,7 @@
         entry.append(make("span", undefined, `metric-swatch${band === null ? " neutral" : ` heat-${band}`}`), make("span", label)); target?.append(entry);
       }
       if (relative) target?.append(make("span", "Ties stay together · — unavailable"));
+      explorerLegend(scale);
     }
     if (get("metric-relative")) get("metric-relative").checked = false;
     get("metric-relative")?.addEventListener("change", event => {

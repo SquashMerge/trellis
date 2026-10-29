@@ -270,6 +270,11 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .file-tree .method-pick.selected::before { color: var(--on-selected); }
 .file-tree .unindexed-file { display: block; padding: 4px 6px 0; font-size: 12px; color: var(--secondary); }
 .file-tree .unindexed-file + .detail { padding-left: 6px; }
+.file-tree .unsupported-files summary { padding: 3px 6px; color: var(--secondary); font: 11px/1.5 var(--mono); }
+.file-tree .file-pick:has(> .metric-value) { display: flex; align-items: baseline; }
+.file-tree .file-pick > .metric-value { display: inline-flex; flex: none; align-items: center; gap: 4px; margin-left: auto; padding-left: 8px; }
+.explorer-legend { margin: 4px 0 8px; }
+.explorer-legend:empty { display: none; }
 #reveal-method, #retry-files, #more-files { padding: 4px 6px; }
 .canvas-area { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 .view-tabs, .dock-tabs { display: flex; align-items: stretch; gap: 0; }

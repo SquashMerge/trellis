@@ -23,7 +23,7 @@ function fixture(aggregate = "max", role = "production") {
   if (role === "all") for (const row of files) { row.declarationCount += row.roleCounts.test; if (row.declarationCount) row.metrics.cognitive = 7; }
   return {...pin, aggregate, role, workbench:true,metricsVersion:"metrics:v1", scope:"revision", files, directories:[]};
 }
-function harness() {
+function harness(globals = {}) {
   const elements = new Map(), calls = [], renders = [], reads = [], conflicts = [];
   let context = {rootKey:"checkout-one", session:1, pin}, response = async () => ({payload:fixture()});
   function node(tagName) {
@@ -50,7 +50,7 @@ function harness() {
     clearTreemapInspector:() => { get("treemap-inspector").hidden = true; get("treemap-inspector-content").replaceChildren(); },
     showTreemapInspector:() => { get("treemap-inspector").hidden = false; },
   }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console, ...globals});
   const controller = window.TrellisTreemap.create({request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
     readSource:(site, revision, current) => reads.push({site, revision, current}), onConflict:error => conflicts.push(error)});
   const button = label => { const result = descendants(get("treemap-inspector-content")).find(item => item.tagName === "button" && item.textContent === label); assert.ok(result, `Missing ${label}`); return result; };
@@ -266,4 +266,97 @@ test("layer exclusions warning preserves measured paint and stays visible in emp
   assert.ok(h.get("treemap-state").textContent.endsWith(warning));
   h.setResponse(async () => ({payload:fixture()})); await h.controller.refresh();
   assert.ok(!h.get("treemap-state").textContent.includes(warning), "a normal payload clears the warning");
+});
+
+test("root label is the observed checkout name only when one source set owns every indexed file (#425)", async () => {
+  const workspaceOnly = async () => { const payload = fixture(); payload.files = payload.files.filter(file => file.sourceSetId === "workspace"); return {payload}; };
+  const mixed = harness(); mixed.setContext({rootKey:"checkout-one", session:1, pin, workspaceRoot:"/home/dev/trellis"});
+  await mixed.controller.refresh();
+  assert.equal(mixed.renders[0].options.rootLabel("workspace"), "workspace", "two source sets: no source set is guessed to be the checkout");
+  const single = harness(); single.setContext({rootKey:"checkout-one", session:1, pin, workspaceRoot:"/home/dev/trellis/"});
+  single.setResponse(workspaceOnly); await single.controller.refresh();
+  assert.equal(single.renders[0].options.rootLabel("workspace"), "trellis");
+  await single.renders[0].options.onSelectDirectory({sourceSetId:"workspace", path:"src"});
+  assert.deepEqual(single.get("treemap-breadcrumbs").children.map(node => node.textContent), ["All indexed files", "trellis", "src"]);
+  const unknown = harness(); unknown.setResponse(workspaceOnly); await unknown.controller.refresh();
+  assert.equal(unknown.renders[0].options.rootLabel("workspace"), "workspace", "no observed checkout root: keep the exact source set");
+  assert.equal(unknown.renders[0].options.viewport, undefined, "an unmeasured box keeps the natural square layout");
+});
+
+// Resize lifecycle (#425): ResizeObserver and timers are stubs; the renderer models the adapter's
+// owner gate: it paints only if current at completion, and its controls act only while current.
+function resizeHarness() {
+  const observers = [], timers = [], painted = [], held = [];
+  const h = harness({ResizeObserver:class { constructor(callback) { observers.push(callback); } observe() {} },
+    setTimeout:callback => { timers.push(callback); return timers.length; }, clearTimeout:() => {}, getComputedStyle:() => ({})});
+  const adapter = {}; vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/treemap-pele.js"), "utf8"), {window:adapter, TextEncoder});
+  h.window.TrellisTreemapPele.layoutSize = adapter.TrellisTreemapPele.layoutSize;
+  const box = h.get("treemap-diagram");
+  let hold = () => false;
+  h.setRenderer((container, files, options) => {
+    const projection = adapter.TrellisTreemapPele.layoutSize(files.filter(file => file.physicalLines > 0).length, options.viewport);
+    const control = {files, options, projection};
+    const finish = () => { if (!options.isCurrent()) return {status:"stale"}; painted.push(control); return {status:"ready", projection}; };
+    h.renders.push(control);
+    if (!hold(projection)) return Promise.resolve(finish());
+    const gate = deferred(); held.push(gate); return gate.promise.then(finish);
+  });
+  const setBox = (width, height = 600) => { box.offsetWidth = width + 16; box.offsetHeight = height + 16; };
+  // One observer callback, then its debounced relayout.
+  const resize = async (width, height) => { setBox(width, height); observers[0](); const run = timers.pop(); timers.length = 0; await run?.(); };
+  // The adapter's click/keyboard handler: inert unless its owner is current.
+  const click = (control, file) => { if (control.options.isCurrent()) control.options.onSelectFile(file); };
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  return {...h, observers, painted, held, setBox, resize, click, settle, holdWhen:fn => { hold = fn; }};
+}
+const widths = r => r.painted.map(control => control.projection.width);
+
+test("a resize back to the committed size supersedes a pending relayout, so a late stale size cannot repaint (#425)", async () => {
+  const r = resizeHarness(); r.holdWhen(size => size.width === 2000); r.setBox(1000);
+  await r.controller.refresh(); await r.settle();
+  assert.equal(r.observers.length, 1); assert.deepEqual(widths(r), [1000], "layout A committed");
+  const a = r.painted[0], main = a.files.find(file => file.path === "src/main.rs");
+  r.click(a, main);
+  const b = r.resize(2000); await Promise.resolve();
+  assert.equal(r.held.length, 1, "layout B is pending");
+  await r.resize(1000);
+  assert.equal(r.renders.length, 2, "the committed size A is not rendered again");
+  r.held[0].resolve(); await b;
+  assert.deepEqual(widths(r), [1000], "late B cannot replace A");
+  assert.equal(r.get("treemap-state").dataset.state, "ready");
+  assert.equal(r.get("treemap-inspector").hidden, false, "selection survives");
+  assert.equal(a.options.isCurrent(), true, "A stays the interactive owner");
+  await r.resize(1000); assert.equal(r.renders.length, 2, "A stays the committed size");
+  await r.resize(1200); assert.deepEqual(widths(r), [1000, 1200], "a later real change still relayouts");
+});
+
+test("a same-size callback after a completed resize keeps the published SVG interactive (#425)", async () => {
+  const r = resizeHarness(); r.setBox(1000);
+  await r.controller.refresh(); await r.settle();
+  await r.resize(1200, 360); assert.deepEqual(widths(r), [1000, 1200]);
+  const published = r.painted[1], files = published.files;
+  await r.resize(1200, 360);
+  await r.resize(1200.4, 350);
+  assert.equal(r.renders.length, 2, "same size, and a raw change that floors/clamps to it, do not render again");
+  assert.equal(published.options.isCurrent(), true, "the retained SVG still owns its controls");
+  assert.equal(r.painted[0].options.isCurrent(), false, "the replaced SVG stays inert");
+  r.click(published, files.find(file => file.path === "src/main.rs"));
+  assert.equal(r.get("treemap-inspector-title").textContent, "src/main.rs", "click selects through the owner gate");
+  r.click(published, files.find(file => file.path === "src/no-callables.rs"));
+  assert.equal(r.get("treemap-inspector-title").textContent, "src/no-callables.rs", "a second selection also works");
+  r.click(r.painted[0], files.find(file => file.path === "src/main.rs"));
+  assert.equal(r.get("treemap-inspector-title").textContent, "src/no-callables.rs", "the old SVG cannot select");
+});
+
+test("a resize during the initial paint is reconciled once that paint publishes (#425)", async () => {
+  const r = resizeHarness(); let first = true;
+  r.holdWhen(() => { const hold = first; first = false; return hold; }); r.setBox(1000);
+  const loading = r.controller.refresh(); await r.settle();
+  assert.equal(r.held.length, 1, "initial paint is pending");
+  await r.resize(2000);
+  assert.equal(r.renders.length, 1, "no relayout exists before the first paint publishes");
+  r.held[0].resolve(); await loading; await r.settle();
+  assert.deepEqual(widths(r), [1000, 2000], "the current box is painted after the old size publishes");
+  assert.equal(r.painted[1].options.isCurrent(), true); assert.equal(r.painted[0].options.isCurrent(), false);
+  await r.resize(2000); assert.equal(r.renders.length, 2, "and then it is the committed size");
 });

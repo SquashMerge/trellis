@@ -510,6 +510,25 @@ test("server unindexed reasons are plain text, legacy reasons remain, and indexe
   assert.equal(h.run('fileStates.size'), 0);
 });
 
+test("unsupported source type files collapse into one quiet counted marker per folder (#425)", async () => {
+  const h = harness();
+  const unsupported = name => ({...treeFile(name), unindexedReason:'Unsupported source type'});
+  h.context.fetch = async path => response(path.includes('path=docs')
+    ? treePage('docs', [unsupported('docs/guide.md')])
+    : treePage('', [folder('docs'), unsupported('Cargo.toml'), unsupported('<img src=x>.lock'), {...treeFile('a.ts'), unindexedReason:'TypeScript indexing not supported yet'}, treeFile('lib.rs', 'lib.rs')]));
+  await h.run('loadTreeRoot()');
+  await h.run("toggleDirectory('docs')");
+  const markers = descendants(h.get('file-tree')).filter(n => n.className === 'unsupported-files');
+  assert.equal(markers.length, 2, 'one marker per folder');
+  assert.match(text(markers[0]), /1 file · unsupported source type · not indexed/);
+  assert.match(text(markers[1]), /2 files · unsupported source type · not indexed/);
+  assert.match(text(markers[1]), /Cargo\.toml/); assert.match(text(markers[1]), /<img src=x>\.lock/);
+  assert.ok(descendants(h.get('file-tree')).every(n => n.tagName !== 'img'), 'names stay text');
+  const rendered = text(h.get('file-tree'));
+  assert.equal((rendered.match(/Unsupported source type/g) || []).length, 0, 'no per-file unsupported rows');
+  assert.match(rendered, /TypeScript indexing not supported yet/, 'other unindexed reasons keep their own rows');
+});
+
 test("index scope mismatch stays in primary roots and action label, same root adds no warning", async () => {
   const h = harness();
   h.context.fetch = async () => response(treePage('', []));

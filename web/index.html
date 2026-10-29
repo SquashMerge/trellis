@@ -104,7 +104,7 @@
             <ul id="indexed-checkouts" class="plain" aria-label="Indexed checkouts"></ul>
             <p class="detail">Agents can use these indexes through <code>trellis mcp</code>.</p>
           </section>
-          <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><label class="file-hidden-toggle"><input id="show-hidden-files" type="checkbox"/> Show hidden/ignored</label><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
+          <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><label class="file-hidden-toggle"><input id="show-hidden-files" type="checkbox"/> Show hidden/ignored</label><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><div role="group" id="explorer-metric-legend" class="metric-legend explorer-legend" aria-label="Explorer metric legend"></div><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
         <div class="canvas-area">
           <nav id="diagram-tabs" class="view-tabs" aria-label="Workspace views" role="tablist">
             <button id="view-architecture" role="tab" type="button" aria-selected="false" aria-controls="architecture-panel" tabindex="-1">Architecture</button>
@@ -207,7 +207,7 @@
             <p class="treemap-basis">Area: physical file lines · includes inline test lines. Heat: measured callable metrics, not runtime evidence.</p>
             <nav id="treemap-breadcrumbs" aria-label="Treemap directory"></nav>
             <p id="treemap-state" role="status" aria-live="polite">Open Treemap to read indexed file lines and metrics.</p>
-            <div id="treemap-legend" class="metric-legend" aria-label="Treemap heat legend"></div>
+            <div role="group" id="treemap-legend" class="metric-legend" aria-label="Treemap heat legend"></div>
             <div id="treemap-diagram" tabindex="0" aria-label="Lines by folder. Scroll to explore; select a file or directory."></div>
             <details class="treemap-file-list"><summary>Files in this scope · includes empty and tiny files</summary><div id="treemap-files"></div></details>
           </section>

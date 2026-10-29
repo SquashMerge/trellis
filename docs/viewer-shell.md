@@ -69,7 +69,9 @@ The Diagrams Explorer remains live filesystem metadata. Only `indexedPath` joins
 Directory paths must map inside the verified indexed workspace; outside paths, symlinks, nonindexed
 files and ambiguous source-set/language matches have no metric evidence. Expanding a path for
 metrics never reads source, starts indexing or calls a provider. Compacted directory chains inspect
-their terminal displayed directory. Filtering still searches loaded entries only. Files instead
+their terminal displayed directory. Files the server reports as an unsupported source type
+collapse into one quiet marker per folder that keeps their count and names; other unindexed
+reasons keep their own rows. Filtering still searches loaded entries only. Files instead
 uses the pinned indexed-file catalog: its cached source must remain reachable when a live file
 has been deleted. That catalog is not a claim about the current filesystem or Git changed set.
 
@@ -82,7 +84,9 @@ Callable-range LOC/SLOC may overlap and are not production physical file lines. 
 `roleCounts` describe all measured production/test callables at the pin, not physical line coverage.
 
 Heat uses the shared [fixed per-callable bands](metrics.md#workbench-heat-395) by default,
-including in the explorer beside Sequence. Max and mean use the same bands; sum is neutral
+including in the explorer. Explorer rows show a swatch and number; whenever they do, an explorer
+legend names their metric, aggregate and population and states the bands, in every Diagrams view.
+Max and mean use the same bands; sum is neutral
 and labelled relative totals. **Relative**, off by default, explicitly uses quartiles of the
 currently displayed finite file/directory rows after loaded-entry filtering, expansion and
 pagination. The legend always names the scale. Maintainability reverses severity, not values.

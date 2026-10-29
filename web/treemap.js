@@ -19,12 +19,13 @@
   function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, navigationSerial = 0, view = null, basis = null, selectedKey = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, hideTests = true, path = "", language = "", scope = null;
+    let relayout = null, resizeTimer = null;
     const population = () => role === "all" ? "all indexed callables" : "production callables";
     const state = (message, kind = "ready") => { get("treemap-state").textContent = message; get("treemap-state").dataset.state = kind; };
     const paragraph = (target, message) => target.append(make("p", message));
     function capture() {
       const c = context();
-      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial};
+      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), workspaceRoot:c.workspaceRoot, aggregate, role, serial};
     }
     function current(c) {
       const now = context();
@@ -32,6 +33,19 @@
         !!c.pin && window.TrellisIndexPin.equal(c.pin, now.pin);
     }
     const usable = () => !!view && current(basis);
+    // The observed checkout directory names the root, and only when one source set owns every indexed file.
+    function rootLabel(sourceSetId) {
+      const name = typeof basis?.workspaceRoot === "string" ? basis.workspaceRoot.split("/").filter(Boolean).at(-1) : "";
+      return name && view && view.files.every(file => file.sourceSetId === sourceSetId) ? name : sourceSetId;
+    }
+    // The diagram box's own content size, less Pele's 8 px padding on each side; unknown while hidden.
+    function viewport() {
+      const node = get("treemap-diagram");
+      if (!node?.offsetWidth || !node.offsetHeight || typeof getComputedStyle !== "function") return undefined;
+      const style = getComputedStyle(node), px = (...names) => names.reduce((sum, name) => sum + (parseFloat(style[name]) || 0), 0);
+      return {width:node.offsetWidth - px("paddingLeft", "paddingRight", "borderLeftWidth", "borderRightWidth") - 16,
+        height:node.offsetHeight - px("paddingTop", "paddingBottom", "borderTopWidth", "borderBottomWidth") - 16};
+    }
     function markSelection() {
       window.TrellisTreemapPele?.select?.(get("treemap-diagram"), selectedKey);
       for (const node of get("treemap-files").querySelectorAll("[data-trellis-file-id]")) {
@@ -43,7 +57,7 @@
       window.TrellisShell?.clearTreemapInspector(); markSelection();
     }
     function reset(message = "Open Treemap to read the indexed snapshot.") {
-      serial++; renderSerial++; clearInspection(); view = null; basis = null;
+      serial++; renderSerial++; relayout = null; clearInspection(); view = null; basis = null;
       for (const id of ["treemap-diagram", "treemap-files", "treemap-legend", "treemap-breadcrumbs"]) get(id).replaceChildren();
       get("treemap-diagram").setAttribute("aria-busy", "false"); state(message, "empty");
     }
@@ -80,7 +94,7 @@
       };
       crumb("All indexed files", null);
       if (!scope) return;
-      crumb(scope.sourceSetId, {sourceSetId:scope.sourceSetId, path:""});
+      crumb(rootLabel(scope.sourceSetId), {sourceSetId:scope.sourceSetId, path:""});
       const parts = scope.path ? scope.path.split("/") : [];
       parts.forEach((part, index) => crumb(part, {sourceSetId:scope.sourceSetId, path:parts.slice(0, index + 1).join("/")}));
     }
@@ -127,7 +141,7 @@
     async function render(select = null) {
       if (!usable()) return;
       const payload = view, c = basis, ticket = ++renderSerial;
-      let ready = false;
+      let ready = false; relayout = null;
       const active = () => current(c) && view === payload && ticket === renderSerial;
       const interactive = () => active() && ready;
       clearInspection(); get("treemap-diagram").replaceChildren(); get("treemap-files").replaceChildren();
@@ -138,18 +152,45 @@
       try {
         if (files.some(file => file.physicalLines > 0)) {
           if (!window.TrellisTreemapPele) throw new Error("Treemap renderer unavailable. Nothing displayed.");
-          const outcome = await window.TrellisTreemapPele.render(get("treemap-diagram"), files, {
-            metric, aggregate, selectedKey:select, isCurrent:active,
-            fileValue:file => metric === "role" ? undefined : metricValue(file.metrics, metric),
-            fileBand:file => metric === "role" ? classification(file) : scale.band(metricValue(file.metrics, metric)),
-            onSelectFile:file => { if (interactive() && files.includes(file)) inspect(file, interactive); },
-            onSelectDirectory:directory => {
-              if (!interactive() || !directory || !files.some(file => file.sourceSetId === directory.sourceSetId && (!directory.path || file.path.startsWith(directory.path + "/")))) return;
-              navigationSerial++; scope = {sourceSetId:directory.sourceSetId, path:directory.path}; return render();
-            },
-          });
-          if (!active()) return;
+          // Each paint owns its SVG while it is the pending request or the published one. Cancelling a
+          // pending paint never touches the published owner, so a kept SVG stays interactive.
+          let paints = 0, requested = 0, published = 0;
+          const paint = selectedKey => {
+            const id = requested = ++paints;
+            const owner = () => active() && (id === requested || id === published);
+            return window.TrellisTreemapPele.render(get("treemap-diagram"), files, {
+              metric, aggregate, selectedKey, isCurrent:owner, viewport:viewport(), rootLabel,
+              fileValue:file => metric === "role" ? undefined : metricValue(file.metrics, metric),
+              fileBand:file => metric === "role" ? classification(file) : scale.band(metricValue(file.metrics, metric)),
+              onSelectFile:file => { if (interactive() && files.includes(file)) inspect(file, interactive); },
+              onSelectDirectory:directory => {
+                if (!interactive() || !directory || !files.some(file => file.sourceSetId === directory.sourceSetId && (!directory.path || file.path.startsWith(directory.path + "/")))) return;
+                navigationSerial++; scope = {sourceSetId:directory.sourceSetId, path:directory.path}; return render();
+              },
+            }).then(result => ({id, result}));
+          };
+          const first = await paint(select), outcome = first.result;
+          if (!active() || first.id !== requested) return;
           if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Treemap mapping failed. Nothing displayed.");
+          published = first.id; requested = 0;
+          // Resizes relayout the same admitted files; only a changed layout size renders again.
+          let laidOut = outcome.projection;
+          const area = files.filter(file => file.physicalLines > 0).length;
+          relayout = async () => {
+            // A newer desired size cancels any pending paint, even when it is the published size again.
+            requested = 0;
+            const next = interactive() && laidOut ? viewport() : undefined;
+            if (!next) return;
+            const size = window.TrellisTreemapPele.layoutSize(area, next);
+            if (size.width === laidOut.width && size.height === laidOut.height) return;
+            const {id, result} = await paint(selectedKey);
+            if (!interactive() || id !== requested) return;
+            requested = 0;
+            if (result?.status === "ready") { published = id; laidOut = result.projection; markSelection(); return; }
+            ready = false; relayout = null; clearInspection();
+            for (const id of ["treemap-files", "treemap-legend"]) get(id).replaceChildren();
+            state(result?.error?.message || "Treemap rendering failed. Nothing displayed.", "error");
+          };
         }
         if (!active()) return;
         ready = true;
@@ -162,6 +203,8 @@
         const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.";
         state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
+        // Resizes during the first paint had no relayout to call; reconcile with the box once.
+        void relayout?.();
       } catch (error) {
         if (!active()) return;
         ready = false; clearInspection();
@@ -199,6 +242,10 @@
       scope = {sourceSetId:selected.sourceSetId, path:selected.path.includes("/") ? selected.path.slice(0, selected.path.lastIndexOf("/")) : ""};
       if (testFile(selected)) { hideTests = false; get("treemap-hide-tests").checked = false; }
       await render(identity(selected)); return navigation === navigationSerial && current(c) && selectedKey === identity(selected);
+    }
+    if (typeof ResizeObserver === "function") {
+      // One trailing relayout per burst of resizes; a newer one supersedes an older one.
+      new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => relayout?.(), 120); }).observe(get("treemap-diagram"));
     }
     get("treemap-relative").checked = false;
     get("treemap-relative").addEventListener("change", event => { relative = event.target.checked; return render(); });

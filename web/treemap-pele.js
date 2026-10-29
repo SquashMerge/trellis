@@ -7,6 +7,7 @@
   const colors = ["#343644","#FFC20A","#FFAA10","#FF7A00"];
   const classifications = {production:"#ABA5FF",mixed:"#FFAA10",test:"#85C7FF",none:"#343644"};
   const selections = new WeakMap();
+  const MIN_WIDTH = 640, MIN_HEIGHT = 360;
   const identity = file => JSON.stringify([file.sourceSetId,file.language,file.path]);
   const directoryKey = directory => JSON.stringify([directory.sourceSetId,directory.path]);
   const bytes = value => new TextEncoder().encode(value).length;
@@ -60,16 +61,16 @@
       }
     }
     const source = ["treemap-beta"]; let sourceBytes = bytes("treemap-beta\n");
-    // 100 px per sqrt(file count), at least 640 px and at most 4000 px.
-    // Pele's nodeWidth/nodeHeight units are ten pixels. No viewport rescaling.
-    const size = Math.min(4000,Math.max(640,Math.ceil(Math.sqrt(files.length-zeroArea.length)*100)));
+    const {width,height} = layoutSize(files.length-zeroArea.length,options.viewport);
     const roots = [...directories.values()].filter(item => !item.record.path).sort((a,b) => compare(a.key,b.key));
     const stack = roots.slice().reverse().map(item => ({item,depth:0}));
     while (stack.length) {
       const {item,depth} = stack.pop();
       if (item.kind === "directory") {
-        item.label = `${item.record.path ? item.record.path.slice(item.record.path.lastIndexOf("/")+1) : item.record.sourceSetId} · ${item.total} lines`;
-        item.full = `${item.record.sourceSetId} · ${item.record.path || "/"} · ${item.total} physical file lines`;
+        // The root shows the caller's observed checkout name; the exact source set stays in the full label.
+        const root = item.record.path ? "" : rootName(item.record.sourceSetId,options);
+        item.label = `${item.record.path ? item.record.path.slice(item.record.path.lastIndexOf("/")+1) : root} · ${item.total} lines`;
+        item.full = `${root && root !== item.record.sourceSetId ? root+" · " : ""}${item.record.sourceSetId} · ${item.record.path || "/"} · ${item.total} physical file lines`;
       }
       const line = `${"  ".repeat(depth)}"${item.id}"${item.kind === "file" ? `: ${item.total}` : ""}`;
       sourceBytes += bytes(line)+1;
@@ -83,7 +84,23 @@
     }
     const text = source.join("\n")+"\n";
     if (bytes(text) > 512*1024) unsupported("Treemap Mermaid source too large");
-    return {source:text,nodes,files:ordered,zeroArea,total,config:{treemap:{nodeWidth:size/10,nodeHeight:size/10,showValues:false}},size};
+    return {source:text,nodes,files:ordered,zeroArea,total,config:{treemap:{nodeWidth:width/10,nodeHeight:height/10,showValues:false}},width,height,size:Math.max(width,height)};
+  }
+  function rootName(sourceSetId,options) {
+    const name = options.rootLabel?.(sourceSetId);
+    return typeof name === "string" && name ? name : sourceSetId;
+  }
+  // Without a measured viewport: 100 px per sqrt(file count), 640–4000 px square.
+  // With one: the panel's own size, grown in its aspect ratio only when it gives a
+  // file less than 50×50 px on average, and never beyond 4000 px per side. Pele's
+  // nodeWidth/nodeHeight units are ten pixels.
+  function layoutSize(count,viewport) {
+    const natural = Math.min(4000,Math.max(640,Math.ceil(Math.sqrt(count)*100)));
+    if (!viewport || !Number.isFinite(viewport.width) || !Number.isFinite(viewport.height)) return {width:natural,height:natural};
+    let width = Math.max(MIN_WIDTH,Math.floor(viewport.width)), height = Math.max(MIN_HEIGHT,Math.floor(viewport.height));
+    const needed = count*2500;
+    if (width*height < needed) { const scale = Math.sqrt(needed/(width*height)); width = Math.ceil(width*scale); height = Math.ceil(height*scale); }
+    return {width:Math.min(4000,width),height:Math.min(4000,height)};
   }
   function validatedSvg(raw, projection) {
     if (typeof raw !== "string" || bytes(raw) > 8*1024*1024) unsupported("Treemap SVG too large");
@@ -102,8 +119,8 @@
       if (++count > 12000 || node.namespaceURI !== NS || !tags.has(node.localName)) unsupported("Unexpected Treemap SVG element");
       for (const attr of node.attributes) if (!attrs.has(attr.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(attr.value)) unsupported("Unexpected Treemap SVG attribute");
     }
-    const dimension = projection.size+16;
-    if (root.getAttribute("class") !== "pele pele-treemap" || root.getAttribute("width") !== String(dimension) || root.getAttribute("height") !== String(dimension) || root.getAttribute("viewBox") !== `0 0 ${dimension} ${dimension}`) unsupported("Changed Treemap viewport");
+    const outerWidth = projection.width+16, outerHeight = projection.height+16;
+    if (root.getAttribute("class") !== "pele pele-treemap" || root.getAttribute("width") !== String(outerWidth) || root.getAttribute("height") !== String(outerHeight) || root.getAttribute("viewBox") !== `0 0 ${outerWidth} ${outerHeight}`) unsupported("Changed Treemap viewport");
     const controls = new Map();
     let sections = 0, leaves = 0;
     for (const group of root.children) {
@@ -121,7 +138,7 @@
         if (title && title.textContent !== id) unsupported("Changed Treemap title placeholder");
         if (label && !(label.textContent === id || (label.textContent.endsWith("…") && label.textContent.length > 1 && id.startsWith(label.textContent.slice(0,-1))))) unsupported("Changed Treemap label placeholder");
         const geometry = Object.fromEntries(["x","y","width","height"].map(key => [key,Number(rect.getAttribute(key))]));
-        if (!["x","y","width","height"].every(key => rect.hasAttribute(key) && Number.isFinite(geometry[key]) && geometry[key] >= 0) || geometry.x+geometry.width > dimension || geometry.y+geometry.height > dimension) unsupported("Invalid Treemap geometry");
+        if (!["x","y","width","height"].every(key => rect.hasAttribute(key) && Number.isFinite(geometry[key]) && geometry[key] >= 0) || geometry.x+geometry.width > outerWidth || geometry.y+geometry.height > outerHeight) unsupported("Invalid Treemap geometry");
         if (label) {
           const fontSize = Number(label.getAttribute("font-size") || (section ? 12 : 14));
           const x = Number(label.getAttribute("x")), y = Number(label.getAttribute("y"));
@@ -202,5 +219,5 @@
       return {status:"error",error};
     }
   }
-  window.TrellisTreemapPele = {project,validatedSvg,render,select,identity,directoryKey};
+  window.TrellisTreemapPele = {project,validatedSvg,render,select,identity,directoryKey,layoutSize};
 })();
