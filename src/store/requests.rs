@@ -462,15 +462,61 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionOutcome {
     Done(IndexPin),
-    Failed(&'static str),
+    Failed(String),
 }
+
+const SEMANTIC_IMPORT_CLASSES: [&str; 8] = [
+    "invalid_request",
+    "invalid_artifact",
+    "limit_exceeded",
+    "capture_unavailable",
+    "stale_basis",
+    "revision_conflict",
+    "root_changed",
+    "index_failed",
+];
+
+fn stable_reason(reason: &str) -> bool {
+    let bytes = reason.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[0].is_ascii_lowercase() | bytes[0].is_ascii_digit()
+        && bytes.iter().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b' ' | b'.' | b'_' | b'/' | b'-')
+        })
+}
+
+/// Classifies the top-level message of a failed semantic import as `<class>` or
+/// `<class>: <reason>`. The class comes from a closed list and the reason survives only when it
+/// is a short stable phrase; any other message is `index_failed`.
+pub fn semantic_import_code(message: &str) -> String {
+    for class in SEMANTIC_IMPORT_CLASSES {
+        let Some(rest) = message.strip_prefix(class) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return class.to_owned();
+        }
+        if let Some(reason) = rest.strip_prefix(": ") {
+            return if stable_reason(reason) {
+                format!("{class}: {reason}")
+            } else {
+                class.to_owned()
+            };
+        }
+    }
+    "index_failed".to_owned()
+}
+
 impl CompletionOutcome {
-    fn from_result(result: Result<IndexPin>) -> Result<Self> {
+    fn from_result(kind: RequestKind, result: Result<IndexPin>) -> Result<Self> {
         Ok(match result {
             Ok(pin) => Self::Done(pin),
             Err(error) if super::nonterminal_storage_busy(&error) => return Err(error),
             Err(error) if error.to_string().starts_with("revision conflict") => {
-                Self::Failed("revision_conflict")
+                Self::Failed("revision_conflict".to_owned())
             }
             Err(error) => {
                 // A terminal row intentionally retains only a stable error code.
@@ -480,7 +526,12 @@ impl CompletionOutcome {
                     use std::io::Write;
                     let _ = writeln!(std::io::stderr(), "index-phase request_failure={error:#}");
                 }
-                Self::Failed("index_failed")
+                match kind {
+                    RequestKind::Index => Self::Failed("index_failed".to_owned()),
+                    RequestKind::SemanticImport => {
+                        Self::Failed(semantic_import_code(&error.to_string()))
+                    }
+                }
             }
         })
     }
@@ -491,7 +542,7 @@ impl CompletionOutcome {
             }
             Self::Failed(code) => {
                 row.state == "failed"
-                    && row.error_code.as_deref() == Some(*code)
+                    && row.error_code.as_deref() == Some(code.as_str())
                     && row.revision.is_none()
             }
         }
@@ -1880,7 +1931,7 @@ impl Store {
             ensure!(slot.is_none(), "storage_busy: unresolved FIFO completion");
             *slot = Some(PendingCompletion {
                 request: request.clone(),
-                outcome: CompletionOutcome::from_result(result)?,
+                outcome: CompletionOutcome::from_result(request.request_kind, result)?,
                 incarnation: session.incarnation().to_string(),
             });
         }
@@ -2031,7 +2082,11 @@ impl Store {
         request: &Request,
         result: Result<IndexPin>,
     ) -> Result<()> {
-        self.finish_request_outcome(session, request, &CompletionOutcome::from_result(result)?)
+        self.finish_request_outcome(
+            session,
+            request,
+            &CompletionOutcome::from_result(request.request_kind, result)?,
+        )
     }
     fn finish_request_outcome(
         &self,
@@ -2067,7 +2122,7 @@ impl Store {
                 Some(pin.index_revision as i64),
                 None,
             ),
-            CompletionOutcome::Failed(code) => (None, None, Some(*code)),
+            CompletionOutcome::Failed(code) => (None, None, Some(code.as_str())),
         };
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
@@ -2131,6 +2186,9 @@ mod recovery_blocked_tests;
 
 #[cfg(test)]
 mod stale_claim_tests;
+
+#[cfg(test)]
+mod typed_code_tests;
 
 #[cfg(test)]
 mod root_failure_tests;
