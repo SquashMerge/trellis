@@ -5,6 +5,7 @@ use super::TestTerminalNotify;
 use crate::{
     indexer::{IndexOptions, ReconcileOptions},
     model::IndexPin,
+    semantic_batch::descriptor::GenerationOrigin,
     store::topology::{UseGuard, WriterSession},
 };
 use anyhow::{Result, ensure};
@@ -417,6 +418,56 @@ pub struct SemanticImportOptions {
     pub descriptor_sha256: String,
 }
 
+/// The persisted options of a Trellis-written import. Only
+/// `Store::enqueue_generated_semantic_import` writes this shape, so an external caller can
+/// neither name a generation nor reach the generated input root.
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GeneratedImportOptions {
+    pub version: u8,
+    pub descriptor: String,
+    pub descriptor_sha256: String,
+    pub origin: GenerationOrigin,
+    pub generation_id: String,
+}
+
+/// A queued semantic import: submitted by the external operation or written by Trellis.
+#[derive(Clone, Debug)]
+pub enum SemanticImportJob {
+    External(SemanticImportOptions),
+    Generated(GeneratedImportOptions),
+}
+
+impl SemanticImportJob {
+    pub fn descriptor(&self) -> &str {
+        match self {
+            Self::External(options) => &options.descriptor,
+            Self::Generated(options) => &options.descriptor,
+        }
+    }
+
+    pub fn descriptor_sha256(&self) -> &str {
+        match self {
+            Self::External(options) => &options.descriptor_sha256,
+            Self::Generated(options) => &options.descriptor_sha256,
+        }
+    }
+}
+
+fn lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn generation_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Upper bound on the encoded options of one queued request, semantic or native.
 pub const MAX_SEMANTIC_OPTIONS_BYTES: usize = 4096;
 
@@ -571,6 +622,28 @@ impl Request {
             "invalid_request: semantic import options"
         );
         Ok(options)
+    }
+
+    /// The semantic job of this request: the external options type first, then the generated
+    /// one. Both are closed, so a row of one shape never parses as the other.
+    pub fn semantic_job(&self) -> Result<SemanticImportJob> {
+        match self.semantic_options() {
+            Ok(options) => Ok(SemanticImportJob::External(options)),
+            Err(error) => {
+                if self.request_kind != RequestKind::SemanticImport
+                    || self.options_json.len() > MAX_SEMANTIC_OPTIONS_BYTES
+                {
+                    return Err(error);
+                }
+                let options: GeneratedImportOptions = serde_json::from_str(&self.options_json)
+                    .map_err(|_| anyhow::anyhow!("invalid_request: semantic import options"))?;
+                ensure!(
+                    options.version == 2 && generation_id(&options.generation_id),
+                    "invalid_request: semantic import options"
+                );
+                Ok(SemanticImportJob::Generated(options))
+            }
+        }
     }
 
     pub fn options(&self, root: &Path) -> Result<IndexOptions> {
@@ -1306,6 +1379,56 @@ impl Store {
             || {},
             || {},
         )
+    }
+
+    /// Accept a Trellis-written import. Only the daemon-internal producer import path calls
+    /// this; the batch is read from the generation's private directory, never the workspace.
+    pub fn enqueue_generated_semantic_import(
+        &self,
+        root: &Path,
+        options: &GeneratedImportOptions,
+    ) -> Result<Request> {
+        ensure!(
+            options.version == 2
+                && lowercase_sha256(&options.descriptor_sha256)
+                && generation_id(&options.generation_id),
+            "invalid_request: semantic import options"
+        );
+        let dir = self.producer_generation_dir(options.origin, &options.generation_id)?;
+        crate::scip_admission::validate_selected_role(&dir, Path::new(&options.descriptor))
+            .map_err(|error| anyhow::anyhow!("invalid_request: {}", error.detail()))?;
+        self.enqueue_typed_request(
+            root,
+            options,
+            RequestKind::SemanticImport,
+            None,
+            || {},
+            || {},
+        )
+    }
+
+    /// The generations named by queued or running Trellis-written imports of this checkout.
+    pub fn pending_generation_ids(&self) -> Result<Vec<(GenerationOrigin, String)>> {
+        let Some((_guard, db)) = self.existing_request_connection()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = db.prepare(&format!(
+            "SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND request_kind='semanticImport' AND root_device=?1 AND root_inode=?2 ORDER BY seq"
+        ))?;
+        let rows = statement.query_map(
+            params![
+                self.identity.device.to_string(),
+                self.identity.inode.to_string()
+            ],
+            read,
+        )?;
+        let mut pending = Vec::new();
+        for row in rows {
+            if let Ok(SemanticImportJob::Generated(options)) = row?.semantic_job() {
+                pending.push((options.origin, options.generation_id));
+            }
+        }
+        Ok(pending)
     }
 
     /// Queues `options` verbatim as a semantic import row, skipping option validation, so a test

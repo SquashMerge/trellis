@@ -5,8 +5,8 @@
 use super::{
     AdmittedBatch, BatchCounters, BatchLimits,
     descriptor::{
-        ArtifactEntry, Descriptor, Disposition, PageEntry, PageKind, RowOrder,
-        SourceManifestHasher, SourceRow, check_page_bytes, parse_page,
+        ArtifactEntry, Descriptor, Disposition, GenerationOrigin, ImportOrigin, PageEntry,
+        PageKind, RowOrder, SourceManifestHasher, SourceRow, check_page_bytes, parse_page,
     },
     limits::STAGE_CHECK_COPIED_BYTES,
     staging::{Stage, StageBudget, StageClaimSink, artifact_file, lookup_assigned},
@@ -15,14 +15,19 @@ use crate::{
     index_coordinator::{CopiedInput, copy_semantic_input_to_stage, open_semantic_input},
     model::{CancelFlag, IndexPin},
     native_evidence as native,
-    scip_admission::{PinnedProducer, admission, order},
+    scip_admission::{PinnedProducer, admission, file_uri, order},
     scip_raw::{self, AuthenticatedArtifact, DocumentSource, ScipCaptureError, decode_streaming},
     store::{InventoryStream, NativeReader, Store},
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::de::DeserializeOwned;
-use std::{borrow::Cow, io::Read, path::Path, sync::atomic::Ordering};
+use std::{
+    borrow::Cow,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+};
 
 /// Who owns the stage: the claimed request and its claim incarnation.
 #[derive(Debug, Clone, Copy)]
@@ -475,12 +480,56 @@ impl NativeSource for ReaderSource<'_, '_> {
     }
 }
 
+/// Where a batch is read from and which project-root spellings its header may bind to.
+#[derive(Debug, Clone)]
+pub struct StageInput {
+    /// The directory the descriptor, pages and artifacts are read under.
+    pub input_root: PathBuf,
+    pub project_roots: Vec<String>,
+    pub origin: ImportOrigin,
+    pub generation_id: Option<String>,
+}
+
+impl StageInput {
+    /// An external import: the workspace is the input root and `file://<workspace>` the only
+    /// project root.
+    pub fn external(workspace: &Path) -> std::result::Result<Self, ScipCaptureError> {
+        Ok(Self {
+            input_root: workspace.to_owned(),
+            project_roots: vec![file_uri(workspace)?],
+            origin: ImportOrigin::External,
+            generation_id: None,
+        })
+    }
+
+    /// A Trellis-written batch read from its private generation directory. A pickup binds to
+    /// the workspace; a run binds to its controlled worktree under the run directory.
+    pub fn generated(
+        workspace: &Path,
+        origin: GenerationOrigin,
+        generation_id: &str,
+        generation_dir: &Path,
+    ) -> std::result::Result<Self, ScipCaptureError> {
+        let bare = match origin {
+            GenerationOrigin::OwnerPickup => file_uri(workspace)?,
+            GenerationOrigin::TrellisRun => format!("{}/worktree", file_uri(generation_dir)?),
+        };
+        Ok(Self {
+            input_root: generation_dir.to_owned(),
+            project_roots: vec![bare.clone(), format!("{bare}/")],
+            origin: origin.into(),
+            generation_id: Some(generation_id.to_owned()),
+        })
+    }
+}
+
 /// Admits the batch named by `descriptor_path` into a new stage. The descriptor and every
-/// page and artifact are read under `root`; the captured revision is read from the store.
+/// page and artifact are read under the input root; the captured revision is read from the
+/// store.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_batch(
     store: &Store,
-    root: &Path,
+    input: &StageInput,
     owner: StageOwner<'_>,
     descriptor_path: &Path,
     descriptor_sha256: &str,
@@ -491,6 +540,7 @@ pub fn stage_batch(
     #[cfg(feature = "test-support")]
     super::testing::reset_whole_snapshot_reads();
     check_cancel(cancel)?;
+    let root = input.input_root.as_path();
     let (file, len) = open_semantic_input(root, descriptor_path)?;
     if len > limits.descriptor_bytes {
         return Err(ScipCaptureError::LimitExceeded("descriptor bytes".into()).into());
@@ -498,6 +548,7 @@ pub fn stage_batch(
     let mut bytes = Vec::with_capacity(len as usize);
     file.take(len + 1).read_to_end(&mut bytes)?;
     let descriptor = Descriptor::parse_admitted(&bytes, descriptor_sha256, limits)?;
+    descriptor.check_origin(input.origin, input.generation_id.as_deref())?;
     let producer = descriptor.check_producer()?;
     let captured: IndexPin = store
         .retained_native_pin_for(&descriptor.source_revision, &descriptor.source_set.id)
@@ -510,7 +561,7 @@ pub fn stage_batch(
         })?;
     store.with_native_reader(captured, |reader| {
         let header = reader.header()?;
-        Ok(descriptor.bind_header(root, &header.source_set, &header.revision)?)
+        Ok(descriptor.bind_header(&input.project_roots, &header.source_set, &header.revision)?)
     })?;
     descriptor.check_pages(limits)?;
     descriptor.check_artifacts(limits)?;

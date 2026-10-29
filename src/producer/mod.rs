@@ -4,8 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod batch;
 pub mod detect;
 pub mod exec;
+pub mod import;
+pub mod pickup;
 pub mod plan;
 pub mod process_info;
 pub mod profiles;
@@ -13,7 +16,11 @@ pub mod state;
 pub mod worktree;
 
 #[cfg(test)]
+mod batch_tests;
+#[cfg(test)]
 mod detect_tests;
+#[cfg(test)]
+mod pickup_tests;
 #[cfg(test)]
 mod plan_tests;
 #[cfg(test)]
@@ -35,6 +42,8 @@ pub const INDEX_NOT_READY: &str = "index_not_ready";
 pub const CAPTURE_UNAVAILABLE: &str = "capture_unavailable";
 pub const INVALID_REQUEST: &str = "invalid_request";
 pub const ROOT_CHANGED: &str = "root_changed";
+/// A producer artifact that cannot be turned into a batch.
+pub const PRODUCER_OUTPUT_INVALID: &str = "producer_output_invalid";
 pub const PRODUCER_STATE_CORRUPT: &str = "producer_state_corrupt";
 /// Refusal for producer state that is symlinked, foreign or not private.
 pub const UNSAFE_STATE: &str = "invalid_request: unsafe producer state";
