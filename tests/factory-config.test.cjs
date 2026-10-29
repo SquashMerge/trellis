@@ -190,47 +190,12 @@ fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
   try {
+    // This test checks orchestration only; the real suites run once in verify.
     for (const name of ["cargo", "node", "python3"]) {
       const command = join(fakeDir, name);
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
     }
-    // The #40 smoke needs the real trellis binary, which the fake cargo never
-    // builds. Skip only that script; every other python3 call runs for real.
-    const realPython = spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
-    const pythonShim = join(fakeDir, "python3");
-    writeFileSync(pythonShim, `#!/bin/sh
-case "$1" in
-  tools/verify-40-query-performance.py)
-    line="python3"
-    for arg in "$@"; do line="$line$(printf '\\t')$arg"; done
-    printf '%s\\n' "$line" >> "$FAKE_VERIFY_LOG"
-    exit 0 ;;
-esac
-exec "${realPython}" "$@"
-`);
-    chmodSync(pythonShim, 0o755);
-    // The real python checks (#61 gate, semantic-contract unittests) generate
-    // cohorts through the real node and read its version. Those calls run for
-    // real and unlogged, like the python3 calls above.
-    const realNode = spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8" }).stdout.trim();
-    const nodeShim = join(fakeDir, "node");
-    writeFileSync(nodeShim, `#!/bin/sh
-case "$1" in
-  -v|tools/synthetic-cohorts/generate.mjs|*/tools/synthetic-cohorts/generate.mjs)
-    exec "${realNode}" "$@" ;;
-esac
-${fakeTool.replace("#!/bin/sh\n", "")}`);
-    chmodSync(nodeShim, 0o755);
-    // The gate tests also record the toolchain version with `cargo -V`.
-    const realCargo = spawnSync("sh", ["-c", "command -v cargo"], { encoding: "utf8" }).stdout.trim();
-    const cargoShim = join(fakeDir, "cargo");
-    writeFileSync(cargoShim, `#!/bin/sh
-case "$1" in
-  -V) exec "${realCargo}" "$@" ;;
-esac
-${fakeTool.replace("#!/bin/sh\n", "")}`);
-    chmodSync(cargoShim, 0o755);
     function runVerify(extraEnv = {}, timeout = undefined) {
       const result = spawnSync(config.verify, [], {
         cwd: ROOT,
@@ -247,7 +212,7 @@ ${fakeTool.replace("#!/bin/sh\n", "")}`);
         },
       });
       const commands = readFileSync(log, "utf8").trimEnd().split("\n").map((line) => line.split("\t"));
-      return { result, commands };
+      return { result, commands, output: result.stdout + result.stderr };
     }
     // Lanes run concurrently; commands within a lane keep this order.
     const lanes = {
@@ -268,6 +233,12 @@ ${fakeTool.replace("#!/bin/sh\n", "")}`);
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
       checks: [
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
+        ["python3", "tools/stage3-watcher-runner-test.py"],
+        ["python3", "tools/verify-67-mixed-performance-test.py"],
+        ["python3", "tools/verify-40-query-performance-test.py"],
+        ["python3", "tools/verify-61-combined-gate-test.py"],
+        ["python3", "-m", "unittest", "discover", "-s", "tools/semantic-contract/test", "-p", "test_*.py"],
+        ["python3", "-m", "unittest", "discover", "-s", "tools/release", "-p", "test_*.py"],
         ["node", "--test", "tests/factory-config.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
@@ -288,14 +259,14 @@ ${fakeTool.replace("#!/bin/sh\n", "")}`);
     assert.deepEqual(setupFailure.commands, lanes.setup, "failed setup must not start other lanes");
     rmSync(log);
     const success = runVerify();
-    assert.equal(success.result.status, 0, success.result.stderr);
+    assert.equal(success.result.status, 0, success.output);
     assertRan(success.commands, lanes);
     rmSync(log);
     // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages install in the
     // background and the browser suite runs only after it succeeds (#244).
     const deps = ["node", "tests/browser/node_modules/playwright/cli.js", "install-deps", "chromium"];
     const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
-    assert.equal(withDeps.result.status, 0, withDeps.result.stderr);
+    assert.equal(withDeps.result.status, 0, withDeps.output);
     assertRan(withDeps.commands, { ...lanes, deps: [deps] });
     assert.match(withDeps.result.stdout, /^verify: Chromium system package install finished in \d+ s \(exit 0\)/m);
     rmSync(log);
