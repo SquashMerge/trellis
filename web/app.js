@@ -379,10 +379,16 @@ function clearSource() {
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
 function showSelectedGit(git) {
   selectedGit = git || null;
+  if (selectedGit?.state !== "available") {
+    filesGitStatus = null; filesDiffSerial++; filesDiff = null;
+    $("files-diff")?.replaceChildren();
+  }
   const row = checkouts.find(row => row.rootKey === selectedRootKey);
   if (row) row.git = selectedGit;
   updateCheckoutOptions();
+  renderCheckoutList();
   updateFilesBasis();
+  if (treeMode || files.length || filesCatalogLoaded) renderFiles();
   window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
   if (!status) window.TrellisShell?.updateWorkspace(null);
 }
@@ -391,9 +397,9 @@ async function refreshGit() {
   filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
   try {
     const data = await api("/api/git");
-    if (serial === gitSerial && session === epoch && root === selectedRootKey) { filesGitStatus = data; showSelectedGit(data?.git); updateFilesBasis(); if (section === "files") renderFiles(); }
+    if (serial === gitSerial && session === epoch && root === selectedRootKey) { filesGitStatus = data; showSelectedGit(data?.git); }
   } catch (error) {
-    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") { filesGitStatus = null; showSelectedGit(null); updateFilesBasis(); }
+    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") { filesGitStatus = null; showSelectedGit(null); }
   }
 }
 async function refreshStatus(followup = false) {
@@ -414,6 +420,7 @@ async function refreshStatus(followup = false) {
       resetCheckout();
       selectedRootKey = root; selectedWorkspaceRoot = listedRoot; indexNotReady = true;
       showSelectedGit(git);
+      void refreshGit();
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
       $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
@@ -668,6 +675,7 @@ async function loadCheckouts() {
       checkoutBusy = true;
       $("checkout-root").textContent = verifiedRoot;
     }
+    if (sameRoot && gitAtStart !== gitSerial) selected.git = selectedGit;
     checkouts = next;
     renderCheckoutList();
     if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
@@ -681,7 +689,11 @@ async function loadCheckouts() {
       option.disabled = !selectable(row); select.append(option);
     }
     select.value = choice;
-    if (choice && !busy && gitAtStart === gitSerial) { gitSerial++; showSelectedGit(selected.git); }
+    if (choice && !busy && gitAtStart === gitSerial) {
+      gitSerial++; filesGitStatus = null; showSelectedGit(selected.git);
+      if (section === "files" && filesFile && filesBasis === "working") void setFilesBasis("working");
+      else void refreshGit();
+    }
     select.disabled = !checkouts.some(selectable);
     $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
@@ -729,6 +741,7 @@ async function selectCheckout(key) {
   $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
   window.TrellisShell?.setConnected(true);
   const session = epoch;
+  void refreshGit();
   try {
     await refreshStatus();
     if (session !== epoch) return;
@@ -1197,11 +1210,17 @@ async function setFilesBasis(basis) {
     const data = await api(`/api/git/diff?path=${encodeURIComponent(path)}`, "GET", undefined, current);
     if (!current()) return;
     if (data.file && data.file.path !== path) throw new Error("Git diff path changed. Refresh to measure again.");
-    filesDiff = data; showSelectedGit(data.git); window.TrellisFiles?.diff($("files-diff"), data); renderFiles();
-  } catch (error) { if (current()) $("files-diff").replaceChildren(); filesFailure(error, "files-diff", current); }
+    filesDiff = data;
+    if (data.git.state !== "available") { filesGitStatus = null; showSelectedGit(data.git); }
+    window.TrellisFiles?.diff($("files-diff"), data); renderFiles();
+  } catch (error) {
+    if (!current()) return;
+    filesGitStatus = null; showSelectedGit(null);
+    filesFailure(error, "files-diff", guard);
+  }
 }
 function appendChangedOnlyPaths(tree, filter) {
-  const indexed = new Set(files.map(file => file.path));
+  const indexed = new Set(files.map(file => file.path)), markers = gitChangesByPath();
   const changes = filesGitStatus?.changes?.filter(change => !indexed.has(change.path) && change.path.toLowerCase().includes(filter)) || [];
   if (!changes.length) return;
   const group = element("li", "Uncommitted paths · not indexed"), list = element("ul"); group.append(list); tree.append(group);
@@ -1214,7 +1233,8 @@ function appendChangedOnlyPaths(tree, filter) {
       $("source-path").textContent = `${change.path} · not in the loaded indexed catalog; no indexed outline or navigation`;
       await setFilesBasis("working");
     });
-    pick.className = "files-change-pick"; pick.setAttribute("data-path", change.path); row.append(pick); list.append(row);
+    pick.className = "files-change-pick"; pick.setAttribute("data-path", change.path);
+    appendGitMarker(pick, change.path, markers); row.append(pick); list.append(row);
   }
 }
 $("files-indexed")?.addEventListener("click", () => setFilesBasis("indexed"));
@@ -1298,6 +1318,28 @@ function hiddenTreeEntry(item) {
   const selection = metricDirectorySelection(item.path);
   return !!selection && viewerMetrics?.indexedDirectory(selection.path) === false;
 }
+function gitChangesByPath() {
+  if (filesGitStatus?.git?.state !== "available" || !Array.isArray(filesGitStatus.changes)) return new Map();
+  const paths = new Map();
+  for (const change of filesGitStatus.changes) paths.set(change.path, change);
+  for (const change of filesGitStatus.changes) {
+    if (change.status === "renamed" && change.previousPath && !paths.has(change.previousPath)) paths.set(change.previousPath, change);
+  }
+  return paths;
+}
+function appendGitMarker(node, path, changes) {
+  const change = changes.get(path);
+  const labels = {modified:["M", "Modified"], added:["A", "Added"], deleted:["D", "Deleted"], renamed:["R", "Renamed"]};
+  const label = labels[change?.status];
+  if (!label) return;
+  const marker = element("span", label[0], "git-marker");
+  const rename = change.status === "renamed" ? path === change.previousPath ? ` · to ${change.path}` : ` · from ${change.previousPath}` : "";
+  marker.title = `${label[1]} · uncommitted vs HEAD${rename}`;
+  marker.setAttribute("aria-label", marker.title);
+  marker.setAttribute("data-status", change.status);
+  marker.setAttribute("data-path", path);
+  node.append(marker);
+}
 function renderFiles() {
   $("show-hidden-files").checked = showHiddenFiles();
   if (section !== "files" && treeMode) { renderDirectoryTree(); return; }
@@ -1305,7 +1347,7 @@ function renderFiles() {
   const tree = $("file-tree"); tree.replaceChildren();
   const filter = $("file-filter").value.toLowerCase();
   const visible = files.filter(f => f.path.toLowerCase().includes(filter) && (showHiddenFiles() || !dotPath(f.path)));
-  const metricRows = [];
+  const changes = gitChangesByPath(), metricRows = [];
   const dirs = new Map([["", tree]]);
   for (const file of visible) {
     const parts = file.path.split("/"); let parent = tree, key = "";
@@ -1331,6 +1373,7 @@ function renderFiles() {
     const selection = {scope:"file", path:file.path};
     const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)}${section === "files" ? "" : " · " + file.methodCount}`, () => { if (!fileCurrent() || fileSurface !== sectionSerial) return; if (section === "files") return selectFilesFile(file); inspectTreeSelection(selection); return toggleFile(file); });
     pick.className = "file-pick"; pick.title = file.path;
+    appendGitMarker(pick, file.path, changes);
     if (section !== "files") attachClassMenu(pick, {path:file.path});
     pick.setAttribute("aria-expanded", String(section === "files" ? !!state?.outlineOpen : !!state?.open));
     if (section !== "files") metricRows.push(viewerMetrics?.decorate(pick, selection)); li.append(pick);
@@ -1672,11 +1715,14 @@ const unsupportedSourceReason = "Unsupported source type";
 function unsupportedTreeFile(item) {
   return item.kind === "file" && item.indexedPath == null && item.unindexedReason === unsupportedSourceReason;
 }
-function unsupportedFilesMarker(names) {
+function unsupportedFilesMarker(items, changes) {
   const row = element("li", undefined, "unsupported-files"), details = element("details");
-  details.append(element("summary", `${names.length} ${names.length === 1 ? "file" : "files"} · unsupported source type · not indexed`));
+  details.append(element("summary", `${items.length} ${items.length === 1 ? "file" : "files"} · unsupported source type · not indexed`));
   const list = element("ul");
-  for (const name of names) list.append(element("li", name, "unindexed-file"));
+  for (const item of items) {
+    const name = element("li", item.name, "unindexed-file");
+    appendGitMarker(name, item.path, changes); list.append(name);
+  }
   details.append(list); row.append(details);
   return row;
 }
@@ -1702,6 +1748,7 @@ function renderDirectoryTree() {
   }
   let count = 0, hidden = 0;
   const metricRows = [], showHidden = showHiddenFiles();
+  const changes = treeRoot === selectedWorkspaceRoot ? gitChangesByPath() : new Map();
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
     if (!state) return;
@@ -1709,7 +1756,7 @@ function renderDirectoryTree() {
     for (const item of (state.items || []).filter(matches)) {
       if (!showHidden && hiddenTreeEntry(item)) { hidden++; continue; }
       count++;
-      if (unsupportedTreeFile(item)) { unsupported.push(item.name); continue; }
+      if (unsupportedTreeFile(item)) { unsupported.push(item); continue; }
       const row = element("li");
       if (item.kind === "directory") {
         const compact = compactDirectory(item), child = directories.get(item.path);
@@ -1731,17 +1778,20 @@ function renderDirectoryTree() {
         const selection = {scope:"file", path:item.indexedPath};
         const pick = button(`${open ? "▾" : "▸"} ${item.name} · ${item.methodCount ?? 0}`, () => { inspectTreeSelection(selection); return toggleFile(file); });
         pick.className = "file-pick"; pick.title = item.path;
+        appendGitMarker(pick, item.path, changes);
         attachClassMenu(pick, {path:file.path});
         pick.setAttribute("aria-expanded", String(open));
         metricRows.push(viewerMetrics?.decorate(pick, selection));
         row.append(pick); appendMethods(row, file);
       } else {
-        row.append(element("span", item.name, "unindexed-file"), element("span",
+        const name = element("span", item.name, "unindexed-file");
+        if (item.kind === "file") appendGitMarker(name, item.path, changes);
+        row.append(name, element("span",
           item.kind === "symlink" ? "Symbolic link · not followed" : item.kind === "file" ? (item.unindexedReason || "Not indexed in current workspace") : "Special entry · metadata only", "detail"));
       }
       list.append(row);
     }
-    if (unsupported.length) list.append(unsupportedFilesMarker(unsupported));
+    if (unsupported.length) list.append(unsupportedFilesMarker(unsupported, changes));
     if (state.loading) list.append(element("li", "Loading folder…", "detail"));
     if (state.error) {
       const row = element("li", state.error, "warning");

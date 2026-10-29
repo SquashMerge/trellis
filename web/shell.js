@@ -296,9 +296,12 @@
     const head = git.head?.kind === "branch" ? git.head.name
       : git.head?.kind === "detached" ? (git.head.shortCommit ? `Detached HEAD ${git.head.shortCommit}` : "Detached HEAD") : null;
     if (!head) return "Git unavailable";
+    const changes = git.workingTree?.state === "available" && Number.isSafeInteger(git.workingTree.changedFiles) && git.workingTree.changedFiles >= 0
+      ? git.workingTree.changedFiles === 0 ? "clean" : `${git.workingTree.changedFiles} uncommitted`
+      : "Changes unavailable";
     return git.upstream
-      ? `${head} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · As of last fetch`
-      : `${head} · No upstream`;
+      ? `${head} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · ${changes} · As of last fetch`
+      : `${head} · No upstream · ${changes}`;
   }
   function checkoutLabel(row) {
     const name = rootName(row?.workspaceRoot) || row?.rootKey || "Checkout";

@@ -539,3 +539,5 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 @media (min-width: 901px) and (max-width: 1200px) {
   body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 214px minmax(0, 1fr); }
 }
+
+.git-marker { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1.5 var(--mono); color: var(--ink); }

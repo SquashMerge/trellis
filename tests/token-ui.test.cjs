@@ -40,6 +40,7 @@ function harness({saved, blocked = false, routes} = {}) {
       url = "/api" + url.slice(SCOPED.length);
       if (url === "/api/status") return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/synthetic",stats:{}});
       if (url.startsWith("/api/tree?")) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});
+      if (url === "/api/git") return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
       if (url === "/api/jobs/current") return response(null);
       if (url === "/api/dependencies") return response({state:"disabled",workspaceRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},catalogId:null,packages:[],warnings:[]});
       throw new Error(`Unexpected request: ${url}`);
@@ -68,7 +69,7 @@ test("checkout selection and refresh load only retained services and keep curren
   await h.connect("synthetic",false);
   assert.equal(h.get("checkout-state").textContent,"");
   assert.deepEqual(h.requests.map(({url})=>url),[
-    "/api/checkouts","/api/daemon/status",`${SCOPED}/status`,
+    "/api/checkouts","/api/daemon/status",`${SCOPED}/git`,`${SCOPED}/status`,
     `${SCOPED}/tree?path=&offset=0&limit=200`,`${SCOPED}/dependencies`,`${SCOPED}/jobs/current`
   ]);
   h.get("refresh").listeners.click();await flush();
@@ -292,6 +293,7 @@ test("explicit A to B switch keeps exact B URLs and rejects late A 401 with equa
       return response({revision:pair,path:"",root:`/checkout/${label}`,items:[{kind:"file",name:"same.rs",path:"same.rs",methodCount:1}],nextOffset:null});
     }
     if (suffix === "source") return response({revision:pair,file:{path:"same.rs",text:`source-${label}`}});
+    if (suffix === "git") return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if (suffix === "jobs/current") return response(null);
     if (suffix === "dependencies") return response({state:"disabled",workspaceRevision:pair,catalogId:null,packages:[],warnings:[]});
     if (["index","navigation"].includes(suffix)) return response({});
@@ -371,6 +373,7 @@ test("cold checkout keeps its explicit selection and never invents evidence", as
     if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
     if(url===`${SCOPED}/status`)return {ok:false,status:503,json:async()=>({error:{code:"index_not_ready",message:"Cold checkout"}})};
+    if(url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     throw new Error(`Cold checkout leaked request: ${url}`);
   }});
   await h.connect("synthetic",false,false);
@@ -379,7 +382,7 @@ test("cold checkout keeps its explicit selection and never invents evidence", as
   assert.equal(h.run("status"),null);
   assert.match(h.get("checkout-state").textContent,/Index not ready/i);
   assert.equal(h.get("checkout-root").textContent.includes("/synthetic"),false,"unverified display path is not evidence");
-  assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status",`${SCOPED}/status`]);
+  assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status",`${SCOPED}/git`,`${SCOPED}/status`,`${SCOPED}/git`]);
 });
 
 test("catching-up prior head remains paired and clears on a refreshed status", async () => {
@@ -389,6 +392,7 @@ test("catching-up prior head remains paired and clears on a refreshed status", a
     if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
     assert.ok(url.startsWith(`${SCOPED}/`),`Wrong root: ${url}`);
+    if(url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if(url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:pair,catchingUp,stats:{}});
     if(url.startsWith(`${SCOPED}/tree?`))return response({revision:pair,path:"",root:"/synthetic",items:[],nextOffset:null});
     if(url===`${SCOPED}/jobs/current`)return response(null);
@@ -411,6 +415,7 @@ test("state change in refreshed checkout list clears a selected root", async () 
   const h=harness({routes:url=>{
     if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state,active:false}]});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if(url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:null,stats:{}});
     throw new Error(`Unexpected: ${url}`);
   }});
@@ -431,6 +436,7 @@ test("a warm head is erased on typed cold status and a later ready head loads cl
     if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
     assert.ok(url.startsWith(`${SCOPED}/`),`Unselected request: ${url}`);
+    if(url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if(url===`${SCOPED}/status`)return phase==="cold"
       ? {ok:false,status:503,json:async()=>({error:{code:"index_not_ready",message:"No admitted head"}})}
       : phase==="unavailable" ? {ok:false,status:503,json:async()=>({error:{code:"checkout_capacity",message:"Retry later"}})}
@@ -510,6 +516,7 @@ test("a refreshed ambiguous selected key clears the old root before another scop
       ? [{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available"},{rootKey:ROOT,workspaceRoot:"/other",state:"unavailable"}]
       : [{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available"}]});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(!duplicate && url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if(!duplicate && url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:null,stats:{}});
     throw new Error(`Ambiguous checkout sent a scoped request: ${url}`);
   }});
@@ -546,6 +553,7 @@ test("selected checkout survives typed storage_busy without scoped traffic and r
     if(phase==="busy")throw new Error(`Scoped request during typed storage_busy: ${url}`);
     assert.ok(url.startsWith(`${SCOPED}/`),`Unexpected route: ${url}`);
     const revision=phase==="warm"?P:Q;
+    if(url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if(url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision,stats:{},diagnostics:[`diagnostic-${phase}`]});
     if(url.startsWith(`${SCOPED}/tree?`))return response({revision,path:"",root:"/synthetic",items:[],nextOffset:null});
     if(url===`${SCOPED}/jobs/current`)return response(null);
@@ -595,6 +603,7 @@ for(const unavailable of ["unavailable","corrupt","missing","changed","duplicate
         : phase==="duplicate"?[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"storage_busy"},{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available"}]
         :[{rootKey:ROOT,workspaceRoot:"/synthetic",state:phase}]});
       if(url==="/api/daemon/status")return response({activeCheckouts:0});
+      if(phase==="warm"&&url===`${SCOPED}/git`)return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
       if(phase==="warm"&&url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:null,stats:{}});
       throw new Error(`Unexpected scoped request after ${phase}: ${url}`);
     }});
@@ -607,10 +616,10 @@ for(const unavailable of ["unavailable","corrupt","missing","changed","duplicate
     assert.ok(h.requests.slice(at).every(({url})=>url==="/api/checkouts"));
   });
 
-const gitBranch = (name, upstream = null) => ({state:"available",head:{kind:"branch",name,commit:"abcdef123456",shortCommit:"abcdef1"},upstream});
+const gitBranch = (name, upstream = null) => ({state:"available",head:{kind:"branch",name,commit:"abcdef123456",shortCommit:"abcdef1"},upstream,workingTree:{state:"available",changedFiles:3}});
 const coldStatus = () => ({ok:false,status:503,json:async()=>({error:{code:"index_not_ready",message:"No admitted head"}})});
 
-test("checkout options and cold header share measured Git labels without extra requests on connect or selection",async()=>{
+test("Connect uses discovery only; explicit cold selection refreshes measured Git independently",async()=>{
   const rows=[
     {rootKey:ROOT,workspaceRoot:"/repo/branch",state:"available",git:gitBranch("feature/<script>",{name:"origin/main",ahead:2,behind:1,basis:"last_fetch"})},
     {rootKey:"b".repeat(64),workspaceRoot:"/repo/no-upstream",state:"available",git:gitBranch("local")},
@@ -618,11 +627,13 @@ test("checkout options and cold header share measured Git labels without extra r
     {rootKey:"d".repeat(64),workspaceRoot:"/repo/non-git",state:"available",git:{state:"unavailable",reason:"not_repository"}},
     {rootKey:"e".repeat(64),workspaceRoot:"/repo/missing-git",state:"available"}
   ];
-  const labels=["feature/<script> · origin/main ↑2 ↓1 · As of last fetch","local · No upstream","Detached HEAD abcdef1 · No upstream","Git unavailable","Git unavailable"];
+  const labels=["feature/<script> · origin/main ↑2 ↓1 · 3 uncommitted · As of last fetch","local · No upstream · 3 uncommitted","Detached HEAD abcdef1 · No upstream · Changes unavailable","Git unavailable","Git unavailable"];
   const h=harness({routes:url=>{
     if(url==="/api/checkouts")return response({checkouts:rows});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
     if(rows.some(row=>url===`/api/checkouts/${row.rootKey}/status`))return coldStatus();
+    const selected=rows.find(row=>url===`/api/checkouts/${row.rootKey}/git`);
+    if(selected)return response({git:selected.git,changes:selected.git?.state==="available"?[]:null});
     throw new Error(`Unexpected Git or provider request: ${url}`);
   }});
   assert.equal(h.requests.length,0);
@@ -634,7 +645,7 @@ test("checkout options and cold header share measured Git labels without extra r
     assert.equal(option.textContent,`${row.workspaceRoot.split("/").at(-1)} ⎇ ${head} · Not indexed`);
     assert.equal(option.title,row.workspaceRoot);
     assert.equal(option.children.length,0,"repository labels stay text, not markup");
-    await h.run(`selectCheckout(${JSON.stringify(row.rootKey)})`);
+    await h.run(`selectCheckout(${JSON.stringify(row.rootKey)})`); await flush();
     assert.equal(h.get("workspace-git").textContent,labels[i]);
     assert.equal(h.get("workspace-git").hidden,false);
     assert.equal(h.run("status"),null);
@@ -642,7 +653,7 @@ test("checkout options and cold header share measured Git labels without extra r
     h.context.window.TrellisShell.updateWorkspace(null);
     assert.equal(h.get("workspace-git").textContent,labels[i]);
   }
-  assert.equal(h.requests.length,2+rows.length);
+  assert.equal(h.requests.length,2+3*rows.length,"each cold selection reads status and restarts Git after its cold reset");
   h.get("logout").listeners.click();
   assert.equal(h.get("workspace-git").textContent,"");
   assert.equal(h.get("workspace-git").hidden,true);
@@ -662,11 +673,13 @@ test("explicit status refresh reads Git even with a cold index; list refresh and
   git=gitBranch("after",{name:"origin/after",ahead:0,behind:4,basis:"last_fetch"});
   const before=h.requests.length;
   await h.get("refresh").listeners.click();
-  assert.deepEqual(h.requests.slice(before).map(r=>r.url),[`${SCOPED}/git`,`${SCOPED}/status`]);
-  assert.equal(h.get("workspace-git").textContent,"after · origin/after ↑0 ↓4 · As of last fetch");
+  await flush();
+  assert.deepEqual(h.requests.slice(before).map(r=>r.url),[`${SCOPED}/git`,`${SCOPED}/status`,`${SCOPED}/git`]);
+  assert.equal(h.get("workspace-git").textContent,"after · origin/after ↑0 ↓4 · 3 uncommitted · As of last fetch");
   assert.equal(h.run("status"),null);
   git=gitBranch("from-list");await h.run("loadCheckouts()");
-  assert.equal(h.get("workspace-git").textContent,"from-list · No upstream");
+  await flush();
+  assert.equal(h.get("workspace-git").textContent,"from-list · No upstream · 3 uncommitted");
   fail=true;await h.run("refreshGit()");
   assert.equal(h.get("workspace-git").textContent,"Git unavailable");
   assert.equal(h.run("selectedRootKey"),ROOT);
@@ -677,44 +690,47 @@ test("explicit status refresh reads Git even with a cold index; list refresh and
 
 test("late Git success or authentication failure from A cannot overwrite B or disconnect it",async()=>{
   for(const lateAuth of [false,true]) {
-    const B="b".repeat(64);let finish;
+    const B="b".repeat(64);let finish, holdA=false;
     const rows=[ROOT,B].map((rootKey,i)=>({rootKey,workspaceRoot:i?"/B":"/A",state:"available",git:gitBranch(i?"branch-B":"branch-A")}));
     const h=harness({routes:url=>{
       if(url==="/api/checkouts")return response({checkouts:rows});
       if(url==="/api/daemon/status")return response({activeCheckouts:0});
       if(url.endsWith("/status"))return coldStatus();
-      if(url===`${SCOPED}/git`)return new Promise(resolve=>{finish=resolve;});
+      if(url===`${SCOPED}/git` && holdA)return new Promise(resolve=>{finish=resolve;});
+      const row=rows.find(row=>url===`/api/checkouts/${row.rootKey}/git`);
+      if(row)return response({git:row.git,changes:[]});
       throw new Error(`Wrong-root Git request: ${url}`);
     }});
-    await h.connect("synthetic",false,false);await h.run(`selectCheckout('${ROOT}')`);
-    const pending=h.run("refreshGit()");
+    await h.connect("synthetic",false,false);await h.run(`selectCheckout('${ROOT}')`); await flush();
+    holdA=true;const pending=h.run("refreshGit()");
     assert.ok(finish);
-    await h.run(`selectCheckout('${B}')`);
+    await h.run(`selectCheckout('${B}')`); await flush();
     finish(lateAuth?{ok:false,status:401,json:async()=>({error:{message:"obsolete authentication"}})}:response({git:gitBranch("obsolete-A"),changes:[]}));
     await pending;
     assert.equal(h.run("selectedRootKey"),B);
-    assert.equal(h.get("workspace-git").textContent,"branch-B · No upstream");
+    assert.equal(h.get("workspace-git").textContent,"branch-B · No upstream · 3 uncommitted");
     assert.equal(h.get("connect-form").hidden,true);
     assert.equal(h.get("error").hidden,true);
   }
 });
 
 test("newer selected Git read wins over an older read and an in-flight list summary",async()=>{
-  let holdList=false,finishList;const reads=[];
+  let holdList=false,finishList,holdGit=false;const reads=[];
   const row=git=>({rootKey:ROOT,workspaceRoot:"/repo",state:"available",git});
   const h=harness({routes:url=>{
     if(url==="/api/checkouts")return holdList?new Promise(resolve=>{finishList=resolve;}):response({checkouts:[row(gitBranch("initial"))]});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
     if(url===`${SCOPED}/status`)return coldStatus();
-    if(url===`${SCOPED}/git`)return new Promise(resolve=>reads.push(resolve));
+    if(url===`${SCOPED}/git`)return holdGit?new Promise(resolve=>reads.push(resolve)):response({git:gitBranch("initial"),changes:[]});
     throw new Error(`Unexpected request: ${url}`);
   }});
   await h.connect("synthetic",false,false);await h.run(`selectCheckout('${ROOT}')`);
-  holdList=true;const listed=h.run("loadCheckouts()"),older=h.run("refreshGit()"),newer=h.run("refreshGit()");
+  await flush();holdList=true;holdGit=true;
+  const listed=h.run("loadCheckouts()"),older=h.run("refreshGit()"),newer=h.run("refreshGit()");
   reads[1](response({git:gitBranch("newest"),changes:[]}));await newer;
   reads[0](response({git:gitBranch("older"),changes:[]}));await older;
   finishList(response({checkouts:[row(gitBranch("older-list"))]}));await listed;
-  assert.equal(h.get("workspace-git").textContent,"newest · No upstream");
+  assert.equal(h.get("workspace-git").textContent,"newest · No upstream · 3 uncommitted");
 });
 
 test("Disconnect clears selected Git and rejects an in-flight Git read",async()=>{
@@ -752,6 +768,7 @@ test("checkout list shows measured freshness and shares explicit selection with 
     if (url === `${SCOPED}/status`) return response({workspaceRoot:"/synthetic",revision:pin,catchingUp:false,stats:{}});
     if (url.startsWith(`${SCOPED}/tree?`)) return response({revision:pin,path:"",root:"/synthetic",indexedWorkspace:"/synthetic",items:[],nextOffset:null});
     if (url === `${SCOPED}/dependencies`) return response({state:"disabled",workspaceRevision:pin,catalogId:null,packages:[],warnings:[]});
+    if (url === `${SCOPED}/git`) return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if (url === `${SCOPED}/jobs/current`) return response(null);
     throw new Error("Unexpected " + url);
   }});
@@ -793,6 +810,7 @@ test("newer checkout list freshness updates the selected card and header at the 
     if (url === `${SCOPED}/status`) return response({workspaceRoot:"/synthetic",revision:pin,catchingUp:false,stats:{}});
     if (url.startsWith(`${SCOPED}/tree?`)) return response({revision:pin,path:"",root:"/synthetic",indexedWorkspace:"/synthetic",items:[],nextOffset:null});
     if (url === `${SCOPED}/dependencies`) return response({state:"disabled",workspaceRevision:pin,catalogId:null,packages:[],warnings:[]});
+    if (url === `${SCOPED}/git`) return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if (url === `${SCOPED}/jobs/current`) return response(null);
     throw new Error("Unexpected " + url);
   }});
@@ -808,6 +826,6 @@ test("newer checkout list freshness updates the selected card and header at the 
   assert.equal(h.get("workspace-index-state").attrs["data-state"],"catching-up");
   assert.match(h.get("workspace-index-label").textContent,/Catching up/);
   assert.equal(h.run("status.catchingUp"),false,"cached status must not override the newer list observation");
-  assert.deepEqual(h.requests.slice(before).map(request => request.url),["/api/checkouts"]);
+  assert.deepEqual(h.requests.slice(before).map(request => request.url),["/api/checkouts",`${SCOPED}/git`]);
   assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),pin);
 });

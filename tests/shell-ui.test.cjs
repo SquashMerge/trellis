@@ -326,13 +326,17 @@ test("inspector refuses source callback for malformed ranges or missing paired s
  assert.equal(opened,0);
 });
 
-const branchGit = (upstream = null) => ({state:"available",head:{kind:"branch",name:"feature/<script>",commit:"abcdef123456",shortCommit:"abcdef1"},upstream});
-test("Git header shows measured branch, last-fetch counts, detached HEAD and unavailable without inventing a branch",()=>{
+const branchGit = (upstream = null, workingTree = {state:"available",changedFiles:3}) => ({state:"available",head:{kind:"branch",name:"feature/<script>",commit:"abcdef123456",shortCommit:"abcdef1"},upstream,workingTree});
+test("Git header uses measured counts independently of branch, upstream and index freshness",()=>{
   const h=harness();
   for (const [git,expected] of [
-    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · origin/main ↑2 ↓3 · As of last fetch"],
-    [branchGit(),"feature/<script> · No upstream"],
-    [{state:"available",head:{kind:"detached",name:null,commit:"abcdef123456",shortCommit:"abcdef1"},upstream:null},"Detached HEAD abcdef1 · No upstream"],
+    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · origin/main ↑2 ↓3 · 3 uncommitted · As of last fetch"],
+    [branchGit(),"feature/<script> · No upstream · 3 uncommitted"],
+    [branchGit(null,{state:"available",changedFiles:0}),"feature/<script> · No upstream · clean"],
+    [branchGit(null,{state:"unavailable",reason:"git_changed"}),"feature/<script> · No upstream · Changes unavailable"],
+    [{...branchGit(),workingTree:undefined},"feature/<script> · No upstream · Changes unavailable"],
+    [{state:"available",head:{kind:"detached",name:null,commit:"abcdef123456",shortCommit:"abcdef1"},upstream:null,workingTree:{state:"available",changedFiles:1}},"Detached HEAD abcdef1 · No upstream · 1 uncommitted"],
+    [{state:"available",head:{kind:"detached"},upstream:null,workingTree:{state:"available",changedFiles:0}},"Detached HEAD · No upstream · clean"],
     [{state:"unavailable",reason:"not_repository"},"Git unavailable"],
     [undefined,"Git unavailable"]
   ]) {
@@ -341,6 +345,7 @@ test("Git header shows measured branch, last-fetch counts, detached HEAD and una
     assert.equal(h.get("workspace-git").title,expected);
     assert.equal(h.get("workspace-git").hidden,false);
     assert.equal(all(h.get("workspace-git")).some(n=>n.tagName==="script"),false);
+    if (!git?.upstream) assert.doesNotMatch(expected,/[↑↓]/);
     h.shell.updateWorkspace(null);
     assert.equal(h.get("workspace-git").textContent,expected,"cold index must not erase independent Git");
     assert.equal(h.get("workspace-name").textContent,"repo");
@@ -547,7 +552,7 @@ test("detached heads without a short commit say Detached and roots split on eith
   const revision = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:7};
   const detached = {state:"available",head:{kind:"detached",shortCommit:null}};
   assert.equal(h.shell.checkoutLabel({workspaceRoot:"/private/long/repo",revision,git:detached}), "repo ⎇ Detached · rev 12345678:7");
-  assert.equal(h.shell.formatGit(detached), "Detached HEAD · No upstream");
+  assert.equal(h.shell.formatGit(detached), "Detached HEAD · No upstream · Changes unavailable");
   assert.equal(h.shell.checkoutLabel({workspaceRoot:"C:\\work\\repo\\",revision,git:{state:"unavailable"}}), "repo ⎇ Git unavailable · rev 12345678:7");
   for (const root of ["/a/b/repo", "/a/b/repo/", "C:\\a\\repo", "C:\\a\\repo\\"]) assert.equal(h.shell.rootName(root), "repo");
   assert.equal(h.shell.rootName(""), "");
