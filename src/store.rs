@@ -4241,7 +4241,7 @@ fn storage_fault(error: &anyhow::Error) -> bool {
 }
 
 /// SQLite reported a full disk (SQLITE_FULL) while writing staged or published rows. The
-/// request settles `index_failed`; the cause stays in the error chain for diagnostics.
+/// request settles `storage_full`; the full cause stays in the error chain for diagnostics.
 #[derive(Debug)]
 pub struct StorageFull(());
 

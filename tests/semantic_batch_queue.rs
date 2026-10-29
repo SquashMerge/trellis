@@ -480,11 +480,6 @@ fn precommit_sql_fault_leaves_prior_head_and_retry_publishes_once() {
     let before = world.head();
     let failed = world.import(&descriptor, &sha);
     assert!(!failed.status.success());
-    assert!(
-        String::from_utf8_lossy(&failed.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&failed.stderr)
-    );
     assert!(marker.exists());
     assert_eq!(
         world.head(),
@@ -500,9 +495,10 @@ fn precommit_sql_fault_leaves_prior_head_and_retry_publishes_once() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
+    assert_terminal_error(
+        "injected SQL fault",
         world.queue().last().unwrap().2.as_deref(),
-        Some("index_failed")
+        &failed.stderr,
     );
     let retried = succeeded(&world.import(&descriptor, &sha));
     let published: IndexPin = serde_json::from_value(retried["publishedRevision"].clone()).unwrap();
@@ -745,17 +741,9 @@ fn claim_time_causes_map_to_stable_terminal_codes() {
         let _daemon = LoggedDaemon::start(&world.home, &log, env);
         let output = world.import(&descriptor, &sha);
         assert!(!output.status.success(), "{cause}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-            "{cause}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
         let row = world.queue().pop().unwrap();
-        assert_eq!(
-            (row.1.as_str(), row.2.as_deref()),
-            ("failed", Some("index_failed")),
-            "{cause}"
-        );
+        assert_eq!(row.1, "failed", "{cause}");
+        assert_terminal_error(cause, row.2.as_deref(), &output.stderr);
         assert_eq!(
             world.count("SELECT count(*) FROM semantic_raw_batches"),
             0,
@@ -799,9 +787,10 @@ fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_comp
     assert_eq!(world.head(), published);
     let queue = world.queue();
     let old = queue.iter().find(|row| row.0 == v1.id).unwrap();
+    // An untyped cause records only the fixed generic reason, never its text.
     assert_eq!(
         (old.1.as_str(), old.2.as_deref()),
-        ("failed", Some("index_failed"))
+        ("failed", Some("index_failed: internal error"))
     );
     trellis::testing::wait_until("v1 diagnostic cause", || {
         fs::read_to_string(&log).is_ok_and(|text| {
@@ -833,8 +822,36 @@ fn four_language_fixture(world: &World) -> BatchFixture {
     fixture
 }
 
-/// Imports the batch on a fresh daemon with `env` and asserts the claim fails typed: terminal
-/// `index_failed`, the diagnostic `cause`, nothing published and no stage left.
+/// Asserts the terminal error a failed import records for its diagnostic `cause` (#445): a
+/// typed cause keeps its code and a listed reason, any other cause is `index_failed: internal
+/// error`, and the CLI error names the same code and reason.
+fn assert_terminal_error(cause: &str, stored: Option<&str>, stderr: &[u8]) {
+    let stored = stored.unwrap_or_else(|| panic!("{cause}: no terminal error"));
+    let typed = [
+        "invalid_request:",
+        "invalid_artifact:",
+        "limit_exceeded:",
+        "storage_full:",
+    ]
+    .iter()
+    .any(|code| cause.starts_with(code));
+    if typed {
+        assert!(stored.starts_with(cause), "{cause}: {stored}");
+        assert!(!stored.ends_with(": unlisted detail"), "{cause}: {stored}");
+    } else {
+        assert_eq!(stored, "index_failed: internal error", "{cause}");
+    }
+    let (code, reason) = stored.split_once(": ").unwrap();
+    let stderr = String::from_utf8_lossy(stderr);
+    assert!(
+        stderr.contains(&format!("{code}: request "))
+            && stderr.contains(&format!(" failed: {reason}")),
+        "{cause}: {stderr}"
+    );
+}
+
+/// Imports the batch on a fresh daemon with `env` and asserts the claim fails typed: the
+/// terminal error for `cause`, the diagnostic `cause`, nothing published and no stage left.
 fn assert_claim_fails(
     world: &World,
     log: &Path,
@@ -845,17 +862,9 @@ fn assert_claim_fails(
     let daemon = LoggedDaemon::start(&world.home, log, env);
     let output = world.import(&batch.0, &batch.1);
     assert!(!output.status.success(), "{cause}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{cause}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed")),
-        "{cause}"
-    );
+    assert_eq!(row.1, "failed", "{cause}");
+    assert_terminal_error(cause, row.2.as_deref(), &output.stderr);
     assert_eq!(
         world.count("SELECT count(*) FROM semantic_raw_batches"),
         0,
@@ -1040,6 +1049,21 @@ fn malformed_final_artifact_after_valid_artifacts_publishes_nothing() {
     })]);
 }
 
+#[test]
+fn empty_occurrence_range_records_its_typed_cause() {
+    // The live #445 failure: a non-module occurrence with an empty range. The row and the CLI
+    // name `invalid_artifact` and the fixed reason, not only `index_failed`.
+    run_fault_cases(
+        &[("invalid_artifact: empty or reversed SCIP range", |world| {
+            batch_with_artifact_edit(world, "java", |index| {
+                let occurrence = &mut index.documents[0].occurrences[0];
+                let start = occurrence.range[1];
+                occurrence.range = vec![occurrence.range[0], start, start];
+            })
+        })],
+    );
+}
+
 /// A batch whose artifact for `language` is edited after generation, next to ordinary ones.
 fn batch_with_artifact_edit(
     world: &World,
@@ -1164,16 +1188,10 @@ fn full_disk_during_staging_fails_index_failed_with_prior_head() {
     );
     let output = world.import(&batch.0, &batch.1);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed"))
-    );
+    assert_eq!(row.1, "failed");
+    // A file-system ENOSPC is not a typed SQLite full disk.
+    assert_terminal_error("staging write", row.2.as_deref(), &output.stderr);
     assert_eq!(world.head(), prior, "the prior head stays");
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
     assert_eq!(stage_entries(&world), Vec::<String>::new());
@@ -1186,7 +1204,7 @@ fn full_disk_during_staging_fails_index_failed_with_prior_head() {
 }
 
 #[test]
-fn full_disk_at_commit_fails_index_failed_with_prior_head() {
+fn full_disk_at_commit_fails_storage_full_with_prior_head() {
     let marker = Builder::new()
         .prefix("semantic-commit-full-")
         .tempdir_in("/tmp")
@@ -1210,15 +1228,12 @@ fn full_disk_at_commit_fails_index_failed_with_prior_head() {
     let output = world.import(&batch.0, &batch.1);
     assert!(!output.status.success());
     assert!(disk_full.exists(), "the COMMIT failed once");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed"))
+    assert_eq!(row.1, "failed");
+    assert_terminal_error(
+        "storage_full: database or disk is full",
+        row.2.as_deref(),
+        &output.stderr,
     );
     assert_eq!(world.head(), prior, "the prior head stays");
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
@@ -1647,15 +1662,12 @@ fn lookup_budget_spans_the_rejoin_after_a_cutoff_edit() {
         },
     );
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed"))
+    assert_eq!(row.1, "failed");
+    assert_terminal_error(
+        "limit_exceeded: lookup steps",
+        row.2.as_deref(),
+        &output.stderr,
     );
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
     // The request can fail on a watcher generation change before the watcher has published the

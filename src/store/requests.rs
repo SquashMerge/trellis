@@ -19,6 +19,10 @@ use std::{
 };
 use uuid::Uuid;
 
+mod failure;
+pub(crate) use failure::TypedFailure;
+pub use failure::split_error;
+
 /// A single maintenance unit's existing-only queue admission. Unknown is a
 /// priority signal: never begin (or commit) maintenance on uncertain queue data.
 pub enum QueueProbeAdmission {
@@ -462,7 +466,8 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionOutcome {
     Done(IndexPin),
-    Failed(&'static str),
+    /// The stored terminal error: a bare code, or `<code>: <reason>` from a closed set.
+    Failed(String),
 }
 impl CompletionOutcome {
     fn from_result(result: Result<IndexPin>) -> Result<Self> {
@@ -470,17 +475,18 @@ impl CompletionOutcome {
             Ok(pin) => Self::Done(pin),
             Err(error) if super::nonterminal_storage_busy(&error) => return Err(error),
             Err(error) if error.to_string().starts_with("revision conflict") => {
-                Self::Failed("revision_conflict")
+                Self::Failed("revision_conflict".to_owned())
             }
             Err(error) => {
-                // A terminal row intentionally retains only a stable error code.
-                // Opt-in diagnostics preserve the cause in either process's log
+                // A terminal row retains only a typed code and a reason from a closed set.
+                // Opt-in diagnostics preserve the full cause in either process's log
                 // without letting a broken stderr change the terminal outcome.
                 if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
                     use std::io::Write;
                     let _ = writeln!(std::io::stderr(), "index-phase request_failure={error:#}");
                 }
-                Self::Failed("index_failed")
+                let (code, reason) = failure::classify(&error);
+                Self::Failed(format!("{code}: {reason}"))
             }
         })
     }
@@ -491,7 +497,7 @@ impl CompletionOutcome {
             }
             Self::Failed(code) => {
                 row.state == "failed"
-                    && row.error_code.as_deref() == Some(*code)
+                    && row.error_code.as_deref() == Some(code.as_str())
                     && row.revision.is_none()
             }
         }
@@ -2067,7 +2073,7 @@ impl Store {
                 Some(pin.index_revision as i64),
                 None,
             ),
-            CompletionOutcome::Failed(code) => (None, None, Some(*code)),
+            CompletionOutcome::Failed(code) => (None, None, Some(code.as_str())),
         };
         let changed=tx.execute("UPDATE requests SET state=?1,result_generation=?2,result_revision=?3,error_code=?4,finished_at=?5 WHERE seq=?6 AND state='running' AND claim_incarnation=?7 AND root_device=?8 AND root_inode=?9",params![if code.is_some(){"failed"}else{"done"},generation,revision,code,now(),request.seq,session.incarnation().to_string(),self.identity.device.to_string(),self.identity.inode.to_string()])?;
         ensure!(changed == 1, "storage_busy: request claim changed");
