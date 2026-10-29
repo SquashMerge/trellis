@@ -34,6 +34,8 @@ const sources = new Map([
   ["nested/empty.test.js", ""],
   [hostilePath, "// untrusted file label\nconst value = 1;\n"],
 ]);
+// Unsupported source types: explorer metadata only, never Treemap rows.
+const unsupportedFiles = ["README.md", "LICENSE", "src/schema.json", "src/notes.md"];
 const fileKey = row => JSON.stringify([row.sourceSetId, row.language, row.path]);
 const hiddenTest = row => row.fileRole === "test" || (row.roleCounts.production === 0 && row.roleCounts.test > 0);
 // Rust str::lines excludes the final terminator and counts an empty file as zero.
@@ -88,6 +90,7 @@ async function published(callback) {
   for (const [path, text] of sources) {
     const target = join(paths.workspace, path); mkdirSync(dirname(target), {recursive:true}); writeFileSync(target, text);
   }
+  for (const path of unsupportedFiles) writeFileSync(join(paths.workspace, path), "not indexed source\n");
   mkdirSync(join(paths.workspace, ".trellis"));
   writeFileSync(join(paths.workspace, ".trellis/rules.toml"), 'version = 1\n[layers.source]\norder = 1\npaths = ["**"]\n');
   let server, browser, context;
@@ -480,3 +483,106 @@ for (const transition of ["generation", "revision", "checkout", "session"]) {
     }
   }));
 }
+
+async function layout(page) {
+  return page.locator("#treemap-diagram").evaluate(node => {
+    const style = getComputedStyle(node), svg = node.querySelector("svg");
+    return {width:node.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+      height:node.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+      svgWidth:Number(svg?.getAttribute("width")), svgHeight:Number(svg?.getAttribute("height")),
+      overflowX:node.scrollWidth > node.clientWidth, overflowY:node.scrollHeight > node.clientHeight};
+  });
+}
+// The native SVG is the box's content size, floored to whole pixels.
+const fills = box => box.width - box.svgWidth >= 0 && box.width - box.svgWidth < 1 && box.height - box.svgHeight >= 0 && box.height - box.svgHeight < 1;
+async function filled(page) {
+  await page.waitForFunction(() => {
+    const node = document.querySelector("#treemap-diagram"), svg = node?.querySelector("svg"), style = node && getComputedStyle(node);
+    if (!svg) return false;
+    const width = node.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight), height = node.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const dx = width - Number(svg.getAttribute("width")), dy = height - Number(svg.getAttribute("height"));
+    return dx >= 0 && dx < 1 && dy >= 0 && dy < 1;
+  });
+  return layout(page);
+}
+
+test("Treemap root is the checkout name and fills its panel across resizes; explorer collapses unsupported files and labels its numbers (#425)", {timeout:240000}, async () => published(async selected => {
+  const {page} = selected, dto = await metrics(selected);
+  const sourceSets = [...new Set(dto.files.map(row => row.sourceSetId))];
+  assert.equal(sourceSets.length, 1, "one indexed source set owns the checkout");
+  const root = await page.locator("#treemap-diagram g.pele-section[data-trellis-directory-id]").evaluateAll((nodes, key) => nodes
+    .filter(node => node.getAttribute("data-trellis-directory-id") === key)
+    .map(node => ({label:node.querySelector("text")?.textContent, aria:node.getAttribute("aria-label")})), JSON.stringify([sourceSets[0], ""]));
+  assert.equal(root.length, 1);
+  assert.match(root[0].label, /^workspace · \d+ lines$/, "root label is the observed checkout directory name");
+  assert.ok(root[0].aria.startsWith(`workspace · ${sourceSets[0]} · / · `), "exact source set stays in the accessible label");
+  await drill(page, sourceSets[0], "src");
+  assert.deepEqual(await page.locator("#treemap-breadcrumbs button").evaluateAll(nodes => nodes.map(node => node.textContent)), ["All indexed files", "workspace", "src"]);
+  await page.locator("#treemap-breadcrumbs").getByRole("button", {name:"All indexed files", exact:true}).click(); await ready(page);
+
+  const wide = await filled(page);
+  assert.ok(fills(wide), JSON.stringify(wide));
+  assert.notEqual(wide.svgWidth, wide.svgHeight, "the layout takes the panel's shape, not a square");
+  assert.equal(wide.overflowX || wide.overflowY, false, "a filled layout needs no diagram scroll");
+  const mixed = rowAt(dto, "src/mixed.rs"); await selectFile(page, mixed);
+  const before = metricRequests(selected).length;
+  await page.evaluate(() => {
+    const original = window.pele;
+    window.treemapRenders = {original, count:0};
+    window.pele = {...original, render:(...args) => { if (String(args[0]).startsWith("treemap-beta")) window.treemapRenders.count++; return original.render(...args); }};
+  });
+  try {
+    await page.setViewportSize({width:1180, height:820});
+    const narrow = await filled(page);
+    assert.ok(fills(narrow) && narrow.svgWidth < wide.svgWidth, JSON.stringify(narrow));
+    assert.equal(metricRequests(selected).length, before, "relayout reuses the admitted snapshot");
+    assert.equal(await page.locator("#treemap-inspector-title").textContent(), mixed.path, "relayout keeps the selection");
+    const tiles = page.locator("#treemap-diagram [data-trellis-file-id]");
+    const keys = await tiles.evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-file-id")));
+    assert.equal(await tiles.nth(keys.indexOf(fileKey(mixed))).getAttribute("aria-pressed"), "true");
+    // A burst of five box sizes renders once per settled size, not once per change.
+    const counted = await page.evaluate(() => window.treemapRenders.count);
+    await page.evaluate(async () => {
+      const node = document.querySelector("#treemap-diagram");
+      for (const height of [520, 540, 560, 580, 600]) { node.style.flex = `0 0 ${height}px`; await new Promise(resolveStep => setTimeout(resolveStep, 20)); }
+    });
+    const burst = await filled(page);
+    assert.ok(fills(burst) && burst.height === 600 - 16, JSON.stringify(burst));
+    await page.evaluate(() => new Promise(resolveWait => setTimeout(resolveWait, 400)));
+    const renders = await page.evaluate(() => window.treemapRenders.count) - counted;
+    assert.ok(renders >= 1 && renders < 5, `bounded relayout: ${renders} renders for 5 resizes`);
+    await page.evaluate(() => { document.querySelector("#treemap-diagram").style.flex = ""; });
+    assert.ok(fills(await filled(page)));
+  } finally {
+    await page.evaluate(() => { window.pele = window.treemapRenders.original; delete window.treemapRenders; });
+  }
+  await capture(page, "treemap-fills-panel");
+
+  const tree = page.locator("#file-tree");
+  await tree.locator(".directory-pick").first().waitFor();
+  const rootMarker = tree.locator(":scope > li.unsupported-files");
+  assert.equal(await rootMarker.count(), 1, "one marker for the checkout root");
+  assert.equal(await rootMarker.locator("summary").textContent(), "2 files · unsupported source type · not indexed");
+  await rootMarker.locator("summary").click();
+  assert.deepEqual(await rootMarker.locator("li").evaluateAll(nodes => nodes.map(node => node.textContent).sort()), ["LICENSE", "README.md"]);
+  if (!await page.locator('.file-pick[title="src/mixed.rs"]').count()) await page.locator('.directory-pick[title="src/"]').click();
+  await page.locator('.file-pick[title="src/mixed.rs"]').waitFor();
+  assert.equal(await tree.locator("li.unsupported-files").count(), 2, "one more marker for src/");
+  assert.equal(await tree.locator("li.unsupported-files").nth(1).locator("summary").textContent(), "2 files · unsupported source type · not indexed");
+  assert.doesNotMatch(await tree.textContent(), /Unsupported source type/, "no per-file unsupported rows");
+
+  const legend = page.locator("#explorer-metric-legend");
+  assert.equal(await legend.isVisible(), true, "the explorer legend is visible beside its numbers in Treemap");
+  assert.match(await legend.textContent(), /Numbers: Cognitive · max · production callables · Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
+  assert.deepEqual(await legend.locator(".metric-legend-entry .metric-swatch").evaluateAll(nodes => nodes.map(node => getComputedStyle(node).backgroundColor)),
+    ["rgb(52, 54, 68)", "rgb(255, 194, 10)", "rgb(255, 170, 16)", "rgb(255, 122, 0)"], "legend uses the shared heat tokens");
+  const folder = await page.locator('.directory-pick[title="src/"]').evaluate(pick => {
+    const value = pick.querySelector(".metric-value"), swatch = value?.querySelector(".metric-swatch");
+    return {number:value?.querySelector("span:last-child")?.textContent, swatch:swatch?.className, gap:pick.getBoundingClientRect().right - value.getBoundingClientRect().right};
+  });
+  const value = Number(folder.number);
+  assert.ok(Number.isFinite(value), "src/ has a measured folder number");
+  assert.equal(folder.swatch, `metric-swatch heat-${[5, 15, 30].filter(cut => value > cut).length}`, "folder swatch uses the legend's fixed band");
+  assert.ok(folder.gap >= 0 && folder.gap < 12, "folder number is right-aligned in its row");
+  await capture(page, "treemap-explorer-legend");
+}));

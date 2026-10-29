@@ -1,11 +1,11 @@
-/* Native Pele geometry stays at natural size. Small tiles also have a file list. */
+/* Pele lays out to this box's measured size (with a readable minimum). Small tiles also have a file list. */
 #treemap-panel { display: flex; flex-direction: column; min-height: 0; overflow: auto; }
 .treemap-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; }
 .treemap-controls label { font-size: 12px; }
 .treemap-controls input[type="search"] { width: 180px; min-width: 0; }
 .treemap-basis, #treemap-state, #treemap-legend, #treemap-breadcrumbs { margin: 4px 16px 8px; font-size: 12px; }
 #treemap-breadcrumbs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-#treemap-diagram { overflow: auto; flex: 1 0 300px; min-height: 260px; max-height: 70vh; padding: 8px; }
+#treemap-diagram { overflow: auto; flex: 1 1 0; min-height: 400px; padding: 8px; }
 #treemap-diagram svg { display: block; max-width: none; flex: none; font-family: var(--sans); }
 #treemap-diagram [role="button"] { cursor: pointer; }
 #treemap-diagram [role="button"]:is(:hover, :focus-visible, [aria-pressed="true"]) > rect { stroke: var(--sm-lavender); stroke-width: 3px; }

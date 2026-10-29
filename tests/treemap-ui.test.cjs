@@ -267,3 +267,18 @@ test("layer exclusions warning preserves measured paint and stays visible in emp
   h.setResponse(async () => ({payload:fixture()})); await h.controller.refresh();
   assert.ok(!h.get("treemap-state").textContent.includes(warning), "a normal payload clears the warning");
 });
+
+test("root label is the observed checkout name only when one source set owns every indexed file (#425)", async () => {
+  const workspaceOnly = async () => { const payload = fixture(); payload.files = payload.files.filter(file => file.sourceSetId === "workspace"); return {payload}; };
+  const mixed = harness(); mixed.setContext({rootKey:"checkout-one", session:1, pin, workspaceRoot:"/home/dev/trellis"});
+  await mixed.controller.refresh();
+  assert.equal(mixed.renders[0].options.rootLabel("workspace"), "workspace", "two source sets: no source set is guessed to be the checkout");
+  const single = harness(); single.setContext({rootKey:"checkout-one", session:1, pin, workspaceRoot:"/home/dev/trellis/"});
+  single.setResponse(workspaceOnly); await single.controller.refresh();
+  assert.equal(single.renders[0].options.rootLabel("workspace"), "trellis");
+  await single.renders[0].options.onSelectDirectory({sourceSetId:"workspace", path:"src"});
+  assert.deepEqual(single.get("treemap-breadcrumbs").children.map(node => node.textContent), ["All indexed files", "trellis", "src"]);
+  const unknown = harness(); unknown.setResponse(workspaceOnly); await unknown.controller.refresh();
+  assert.equal(unknown.renders[0].options.rootLabel("workspace"), "workspace", "no observed checkout root: keep the exact source set");
+  assert.equal(unknown.renders[0].options.viewport, undefined, "an unmeasured box keeps the natural square layout");
+});

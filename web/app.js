@@ -1495,7 +1495,7 @@ const viewerMetrics = window.TrellisMetrics?.create({
 });
 const treemap = window.TrellisTreemap?.create({
   request: (path, current) => api(path, "GET", undefined, current),
-  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, workspaceRoot:status?.workspaceRoot}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   onConflict: () => unexpectedPair("Treemap snapshot changed. Refresh status before reopening Treemap."),
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
@@ -1632,6 +1632,19 @@ async function loadDirectory(path, reset = false) {
   try { await pending; }
   finally { if (state.pending === pending) state.pending = null; }
 }
+// Files of a type Trellis does not index collapse into one quiet, countable marker per folder (#425).
+const unsupportedSourceReason = "Unsupported source type";
+function unsupportedTreeFile(item) {
+  return item.kind === "file" && item.indexedPath == null && item.unindexedReason === unsupportedSourceReason;
+}
+function unsupportedFilesMarker(names) {
+  const row = element("li", undefined, "unsupported-files"), details = element("details");
+  details.append(element("summary", `${names.length} ${names.length === 1 ? "file" : "files"} · unsupported source type · not indexed`));
+  const list = element("ul");
+  for (const name of names) list.append(element("li", name, "unindexed-file"));
+  details.append(list); row.append(details);
+  return row;
+}
 function renderDirectoryTree() {
   treeSerial++;
   const tree = $("file-tree"); tree.replaceChildren();
@@ -1657,9 +1670,11 @@ function renderDirectoryTree() {
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
     if (!state) return;
+    const unsupported = [];
     for (const item of (state.items || []).filter(matches)) {
       if (!showHidden && hiddenTreeEntry(item)) { hidden++; continue; }
       count++;
+      if (unsupportedTreeFile(item)) { unsupported.push(item.name); continue; }
       const row = element("li");
       if (item.kind === "directory") {
         const compact = compactDirectory(item), child = directories.get(item.path);
@@ -1691,6 +1706,7 @@ function renderDirectoryTree() {
       }
       list.append(row);
     }
+    if (unsupported.length) list.append(unsupportedFilesMarker(unsupported));
     if (state.loading) list.append(element("li", "Loading folder…", "detail"));
     if (state.error) {
       const row = element("li", state.error, "warning");

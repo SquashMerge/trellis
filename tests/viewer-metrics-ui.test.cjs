@@ -297,3 +297,22 @@ test("layer exclusions warnings remain visible with measured heat and with no in
     assert.ok(!h.get("metrics-state").textContent.includes(warning), "a normal payload clears the warning");
   }
 });
+
+test("explorer legend names the numbers' metric and shows the shared fixed bands; it is empty without decorated rows (#425)", async () => {
+  const h = harness(); await publish(h, [row("two.js", 2), row("twenty.js", 20)]);
+  const rows = ["two.js", "twenty.js"].map(path => h.controller.decorate(h.node("button"), {scope:"file", path}));
+  h.controller.renderLegend(rows);
+  const legend = h.get("explorer-metric-legend");
+  assert.match(text(legend), /Numbers: Cognitive · max · production callables · Fixed per-callable bands/);
+  const entries = legend.children.filter(node => node.className === "metric-legend-entry");
+  assert.deepEqual(entries.map(entry => [entry.children[0].className, entry.children[1].textContent]),
+    [["metric-swatch heat-0", "≤5"], ["metric-swatch heat-1", ">5–15"], ["metric-swatch heat-2", ">15–30"], ["metric-swatch heat-3", ">30"]]);
+  assert.match(rows[1].swatch.className, /heat-2/, "row swatch uses the same fixed bands as the legend");
+  h.change("metric-color", "maintainabilityIndex");
+  h.controller.renderLegend(["two.js"].map(path => h.controller.decorate(h.node("button"), {scope:"file", path})));
+  assert.match(text(h.get("explorer-metric-legend")), /Numbers: Maintainability · max .*higher is better/);
+  h.controller.renderLegend([]);
+  assert.equal(h.get("explorer-metric-legend").children.length, 0, "no numbered rows (Files section): no legend");
+  h.change("metric-color", "none"); h.controller.renderLegend([]);
+  assert.equal(h.get("explorer-metric-legend").children.length, 0);
+});
