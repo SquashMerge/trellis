@@ -289,20 +289,23 @@
     drawer("inspector", true);
   }
   let checkoutRoot = "";
+  // Last segment of a checkout root; roots may use either separator.
+  function rootName(root) { return String(root || "").split(/[\\/]/).filter(Boolean).at(-1) || ""; }
   function formatGit(git) {
     if (git?.state !== "available") return "Git unavailable";
     const head = git.head?.kind === "branch" ? git.head.name
-      : git.head?.kind === "detached" && git.head.shortCommit ? `Detached HEAD ${git.head.shortCommit}` : null;
+      : git.head?.kind === "detached" ? (git.head.shortCommit ? `Detached HEAD ${git.head.shortCommit}` : "Detached HEAD") : null;
     if (!head) return "Git unavailable";
     return git.upstream
       ? `${head} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · As of last fetch`
       : `${head} · No upstream`;
   }
   function checkoutLabel(row) {
-    const root = row?.workspaceRoot || "", name = root.split(/[\/]/).filter(Boolean).at(-1) || row?.rootKey || "Checkout";
+    const name = rootName(row?.workspaceRoot) || row?.rootKey || "Checkout";
     const git = row?.git;
-    const head = git?.state === "available" && git.head?.kind === "branch" ? git.head.name
-      : git?.state === "available" && git.head?.kind === "detached" && git.head.shortCommit ? `Detached ${git.head.shortCommit}` : "Git unavailable";
+    const head = git?.state !== "available" ? "Git unavailable"
+      : git.head?.kind === "branch" ? git.head.name
+        : git.head?.kind === "detached" ? (git.head.shortCommit ? `Detached ${git.head.shortCommit}` : "Detached") : "Git unavailable";
     const pin = row?.revision;
     const revision = pin && typeof pin.indexGeneration === "string" && Number.isSafeInteger(pin.indexRevision)
       ? `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}` : "Not indexed";
@@ -314,12 +317,12 @@
     text("workspace-git", label);
     hide("workspace-git", !checkoutRoot);
     if (get("workspace-git")) get("workspace-git").title = label;
-    text("workspace-name", checkoutRoot.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
+    text("workspace-name", rootName(checkoutRoot) || "No workspace");
     if (get("workspace-name")) get("workspace-name").title = checkoutRoot;
   }
   function updateWorkspace(status) {
     const root = status?.workspaceRoot || checkoutRoot;
-    text("workspace-name", root.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
+    text("workspace-name", rootName(root) || "No workspace");
     text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : checkoutRoot ? "Index status unavailable" : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
 
@@ -352,6 +355,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
+  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();

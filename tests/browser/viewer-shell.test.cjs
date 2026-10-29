@@ -1038,6 +1038,7 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     for (const [git, expected] of [
       [{...available, head:{...available.head, kind:"detached", name:null}}, `Detached ${available.head.shortCommit}`],
       [{state:"unavailable", reason:"not_repository"}, "Git unavailable"],
+      [{...available, head:{kind:"detached", name:null, shortCommit:null}}, "Detached"],
     ]) {
       rows[0].git = git;
       const refreshed = page.waitForResponse(response => response.url() === pattern);
@@ -1047,6 +1048,9 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
       assert.equal(await option.textContent(), `workspace ⎇ ${expected} · ${shortRevision}`);
       assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "retry retains explicit selection of the same available checkout");
     }
+    const listedGit = page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git');
+    await page.waitForFunction(() => /^Detached HEAD/.test(document.querySelector('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git')?.textContent || ""));
+    assert.doesNotMatch(await listedGit.textContent(), /Git unavailable/, "a detached HEAD without a short commit is still Git");
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
     await capture(page, "chrome-checkout-git-unavailable");
   } finally {
@@ -1054,3 +1058,66 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     await page.unroute(gitPattern, respondGit);
   }
 }, undefined, {git:true}));
+
+test("a failed job lookup reads as unavailable until Refresh retries it, and the live region skips progress-only polls", {timeout:240000}, async () => published(async ({page, paths, server, requests}) => {
+  const fixture = await chromeFixture(page, paths, server);
+  const prefix = H.scoped(server.rootKey, "");
+  const jobsPattern = `${server.base}${prefix}jobs/current`;
+  const failure = '<img src=x onerror=globalThis.jobExecuted=true> job lookup failed';
+  const failJobs = route => route.fulfill({status:500, contentType:"application/json", body:JSON.stringify({error:{code:"storage_io", message:failure}})});
+  try {
+    fixture.status.catchingUp = false;
+    fixture.status.stats.changedFiles = [];
+    assert.equal(await page.locator("#workspace-index-state").getAttribute("aria-live"), null, "the visible label is not itself a live region");
+    assert.equal(await page.locator("#workspace-index-announce").getAttribute("aria-live"), "polite");
+    await page.route(jobsPattern, failJobs);
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await assertIndexState(page, "failed", /^Index job unavailable · retry status$/);
+    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /Stale|Fresh/);
+    assert.equal(await page.locator("#workspace-index-announce").textContent(), "Index job unavailable · retry status");
+    assert.ok((await page.locator("#checkout-state").textContent()).includes(failure), "the lookup error is shown as text");
+    assert.equal(await page.locator("#checkout-state img, #workspace-index-state img, #stale img").count(), 0);
+    assert.equal(await page.evaluate(() => globalThis.jobExecuted), undefined);
+    await capture(page, "chrome-job-lookup-unavailable");
+
+    await page.unroute(jobsPattern, failJobs);
+    const retried = page.waitForResponse(response => new URL(response.url()).pathname === `${prefix}jobs/current`);
+    await page.locator("#refresh").click();
+    assert.equal((await retried).status(), 200, "Refresh retries the failed job lookup");
+    await assertIndexState(page, "fresh", /^Fresh/);
+    assert.equal(await page.locator("#checkout-state").isVisible(), false);
+
+    fixture.job = {id:"live-job", state:"running", error:null, finishedAt:null, revision:null, progress:{phase:"capture", completed:1, total:10}};
+    await page.locator("#index").click();
+    await page.waitForFunction(() => document.querySelector("#workspace-index-label")?.textContent === "Indexing · capture · 1/10");
+    assert.equal(await page.locator("#workspace-index-announce").textContent(), "Indexing · capture · 1/10");
+    fixture.job = {...fixture.job, progress:{phase:"capture", completed:6, total:10}};
+    await page.waitForFunction(() => document.querySelector("#workspace-index-label")?.textContent === "Indexing · capture · 6/10");
+    assert.equal(await page.locator("#workspace-index-announce").textContent(), "Indexing · capture · 1/10", "a progress-only poll is not announced");
+    fixture.job = {...fixture.job, state:"failed", error:{code:"index_failed", message:"fixture"}, finishedAt:1};
+    await page.waitForFunction(() => document.querySelector("#workspace-index-announce")?.textContent === "Index failed · see Diagnostics");
+    assert.equal(requests.filter(row => row.method === "POST" && row.url.pathname.endsWith("/index")).length, 1, "only the explicit Index click requests a job");
+  } finally {
+    await page.unroute(jobsPattern, failJobs).catch(() => {});
+    await fixture.close();
+  }
+}));
+
+test("an unsaved token warning stays visible in the header after a checkout is selected", {timeout:240000}, async () => published(async ({page, paths, server}) => {
+  const warning = "Browser storage is unavailable; token was not saved.";
+  await page.locator("#logout").click();
+  await page.evaluate(() => { Storage.prototype.setItem = () => { throw new DOMException("blocked", "SecurityError"); }; });
+  await page.locator("#token").fill(paths.token);
+  await page.locator("#remember-token").check();
+  await page.locator("#connect-form button[type=submit]").click();
+  await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
+  assert.ok((await page.locator("#notice").textContent()).includes(warning), "the warning is reported before selection");
+  await page.locator("#checkout-select").selectOption(server.rootKey);
+  await page.locator("#workspace").waitFor({state:"visible"});
+  await page.waitForFunction(text => document.querySelector("#checkout-state")?.textContent === text, warning);
+  assert.equal(await page.locator("#notice").isVisible(), false, "the connected browse notice row stays folded");
+  assert.equal(await page.locator("#checkout-state").isVisible(), true, "the warning remains visible once a checkout is selected");
+  const box = await page.locator("#checkout-state").boundingBox();
+  assert.ok(box && box.width > 0 && box.height > 0);
+  await capture(page, "chrome-storage-warning");
+}));

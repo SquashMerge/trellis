@@ -189,7 +189,8 @@ test("blocked storage does not prevent startup or normal connect and reports sav
   assert.equal(h.get("workspace").hidden, false);
   assert.match(h.get("notice").textContent, /storage.*unavailable|not saved/i);
   await h.run(`selectCheckout('${ROOT}')`);
-  assert.match(h.get("notice").textContent, /storage.*unavailable|not saved/i,"checkout guidance must retain a failed token-save warning");
+  // The connected notice row is hidden once a checkout is shown, so the warning moves to the header status line.
+  assert.match(h.get("checkout-state").textContent, /storage.*unavailable|not saved/i,"the selected checkout must retain a failed token-save warning");
   assert.doesNotThrow(() => h.get("logout").listeners.click());
   await h.connect("synthetic-memory-only",false);
   assert.equal(h.get("workspace").hidden,false);
