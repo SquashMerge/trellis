@@ -96,6 +96,14 @@ impl RuntimePhase {
 }
 
 impl DaemonState {
+    pub(super) fn worker_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self.test_worker_now.lock().unwrap() {
+            return now;
+        }
+        Instant::now()
+    }
+
     pub fn runtime_phase(&self) -> RuntimePhase {
         RuntimePhase::of(&self.runtime.lock().unwrap())
     }
@@ -174,6 +182,14 @@ impl DaemonState {
         &self,
         work_pending: impl FnOnce() -> anyhow::Result<Option<bool>>,
     ) -> anyhow::Result<bool> {
+        if self
+            .recovery_retry_after
+            .lock()
+            .unwrap()
+            .is_some_and(|retry| self.worker_now() < retry)
+        {
+            return Ok(false);
+        }
         match &*self.runtime.lock().unwrap() {
             RuntimeState::Reconciling { .. } => return Ok(true),
             RuntimeState::Activating => {}
@@ -257,6 +273,10 @@ impl DaemonState {
         retained: Option<(Arc<WriterSession>, Option<IndexOptions>)>,
     ) -> anyhow::Result<Arc<WriterSession>> {
         self.store.settle_foreign_root_requests()?;
+        #[cfg(test)]
+        if let Some(error) = self.test_startup_error.lock().unwrap().take() {
+            return Err(error);
+        }
         #[cfg(feature = "test-support")]
         {
             let hook = self.startup_hook.lock().unwrap().take();
@@ -369,13 +389,13 @@ impl DaemonState {
                     *backoff = backoff.saturating_mul(2).min(STARTUP_BACKOFF_MAX);
                     delay
                 };
-                *self.recovery_retry_after.lock().unwrap() = Some(Instant::now() + delay);
+                *self.recovery_retry_after.lock().unwrap() = Some(self.worker_now() + delay);
                 if let RuntimeState::Reconciling { waiting, .. } =
                     &mut *self.runtime.lock().unwrap()
                 {
                     *waiting = true;
                 }
-                if crate::store::transient_storage_contention(&error) {
+                if crate::store::nonterminal_storage_busy(&error) {
                     self.note_state_change();
                     return Ok(());
                 }
@@ -498,9 +518,18 @@ impl DaemonState {
         }
     }
 
+    fn failed_step_retry(&self) -> Instant {
+        let now = self.worker_now();
+        self.recovery_retry_after
+            .lock()
+            .unwrap()
+            .filter(|retry| *retry > now)
+            .unwrap_or(now + STEP_RETRY)
+    }
+
     /// When the worker next has work, if nothing wakes it first.
     fn next_wake(&self) -> Option<Instant> {
-        let now = Instant::now();
+        let now = self.worker_now();
         if self.step_progress.swap(false, Ordering::AcqRel) {
             return Some(now);
         }
@@ -992,9 +1021,17 @@ impl Drop for AdmissionLease {
 }
 
 fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
-    let mut deadline = Some(Instant::now());
+    worker_loop_with_wait(weak, inbox.clone(), |deadline| inbox.wait(deadline));
+}
+
+fn worker_loop_with_wait(
+    weak: std::sync::Weak<DaemonState>,
+    inbox: Arc<WorkerInbox>,
+    mut wait: impl FnMut(Option<Instant>),
+) {
+    let mut deadline = weak.upgrade().map(|state| state.worker_now());
     loop {
-        inbox.wait(deadline);
+        wait(deadline);
         crate::index_coordinator::diagnostic_marker("-", "worker_wake", "");
         if inbox.shutdown.load(Ordering::Acquire) {
             return;
@@ -1021,18 +1058,21 @@ fn worker_loop(weak: std::sync::Weak<DaemonState>, inbox: Arc<WorkerInbox>) {
                     std::io::stderr(),
                     format_args!("checkout worker step failed: {error:#}\n"),
                 );
-                Some(Instant::now() + STEP_RETRY)
+                Some(state.failed_step_retry())
             }
             Err(_) => {
                 super::best_effort_queue_stderr(
                     std::io::stderr(),
                     format_args!("checkout worker step failed: panicked\n"),
                 );
-                Some(Instant::now() + STEP_RETRY)
+                Some(state.failed_step_retry())
             }
         };
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod missing_index_tests {
