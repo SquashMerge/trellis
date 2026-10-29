@@ -2036,9 +2036,12 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                     if ambiguous_call {
                         2
                     } else {
-                        usize::from(call_witness && !alias_case)
+                        // The use at the exact measured callee is the call, with or
+                        // without an enclosing range (#444); the alias and write sites
+                        // are not callees.
+                        usize::from(!alias_case && !write_case)
                     },
-                    "{language}: authenticated call role controls selected binding"
+                    "{language}: exact measured callee controls selected binding"
                 );
                 if ambiguous_call {
                     assert!(selected.call_bindings.iter().all(|c| c.resolution

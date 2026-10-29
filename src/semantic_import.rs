@@ -1357,14 +1357,25 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     } else {
         None
     };
+    // The measured call this use occurrence names (#444). SCIP has no call role, and
+    // scip-typescript, scip-java and scip-python never give a reference an enclosing range,
+    // so the occurrence's exact span on one measured callee identifies the call by itself.
+    // A producer-supplied enclosing range must still join exactly to that same call.
+    let witness = match &invocation {
+        Some(j) => (j.status == semantic::JoinStatus::Exact
+            && (call.status != semantic::JoinStatus::Exact
+                || call.candidate_ids == j.candidate_ids))
+            .then_some(j),
+        None => (roles & 1 == 0 && call.status == semantic::JoinStatus::Exact).then_some(&call),
+    };
     if reference.status == semantic::JoinStatus::Exact {
         let r = store
             .reference_of(&doc, &reference.candidate_ids[0])?
             .context("missing indexed native reference")?;
         let declaration_site = roles & 1 != 0
             && store.has_declaration_name(&doc, r.range.start, r.range.end, &r.spelling)?;
-        let is_call = match &invocation {
-            Some(j) if j.status == semantic::JoinStatus::Exact => store
+        let is_call = match witness {
+            Some(j) => store
                 .calls_with_id(&doc, &j.candidate_ids[0], operation)?
                 .iter()
                 .any(|c| {
@@ -1377,10 +1388,8 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                         && c.callee_range
                             .as_ref()
                             .is_none_or(|callee| callee == &r.range)
-                        && (call.status != semantic::JoinStatus::Exact
-                            || call.candidate_ids == j.candidate_ids)
                 }),
-            _ => false,
+            None => false,
         };
         store.reserve_operation(
             operation,
@@ -1543,10 +1552,7 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         out.join(&claim.captured_proof_id, &call)?;
         if candidate.status == semantic::JoinStatus::Exact
             && reference.status == semantic::JoinStatus::Exact
-            && invocation.as_ref().is_some_and(|j| {
-                j.status == semantic::JoinStatus::Exact
-                    && j.candidate_ids == candidate.candidate_ids
-            })
+            && witness.is_some_and(|j| j.candidate_ids == candidate.candidate_ids)
         {
             let actual = store.call_of(&doc, &candidate.candidate_ids[0])?;
             let owning_references =

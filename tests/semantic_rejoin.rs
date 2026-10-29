@@ -1601,10 +1601,16 @@ fn same_target_plain_reference_claims_keep_roles_and_every_raw_proof() {
         let reference = references[0];
         assert_eq!(reference.resolution, semantic::Resolution::Resolved);
         assert!(reference.candidates.is_empty());
+        // `target` is the exact measured callee of `target()`, so both claims also name the
+        // call even without an enclosing range (#444).
         let expected_roles = if repeated_roles == 4 {
-            vec![semantic::Role::Read, semantic::Role::Write]
+            vec![
+                semantic::Role::Read,
+                semantic::Role::Write,
+                semantic::Role::Call,
+            ]
         } else {
-            vec![semantic::Role::Read]
+            vec![semantic::Role::Read, semantic::Role::Call]
         };
         assert_eq!(reference.roles, expected_roles);
         let coverage = result
