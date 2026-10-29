@@ -850,7 +850,7 @@ impl<'a> JoinStore for StagedSide<'a> {
             .as_ref()
             .and_then(|maps| maps.get(&encoding))
             .context("missing SCIP coordinate map")?;
-        mapped_range(endpoints, offsets)
+        mapped_range(claim, endpoints, offsets)
     }
 
     fn role_sites(&self, document: &native::DocumentKey) -> Result<RoleSites> {
@@ -1788,6 +1788,10 @@ impl StagedJoin<'_> {
                 continue;
             }
             let range = self.captured.occurrence_range(&claim, enc)?;
+            if range.start == range.end {
+                self.mark("eligible", &doc.language, &doc.path)?;
+                continue;
+            }
             let roles = claim.envelope.raw["symbolRoles"]
                 .as_u64()
                 .context("invalid raw roles")?;

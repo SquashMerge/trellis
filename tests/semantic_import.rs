@@ -355,9 +355,6 @@ fn admitted_case_with_calls(
 ) {
     use protobuf::{EnumOrUnknown, Message};
     use scip::types::{self};
-    let root = tempfile::tempdir().unwrap();
-    let physical = fs::canonicalize(root.path()).unwrap();
-    fs::create_dir(physical.join("src")).unwrap();
     let (path, producer_name, encoding) = match language {
         "java" => ("src/A.java", "scip-java", 2),
         "javascript" => ("src/A.js", "scip-typescript", 2),
@@ -365,7 +362,6 @@ fn admitted_case_with_calls(
         "rust" => ("src/A.rs", "rust-analyzer", 1),
         _ => panic!("unsupported test language"),
     };
-    fs::write(physical.join(path), source).unwrap();
     let mut index = types::Index::new();
     let mut document = types::Document::new();
     document.language = language.into();
@@ -415,13 +411,32 @@ fn admitted_case_with_calls(
     }
     index.documents.push(document);
     let bytes = index.write_to_bytes().unwrap();
-    fs::write(physical.join("artifact.scip"), &bytes).unwrap();
+    admitted_artifact_case(language, producer_name, path, source, &bytes)
+}
+
+fn admitted_artifact_case(
+    language: &str,
+    producer_name: &str,
+    path: &str,
+    source: &str,
+    bytes: &[u8],
+) -> (
+    tempfile::TempDir,
+    native::Artifact,
+    BTreeMap<native::DocumentKey, Vec<u8>>,
+    CapturedScipInventory,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let physical = fs::canonicalize(root.path()).unwrap();
+    fs::create_dir_all(physical.join(path).parent().unwrap()).unwrap();
+    fs::write(physical.join(path), source).unwrap();
+    fs::write(physical.join("artifact.scip"), bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(physical.clone());
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let inventory = admit(&capture, producer_name, language, &bytes, &cancel);
+    let inventory = admit(&capture, producer_name, language, bytes, &cancel);
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture
         .files
@@ -438,6 +453,210 @@ fn admitted_case_with_calls(
         })
         .collect();
     (root, native, sources, inventory)
+}
+
+// First documents emitted by scip-typescript and scip-python for the producer
+// fixtures in issue #420. Preserve the actual marker roles, symbol, absent kind,
+// and (for TypeScript) enclosing range instead of inventing a module enum kind.
+const JAVASCRIPT_MODULE_DOCUMENT: &str = concat!(
+    "0a087372632f612e6a7312500a030000001241736369702d74797065736372697074206e706d207472656c6c69732d70",
+    "726f64756365722d666978747572652d6a7320312e302e30207372632f60612e6a73602f18013a040000030012580a03",
+    "0010151249736369702d74797065736372697074206e706d207472656c6c69732d70726f64756365722d666978747572",
+    "652d6a7320312e302e30207372632f60612e6a73602f677265657428292e18013a040000020112580a0300161a124f73",
+    "6369702d74797065736372697074206e706d207472656c6c69732d70726f64756365722d666978747572652d6a732031",
+    "2e302e30207372632f60612e6a73602f677265657428292e286e616d6529180112560a03011418124f736369702d7479",
+    "7065736372697074206e706d207472656c6c69732d70726f64756365722d666978747572652d6a7320312e302e302073",
+    "72632f60612e6a73602f677265657428292e286e616d65291a5c0a41736369702d74797065736372697074206e706d20",
+    "7472656c6c69732d70726f64756365722d666978747572652d6a7320312e302e30207372632f60612e6a73602f1a1760",
+    "606074730a6d6f64756c652022612e6a73220a6060601a780a49736369702d74797065736372697074206e706d207472",
+    "656c6c69732d70726f64756365722d666978747572652d6a7320312e302e30207372632f60612e6a73602f6772656574",
+    "28292e1a2b60606074730a66756e6374696f6e206772656574286e616d653a20616e79293a20737472696e670a606060",
+    "1a720a4f736369702d74797065736372697074206e706d207472656c6c69732d70726f64756365722d66697874757265",
+    "2d6a7320312e302e30207372632f60612e6a73602f677265657428292e286e616d65291a1f60606074730a2870617261",
+    "6d6574657229206e616d653a20616e790a606060",
+);
+
+const PYTHON_MODULE_DOCUMENT: &str = concat!(
+    "0a0f706b672f5f5f696e69745f5f2e7079123d0a030000001234736369702d707974686f6e20707974686f6e20747265",
+    "6c6c69732d776f726b7370616365203020706b672f5f5f696e69745f5f3a1801123c0a030000071233736369702d7079",
+    "74686f6e20707974686f6e207472656c6c69732d776f726b7370616365203020706b672f56455253494f4e2e18011a44",
+    "0a34736369702d707974686f6e20707974686f6e207472656c6c69732d776f726b7370616365203020706b672f5f5f69",
+    "6e69745f5f3a1a0c286d6f64756c652920706b671a510a33736369702d707974686f6e20707974686f6e207472656c6c",
+    "69732d776f726b7370616365203020706b672f56455253494f4e2e1a1a606060707974686f6e0a6275696c74696e732e",
+    "7374720a606060",
+);
+
+fn real_module_document(language: &str) -> (scip::types::Document, &'static str, &'static str) {
+    use protobuf::Message;
+    let (wire, producer, source) = match language {
+        "javascript" => (
+            JAVASCRIPT_MODULE_DOCUMENT,
+            "scip-typescript",
+            "export function greet(name) {\n  return \"hello \" + name;\n}\n",
+        ),
+        "python" => (PYTHON_MODULE_DOCUMENT, "scip-python", "VERSION = \"1\"\n"),
+        _ => unreachable!(),
+    };
+    (
+        scip::types::Document::parse_from_bytes(&hex::decode(wire).unwrap()).unwrap(),
+        producer,
+        source,
+    )
+}
+
+fn assert_real_module_marker_joins_without_invented_anchor(language: &str) {
+    use protobuf::Message;
+    let (document, producer, source) = real_module_document(language);
+    let path = document.relative_path.clone();
+    let marker = &document.occurrences[0];
+    assert_eq!(marker.range, vec![0, 0, 0]);
+    assert_eq!(marker.symbol_roles, 1);
+    assert_eq!(document.symbols[0].kind.value(), 0);
+    let marker_symbol = marker.symbol.clone();
+    let mut index = scip::types::Index::new();
+    index.documents.push(document);
+    let bytes = index.write_to_bytes().unwrap();
+    let (_root, native, sources, inventory) =
+        admitted_artifact_case(language, producer, &path, source, &bytes);
+    let raw_marker = inventory
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.envelope.record_kind == "occurrence"
+                && claim.envelope.raw["symbol"] == marker_symbol
+        })
+        .unwrap();
+    assert_eq!(
+        raw_marker.envelope.raw["range"],
+        json!({"encoding":"legacy","values":[0,0,0]})
+    );
+    assert_eq!(raw_marker.envelope.raw["symbolRoles"], 1);
+    let retained = (
+        raw_marker.envelope.raw.clone(),
+        raw_marker.canonical_bytes.clone(),
+        raw_marker.captured_proof_id.clone(),
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2)
+        .expect("real producer module definition must not abort the complete join");
+    assert_eq!(
+        retained,
+        (
+            raw_marker.envelope.raw.clone(),
+            raw_marker.canonical_bytes.clone(),
+            raw_marker.captured_proof_id.clone(),
+        ),
+        "joining must retain the captured raw marker and proof"
+    );
+    let symbol_claim = inventory
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.envelope.record_kind == "symbolInformation"
+                && claim.envelope.raw["symbol"] == marker_symbol
+        })
+        .unwrap();
+    let symbol = output
+        .symbols
+        .iter()
+        .find(|symbol| symbol.provenance_id == symbol_claim.captured_proof_id)
+        .expect("module symbol must be retained");
+    assert!(symbol.declarations.is_empty());
+    assert!(output.joins.iter().all(|(proof, join)| {
+        proof != &raw_marker.captured_proof_id && join.anchor.range.start < join.anchor.range.end
+    }));
+    assert!(
+        output
+            .declaration_bindings
+            .iter()
+            .all(|binding| { binding.provenance_id != raw_marker.captured_proof_id })
+    );
+    assert!(
+        output
+            .call_bindings
+            .iter()
+            .all(|binding| { binding.provenance_id != raw_marker.captured_proof_id })
+    );
+    assert!(
+        output
+            .references
+            .iter()
+            .all(|reference| { reference.provenance_id != raw_marker.captured_proof_id })
+    );
+    assert!(
+        output.declaration_bindings.iter().any(|binding| {
+            binding.join.status == semantic::JoinStatus::Exact && binding.syntax_id.is_some()
+        }),
+        "ordinary declarations in the same emitted document still join"
+    );
+}
+
+#[test]
+fn real_typescript_module_marker_joins_without_invented_anchor() {
+    assert_real_module_marker_joins_without_invented_anchor("javascript");
+}
+
+#[test]
+fn real_python_module_marker_joins_without_invented_anchor() {
+    assert_real_module_marker_joins_without_invented_anchor("python");
+}
+
+#[test]
+fn module_marker_exception_rejects_other_empty_occurrences() {
+    for (language, symbol, roles, kind) in [
+        ("javascript", "scip-typescript npm pkg 1.0.0 f().", 1, 17),
+        ("javascript", "scip-typescript npm pkg 1.0.0 C#", 1, 7),
+        (
+            "javascript",
+            "scip-typescript npm pkg 1.0.0 src/`A.js`/",
+            0,
+            0,
+        ),
+        ("python", "scip-python python pkg 0 f().", 1, 17),
+        ("python", "scip-python python pkg 0 C#", 1, 7),
+        ("python", "scip-python python pkg 0 `src.A`/__init__:", 8, 0),
+    ] {
+        let source = if language == "python" {
+            "value = 1\n"
+        } else {
+            "let value = 1;\n"
+        };
+        let (_root, native, sources, inventory) = admitted_case(
+            language,
+            source,
+            vec![(0, 0, symbol, roles)],
+            vec![(symbol, kind, vec![])],
+        );
+        assert!(
+            join_inventory(&inventory, &native, &sources, 2).is_err(),
+            "empty non-module-definition occurrence must fail: {language} {symbol} roles={roles}"
+        );
+    }
+}
+
+#[test]
+fn module_marker_exception_rejects_reversed_ranges() {
+    use trellis::semantic_import::occurrence_range;
+    let (_root, _native, sources, inventory) = fixture();
+    let source = sources.values().next().unwrap();
+    let mut claim = inventory
+        .claims
+        .iter()
+        .find(|claim| claim.envelope.record_kind == "occurrence")
+        .unwrap()
+        .clone();
+    for symbol in [
+        "scip-typescript npm pkg 1.0.0 src/`a.js`/",
+        "scip-typescript npm pkg 1.0.0 f().",
+        "scip-python python pkg 0 pkg/__init__:",
+        "scip-python python pkg 0 f().",
+    ] {
+        claim.envelope.raw["symbol"] = json!(symbol);
+        claim.envelope.raw["range"] = json!({"encoding":"legacy","values":[0,1,0]});
+        assert!(
+            occurrence_range(&claim, source, 2).is_err(),
+            "reversed {symbol}"
+        );
+    }
 }
 
 #[test]
