@@ -279,3 +279,21 @@ test("excluded file counts use selected minus raw exactly once and sum requires 
   const count = h.requests.length; h.change("metric-relative", true); h.controller.renderLegend([item]);
   assert.match(item.swatch.className, /heat-0/); assert.equal(h.requests.length, count);
 });
+
+
+test("layer exclusions warnings remain visible with measured heat and with no indexed files", async () => {
+  const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
+  for (const rows of [[row("measured.js", 7)], []]) {
+    const h = harness(); await publish(h, rows, {layerExclusionsWarning:warning});
+    assert.ok(h.get("metrics-state").textContent.endsWith(warning));
+    assert.match(text(h.get("metrics-state")), /Indexed snapshot · max · production callables/);
+    assert.equal(h.get("metrics-state").children.length, 0, "warning is plain state text");
+    if (rows.length) {
+      const decoration = h.controller.decorate(h.node("button"), {scope:"file",path:"measured.js"});
+      h.controller.renderLegend([decoration]);
+      assert.match(text(decoration.node), /7/); assert.match(decoration.swatch.className, /heat-1/);
+    }
+    await publish(h, rows);
+    assert.ok(!h.get("metrics-state").textContent.includes(warning), "a normal payload clears the warning");
+  }
+});

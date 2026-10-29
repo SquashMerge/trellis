@@ -1279,12 +1279,17 @@ pub struct MetricsTopCognitiveScore {
     pub cyclomatic: usize,
     pub max_nesting: usize,
 }
+const LAYER_EXCLUSIONS_WARNING: &str =
+    "Rules unavailable; layer-based heat exclusions were not applied.";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsPayload {
     pub metrics_version: &'static str,
     pub role: String,
     pub workbench: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_exclusions_warning: Option<&'static str>,
     pub index_generation: String,
     pub index_revision: u64,
     pub scope: String,
@@ -1631,6 +1636,7 @@ impl EvidenceResponse {
                 ..MetricsOptions::default()
             },
             Some(config),
+            true,
             check,
         )?;
         let files: BTreeMap<_, _> = metrics
@@ -2063,18 +2069,27 @@ impl EvidenceResponse {
     ) -> Result<MetricsPayload> {
         options.validate()?;
         check()?;
-        let config = if options.workbench {
-            crate::rules::load(Path::new(self.store.workspace_root()))?
+        let (config, invalid_rules) = if options.workbench {
+            match crate::rules::load(Path::new(self.store.workspace_root())) {
+                Ok(config) => (config, false),
+                Err(error) if crate::rules::diagnostic(&error).is_some() => (None, true),
+                Err(error) => return Err(error),
+            }
         } else {
-            None
+            (None, false)
         };
-        self.metrics_at_with_config(options, config.as_ref(), check)
+        let mut payload = self.metrics_at_with_config(options, config.as_ref(), false, check)?;
+        if invalid_rules {
+            payload.layer_exclusions_warning = Some(LAYER_EXCLUSIONS_WARNING);
+        }
+        Ok(payload)
     }
 
     fn metrics_at_with_config(
         &self,
         options: &MetricsOptions,
         config: Option<&crate::rules::Config>,
+        strict_rules: bool,
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<MetricsPayload> {
         let progress = MetricsReadCheck {
@@ -2135,16 +2150,24 @@ impl EvidenceResponse {
         if options.scope != "revision" && included.is_empty() {
             anyhow::bail!("not_found: metrics selector");
         }
+        let mut layer_exclusions_warning = None;
         let hidden_layers = if options.workbench && options.role == "production" {
             if let Some(config) = config {
-                crate::rules::hidden_layer_paths(
+                match crate::rules::hidden_layer_paths(
                     config,
                     &included
                         .iter()
                         .map(|key| key.path.as_str())
                         .collect::<Vec<_>>(),
                     &mut || progress.check(),
-                )?
+                ) {
+                    Ok(paths) => paths,
+                    Err(error) if !strict_rules && crate::rules::diagnostic(&error).is_some() => {
+                        layer_exclusions_warning = Some(LAYER_EXCLUSIONS_WARNING);
+                        BTreeSet::new()
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 BTreeSet::new()
             }
@@ -2628,6 +2651,7 @@ impl EvidenceResponse {
             metrics_version: crate::metrics::VERSION,
             role: options.role.clone(),
             workbench: options.workbench,
+            layer_exclusions_warning,
             index_generation: selected.pin.index_generation.to_string(),
             index_revision: selected.pin.index_revision,
             scope: options.scope.clone(),

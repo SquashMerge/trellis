@@ -1078,7 +1078,28 @@ async fn workbench_metrics_option_is_explicit_and_strict() {
     fs::write(base.path().join("checkout/.trellis/rules.toml"), "bad toml").unwrap();
     let (status, data) = request(app.clone(), &key, "?workbench=false").await;
     assert_eq!(status, StatusCode::OK, "{data}");
-    let (status, data) = request(app, &key, "?workbench=true").await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{data}");
+    assert!(data["payload"].get("layerExclusionsWarning").is_none());
+    let (status, data) = request(app.clone(), &key, "?workbench=true").await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert_eq!(
+        data["payload"]["layerExclusionsWarning"],
+        "Rules unavailable; layer-based heat exclusions were not applied."
+    );
+    assert!(!data["payload"]["files"].as_array().unwrap().is_empty());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/checkouts/{key}/architecture?workbench=true"))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let data: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
     assert_eq!(data["error"]["code"], "invalid_rules");
 }

@@ -244,3 +244,26 @@ test("excluded file rows retain physical area, exact reasons, raw populations an
   assert.match(text(h.get("treemap-inspector-content")), /Excluded from heat: fixture/);
   assert.match(h.get("treemap-state").textContent, /9 physical file lines.*8 callables excluded from heat.*1 fixture files/);
 });
+
+
+test("layer exclusions warning preserves measured paint and stays visible in empty scopes", async () => {
+  const h = harness(), dto = fixture();
+  const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
+  dto.layerExclusionsWarning = warning;
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  assert.equal(h.get("treemap-state").dataset.state, "ready");
+  assert.ok(h.get("treemap-state").textContent.endsWith(warning));
+  const rendered = h.renders.at(-1), measured = rendered.files.find(row => row.declarationCount > 0);
+  assert.equal(rendered.options.fileValue(measured), 3); assert.equal(rendered.options.fileBand(measured), 0);
+  assert.ok(h.get("treemap-files").children.length > 0); assert.ok(h.get("treemap-diagram").children.length > 0);
+  assert.equal(h.get("treemap-state").children.length, 0, "warning is plain state text");
+  h.get("treemap-path").value = "no-matching-files"; await h.get("treemap-path").fire("input");
+  assert.equal(h.get("treemap-state").dataset.state, "empty");
+  assert.match(h.get("treemap-state").textContent, /No indexed files match/);
+  assert.ok(h.get("treemap-state").textContent.endsWith(warning));
+  h.setResponse(async () => ({payload:{...dto,files:[]}})); await h.controller.refresh();
+  assert.equal(h.get("treemap-state").dataset.state, "empty");
+  assert.ok(h.get("treemap-state").textContent.endsWith(warning));
+  h.setResponse(async () => ({payload:fixture()})); await h.controller.refresh();
+  assert.ok(!h.get("treemap-state").textContent.includes(warning), "a normal payload clears the warning");
+});

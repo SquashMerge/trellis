@@ -11,7 +11,7 @@
   const identity = file => JSON.stringify([file.sourceSetId, file.language, file.path]);
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const display = value => finite(value) ? String(value) : "—";
-  const {metricValue, quartiles, relativeBand:band, createScale} = window.TrellisMetricHeat;
+  const {metricValue, quartiles, relativeBand:band, createScale, exclusions} = window.TrellisMetricHeat;
   const classification = file => file.roleCounts.production > 0 ? (file.roleCounts.test > 0 ? "mixed" : "production") : file.roleCounts.test > 0 ? "test" : "none";
   const testFile = file => file.fileRole === "test" || classification(file) === "test";
   const count = value => Number.isSafeInteger(value) && value >= 0;
@@ -20,13 +20,6 @@
     let serial = 0, renderSerial = 0, selectionSerial = 0, navigationSerial = 0, view = null, basis = null, selectedKey = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, hideTests = true, path = "", language = "", scope = null;
     const population = () => role === "all" ? "all indexed callables" : "production callables";
-    function exclusions(rows) {
-      const hidden = rows.reduce((sum, row) => sum + Math.max(0,
-        (row.roleCounts?.production ?? 0) + (row.roleCounts?.test ?? 0) - row.declarationCount), 0);
-      const reasons = [["fixture", "fixture"], ["vendored", "vendored"], ["hidden_layer", "authored hidden-layer"]]
-        .map(([reason, label]) => `${rows.filter(row => row.excludedReason === reason).length} ${label} files`);
-      return `${hidden} callables excluded from heat · excluded files: ${reasons.join(", ")}`;
-    }
     const state = (message, kind = "ready") => { get("treemap-state").textContent = message; get("treemap-state").dataset.state = kind; };
     const paragraph = (target, message) => target.append(make("p", message));
     function capture() {
@@ -166,7 +159,8 @@
           button.addEventListener("click", () => inspect(file, interactive)); get("treemap-files").append(button);
         }
         const total = files.reduce((sum, file) => sum + file.physicalLines, 0);
-        state(files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.", files.length ? "ready" : "empty");
+        const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.";
+        state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
       } catch (error) {
         if (!active()) return;

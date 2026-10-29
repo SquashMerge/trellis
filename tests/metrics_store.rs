@@ -1404,9 +1404,15 @@ fn workbench_missing_rules_keeps_explicit_path_exclusions_only() {
 }
 
 #[test]
-fn workbench_rules_faults_are_typed_and_ordinary_metrics_ignore_rules() {
-    let (_state, root, store, pin) =
-        fixture_with_sources(&[("src/input.js", "function input() {}\n")]);
+fn workbench_rules_faults_warn_without_losing_heat_or_explicit_exclusions() {
+    let (_state, root, store, pin) = fixture_with_sources(&[
+        ("src/input.js", "function input() {}\n"),
+        (
+            "tools/synthetic-cohorts/templates/input.js",
+            "function fixture() {}\n",
+        ),
+        ("web/vendor/bundle.js", "function vendor() {}\n"),
+    ]);
     fs::create_dir(root.path().join(".trellis")).unwrap();
     for text in [
         "not valid toml",
@@ -1420,8 +1426,14 @@ fn workbench_rules_faults_are_typed_and_ordinary_metrics_ignore_rules() {
             ..Default::default()
         };
         let ordinary = response.metrics_at(&options, &mut || Ok(())).unwrap();
-        assert_eq!(ordinary.files[0].declaration_count, 1);
-        let error = response
+        assert!(ordinary.layer_exclusions_warning.is_none());
+        assert!(
+            ordinary
+                .files
+                .iter()
+                .all(|file| file.declaration_count == 1)
+        );
+        let data = response
             .metrics_at(
                 &MetricsOptions {
                     workbench: true,
@@ -1429,8 +1441,19 @@ fn workbench_rules_faults_are_typed_and_ordinary_metrics_ignore_rules() {
                 },
                 &mut || Ok(()),
             )
-            .unwrap_err();
-        assert!(trellis::rules::diagnostic(&error).is_some(), "{error:#}");
+            .unwrap();
+        assert!(data.layer_exclusions_warning.is_some());
+        let production = data
+            .files
+            .iter()
+            .find(|file| file.path == "src/input.js")
+            .unwrap();
+        assert_eq!(production.declaration_count, 1);
+        assert_eq!(production.metrics["cyclomatic"], 1);
+        for file in data.files.iter().filter(|file| file.path != "src/input.js") {
+            assert_eq!(file.declaration_count, 0);
+            assert!(file.excluded_reason.is_some());
+        }
         response.finish(()).unwrap();
     }
 }

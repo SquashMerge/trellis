@@ -10,7 +10,7 @@
   };
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const display = value => finite(value) ? String(value) : "—";
-  const {metricValue, quartiles, relativeBand:band, createScale} = window.TrellisMetricHeat;
+  const {metricValue, quartiles, relativeBand:band, createScale, exclusions} = window.TrellisMetricHeat;
   const pair = value => value && typeof value.indexGeneration === "string" &&
     Number.isSafeInteger(value.indexRevision) && value.indexRevision >= 0
     ? {indexGeneration:value.indexGeneration, indexRevision:value.indexRevision} : null;
@@ -24,13 +24,6 @@
     let decorations = [];
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
-    function exclusions(rows) {
-      const hidden = rows.reduce((sum, row) => sum + Math.max(0,
-        (row.roleCounts?.production ?? 0) + (row.roleCounts?.test ?? 0) - row.declarationCount), 0);
-      const reasons = [["fixture", "fixture"], ["vendored", "vendored"], ["hidden_layer", "authored hidden-layer"]]
-        .map(([reason, label]) => `${rows.filter(row => row.excludedReason === reason).length} ${label} files`);
-      return `${hidden} callables excluded from heat · excluded files: ${reasons.join(", ")}`;
-    }
     const text = (id, value) => { if (get(id)) get(id).textContent = value; };
     function capture() {
       const now = context();
@@ -108,7 +101,7 @@
         const data = await request(url("revision", guard));
         if (!current(guard) || serial !== refreshSerial) return;
         projection = payloadOf(data, guard, "revision"); projectionGuard = guard; loading = false;
-        text("metrics-state", `Indexed snapshot · ${aggregate} · ${population()} · ${exclusions(projection.files)}${data.catchingUp ? " · index catching up" : ""}`);
+        text("metrics-state", `Indexed snapshot · ${aggregate} · ${population()} · ${exclusions(projection.files)}${data.catchingUp ? " · index catching up" : ""}${projection.layerExclusionsWarning ? ` · ${projection.layerExclusionsWarning}` : ""}`);
         onChange();
         if (selected) await inspect(selected);
       } catch (error) {

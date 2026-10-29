@@ -16,7 +16,7 @@
     : JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
   const targetLabel = identity => external(identity)
     ? `${identity.package} (${identity.language}${identity.standardLibrary ? " stdlib" : " package"})` : identity.path;
-  const {metricValue, quartiles, relativeBand:band, createScale} = window.TrellisMetricHeat;
+  const {metricValue, quartiles, relativeBand:band, createScale, exclusions} = window.TrellisMetricHeat;
   const labels = {loc:"LOC (callable ranges)", sloc:"SLOC (callable ranges)", commentLines:"Comment lines (callable ranges)",
     cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
     fanOut:"Fan-out (call sites)", fanIn:"Fan-in", halstead:"Halstead", parameters:"Parameters", exits:"Exits"};
@@ -26,13 +26,6 @@
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
-    function exclusions(rows) {
-      const hidden = rows.reduce((sum, row) => sum + Math.max(0,
-        (row.roleCounts?.production ?? 0) + (row.roleCounts?.test ?? 0) - row.declarationCount), 0);
-      const reasons = [["fixture", "fixture"], ["vendored", "vendored"], ["hidden_layer", "authored hidden-layer"]]
-        .map(([reason, label]) => `${rows.filter(row => row.excludedReason === reason).length} ${label} files`);
-      return `${hidden} callables excluded from heat · excluded files: ${reasons.join(", ")}`;
-    }
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();

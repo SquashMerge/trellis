@@ -6,7 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const window = {};
 vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8"), {window});
-const {createScale, quartiles, metricValue, relativeBand} = window.TrellisMetricHeat;
+const {createScale, quartiles, metricValue, relativeBand, exclusions} = window.TrellisMetricHeat;
 const plain = value => JSON.parse(JSON.stringify(value));
 
 const cutsByMetric = {
@@ -118,4 +118,19 @@ test("metricValue reads nested leaves without replacing unavailable data", () =>
   assert.equal(metricValue(metrics, "halstead.volume"), 500);
   assert.equal(metricValue(metrics, "fanIn.value"), null);
   assert.equal(metricValue(undefined, "halstead.volume"), undefined);
+});
+
+
+test("exclusions count raw minus selected callables once per row and count each excluded file once", () => {
+  const rows = [
+    {roleCounts:{production:2,test:3},declarationCount:2},
+    {roleCounts:{production:4,test:1},declarationCount:0,excludedReason:"fixture"},
+    {roleCounts:{production:2,test:0},declarationCount:0,excludedReason:"vendored"},
+    {roleCounts:{production:1,test:2},declarationCount:0,excludedReason:"hidden_layer"},
+    {roleCounts:{production:1,test:0},declarationCount:2},
+    {declarationCount:0},
+  ];
+  assert.equal(exclusions(rows), "13 callables excluded from heat · excluded files: 1 fixture files, 1 vendored files, 1 authored hidden-layer files");
+  assert.equal(exclusions([]), "0 callables excluded from heat · excluded files: 0 fixture files, 0 vendored files, 0 authored hidden-layer files");
+  assert.match(exclusions([{roleCounts:{production:2,test:3},declarationCount:5}]), /^0 callables/);
 });

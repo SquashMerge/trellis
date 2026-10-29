@@ -10,6 +10,13 @@
     fanOut:[7, 15, 30],
     "halstead.volume":[500, 1000, 2000],
   };
+  function exclusions(rows) {
+    const hidden = rows.reduce((sum, row) => sum + Math.max(0,
+      (row.roleCounts?.production ?? 0) + (row.roleCounts?.test ?? 0) - row.declarationCount), 0);
+    const reasons = [["fixture", "fixture"], ["vendored", "vendored"], ["hidden_layer", "authored hidden-layer"]]
+      .map(([reason, label]) => `${rows.filter(row => row.excludedReason === reason).length} ${label} files`);
+    return `${hidden} callables excluded from heat · excluded files: ${reasons.join(", ")}`;
+  }
   const metricValue = (metrics, name) => name.split(".").reduce((value, key) => value?.[key], metrics);
   const quartiles = values => {
     const sorted = values.filter(finite).sort((a, b) => a - b);
@@ -48,5 +55,5 @@
     if (!values.some(finite)) return {band:() => null, label:`${label} · No measured values · — unavailable, not zero`, entries};
     return {band:value => finite(value) ? classify(value) : null, label, entries};
   }
-  window.TrellisMetricHeat = {createScale, quartiles, metricValue, relativeBand};
+  window.TrellisMetricHeat = {createScale, quartiles, metricValue, relativeBand, exclusions};
 })();

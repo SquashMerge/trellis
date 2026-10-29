@@ -68,7 +68,11 @@ matcher to authored `display="hidden"` layers. The **Include tests and fixtures 
 metrics** checkbox requests `role=all` and restores those tests/fixtures/hidden-layer
 contributions. Expanding a layer, quiet-layer folding, path filtering and client
 visibility do not change this selected callable population. Missing rules add no
-layer exclusions; explicit fixture roots still apply.
+layer exclusions; explicit fixture roots still apply. Invalid or unreadable rules, including
+ambiguous layer membership, also leave metrics heat available without layer-based exclusions.
+The metrics payload carries `layerExclusionsWarning`, shown by the explorer and Treemap;
+stored-role and explicit fixture/vendor exclusions still apply. Architecture retains the
+located typed rules error instead of showing a partial policy diagram.
 
 Under `workbench=true`, `web/vendor/` is the clear vendored/generated path rule:
 its files, including the bundled Pele renderer, never contribute metrics, even

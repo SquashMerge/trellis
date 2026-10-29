@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal, {library = false} = {}) {
+async function published(callback, signal, {library = false, rules = null} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -82,6 +82,10 @@ async function published(callback, signal, {library = false} = {}) {
     writeFileSync(join(paths.workspace, "Cargo.lock"), "version=4\n[[package]]\nname='browser-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\n");
     writeFileSync(join(paths.workspace, "vendor", "local-library", "Cargo.toml"), "[package]\nname='local-library'\nversion='0.1.0'\n");
     writeFileSync(join(paths.workspace, "vendor", "local-library", "src", "lib.rs"), "// <img src=x onerror='globalThis.libraryExecuted=true'>\npub fn candidate_only() { unknown_external(); }\n");
+  }
+  if (rules !== null) {
+    mkdirSync(join(paths.workspace, ".trellis"), {recursive:true});
+    writeFileSync(join(paths.workspace, ".trellis/rules.toml"), rules);
   }
   let server, browser, context;
   try {
@@ -789,3 +793,48 @@ test("Sequence explorer excludes fixtures and vendored inputs from heat while Fi
     assert.equal(row.metrics.cognitive === null, path.startsWith("web/"), "Include tests restores fixtures, never vendor inputs");
   }
 }));
+
+
+test("invalid rules keep Explorer and Treemap heat with a warning while Architecture keeps its typed error", {timeout:240000}, async () => published(async ({page, paths, server, pin}) => {
+  const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
+  const payload = await metrics(server, paths, pin, "max");
+  assert.equal(payload.layerExclusionsWarning, warning);
+  assert.ok(await page.locator("#metrics-state").isVisible());
+  assert.ok((await page.locator("#metrics-state").textContent()).includes(warning));
+  const measured = payload.files.find(row => row.path === "src/flow.js");
+  assert.ok(measured.metrics.cognitive > 0);
+  const fixture = payload.files.find(row => row.path === "tests/fixtures/input.js");
+  assert.equal(fixture.excludedReason, "fixture"); assert.equal(fixture.metrics.cognitive, null);
+  const vendored = payload.files.find(row => row.path.startsWith("web/vendor/"));
+  assert.equal(vendored.excludedReason, "vendored"); assert.equal(vendored.metrics.cognitive, null);
+  await expandSources(page); await assertLegend(page, payload, "cognitive");
+  assert.doesNotMatch(await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class"), /neutral/);
+
+  await page.locator("#view-treemap").click();
+  await page.locator("#treemap-state[data-state=ready]").waitFor();
+  assert.ok(await page.locator("#treemap-state").isVisible());
+  assert.ok((await page.locator("#treemap-state").textContent()).includes(warning));
+  const tiles = page.locator("#treemap-diagram [data-trellis-file-id]");
+  const key = JSON.stringify([measured.sourceSetId, measured.language, measured.path]);
+  const keys = await tiles.evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-file-id")));
+  assert.equal(keys.filter(value => value === key).length, 1);
+  const tile = tiles.nth(keys.indexOf(key));
+  assert.ok(await tile.locator("rect").first().isVisible());
+  const band = [5, 15, 30].filter(cut => measured.metrics.cognitive > cut).length;
+  assert.equal(await tile.locator("rect").first().getAttribute("fill"), ["#343644", "#FFC20A", "#FFAA10", "#FF7A00"][band]);
+  await tile.click();
+  assert.equal(await page.locator("#treemap-inspector-content dt").filter({hasText:/^cognitive$/}).evaluate(node => node.nextElementSibling.textContent), String(measured.metrics.cognitive));
+  await page.locator("#treemap-path").fill("no-matching-files");
+  await page.locator("#treemap-state[data-state=empty]").waitFor();
+  assert.ok((await page.locator("#treemap-state").textContent()).includes(warning));
+
+  const query = new URLSearchParams({...pin, workbench:"true",aggregate:"max",role:"production"});
+  const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `architecture?${query}`));
+  assert.equal(response.status, 422, JSON.stringify(response.data));
+  assert.equal(response.data.error.code, "invalid_rules"); assert.equal(Object.hasOwn(response.data, "payload"), false);
+  await page.locator("#view-architecture").click();
+  await page.locator("#architecture-state[data-state=error]").waitFor();
+  assert.match(await page.locator("#architecture-state").textContent(), /invalid_rules.*\.trellis\/rules\.toml/);
+  assert.ok(!(await page.locator("#architecture-panel").textContent()).includes(warning));
+  assert.equal(await page.locator("#architecture-diagram svg, #architecture-diagram [data-trellis-module-id]").count(), 0);
+}, undefined, {rules:'version = 1\n[layers.broken]\norder = "not an integer"\npaths = ["src/**"]\n'}));
