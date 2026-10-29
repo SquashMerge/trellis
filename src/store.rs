@@ -954,6 +954,19 @@ impl NativeReader<'_> {
         Store::read_native_header(self.db, self.selected)
     }
 
+    /// The original canonical toolchain, config and dependency root inputs
+    /// retained with the selected revision.
+    pub fn retained_components(
+        &self,
+    ) -> Result<(
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    )> {
+        self.store
+            .retained_native_components_from_db(self.db, self.selected)
+    }
+
     /// The retained source bytes of one inventory entry, checked against its identity.
     pub fn source_bytes(&self, document: &crate::native_evidence::Document) -> Result<Vec<u8>> {
         self.store
@@ -14115,6 +14128,10 @@ impl Store {
     }
     pub fn workspace_root(&self) -> &str {
         &self.workspace_root
+    }
+    /// The topology inputs of path-only derived state such as producer state.
+    pub fn state_topology(&self) -> (&topology::TopologyRoots, &topology::WorkspaceIdentity) {
+        (&self.roots, &self.identity)
     }
     pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
         (|| {

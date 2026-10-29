@@ -1829,6 +1829,30 @@ impl CheckoutRuntime {
         Ok(status)
     }
 
+    /// The plan of one producer run. Reads and hashes files and the retained
+    /// native revision only; it executes nothing and creates no state.
+    pub fn cli_producer_plan(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::plan::PlanRequest::parse(args)?;
+        let resources = self.resources()?;
+        let _lease = resources.scheduler.admission_lease()?;
+        resources.store.verify_root()?;
+        let stub = crate::producer::profiles::Stub::from_env();
+        crate::producer::plan::plan(&resources.store, &request, stub.as_ref())
+    }
+
+    /// Producer detection, trust-profile availability and run state.
+    pub fn cli_producer_status(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::plan::StatusRequest::parse(args)?;
+        let resources = self.resources()?;
+        let _lease = resources.scheduler.admission_lease()?;
+        resources.store.verify_root()?;
+        let stub = crate::producer::profiles::Stub::from_env();
+        crate::producer::plan::status(&resources.store, &request, stub.as_ref())
+    }
+
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!((1..=150).contains(&limit), "limit must be 1..150");
         let (response, catching_up) = self.evidence_response()?;
