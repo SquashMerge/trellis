@@ -198,6 +198,7 @@ impl World {
             .unwrap();
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
         trellis::testing::wait_until("daemon exit", || !trellis::testing::process_running(pid));
+        wait_for_daemon_election_free(&self.home);
     }
 }
 
@@ -602,6 +603,56 @@ fn commit_contention_requeues_the_request_instead_of_rejoining_or_failing() {
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 1);
 }
 
+/// Waits until no process holds the daemon's election lock. A process that no longer looks
+/// running can still hold the lock for a moment under load, and a successor started in that
+/// window loses the election and exits, leaving the CLI talking to the dying daemon (which
+/// ends in `outcome_unknown`). The lock itself is the condition a successor needs.
+fn wait_for_daemon_election_free(home: &Path) {
+    let lock = trellis::daemon::SocketPaths::new(&data_dir(home)).lock;
+    wait_until_lock_free(&lock, || {});
+}
+
+/// `on_poll` runs once per attempt that finds the lock held.
+fn wait_until_lock_free(lock: &Path, mut on_poll: impl FnMut()) {
+    use std::os::fd::AsRawFd;
+    trellis::testing::wait_until("daemon election lock released", || {
+        let Ok(file) = fs::File::open(lock) else {
+            return true;
+        };
+        // The flock lives on this open file description and ends when `file` drops.
+        let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if !free {
+            on_poll();
+        }
+        free
+    });
+}
+
+#[test]
+fn election_wait_returns_only_after_the_holder_releases_the_lock() {
+    use std::os::fd::AsRawFd;
+    let dir = Builder::new()
+        .prefix("election-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let lock = dir.path().join("daemon.lock");
+    let held = fs::File::create(&lock).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let mut held = Some(held);
+    let mut polls = 0;
+    wait_until_lock_free(&lock, || {
+        polls += 1;
+        if polls == 3 {
+            drop(held.take());
+        }
+    });
+    assert_eq!(polls, 3, "the wait outlasted the holder, then returned");
+    assert!(held.is_none());
+}
+
 /// A daemon started on its own so its diagnostics reach a file.
 struct LoggedDaemon {
     child: std::process::Child,
@@ -609,6 +660,7 @@ struct LoggedDaemon {
 
 impl LoggedDaemon {
     fn start(home: &Path, log: &Path, env: &[(&str, &str)]) -> Self {
+        wait_for_daemon_election_free(home);
         let mut command = cli(home);
         command
             .arg("daemon")
@@ -620,6 +672,16 @@ impl LoggedDaemon {
         }
         let mut child = command.spawn().unwrap();
         let socket = trellis::daemon::SocketPaths::new(&data_dir(home)).socket;
+        // Only the elected daemon records its PID. Wait for this process to be the elected one
+        // before connecting, so the socket is its own and not a departing daemon's.
+        let pid_file = home.join("daemon.pid");
+        trellis::testing::wait_until("logged daemon elected", || {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the logged daemon exited without being elected"
+            );
+            fs::read_to_string(&pid_file).is_ok_and(|pid| pid == child.id().to_string())
+        });
         trellis::testing::wait_until("logged daemon listening", || {
             assert!(child.try_wait().unwrap().is_none());
             std::os::unix::net::UnixStream::connect(&socket).is_ok()
