@@ -1201,21 +1201,21 @@ async function setFilesBasis(basis) {
   const path = filesFile.path, guard = filesGuard({basis:true}), observation = ++gitSerial;
   const current = () => guard() && serial === filesDiffSerial && observation === gitSerial;
   $("files-diff").append(element("p", "Measuring uncommitted changes against HEAD…"));
+  let statusMeasured = false;
   try {
     const statusData = await api("/api/git", "GET", undefined, current);
     if (!current()) return;
-    filesGitStatus = statusData; showSelectedGit(statusData.git);
+    filesGitStatus = statusData; showSelectedGit(statusData.git); statusMeasured = true;
     if (statusData.git.state !== "available") { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
     if (!statusData.changes?.some(change => change.path === path)) { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
     const data = await api(`/api/git/diff?path=${encodeURIComponent(path)}`, "GET", undefined, current);
     if (!current()) return;
     if (data.file && data.file.path !== path) throw new Error("Git diff path changed. Refresh to measure again.");
     filesDiff = data;
-    if (data.git.state !== "available") { filesGitStatus = null; showSelectedGit(data.git); }
     window.TrellisFiles?.diff($("files-diff"), data); renderFiles();
   } catch (error) {
     if (!current()) return;
-    filesGitStatus = null; showSelectedGit(null);
+    if (!statusMeasured) { filesGitStatus = null; showSelectedGit(null); }
     filesFailure(error, "files-diff", guard);
   }
 }

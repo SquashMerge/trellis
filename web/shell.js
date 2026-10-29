@@ -300,7 +300,7 @@
       ? git.workingTree.changedFiles === 0 ? "clean" : `${git.workingTree.changedFiles} uncommitted`
       : "Changes unavailable";
     return git.upstream
-      ? `${head} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · ${changes} · As of last fetch`
+      ? `${head} · ${changes} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · As of last fetch`
       : `${head} · No upstream · ${changes}`;
   }
   function checkoutLabel(row) {

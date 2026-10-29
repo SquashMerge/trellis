@@ -330,7 +330,7 @@ const branchGit = (upstream = null, workingTree = {state:"available",changedFile
 test("Git header uses measured counts independently of branch, upstream and index freshness",()=>{
   const h=harness();
   for (const [git,expected] of [
-    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · origin/main ↑2 ↓3 · 3 uncommitted · As of last fetch"],
+    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · 3 uncommitted · origin/main ↑2 ↓3 · As of last fetch"],
     [branchGit(),"feature/<script> · No upstream · 3 uncommitted"],
     [branchGit(null,{state:"available",changedFiles:0}),"feature/<script> · No upstream · clean"],
     [branchGit(null,{state:"unavailable",reason:"git_changed"}),"feature/<script> · No upstream · Changes unavailable"],

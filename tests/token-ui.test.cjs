@@ -627,7 +627,7 @@ test("Connect uses discovery only; explicit cold selection refreshes measured Gi
     {rootKey:"d".repeat(64),workspaceRoot:"/repo/non-git",state:"available",git:{state:"unavailable",reason:"not_repository"}},
     {rootKey:"e".repeat(64),workspaceRoot:"/repo/missing-git",state:"available"}
   ];
-  const labels=["feature/<script> · origin/main ↑2 ↓1 · 3 uncommitted · As of last fetch","local · No upstream · 3 uncommitted","Detached HEAD abcdef1 · No upstream · Changes unavailable","Git unavailable","Git unavailable"];
+  const labels=["feature/<script> · 3 uncommitted · origin/main ↑2 ↓1 · As of last fetch","local · No upstream · 3 uncommitted","Detached HEAD abcdef1 · No upstream · Changes unavailable","Git unavailable","Git unavailable"];
   const h=harness({routes:url=>{
     if(url==="/api/checkouts")return response({checkouts:rows});
     if(url==="/api/daemon/status")return response({activeCheckouts:0});
@@ -675,7 +675,7 @@ test("explicit status refresh reads Git even with a cold index; list refresh and
   await h.get("refresh").listeners.click();
   await flush();
   assert.deepEqual(h.requests.slice(before).map(r=>r.url),[`${SCOPED}/git`,`${SCOPED}/status`,`${SCOPED}/git`]);
-  assert.equal(h.get("workspace-git").textContent,"after · origin/after ↑0 ↓4 · 3 uncommitted · As of last fetch");
+  assert.equal(h.get("workspace-git").textContent,"after · 3 uncommitted · origin/after ↑0 ↓4 · As of last fetch");
   assert.equal(h.run("status"),null);
   git=gitBranch("from-list");await h.run("loadCheckouts()");
   await flush();

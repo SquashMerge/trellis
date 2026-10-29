@@ -186,17 +186,51 @@ for(const failure of [false,true]) test(`mini replacement and reset ignore delay
   h.run('clearBrowse()'); assert.equal(h.run("filesFile"),null); assert.equal(h.get("files-mini-sequence").children.length,0);
 });
 
-test("Working status and diff failures clear previous hunks and no-Git hides the toggle", async () => {
-  const h=harness(); indexedNetwork(h); await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
-  h.run(`selectedGit=${JSON.stringify(git)}`);
-  h.network(url=>url==="/api/git"?response({git,changes:[{path:"main.java"}]}):response({git,file:fileDiff}));
+for (const failure of ["unavailable", "HTTP error"]) test(`Working whole-status ${failure} clears previous hunks, summary and markers`, async () => {
+  const h=harness(), measured={...git,workingTree:{state:"available",changedFiles:1}};
+  indexedNetwork(h); await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
+  h.context.measured=measured; h.run('selectedWorkspaceRoot="/fixture";selectedGit=measured');
+  h.network(url=>url==="/api/git"?response({git:measured,changes:[{path:"main.java",status:"modified"}]}):response({git:measured,file:fileDiff}));
   await h.run('setFilesBasis("working")'); assert.match(text(h.get("files-diff")),/<old>/);
-  h.network(()=>response({git:{state:"unavailable",reason:"git_changed"},changes:null}));
-  await h.run('setFilesBasis("working")'); assert.doesNotMatch(text(h.get("files-diff")),/<old>/);
-  assert.match(text(h.get("files-diff")),/git_changed/); assert.equal(h.get("files-working").hidden,true);
-  h.run(`selectedGit=${JSON.stringify(git)}`);
-  h.network(url=>url==="/api/git"?response({git,changes:[{path:"main.java"}]}):Promise.reject(new Error("Git changed during diff")));
-  await h.run('setFilesBasis("working")'); assert.doesNotMatch(text(h.get("files-diff")),/<old>/); assert.match(h.get("files-diff").textContent,/Git changed during diff/);
+  assert.equal(all(h.get("file-tree")).filter(node=>node.className==="git-marker").length,1);
+  h.network(()=>failure==="unavailable" ? response({git:{state:"unavailable",reason:"git_changed"},changes:null})
+    : {ok:false,status:500,json:async()=>({error:{code:"git_unavailable",message:"Whole Git status failed"}})});
+  await h.run('setFilesBasis("working")');
+  assert.doesNotMatch(text(h.get("files-diff")),/<old>/);
+  assert.match(text(h.get("files-diff")),failure==="unavailable"?/git_changed/:/Whole Git status failed/);
+  assert.equal(h.run("filesGitStatus"),null);
+  assert.equal(h.get("workspace-git").textContent,"Git unavailable");
+  assert.equal(all(h.get("file-tree")).filter(node=>node.className==="git-marker").length,0);
+  assert.equal(h.get("files-working").hidden,true);
+});
+
+for (const failure of ["HTTP 404", "path mismatch", "unavailable", "rejected request"]) test(`Working per-file ${failure} keeps the whole-status summary and markers`, async () => {
+  const h=harness(), measured={...git,workingTree:{state:"available",changedFiles:1}};
+  const wholeStatus={git:measured,changes:[{path:"main.java",status:"modified"}]};
+  indexedNetwork(h); await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
+  h.context.measured=measured; h.run('selectedWorkspaceRoot="/fixture";selectedGit=measured');
+  h.network(url=>url==="/api/git"?response(wholeStatus):response({git:measured,file:fileDiff}));
+  await h.run('setFilesBasis("working")'); assert.match(text(h.get("files-diff")),/<old>/);
+  const header=h.get("workspace-git").textContent;
+  assert.match(header,/1 uncommitted/);
+  const marker=()=>all(h.get("file-tree")).find(node=>node.className==="git-marker");
+  assert.equal(marker().attrs["data-status"],"modified");
+  h.network(url=>{
+    if(url==="/api/git") return response(wholeStatus);
+    if(failure==="HTTP 404") return {ok:false,status:404,json:async()=>({error:{code:"path_not_found",message:"Selected path no longer exists"}})};
+    if(failure==="path mismatch") return response({git:measured,file:{...fileDiff,path:"other.java"}});
+    if(failure==="unavailable") return response({git:{state:"unavailable",reason:"git_changed"},file:null});
+    return Promise.reject(new Error("Git changed during diff"));
+  });
+  await h.run('setFilesBasis("working")');
+  assert.doesNotMatch(text(h.get("files-diff")),/<old>/);
+  const errors={"HTTP 404":/Selected path no longer exists/,"path mismatch":/Git diff path changed/,unavailable:/git_changed/,"rejected request":/Git changed during diff/};
+  assert.match(text(h.get("files-diff")),errors[failure]);
+  assert.equal(h.get("workspace-git").textContent,header);
+  assert.equal(h.run("filesGitStatus"),wholeStatus);
+  assert.equal(h.run("selectedGit"),measured);
+  assert.equal(marker()?.attrs["data-status"],"modified");
+  assert.equal(h.get("files-working").hidden,false);
 });
 
 

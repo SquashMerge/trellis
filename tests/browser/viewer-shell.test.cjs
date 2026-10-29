@@ -1027,7 +1027,7 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent === "");
     assert.equal(await page.locator("#checkout-select").getAttribute("title"), observed.workspaceRoot);
     assert.equal(await page.locator("#workspace-name").getAttribute("title"), observed.workspaceRoot);
-    const hostileGit = `${branch} · ${upstream} ↑2 ↓3 · 9 uncommitted · As of last fetch`;
+    const hostileGit = `${branch} · 9 uncommitted · ${upstream} ↑2 ↓3 · As of last fetch`;
     await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, hostileGit);
     assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), hostileGit);
     assert.equal(await page.locator(".app-header svg, #indexed-checkouts svg, #workspace-git img, #indexed-checkouts img").count(), 0);

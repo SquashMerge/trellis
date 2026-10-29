@@ -603,7 +603,7 @@ test("measured Git counts and exact M/A/D/R markers preserve indexed evidence bo
   assert.deepEqual(status.git.workingTree, {state:"available", changedFiles:7});
   assert.equal(status.changes.length, 7, "a rename counts once and restored staged content is net unchanged");
   assert.deepEqual([status.git.upstream.ahead, status.git.upstream.behind], [1, 1]);
-  const expected = `${status.git.head.name} · origin/main ↑1 ↓1 · 7 uncommitted · As of last fetch`;
+  const expected = `${status.git.head.name} · 7 uncommitted · origin/main ↑1 ↓1 · As of last fetch`;
   await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, expected);
   assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), expected);
   const marker = async (path, status, letter) => {
