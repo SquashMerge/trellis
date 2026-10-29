@@ -585,8 +585,38 @@ test("a failed job lookup after status succeeds marks the selection unavailable,
   jobs = async () => ({ok:true,status:204,json:async()=>null});
   await h.get("refresh").listeners.click();
   for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.match(h.get("workspace-index-label").textContent, /^Fresh/);
+  // Stubbed tree reads lack a pin, so the header may report other stale evidence, but the job is known again.
+  assert.doesNotMatch(h.get("workspace-index-label").textContent, /job unavailable/);
+  assert.notEqual(h.get("workspace-index-state").attrs["data-state"], "failed");
   assert.equal(h.get("checkout-state").textContent, "");
+});
+test("an older failed job lookup never overrides a newer accepted job after Stop waiting", async () => {
+  const h = harness(true);
+  let failLookup;
+  const held = new Promise(resolve => { failLookup = () => resolve({ok:false,status:500,json:async()=>({error:{code:"storage_io",message:"late lookup failure"}})}); });
+  const running = {id:"accepted",state:"running",progress:{phase:"capture",total:10,completed:2}};
+  const posts = [];
+  h.run(`checkouts[0].catchingUp=false;checkouts[0].revision=status.revision;uniqueSelectableRoot=()=>true;`);
+  h.context.fetch = async (path, options) => {
+    if (path === "/api/status") return response(selectedStatus);
+    if (path === "/api/jobs/current") return held;
+    if (path === "/api/index") { posts.push(options?.method); return {ok:true,status:202,json:async()=>running}; }
+    return response({});
+  };
+  const flush = async () => { for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve)); };
+  const selecting = h.run(`selectCheckout(selectedRootKey)`);
+  await flush();
+  await h.get("index").listeners.click();
+  await flush();
+  assert.deepEqual(posts, ["POST"]);
+  assert.match(h.get("workspace-index-label").textContent, /^Indexing · capture · 2\/10/);
+  h.get("cancel").listeners.click();
+  assert.match(h.get("workspace-index-label").textContent, /no longer waiting here/);
+  failLookup();
+  await selecting; await flush();
+  assert.equal(h.get("workspace-index-state").attrs["data-state"], "catching-up");
+  assert.match(h.get("workspace-index-label").textContent, /^Indexing · capture · 2\/10 · no longer waiting here$/);
+  assert.doesNotMatch(h.get("checkout-state").textContent, /late lookup failure/);
 });
 test("a storage failure stays in the header status line after a checkout is selected", async () => {
   const h = harness(true);

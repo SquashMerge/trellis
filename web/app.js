@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, selectedGit = null, gitSerial = 0, checkoutBusy = false, checkouts = [], sourceSerial = 0;
 const pendingRequests = new Set();
-let status = null, statusUnavailable = false, jobUnavailable = false, indexNotReady = false, staleMessage = "";
+let status = null, statusUnavailable = false, jobUnavailable = false, jobObservation = 0, indexNotReady = false, staleMessage = "";
 let statusSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null, waitingForJob = false;
@@ -732,20 +732,16 @@ async function selectCheckout(key) {
   try {
     await refreshStatus();
     if (session !== epoch) return;
-    job = await api("/api/jobs/current").catch(error => { if (error.name !== "AbortError") throw error; return null; });
+    const lookup = await lookupCurrentJob();
     if (session !== epoch) return;
-    waitingForJob = !!job && activeJob(job);
-    showJob();
-    if (job) schedulePoll();
     // The browse notice is hidden once a checkout is shown; the storage warning stays in the header status line.
-    $("checkout-state").textContent = storageWarning();
+    $("checkout-state").textContent = lookup.error && jobUnavailable
+      ? `Index job unavailable: ${lookup.error.message} Retry status; your selection is unchanged.` : storageWarning();
     void readNavigationLocation(true);
     $("notice").textContent = `Browse folders below. Indexed files expand to methods.${storageWarning() ? ` ${storageWarning()}` : ""}`;
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     const cold = error.code === "index_not_ready";
-    // When status succeeded but the job lookup failed, the header says the job is unavailable, not stale.
-    jobUnavailable = !cold && !statusUnavailable;
     showCheckoutIndexState(cold ? checkouts.find(row => row.rootKey === key) : {state:"unavailable"});
     $("checkout-root").textContent = error.workspaceRoot || status?.workspaceRoot || "Selected checkout · verified root unavailable until status responds";
     $("checkout-state").textContent = cold ? "Index not ready. Retry status after indexing starts." : `Checkout unavailable: ${error.message} Retry status; your selection is unchanged.`;
@@ -862,9 +858,9 @@ async function refreshView() {
   await refreshStatus();
   if (jobUnavailable) {
     // Retrying status also retries the job lookup that failed during selection.
-    const current = await api("/api/jobs/current");
+    const lookup = await lookupCurrentJob();
     if (session !== epoch || root !== selectedRootKey) return;
-    job = current; waitingForJob = !!job && activeJob(job); showJob();
+    if (lookup.error) throw lookup.error;
     $("checkout-state").textContent = storageWarning();
   }
   if (IndexPin.equal(revision, status?.revision)) {
@@ -897,8 +893,24 @@ function jobText(value) {
   if (value.error) parts.push("see Diagnostics");
   return parts.join(" · ");
 }
+// Every job read from the daemon is an observation; an older lookup never overrides a newer one.
+function observeJob(value) { job = value; jobObservation++; jobUnavailable = false; }
+async function lookupCurrentJob() {
+  const observed = jobObservation, session = epoch;
+  let current, error = null;
+  try { current = await api("/api/jobs/current"); }
+  catch (failure) { if (failure.name === "AbortError") return {error:null}; error = failure; }
+  if (session !== epoch || observed !== jobObservation) return {error:null};
+  if (error) {
+    // The job is unknown: never let the header fall back to Fresh.
+    jobUnavailable = true; $("job").textContent = `Index job unavailable: ${error.message}`; renderIndexStatus();
+    return {error};
+  }
+  observeJob(current); waitingForJob = !!job && activeJob(job); showJob();
+  if (job) schedulePoll();
+  return {error:null};
+}
 function showJob() {
-  jobUnavailable = false;
   if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; renderIndexStatus(); return; }
   $("job").textContent = `${jobText(job)}${job.error ? `\n${describe(job.error)}` : ""}`;
   renderIndexStatus();
@@ -909,7 +921,7 @@ function schedulePoll() {
   clearTimeout(pollTimer);
   if (!waitingForJob || !job || !activeJob(job) || !token) return;
   pollTimer = setTimeout(() => perform(async () => {
-    job = await api(`/api/jobs/${encodeURIComponent(job.id)}`); showJob();
+    observeJob(await api(`/api/jobs/${encodeURIComponent(job.id)}`)); showJob();
     if (activeJob(job)) schedulePoll();
     else { waitingForJob = false; showJob(); await refreshStatus(); }
   }), 700);
@@ -918,7 +930,7 @@ $("index").addEventListener("click", () => perform(async () => {
   clearNavigationHistory();
   window.TrellisClasses?.reset();
   diagramSerial++; viewerMetrics?.clearInspection(); window.TrellisShell?.resetInspector(); clearSource();
-  job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
+  observeJob(await api("/api/index", "POST", {})); waitingForJob = true; showJob(); schedulePoll();
 }, $("index")).then(() => { if (job) showJob(); }));
 $("cancel").addEventListener("click", () => {
   // Stopping this page's polling never cancels a durably accepted request.
