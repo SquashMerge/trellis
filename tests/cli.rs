@@ -661,7 +661,13 @@ fn daemon_status_uses_selected_head_and_reports_typed_contention() {
         .args(["gc", "--report"])
         .output()
         .unwrap();
-    assert!(report.status.success());
+    assert!(
+        report.status.success(),
+        "gc --report failed: {}\nstdout: {}\nstderr: {}",
+        report.status,
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
     let report: Value = serde_json::from_slice(&report.stdout).unwrap();
     assert_eq!(report["derived"][0]["status"], "busy");
 }
