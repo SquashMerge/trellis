@@ -470,13 +470,22 @@ test("Architecture draws module chips per band, count chips matching rules check
   const dto = (await architecture(selected)).data.payload;
   const flagged = dto.edges.filter(edge => edge.role === "production" && ((edge.status === "deviates" && !edge.excepted) || edge.status === "unknown"));
   assert.equal(await page.locator("#architecture-deviations-only").isChecked(), true, "production deviations exist, so review starts focused");
-  assert.deepEqual(await bandStates(page), ["low", "mid", "peer", "shared", "top"].map(name => [name, "true"]), "bands open on module chips");
+  assert.deepEqual(await bandStates(page), ["low", "mid", "peer", "shared", "top"].map(name => [name, "false"]), "#391: bands without a display hint start collapsed");
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), flagged.map(summaryKey).sort(), "only deviating or unknown production edges are drawn");
   assert.match(await page.locator("#architecture-focus-state").textContent(), /Showing 5 layers and 5 files/);
   assert.equal(await page.locator("#architecture-quiet-toggle").textContent(), "▸ 1 quiet layer · 0 files · 0 production edges");
   assert.equal(await page.locator("#architecture-quiet-names").textContent(), hostileLayer, "quiet layer names are text, never markup");
   const lowModule = dto.modules.find(module => module.identity.path === "src/low.rs");
   const lowModules = dto.modules.filter(module => module.layer === "low");
+  const low = '#architecture-diagram [data-trellis-layer-id="low"]';
+  assert.equal(await page.locator("#architecture-diagram [data-trellis-module-id]").count(), 0, "collapsed bands draw no chips");
+  assert.match(await page.locator(low).getAttribute("aria-label"), /^3 · low · \d+ files/, "the band's one toggle is named by its layer");
+  const folded = page.locator("#architecture-diagram .pele-node").filter({hasText:new RegExp(`^${lowModules.length} files folded$`)});
+  assert.equal(await folded.count(), 1); assert.equal(await folded.getAttribute("role"), null, "the folded summary is not a second toggle");
+  await page.locator(low).focus();
+  await rerendered(page, () => page.keyboard.press("Enter"));
+  assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true");
+  assert.equal(await focused(page, low), true, "keyboard focus stays on the band after it re-renders");
   const focusedIds = await moduleIds(page);
   assert.ok(focusedIds.includes(identityKey(lowModule.identity)), "deviations only draws the involved file");
   assert.ok(!focusedIds.includes(identityKey(dto.modules.find(module => module.identity.path === "src/low/extra.rs").identity)), "uninvolved files stay out of focus");
@@ -512,14 +521,11 @@ test("Architecture draws module chips per band, count chips matching rules check
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.ok(!(await moduleIds(page)).includes(identityKey(extra.identity)), "the module folds again");
 
-  const low = '#architecture-diagram [data-trellis-layer-id="low"]';
   await page.locator(low).focus();
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "false");
-  assert.equal(await focused(page, low), true, "keyboard focus stays on the band after it re-renders");
   assert.deepEqual(await chipTexts(page, "low"), (chips.get("low") || []).map(text => [text, /^[↑⇄]/.test(text) ? "error" : "neutral"]), "a folded band keeps its count chips");
-  const show = page.locator("#architecture-diagram").getByRole("button", {name:/^Show module chips\s+\d+ files$/});
-  await rerendered(page, () => show.click());
+  await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true");
 
   await page.locator("#architecture-quiet-toggle").focus();
@@ -570,7 +576,7 @@ test("Architecture applies authored display hints without changing evaluation", 
     assert.equal(siteTotal(dto.edges.filter(edge => edge.role === "production")), 8, "the hint never changes summary counts");
     assert.equal(siteTotal(dto.references.production), 10);
     assert.equal(dto.edges.find(edge => edge.role === "production" && edge.sourceLayer === "mid" && edge.destinationLayer === "peer").status, "deviates");
-    assert.deepEqual(await bandStates(page), [["low", "true"], ["mid", "true"], ["shared", "true"], ["top", "true"]], "hidden is in the footer; bands start on module chips");
+    assert.deepEqual(await bandStates(page), [["low", "false"], ["mid", "false"], ["shared", "false"], ["top", "true"]], "hidden is in the footer; expanded starts open");
     assert.equal(await page.locator("#architecture-hidden-toggle").textContent(), "▸ 1 hidden layer · 1 file · 1 production edge");
     assert.equal(await page.locator("#architecture-quiet").isVisible(), false, "an explicit display opts the empty layer out of automatic quiet collapse");
     await rerendered(page, () => page.locator("#architecture-deviations-only").uncheck());

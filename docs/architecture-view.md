@@ -39,12 +39,14 @@ Unassigned endpoints and unresolved sites remain explicit unknown evidence.
 
 ## Module chips and counts (#424)
 
-Each band draws **one chip per module**, not per file. A module is a browser display
+An open band draws **one chip per module**, not per file. Bands start collapsed unless
+their authored `display` is `"expanded"` (#391 ruling; see [rules](rules.md#layer-display-hint)). A module is a browser display
 grouping computed from the existing response, not an identity or a new API field: the
 first path component below the band's common directory, where a file and its same-named
-directory form one module (`src/store.rs` and `src/store/**` are `store`). A one-file
+directory form one module (`src/store.rs` and `src/store/**` are `store`), and a
+directory's `mod.rs` or `__init__.py` is that module's root file. A one-file
 module is that file's chip. Selecting a module chip opens it one level (its root file,
-then nested modules) down to file chips; selecting a band header folds it to its header.
+then nested modules) down to file chips; selecting a band header folds or opens it.
 Chips show the module's maximum (minimum for Maintainability) displayed metric and its
 measured file count; files without selected callables remain counted in a note.
 
@@ -57,10 +59,11 @@ edges, so they equal the `$layers` instances' `referenceCount` from
 `trellis rules check --format json` on the same pin and rules.
 
 The SPEC §9 size cap applies to chips: at most 40 per band or open module and 150 in
-the whole diagram. The rest of a list becomes one visible "N files not drawn" note
-that opens the layer's complete file list in the inspector, and the status line
-reports the total not drawn. Test and fixture layers stay in the hidden footer until
-**Include tests and fixtures in metrics** is on.
+the whole diagram, counting every note. The rest of a list becomes one visible "N files
+not drawn" note that opens the layer's complete file list in the inspector. Once the
+budget is spent, further bands and modules stay folded and no more notes are added; the
+status line reports the total not drawn. Test and fixture layers without a `display`
+hint stay in the hidden footer until **Include tests and fixtures in metrics** is on.
 
 Click a module or select it with Enter/Space to inspect its identity, layer, captured
 physical file lines, callable count, every metric and incident references. Select a

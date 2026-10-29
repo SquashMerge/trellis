@@ -25,6 +25,8 @@
   // SPEC §9 size cap: chips per band or open module, and in the whole diagram.
   const ENTRY_CAP = 40, BOX_CAP = 150;
   const stem = name => { const dot = name.lastIndexOf("."); return dot > 0 ? name.slice(0, dot) : name; };
+  // A directory module's own root file: shown first when it opens, never as a "mod" chip.
+  const ROOT_FILES = new Set(["mod.rs", "__init__.py"]);
   // Longest common directory ("" or ending in "/") of a band's file paths.
   function commonDirectory(paths) {
     let shared = null;
@@ -43,7 +45,7 @@
     const groups = new Map();
     for (const module of modules) {
       const rest = module.identity.path.slice(base.length), slash = rest.indexOf("/");
-      const name = slash < 0 ? stem(rest) : rest.slice(0, slash);
+      const name = slash >= 0 ? rest.slice(0, slash) : ROOT_FILES.has(rest) ? rest : stem(rest);
       if (!groups.has(name)) groups.set(name, []);
       groups.get(name).push(module);
     }
@@ -177,7 +179,8 @@
     // Authored rules.toml presentation hint (#391 ruling); absent leaves the choice to the browser.
     const hint = layer => ["expanded", "collapsed", "hidden"].includes(layer.display) ? layer.display : null;
     // Bands open on module chips unless the authored hint asks for a collapsed summary.
-    const expanded = layer => shown.open.has(layer.name) ? shown.open.get(layer.name) : hint(layer) !== "collapsed";
+    // #391 ruling: an absent hint starts collapsed like "collapsed"; "expanded" opens on module chips.
+    const expanded = layer => shown.open.has(layer.name) ? shown.open.get(layer.name) : hint(layer) === "expanded";
     // A test or fixture layer: every file is a fixture input or holds only test callables.
     function testLayer(layer, modules) {
       const members = modules.filter(module => module.layer === layer.name);
@@ -194,8 +197,9 @@
         .filter(identity => identity && !external(identity)).map(moduleKey));
       const deviates = production.some(edge => edge.status === "deviates" && !edge.excepted);
       const focus = focusEdges.length > 0 && (shown.deviationsOnly ?? deviates);
-      // Test and fixture layers join the hidden footer until tests and fixtures are included.
-      const tests = new Set(role === "production" ? payload.layers.filter(layer => testLayer(layer, payload.modules)).map(layer => layer.name) : []);
+      // Unhinted test and fixture layers join the hidden footer until tests and fixtures are included;
+      // an authored display hint always wins.
+      const tests = new Set(role === "production" ? payload.layers.filter(layer => hint(layer) === null && testLayer(layer, payload.modules)).map(layer => layer.name) : []);
       const hidden = payload.layers.filter(layer => hint(layer) === "hidden" || tests.has(layer.name));
       // Automatic quiet collapse applies only to layers without an authored display hint.
       const quiet = payload.layers.filter(layer => hint(layer) === null && !hidden.includes(layer) && !active.has(layer.name));
@@ -217,23 +221,30 @@
         if (files.length === 1) return {type:"module", module:files[0], name};
         const prefix = `${base}${name}`, key = JSON.stringify([layerKey, prefix]), open = shown.drilled.has(key), value = worst(files);
         const amount = value === undefined ? "" : `${metric === "maintainabilityIndex" ? "min" : "max"} ${display(value)}`;
-        const inner = `${prefix}/`, nested = files.filter(file => file.identity.path.startsWith(inner));
-        // An open module lists its own root file (`store.rs`) before its nested modules.
-        const children = () => [...files.filter(file => !nested.includes(file)).map(module => ({type:"module", module, name:module.identity.path.slice(base.length)})),
-          ...level(layerKey, inner, nested, scale)];
+        // An open module lists its own root file (`store.rs`, `store/mod.rs`, `pkg/__init__.py`) before its nested modules.
+        const inner = `${prefix}/`, root = file => !file.identity.path.startsWith(inner) || ROOT_FILES.has(file.identity.path.slice(inner.length));
+        const children = () => [...files.filter(root).map(module => ({type:"module", module, name:module.identity.path.slice(base.length)})),
+          ...level(layerKey, inner, files.filter(file => !root(file)), scale)];
         return {type:"directory", key, open, size:files.length, band:scale.band(value), entries:[], children:open ? children : null,
           label:`${name}\n${plural(files.length, "file")}${amount ? ` · ${amount}` : ""}\n${prefix}`,
           shown:`${name}\n${value === undefined ? "" : `${display(value)} · `}${plural(files.length, "file")}`};
       });
     }
-    // Past the cap, the rest of a list becomes one visible note that opens the complete file list.
+    // Every chip and note costs one unit of the diagram budget, so a render never draws more
+    // than BOX_CAP. Past the cap, the rest of a list becomes one note that opens the full file list.
     function capped(layerKey, list, budget) {
       const room = Math.min(ENTRY_CAP, budget.left), kept = list.length > room ? list.slice(0, Math.max(0, room - 1)) : list;
       budget.left -= kept.length;
-      for (const entry of kept) if (entry.children) entry.entries = capped(layerKey, entry.children(), budget);
+      for (const entry of kept) {
+        if (!entry.children) continue;
+        // With the budget spent, an open module stays folded rather than drawing an empty box.
+        if (budget.left > 0) entry.entries = capped(layerKey, entry.children(), budget); else entry.open = false;
+      }
       if (kept.length === list.length) return kept;
       const omitted = list.slice(kept.length).reduce((sum, entry) => sum + (entry.size ?? 1), 0);
-      budget.left = Math.max(0, budget.left - 1); budget.truncated += omitted;
+      budget.truncated += omitted;
+      if (budget.left < 1) return kept;
+      budget.left -= 1;
       return [...kept, {type:"note", layerKey, label:`${plural(omitted, "file")} not drawn · diagram size cap\nselect to list ${layerKey === null ? "unassigned" : "this layer's"} files`,
         shown:`${plural(omitted, "file")}\nnot drawn (cap)`}];
     }
@@ -245,8 +256,9 @@
       const result = capped(layerKey, level(layerKey, commonDirectory(modules.map(module => module.identity.path)), measured, scale), budget);
       // Notes are chip-sized: a short drawn label, the full sentence as the accessible name.
       const unmeasured = visible.length - measured.length, hidden = modules.length - visible.length;
-      if (unmeasured) result.push({type:"note", layerKey, label:`${plural(unmeasured, "file")} · metrics unavailable\nno ${callables()}`, shown:`${plural(unmeasured, "file")}\nno metrics`});
-      if (hidden) result.push({type:"note", layerKey, label:`${plural(hidden, "file")} outside deviations`, shown:`${plural(hidden, "file")}\nnot deviating`});
+      const note = entry => { if (budget.left > 0) { budget.left -= 1; result.push(entry); } };
+      if (unmeasured) note({type:"note", layerKey, label:`${plural(unmeasured, "file")} · metrics unavailable\nno ${callables()}`, shown:`${plural(unmeasured, "file")}\nno metrics`});
+      if (hidden) note({type:"note", layerKey, label:`${plural(hidden, "file")} outside deviations`, shown:`${plural(hidden, "file")}\nnot deviating`});
       return result;
     }
     function footer(id, layers, open, text) {
@@ -311,9 +323,9 @@
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
           moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
           layerLabel, layerStats,
-          display:{layers:layout.layers, expanded:name => expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, scale, budget),
+          display:{layers:layout.layers, expanded:name => budget.left > 0 && expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, scale, budget),
             edge:edge => !layout.focus || flagged(edge),
-            unassigned:layout.focus ? null : {label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, expanded:shown.unassigned}},
+            unassigned:layout.focus ? null : {label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
           onSelectModule:module => { if (active() && payload.modules.includes(module)) inspect("module", module); },
           onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) inspect("edge", edge); },
           onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },

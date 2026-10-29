@@ -96,11 +96,11 @@
         else unsupported("Invalid Architecture display entry");
       }
     }
-    // Pele gives a leaf row the height of the tallest sibling, so a folded band is a
-    // composite holding one short "show" node instead of a leaf as tall as the stack.
+    // Pele gives a leaf row the height of its tallest sibling, so a folded band is a composite
+    // whose header is the one toggle, over a short non-interactive file count.
     function folded(item, record, text, span) {
       open(item,1,span);
-      const toggle = addNode("S",record,text,false,text,CHIP_WIDTH * 2); toggle.owner = item; leaf(toggle);
+      const summary = addNode("S",record,text,false,text,CHIP_WIDTH * 2); summary.owner = item; leaf(summary);
       source.push("end");
     }
     function emitLayer(layer, span = 1) {
@@ -109,7 +109,7 @@
       const members = moduleRows.get(layer.name).sort((a,b) => identity(a).localeCompare(identity(b)));
       if (display) {
         item.expanded = !!display.expanded(layer.name);
-        if (!item.expanded) { folded(item,layer,`Show module chips\n${members.length} files`,span); return; }
+        if (!item.expanded) { folded(item,layer,`${members.length} files folded`,span); return; }
         open(item,columns,span); emitEntries(display.entries(layer.name,members),columns); source.push("end"); return;
       }
       open(item,columns);
@@ -140,7 +140,7 @@
     if (display?.unassigned && unassigned.length) {
       const item = addNode("U",display.unassigned,display.unassigned.label); item.expanded = !!display.unassigned.expanded;
       if (item.expanded) { open(item,CHIP_COLUMNS,stackSpan + shared.length); emitEntries(display.entries(null,unassigned),CHIP_COLUMNS); source.push("end"); }
-      else folded(item,display.unassigned,`Show unassigned files\n${unassigned.length} files`,stackSpan + shared.length);
+      else folded(item,display.unassigned,`${unassigned.length} files folded`,stackSpan + shared.length);
     } else if (!display && unassigned.length) {
       open(addNode("B",null,"Unassigned / unknown"),4);
       for (const m of unassigned) moduleNode(m);
@@ -274,7 +274,6 @@
           if (item.kind === "D") expanded = false;
         } else if (item.kind === "D") { callback = options.onToggleDirectory; expanded = true; }
         else if (item.kind === "U") { callback = options.onToggleUnassigned; expanded = item.expanded; }
-        else if (item.kind === "S") { callback = item.owner.kind === "U" ? options.onToggleUnassigned : options.onToggleLayer; expanded = false; }
         else if (item.kind === "N") callback = options.onSelectNote;
         else if (item.kind === "L") {
           callback = options.display ? options.onToggleLayer : options.onSelectLayer;

@@ -454,7 +454,7 @@ test("one chip per module: a file and its same-named directory form one module t
   dto.modules = ["src/store.rs", "src/store/a.rs", "src/store/deep/b.rs", "src/model.rs"].map((path, i) => ({...base, identity:identity(path), metrics:{cognitive:i}}));
   h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   const display = () => h.renders.at(-1).options.display;
-  assert.equal(display().expanded("UI"), true, "bands open on module chips by default");
+  assert.equal(display().expanded("UI"), false, "#391: a band without a display hint starts collapsed");
   const top = display().entries("UI", dto.modules);
   const plain = value => JSON.parse(JSON.stringify(value));
   assert.deepEqual(plain(top.map(entry => [entry.type, entry.name ?? entry.shown])), [["module","model"],["directory","store\n2 · 3 files"]]);
@@ -466,25 +466,67 @@ test("one chip per module: a file and its same-named directory form one module t
     "the root file comes first, then nested modules one level down");
 });
 
-test("module chips respect the diagram size cap with a visible note per truncated list", async () => {
+test("mod.rs and __init__.py are their module's root file, never nested mod or __init__ chips", async () => {
+  const {groupModules} = harness().window.TrellisArchitecture;
+  const modules = paths => paths.map(path => ({identity:identity(path)}));
+  const plain = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(plain(groupModules(modules(["src/daemon/mod.rs", "src/daemon/client.rs", "src/pkg/__init__.py"].filter(path => path.startsWith("src/daemon/"))), "src/daemon/").map(([name]) => name)),
+    ["client", "mod.rs"], "a band rooted at the module directory names its root file, not \"mod\"");
+  assert.deepEqual(plain(groupModules(modules(["pkg/__init__.py", "pkg/util.py"]), "pkg/").map(([name]) => name)), ["__init__.py", "util"]);
   const h = harness(), dto = fixture(), base = dto.modules[0];
-  dto.modules = Array.from({length:200}, (_, i) => ({...base, identity:identity(`src/m${String(i).padStart(3, "0")}.rs`)}));
+  dto.modules = ["src/daemon/mod.rs", "src/daemon/client.rs", "src/daemon/registry/mod.rs", "src/daemon/registry/table.rs", "src/pkg/__init__.py", "src/pkg/util.py", "src/main.rs"]
+    .map(path => ({...base, identity:identity(path)}));
   h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
-  const display = h.renders.at(-1).options.display;
-  const first = display.entries("UI", dto.modules);
-  assert.equal(first.length, 40); assert.equal(first.filter(entry => entry.type === "module").length, 39);
-  assert.equal(first.at(-1).type, "note"); assert.match(first.at(-1).label, /^161 files not drawn · diagram size cap\nselect to list this layer's files$/);
-  let drawn = 40;
-  for (let i = 0; i < 5; i++) drawn += display.entries("UI", dto.modules).length;
-  assert.ok(drawn <= 150 + 5, `one render draws at most the cap plus its truncation notes (${drawn})`);
-  assert.equal(display.entries("UI", dto.modules).filter(entry => entry.type !== "note").length, 0, "the shared budget is exhausted");
+  const entries = () => h.renders.at(-1).options.display.entries("UI", dto.modules);
+  assert.deepEqual(plain(entries().map(entry => entry.name ?? entry.shown.split("\n")[0])), ["daemon", "main", "pkg"]);
+  for (const index of [0, 2]) await h.renders.at(-1).options.onToggleDirectory(entries()[index]);
+  const [daemon, , pkg] = entries();
+  assert.deepEqual(plain(daemon.entries.map(entry => entry.name ?? entry.shown.split("\n")[0])), ["daemon/mod.rs", "client", "registry"], "mod.rs opens first as the module root");
+  assert.deepEqual(plain(pkg.entries.map(entry => entry.name)), ["pkg/__init__.py", "util"]);
+  await h.renders.at(-1).options.onToggleDirectory(daemon.entries[2]);
+  assert.deepEqual(plain(entries()[0].entries[2].entries.map(entry => entry.name)), ["registry/mod.rs", "table"]);
 });
 
-test("test and fixture layers are hidden until tests and fixtures are included in metrics", async () => {
+// Walk one render's display the way the projection does: band by band, expansion before entries.
+function drawnEntries(display, layers, modules) {
+  let total = 0;
+  const count = list => { for (const entry of list) { total++; if (entry.type === "directory" && entry.open) count(entry.entries); } };
+  const lists = [];
+  for (const layer of layers) {
+    if (!display.expanded(layer)) { lists.push(null); continue; }
+    const list = display.entries(layer, modules.filter(module => module.layer === layer)); count(list); lists.push(list);
+  }
+  return {total, lists};
+}
+test("one render draws at most the 150-chip cap, notes included, with one overflow note per truncated list", async () => {
+  const h = harness(), dto = fixture(), base = dto.modules[0];
+  dto.layers = Array.from({length:6}, (_, i) => ({name:`L${i}`, order:i + 1, shared:false, display:"expanded"}));
+  // Each band: 60 measured single-file modules, one unmeasured file and one two-file module opened below.
+  dto.modules = dto.layers.flatMap(({name}) => [
+    ...Array.from({length:60}, (_, i) => ({...base, layer:name, identity:identity(`${name}/m${String(i).padStart(2, "0")}.rs`)})),
+    {...base, layer:name, declarationCount:0, identity:identity(`${name}/unmeasured.rs`)},
+    ...["a", "b"].map(file => ({...base, layer:name, identity:identity(`${name}/aa/${file}.rs`)}))]);
+  dto.edges = [];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const first = h.renders.at(-1).options.display.entries("L0", dto.modules.filter(module => module.layer === "L0"));
+  await h.renders.at(-1).options.onToggleDirectory(first[0]);
+  const {display} = h.renders.at(-1).options;
+  const {total, lists} = drawnEntries(display, dto.layers.map(layer => layer.name), dto.modules);
+  assert.equal(total, 150, "chips and every kind of note share one exact bound");
+  assert.equal(lists[0].length, 41, "40 module entries (39 chips and the overflow note), then the unmeasured note");
+  assert.equal(lists[0][0].type, "directory"); assert.equal(lists[0][0].open, true); assert.equal(lists[0][0].entries.length, 2);
+  assert.match(lists[0][39].label, /^22 files not drawn · diagram size cap\nselect to list this layer's files$/);
+  assert.match(lists[0][40].label, /^1 file · metrics unavailable/);
+  assert.deepEqual(lists.map(list => list?.length ?? null), [41, 41, 41, 25, null, null], "bands past the spent budget stay folded instead of drawing empty boxes");
+  assert.match(lists[3].at(-1).label, /^37 files not drawn/, "the last list ends on its overflow note; no further notes once the budget is spent");
+});
+
+test("unhinted test and fixture layers are hidden until tests and fixtures are included; an authored hint wins", async () => {
   const h = harness();
+  let hinted = null;
   const payload = role => {
     const dto = fixture("max", "rules-one", role), base = dto.modules[0]; dto.modules[1].roleCounts = {production:1,test:2};
-    dto.layers.push({name:"Fixtures",order:0,shared:false,display:null});
+    dto.layers.push({name:"Fixtures",order:0,shared:false,display:hinted});
     dto.modules.push({...base, identity:identity("tests/fixtures/a.rs"), layer:"Fixtures", roleCounts:{production:3,test:0}, ...(role === "production" ? {excludedReason:"fixture"} : {})},
       {...base, identity:identity("tests/b.rs"), layer:"Fixtures", roleCounts:{production:0,test:2}});
     dto.edges.push(edge("Fixtures","UI",1));
@@ -498,4 +540,10 @@ test("test and fixture layers are hidden until tests and fixtures are included i
   h.get("architecture-metric-tests").checked = true; await h.get("architecture-metric-tests").fire("change");
   assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), true, "Include tests and fixtures draws the layer");
   assert.equal(h.get("architecture-hidden").hidden, true);
+  h.get("architecture-metric-tests").checked = false; await h.get("architecture-metric-tests").fire("change");
+  for (const hint of ["expanded", "collapsed"]) {
+    hinted = hint; await h.controller.refresh();
+    assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), true, `an authored ${hint} hint wins over the default test-layer hiding`);
+    assert.equal(h.renders.at(-1).options.display.expanded("Fixtures"), hint === "expanded");
+  }
 });
