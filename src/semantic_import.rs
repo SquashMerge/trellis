@@ -448,14 +448,82 @@ fn occurrence_endpoints(claim: &CapturedClaim, admitted_encoding: u8) -> Result<
     Ok((encoding, endpoints))
 }
 
-fn mapped_range(endpoints: Endpoints, offsets: &CoordinateMap) -> Result<native::Range> {
+/// Recognize the pinned producers' raw file/module markers, not a measured name anchor.
+fn module_definition(claim: &CapturedClaim) -> bool {
+    use scip::types::descriptor::Suffix;
+    if claim.envelope.record_kind != "occurrence"
+        || !claim.envelope.raw["symbolRoles"]
+            .as_u64()
+            .is_some_and(|roles| roles & 1 != 0)
+    {
+        return false;
+    }
+    let Some(symbol) = claim.envelope.raw["symbol"].as_str() else {
+        return false;
+    };
+    let Ok(symbol) = scip::symbol::parse_symbol(symbol) else {
+        return false;
+    };
+    let package = |descriptor: &scip::types::Descriptor| {
+        descriptor.suffix.enum_value() == Ok(Suffix::Package)
+    };
+    match (claim.language.as_str(), symbol.scheme.as_str()) {
+        ("javascript", "scip-typescript") => {
+            !symbol.descriptors.is_empty()
+                && symbol.descriptors.iter().all(package)
+                && symbol
+                    .descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("/")
+                    == claim.envelope.relative_path
+        }
+        ("python", "scip-python") => {
+            symbol
+                .descriptors
+                .split_last()
+                .is_some_and(|(last, prefix)| {
+                    last.suffix.enum_value() == Ok(Suffix::Meta)
+                        && last.name == "__init__"
+                        && !prefix.is_empty()
+                        && prefix.iter().all(package)
+                        && claim
+                            .envelope
+                            .relative_path
+                            .strip_suffix("/__init__.py")
+                            .or_else(|| claim.envelope.relative_path.strip_suffix(".py"))
+                            .is_some_and(|path| {
+                                prefix
+                                    .iter()
+                                    .map(|descriptor| descriptor.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                                    == path.replace('/', ".")
+                            })
+                })
+        }
+        _ => false,
+    }
+}
+
+fn mapped_range(
+    claim: &CapturedClaim,
+    endpoints: Endpoints,
+    offsets: &CoordinateMap,
+) -> Result<native::Range> {
     let start = *offsets
         .get(&endpoints.0)
         .context("missing SCIP start position")?;
     let end = *offsets
         .get(&endpoints.1)
         .context("missing SCIP end position")?;
-    ensure!(start < end, "empty or reversed SCIP range");
+    if start > end || (start == end && !module_definition(claim)) {
+        return Err(crate::scip_raw::ScipCaptureError::InvalidArtifact(
+            "empty or reversed SCIP range".into(),
+        )
+        .into());
+    }
     Ok(native::Range { start, end })
 }
 
@@ -473,7 +541,7 @@ pub fn occurrence_range(
         &mut vec![endpoints.0, endpoints.1],
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
-    mapped_range(endpoints, &offsets)
+    mapped_range(claim, endpoints, &offsets)
 }
 
 struct CoordinateMaps {
@@ -550,7 +618,7 @@ impl CoordinateMaps {
                 encoding,
             ))
             .context("missing SCIP coordinate map")?;
-        mapped_range(endpoints, offsets)
+        mapped_range(claim, endpoints, offsets)
     }
 }
 
@@ -880,6 +948,11 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             let declaration = roles & 1 != 0;
             if declaration {
                 index.put_symbol(symbol, true, false)?;
+            }
+            // Valid empty module markers retain their raw proof and declared symbol,
+            // but cannot author a measured name, reference or call association.
+            if range.start == range.end {
+                continue;
             }
             let binding = store.join(&doc, range.clone(), semantic::JoinKind::DeclarationName)?;
             let reference = store.join(&doc, range.clone(), semantic::JoinKind::Reference)?;
@@ -2327,6 +2400,10 @@ fn rejoin_with_stores<S: JoinStore + NativeFacts>(
         }
         if claim.envelope.record_kind == "occurrence" {
             let range = captured_store.occurrence_range(&claim, admitted_encoding)?;
+            if range.start == range.end {
+                eligible.insert(doc);
+                continue;
+            }
             #[cfg(feature = "test-support")]
             count_publication_work(|work| work.original_role_parses += 1);
             let roles = claim.envelope.raw["symbolRoles"]

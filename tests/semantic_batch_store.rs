@@ -2,6 +2,7 @@
 #[path = "support/semantic_batch.rs"]
 mod semantic_batch_support;
 
+use protobuf::Message;
 use semantic_batch_support::{
     BatchFixture, DocSpec, edit_descriptor, edit_page, long_path_workspace, uniform_workspace,
 };
@@ -2091,6 +2092,415 @@ fn identical_envelopes_are_deduplicated_per_authenticated_tuple() {
             .collect()
     };
     assert_eq!(digests(&world), digests(&other));
+}
+
+#[test]
+fn empty_document_languages_bind_through_batch_publication_and_stored_rejoin() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/C.py", "def f():\n    f()\n"),
+            ],
+        )
+    });
+    let (a, b) = definitions_docs();
+    let python = DocSpec::new("src/C.py")
+        .occurrence(&[0, 4, 5], &[], "pkg f().", 1)
+        .occurrence(&[1, 4, 5], &[1, 4, 7], "pkg f().", 0);
+    let mut fixture = world.fixture();
+    let mut originals = Vec::new();
+    for (language, docs) in [("javascript", vec![a, b]), ("python", vec![python])] {
+        let ordinal = fixture.artifact(language, docs.clone());
+        let mut index =
+            scip::types::Index::parse_from_bytes(&fixture.scip_bytes(language, &docs)).unwrap();
+        for document in &mut index.documents {
+            document.language.clear();
+        }
+        let bytes = index.write_to_bytes().unwrap();
+        fixture.override_artifact_raw(ordinal, bytes.clone());
+        originals.push(bytes);
+    }
+    let descriptor = world.write(&fixture);
+    let parsed = Descriptor::parse(&fs::read(&descriptor.0).unwrap()).unwrap();
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    let assert_bound = |snapshot: &trellis::semantic_evidence::SemanticSnapshot| {
+        use trellis::semantic_evidence::Language;
+        assert!(!snapshot.provenance.is_empty());
+        for proof in &snapshot.provenance {
+            let expected = if proof.document.path.ends_with(".py") {
+                ("python", Language::Python)
+            } else {
+                ("javascript", Language::Javascript)
+            };
+            assert_eq!(proof.document.language, expected.0);
+            assert_eq!(proof.basis.as_ref().unwrap().language, expected.1);
+        }
+    };
+    assert_bound(&published);
+    let proofs = stored_proofs(&world);
+    assert_eq!(proofs.len(), 7);
+    for (_, _, _, language, path) in &proofs {
+        assert_eq!(
+            language,
+            if path.ends_with(".py") {
+                "python"
+            } else {
+                "javascript"
+            }
+        );
+    }
+    let db = world.db();
+    for (artifact, original) in parsed.artifacts.iter().zip(&originals) {
+        let (stored_hash, stored): (String, Vec<u8>) = db
+            .query_row(
+                "SELECT artifact_hash,binary_bytes FROM semantic_raw_captures WHERE ordinal=?1",
+                [artifact.ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, *original);
+        assert_eq!(stored_hash, artifact.sha256);
+        assert_eq!(stored_hash, semantic_batch_support::sha256(original));
+        let index = scip::types::Index::parse_from_bytes(&stored).unwrap();
+        assert!(
+            index
+                .documents
+                .iter()
+                .all(|document| document.language.is_empty())
+        );
+    }
+    drop(db);
+    let imported = world.basis_artifacts();
+    assert_eq!(imported.len(), 3);
+    // Native recovery authenticates the stored originals again, not the admitted stage.
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(world.basis_artifacts(), imported);
+    assert_eq!(stored_proofs(&world), proofs);
+    assert_bound(
+        &world
+            .store
+            .semantic_at(world.store.index_baseline().unwrap())
+            .unwrap(),
+    );
+}
+
+// These marker fields are copied from the real scip-typescript 0.4.0 and scip-python
+// 0.6.6 outputs diagnosed in #423. Both omit SymbolInformation.kind (numeric 0).
+fn real_module_marker_batch(language: &str) {
+    let (files, a, b, marker_symbols) = match language {
+        "javascript" => (
+            vec![
+                (
+                    "src/a.js",
+                    "export function greet(name) {\n  return \"hello \" + name;\n}\n",
+                ),
+                (
+                    "src/b.js",
+                    "import { greet } from \"./a.js\";\n\nexport function welcome(user) {\n  return greet(user) + \"!\";\n}\n",
+                ),
+            ],
+            DocSpec::new("src/a.js")
+                .occurrence(
+                    &[0, 0, 0],
+                    &[0, 0, 3, 0],
+                    "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/",
+                    1,
+                )
+                .symbol(
+                    "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/",
+                    0,
+                    &[],
+                )
+                .occurrence(
+                    &[0, 16, 21],
+                    &[],
+                    "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/greet().",
+                    1,
+                )
+                .symbol(
+                    "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/greet().",
+                    17,
+                    &[],
+                ),
+            DocSpec::new("src/b.js")
+                .occurrence(
+                    &[0, 0, 0],
+                    &[0, 0, 5, 0],
+                    "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`b.js`/",
+                    1,
+                )
+                .symbol(
+                    "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`b.js`/",
+                    0,
+                    &[],
+                )
+                .occurrence(
+                    &[3, 9, 14],
+                    &[3, 9, 20],
+                    "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/greet().",
+                    0,
+                ),
+            [
+                "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/",
+                "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`b.js`/",
+            ],
+        ),
+        "python" => (
+            vec![
+                (
+                    "pkg/a.py",
+                    "def greet(name):\n    return \"hello \" + name\n",
+                ),
+                (
+                    "pkg/b.py",
+                    "from pkg.a import greet\n\n\ndef welcome(user):\n    return greet(user) + \"!\"\n",
+                ),
+            ],
+            DocSpec::new("pkg/a.py")
+                .occurrence(
+                    &[0, 0, 0],
+                    &[],
+                    "scip-python python trellis-workspace 0 `pkg.a`/__init__:",
+                    1,
+                )
+                .symbol(
+                    "scip-python python trellis-workspace 0 `pkg.a`/__init__:",
+                    0,
+                    &[],
+                )
+                .occurrence(
+                    &[0, 4, 9],
+                    &[],
+                    "scip-python python trellis-workspace 0 `pkg.a`/greet().",
+                    1,
+                )
+                .symbol(
+                    "scip-python python trellis-workspace 0 `pkg.a`/greet().",
+                    12,
+                    &[],
+                ),
+            DocSpec::new("pkg/b.py")
+                .occurrence(
+                    &[0, 0, 0],
+                    &[],
+                    "scip-python python trellis-workspace 0 `pkg.b`/__init__:",
+                    1,
+                )
+                .symbol(
+                    "scip-python python trellis-workspace 0 `pkg.b`/__init__:",
+                    0,
+                    &[],
+                )
+                .occurrence(
+                    &[4, 11, 16],
+                    &[4, 11, 22],
+                    "scip-python python trellis-workspace 0 `pkg.a`/greet().",
+                    8,
+                ),
+            [
+                "scip-python python trellis-workspace 0 `pkg.a`/__init__:",
+                "scip-python python trellis-workspace 0 `pkg.b`/__init__:",
+            ],
+        ),
+        _ => unreachable!(),
+    };
+    let world = world(|root| write_files(root, &files));
+    let descriptor = one_artifact_per_language(&world, vec![(language, vec![a, b])]);
+    let memory = world.memory_admission(&descriptor);
+    let markers: Vec<_> = memory
+        .merged
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.envelope.record_kind == "occurrence"
+                && marker_symbols.contains(&claim.envelope.raw["symbol"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(markers.len(), 2);
+    for marker in &markers {
+        assert_eq!(
+            marker.envelope.raw["range"],
+            json!({"encoding":"legacy","values":[0,0,0]})
+        );
+        assert_eq!(marker.envelope.raw["symbolRoles"], json!(1));
+    }
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    for symbol in marker_symbols {
+        let marker = published
+            .symbols
+            .iter()
+            .find(|row| row.key.symbol == symbol)
+            .unwrap();
+        assert!(
+            marker.declarations.is_empty(),
+            "file marker is not a measured declaration name"
+        );
+    }
+    assert!(
+        published
+            .references
+            .iter()
+            .any(|row| row.spelling == "greet")
+    );
+    assert!(
+        published
+            .call_bindings
+            .iter()
+            .any(|row| row.call_id.is_some())
+    );
+    assert!(
+        published
+            .declaration_bindings
+            .iter()
+            .any(|row| row.syntax_id.is_some())
+    );
+    // No measured row may be fabricated from either zero-width file marker.
+    for marker in markers {
+        let derived: Vec<_> = published
+            .provenance
+            .iter()
+            .filter(|row| {
+                row.derived_from
+                    .as_ref()
+                    .is_some_and(|from| from.provenance_id == marker.captured_proof_id)
+            })
+            .map(|row| &row.id)
+            .collect();
+        assert!(
+            published
+                .declaration_bindings
+                .iter()
+                .all(|row| !derived.contains(&&row.provenance_id))
+        );
+        assert!(
+            published
+                .references
+                .iter()
+                .all(|row| !derived.contains(&&row.provenance_id))
+        );
+        assert!(
+            published
+                .call_bindings
+                .iter()
+                .all(|row| !derived.contains(&&row.provenance_id))
+        );
+    }
+    let db = world.db();
+    for claim in &memory.merged.claims {
+        let (kind, digest, bytes): (String, String, Vec<u8>) = db.query_row(
+            "SELECT record_kind,fact_digest,canonical_bytes FROM semantic_raw_proofs WHERE proof_id=?1",
+            [&claim.captured_proof_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(kind, claim.envelope.record_kind);
+        assert_eq!(digest, claim.fact_digest);
+        assert_eq!(bytes, claim.canonical_bytes);
+    }
+    let (stored_hash, stored): (String, Vec<u8>) = db
+        .query_row(
+            "SELECT artifact_hash,binary_bytes FROM semantic_raw_captures",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, memory.artifacts[0]);
+    assert_eq!(
+        stored_hash,
+        semantic_batch_support::sha256(&memory.artifacts[0])
+    );
+    drop(db);
+    let proofs = stored_proofs(&world);
+    drop(admitted);
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(stored_proofs(&world), proofs);
+}
+
+#[test]
+fn real_typescript_empty_module_markers_publish_and_rejoin_without_measured_anchors() {
+    real_module_marker_batch("javascript");
+}
+
+#[test]
+fn real_python_empty_module_markers_publish_and_rejoin_without_measured_anchors() {
+    real_module_marker_batch("python");
+}
+
+#[test]
+fn invalid_empty_or_reversed_occurrences_reject_typed_without_partial_publication() {
+    let world = world(|root| write_files(root, &[("src/a.js", "function greet() {}\n")]));
+    let head = world.store.index_baseline().unwrap();
+    for (range, symbol, roles, kind) in [
+        (vec![0, 0, 0], "pkg greet().", 1, 17),
+        (vec![0, 0, 0], "pkg greet().", 0, 17),
+        (
+            vec![0, 0, 0],
+            "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/",
+            0,
+            0,
+        ),
+        (
+            vec![0, 1, 0],
+            "scip-typescript npm trellis-producer-fixture-js 1.0.0 src/`a.js`/",
+            1,
+            0,
+        ),
+    ] {
+        let doc = DocSpec::new("src/a.js")
+            .occurrence(&[0, 9, 14], &[], "pkg valid().", 1)
+            .symbol("pkg valid().", 17, &[])
+            .occurrence(&range, &[], symbol, roles)
+            .symbol(symbol, kind, &[]);
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
+        let error = world.publish(&descriptor).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ScipCaptureError>(),
+                Some(ScipCaptureError::InvalidArtifact(_))
+            ),
+            "{range:?}, {symbol}, roles {roles}: {error:#}"
+        );
+        assert_nothing_published(&world, head);
+        assert!(world.stage_dirs().is_empty());
+    }
+}
+
+#[test]
+fn nonempty_document_language_mismatch_still_fails_typed_in_batch_admission() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let docs = vec![a, b];
+    let mut fixture = world.fixture();
+    let ordinal = fixture.artifact("javascript", docs.clone());
+    let mut index =
+        scip::types::Index::parse_from_bytes(&fixture.scip_bytes("javascript", &docs)).unwrap();
+    index.documents[0].language = "python".into();
+    fixture.override_artifact_raw(ordinal, index.write_to_bytes().unwrap());
+    let error = expect_err(world.admit(&world.write(&fixture)));
+    assert_eq!(
+        error.downcast_ref::<ScipCaptureError>(),
+        Some(&ScipCaptureError::InvalidArtifact(
+            "document source binding".into()
+        ))
+    );
+    assert!(world.stage_dirs().is_empty());
 }
 
 #[test]

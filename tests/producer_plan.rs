@@ -232,14 +232,10 @@ fn plan_and_status_execute_nothing() {
     }
     assert!(!marker.exists(), "a tripwire script ran");
     assert!(!stub_marker.exists(), "the stub ran");
-    let state = checkout
-        .home
-        .join("Library/Caches/dev.squashmerge.trellis/producers");
-    let state_alt = checkout
-        .home
-        .join(".cache/dev.squashmerge.trellis/producers");
     assert!(
-        !state.exists() && !state_alt.exists(),
+        !support::cache_dir(&checkout.home)
+            .join("producers")
+            .exists(),
         "planning created state"
     );
 }
@@ -331,4 +327,99 @@ fn status_reports_detection_and_imported_only() {
         rust["trustProfiles"]["restricted"]["result"],
         "profile_unsupported"
     );
+}
+
+#[test]
+fn trusted_java_and_rust_plans_declare_downloads_and_caches() {
+    use std::path::PathBuf;
+    use trellis::producer::{
+        ProducerName, TrustProfile,
+        detect::{Declared, Environment, Exe, Resolution, Verification},
+        plan::{Basis, LimitsRequest, Parts, build},
+        profiles::{Row, Target},
+    };
+    let environment = Environment {
+        path: "/usr/bin".into(),
+        home: "/home/u".into(),
+        rustup_home: Some("/home/u/.rustup".into()),
+        cargo_home: Some("/home/u/.cargo".into()),
+        coursier_cache: Some("/home/u/coursier/v1".into()),
+        coursier_archive_cache: Some("/home/u/coursier/arc".into()),
+    };
+    let declared = Declared::new(&environment).unwrap();
+    let exe = |path: &str| Exe {
+        path: PathBuf::from(path),
+        sha256: "0".repeat(64),
+        dir: PathBuf::from(path).parent().unwrap().to_path_buf(),
+    };
+    let basis = Basis {
+        source_set_id: "set".into(),
+        root_id: "root".into(),
+        source_revision: "revision".into(),
+        source_manifest_hash: "0".repeat(64),
+        toolchain_hash: "0".repeat(64),
+        config_hash: "0".repeat(64),
+        dependency_hash: "0".repeat(64),
+        documents: 1,
+        requested_documents: 1,
+        inputs: Default::default(),
+    };
+    let planned = |producer: ProducerName, resolution: Resolution| {
+        let pin = trellis::scip_admission::pinned_producer_by_id(producer.as_str()).unwrap();
+        build(&Parts {
+            workspace: "/w",
+            row: Row {
+                target: Target::Real(producer),
+                trust: TrustProfile::Trusted,
+            },
+            pin: &pin,
+            resolution: &resolution,
+            declared: &declared,
+            stub: None,
+            basis: &basis,
+            limits: LimitsRequest {
+                timeout_secs: 60,
+                memory_mib: 1024,
+            },
+            run_dir: "/state/runs/{runId}",
+        })
+    };
+    let resolution = |java: bool| Resolution {
+        launcher: PathBuf::from("/bin/launcher"),
+        verification: Verification {
+            method: "executableSha256",
+            observed: "0".repeat(64),
+        },
+        node: None,
+        java: java.then(|| exe("/jdk/bin/java")),
+        java_home: None,
+        rustup: (!java).then(|| exe("/bin/rustup")),
+        python3: None,
+    };
+
+    let java = planned(ProducerName::ScipJava, resolution(true));
+    assert_eq!(java["policy"]["network"]["decision"], "allow");
+    assert!(
+        java["policy"]["network"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("download")
+    );
+    let caches = java["inputs"]["declaredCaches"].as_array().unwrap();
+    let named = |name: &str| caches.iter().find(|c| c["name"] == name).unwrap()["path"].clone();
+    assert_eq!(named("COURSIER_CACHE"), "/home/u/coursier/v1");
+    assert_eq!(named("COURSIER_ARCHIVE_CACHE"), "/home/u/coursier/arc");
+
+    let rust = planned(ProducerName::RustAnalyzer, resolution(false));
+    assert_eq!(rust["policy"]["network"]["decision"], "allow");
+    assert!(
+        rust["policy"]["network"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("download")
+    );
+    let caches = rust["inputs"]["declaredCaches"].as_array().unwrap();
+    let named = |name: &str| caches.iter().find(|c| c["name"] == name).unwrap()["path"].clone();
+    assert_eq!(named("RUSTUP_HOME"), "/home/u/.rustup");
+    assert_eq!(named("CARGO_HOME"), "/home/u/.cargo");
 }
