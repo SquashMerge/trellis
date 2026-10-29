@@ -38,6 +38,27 @@ fn canonical_targets(live: &Rc<LiveBudget>, targets: &mut Vec<semantic::Target>)
     Ok(())
 }
 
+/// Replaces `declared`/`candidates` with copies of `from_declared`/`from_candidates`. The
+/// copies are admitted from the borrowed source before anything is cloned; the replaced values
+/// stay charged (overlap). The incoming set can be larger than the one it replaces: a captured
+/// internal target may survive retargeting although destination discovery excluded its
+/// ineligible document.
+fn adopt_targets(
+    owner: &mut Reservation,
+    declared: &mut Option<semantic::Target>,
+    candidates: &mut Vec<semantic::Target>,
+    from_declared: Option<&semantic::Target>,
+    from_candidates: &[semantic::Target],
+) -> Result<()> {
+    owner.grow(sizes::sum(&[
+        from_declared.map_or(Ok(0), sizes::target_payload)?,
+        sizes::targets(from_candidates)?,
+    ])?)?;
+    *declared = from_declared.cloned();
+    *candidates = from_candidates.to_vec();
+    Ok(())
+}
+
 /// Admits one new `BTreeMap` entry whose owned key/value payload is `payload` bytes.
 fn entry<K, V>(owner: &mut Reservation, payload: u64) -> Result<()> {
     owner.grow(sizes::sum(&[sizes::map_entries::<K, V>(1)?, payload])?)
@@ -285,18 +306,22 @@ impl StagedJoin<'_> {
                 continue;
             }
             for symbol in &binding.symbols {
-                let target = semantic::Target::Internal {
-                    syntax_id: syntax_id.clone(),
-                    document: doc.clone(),
-                    revision_id: self.captured_id().to_owned(),
-                };
-                // The map entry is charged with every push: a conservative upper bound.
+                // Admitted from borrowed parts, built only after admission. The map entry is
+                // charged with every push: a conservative upper bound.
                 let payload = sizes::sum(&[
                     sizes::map_entries::<&str, Vec<semantic::Target>>(1)?,
-                    sizes::target_payload(&target)?,
+                    syntax_id.len() as u64,
+                    sizes::document(doc)?,
+                    self.captured_id().len() as u64,
                 ])?;
                 let targets = captured_targets.entry(symbol.symbol.as_str()).or_default();
-                streaming::append_reserved(targets, target, payload, &mut owner)?;
+                streaming::append_reserved_with(targets, payload, &mut owner, || {
+                    semantic::Target::Internal {
+                        syntax_id: syntax_id.clone(),
+                        document: doc.clone(),
+                        revision_id: self.captured_id().to_owned(),
+                    }
+                })?;
             }
         }
         for targets in captured_targets.values_mut() {
@@ -379,16 +404,14 @@ impl StagedJoin<'_> {
             if reference.roles.is_empty() {
                 continue;
             }
-            owner.grow(sizes::sum(&[
-                prior
-                    .declared_target
-                    .as_ref()
-                    .map_or(Ok(0), sizes::target_payload)?,
-                sizes::targets(&prior.candidates)?,
-            ])?)?;
             reference.resolution = prior.resolution;
-            reference.declared_target = prior.declared_target.clone();
-            reference.candidates = prior.candidates.clone();
+            adopt_targets(
+                &mut owner,
+                &mut reference.declared_target,
+                &mut reference.candidates,
+                prior.declared_target.as_ref(),
+                &prior.candidates,
+            )?;
             if !self.retarget_all(
                 reference
                     .declared_target
@@ -411,18 +434,18 @@ impl StagedJoin<'_> {
                 .iter()
                 .chain(&reference.candidates)
             {
-                streaming::append_reserved(
+                streaming::append_reserved_with(
                     united,
-                    target.clone(),
                     sizes::target_payload(target)?,
                     &mut owner,
+                    || target.clone(),
                 )?;
             }
-            streaming::append_reserved(
+            streaming::append_reserved_with(
                 proofs.entry(id.clone()).or_default(),
-                raw.clone(),
                 raw.len() as u64,
                 &mut owner,
+                || raw.clone(),
             )?;
             entry::<String, String>(&mut owner, (raw.len() + id.len()) as u64)?;
             accepted.insert(raw.clone(), id.clone());
@@ -512,11 +535,17 @@ impl StagedJoin<'_> {
             let Some(old) = old_targets.get(calls[index].provenance_id.as_str()) else {
                 continue;
             };
+            // The working copy, then the captured reference's targets it adopts.
             owner.grow(sizes::call(&calls[index])?)?;
             let mut call = calls[index].clone();
             call.resolution = old.resolution;
-            call.declared_target = old.declared_target.clone();
-            call.candidates = old.candidates.clone();
+            adopt_targets(
+                &mut owner,
+                &mut call.declared_target,
+                &mut call.candidates,
+                old.declared_target.as_ref(),
+                &old.candidates,
+            )?;
             if !self.retarget_all(
                 call.declared_target
                     .iter_mut()
@@ -540,8 +569,13 @@ impl StagedJoin<'_> {
                 continue;
             };
             call.resolution = reference.resolution;
-            call.declared_target = reference.declared_target.clone();
-            call.candidates = reference.candidates.clone();
+            adopt_targets(
+                &mut owner,
+                &mut call.declared_target,
+                &mut call.candidates,
+                reference.declared_target.as_ref(),
+                &reference.candidates,
+            )?;
             call.stale_target = call.declared_target.as_ref().and_then(|target| {
                 matches!(target, semantic::Target::Internal { .. }).then_some(false)
             });
@@ -790,5 +824,67 @@ impl StagedJoin<'_> {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adopted_targets_are_admitted_from_the_incoming_set_before_any_copy() {
+        let document = |path: &str| native::DocumentKey {
+            source_set_id: "source".into(),
+            language: "javascript".into(),
+            path: path.into(),
+        };
+        // Destination discovery excluded the ineligible B.js, so the destination call holds
+        // a small external target; the captured reference names B.js's declaration.
+        let mut declared = Some(semantic::Target::External {
+            symbol: super::super::super::symbol_key("pkg target.", &document("src/A.js")),
+        });
+        let mut candidates = Vec::new();
+        let captured = semantic::Target::Internal {
+            syntax_id: "sid:v1:".repeat(8),
+            document: document("src/B.js"),
+            revision_id: "revision:v2:".repeat(8),
+        };
+        let others = vec![captured.clone(), captured.clone()];
+        let incoming = sizes::target_payload(&captured).unwrap() + sizes::targets(&others).unwrap();
+        let existing = sizes::target_payload(declared.as_ref().unwrap()).unwrap();
+        assert!(incoming > existing, "the incoming set is the larger one");
+
+        // Room for a copy of the replaced set, not of the incoming one: denied, nothing copied.
+        let budget = LiveBudget::new(incoming - 1);
+        let mut owner = budget.reserve(0).unwrap();
+        let before = declared.clone();
+        let error = adopt_targets(
+            &mut owner,
+            &mut declared,
+            &mut candidates,
+            Some(&captured),
+            &others,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name=="unit expansion")
+        );
+        assert_eq!(declared, before);
+        assert!(candidates.is_empty());
+        assert_eq!(budget.high_water(), 0, "nothing was admitted or copied");
+
+        let budget = LiveBudget::new(incoming);
+        let mut owner = budget.reserve(0).unwrap();
+        adopt_targets(
+            &mut owner,
+            &mut declared,
+            &mut candidates,
+            Some(&captured),
+            &others,
+        )
+        .unwrap();
+        assert_eq!(declared.as_ref(), Some(&captured));
+        assert_eq!(candidates, others);
+        assert_eq!(budget.high_water(), incoming);
     }
 }

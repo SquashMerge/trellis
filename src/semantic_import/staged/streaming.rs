@@ -292,7 +292,7 @@ pub(super) fn append_reserved<T>(
     append_reserved_with(rows, payload, retained, || row)
 }
 
-fn append_reserved_with<T>(
+pub(super) fn append_reserved_with<T>(
     rows: &mut Vec<T>,
     payload: u64,
     retained: &mut Reservation,
