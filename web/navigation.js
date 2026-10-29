@@ -206,10 +206,17 @@
     const usable = () => !disposed && api === owner && window.TrellisIndexPin.equal(owner?.currentRevision?.(), revision) &&
       owner?.currentSession?.() === session && (!isCurrent || isCurrent());
     const annotations = [], seen = new Set();
+    let activeAction = null;
+    const lineActions = () => annotations.filter(node => node.parentNode === rows[active]);
+    function updateActions(preferred = activeAction) {
+      const actions = lineActions();
+      activeAction = actions.includes(preferred) ? preferred : actions[0] || null;
+      for (const action of annotations) action.setAttribute("tabindex", action === activeAction ? "0" : "-1");
+    }
     let nextOffset = 0, metadataLoading = false, metadataCount = 0, metadataPartial = false, admitted = null;
     function clearAnnotations() {
       for (const node of annotations) node.remove();
-      annotations.length = 0;
+      annotations.length = 0; activeAction = null;
     }
     function renderSymbols(symbols) {
       for (const symbol of symbols) {
@@ -219,6 +226,7 @@
         const row = rows[lines.indexOf(symbol.range.startLine)];
         if (!row) continue;
         const action = el("button", undefined, "source-diagram-action"); action.type = "button";
+        action.setAttribute("tabindex", "-1");
         action.setAttribute("data-symbol-id", symbol.id);
         action.setAttribute("data-source-action", "sequence");
         // A CSS label keeps controls out of source text and native copy/selection.
@@ -231,6 +239,7 @@
         });
         row.append(action); annotations.push(action);
       }
+      update();
     }
     function updateCoverage() {
       more.hidden = nextOffset === null; more.textContent = "More source actions";
@@ -278,8 +287,10 @@
       else delete container.dataset.navigationLine;
       button.disabled = !line;
       button.textContent = line ? `Navigate line ${line}` : "Navigate";
-      status.textContent = line ? "Line-based targets · ↑ ↓ to select · Shift F10 to navigate" : "No source lines available for navigation.";
-      container.setAttribute("aria-label", line ? `Source code. Active line ${line}. Use Up and Down to select a line; Shift F10 to navigate indexed targets.` : "Source code. No navigable lines.");
+      updateActions();
+      const actionHint = activeAction ? ` · Tab for Sequence${lineActions().length > 1 ? " · ← → to choose declaration" : ""}` : "";
+      status.textContent = line ? `Line-based targets · ↑ ↓ to select · Shift F10 to navigate${actionHint}` : "No source lines available for navigation.";
+      container.setAttribute("aria-label", line ? `Source code. Active line ${line}. Use Up and Down to select a line; Shift F10 to navigate indexed targets.${activeAction ? " Tab for Sequence. Left and Right choose declarations on this line." : ""}` : "Source code. No navigable lines.");
       rows[active]?.classList.add("navigation-active-line");
     }
     function activate(index, scroll = false) {
@@ -299,6 +310,10 @@
         {isCurrent: () => usable() && scope === generation});
     }
     function click(event) { const index = rowIndex(event.target); if (index >= 0) activate(index); }
+    function focusin(event) {
+      if (!usable() || !annotations.includes(event.target)) return;
+      activate(rowIndex(event.target)); updateActions(event.target);
+    }
     function contextmenu(event) {
       const index = rowIndex(event.target);
       if (index < 0) return;
@@ -308,13 +323,25 @@
       if (!usable() || event.altKey || event.ctrlKey || event.metaKey) return;
       if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) return navigate(event);
       // Shift-arrow remains native text selection. Copy and page scrolling remain native.
-      if (event.shiftKey || event.target !== container) return;
+      const onAction = annotations.includes(event.target);
+      if (event.shiftKey || (event.target !== container && !onAction)) return;
+      if (onAction && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
+        event.preventDefault();
+        const actions = lineActions(), step = event.key === "ArrowRight" ? 1 : -1;
+        const nextAction = actions[(actions.indexOf(event.target) + step + actions.length) % actions.length];
+        updateActions(nextAction); nextAction?.focus(); return;
+      }
       const next = {ArrowDown: Math.min(rows.length - 1, active + 1), ArrowUp: Math.max(0, active - 1), Home: 0, End: rows.length - 1}[event.key];
-      if (next !== undefined && rows.length) { event.preventDefault(); activate(next, true); }
+      if (next !== undefined && rows.length) {
+        event.preventDefault();
+        if (onAction) container.focus({preventScroll:true});
+        activate(next, true);
+      }
     }
     container.addEventListener("click", click);
     container.addEventListener("contextmenu", contextmenu);
     container.addEventListener("keydown", keydown);
+    container.addEventListener("focusin", focusin);
     button.addEventListener("click", navigate);
     more.addEventListener("click", loadDeclarations);
     const binding = {container, snapshot() {
@@ -325,6 +352,7 @@
       container.removeEventListener("click", click);
       container.removeEventListener("contextmenu", contextmenu);
       container.removeEventListener("keydown", keydown);
+      container.removeEventListener("focusin", focusin);
       button.removeEventListener("click", navigate);
       more.removeEventListener("click", loadDeclarations); clearAnnotations();
       delete container.dataset.navigationLine;

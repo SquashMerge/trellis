@@ -155,6 +155,7 @@ async function navigateDiagram(symbol, revision, kind = "sequence", admitted = n
   diagramSerial++;
   const source = captureSourceEntry();
   if (source) rememberNavigation(source, true, "#source");
+  else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
   rememberNavigation({kind, symbol, admitted, showAll:false}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
@@ -227,6 +228,8 @@ async function readNavigationLocation(force = false) {
   try {
     if (entry) {
       if (!navigationCurrent(entry)) throw new Error("This history entry is stale. Select source from the current snapshot.");
+      if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
+      $("error").hidden = true;
       if (entry.kind === "source") return await restoreSourceEntry(entry, current);
       clearSource(); diagramSequence = null;
       await setSection("diagrams");
@@ -1643,6 +1646,7 @@ let externalSerial = 0, externalFileSerial = 0, externalSnapshot = null, externa
 let externalWindowStart = 0, externalSelectedRange = null;
 function resetExternalWindow() {
   externalWindowStart = 0; externalSelectedRange = null;
+  $("external-source-hint").hidden = true;
   $("external-previous").disabled = true; $("external-next").disabled = true;
 }
 function clearExternalSources() {
@@ -1792,7 +1796,8 @@ function renderExternalSource(range = externalSelectedRange, windowStart) {
     if (range && number >= range.startLine && number <= range.endLine) line.classList.add("highlight");
     line.append(element("span", String(number), "line-number"), document.createTextNode(content)); fragment.append(line);
   }
-  fragment.append(element("span", "Workspace diagrams are unavailable for this external candidate snapshot.", "source-line warning"));
+  $("external-source-hint").textContent = "Workspace diagrams are unavailable for this external candidate snapshot.";
+  $("external-source-hint").hidden = false;
   $("external-source").replaceChildren(fragment);
   if (range) {
     $("external-source").focus({preventScroll:true});

@@ -334,6 +334,27 @@ test("Files source action Back/Forward restores the same source, range, active l
   assert.equal(h.requests.filter(request=>request.url.endsWith("/sequence")).length,1);
 });
 
+test("mini Full without visible indexed source marks blank Back history and Forward reuses the pinned diagram", async () => {
+  const browser=historyBrowser(), h=harness(browser), item=outline("measured"); indexedNetwork(h,item);
+  await h.run('readNavigationLocation()'); assert.equal(h.get("error").hidden,true,"an ordinary blank route is not an error");
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)');
+  h.run('filesBasis="working";updateFilesBasis()');
+  const reads=h.requests.length;
+  await h.run('openFilesFull()');
+  const hash=browser.location.hash;
+  assert.equal(browser.history.length,2); assert.match(hash,/^#sequence\?sid=measured&/);
+  browser.history.go(-1); await h.run('readNavigationLocation()');
+  assert.equal(browser.location.hash,""); assert.deepEqual(Object.keys(browser.history.state),["trellisNavigation"]);
+  assert.equal(h.get("error").hidden,false); assert.match(h.get("error").textContent,/no saved source view.*current diagram remains open.*Forward/);
+  assert.equal(h.run('section'),"diagrams"); assert.equal(h.run('selectedMethod.id'),item.symbol.id);
+  assert.equal(h.requests.length,reads,"Back does not read or guess a source location");
+  browser.history.go(1); await h.run('readNavigationLocation()');
+  assert.equal(browser.location.hash,hash); assert.equal(h.get("error").hidden,true);
+  assert.equal(h.run('diagramSequence.seed.id'),item.symbol.id); assert.equal(h.run('section'),"diagrams");
+  assert.equal(h.requests.length,reads); assert.equal(browser.history.length,2);
+});
+
 test("source history from a previous pin is rejected without rereading source or adopting the successor", async () => {
   const browser=historyBrowser(), h=harness(browser), item=outline("measured"); indexedNetwork(h,item);
   await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;

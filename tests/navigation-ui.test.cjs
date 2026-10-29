@@ -32,7 +32,7 @@ function harness({openSource = false} = {}) {
       addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);},
       removeEventListener(type,fn){this.listeners[type]=(this.listeners[type]||[]).filter(f=>f!==fn);},
       getBoundingClientRect(){return {left:20,top:30,bottom:50,width:200,height:20};},
-      scrollIntoView(options){this.scrolled=options;},focus(){document.activeElement=this;},
+      scrollIntoView(options){this.scrolled=options;},focus(){if(document.activeElement!==this){document.activeElement=this;this.fire("focusin");}},
       set innerHTML(_){throw new Error("Unsafe HTML assignment");},
       fire(type,details={}) {
         const event={type,target:this,currentTarget:this,preventDefault(){this.prevented=true;},stopPropagation(){this.stopped=true;},...details};
@@ -527,6 +527,50 @@ test("pinned metadata adds one-click callable declarations without changing sour
   assert.deepEqual(p.rows.map(row=>row.children[1].textContent),original);
   assert.equal(h.selected.length,0);await actions[0].fire("click").done;
   assert.equal(h.selected[0],method);assert.equal(h.callbackPins[0].indexRevision,1);assert.equal(p.pre.dataset.navigationLine,"5");assert.equal(h.calls.length,0);
+});
+
+test("source declaration actions keep one tab stop on the active line and rove exact same-line identities",async()=>{
+  const h=harness(),methods=Array.from({length:32},(_,i)=>declaration(`method-${i}`,"method",4+i));
+  const sameLine=declaration("same-line-exact","method",5);
+  h.symbolsRequest=async()=>outline([...methods,sameLine]);
+  const p=h.pane(Array.from({length:33},(_,i)=>4+i));await p.binding.ready;
+  const actions=inlineActions(p),peer=actions.find(node=>node.getAttribute("data-symbol-id")===sameLine.id),nextLine=actions.find(node=>node.getAttribute("data-symbol-id")===methods[2].id),tabbable=()=>actions.filter(node=>node.getAttribute("tabindex")==="0");
+  assert.equal(actions.length,33);assert.deepEqual(tabbable(),[actions[0]]);
+  p.pre.focus();p.pre.fire("keydown",{key:"ArrowDown"});
+  assert.equal(p.pre.dataset.navigationLine,"5");assert.deepEqual(tabbable(),[actions[1]]);
+  assert.equal(p.rows[1].scrolled.block,"nearest");assert.match(p.status.textContent,/Tab for Sequence.*← →/);
+  actions[1].focus();const right=actions[1].fire("keydown",{key:"ArrowRight"});
+  assert.equal(right.prevented,true);assert.equal(h.document.activeElement,peer);
+  assert.deepEqual(tabbable(),[peer]);assert.equal(peer.textContent,"");
+  assert.equal(peer.getAttribute("data-symbol-id"),sameLine.id);
+  peer.fire("keydown",{key:"ArrowLeft"});assert.equal(h.document.activeElement,actions[1]);
+  actions[1].fire("keydown",{key:"ArrowRight"});await peer.fire("click").done;
+  assert.equal(h.selected[0],sameLine);assert.equal(h.calls.length,0);
+  peer.fire("keydown",{key:"ArrowDown"});
+  assert.equal(h.document.activeElement,p.pre);assert.equal(p.pre.dataset.navigationLine,"6");
+  assert.deepEqual(tabbable(),[nextLine]);
+  p.pre.fire("keydown",{key:"End"});assert.equal(tabbable().length,0,"a line without declarations adds no tab stop");
+  peer.focus();assert.equal(p.pre.dataset.navigationLine,"5");assert.deepEqual(tabbable(),[peer],"programmatic focus restores the exact roving action");
+});
+
+test("More and metadata snapshots preserve a single active action including later same-line declarations",async()=>{
+  const h=harness(),first=declaration("first","method",4),second=declaration("second","method",4),later=declaration("later-page","method",4);
+  h.symbolsRequest=async url=>new URL(url,"http://localhost").searchParams.get("offset")==="0" ?
+    outline([first,second],{nextOffset:2,truncated:true}) : outline([later]);
+  const p=h.pane([4,5]);await p.binding.ready;
+  inlineActions(p)[1].focus();const more=p.toolbar.children[2];more.focus();
+  await more.fire("click").done;
+  assert.equal(h.document.activeElement,more,"appending metadata never steals focus");
+  const actions=inlineActions(p);assert.equal(actions.length,3);
+  assert.deepEqual(actions.map(node=>node.getAttribute("tabindex")),["-1","0","-1"],"More does not reset the chosen action");
+  actions[1].focus();actions[1].fire("keydown",{key:"ArrowRight"});assert.equal(h.document.activeElement,actions[2]);
+  const saved=p.binding.snapshot();p.binding.dispose();const requests=h.metadataCalls.length;
+  const restored=h.pane([4,5],{metadataSnapshot:saved,startLine:4}),hydrated=inlineActions(restored);
+  assert.equal(h.metadataCalls.length,requests);assert.equal(hydrated.length,3);
+  hydrated[2].focus();
+  assert.deepEqual(hydrated.map(node=>node.getAttribute("tabindex")),["-1","-1","0"]);
+  assert.equal(restored.pre.dataset.navigationLine,"4");await hydrated[2].fire("click").done;
+  assert.equal(h.selected[0],later);assert.equal(h.calls.length,0);
 });
 
 test("source action coverage is finite and continues only with explicit More",async()=>{

@@ -200,6 +200,38 @@ test("published Files keeps original all-kind outline, UTF-8 syntax locations an
 }));
 
 
+test("mini Full from Working tree explains Back to an unsaved blank route and Forward restores its pinned sequence", {timeout:240000}, async () => published({git:true}, async selected => {
+  const {page, pin, server, requests} = selected;
+  await enterFiles(selected); await openFile(selected, "Watcher.java");
+  const method = (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "measured");
+  assert.ok(method); await selectSymbol(page, method);
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false);
+  await page.locator("#files-working").click();
+  await page.locator("#files-diff .files-diff-hunk").first().waitFor();
+  assert.equal(await page.locator("#source").isVisible(), false, "Working tree has no visible indexed source to capture");
+  assert.equal(await page.evaluate(() => location.hash), "");
+  const sourceCount = sourceReads(requests), sequenceCount = sequenceReads(requests);
+  await page.locator("#files-open-full").click();
+  await page.waitForFunction(() => location.hash.startsWith("#sequence?") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  const hash = await page.evaluate(() => location.hash), historyLength = await page.evaluate(() => history.length);
+  const route = new URLSearchParams(hash.slice("#sequence?".length));
+  assert.equal(route.get("sid"), method.symbol.id); assert.equal(route.get("rootKey"), server.rootKey);
+  assert.equal(route.get("indexGeneration"), pin.indexGeneration); assert.equal(route.get("indexRevision"), String(pin.indexRevision));
+  await page.goBack();
+  await page.waitForFunction(() => location.hash === "" && !document.querySelector("#error")?.hidden && document.querySelector("#error")?.textContent.includes("no saved source view"));
+  assert.equal(await page.locator("#error").isVisible(), true);
+  assert.match(await page.locator("#error").textContent(), /current diagram remains open.*Forward/);
+  assert.equal(await page.locator("#sequence-diagram").isVisible(), true);
+  assert.equal(sourceReads(requests), sourceCount); assert.equal(sequenceReads(requests), sequenceCount);
+  assert.equal(await page.evaluate(() => history.length), historyLength, "Back does not append a replacement route");
+  await page.goForward();
+  await page.waitForFunction(hash => location.hash === hash && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered") && document.querySelector("#error")?.hidden, hash);
+  assert.equal(await page.locator("#sequence-diagram").isVisible(), true);
+  assert.equal(sourceReads(requests), sourceCount); assert.equal(sequenceReads(requests), sequenceCount, "Forward reuses the exact admitted mini sequence");
+  assert.equal(await page.evaluate(() => history.length), historyLength);
+}));
+
+
 const navigationSource = source.replace("  int measured", `${Array.from({length:60}, (_, i) => `  // Context ${i + 1}`).join("\n")}\n  int measured`);
 test("Files declaration Sequence and browser traversal restore the exact pinned source position", {timeout:240000}, async () => published({sourceText:navigationSource}, async selected => {
   const {page, pin, server, requests} = selected;

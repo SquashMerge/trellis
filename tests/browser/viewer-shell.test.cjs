@@ -578,6 +578,11 @@ test("Libraries candidate source never sends candidate IDs to workspace sequence
   assert.match(await page.locator("#external-source-path").textContent(), /immutable candidate snapshot.*terminal library boundary/);
   assert.equal(await page.locator("#external-source").isVisible(), true);
   assert.equal(await page.locator("#external-source .source-diagram-action").count(), 0);
+  assert.equal(await page.locator("#external-source-hint").isVisible(), true);
+  assert.match(await page.locator("#external-source-hint").textContent(), /Workspace diagrams are unavailable/);
+  assert.doesNotMatch(await page.locator("#external-source").textContent(), /Workspace diagrams are unavailable/);
+  assert.equal(await page.locator("#external-source .source-line").evaluateAll(lines => lines.map(line =>
+    [...line.childNodes].filter(node => !node.classList?.contains("line-number")).map(node => node.textContent).join("")).join("\n")), snapshot.file.text);
   assert.equal(await page.locator("#external-source img").count(), 0);
   assert.equal(await page.evaluate(() => globalThis.libraryExecuted), undefined);
   const before = requests.filter(row => /\/(sequence|navigation)$/.test(row.url.pathname)).length;

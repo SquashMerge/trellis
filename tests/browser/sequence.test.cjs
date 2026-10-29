@@ -82,6 +82,47 @@ test("method source Sequence uses the clicked declaration, not the left-tree sel
  assert.match(await page.locator(".method-pick.selected").textContent(), /measured/, "Back restores the original diagram selection as well as source");
 }));
 
+const rovingSource = `function measured() { helper_0(); }
+function helper_0() {} function helper_peer() {}
+${Array.from({length:30},(_,i)=>`function helper_${i+1}() {}`).join("\n")}
+`;
+test("published source roves one tabbable declaration action and invokes exact same-line identity by keyboard", {timeout:240000}, async () => published(rovingSource, async ({page, pin}) => {
+ await page.locator("#method-source").click();
+ await page.waitForFunction(() => document.querySelectorAll("#source .source-diagram-action").length === 33);
+ const sourcePane = page.locator("#source");
+ const tabbable = page.locator('#source .source-diagram-action[tabindex="0"]');
+ assert.equal(await tabbable.count(), 1, "many declarations must not add many source tab stops");
+ await sourcePane.focus();await page.keyboard.press("Home");await page.keyboard.press("ArrowDown");
+ assert.equal(await sourcePane.getAttribute("data-navigation-line"), "2");
+ assert.equal(await tabbable.count(), 1);
+ const sameLine = page.locator("#source .source-line.navigation-active-line .source-diagram-action");
+ assert.equal(await sameLine.count(), 2, "both declarations on the line remain reachable");
+ const firstId = await sameLine.nth(0).getAttribute("data-symbol-id"), exactId = await sameLine.nth(1).getAttribute("data-symbol-id");
+ assert.ok(firstId && exactId && firstId !== exactId);
+ await page.keyboard.press("Tab");
+ assert.equal(await page.evaluate(() => document.activeElement?.dataset.symbolId), firstId, "Tab from source enters only its active line action");
+ assert.equal(await tabbable.evaluate(node => getComputedStyle(node).opacity), "1", "active-line action is revealed");
+ await page.keyboard.press("ArrowRight");
+ assert.equal(await page.evaluate(() => document.activeElement?.dataset.symbolId), exactId);
+ assert.equal(await tabbable.count(), 1);
+ assert.equal(await tabbable.evaluate(node => getComputedStyle(node).outlineStyle), "solid");
+ const before = await sourcePane.textContent();
+ const responsePromise = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === exactId);
+ await page.keyboard.press("Enter");
+ const response = await responsePromise, selected = await response.json();
+ assert.equal(response.status(), 200, JSON.stringify(selected));assert.equal(selected.seed.id, exactId);assert.deepEqual(selected.revision, pin);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), exactId);
+ await page.goBack();
+ await page.waitForFunction(({id,text}) => document.activeElement?.dataset.symbolId === id && document.querySelector("#source")?.textContent === text, {id:exactId,text:before});
+ assert.equal(await sourcePane.getAttribute("data-navigation-line"), "2");assert.equal(await tabbable.count(), 1);
+ assert.equal(await tabbable.getAttribute("data-symbol-id"), exactId, "Back restores the exact roving action, not a second tab stop");
+ await page.keyboard.press("ArrowLeft");assert.equal(await page.evaluate(() => document.activeElement?.dataset.symbolId), firstId);
+ await page.keyboard.press("ArrowDown");
+ assert.equal(await sourcePane.evaluate(node => document.activeElement === node), true);
+ assert.equal(await sourcePane.getAttribute("data-navigation-line"), "3");assert.equal(await tabbable.count(), 1);
+ await page.keyboard.press("Tab");assert.equal(await page.evaluate(() => document.activeElement?.matches('.source-line.navigation-active-line .source-diagram-action')), true);
+}, "roving.js"));
+
 module.exports={published};
 
 const jsSource="async function measured(path, value) {\n  console.log(writeDb());\n  if (!valid(path)) throw new Error(\"invalid\");\n  const tmp = tempName(path);\n  try {\n    await fs.writeFile(tmp, encode(value));\n    await fs.rename(tmp, path);\n    return path;\n  } catch (err) {\n    await fs.unlink(tmp);\n    throw err;\n  } finally {\n    release(path);\n  }\n}\n";
