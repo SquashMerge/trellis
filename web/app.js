@@ -797,9 +797,12 @@ function paintCachedSource(data, range, current, startLine = range?.startLine ||
   $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot`;
   const fragment = document.createDocumentFragment();
   const lastLine = range && range.endLine > range.startLine && range.endColumn === 1 ? range.endLine - 1 : range?.endLine;
-  data.file.text.split("\n").forEach((text, index) => {
+  const lines = data.file.text.split("\n"), syntax = section === "files" ? window.TrellisFiles?.lineClass : null;
+  lines.forEach((text, index) => {
     const number = index + 1, line = element("span", undefined, "source-line");
     if (range && number >= range.startLine && number <= lastLine) line.classList.add("highlight");
+    const kind = syntax?.(data.file.language, text, lines.length);
+    if (kind) line.classList.add(kind);
     line.append(element("span", String(number), "line-number"), document.createTextNode(text)); fragment.append(line);
   });
   $("source").replaceChildren(fragment); $("source").hidden = false;

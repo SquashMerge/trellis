@@ -57,7 +57,7 @@ test("Files opens pinned catalog without choosing source; explicit file reads ze
   assert.ok(h.requests.every(request=>!request.url.includes("/source?")&&!request.url.endsWith("/sequence")));
   assert.match(h.requests[0].url,/indexGeneration=.*indexRevision=1/);
   h.run('files[0].methodCount=0'); await h.run('selectFilesFile(files[0])');
-  assert.match(text(h.get("source")),/int measured/); assert.match(text(h.get("file-tree")),/class · Holder/);
+  assert.match(text(h.get("source")),/int measured/); assert.match(text(h.get("file-tree")),/◇ Holder class L1/);
   assert.equal(h.get("files-working").hidden,true); assert.match(h.get("files-git-state").textContent,/not_repository/);
   h.context.item=item; await h.run('selectFilesSymbol(item)');
   assert.match(h.get("files-mini-state").textContent,/noncallable/);
@@ -266,10 +266,10 @@ test("retained outline More and Retry intents cannot read a successor checkout/s
 test("selecting another file collapses previous outline; interrupted outline exposes retry on return", async () => {
   const h=harness(), first=outline("First","class"), second=outline("Second","class","other.java"); indexedNetwork(h,first);
   await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
-  assert.match(text(h.get("file-tree")),/class · First/);
+  assert.match(text(h.get("file-tree")),/◇ First class L1/);
   h.context.secondFile={path:"other.java",methodCount:0}; h.run('files.push(secondFile)'); indexedNetwork(h,second);
-  await h.run('selectFilesFile(secondFile)'); assert.doesNotMatch(text(h.get("file-tree")),/class · First/);
-  assert.match(text(h.get("file-tree")),/class · Second/);
+  await h.run('selectFilesFile(secondFile)'); assert.doesNotMatch(text(h.get("file-tree")),/◇ First class L1/);
+  assert.match(text(h.get("file-tree")),/◇ Second class L1/);
   const held=deferred(); indexedNetwork(h,second,url=>url.startsWith("/api/symbols?")?held.promise:undefined);
   const pending=h.run('loadFilesOutline(secondFile)'); await h.run('setSection("diagrams")');
   held.resolve(response({revision:pin,path:"other.java",items:[second],nextOffset:null,truncated:false,warnings:[]})); await pending;
@@ -443,4 +443,27 @@ test("source history passes all already-admitted action metadata back to the nor
   browser.history.go(-1);await h.run('readNavigationLocation()');
   assert.equal(received.at(-1),admitted);
   assert.equal(h.run('workspaceSource.navigation.snapshot()'),admitted);
+});
+
+test("Files syntax colouring classifies whole lines by prefix and leaves large files plain", () => {
+  const context = {window:{}};
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../web/files.js"), "utf8"), context);
+  const {lineClass, SYNTAX_LINE_LIMIT} = context.window.TrellisFiles;
+  assert.equal(lineClass("rust", "#[derive(Debug)]", 10), "syntax-attribute");
+  assert.equal(lineClass("rust", "    #![allow(dead_code)]", 10), "syntax-attribute");
+  assert.equal(lineClass("rust", "    /// docs", 10), "syntax-comment");
+  assert.equal(lineClass("rust", "let x = 1; // trailing", 10), "", "only a line's prefix is classified");
+  assert.equal(lineClass("java", "  @Override", 10), "syntax-attribute");
+  assert.equal(lineClass("java", "   * javadoc", 10), "syntax-comment");
+  assert.equal(lineClass("java", "  *count = 1;", 10), "");
+  assert.equal(lineClass("python", "# comment", 10), "syntax-comment");
+  assert.equal(lineClass("python", "@decorator", 10), "syntax-attribute");
+  assert.equal(lineClass("javascript", "#private = 1;", 10), "");
+  assert.equal(lineClass("javascript", "// <script>alert(1)</script>", 10), "syntax-comment");
+  assert.equal(lineClass("rust", " ".repeat(100) + "// deep", 10), "", "the prefix scan is bounded");
+  assert.equal(lineClass("markdown", "* bullet", 10), "", "Markdown bullets are not comments");
+  assert.equal(lineClass("yaml", "# key note", 10), "", "unknown comment syntax stays plain");
+  assert.equal(lineClass("python", "// not a comment", 10), "");
+  assert.equal(lineClass("go", "// comment", 10), "syntax-comment");
+  assert.equal(lineClass("rust", "// comment", SYNTAX_LINE_LIMIT + 1), "", "large files stay plain");
 });
