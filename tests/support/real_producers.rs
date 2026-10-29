@@ -92,16 +92,18 @@ fn declared_path_dirs(home: &Path) -> Vec<PathBuf> {
     dirs.retain(|dir| {
         dir.is_absolute() && !dir.components().any(|part| part.as_os_str() == "shims")
     });
-    let installs = home.join(".local/share/mise/installs/node");
-    if let Ok(entries) = fs::read_dir(installs) {
-        let mut versions: Vec<PathBuf> = entries
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .map(|entry| entry.path().join("bin"))
-            .collect();
-        versions.sort();
-        versions.reverse();
-        dirs.extend(versions);
+    for tool in ["node", "java"] {
+        let installs = home.join(".local/share/mise/installs").join(tool);
+        if let Ok(entries) = fs::read_dir(installs) {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path().join("bin"))
+                .collect();
+            versions.sort();
+            versions.reverse();
+            dirs.extend(versions);
+        }
     }
     for dir in ["/usr/bin", "/bin"] {
         dirs.push(PathBuf::from(dir));
