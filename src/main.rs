@@ -169,6 +169,21 @@ enum ProducerAction {
     Plan(ProducerPlanArgs),
     /// Report producer detection, trust-profile availability and run state.
     Status(ProducerStatusArgs),
+    /// Import an owner-configured artifact without running a producer, or clear the entry.
+    Pickup(ProducerPickupArgs),
+}
+#[derive(Args)]
+struct ProducerPickupArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(trellis::producer::profiles::cli_producer_names()))]
+    producer: String,
+    /// Artifact to import now and whenever it changes.
+    #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+    artifact: Option<PathBuf>,
+    /// Remove the producer's pickup configuration.
+    #[arg(long)]
+    clear: bool,
 }
 #[derive(Args)]
 struct ProducerPlanArgs {
@@ -662,7 +677,10 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     let cli_bound = CLI_REPLY_BOUND;
     #[cfg(feature = "test-support")]
     let cli_bound = metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(cli_bound);
-    let reply_bound = if matches!(request.operation.as_str(), "index" | "semantic_import") {
+    let reply_bound = if matches!(
+        request.operation.as_str(),
+        "index" | "semantic_import" | "producer_pickup"
+    ) {
         index_bound
     } else {
         cli_bound
@@ -874,6 +892,36 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             }),
             true,
         ),
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Pickup(args),
+        }) => {
+            let artifact = args
+                .artifact
+                .as_ref()
+                .map(|path| -> Result<String> {
+                    let absolute = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    };
+                    Ok(absolute
+                        .to_str()
+                        .context("invalid_request: non-UTF8 artifact path")?
+                        .to_owned())
+                })
+                .transpose()?;
+            (
+                "producer_pickup",
+                &args.workspace,
+                serde_json::json!({
+                    "version": 1,
+                    "producer": args.producer,
+                    "artifact": artifact,
+                    "clear": args.clear,
+                }),
+                false,
+            )
+        }
         Command::Semantic(SemanticCommand {
             action: SemanticAction::Import(args),
         }) => {
@@ -966,6 +1014,18 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         }
     } else {
         print_json(&value)?;
+    }
+    if let Command::Producer(ProducerCommand {
+        action: ProducerAction::Pickup(args),
+    }) = command
+        && args.artifact.is_some()
+        && value["state"] != "done"
+    {
+        anyhow::bail!(
+            "{}: producer pickup {}",
+            value["errorCode"].as_str().unwrap_or("index_failed"),
+            value["state"].as_str().unwrap_or("failed")
+        );
     }
     if matches!(command, Command::Rules(_) | Command::References(_)) && value.get("error").is_some()
     {
@@ -1576,6 +1636,7 @@ fn dispatch_connection(
                     | "references"
                     | "producer_plan"
                     | "producer_status"
+                    | "producer_pickup"
             ),
             "unknown daemon operation"
         );
@@ -1630,6 +1691,7 @@ fn dispatch_connection(
                 "status" => checkout.cli_status(),
                 "producer_plan" => checkout.cli_producer_plan(args),
                 "producer_status" => checkout.cli_producer_status(args),
+                "producer_pickup" => checkout.cli_producer_pickup(args),
                 "symbols" => checkout.cli_symbols(
                     args["search"].as_str().context("missing search")?,
                     args["limit"].as_u64().context("missing limit")? as usize,
@@ -1823,11 +1885,13 @@ fn dispatch_connection(
             };
             // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
-            if !matches!(request.operation.as_str(), "index" | "semantic_import")
-                && selected
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
+            if !matches!(
+                request.operation.as_str(),
+                "index" | "semantic_import" | "producer_pickup"
+            ) && selected
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
                 #[cfg(all(feature = "test-support", unix))]

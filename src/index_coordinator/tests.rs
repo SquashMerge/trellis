@@ -1026,7 +1026,7 @@ fn lookup_budget_is_shared_across_destination_retries() {
     use crate::{
         scip_raw::ScipCaptureError,
         semantic_batch::{
-            BatchCounters, BatchLimits, LookupBudget, StageOwner, stage_batch,
+            BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner, stage_batch,
             testing::single_artifact_batch,
         },
         semantic_import::{DestinationMutations, join_staged},
@@ -1054,7 +1054,7 @@ fn lookup_budget_is_shared_across_destination_retries() {
     let stage = |limits: &BatchLimits| {
         stage_batch(
             &store,
-            &root,
+            &StageInput::external(&root).unwrap(),
             StageOwner {
                 request_id: "budget",
                 incarnation: "claim-1",

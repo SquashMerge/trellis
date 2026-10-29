@@ -701,6 +701,25 @@ impl DaemonState {
         Ok(row)
     }
 
+    /// A Trellis-written import joins the same lease, FIFO and inbox wake. Only the producer
+    /// import module calls this.
+    pub(crate) fn enqueue_generated_semantic_import(
+        &self,
+        options: &crate::store::requests::GeneratedImportOptions,
+    ) -> anyhow::Result<crate::store::requests::Request> {
+        let lease = self.admission_lease()?;
+        let row = self.store.enqueue_generated_semantic_import(
+            std::path::Path::new(self.store.workspace_root()),
+            options,
+        )?;
+        self.fifo_pending.store(true, Ordering::Release);
+        drop(lease);
+        self.pending_requests.lock().unwrap().push(row.id.clone());
+        *self.recovery_retry_after.lock().unwrap() = None;
+        self.inbox.wake();
+        Ok(row)
+    }
+
     /// Take an admission lease unless the runtime is retired. Release declines
     /// while a lease is held, and both decide under the runtime state lock.
     /// A lease taken while retirement is requested cancels it (Decision 0009

@@ -627,6 +627,7 @@ impl CheckoutRegistry {
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing,
             rules_edit_owner: std::sync::Mutex::new(()),
+            pickup: crate::producer::pickup::PickupOwner::default(),
             search: self.search.clone(),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1703,6 +1704,8 @@ pub struct CheckoutRuntime {
     root_lost: std::sync::atomic::AtomicBool,
     initial_indexing: bool,
     rules_edit_owner: std::sync::Mutex<()>,
+    /// The only writer of this checkout's `pickup.json`.
+    pickup: crate::producer::pickup::PickupOwner,
 }
 
 /// Startup reconciliation is due or running (not waiting out a backoff).
@@ -1850,7 +1853,34 @@ impl CheckoutRuntime {
         let _lease = resources.scheduler.admission_lease()?;
         resources.store.verify_root()?;
         let stub = crate::producer::profiles::Stub::from_env();
-        crate::producer::plan::status(&resources.store, &request, stub.as_ref())
+        let mut status = crate::producer::plan::status(&resources.store, &request, stub.as_ref())?;
+        if let Some(producers) = status["producers"].as_array_mut() {
+            for producer in producers {
+                let name = producer["name"].as_str().unwrap_or_default().to_owned();
+                producer["pickup"] = self.pickup.status(&resources.store, &name);
+            }
+        }
+        Ok(status)
+    }
+
+    /// Configure or clear an owner artifact pickup. `--artifact` imports at once and replies
+    /// with the typed import outcome; nothing here runs a producer.
+    pub fn cli_producer_pickup(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::pickup::PickupRequest::parse(args)?;
+        let resources = self.resources()?;
+        resources.store.verify_root()?;
+        match &request.artifact {
+            Some(artifact) => self.pickup.set(
+                &resources.store,
+                &resources.scheduler,
+                &request.producer,
+                artifact,
+            ),
+            None => self.pickup.clear(&resources.store, &request.producer),
+        }
     }
 
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
@@ -2668,6 +2698,7 @@ mod selection_tests {
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing: true,
             rules_edit_owner: std::sync::Mutex::new(()),
+            pickup: crate::producer::pickup::PickupOwner::default(),
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             mcp_call_clock_origin: std::sync::Mutex::new(None),
             mcp_hint_clock_origin: std::sync::Mutex::new(None),

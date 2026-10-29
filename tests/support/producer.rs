@@ -190,3 +190,49 @@ pub fn pinned_version(name: &str) -> String {
         .unwrap()
         .version
 }
+
+/// The data directory a test `HOME` selects.
+pub fn data_dir(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/dev.squashmerge.trellis")
+    } else {
+        home.join(".local/share/trellis")
+    }
+}
+
+/// The cache directory a test `HOME` selects.
+pub fn cache_dir(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Caches/dev.squashmerge.trellis")
+    } else {
+        home.join(".cache/trellis")
+    }
+}
+
+/// The producer state directory of `checkout`.
+pub fn state_dir(checkout: &Checkout) -> PathBuf {
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let roots =
+        TopologyRoots::isolated_for_tests(cache_dir(&checkout.home), data_dir(&checkout.home));
+    let identity = WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root).unwrap();
+    roots.producer_state_dir(&identity)
+}
+
+/// SIGTERM the daemon this test's CLI started and wait until it has released
+/// its election lock, so the next CLI call starts a new one.
+pub fn stop_daemon(home: &Path) {
+    use std::os::fd::AsRawFd;
+    let pid: i32 = fs::read_to_string(home.join("daemon.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    trellis::testing::wait_until("daemon exit", || !trellis::testing::process_running(pid));
+    let lock = trellis::daemon::SocketPaths::new(&data_dir(home)).lock;
+    trellis::testing::wait_until("daemon election lock released", || {
+        let Ok(file) = fs::File::open(&lock) else {
+            return true;
+        };
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    });
+}

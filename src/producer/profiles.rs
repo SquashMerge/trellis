@@ -547,36 +547,11 @@ pub fn policies(row: &Row) -> Policies {
     all
 }
 
-/// A descriptor component named by the generation provenance (D4).
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Component {
-    Source,
-    Config,
-    DependencyManifests,
-    ProducerVersion,
-    ProducerExecutable,
-    Runtime,
-    ExternalInputs,
-}
-
-impl Component {
-    pub const ALL: [Self; 7] = [
-        Self::Source,
-        Self::Config,
-        Self::DependencyManifests,
-        Self::ProducerVersion,
-        Self::ProducerExecutable,
-        Self::Runtime,
-        Self::ExternalInputs,
-    ];
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RuntimeEntry {
-    pub name: String,
-    pub sha256: String,
-}
+/// The descriptor's own generation types, so the table and the retained `generation` object
+/// cannot drift apart.
+pub use crate::semantic_batch::descriptor::{
+    GenerationComponent as Component, GenerationRuntime as RuntimeEntry,
+};
 
 /// What a generated batch will assert versus observe, exactly as the
 /// descriptor's `generation` records it.

@@ -4145,8 +4145,9 @@ fn storage_fault(error: &anyhow::Error) -> bool {
     })
 }
 
-/// SQLite reported a full disk (SQLITE_FULL) while writing staged or published rows. The
-/// request settles `index_failed`; the cause stays in the error chain for diagnostics.
+/// SQLite reported a full disk (SQLITE_FULL) while writing staged or published rows. Its
+/// message is outside the closed import classes, so an index or semantic import request settles
+/// `index_failed`; the cause stays in the error chain for diagnostics.
 #[derive(Debug)]
 pub struct StorageFull(());
 
@@ -5670,7 +5671,7 @@ fn authenticate_stored_batch(
     captured: &crate::semantic_evidence::CapturedComponents,
     r1: &crate::native_evidence::Artifact,
     sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
-    root: &std::path::Path,
+    identity: &topology::WorkspaceIdentity,
     cancel: &CancelFlag,
 ) -> Result<AttestedProfileProducer> {
     use crate::native_ids::digest;
@@ -5691,8 +5692,16 @@ fn authenticate_stored_batch(
     let pinned = descriptor
         .check_producer()
         .context("raw producer not pinned")?;
+    // Every spelling admission accepts for the descriptor's origin is accepted here, so a
+    // batch that was admitted can always be re-authenticated against its retained root.
+    let workspace_uri =
+        crate::scip_admission::file_uri(&identity.root).context("raw project root")?;
     descriptor
-        .bind_header(root, &r1.source_set, &r1.revision)
+        .bind_header(
+            &descriptor.reuse_project_roots(&workspace_uri, &identity.root_key),
+            &r1.source_set,
+            &r1.revision,
+        )
         .context("raw batch header binding")?;
     let mut manifest_hash = SourceManifestHasher::new(&r1.source_set.id);
     for doc in &r1.revision.documents {
@@ -5712,7 +5721,7 @@ fn authenticate_stored_batch(
             && captured.sources == *sources,
         "raw captured native/source identity differs"
     );
-    let uri = crate::scip_admission::file_uri(root).context("raw project root")?;
+    let uri = descriptor.metadata.project_root.clone();
     let mut claims = Vec::new();
     for capture in &raw.captures {
         // The artifact covers every retained document of its language that the batch did not
@@ -8857,7 +8866,7 @@ fn selected_native_rejoin_once(
                         &full_captured,
                         full_r1,
                         full_sources,
-                        &store.identity.root,
+                        &store.identity,
                         cancel,
                     )?;
                     ensure!(
@@ -8946,7 +8955,7 @@ fn selected_native_rejoin_once(
                 &captured,
                 r1,
                 r1_sources,
-                &store.identity.root,
+                &store.identity,
                 cancel,
             )?;
             ensure!(
@@ -14359,6 +14368,43 @@ impl Store {
     /// Directory that holds per-operation semantic stages: the existing index directory.
     pub(crate) fn semantic_stage_parent(&self) -> Result<std::path::PathBuf> {
         self.roots.existing_index_dir(&self.identity)
+    }
+
+    /// The canonical private directory of one generated batch: a run directory or a pickup
+    /// directory under the producer state directory. The worker derives every generated input
+    /// root here; no caller-supplied path is ever a root.
+    pub fn producer_generation_dir(
+        &self,
+        origin: crate::semantic_batch::descriptor::GenerationOrigin,
+        generation_id: &str,
+    ) -> Result<std::path::PathBuf> {
+        ensure!(
+            generation_id.len() == 32
+                && generation_id
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "invalid_request: generation directory"
+        );
+        self.roots
+            .producer_state_dir(&self.identity)
+            .join(origin.subdir())
+            .join(generation_id)
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("invalid_request: generation directory"))
+    }
+
+    /// The generation directories named by queued or running generated imports, which the
+    /// producer state sweep must keep.
+    pub fn pending_generation_dirs(
+        &self,
+    ) -> Result<std::collections::BTreeSet<std::path::PathBuf>> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for (origin, id) in self.pending_generation_ids()? {
+            if let Ok(dir) = self.producer_generation_dir(origin, &id) {
+                dirs.insert(dir);
+            }
+        }
+        Ok(dirs)
     }
 
     pub(crate) fn begin_writer_publication(&self, session: &topology::WriterSession) -> Result<()> {

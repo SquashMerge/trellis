@@ -1,7 +1,7 @@
 //! Test-support entry points: admission over in-memory bytes, and the whole-snapshot-read seam.
 use super::{
     AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
-    admit::{BatchInputs, NativeSource, Passes, StageOwner, stage_batch},
+    admit::{BatchInputs, NativeSource, Passes, StageInput, StageOwner, stage_batch},
     descriptor::{
         ArtifactEntry, Descriptor, PageEntry, SourceManifestHasher, basis_artifact_ordinal,
     },
@@ -175,7 +175,7 @@ fn admit(
         let sha = scip_raw::sha(descriptor_bytes);
         let descriptor = Descriptor::parse_admitted(descriptor_bytes, &sha, &limits)?;
         let producer = descriptor.check_producer()?;
-        descriptor.bind_header(root, source_set, revision)?;
+        descriptor.bind_header(&[file_uri(root)?], source_set, revision)?;
         descriptor.check_pages(&limits)?;
         descriptor.check_artifacts(&limits)?;
         for relative in descriptor
@@ -495,7 +495,7 @@ pub fn stage_and_join_admitted(
     let request = format!("join-{}", NEXT_JOIN.fetch_add(1, Ordering::Relaxed));
     let mut admitted = stage_batch(
         store,
-        root,
+        &StageInput::external(root)?,
         StageOwner {
             request_id: &request,
             incarnation: "claim-1",

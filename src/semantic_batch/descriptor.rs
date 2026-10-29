@@ -8,8 +8,7 @@ use crate::{
     native_evidence as native,
     native_ids::canonical_into,
     scip_admission::{
-        PinnedProducer, admission, file_uri, hexhash, order, path, pinned_producer,
-        validate_selected_role,
+        PinnedProducer, admission, hexhash, order, path, pinned_producer, validate_selected_role,
     },
     scip_raw::{self, Completion, ScipCaptureError},
 };
@@ -137,6 +136,100 @@ pub struct Descriptor {
     pub totals: Totals,
     pub pages: Vec<PageEntry>,
     pub artifacts: Vec<ArtifactEntry>,
+    /// Provenance of a batch Trellis wrote itself (#21). Absent means an external batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<Generation>,
+}
+
+/// Which Trellis-owned flow wrote a generated batch. It names the private directory the
+/// batch is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenerationOrigin {
+    #[serde(rename = "trellisRun")]
+    TrellisRun,
+    #[serde(rename = "ownerPickup")]
+    OwnerPickup,
+}
+
+impl GenerationOrigin {
+    /// The directory under the producer state directory that holds this origin's batches.
+    pub fn subdir(self) -> &'static str {
+        match self {
+            Self::TrellisRun => "runs",
+            Self::OwnerPickup => "pickups",
+        }
+    }
+}
+
+/// The origin of an import as the worker sees it: external, or one of the generated origins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOrigin {
+    External,
+    TrellisRun,
+    OwnerPickup,
+}
+
+impl From<GenerationOrigin> for ImportOrigin {
+    fn from(origin: GenerationOrigin) -> Self {
+        match origin {
+            GenerationOrigin::TrellisRun => Self::TrellisRun,
+            GenerationOrigin::OwnerPickup => Self::OwnerPickup,
+        }
+    }
+}
+
+/// The trust profile a run used, as recorded in `generation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GenerationTrust {
+    Restricted,
+    Trusted,
+}
+
+/// A descriptor component the generation provenance names as observed or asserted.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GenerationComponent {
+    Source,
+    Config,
+    DependencyManifests,
+    ProducerVersion,
+    ProducerExecutable,
+    Runtime,
+    ExternalInputs,
+}
+
+impl GenerationComponent {
+    pub const ALL: [Self; 7] = [
+        Self::Source,
+        Self::Config,
+        Self::DependencyManifests,
+        Self::ProducerVersion,
+        Self::ProducerExecutable,
+        Self::Runtime,
+        Self::ExternalInputs,
+    ];
+}
+
+/// One runtime executable whose hash Trellis observed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationRuntime {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// The closed `generation` object. Every key is required; `trustProfile` may be null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Generation {
+    pub origin: GenerationOrigin,
+    pub generation_id: String,
+    #[serde(deserialize_with = "nullable")]
+    pub trust_profile: Option<GenerationTrust>,
+    pub runtime: Vec<GenerationRuntime>,
+    pub observed: Vec<GenerationComponent>,
+    pub asserted: Vec<GenerationComponent>,
 }
 
 impl Descriptor {
@@ -172,10 +265,57 @@ impl Descriptor {
         pinned_producer(&self.trust_origin, &self.profile_id, &self.producer)
     }
 
+    /// Generation-origin rule: an external import carries no `generation`; a generated one
+    /// carries exactly the origin and ID of its job.
+    pub fn check_origin(&self, origin: ImportOrigin, generation_id: Option<&str>) -> Result<()> {
+        let matches = match (origin, &self.generation) {
+            (ImportOrigin::External, None) => generation_id.is_none(),
+            (ImportOrigin::TrellisRun, Some(generation)) => {
+                generation.origin == GenerationOrigin::TrellisRun
+                    && generation_id == Some(generation.generation_id.as_str())
+            }
+            (ImportOrigin::OwnerPickup, Some(generation)) => {
+                generation.origin == GenerationOrigin::OwnerPickup
+                    && generation_id == Some(generation.generation_id.as_str())
+            }
+            _ => false,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(admission("generation origin"))
+        }
+    }
+
+    /// The project-root spellings a stored batch may bind to on store reuse. Every spelling
+    /// admission accepts for the descriptor's origin is accepted here.
+    pub fn reuse_project_roots(&self, workspace_uri: &str, root_key: &str) -> Vec<String> {
+        let workspace_spellings = || vec![workspace_uri.to_owned(), format!("{workspace_uri}/")];
+        match &self.generation {
+            None => vec![workspace_uri.to_owned()],
+            Some(generation) => match generation.origin {
+                GenerationOrigin::OwnerPickup => workspace_spellings(),
+                GenerationOrigin::TrellisRun => {
+                    let retained = &self.metadata.project_root;
+                    let bare = retained.strip_suffix('/').unwrap_or(retained);
+                    let suffix = format!(
+                        "/producers/{root_key}/runs/{}/worktree",
+                        generation.generation_id
+                    );
+                    if bare.starts_with("file:///") && bare.ends_with(&suffix) {
+                        vec![retained.clone()]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            },
+        }
+    }
+
     /// Check 3: the header must name the retained captured revision.
     pub fn bind_header(
         &self,
-        root: &Path,
+        project_roots: &[String],
         source_set: &native::SourceSet,
         revision: &native::Revision,
     ) -> Result<()> {
@@ -197,7 +337,7 @@ impl Descriptor {
         {
             return Err(admission("native revision components"));
         }
-        if self.metadata.project_root != file_uri(root)?
+        if !project_roots.contains(&self.metadata.project_root)
             || self.metadata.protocol_version != 0
             || self.metadata.text_document_encoding != 1
         {

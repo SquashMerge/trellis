@@ -12,7 +12,7 @@ pub mod staging;
 #[cfg(feature = "test-support")]
 pub mod testing;
 
-pub use admit::{StageOwner, stage_batch};
+pub use admit::{StageInput, StageOwner, stage_batch};
 pub use limits::BatchLimits;
 
 #[cfg(test)]

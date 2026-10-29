@@ -16,7 +16,7 @@ use trellis::{
     model::IndexPin,
     scip_raw::ScipCaptureError,
     semantic_batch::{
-        AdmittedBatch, BatchCounters, BatchLimits, LookupBudget, StageOwner,
+        AdmittedBatch, BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner,
         descriptor::Descriptor, limits, stage_batch, testing,
     },
     semantic_evidence::{Freshness, Resolution, SemanticPublication},
@@ -111,7 +111,7 @@ impl World {
     ) -> anyhow::Result<AdmittedBatch> {
         stage_batch(
             &self.store,
-            &self.root,
+            &StageInput::external(&self.root)?,
             StageOwner {
                 request_id: "request-1",
                 incarnation: "claim-1",
