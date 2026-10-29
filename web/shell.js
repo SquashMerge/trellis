@@ -298,6 +298,16 @@
       ? `${head} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · As of last fetch`
       : `${head} · No upstream`;
   }
+  function checkoutLabel(row) {
+    const root = row?.workspaceRoot || "", name = root.split(/[\/]/).filter(Boolean).at(-1) || row?.rootKey || "Checkout";
+    const git = row?.git;
+    const head = git?.state === "available" && git.head?.kind === "branch" ? git.head.name
+      : git?.state === "available" && git.head?.kind === "detached" && git.head.shortCommit ? `Detached ${git.head.shortCommit}` : "Git unavailable";
+    const pin = row?.revision;
+    const revision = pin && typeof pin.indexGeneration === "string" && Number.isSafeInteger(pin.indexRevision)
+      ? `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}` : "Not indexed";
+    return `${name} ⎇ ${head} · ${revision}`;
+  }
   function updateCheckout(root, git) {
     checkoutRoot = root || "";
     const label = checkoutRoot ? formatGit(git) : "";
@@ -312,9 +322,7 @@
     text("workspace-name", root.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
     text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : checkoutRoot ? "Index status unavailable" : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
-    const state = status ? (status.catchingUp === true ? "catching-up" : "fresh") : "unknown";
-    get("workspace-index-state")?.setAttribute("data-state", state);
-    text("workspace-index-label", status ? `${status.catchingUp === true ? "Catching up" : "Fresh"} · revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision}` : checkoutRoot ? "Index status unavailable" : "No checkout selected");
+
   }
   function reset() {
     setSection("diagrams"); resetInspector(); showView("sequence"); hide("source-dock", true); sourceReturnFocus = null;
@@ -344,6 +352,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
+  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();

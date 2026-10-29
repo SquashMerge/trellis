@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal, {library = false, rules = null} = {}) {
+async function published(callback, signal, {library = false, rules = null, git = false} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -89,6 +89,12 @@ async function published(callback, signal, {library = false, rules = null} = {})
   }
   let server, browser, context;
   try {
+    if (git) {
+      for (const args of [["init", "-q", "-b", "measured-branch"], ["config", "user.name", "Chrome acceptance"],
+        ["config", "user.email", "chrome@example.invalid"], ["add", "."], ["commit", "-qm", "Chrome baseline"]]) {
+        await H.run("git", args, {cwd:paths.workspace, env:paths.env});
+      }
+    }
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
     const pin = JSON.parse(indexed.stdout).status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
@@ -262,7 +268,7 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   const freshness = status.data.catchingUp ? "catching-up" : "fresh";
   assert.equal(await checkoutPick.locator(".checkout-freshness").getAttribute("data-state"), freshness);
   assert.equal(await page.locator("#workspace-index-state").getAttribute("data-state"), freshness);
-  assert.match(await page.locator("#workspace-index-label").textContent(), new RegExp(`revision ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
+  assert.match(await page.locator("#workspace-index-label").textContent(), new RegExp(`rev(?:ision)? ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
   await expandSources(page);
   let payload = await metrics(server, paths, pin, "max");
   await assertLegend(page, payload, "cognitive");
@@ -711,7 +717,7 @@ test("retained Files and diagram evidence names the newer head until explicit ke
   const actualHead = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"));
   assert.equal(actualHead.status, 200);
   assert.deepEqual(actualHead.data.revision, head, "explicit reload adopts the current head, independently verified from the daemon");
-  await page.waitForFunction(expected => document.querySelector("#workspace-index-label")?.textContent.includes(`revision ${expected}`), label(head));
+  await page.waitForFunction(expected => new RegExp(`rev(?:ision)? ${expected}`).test(document.querySelector("#workspace-index-label")?.textContent || ""), label(head));
   assert.equal(await page.locator(".method-pick.selected").count(), 0, "reload does not carry an old symbol selection into head");
   assert.equal(await page.locator("#source .source-line").count(), 0, "reload clears old source before a new file selection");
   assert.equal(await banner.isVisible(), false);
@@ -838,3 +844,213 @@ test("invalid rules keep Explorer and Treemap heat with a warning while Architec
   assert.ok(!(await page.locator("#architecture-panel").textContent()).includes(warning));
   assert.equal(await page.locator("#architecture-diagram svg, #architecture-diagram [data-trellis-module-id]").count(), 0);
 }, undefined, {rules:'version = 1\n[layers.broken]\norder = "not an integer"\npaths = ["src/**"]\n'}));
+
+
+// Status responses are controlled at the existing API boundary; files, metrics
+// and every displayed revision still come from the real published fixture.
+async function chromeFixture(page, paths, server) {
+  const observed = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"));
+  assert.equal(observed.status, 200, JSON.stringify(observed.data));
+  const fixture = {status:structuredClone(observed.data), job:null};
+  const prefix = H.scoped(server.rootKey, "");
+  const pattern = `${server.base}${prefix}**`;
+  const respond = async route => {
+    const suffix = new URL(route.request().url()).pathname.slice(prefix.length);
+    let body;
+    if (suffix === "status") body = fixture.status;
+    else if (suffix === "jobs/current" || suffix.startsWith("jobs/")) body = fixture.job;
+    else if (suffix === "index" && route.request().method() === "POST") body = fixture.job;
+    else return route.continue();
+    await route.fulfill({status:suffix === "index" ? 202 : 200, contentType:"application/json", body:JSON.stringify(body)});
+  };
+  await page.route(pattern, respond);
+  fixture.select = async () => {
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent === "");
+  };
+  fixture.close = () => page.unroute(pattern, respond);
+  return fixture;
+}
+async function assertIndexState(page, state, words) {
+  await page.waitForFunction(expected => document.querySelector("#workspace-index-state")?.dataset.state === expected, state);
+  assert.match(await page.locator("#workspace-index-label").textContent(), words);
+  const shape = await page.locator("#workspace-index-state .state-shape").boundingBox();
+  assert.ok(shape && shape.width > 0 && shape.height > 0, `${state} has a visible shape as well as words`);
+}
+
+test("connected chrome uses one desktop action line, folded details and brand-sized controls without losing narrow drawers", {timeout:240000}, async () => published(async ({page, requests}) => {
+  const toolbar = page.locator(".workspace-toolbar");
+  const header = await page.locator(".app-header").boundingBox();
+  const actions = await toolbar.boundingBox();
+  const frame = await page.locator(".workspace-frame").boundingBox();
+  const primary = await page.locator("#index").boundingBox();
+  assert.ok(header && actions && frame && primary);
+  assert.ok(primary.height >= 44, "explicit Index is a primary action of at least 44px");
+  assert.ok(actions.height <= primary.height + 20, "closed desktop status/actions occupy one compact line");
+  assert.ok(Math.abs(actions.y - (header.y + header.height)) <= 1, "no revision or browse-notice row separates header and actions");
+  assert.ok(Math.abs(frame.y - (actions.y + actions.height)) <= 1, "no job row separates actions from the panes");
+  const headerControls = await Promise.all([".brand", ".section-nav", "#checkout-select", "#logout"].map(selector => page.locator(selector).boundingBox()));
+  assert.ok(headerControls.every(Boolean));
+  assert.ok(Math.max(...headerControls.map(box => box.y)) < Math.min(...headerControls.map(box => box.y + box.height)), "desktop header controls share one row");
+  for (const id of ["workspace-meta", "checkout-root", "status", "diagnostics", "job", "stale"]) {
+    assert.equal(await page.locator(`#${id}`).evaluate(node => node.closest("#workspace-details") !== null), true, `${id} belongs to folded Diagnostics`);
+    assert.equal(await page.locator(`#${id}`).isVisible(), false, `${id} consumes no closed-chrome height`);
+  }
+  assert.equal(await page.locator("#checkout-state").isVisible(), false, "successful selection adds no guidance row");
+  assert.equal(await page.locator("#notice").isVisible(), false, "browse guidance is not a separate connected row");
+  for (const selector of ["#refresh", "#index", "#checkout-select", "#file-filter", "#metric-color", "#metric-aggregate"]) {
+    const style = await page.locator(selector).evaluate(node => ({font:getComputedStyle(node).fontSize, radius:getComputedStyle(node).borderTopLeftRadius}));
+    assert.deepEqual(style, {font:"14px", radius:"8px"}, `${selector} uses interface label and control tokens`);
+  }
+  assert.ok((await page.locator("#refresh").boundingBox()).height < primary.height, "secondary controls stay compact rather than all becoming primary-sized");
+  await capture(page, "chrome-compact-desktop");
+  for (const width of [390, 320]) {
+    await page.setViewportSize({width, height:844});
+    await noOverflow(page, width);
+    for (const selector of ["#checkout-select", "#refresh", "#index", "#workspace-details > summary"]) {
+      const box = await page.locator(selector).boundingBox();
+      assert.ok(box && box.x >= 0 && box.x + box.width <= width + 1, `${selector} remains reachable at ${width}px`);
+    }
+    await page.locator("#explorer-toggle").click();
+    assert.equal(await page.locator("#explorer-panel").isVisible(), true);
+    await page.keyboard.press("Escape");
+    assert.equal(await page.locator("#explorer-panel").isVisible(), false);
+    await capture(page, `chrome-compact-${width}`);
+  }
+  assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "layout and drawer actions never request indexing");
+}));
+
+test("selected status reconciles jobs, catch-up and stale evidence while raw errors stay in Diagnostics and Stop waiting never cancels", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+  const fixture = await chromeFixture(page, paths, server);
+  const failure = '<img src=x onerror=globalThis.statusExecuted=true> index fixture failure';
+  const job = {id:"chrome-fixture-job", state:"failed", progress:{phase:"index", completed:0, total:0},
+    error:{code:"index_failed", message:failure}, finishedAt:1, revision:null};
+  try {
+    fixture.status.catchingUp = false;
+    fixture.status.stats.changedFiles = [];
+    fixture.job = job;
+    await fixture.select();
+    await assertIndexState(page, "failed", /Index failed/i);
+    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /Fresh|0\/0|index_failed/);
+    const selectedCheckout = page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-freshness');
+    assert.match(await selectedCheckout.textContent(), /Index failed/i);
+    assert.doesNotMatch(await selectedCheckout.textContent(), /Fresh/);
+    assert.equal(await page.locator("#job").isVisible(), false);
+    assert.equal(await page.locator("body").evaluate((node, text) => node.innerText.includes(text), failure), false, "raw error text is not exposed in the compact chrome");
+    await page.locator("#workspace-details > summary").click();
+    assert.ok((await page.locator("#job").textContent()).includes(failure));
+    assert.match(await page.locator("#job").textContent(), /index_failed/);
+    assert.equal(await page.locator("#workspace-details img").count(), 0, "error objects render only as inert text");
+    assert.equal(await page.evaluate(() => globalThis.statusExecuted), undefined);
+    await capture(page, "chrome-failed-diagnostics");
+    await page.locator("#workspace-details > summary").click();
+
+    fixture.job = {...job, state:"done", error:null, revision:pin};
+    fixture.status.catchingUp = true;
+    await fixture.select();
+    await assertIndexState(page, "catching-up", /Catching up/i);
+    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /Fresh|0\/0/);
+    fixture.status.catchingUp = false;
+    fixture.status.stats.changedFiles = ["src/flow.js"];
+    await fixture.select();
+    await assertIndexState(page, "stale", /Stale evidence/i);
+    await page.locator("#workspace-details > summary").click();
+    assert.match(await page.locator("#stale").textContent(), /1 inputs differ/);
+    await page.locator("#workspace-details > summary").click();
+    fixture.status.stats.changedFiles = [];
+    await fixture.select();
+    await assertIndexState(page, "fresh", /Fresh/i);
+    assert.doesNotMatch(await page.locator("#job").textContent(), /0\/0/);
+    assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "selecting or refreshing status never indexes");
+
+    fixture.job = {...job, state:"running", error:null, finishedAt:null, progress:{phase:"capture", completed:0, total:0}};
+    const accepted = page.waitForResponse(response => new URL(response.url()).pathname === H.scoped(server.rootKey, "index"));
+    await page.locator("#index").click();
+    assert.equal((await accepted).status(), 202);
+    await assertIndexState(page, "catching-up", /Indexing.*capture/i);
+    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /0\/0/);
+    assert.equal(await page.locator("#cancel").isVisible(), true);
+    await page.locator("#cancel").click();
+    assert.equal(await page.locator("#cancel").isVisible(), false);
+    assert.match(await page.locator("#workspace-index-label").textContent(), /no longer waiting/i);
+    assert.equal(await page.locator("#index").isEnabled(), true);
+    assert.equal(requests.filter(row => row.method === "POST" && row.url.pathname.endsWith("/index")).length, 1, "only the explicit Index button requests a job");
+    assert.equal(requests.some(row => row.url.pathname.endsWith("/cancel")), false, "Stop waiting has no durable job cancellation request");
+    // Reloading selection re-observes that same accepted job, not a fabricated cancellation.
+    await fixture.select();
+    assert.equal(await page.locator("#cancel").isVisible(), true);
+    await assertIndexState(page, "catching-up", /Indexing/i);
+    await page.locator("#cancel").click();
+  } finally { await fixture.close(); }
+}));
+
+test("checkout picker uses observed branch, detached and unavailable Git labels, keeps exact roots discoverable and treats malicious branch text as text", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+  const listing = await H.api(server.base, paths.token, "GET", "/api/checkouts");
+  assert.equal(listing.status, 200, JSON.stringify(listing.data));
+  const observed = listing.data.checkouts.find(row => row.rootKey === server.rootKey);
+  const gitResponse = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "git"));
+  assert.equal(gitResponse.status, 200, JSON.stringify(gitResponse.data));
+  assert.equal(gitResponse.data.git.state, "available");
+  assert.equal(gitResponse.data.git.head.name, "measured-branch");
+  const shortRevision = `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`;
+  assert.equal(await page.locator(`#checkout-select option[value="${server.rootKey}"]`).textContent(), `workspace ⎇ measured-branch · ${shortRevision}`, "the real measured Git branch labels the published checkout");
+  const branch = '<svg onload="globalThis.branchExecuted=true">' + "-long-branch".repeat(12);
+  const available = {...gitResponse.data.git, head:{...gitResponse.data.git.head, name:branch}};
+  const rows = [
+    {...observed, git:available},
+    {...observed, rootKey:"b".repeat(64), workspaceRoot:join(paths.workspace, "busy"), state:"storage_busy", git:{state:"unavailable", reason:"not_repository"}},
+    {...observed, rootKey:"c".repeat(64), workspaceRoot:join(paths.workspace, "unavailable"), state:"unavailable", git:{state:"unavailable", reason:"not_repository"}},
+  ];
+  const pattern = `${server.base}/api/checkouts`;
+  const respond = route => route.fulfill({status:200, contentType:"application/json", body:JSON.stringify({...listing.data, checkouts:rows})});
+  const gitPattern = `${server.base}${H.scoped(server.rootKey, "git")}`;
+  const respondGit = route => route.fulfill({status:200, contentType:"application/json", body:JSON.stringify({...gitResponse.data, git:rows[0].git})});
+  await page.route(pattern, respond);
+  await page.route(gitPattern, respondGit);
+  try {
+    await page.locator("#logout").click();
+    await page.locator("#token").fill(paths.token);
+    await page.locator("#connect-form button[type=submit]").click();
+    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
+    assert.equal(await page.locator("#checkout-select").inputValue(), "", "even a measured branch never auto-selects a checkout");
+    const option = page.locator(`#checkout-select option[value="${server.rootKey}"]`);
+    assert.equal(await option.textContent(), `workspace ⎇ ${branch} · ${shortRevision}`);
+    assert.equal(await option.getAttribute("title"), observed.workspaceRoot);
+    for (const row of rows.slice(1)) assert.equal(await page.locator(`#checkout-select option[value="${row.rootKey}"]`).isDisabled(), true, `${row.state} entries cannot be selected`);
+    assert.equal(await page.locator("#checkout-retry").isVisible(), true);
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent === "");
+    assert.equal(await page.locator("#checkout-select").getAttribute("title"), observed.workspaceRoot);
+    assert.equal(await page.locator("#workspace-name").getAttribute("title"), observed.workspaceRoot);
+    assert.equal(await page.locator(".app-header svg, #indexed-checkouts svg").count(), 0);
+    assert.equal(await page.evaluate(() => globalThis.branchExecuted), undefined);
+    for (const width of [390, 320]) {
+      await page.setViewportSize({width, height:844});
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px long branch does not create document overflow`);
+      const picker = await page.locator("#checkout-select").boundingBox();
+      assert.ok(picker && picker.x >= 0 && picker.x + picker.width <= width + 1);
+    }
+    await page.setViewportSize({width:1440, height:900});
+    assert.equal(await page.locator("#checkout-root").isVisible(), false);
+    await page.locator("#workspace-details > summary").click();
+    assert.equal(await page.locator("#checkout-root").textContent(), observed.workspaceRoot);
+    await page.locator("#workspace-details > summary").click();
+    for (const [git, expected] of [
+      [{...available, head:{...available.head, kind:"detached", name:null}}, `Detached ${available.head.shortCommit}`],
+      [{state:"unavailable", reason:"not_repository"}, "Git unavailable"],
+    ]) {
+      rows[0].git = git;
+      const refreshed = page.waitForResponse(response => response.url() === pattern);
+      await page.locator("#checkout-retry").click();
+      assert.equal((await refreshed).status(), 200);
+      await page.waitForFunction(({key, label}) => [...document.querySelector("#checkout-select").options].find(option => option.value === key)?.textContent.includes(label), {key:server.rootKey, label:expected});
+      assert.equal(await option.textContent(), `workspace ⎇ ${expected} · ${shortRevision}`);
+      assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "retry retains explicit selection of the same available checkout");
+    }
+    assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
+    await capture(page, "chrome-checkout-git-unavailable");
+  } finally {
+    await page.unroute(pattern, respond);
+    await page.unroute(gitPattern, respondGit);
+  }
+}, undefined, {git:true}));
