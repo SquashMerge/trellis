@@ -42,7 +42,10 @@ const DECLARATIONS_SQL: &str = "SELECT owner_language, owner_path, syntax_id FRO
      ORDER BY owner_language, owner_path, syntax_id";
 const PROVENANCE_SQL: &str = "SELECT raw_id, kind FROM w_prov ORDER BY raw_id, kind";
 const REFERENCES_SQL: &str = "SELECT ref_id, body FROM w_refrows ORDER BY ref_id";
-const CALLS_SQL: &str = "SELECT raw_id, body FROM w_calls ORDER BY ord";
+const RESOLVE_CALLS_SQL: &str = "SELECT raw_id, body FROM w_calls ORDER BY ord";
+const CALLS_SQL: &str = "SELECT raw_id, body FROM w_callres ORDER BY ord";
+const SITE_TARGETS_SQL: &str =
+    "SELECT call_id, canon, target FROM w_sitetargets ORDER BY call_id, canon";
 const REFERENCE_CLAIMS_SQL: &str =
     "SELECT proof_id, body FROM f_refclaims WHERE side=1 ORDER BY proof_id";
 const SYMBOLS_SQL: &str = "SELECT body FROM f_symbols WHERE side=1 ORDER BY ord";
@@ -58,6 +61,8 @@ pub(crate) fn cursor_sql() -> Vec<String> {
         DECLARATIONS_SQL.to_owned(),
         PROVENANCE_SQL.to_owned(),
         REFERENCES_SQL.to_owned(),
+        RESOLVE_CALLS_SQL.to_owned(),
+        SITE_TARGETS_SQL.to_owned(),
         CALLS_SQL.to_owned(),
         REFERENCE_CLAIMS_SQL.to_owned(),
         SYMBOLS_SQL.to_owned(),
@@ -2389,9 +2394,13 @@ impl StagedJoin<'_> {
         Ok(())
     }
 
-    fn calls(&self) -> Result<()> {
+    /// Resolves each staged call binding from its final reference, then settles every native
+    /// call site that more than one binding reaches. Contradictory exact evidence becomes
+    /// `ambiguous` over the union of the asserted targets (contract-v1 CallBinding), exactly as
+    /// the whole-publication validator requires, so no contradictory site reaches the stage.
+    fn resolve_calls(&self) -> Result<()> {
         let conn = self.conn();
-        let mut statement = conn.prepare(CALLS_SQL)?;
+        let mut statement = conn.prepare(RESOLVE_CALLS_SQL)?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let raw: String = row.get(0)?;
@@ -2412,6 +2421,97 @@ impl StagedJoin<'_> {
             call.stale_target = call.declared_target.as_ref().and_then(|target| {
                 matches!(target, semantic::Target::Internal { .. }).then_some(false)
             });
+            #[cfg(feature = "test-support")]
+            crate::semantic_batch::testing::edit_row("callResolution", &mut call)?;
+            self.ctx.row()?;
+            conn.prepare_cached("INSERT INTO w_callres(raw_id, call_id, body) VALUES(?1,?2,?3)")?
+                .execute(params![raw, call.call_id, to_json(&call)?])?;
+            if let Some(site) = &call.call_id {
+                for target in call.declared_target.iter().chain(&call.candidates) {
+                    self.ctx.row()?;
+                    conn.prepare_cached("INSERT OR IGNORE INTO w_sitetargets VALUES(?1,?2,?3)")?
+                        .execute(params![
+                            site,
+                            crate::native_ids::canonical(&serde_json::to_value(target)?),
+                            to_json(target)?
+                        ])?;
+                }
+            }
+        }
+        self.settle_call_sites()
+    }
+
+    /// One pass over the site targets in `(site, canonical target)` order. A site asserting more
+    /// than one distinct target is rewritten to the ambiguous union on every binding that
+    /// reaches it; only that one site's targets are held at a time.
+    fn settle_call_sites(&self) -> Result<()> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(SITE_TARGETS_SQL)?;
+        let mut rows = statement.query([])?;
+        let mut site: Option<String> = None;
+        let mut asserted: Vec<(Vec<u8>, String)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            self.ctx.charge(1)?;
+            let id: String = row.get(0)?;
+            if site.as_ref() != Some(&id)
+                && let Some(done) = site.replace(id)
+            {
+                self.settle_call_site(&done, std::mem::take(&mut asserted))?;
+            }
+            asserted.push((row.get(1)?, row.get(2)?));
+        }
+        if let Some(done) = site {
+            self.settle_call_site(&done, asserted)?;
+        }
+        Ok(())
+    }
+
+    fn settle_call_site(&self, site: &str, asserted: Vec<(Vec<u8>, String)>) -> Result<()> {
+        if asserted.len() < 2 {
+            return Ok(());
+        }
+        let conn = self.conn();
+        let union = asserted
+            .iter()
+            .map(|(_, target)| from_json(target))
+            .collect::<Result<Vec<semantic::Target>>>()?;
+        let bindings = {
+            self.ctx.charge(1)?;
+            let mut statement =
+                conn.prepare_cached("SELECT ord, body FROM w_callres WHERE call_id=?1")?;
+            let found = statement
+                .query_map([site], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            self.ctx.charge(found.len())?;
+            found
+        };
+        for (ord, body) in bindings {
+            let mut call: semantic::CallBinding = from_json(&body)?;
+            if call.resolution == semantic::Resolution::Ambiguous
+                && call.declared_target.is_none()
+                && call.candidates == union
+            {
+                continue;
+            }
+            call.resolution = semantic::Resolution::Ambiguous;
+            call.declared_target = None;
+            call.candidates = union.clone();
+            call.stale_target = None;
+            conn.prepare_cached("UPDATE w_callres SET body=?2 WHERE ord=?1")?
+                .execute(params![ord, to_json(&call)?])?;
+        }
+        Ok(())
+    }
+
+    fn calls(&self) -> Result<()> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(CALLS_SQL)?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let mut call: semantic::CallBinding = from_json(&row.get::<_, String>(1)?)?;
             self.outcome(
                 &raw,
                 if call.resolution == semantic::Resolution::Ambiguous {
@@ -2947,6 +3047,7 @@ impl StagedJoin<'_> {
         self.stage_calls()?;
         self.reference_claims()?;
         self.references()?;
+        self.resolve_calls()?;
         self.calls()?;
         self.relationships()?;
         self.provenance()?;

@@ -2935,6 +2935,40 @@ fn two_references_resolving_one_native_call_agree_across_paths() {
     }
 }
 
+#[test]
+fn bindings_reaching_one_call_with_conflicting_targets_resolve_to_the_ambiguous_union() {
+    let (world, descriptor) = two_references_one_call();
+    let mutations = DestinationMutations::default();
+    let memory = world.memory_publication(&descriptor, mutations);
+    // Make the first binding of the shared call site claim one resolved target while the second
+    // keeps the ambiguous pair, as two references with different targets would on one native call.
+    let mut edited = false;
+    testing::before_row_validation(move |kind, row| {
+        if kind == "callResolution" && !edited {
+            edited = true;
+            let first = row["candidates"][0].clone();
+            row["resolution"] = json!("resolved");
+            row["declaredTarget"] = first;
+            row["candidates"] = json!([]);
+            row["staleTarget"] = json!(false);
+        }
+    });
+    let joined = world.join_with(&descriptor, &BatchLimits::PRODUCTION, mutations);
+    testing::clear_row_hook();
+    let (mut admitted, _, _) = joined.unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    assert_same_publication(&staged, &memory, "conflicting targets on one call site");
+    world
+        .full_validation(&descriptor, mutations, &staged)
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    assert_eq!(staged.call_bindings.len(), 2);
+    for binding in &staged.call_bindings {
+        assert_eq!(binding.resolution, Resolution::Ambiguous);
+        assert!(binding.declared_target.is_none());
+        assert_eq!(binding.candidates.len(), 2);
+    }
+}
+
 type PublicationEdit = fn(&mut SemanticPublication);
 
 #[test]

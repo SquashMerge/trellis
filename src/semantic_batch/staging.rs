@@ -58,6 +58,9 @@ CREATE TABLE w_reftargets(ref_id TEXT NOT NULL, ord INTEGER NOT NULL, target TEX
 CREATE TABLE w_refproofs(ref_id TEXT NOT NULL, raw_id TEXT NOT NULL, PRIMARY KEY(ref_id, raw_id)) WITHOUT ROWID;
 CREATE TABLE w_accepted(raw_id TEXT PRIMARY KEY, ref_id TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE w_calls(ord INTEGER PRIMARY KEY, raw_id TEXT NOT NULL, body TEXT NOT NULL);
+CREATE TABLE w_callres(ord INTEGER PRIMARY KEY, raw_id TEXT NOT NULL, call_id TEXT, body TEXT NOT NULL);
+CREATE INDEX w_callres_site ON w_callres(call_id);
+CREATE TABLE w_sitetargets(call_id TEXT NOT NULL, canon BLOB NOT NULL, target TEXT NOT NULL, PRIMARY KEY(call_id, canon)) WITHOUT ROWID;
 CREATE TABLE w_observed(language TEXT NOT NULL, path TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(language, path, role)) WITHOUT ROWID;
 CREATE TABLE out_coverage(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL UNIQUE, artifact INTEGER, derived_from TEXT, derived_kind TEXT, derived_digest TEXT, body TEXT NOT NULL);
@@ -102,6 +105,8 @@ pub const JOIN_TABLES: &[&str] = &[
     "w_refproofs",
     "w_accepted",
     "w_calls",
+    "w_callres",
+    "w_sitetargets",
     "w_observed",
     "out_coverage",
     "out_provenance",
