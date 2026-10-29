@@ -111,6 +111,7 @@ fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {
         cancel: Arc::new(AtomicBool::new(false)),
         stopped: false,
         worker_running: false,
+        worker: None,
         state: "loading",
         catalog: None,
         warnings: vec![],
@@ -302,7 +303,7 @@ async fn enabled_config_replacement_admits_catalog_without_fifo_or_refresh() {
     let generation = {
         let index = state.dependencies.lock().unwrap();
         assert!(
-            index.worker_running,
+            index.worker.is_some(),
             "enabled configuration publication must admit a catalog driver without FIFO work"
         );
         assert!(index.generation > previous_generation);
@@ -328,7 +329,7 @@ async fn initial_enabled_startup_admits_catalog_after_reconciliation_without_fif
     let generation = {
         let index = state.dependencies.lock().unwrap();
         assert!(
-            index.worker_running,
+            index.worker.is_some(),
             "enabled startup must admit a catalog driver after reconciliation without FIFO work"
         );
         index.generation
@@ -406,4 +407,98 @@ async fn disabling_an_active_catalog_build_keeps_the_successor_disabled() {
     assert_eq!(index.state, "disabled");
     assert!(!index.worker_running);
     assert!(index.catalog.is_none());
+}
+
+#[tokio::test]
+async fn retirement_cancels_and_joins_an_active_catalog_without_publication() {
+    let (_temp, state, pin, session) = indexed_catalog_fixture();
+    state.retain_serving_session_without_tick_for_tests(session);
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    *state.dependency_build_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = entered.send(());
+        let _ = wait_release.recv();
+    }));
+    state.start_dependency_index();
+    tokio::time::timeout(crate::testing::HANG_BACKSTOP, wait_entered)
+        .await
+        .expect("catalog build did not start")
+        .unwrap();
+    let (generation, cancel) = {
+        let index = state.dependencies.lock().unwrap();
+        (index.generation, index.cancel.clone())
+    };
+    let (stopping, mut wait_stopping) = tokio::sync::oneshot::channel();
+    *state.dependency_stop_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = stopping.send(());
+    }));
+    assert!(matches!(
+        state.request_retire(|_| true),
+        RetireOutcome::Requested
+    ));
+    let retiring = state.clone();
+    let (finished, mut wait_finished) = tokio::sync::oneshot::channel();
+    let retirement = std::thread::spawn(move || {
+        let result = retiring.run_retirement();
+        let _ = finished.send(result);
+    });
+    let stopped_before_completion = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
+        tokio::select! {
+            stopped = &mut wait_stopping => {
+                stopped.unwrap();
+                true
+            }
+            result = &mut wait_finished => {
+                result.unwrap().unwrap();
+                false
+            }
+        }
+    })
+    .await
+    .expect("retirement made no progress");
+    // Always release the blocking hook, including the pre-fix failure path.
+    let cancelled_while_active = cancel.load(Ordering::Acquire);
+    let completion_while_active = wait_finished.try_recv();
+    drop(release);
+    if stopped_before_completion {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, wait_finished)
+            .await
+            .expect("retirement did not join the catalog build")
+            .unwrap()
+            .unwrap();
+    } else {
+        tokio::time::timeout(
+            crate::testing::HANG_BACKSTOP,
+            state.dependency_idle.notified(),
+        )
+        .await
+        .expect("catalog driver did not finish after releasing the hook");
+    }
+    retirement.join().unwrap();
+    assert!(
+        stopped_before_completion,
+        "retirement completed without cancelling the active catalog"
+    );
+    assert!(
+        cancelled_while_active,
+        "active build did not observe cancellation"
+    );
+    assert!(
+        matches!(
+            completion_while_active,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "retirement completed while the catalog build was still held"
+    );
+    assert_eq!(state.runtime_phase(), RuntimePhase::Retired);
+    {
+        let index = state.dependencies.lock().unwrap();
+        assert!(index.stopped);
+        assert!(!index.worker_running);
+        assert!(index.catalog.is_none());
+    }
+    state.start_dependency_index();
+    assert!(!state.dependencies.lock().unwrap().worker_running);
+    state.publish_dependency_index(generation, &cancel, Ok(catalog("late", pin)));
+    assert!(state.catalog_snapshot(pin).is_none());
 }
