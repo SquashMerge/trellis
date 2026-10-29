@@ -684,6 +684,7 @@ mod tests {
                     syntax_id: format!("sid:v1:{card:032x}"),
                 },
                 card_hash: key(card),
+                role: crate::native_evidence::DeclarationRole::Production,
             })
             .collect();
         let mut vector = vec![0; crate::search_embed::DIMENSIONS];
@@ -716,6 +717,7 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             Some(&vector),
+            &crate::search_rank::SearchPolicy::default(),
             &mut || {
                 checks.set(checks.get() + 1);
                 Ok(())
@@ -741,6 +743,7 @@ mod tests {
             Some(&snapshot),
             Some(&model),
             Some(&vector),
+            &crate::search_rank::SearchPolicy::default(),
             &mut || {
                 checks.set(checks.get() + 1);
                 if checks.get() == final_check {

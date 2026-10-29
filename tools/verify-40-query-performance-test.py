@@ -52,7 +52,8 @@ class Percentiles(unittest.TestCase):
         self.assertEqual(limits, {
             "defaultBoundedQuery": (100, None), "semanticDefaultBoundedQuery": (100, None),
             "maximumBoundedQuery": (250, 750), "semanticMaximumBoundedQuery": (250, 750),
-            "symbolSubstringSearch": (250, None), "status": (25, None), "sourceByKey": (25, None)})
+            "symbolSubstringSearch": (250, None), "symbolSubstringSearchSparse": (250, None),
+            "status": (25, None), "sourceByKey": (25, None)})
 
     def test_semantic_kind_miss_fails_the_run(self):
         policy = H.load_policy()
@@ -110,7 +111,7 @@ class Floors(unittest.TestCase):
         with patch.object(H, "facts_for", return_value=self.counts()), \
                 patch.object(H, "collect_samples", return_value="samples") as sampler:
             self.assertEqual(H.floored_samples(None, "pin", "medium", 50_000, "perLanguage", "p")[1], "samples")
-        sampler.assert_called_once_with(None, "pin", "p")
+        sampler.assert_called_once_with(None, "pin", "p", smoke=False)
 
 
 class Sampling(unittest.TestCase):
@@ -161,6 +162,112 @@ class Sampling(unittest.TestCase):
                          [sid(1), sid(2), sid(1), sid(2), sid(1), sid(2)])
         self.assertEqual(len(H.callable_roots(db, "pin")), 12)
         self.assertEqual(H.covered_roots(db, "pin", "nobody"), [])
+
+
+class SparseSampling(unittest.TestCase):
+    def fixture(self, groups):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.executescript("""
+            CREATE TABLE revision_documents(revision_id TEXT,vid INTEGER);
+            CREATE TABLE native_version_declarations(vid INTEGER,name TEXT);
+            CREATE VIRTUAL TABLE native_declaration_trigrams USING fts5(
+                name,content='',columnsize=0,tokenize='trigram case_sensitive 1');""")
+        for prefix, active, retained in groups:
+            for n in range(retained):
+                name = f"{prefix}{n:03d}"
+                vid = db.execute("INSERT INTO native_version_declarations(name) VALUES(?)", (name,)).lastrowid
+                db.execute("UPDATE native_version_declarations SET vid=? WHERE rowid=?", (vid, vid))
+                db.execute("INSERT INTO native_declaration_trigrams(rowid,name) VALUES(?,?)", (vid, name.lower()))
+                if n < active:
+                    db.execute("INSERT INTO revision_documents VALUES('pin',?)", (vid,))
+        return db
+
+    def test_sparse_counts_cover_global_history_and_active_revision(self):
+        db = self.fixture([("Needle", 30, 45), ("Other", 200, 201), ("Retired", 21, 40)])
+        samples = H.sparse_substrings(db, "pin")
+        self.assertEqual(samples, H.sparse_substrings(db, "pin"))
+        self.assertEqual(samples["globalFtsRange"], [22, 200])
+        self.assertEqual(samples["activeRevisionMinimum"], 22)
+        self.assertEqual(len(samples["samples"]), H.SAMPLES)
+        self.assertFalse(samples["smokeRelaxedMinimum"])
+        for item in samples["samples"]:
+            query = item["query"]
+            self.assertTrue(db.execute(
+                "SELECT EXISTS(SELECT 1 FROM native_version_declarations WHERE instr(name,?)>0)",
+                (query,)).fetchone()[0])
+            active = db.execute("""SELECT count(*) FROM native_version_declarations d
+                JOIN revision_documents m ON m.vid=d.vid
+                WHERE m.revision_id='pin' AND instr(lower(d.name),lower(?))>0""", (query,)).fetchone()[0]
+            count = db.execute("SELECT count(*) FROM native_declaration_trigrams WHERE native_declaration_trigrams MATCH ?",
+                               ('"' + query.lower() + '"',)).fetchone()[0]
+            self.assertEqual(item["activeRevisionHits"], active)
+            self.assertEqual(item["globalFtsCandidates"], count)
+            self.assertTrue(22 <= active <= count <= 200)
+
+    def test_rejects_global_fts_over_200_even_when_active_is_sparse(self):
+        db = self.fixture([("Broad", 22, 201)])
+        db.execute("DELETE FROM revision_documents")
+        db.executemany("INSERT INTO revision_documents VALUES('pin',?)", [(1 + n * 9,) for n in range(22)])
+        # All narrower generated prefixes have fewer than 22 active hits.
+        with self.assertRaisesRegex(RuntimeError, "no sparse real-name substring"):
+            H.sparse_substrings(db, "pin")
+
+    def test_rejects_retained_sparse_without_enough_active_hits(self):
+        db = self.fixture([("Retired", 21, 40)])
+        with self.assertRaisesRegex(RuntimeError, "no sparse real-name substring"):
+            H.sparse_substrings(db, "pin")
+
+    def test_smoke_explicitly_relaxes_minimum(self):
+        db = self.fixture([("Smoke", 1, 1)])
+        with self.assertRaises(RuntimeError):
+            H.sparse_substrings(db, "pin")
+        samples = H.sparse_substrings(db, "pin", smoke=True)
+        self.assertEqual(samples["globalFtsRange"], [1, 200])
+        self.assertEqual(samples["activeRevisionMinimum"], 1)
+        self.assertTrue(samples["smokeRelaxedMinimum"])
+
+    def test_canonical_class_name_groups_supply_beyond_lookahead_hits(self):
+        for size, count in (("medium", 250), ("large", 2500)):
+            db = self.fixture([("C" + size, count, count)])
+            samples = H.sparse_substrings(db, "pin")
+            self.assertTrue(all(22 <= item["activeRevisionHits"] <= item["globalFtsCandidates"] <= 200
+                                for item in samples["samples"]))
+
+    def test_common_and_sparse_keep_independent_warmups_and_200_timings(self):
+        kinds = ("symbolSubstringSearch", "symbolSubstringSearchSparse")
+        samples = {"substrings": ["common"] * H.SAMPLES,
+                   "sparseSearch": {"samples": [{"query": "rare"}] * H.SAMPLES}}
+        calls = []
+
+        def call(name, arguments):
+            calls.append((name, arguments["query"]))
+            return {"evidenceBasis": {"indexRevision": 1}}, 1 if arguments["query"] == "common" else 2
+
+        mcp = types.SimpleNamespace(call=call)
+        with patch.object(H.V67, "DEADLINE", H.time.monotonic() + 100):
+            results = H.measure_kinds(mcp, kinds, samples, {}, None, {"indexRevision": 1}, None,
+                                      None, H.WARMUPS, H.SAMPLES)
+        self.assertEqual(calls, [("trellis_find_symbols", "common")] * 220 +
+                         [("trellis_find_symbols", "rare")] * 220)
+        self.assertEqual([results[kind]["count"] for kind in kinds], [200, 200])
+        self.assertEqual([results[kind]["p95Ms"] for kind in kinds], [1, 2])
+
+    def test_sparse_kind_is_additional_and_reported_separately(self):
+        samples = {"substrings": ["common"], "sparseSearch": {"samples": [{"query": "rare"}]}}
+        for kind, query in (("symbolSubstringSearch", "common"), ("symbolSubstringSearchSparse", "rare")):
+            self.assertIn(kind, H.SYNTAX_KINDS)
+            self.assertEqual(H.kind_arguments(kind, 0, samples, {}, None, None),
+                             ("trellis_find_symbols", {"query": query}))
+        policy = H.load_policy()
+        stats = {"p95Ms": 251, "p99Ms": 251, "count": H.SAMPLES}
+        cohort = {"facts": {}, "kinds": {"symbolSubstringSearchSparse": stats},
+                  "sparseSearch": {"samples": [{"query": "rare", "globalFtsCandidates": 30, "activeRevisionHits": 22}]}}
+        report = H.build_report("host", "sha", False, {"medium": cohort}, policy)
+        self.assertFalse(report["pass"])
+        self.assertEqual(report["sizes"]["medium"]["sparseSearch"], cohort["sparseSearch"])
+        self.assertEqual(report["sizes"]["medium"]["kinds"]["symbolSubstringSearchSparse"]["limitMs"], 250)
+        self.assertEqual((H.SAMPLES, H.WARMUPS), (200, 20))
 
 
 class CallSiteArtifact(unittest.TestCase):

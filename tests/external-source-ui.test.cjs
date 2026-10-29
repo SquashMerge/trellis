@@ -89,6 +89,10 @@ test("collapsed panel loads nothing until explicit action; metadata browsing is 
   assert.equal(descendants(h.get("external-source")).filter(n=>n.classList?.contains("highlight")).length,1);
   assert.match(text(h.get("external-source")),/<script>alert\(1\)<\/script>/);
   assert.equal(descendants(h.get("external-source")).some(n=>n.tagName==="script"),false);
+  assert.doesNotMatch(text(h.get("external-source")), /Workspace diagrams are unavailable/);
+  assert.match(h.get("external-source-hint").textContent, /Workspace diagrams are unavailable/);
+  assert.equal(h.get("external-source-hint").hidden, false);
+  assert.equal(descendants(h.get("external-source")).filter(node => node.className === "source-line").length, snapshot().file.text.split("\n").length, "only source lines are copied");
   h.get("external-filter").value="OpenOptions"; h.get("external-filter").listeners.input();
   assert.equal(descendants(h.get("external-definitions")).filter(n=>n.tagName==="button").length,1);
    assert.equal(h.run("selectedMethod.id"),"keep");

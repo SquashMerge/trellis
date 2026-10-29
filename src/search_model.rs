@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use serde::Serialize;
 
@@ -82,7 +82,7 @@ impl SearchConfig {
             }
         };
         Ok(Self {
-            model_path,
+            model_path: model_path.filter(|path| !path.as_os_str().is_empty()),
             backend,
         })
     }
@@ -137,6 +137,8 @@ pub enum LexicalState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchUnavailableReason {
+    ModelNotConfigured,
+    ModelLoadFailed,
     VectorBudgetExceeded,
 }
 
@@ -154,15 +156,45 @@ pub struct SearchIndexStatus {
     pub unavailable_reason: Option<SearchUnavailableReason>,
 }
 
+/// Daemon-wide diagnostics, not query-pinned retrieval coverage.
+/// A standalone registry without a search service has no selected backend or
+/// configuration knowledge; its default diagnostics stay null.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchAvailability {
+    pub backend: Option<Backend>,
+    pub unavailable_reason: Option<SearchUnavailableReason>,
+}
+
+const MODEL_AVAILABLE_OR_UNTRIED: u8 = 0;
+const MODEL_NOT_CONFIGURED: u8 = 1;
+const MODEL_LOAD_FAILED: u8 = 2;
+
 #[derive(Clone)]
 pub struct SearchModelStatus {
     backend: Backend,
     ready: Arc<AtomicBool>,
+    model_unavailable: Arc<AtomicU8>,
 }
 
 impl SearchModelStatus {
     pub(crate) fn backend(&self) -> Backend {
         self.backend
+    }
+
+    pub fn availability(&self) -> SearchAvailability {
+        SearchAvailability {
+            backend: Some(self.backend),
+            unavailable_reason: self.unavailable_reason(),
+        }
+    }
+
+    pub(crate) fn unavailable_reason(&self) -> Option<SearchUnavailableReason> {
+        match self.model_unavailable.load(Ordering::Acquire) {
+            MODEL_NOT_CONFIGURED => Some(SearchUnavailableReason::ModelNotConfigured),
+            MODEL_LOAD_FAILED => Some(SearchUnavailableReason::ModelLoadFailed),
+            _ => None,
+        }
     }
 
     /// Counts and `building` come from the caller's coherent owner-published
@@ -214,7 +246,11 @@ impl SearchModelStatus {
             declarations,
             embedded: if ready { embedded } else { 0 },
             lexical,
-            unavailable_reason: None,
+            unavailable_reason: if ready {
+                None
+            } else {
+                self.unavailable_reason()
+            },
         }
     }
 }
@@ -233,6 +269,11 @@ impl SearchModel {
     /// Explicit Metal refusal takes precedence over any model-path failure.
     pub fn new(config: SearchConfig) -> Result<Self, EmbedError> {
         let backend = select_backend(config.backend, backend_available)?;
+        let unavailable = if config.model_path.is_none() {
+            MODEL_NOT_CONFIGURED
+        } else {
+            MODEL_AVAILABLE_OR_UNTRIED
+        };
         Ok(Self {
             config,
             verification: ModelVerification::default(),
@@ -241,6 +282,7 @@ impl SearchModel {
             status: SearchModelStatus {
                 backend,
                 ready: Arc::new(AtomicBool::new(false)),
+                model_unavailable: Arc::new(AtomicU8::new(unavailable)),
             },
         })
     }
@@ -251,6 +293,10 @@ impl SearchModel {
     ) -> Result<Self, EmbedError> {
         let mut model = Self::new(SearchConfig::from_values(None, Some("cpu"))?)?;
         model.factory = Some(factory);
+        model
+            .status
+            .model_unavailable
+            .store(MODEL_AVAILABLE_OR_UNTRIED, Ordering::Release);
         Ok(model)
     }
 
@@ -281,7 +327,8 @@ impl SearchModel {
         let backend = self.status.backend;
         let verification = &mut self.verification;
         let factory = self.factory.as_ref();
-        run_resident_job(
+        let operation_started = std::cell::Cell::new(false);
+        let result = run_resident_job(
             &self.status.ready,
             &mut self.resident,
             control,
@@ -314,8 +361,26 @@ impl SearchModel {
                         as Box<dyn SearchEmbedder>,
                 )
             },
-            |model| operation(model.as_ref()),
-        )
+            |model| {
+                operation_started.set(true);
+                self.status
+                    .model_unavailable
+                    .store(MODEL_AVAILABLE_OR_UNTRIED, Ordering::Release);
+                operation(model.as_ref())
+            },
+        );
+        if !operation_started.get()
+            && (path.is_some() || factory.is_some())
+            && matches!(
+                &result,
+                Err(EmbedError::ModelUnavailable(_) | EmbedError::Runtime(_))
+            )
+        {
+            self.status
+                .model_unavailable
+                .store(MODEL_LOAD_FAILED, Ordering::Release);
+        }
+        result
     }
 }
 
@@ -432,6 +497,48 @@ mod tests {
             control.check()?;
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn successful_load_clears_failure_and_cancel_does_not_create_one() {
+        struct RetryFactory(AtomicBool);
+        impl SearchEmbedderFactory for RetryFactory {
+            fn load(
+                &self,
+                _: &EmbeddingControl<'_>,
+            ) -> Result<Box<dyn SearchEmbedder>, EmbedError> {
+                if self.0.swap(false, Ordering::AcqRel) {
+                    Err(EmbedError::ModelUnavailable("fixture load failure".into()))
+                } else {
+                    Ok(Box::new(TrackedModel(Arc::new(AtomicUsize::new(0)))))
+                }
+            }
+        }
+        let mut owner =
+            SearchModel::with_embedder_for_tests(Arc::new(RetryFactory(AtomicBool::new(true))))
+                .unwrap();
+        let status = owner.status_handle();
+        let cancel = AtomicBool::new(true);
+        let result: Result<(), EmbedError> =
+            owner.with_job(&EmbeddingControl::new(&cancel), |_| unreachable!());
+        assert!(matches!(result, Err(EmbedError::Cancelled)));
+        assert_eq!(status.availability().unavailable_reason, None);
+        cancel.store(false, Ordering::Release);
+        let result: Result<(), EmbedError> =
+            owner.with_job(&EmbeddingControl::new(&cancel), |_| unreachable!());
+        assert!(matches!(result, Err(EmbedError::ModelUnavailable(_))));
+        assert_eq!(
+            status.availability().unavailable_reason,
+            Some(SearchUnavailableReason::ModelLoadFailed)
+        );
+        owner
+            .with_job(&EmbeddingControl::new(&cancel), |_| {
+                assert_eq!(status.availability().unavailable_reason, None);
+                Ok(())
+            })
+            .unwrap();
+        owner.drop_resident();
+        assert_eq!(status.availability().unavailable_reason, None);
     }
 
     #[test]

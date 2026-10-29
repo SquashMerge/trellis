@@ -7,7 +7,7 @@
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
   const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
-  let openSource = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
+  let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
     window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
@@ -56,7 +56,7 @@
   function showMetricInspector() {
     clearTreemapInspector();
     clearArchitectureInspector();
-    openSource = null;
+    openSource = null; targetSelection = null;
     hide("inspector-empty", true); hide("inspector-content", true);
     if (get("inspector-open-source")) get("inspector-open-source").disabled = true;
     hide("metric-inspector", false);
@@ -188,16 +188,21 @@
     clearTreemapInspector();
     clearArchitectureInspector();
     clearMetricInspector();
-    openSource = null;
+    openSource = null; targetSelection = null;
     drawer("inspector", false);
     hide("inspector-empty", document.body.classList.contains("files-section")); hide("inspector-content", true);
     for (const id of ["inspector-title", "inspector-kind", "inspector-target", "inspector-location", "inspector-evidence", "inspector-detail"]) get(id)?.replaceChildren();
     if (get("inspector-open-source")) get("inspector-open-source").disabled = true;
+    text("inspector-open-source", "Open call site");
     if (get("inspector-clear")) get("inspector-clear").disabled = true;
     if (get("inspector-title")) get("inspector-title").title = "";
     syncInspector();
   }
-  function targetText() { return "Terminal syntax only · no verified target"; }
+  function targetText(step, view) {
+    const target = window.TrellisSequence?.target(view, step);
+    if (target) return `Resolved declaration · ${target.declaration.name} · ${location(target.declaration)}`;
+    return step?.callEvidence ? window.TrellisSequence.evidenceLabel(step, view) : "Terminal syntax only · no verified target";
+  }
   function sourceWitness(item) {
     const r = item?.range;
     return typeof item?.path === "string" && !!item.path.trim() && !!r &&
@@ -214,7 +219,28 @@
     const r = step.range;
     return `${step.path}:${r.startLine}${r.startColumn == null ? "" : ":" + r.startColumn}–${r.endLine}${r.endColumn == null ? "" : ":" + r.endColumn}`;
   }
-  function selectStep(step, view, callback) {
+  function inspectSymbol(symbol, revision, readSource) {
+    resetInspector();
+    if (!symbol) return;
+    const paired = typeof revision?.indexGeneration === "string" && !!revision.indexGeneration && Number.isSafeInteger(revision.indexRevision);
+    const title = symbol.name || symbol.id || "Selected declaration";
+    hide("inspector-empty", true); hide("inspector-content", false);
+    if (get("inspector-clear")) get("inspector-clear").disabled = false;
+    text("inspector-title", title);
+    if (get("inspector-title")) get("inspector-title").title = title;
+    text("inspector-kind", symbol.kind || "Declaration");
+    text("inspector-location", `${location(symbol)} · ${paired ? `revision ${revision.indexGeneration.slice(0, 8)}:${revision.indexRevision}` : "snapshot unavailable"}`);
+    text("inspector-target", "Declaration only · no call target or verified dispatch");
+    text("inspector-evidence", "Measured declaration syntax, not a runtime trace or verified dispatch.");
+    const disclosure = make("details");
+    disclosure.append(make("summary", "Measured declaration"), make("pre", JSON.stringify(symbol, null, 2)));
+    get("inspector-detail")?.append(disclosure);
+    openSource = sourceWitness(symbol) && paired && typeof readSource === "function" ? readSource : null;
+    text("inspector-open-source", "Read declaration source");
+    if (get("inspector-open-source")) get("inspector-open-source").disabled = !openSource;
+    drawer("inspector", true);
+  }
+  function selectStep(step, view, callback, openTarget) {
     resetInspector();
     if (!step || !view) return;
     hide("inspector-empty", true); hide("inspector-content", false);
@@ -223,14 +249,18 @@
     text("inspector-kind", step.kind || "Step");
     text("inspector-location", `${location(step)} · ${view.revision?.indexGeneration && Number.isSafeInteger(view.revision.indexRevision) ? `revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : "snapshot unavailable"}`);
     const children = step.children || [];
-    const flat = step.kind === "group" && !step.alternate?.length && children.length && children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length);
-    const entry = flat ? children[0] : step;
+    const preview = window.TrellisSequence?.entry(step), flat = !!preview;
+    const entry = preview || step;
     if (flat) text("inspector-title", `${entry.label || entry.id} · +${children.length - 1} chain calls`);
     if (get("inspector-title")) get("inspector-title").title = step.label || step.id || "";
     text("inspector-target", flat
       ? `First measured entry call only: ${targetText(entry, view, false)}. Other calls may have different receivers and return types.`
       : targetText(step, view, false));
-    text("inspector-evidence", `Measured source steps, not a runtime trace or verified dispatch.`);
+    const target = window.TrellisSequence?.target(view, entry);
+    const selection = {}; targetSelection = selection;
+    text("inspector-evidence", entry.callEvidence
+      ? `${window.TrellisSequence.evidenceLabel(entry, view)} · ${[entry.callEvidence.dispatch, entry.callEvidence.freshness, entry.callEvidence.provenanceId].filter(Boolean).join(" · ")}. Static possible paths, not a runtime trace.`
+      : "Measured source steps, not a runtime trace or verified dispatch.");
     const detail = get("inspector-detail");
     // Every original field and all nested guards, alternates and chain calls remain
     // available as safe text. Never infer equivalent guards or invent confidence.
@@ -238,14 +268,22 @@
       const disclosure = make("details");
       disclosure.append(make("summary", `${label ? label + " · " : ""}${item.kind || "step"}: ${item.label || item.id || "Details"}`));
       disclosure.append(make("p", `${location(item)} · ${targetText(item, view)}`));
-      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate", "target", "resolution", "candidateSymbols", "callbackArguments"].includes(key)));
+      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate"].includes(key)));
       disclosure.append(make("pre", JSON.stringify(fields, null, 2)));
       for (const child of item.children || []) evidence(child, disclosure, "Child");
       for (const child of item.alternate || []) evidence(child, disclosure, "Alternate");
       parent.append(disclosure);
       return disclosure;
     }
-    if (detail) evidence(step, detail, "Measured syntax");
+    if (detail) {
+      if (target && typeof openTarget === "function") {
+        const action = make("button", window.TrellisSequence.targetActionLabel(target.declaration)); action.type = "button";
+        action.setAttribute("data-trellis-target-id", target.id);
+        action.addEventListener("click", () => { if (targetSelection === selection && window.TrellisSequence.target(view, entry) === target) openTarget(target.declaration, entry); });
+        detail.append(action);
+      }
+      evidence(step, detail, "Source and target evidence");
+    }
     openSource = sourceWitness(step) && view.revision?.indexGeneration && Number.isSafeInteger(view.revision.indexRevision) && typeof callback === "function" ? callback : null;
     if (get("inspector-open-source")) get("inspector-open-source").disabled = !openSource;
     drawer("inspector", true);
@@ -259,6 +297,16 @@
     return git.upstream
       ? `${head} · ${git.upstream.name} ↑${git.upstream.ahead} ↓${git.upstream.behind} · As of last fetch`
       : `${head} · No upstream`;
+  }
+  function checkoutLabel(row) {
+    const root = row?.workspaceRoot || "", name = root.split(/[\/]/).filter(Boolean).at(-1) || row?.rootKey || "Checkout";
+    const git = row?.git;
+    const head = git?.state === "available" && git.head?.kind === "branch" ? git.head.name
+      : git?.state === "available" && git.head?.kind === "detached" && git.head.shortCommit ? `Detached ${git.head.shortCommit}` : "Git unavailable";
+    const pin = row?.revision;
+    const revision = pin && typeof pin.indexGeneration === "string" && Number.isSafeInteger(pin.indexRevision)
+      ? `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}` : "Not indexed";
+    return `${name} ⎇ ${head} · ${revision}`;
   }
   function updateCheckout(root, git) {
     checkoutRoot = root || "";
@@ -274,9 +322,7 @@
     text("workspace-name", root.split(/[\\/]/).filter(Boolean).at(-1) || "No workspace");
     text("workspace-meta", status ? `Revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision} · ${status.stats?.files ?? 0} files · ${"Syntax only · SCIP display metadata is not proof"}` : checkoutRoot ? "Index status unavailable" : "Connect to a local daemon");
     if (get("workspace-name")) get("workspace-name").title = root;
-    const state = status ? (status.catchingUp === true ? "catching-up" : "fresh") : "unknown";
-    get("workspace-index-state")?.setAttribute("data-state", state);
-    text("workspace-index-label", status ? `${status.catchingUp === true ? "Catching up" : "Fresh"} · revision ${status.revision.indexGeneration.slice(0, 8)}:${status.revision.indexRevision}` : checkoutRoot ? "Index status unavailable" : "No checkout selected");
+
   }
   function reset() {
     setSection("diagrams"); resetInspector(); showView("sequence"); hide("source-dock", true); sourceReturnFocus = null;
@@ -306,6 +352,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
+  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();

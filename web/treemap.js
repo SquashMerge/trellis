@@ -11,30 +11,21 @@
   const identity = file => JSON.stringify([file.sourceSetId, file.language, file.path]);
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const display = value => finite(value) ? String(value) : "—";
-  const metricValue = (metrics, name) => name.split(".").reduce((value, key) => value?.[key], metrics);
-  const quartiles = values => {
-    const sorted = values.filter(finite).sort((a, b) => a - b);
-    return sorted.length ? [.25, .5, .75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]) : [];
-  };
-  const band = (value, cuts, metric) => {
-    if (!finite(value) || cuts.length !== 3) return null;
-    const rank = cuts.filter(cut => value > cut).length;
-    return metric === "maintainabilityIndex" ? 3 - rank : rank;
-  };
+  const {metricValue, quartiles, relativeBand:band, createScale, exclusions} = window.TrellisMetricHeat;
   const classification = file => file.roleCounts.production > 0 ? (file.roleCounts.test > 0 ? "mixed" : "production") : file.roleCounts.test > 0 ? "test" : "none";
   const testFile = file => file.fileRole === "test" || classification(file) === "test";
   const count = value => Number.isSafeInteger(value) && value >= 0;
   const metrics = new Set(["role", "cognitive", "cyclomatic", "maxNesting", "maintainabilityIndex", "halstead.volume", "fanOut"]);
-  const names = {cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability", "halstead.volume":"Halstead volume", fanOut:"Fan-out"};
   function create({request, context, readSource, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, navigationSerial = 0, view = null, basis = null, selectedKey = null;
-    let metric = "cognitive", aggregate = "max", role = "production", hideTests = true, path = "", language = "", scope = null;
+    let metric = "cognitive", aggregate = "max", role = "production", relative = false, hideTests = true, path = "", language = "", scope = null;
+    let relayout = null, resizeTimer = null;
     const population = () => role === "all" ? "all indexed callables" : "production callables";
     const state = (message, kind = "ready") => { get("treemap-state").textContent = message; get("treemap-state").dataset.state = kind; };
     const paragraph = (target, message) => target.append(make("p", message));
     function capture() {
       const c = context();
-      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), aggregate, role, serial};
+      return {rootKey:c.rootKey, session:c.session, pin:c.pin && window.TrellisIndexPin.copy(c.pin), workspaceRoot:c.workspaceRoot, aggregate, role, serial};
     }
     function current(c) {
       const now = context();
@@ -42,6 +33,19 @@
         !!c.pin && window.TrellisIndexPin.equal(c.pin, now.pin);
     }
     const usable = () => !!view && current(basis);
+    // The observed checkout directory names the root, and only when one source set owns every indexed file.
+    function rootLabel(sourceSetId) {
+      const name = typeof basis?.workspaceRoot === "string" ? basis.workspaceRoot.split("/").filter(Boolean).at(-1) : "";
+      return name && view && view.files.every(file => file.sourceSetId === sourceSetId) ? name : sourceSetId;
+    }
+    // The diagram box's own content size, less Pele's 8 px padding on each side; unknown while hidden.
+    function viewport() {
+      const node = get("treemap-diagram");
+      if (!node?.offsetWidth || !node.offsetHeight || typeof getComputedStyle !== "function") return undefined;
+      const style = getComputedStyle(node), px = (...names) => names.reduce((sum, name) => sum + (parseFloat(style[name]) || 0), 0);
+      return {width:node.offsetWidth - px("paddingLeft", "paddingRight", "borderLeftWidth", "borderRightWidth") - 16,
+        height:node.offsetHeight - px("paddingTop", "paddingBottom", "borderTopWidth", "borderBottomWidth") - 16};
+    }
     function markSelection() {
       window.TrellisTreemapPele?.select?.(get("treemap-diagram"), selectedKey);
       for (const node of get("treemap-files").querySelectorAll("[data-trellis-file-id]")) {
@@ -53,7 +57,7 @@
       window.TrellisShell?.clearTreemapInspector(); markSelection();
     }
     function reset(message = "Open Treemap to read the indexed snapshot.") {
-      serial++; renderSerial++; clearInspection(); view = null; basis = null;
+      serial++; renderSerial++; relayout = null; clearInspection(); view = null; basis = null;
       for (const id of ["treemap-diagram", "treemap-files", "treemap-legend", "treemap-breadcrumbs"]) get(id).replaceChildren();
       get("treemap-diagram").setAttribute("aria-busy", "false"); state(message, "empty");
     }
@@ -62,7 +66,7 @@
       if (!payload || !window.TrellisIndexPin.equal(payload, c.pin)) {
         throw Object.assign(new Error("Indexed snapshot changed. Refresh status."), {code:"revision_conflict", status:409});
       }
-      if (payload.scope !== "revision" || payload.metricsVersion !== "metrics:v1" || payload.aggregate !== c.aggregate || payload.role !== c.role ||
+      if (payload.scope !== "revision" || payload.workbench !== true || payload.metricsVersion !== "metrics:v1" || payload.aggregate !== c.aggregate || payload.role !== c.role ||
           !Array.isArray(payload.files) || !Array.isArray(payload.directories)) throw new Error("Invalid Treemap metrics response. Nothing displayed.");
       const keys = new Set();
       for (const file of payload.files) {
@@ -90,23 +94,19 @@
       };
       crumb("All indexed files", null);
       if (!scope) return;
-      crumb(scope.sourceSetId, {sourceSetId:scope.sourceSetId, path:""});
+      crumb(rootLabel(scope.sourceSetId), {sourceSetId:scope.sourceSetId, path:""});
       const parts = scope.path ? scope.path.split("/") : [];
       parts.forEach((part, index) => crumb(part, {sourceSetId:scope.sourceSetId, path:parts.slice(0, index + 1).join("/")}));
     }
-    function legend(cuts) {
+    function legend(scale) {
       const target = get("treemap-legend"); target.replaceChildren();
-      if (metric === "role") {
-        paragraph(target, "Prod/test · production-only / mixed / test-only / no measured callables. Callable populations, not test-runner discovery. Stored test-file roles are also hidden by Hide test files. Test-only files have dashed outlines.");
-        return;
-      }
-      paragraph(target, `${names[metric]} · ${aggregate} · ${population()} · visible files${metric === "maintainabilityIndex" ? " · higher is better; heat inverted" : ""}`);
-      if (!cuts.length) { paragraph(target, "No measured values · — unavailable, not zero."); return; }
-      [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`].forEach((range, rank) => {
+      if (metric === "role") { paragraph(target, "Prod/test · production-only / mixed / test-only / no measured callables. Callable populations, not test-runner discovery. Stored test-file roles are also hidden by Hide test files. Test-only files have dashed outlines."); return; }
+      paragraph(target, `${scale.label} · ${metric} · ${aggregate} · visible files · ${population()}`);
+      for (const {label, band} of scale.entries) {
         const entry = make("span", undefined, "metric-legend-entry");
-        entry.append(make("span", undefined, `metric-swatch heat-${metric === "maintainabilityIndex" ? 3 - rank : rank}`), make("span", range)); target.append(entry);
-      });
-      target.append(make("span", "Low heat → high heat · ties stay together · — unavailable"));
+        entry.append(make("span", undefined, `metric-swatch${band === null ? " neutral" : ` heat-${band}`}`), make("span", label)); target.append(entry);
+      }
+      if (relative) target.append(make("span", "Low heat → high heat · ties stay together · — unavailable"));
     }
     function inspect(file, active) {
       if (!active()) return;
@@ -120,7 +120,8 @@
       const labels = {production:"production-only", mixed:"mixed", test:"test-only", none:"no measured callables"};
       paragraph(target, `${labels[classification(file)]} callable population · stored file role: ${file.fileRole} · roleCounts: ${file.roleCounts.production} production / ${file.roleCounts.test} test.`);
       paragraph(target, `${file.declarationCount} selected ${population()} · ${aggregate} · metrics:v1. Classification is syntax-based, not test-runner discovery or complete conditional-compilation analysis.`);
-      if (!file.declarationCount) paragraph(target, `No ${population()}. Numeric aggregates are unavailable, not zero.`);
+      if (file.excludedReason) paragraph(target, `Excluded from heat: ${file.excludedReason} · ${exclusions([file])}`);
+      else if (!file.declarationCount) paragraph(target, `No ${population()}. Numeric aggregates are unavailable, not zero.`);
       const values = make("dl", undefined, "metric-inspector-values");
       function visit(value, name) {
         if (value && typeof value === "object") {
@@ -140,28 +141,56 @@
     async function render(select = null) {
       if (!usable()) return;
       const payload = view, c = basis, ticket = ++renderSerial;
-      let ready = false;
+      let ready = false; relayout = null;
       const active = () => current(c) && view === payload && ticket === renderSerial;
       const interactive = () => active() && ready;
       clearInspection(); get("treemap-diagram").replaceChildren(); get("treemap-files").replaceChildren();
       get("treemap-diagram").setAttribute("aria-busy", "true"); state("Rendering indexed files…", "loading");
-      const files = visibleFiles(), cuts = metric === "role" ? [] : quartiles(files.map(file => metricValue(file.metrics, metric)));
-      breadcrumbs(active); legend(cuts);
+      const files = visibleFiles(), values = files.map(file => metricValue(file.metrics, metric));
+      const scale = createScale(metric, aggregate, values, relative);
+      breadcrumbs(active); legend(scale);
       try {
         if (files.some(file => file.physicalLines > 0)) {
           if (!window.TrellisTreemapPele) throw new Error("Treemap renderer unavailable. Nothing displayed.");
-          const outcome = await window.TrellisTreemapPele.render(get("treemap-diagram"), files, {
-            metric, aggregate, selectedKey:select, isCurrent:active,
-            fileValue:file => metric === "role" ? undefined : metricValue(file.metrics, metric),
-            fileBand:file => metric === "role" ? classification(file) : band(metricValue(file.metrics, metric), cuts, metric),
-            onSelectFile:file => { if (interactive() && files.includes(file)) inspect(file, interactive); },
-            onSelectDirectory:directory => {
-              if (!interactive() || !directory || !files.some(file => file.sourceSetId === directory.sourceSetId && (!directory.path || file.path.startsWith(directory.path + "/")))) return;
-              navigationSerial++; scope = {sourceSetId:directory.sourceSetId, path:directory.path}; return render();
-            },
-          });
-          if (!active()) return;
+          // Each paint owns its SVG while it is the pending request or the published one. Cancelling a
+          // pending paint never touches the published owner, so a kept SVG stays interactive.
+          let paints = 0, requested = 0, published = 0;
+          const paint = selectedKey => {
+            const id = requested = ++paints;
+            const owner = () => active() && (id === requested || id === published);
+            return window.TrellisTreemapPele.render(get("treemap-diagram"), files, {
+              metric, aggregate, selectedKey, isCurrent:owner, viewport:viewport(), rootLabel,
+              fileValue:file => metric === "role" ? undefined : metricValue(file.metrics, metric),
+              fileBand:file => metric === "role" ? classification(file) : scale.band(metricValue(file.metrics, metric)),
+              onSelectFile:file => { if (interactive() && files.includes(file)) inspect(file, interactive); },
+              onSelectDirectory:directory => {
+                if (!interactive() || !directory || !files.some(file => file.sourceSetId === directory.sourceSetId && (!directory.path || file.path.startsWith(directory.path + "/")))) return;
+                navigationSerial++; scope = {sourceSetId:directory.sourceSetId, path:directory.path}; return render();
+              },
+            }).then(result => ({id, result}));
+          };
+          const first = await paint(select), outcome = first.result;
+          if (!active() || first.id !== requested) return;
           if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Treemap mapping failed. Nothing displayed.");
+          published = first.id; requested = 0;
+          // Resizes relayout the same admitted files; only a changed layout size renders again.
+          let laidOut = outcome.projection;
+          const area = files.filter(file => file.physicalLines > 0).length;
+          relayout = async () => {
+            // A newer desired size cancels any pending paint, even when it is the published size again.
+            requested = 0;
+            const next = interactive() && laidOut ? viewport() : undefined;
+            if (!next) return;
+            const size = window.TrellisTreemapPele.layoutSize(area, next);
+            if (size.width === laidOut.width && size.height === laidOut.height) return;
+            const {id, result} = await paint(selectedKey);
+            if (!interactive() || id !== requested) return;
+            requested = 0;
+            if (result?.status === "ready") { published = id; laidOut = result.projection; markSelection(); return; }
+            ready = false; relayout = null; clearInspection();
+            for (const id of ["treemap-files", "treemap-legend"]) get(id).replaceChildren();
+            state(result?.error?.message || "Treemap rendering failed. Nothing displayed.", "error");
+          };
         }
         if (!active()) return;
         ready = true;
@@ -171,8 +200,11 @@
           button.addEventListener("click", () => inspect(file, interactive)); get("treemap-files").append(button);
         }
         const total = files.reduce((sum, file) => sum + file.physicalLines, 0);
-        state(files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.", files.length ? "ready" : "empty");
+        const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.";
+        state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
+        // Resizes during the first paint had no relayout to call; reconcile with the box once.
+        void relayout?.();
       } catch (error) {
         if (!active()) return;
         ready = false; clearInspection();
@@ -185,7 +217,7 @@
       if (!c.rootKey || !c.pin) { state("Choose an indexed checkout, then open Treemap.", "empty"); return; }
       state("Reading indexed file metrics…", "loading"); get("treemap-diagram").setAttribute("aria-busy", "true");
       try {
-        const query = new URLSearchParams({scope:"revision", aggregate:c.aggregate, role:c.role, indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
+        const query = new URLSearchParams({scope:"revision", aggregate:c.aggregate, role:c.role, workbench:"true", indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
         const data = await request(`/api/metrics?${query}`, () => current(c));
         if (!current(c)) return;
         view = payloadOf(data, c); basis = c;
@@ -211,6 +243,12 @@
       if (testFile(selected)) { hideTests = false; get("treemap-hide-tests").checked = false; }
       await render(identity(selected)); return navigation === navigationSerial && current(c) && selectedKey === identity(selected);
     }
+    if (typeof ResizeObserver === "function") {
+      // One trailing relayout per burst of resizes; a newer one supersedes an older one.
+      new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => relayout?.(), 120); }).observe(get("treemap-diagram"));
+    }
+    get("treemap-relative").checked = false;
+    get("treemap-relative").addEventListener("change", event => { relative = event.target.checked; return render(); });
     get("treemap-color").value = metric; get("treemap-aggregate").value = aggregate;
     get("treemap-metric-tests").checked = false; get("treemap-hide-tests").checked = true;
     get("treemap-path").value = ""; get("treemap-language").value = "";

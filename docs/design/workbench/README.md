@@ -204,8 +204,8 @@ Item numbers in brackets refer to the gap list above.
 
 - ~~Where does the layer map live?~~ Settled: `.trellis/rules.toml` (#129), proposed by the agent, approved by PR.
 - ~~Should the metric color ramp be quartiles of the visible set (as drawn) or fixed thresholds?~~ Settled 2026-10-28: fixed per-metric thresholds (#395). The mockup's quartile coloring is superseded.
-- In Without-Herdr mode, what does "Design a change" produce: a saved request picked up via `trellis mcp`, or copy-to-clipboard?
-- How does the "Follow active tab" toggle in With-Herdr mode behave when the tab's cwd isn't an indexed checkout?
+- ~~In Without-Herdr mode, what does "Design a change" produce?~~ Settled 2026-10-29: **copy to clipboard**. The copied text carries the context (checkout, revision, the diagram and selection it came from) and a **structured change request** (the typed change from the structural comparison, per the design-handoff ruling), not a Mermaid text diff. It is not saved as a request for `trellis mcp`.
+- ~~How does "Follow active tab" behave when the tab's cwd isn't an indexed checkout?~~ Settled 2026-10-29: tabs whose cwd has **no Trellis index are shown greyed out and can't be clicked through to**. Following such a tab doesn't switch the view.
 
 ## Owner rulings on the packet (2026-10-24)
 

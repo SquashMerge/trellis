@@ -73,6 +73,7 @@ pub fn describe(
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
       "watcherDegraded":degraded,"languages":languages,"toolVersion":2,"schemaVersion":1,
+      "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
         "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":4}},
@@ -215,7 +216,7 @@ pub fn search(
         root,
         catching_up,
         modern,
-        Some((&result.matched_by, &status)),
+        Some((&result.matched_by, &status, result.role)),
     )
 }
 
@@ -226,7 +227,7 @@ fn symbols(
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
-    search: Option<(&[Vec<String>], &Value)>,
+    search: Option<(&[Vec<String>], &Value, crate::search_rank::SearchRole)>,
 ) -> Result<Option<Value>, &'static str> {
     // #156: completeness is a property of the whole searched scope, carried by
     // `scopeCoverage`; per-document coverage covers only the emitted symbols.
@@ -267,7 +268,7 @@ fn symbols(
                 "lines":symbol.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
                 "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}))
         }).collect::<Result<Vec<_>, &'static str>>()?;
-        if let Some((matched_by, _)) = search {
+        if let Some((matched_by, _, _)) = search {
             for (index, symbol) in symbols.iter_mut().enumerate() {
                 symbol["rank"] = json!(index + 1);
                 symbol["matchedBy"] = json!(matched_by[index]);
@@ -332,11 +333,12 @@ fn symbols(
             "warnings":warnings,"partial":incomplete || truncated,"truncated":truncated,
             "truncationReason": if n < result.symbols.len() {Some("response_bytes")}
                 else if result.has_more {Some("limit")} else {None}});
-        let name = if let Some((_, status)) = search {
+        let name = if let Some((_, status, role)) = search {
             let data = envelope["data"].as_object_mut().expect("symbol data");
             let hits = data.remove("symbols").expect("symbol list");
             data.insert("hits".into(), hits);
             data.insert("searchIndex".into(), status.clone());
+            data.insert("role".into(), json!(role));
             "trellis_search_symbols"
         } else {
             "trellis_find_symbols"
@@ -811,6 +813,7 @@ mod search_tests {
             .map(|(name, path)| ((*name).to_owned(), "source-set:v1:test", (*path).to_owned()))
             .collect();
         SearchResult {
+            role: crate::search_rank::SearchRole::default(),
             symbols: super::find_tests::fixture(&hits, scope, has_more),
             matched_by: names
                 .iter()
@@ -859,7 +862,8 @@ mod search_tests {
             .unwrap()
             .unwrap();
             let data = &envelope["data"];
-            assert_eq!(data.as_object().unwrap().len(), 6);
+            assert_eq!(data.as_object().unwrap().len(), 7);
+            assert_eq!(data["role"], "any");
             assert_eq!(data["searchIndex"]["state"], "partial");
             assert_eq!(data["searchIndex"]["embedded"], 1);
             assert_eq!(envelope["partial"], false);
@@ -938,6 +942,39 @@ mod search_tests {
                 assert_eq!(empty["data"][field], json!([]));
             }
             assert_wire(&empty, modern);
+        }
+    }
+
+    #[test]
+    fn search_role_survives_empty_limit_and_byte_trimmed_prefixes() {
+        use crate::search_rank::SearchRole;
+        let oversized = "x".repeat(40_000);
+        for modern in [false, true] {
+            for (role, expected) in [
+                (SearchRole::Any, "any"),
+                (SearchRole::Production, "production"),
+                (SearchRole::Test, "test"),
+            ] {
+                for (names, has_more, reason) in [
+                    (vec![], false, Value::Null),
+                    (vec![("one", "a.js")], true, json!("limit")),
+                    (
+                        vec![(oversized.as_str(), "big.js")],
+                        false,
+                        json!("response_bytes"),
+                    ),
+                ] {
+                    let mut result = fixture(&names, COMPLETE, has_more);
+                    result.role = role;
+                    let envelope = project(result, modern).unwrap().unwrap();
+                    assert_eq!(envelope["data"]["role"], expected);
+                    assert_eq!(envelope["truncationReason"], reason);
+                    if reason == "response_bytes" {
+                        assert_eq!(envelope["data"]["hits"], json!([]));
+                    }
+                    assert_wire(&envelope, modern);
+                }
+            }
         }
     }
 

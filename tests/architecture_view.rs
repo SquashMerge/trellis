@@ -460,3 +460,65 @@ fn architecture_specificity_assignments_match_evaluated_layer_verdicts() {
         }
     }
 }
+
+#[test]
+fn workbench_architecture_forwards_population_without_changing_references_or_policy() {
+    let (_state, root, store, pin) = fixture();
+    rules(
+        root.path(),
+        &format!("{RULES}\n[layers.quiet]\norder=5\npaths=['src/unknown.rs']\ndisplay='hidden'"),
+    );
+    let response = store.evidence_response().unwrap();
+    let ordinary = response
+        .architecture_view(&options(pin, "max"), &mut || Ok(()))
+        .unwrap();
+    assert_eq!(ordinary["workbench"], false);
+    for role in ["production", "all", "test"] {
+        let selected = MetricsOptions {
+            workbench: true,
+            role: role.into(),
+            ..options(pin, "max")
+        };
+        let data = response
+            .architecture_view(&selected, &mut || Ok(()))
+            .unwrap();
+        let measured = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        assert_eq!(data["workbench"], true);
+        for field in ["references", "edges", "rules", "layers"] {
+            assert_eq!(data[field], ordinary[field], "{field}");
+        }
+        assert_eq!(
+            data["modules"].as_array().unwrap().len(),
+            ordinary["modules"].as_array().unwrap().len()
+        );
+        for module in data["modules"].as_array().unwrap() {
+            let file = measured
+                .files
+                .iter()
+                .find(|file| {
+                    module["identity"]["sourceSetId"] == file.source_set_id
+                        && module["identity"]["language"] == file.language
+                        && module["identity"]["path"] == file.path
+                })
+                .unwrap();
+            assert_eq!(module["metrics"], file.metrics);
+            assert_eq!(module["declarationCount"], file.declaration_count);
+            assert_eq!(module["roleCounts"], json!(file.role_counts));
+            assert_eq!(
+                module.get("excludedReason"),
+                serde_json::to_value(file).unwrap().get("excludedReason")
+            );
+        }
+        let hidden = data["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["identity"]["path"] == "src/unknown.rs")
+            .unwrap();
+        assert_eq!(hidden["declarationCount"], usize::from(role == "all"));
+        if role == "production" {
+            assert_eq!(hidden["excludedReason"], "hidden_layer");
+        }
+    }
+    response.finish(()).unwrap();
+}

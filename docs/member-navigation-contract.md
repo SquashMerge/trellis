@@ -5,7 +5,13 @@ Use cached revision-bound evidence, not bare-name grep guesses. No repository ex
 providers, reindex/schema change or changes to inspected repositories.
 
 POST /api/navigation request (deny unknown fields):
-- Source selector: {expectedRevision, path, line} (1-based whole source line).
+- Source selector: {expectedRevision, path, line, semanticProducerId?, semanticProducerPolicy?} (1-based whole source line).
+  `semanticProducerId` is an optional explicit published producer ID. `semanticProducerPolicy` may
+  be `"solePublished"`; it is mutually exclusive with an explicit ID. With neither, navigation stays
+  syntax-only. Empty/unknown IDs, unknown policies and conflicting selectors are invalid requests.
+  The browser requests `"solePublished"`: select the sole published producer at the exact source pin;
+  none means syntax-only; several mean syntax-only plus `multiple semantic producers; showing syntax`.
+  Never merge producers or substitute the current head. No producer picker is provided.
 - Member selector: {expectedRevision, classId, memberName, startByte, endByte}.
 Selectors are exclusive. Member selector MUST match a recorded ClassMember by name+exact byte range;
 never trust typeHint/name as resolution. Source selector must validate path/line against cached file.
@@ -48,8 +54,11 @@ Public attachSource(container,{path,revision,startLine,isCurrent}) binds delegat
 ShiftF10/ContextMenu on existing .source-line rows with .line-number text; do NOT replace source content.
 Return/reset/dispose invalidatespendingnavigation. A visible Navigate action and keyboard line movement
 must work withoutthousandstabstops; preserve selection/copy/scroll and highlightedsource ranges.
-Fetch only onexplicitnavigation, not everysource read/line selection. Include sourceSerial guard supplied
-byroot andreset onclear/source change; late actionscannotrunafteranotherselection/logout/reindex.
+Inline callable actions read one pinned `/api/symbols` page (limit 200) when source is attached;
+continuation requires explicit **More source actions**. Never fetch another source file for actions.
+Line-menu `/api/navigation` reads remain explicit, not triggered by line selection. Include the source
+serial guard and reset on source changes; late actions cannot run after another selection, logout or
+index-pin adoption. Inline controls must not pollute source text or native copy.
 No source fetch justtoopenmenu. Menu candidates distinctreason+certainty+qualifiedidentity whenavailable.
 No guessing arbitrarywordcall targets. Empty/loading/errors visible and recoverable; safe text nodes.
 Root integrates assets and init/attach/reset in app.js/index.html/style hooks, CI and docs.
@@ -66,3 +75,49 @@ source callcount0 untilintentionalread, asyncstale, keyboard/touch/Unicode/safe-
 Root handles integration/review/native+UI gates/staging browser/deployment. Preserve existing
 workspace snapshots; providers stay disabled and closed budgets stay untouched.
 Keep private validation artifacts outside the public repository. All public fixtures are synthetic.
+
+
+## Source-to-diagram continuity (#392)
+
+`selectMethod(symbol, revision)`, `openClass(symbol, revision)` and
+`inspectSymbol(symbol, revision)` receive the measured symbol and the source view's exact full pin.
+Only declaration/enclosing targets with `matchKind: "measured"` or call targets with
+`matchKind: "resolved"` become source diagram choices. Syntax candidates remain non-actions.
+Call graph stays disabled until a browser view exists. Inspect uses the existing inspector and does
+not fetch source; its explicit source action retains the same guards.
+
+The app owns source return and routing. Before a source-to-diagram transition, it replaces the current
+entry with an opaque source-return key and pushes one diagram entry. In-memory entries reference
+admitted source and diagram data; browser history stores no source bytes, token or DTO. Back restores
+the section, selected Files symbol/basis, source range and active line, focus and scroll using the
+normal renderer. Already admitted declaration metadata is retained with the entry, including explicit
+continuation pages, so restore needs no new metadata request and never waits on one for position.
+Pending metadata remains independent of focus/scroll restoration. Entries are invalidated by session, checkout or full-pin changes. Missing state is a
+visible refusal. No new source read or source-text persistence is needed for a retained entry.
+
+`#sequence?sid=…` waits for authentication and explicit checkout selection. Generated links add
+`rootKey`, `indexGeneration` and `indexRevision`; mismatches are refused. The sequence endpoint's
+returned seed must match the requested ID and full pin; no workspace scan or lexical lookup resolves
+a URL. Back, new routes, checkout/session changes and pin adoption fence all pending route results.
+
+Library candidate identities are not workspace declaration IDs. External source therefore has an
+explicit unavailable hint and no workspace navigation attachment. Working-tree-only source has no
+indexed actions. Positive external navigation needs a separate indexed identity contract, not a
+same-name or same-path guess.
+
+
+### Explicit resolved call targets
+
+With an explicit semantic producer, source-line calls use the same selected read transaction and
+full revision pin as the declaration projection. Each native call's ID and measured range join its
+published binding through the #40 `select_binding` / `boundary_reason` rules. Only fresh, resolved,
+direct/constructor Internal targets with an exact selected document and measured callable syntax ID
+become `reason: "call", matchKind: "resolved"` choices. These choices also carry native `callId` and
+byte `range`; repeated sites remain distinct. Unresolved, ambiguous, stale, external, dispatch-only,
+failed/omitted/unrequested coverage and non-callable targets do not gain callee actions. The measured
+enclosing method remains available. A missing required in-scope coverage row is typed corruption,
+not a successful partial navigation result. Existing navigation row, evidence and response budgets also cover these reads.
+The browser explicitly requests the owner-approved `solePublished` policy. The bounded producer
+lookup and call projection share the selected read transaction. Without that policy or an explicit
+ID, the API stays syntax-only. Menu labels distinguish measured syntax declarations from resolved
+callee choices; the latter still require every #40 eligibility check.

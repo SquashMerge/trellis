@@ -1049,3 +1049,57 @@ async fn selected_metrics_reports_catching_up_from_same_admission() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn workbench_metrics_option_is_explicit_and_strict() {
+    let (base, _runtime, browser, key) = fixture().await;
+    let app = browser.router();
+    for (query, expected) in [
+        ("", false),
+        ("?workbench=false", false),
+        ("?workbench=true&role=production", true),
+    ] {
+        let (status, data) = request(app.clone(), &key, query).await;
+        assert_eq!(status, StatusCode::OK, "{data}");
+        assert_eq!(data["payload"]["workbench"], expected);
+    }
+    for query in [
+        "?workbench=",
+        "?workbench=1",
+        "?workbench=True",
+        "?workbench=false&workbench=true",
+        "?workbench=false&%77orkbench=true",
+    ] {
+        let (status, data) = request(app.clone(), &key, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {data}");
+        assert_eq!(data["error"]["code"], "invalid_request");
+    }
+    fs::create_dir_all(base.path().join("checkout/.trellis")).unwrap();
+    fs::write(base.path().join("checkout/.trellis/rules.toml"), "bad toml").unwrap();
+    let (status, data) = request(app.clone(), &key, "?workbench=false").await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert!(data["payload"].get("layerExclusionsWarning").is_none());
+    let (status, data) = request(app.clone(), &key, "?workbench=true").await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert_eq!(
+        data["payload"]["layerExclusionsWarning"],
+        "Rules unavailable; layer-based heat exclusions were not applied."
+    );
+    assert!(!data["payload"]["files"].as_array().unwrap().is_empty());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/checkouts/{key}/architecture?workbench=true"))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let data: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(data["error"]["code"], "invalid_rules");
+}

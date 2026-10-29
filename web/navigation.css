@@ -12,3 +12,11 @@
 .source-line.navigation-active-line .line-number { color: var(--link); }
 .source-line.navigation-active-line.highlight .line-number { color: var(--on-selected); }
 @media (pointer: coarse) { .source-navigation-action { min-height: 44px; } }
+
+/* Reveal declaration actions without replacing source spans or selecting a token. */
+.source-diagram-action { display: inline-block; margin: 0 0 0 12px; padding: 0 6px; min-height: 1.7em; border: 1px solid var(--sm-control); border-radius: 4px; background: var(--surface); color: var(--link); font: inherit; line-height: inherit; vertical-align: baseline; user-select: none; opacity: 0; }
+.source-diagram-action::before { content: attr(data-label); }
+.source-line:hover .source-diagram-action, .source-line:focus-within .source-diagram-action, .source-line.navigation-active-line .source-diagram-action { opacity: 1; }
+.source-diagram-action:hover { background: var(--sm-raised); }
+.source-diagram-action:focus-visible { opacity: 1; outline: 2px solid var(--focus); outline-offset: 3px; }
+@media (pointer: coarse) { .source-diagram-action { opacity: 1; min-height: 44px; } }

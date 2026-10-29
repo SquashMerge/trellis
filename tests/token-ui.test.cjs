@@ -66,7 +66,7 @@ function harness({saved, blocked = false, routes} = {}) {
 test("checkout selection and refresh load only retained services and keep current jobs",async()=>{
   const h=harness();
   await h.connect("synthetic",false);
-  assert.equal(h.get("checkout-state").textContent,"Checkout ready.");
+  assert.equal(h.get("checkout-state").textContent,"");
   assert.deepEqual(h.requests.map(({url})=>url),[
     "/api/checkouts","/api/daemon/status",`${SCOPED}/status`,
     `${SCOPED}/tree?path=&offset=0&limit=200`,`${SCOPED}/dependencies`,`${SCOPED}/jobs/current`
@@ -76,7 +76,7 @@ test("checkout selection and refresh load only retained services and keep curren
   assert.ok(h.requests.every(({url})=>! /\/(?:symbols|symbol|query|views|annotations|questions|jev|acp)(?:[/?]|$)/.test(url)));
   h.get("logout").listeners.click();
   await h.connect("synthetic",false);
-  assert.equal(h.get("checkout-state").textContent,"Checkout ready.");
+  assert.equal(h.get("checkout-state").textContent,"");
 });
 test("retired checkout routes are rejected before a browser request",async()=>{
   const h=harness();await h.connect("synthetic",false);
@@ -629,7 +629,9 @@ test("checkout options and cold header share measured Git labels without extra r
   assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status"]);
   for(const [i,row] of rows.entries()) {
     const option=h.get("checkout-select").children[i+1];
-    assert.equal(option.textContent,`${row.workspaceRoot} · available · ${labels[i]}`);
+    const head = ["feature/<script>", "local", "Detached abcdef1", "Git unavailable", "Git unavailable"][i];
+    assert.equal(option.textContent,`${row.workspaceRoot.split("/").at(-1)} ⎇ ${head} · Not indexed`);
+    assert.equal(option.title,row.workspaceRoot);
     assert.equal(option.children.length,0,"repository labels stay text, not markup");
     await h.run(`selectCheckout(${JSON.stringify(row.rootKey)})`);
     assert.equal(h.get("workspace-git").textContent,labels[i]);
@@ -771,14 +773,14 @@ test("checkout list shows measured freshness and shares explicit selection with 
   const listRequests = h.requests.slice(before).map(request => request.url);
   assert.equal(h.run("selectedRootKey"),ROOT);
   assert.equal(h.get("checkout-select").value,ROOT);
-  assert.equal(h.get("checkout-state").textContent,"Checkout ready.");
+  assert.equal(h.get("checkout-state").textContent,"");
   h.run("resetCheckout()");
   const pickerStart = h.requests.length;
   h.get("checkout-select").value=ROOT;
   h.get("checkout-select").listeners.change({target:h.get("checkout-select")}); await flush();
   assert.deepEqual(h.requests.slice(pickerStart).map(request => request.url),listRequests);
   assert.equal(h.run("selectedRootKey"),ROOT);
-  assert.equal(h.get("checkout-state").textContent,"Checkout ready.");
+  assert.equal(h.get("checkout-state").textContent,"");
 });
 
 test("newer checkout list freshness updates the selected card and header at the same snapshot pin", async () => {

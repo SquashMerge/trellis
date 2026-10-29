@@ -1,8 +1,8 @@
 "use strict";
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const {existsSync, realpathSync, rmSync} = require("node:fs");
-const {dirname} = require("node:path");
+const {existsSync, mkdirSync, realpathSync, rmSync, writeFileSync} = require("node:fs");
+const {dirname, join} = require("node:path");
 const {fork, spawn} = require("node:child_process");
 const {once} = require("node:events");
 const H = require("./sequence-harness.cjs");
@@ -36,6 +36,47 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
   test.after(async () => {
     await H.cleanup();
     if (unrelatedPaths) rmSync(unrelatedPaths.temp, {recursive:true,force:true,maxRetries:10,retryDelay:100});
+  });
+
+  test("CLI index then serve builds the dependency catalog without explicit refresh", {timeout:150000}, async () => {
+    const paths = H.fixture("function measured() { return 1; }\n", "anchor.js");
+    let server;
+    try {
+      const files = {
+        "Cargo.toml": "[package]\nname='browser-app'\nversion='0.1.0'\n[dependencies]\nlocal-library={path='vendor/local-library'}\n",
+        "Cargo.lock": "version=4\n[[package]]\nname='browser-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\n",
+        "vendor/local-library/Cargo.toml": "[package]\nname='local-library'\nversion='0.1.0'\n",
+        "vendor/local-library/src/lib.rs": "pub fn candidate_only() {}\n",
+      };
+      for (const [relative, text] of Object.entries(files)) {
+        const destination = join(paths.workspace, relative);
+        mkdirSync(dirname(destination), {recursive:true});
+        writeFileSync(destination, text);
+      }
+      const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env});
+      const pin = JSON.parse(indexed.stdout).status.revision;
+      server = await H.startDaemon(paths, pin.indexRevision);
+      let catalog;
+      const deadline = Date.now() + 120000;
+      do {
+        const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "dependencies"));
+        assert.equal(response.status, 200);
+        catalog = response.data;
+        if (catalog.state !== "loading") break;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      } while (Date.now() < deadline);
+      assert.equal(catalog.state, "ready", JSON.stringify(catalog));
+      assert.deepEqual(catalog.workspaceRevision, pin);
+      assert.equal(catalog.symbolCount, 1);
+      const library = catalog.packages.find(pkg => pkg.name === "local-library");
+      assert.ok(library, JSON.stringify(catalog));
+      assert.equal(library.indexState, "complete");
+      assert.equal(library.sourceState, "present");
+      assert.equal(library.source, "workspace-path:vendor/local-library");
+    } finally {
+      await H.stopDaemon(server);
+      rmSync(paths.temp, {recursive:true,force:true,maxRetries:10,retryDelay:100});
+    }
   });
   for (const action of ["cleanup", "fail", "SIGTERM", "SIGINT"]) {
     test(`sequence harness cleans its detached daemon on ${action}`, {timeout:150000}, async () => {

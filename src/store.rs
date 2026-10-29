@@ -668,11 +668,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 26;
+const DATABASE_SCHEMA_VERSION: u32 = 27;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V26: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=26), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V27: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=27), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -693,6 +693,8 @@ CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native
 CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(vid,language,path),UNIQUE(vid,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,class_summary_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((class_extraction_state='ready')=(class_summary_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE graph_nodes(gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,id BLOB NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(gid,id));
+CREATE INDEX graph_nodes_search_name ON graph_nodes(name COLLATE BINARY,id,gid);
+CREATE INDEX graph_nodes_search_folded ON graph_nodes(lower(name),name COLLATE BINARY,id,gid);
 CREATE TABLE graph_display_labels(gid INTEGER NOT NULL,id BLOB NOT NULL,label TEXT NOT NULL,PRIMARY KEY(gid,id),FOREIGN KEY(gid,id) REFERENCES graph_nodes(gid,id) DEFERRABLE INITIALLY DEFERRED);
 CREATE VIRTUAL TABLE graph_node_trigrams USING fts5(name,content='',columnsize=0,tokenize='trigram case_sensitive 1');
 CREATE TRIGGER graph_node_trigrams_insert AFTER INSERT ON graph_nodes BEGIN INSERT INTO graph_node_trigrams(rowid,name) VALUES(new.rowid,lower(new.name)); END;
@@ -711,6 +713,8 @@ CREATE INDEX revision_documents_path ON revision_documents(revision_id,path);
 CREATE TABLE native_version_coverage_roles(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,role_kind TEXT NOT NULL CHECK(role_kind IN ('supported','observed')),role TEXT NOT NULL CHECK(role IN ('definition','call')),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(vid,role_kind,ordinal),UNIQUE(vid,role_kind,role));
 CREATE TABLE native_version_declarations(vid INTEGER NOT NULL REFERENCES document_versions(vid) DEFERRABLE INITIALLY DEFERRED,syntax_id BLOB NOT NULL,owner_syntax_id BLOB,kind TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('test','production')),name TEXT,lookup_key TEXT,key_signature_present INTEGER NOT NULL CHECK(key_signature_present IN (0,1)),key_type_parameter_count INTEGER,key_variadic INTEGER,key_ordinal INTEGER NOT NULL CHECK(key_ordinal>=0),start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,name_start INTEGER,name_end INTEGER,CHECK(start_byte>=0 AND end_byte>=start_byte),CHECK((name IS NULL)=(lookup_key IS NULL) AND (name IS NULL)=(name_start IS NULL) AND (name_start IS NULL)=(name_end IS NULL)),CHECK(name_start IS NULL OR (name_start>=start_byte AND name_end<=end_byte AND name_end>name_start)),CHECK((key_signature_present=0 AND key_type_parameter_count IS NULL AND key_variadic IS NULL) OR (key_signature_present=1 AND key_type_parameter_count>=0 AND key_variadic IN (0,1))),PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,owner_syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX native_version_declarations_lookup ON native_version_declarations(lookup_key,vid,syntax_id);
+CREATE INDEX native_version_declarations_search_name ON native_version_declarations(name COLLATE BINARY,syntax_id,vid);
+CREATE INDEX native_version_declarations_search_folded ON native_version_declarations(lower(name),name COLLATE BINARY,syntax_id,vid);
 CREATE INDEX native_version_declarations_owner ON native_version_declarations(vid,owner_syntax_id);
 CREATE TABLE native_version_search_cards(vid INTEGER NOT NULL,syntax_id BLOB NOT NULL,card_text TEXT NOT NULL,card_hash TEXT NOT NULL CHECK(length(card_hash)=64),facts_json TEXT NOT NULL CHECK(json_valid(facts_json)),terms TEXT NOT NULL,PRIMARY KEY(vid,syntax_id),FOREIGN KEY(vid,syntax_id) REFERENCES native_version_declarations(vid,syntax_id) DEFERRABLE INITIALLY DEFERRED);
 CREATE INDEX native_version_search_cards_cursor ON native_version_search_cards(syntax_id,vid);
@@ -1146,6 +1150,7 @@ impl ReadRevision {
 pub struct MetricsOptions {
     pub pin: Option<IndexPin>,
     pub role: String,
+    pub workbench: bool,
     pub scope: String,
     pub source_set_id: Option<String>,
     pub language: Option<String>,
@@ -1162,6 +1167,7 @@ impl Default for MetricsOptions {
             pin: None,
             scope: "revision".into(),
             role: "all".into(),
+            workbench: false,
             source_set_id: None,
             language: None,
             path: None,
@@ -1236,6 +1242,8 @@ pub struct MetricsFileRow {
     pub physical_lines: usize,
     pub file_role: DeclarationRole,
     pub role_counts: MetricsRoleCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_reason: Option<&'static str>,
     pub declaration_count: usize,
     pub metrics: serde_json::Value,
 }
@@ -1284,11 +1292,17 @@ pub struct MetricsTopCognitiveScore {
     pub cyclomatic: usize,
     pub max_nesting: usize,
 }
+const LAYER_EXCLUSIONS_WARNING: &str =
+    "Rules unavailable; layer-based heat exclusions were not applied.";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsPayload {
     pub metrics_version: &'static str,
     pub role: String,
+    pub workbench: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_exclusions_warning: Option<&'static str>,
     pub index_generation: String,
     pub index_revision: u64,
     pub scope: String,
@@ -1610,7 +1624,7 @@ impl EvidenceResponse {
             "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
             "rulesFile": config.as_ref().map(crate::rules::descriptor),
             "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
-            "role": options.role, "evidenceTier": "syntax", "semanticComplete": false,
+            "role": options.role, "workbench": options.workbench, "evidenceTier": "syntax", "semanticComplete": false,
             "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
         });
         if payload["state"] != "ready" {
@@ -1626,13 +1640,16 @@ impl EvidenceResponse {
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
         let mut rules = evaluated.data;
         let assignments = evaluated.layers;
-        let metrics = self.metrics_at(
+        let metrics = self.metrics_at_with_config(
             &MetricsOptions {
                 pin: Some(snapshot.pin),
                 role: options.role.clone(),
+                workbench: options.workbench,
                 aggregate: options.aggregate.clone(),
                 ..MetricsOptions::default()
             },
+            Some(config),
+            true,
             check,
         )?;
         let files: BTreeMap<_, _> = metrics
@@ -1697,6 +1714,9 @@ impl EvidenceResponse {
             row["declarationCount"] = serde_json::json!(file.declaration_count);
             row["roleCounts"] = serde_json::json!(file.role_counts);
             row["metrics"] = file.metrics.clone();
+            if let Some(reason) = file.excluded_reason {
+                row["excludedReason"] = serde_json::json!(reason);
+            }
             modules.push(row);
         }
         drop(assignments);
@@ -2061,6 +2081,30 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<MetricsPayload> {
         options.validate()?;
+        check()?;
+        let (config, invalid_rules) = if options.workbench {
+            match crate::rules::load(Path::new(self.store.workspace_root())) {
+                Ok(config) => (config, false),
+                Err(error) if crate::rules::diagnostic(&error).is_some() => (None, true),
+                Err(error) => return Err(error),
+            }
+        } else {
+            (None, false)
+        };
+        let mut payload = self.metrics_at_with_config(options, config.as_ref(), false, check)?;
+        if invalid_rules {
+            payload.layer_exclusions_warning = Some(LAYER_EXCLUSIONS_WARNING);
+        }
+        Ok(payload)
+    }
+
+    fn metrics_at_with_config(
+        &self,
+        options: &MetricsOptions,
+        config: Option<&crate::rules::Config>,
+        strict_rules: bool,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<MetricsPayload> {
         let progress = MetricsReadCheck {
             check: Mutex::new(check),
             failure: Mutex::new(None),
@@ -2119,6 +2163,30 @@ impl EvidenceResponse {
         if options.scope != "revision" && included.is_empty() {
             anyhow::bail!("not_found: metrics selector");
         }
+        let mut layer_exclusions_warning = None;
+        let hidden_layers = if options.workbench && options.role == "production" {
+            if let Some(config) = config {
+                match crate::rules::hidden_layer_paths(
+                    config,
+                    &included
+                        .iter()
+                        .map(|key| key.path.as_str())
+                        .collect::<Vec<_>>(),
+                    &mut || progress.check(),
+                ) {
+                    Ok(paths) => paths,
+                    Err(error) if !strict_rules && crate::rules::diagnostic(&error).is_some() => {
+                        layer_exclusions_warning = Some(LAYER_EXCLUSIONS_WARNING);
+                        BTreeSet::new()
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                BTreeSet::new()
+            }
+        } else {
+            BTreeSet::new()
+        };
         let mut declarations = Vec::new();
         let mut files = Vec::new();
         let mut top_cognitive = options
@@ -2126,7 +2194,7 @@ impl EvidenceResponse {
             .map(|_| Vec::<MetricsTopCognitiveRow>::new());
         let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
             BTreeMap::new();
-        // Read only the selected version; no checkout filesystem access.
+        // Read source and native rows only from the selected version.
         // Every SQL read runs in order on this request's connection and snapshot.
         // Metrics run on workers, a chunk behind the
         // reads, and are accepted strictly in manifest order: the first failure
@@ -2257,7 +2325,26 @@ impl EvidenceResponse {
                     DeclarationRole::Test => role_counts.test += 1,
                 }
             }
-            rows.retain(|row| options.role == "all" || options.role == row.role.as_str());
+            // Workbench population only: stored roles, file identity and policy stay intact.
+            // Validate and measure every file before excluding its callable contributions.
+            let excluded_reason = if !options.workbench {
+                None
+            } else if key.path.starts_with("web/vendor/") {
+                Some("vendored")
+            } else if options.role == "production"
+                && (key.path.starts_with("tests/fixtures/")
+                    || key.path.starts_with("tools/synthetic-cohorts/templates/"))
+            {
+                Some("fixture")
+            } else if hidden_layers.contains(&key.path) {
+                Some("hidden_layer")
+            } else {
+                None
+            };
+            rows.retain(|row| {
+                excluded_reason.is_none()
+                    && (options.role == "all" || options.role == row.role.as_str())
+            });
             let mut file_fold = crate::metrics::Accumulator::default();
             let mut parents = vec![String::new()];
             let mut directory = String::new();
@@ -2367,6 +2454,7 @@ impl EvidenceResponse {
                     physical_lines,
                     file_role,
                     role_counts,
+                    excluded_reason,
                     declaration_count: file_fold.count(),
                     metrics: file_fold.project(&options.aggregate, &names)?,
                 });
@@ -2575,6 +2663,8 @@ impl EvidenceResponse {
         Ok(MetricsPayload {
             metrics_version: crate::metrics::VERSION,
             role: options.role.clone(),
+            workbench: options.workbench,
+            layer_exclusions_warning,
             index_generation: selected.pin.index_generation.to_string(),
             index_revision: selected.pin.index_revision,
             scope: options.scope.clone(),
@@ -3503,7 +3593,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V26)?;
+    expected.execute_batch(CACHE_SCHEMA_V27)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -3527,7 +3617,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V26).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V27).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -6492,6 +6582,24 @@ fn read_semantic_tuple(
     history_syntax: Option<&str>,
     trusted_admitted_raw: bool,
 ) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+    read_semantic_tuple_for_call(
+        db,
+        key,
+        selected_tuple,
+        history_syntax,
+        trusted_admitted_raw,
+        None,
+    )
+}
+
+fn read_semantic_tuple_for_call(
+    db: &Connection,
+    key: &str,
+    selected_tuple: Option<i64>,
+    history_syntax: Option<&str>,
+    trusted_admitted_raw: bool,
+    call_id: Option<&[u8]>,
+) -> Result<crate::semantic_evidence::SemanticSnapshot> {
     use crate::native_evidence::DocumentKey;
     use crate::semantic_evidence as sem;
     let (source_set, native_id): (String, String) = db.query_row(
@@ -6557,7 +6665,7 @@ fn read_semantic_tuple(
             language: language.clone(),
             path: path.clone(),
         };
-        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path],|r|{
+        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?5 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
             Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,i64>(16)?,r.get::<_,Option<i64>>(17)?,r.get::<_,Option<String>>(18)?,r.get::<_,Option<String>>(19)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (
@@ -6701,7 +6809,7 @@ fn read_semantic_tuple(
             });
         }
         if history_syntax.is_none() {
-            read_semantic_facts(db, tuple, &document, &native_id, &mut result)?;
+            read_semantic_facts(db, tuple, &document, &native_id, &mut result, call_id)?;
         }
     }
     Ok(result)
@@ -6840,9 +6948,13 @@ fn read_semantic_facts(
     document: &crate::native_evidence::DocumentKey,
     native_id: &str,
     result: &mut crate::semantic_evidence::SemanticSnapshot,
+    selected_call: Option<&[u8]>,
 ) -> Result<()> {
     use crate::semantic_evidence as sem;
     let source_set = &document.source_set_id;
+    if selected_call.is_some() {
+        return read_semantic_call_facts(db, tuple, document, result, selected_call);
+    }
     let symbol_rows=db.prepare("SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (
         ordinal,
@@ -7017,9 +7129,66 @@ fn read_semantic_facts(
             provenance_id,
         });
     }
-    let call_rows = db
-        .prepare("SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 ORDER BY ordinal")?
+    read_semantic_call_facts(db, tuple, document, result, None)?;
+    let relationship_rows = db
+        .prepare("SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 ORDER BY ordinal")?
         .query_map([tuple], |r| {
+            let source = semantic_target_read(r, 4, source_set).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(e.to_string())),
+                )
+            })?;
+            let target = semantic_target_read(r, 14, source_set).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(e.to_string())),
+                )
+            })?;
+            Ok((
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                source,
+                target,
+                r.get::<_, String>(24)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (ordinal, (stored, kind, source, target, provenance_id)) in
+        relationship_rows.into_iter().enumerate()
+    {
+        selected_ensure!(
+            ordinal as i64 == stored,
+            "incompatible_index: corrupt semantic relationship ordinal"
+        );
+        result.type_relationships.push(sem::TypeRelationship {
+            kind: semantic_enum(kind)?,
+            source: source.context(SelectedIntegrity(
+                "incompatible_index: missing semantic source".into(),
+            ))?,
+            target: target.context(SelectedIntegrity(
+                "incompatible_index: missing semantic target".into(),
+            ))?,
+            provenance_id,
+        });
+    }
+    Ok(())
+}
+
+fn read_semantic_call_facts(
+    db: &Connection,
+    tuple: i64,
+    document: &crate::native_evidence::DocumentKey,
+    result: &mut crate::semantic_evidence::SemanticSnapshot,
+    selected_call: Option<&[u8]>,
+) -> Result<()> {
+    use crate::semantic_evidence as sem;
+    let source_set = &document.source_set_id;
+    let call_rows = db
+        .prepare("SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 AND (?2 IS NULL OR call_id=?2) ORDER BY ordinal")?
+        .query_map(params![tuple, selected_call], |r| {
             let target = semantic_target_read(r, 14, source_set).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     14,
@@ -7074,7 +7243,7 @@ fn read_semantic_facts(
     ) in call_rows.into_iter().enumerate()
     {
         selected_ensure!(
-            ordinal as i64 == stored,
+            selected_call.is_some() || ordinal as i64 == stored,
             "incompatible_index: corrupt semantic call ordinal"
         );
         result.call_bindings.push(sem::CallBinding {
@@ -7132,50 +7301,6 @@ fn read_semantic_facts(
             )?,
             possible_dispatch_complete,
             stale_target,
-            provenance_id,
-        });
-    }
-    let relationship_rows = db
-        .prepare("SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 ORDER BY ordinal")?
-        .query_map([tuple], |r| {
-            let source = semantic_target_read(r, 4, source_set).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::other(e.to_string())),
-                )
-            })?;
-            let target = semantic_target_read(r, 14, source_set).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    14,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::other(e.to_string())),
-                )
-            })?;
-            Ok((
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                source,
-                target,
-                r.get::<_, String>(24)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (ordinal, (stored, kind, source, target, provenance_id)) in
-        relationship_rows.into_iter().enumerate()
-    {
-        selected_ensure!(
-            ordinal as i64 == stored,
-            "incompatible_index: corrupt semantic relationship ordinal"
-        );
-        result.type_relationships.push(sem::TypeRelationship {
-            kind: semantic_enum(kind)?,
-            source: source.context(SelectedIntegrity(
-                "incompatible_index: missing semantic source".into(),
-            ))?,
-            target: target.context(SelectedIntegrity(
-                "incompatible_index: missing semantic target".into(),
-            ))?,
             provenance_id,
         });
     }
@@ -10297,7 +10422,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V26 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V27 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -12935,7 +13060,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V26)?;
+                db.execute_batch(CACHE_SCHEMA_V27)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -20470,7 +20595,6 @@ impl Store {
         &self,
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
-        request.validate()?;
         self.with_evidence(|tx| self.navigation_in(tx, request, false))
     }
     fn navigation_in(
@@ -20479,9 +20603,42 @@ impl Store {
         request: &crate::navigation::NavigationRequest,
         pre_startup: bool,
     ) -> Result<crate::navigation::NavigationResult> {
+        request.validate()?;
         let selected =
             self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
         let revision = selected.pin;
+        // Policy selection is local to this exact selected snapshot, never the head.
+        let mut producer_bytes = Vec::new();
+        let mut multiple_producers = false;
+        let effective_request = match request {
+            crate::navigation::NavigationRequest::Source(selector)
+                if selector.semantic_producer_policy.is_some() =>
+            {
+                let producers = tx.prepare(
+                    "SELECT CASE WHEN length(CAST(id AS BLOB))<=?2 THEN id END FROM semantic_revision_producers WHERE revision_id=?1 ORDER BY id LIMIT 2",
+                )?.query_map(params![selected.key, crate::navigation::RECORD_BYTES], |row| row.get::<_, Option<String>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut ids = Vec::new();
+                for producer in producers {
+                    let producer = producer.context(SelectedIntegrity(
+                        "selected semantic producer exceeds navigation budget".into(),
+                    ))?;
+                    selected_ensure!(
+                        crate::graph_query::valid_producer_id(&producer),
+                        "invalid selected semantic producer ID"
+                    );
+                    producer_bytes.push(serde_json::to_vec(&producer)?.len());
+                    ids.push(producer);
+                }
+                multiple_producers = ids.len() > 1;
+                let mut selector = selector.clone();
+                selector.semantic_producer_policy = None;
+                selector.semantic_producer_id = if ids.len() == 1 { ids.pop() } else { None };
+                Some(crate::navigation::NavigationRequest::Source(selector))
+            }
+            _ => None,
+        };
+        let request = effective_request.as_ref().unwrap_or(request);
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
         // consumes a selected document, authenticate it against that source BLOB
@@ -20546,6 +20703,24 @@ impl Store {
             selected_document
                 .as_ref()
                 .map(|document| document.nodes.as_slice()),
+            &mut |reader, selector| {
+                if multiple_producers {
+                    reader.warn("multiple semantic producers; showing syntax");
+                }
+                for bytes in &producer_bytes {
+                    if !reader.charge(*bytes) {
+                        return Ok(());
+                    }
+                }
+                graph_read::navigation_calls(
+                    self,
+                    tx,
+                    &selected,
+                    selected_document.as_ref(),
+                    selector,
+                    reader,
+                )
+            },
         )
     }
 
@@ -21494,7 +21669,9 @@ impl Store {
         let mut calls = document.graph_calls;
         calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let file = document.file;
-        crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all).map(Some)
+        let mut view = crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all)?;
+        graph_read::sequence_calls(self, tx, &selected_revision, &mut view)?;
+        Ok(Some(view))
     }
 
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {
@@ -21696,7 +21873,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V26).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V27).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -21832,7 +22009,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V26).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V27).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

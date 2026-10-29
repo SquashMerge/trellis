@@ -1790,6 +1790,13 @@ impl CheckoutRuntime {
         self.search.as_ref()
     }
 
+    pub(crate) fn search_availability(&self) -> crate::search_model::SearchAvailability {
+        self.search
+            .as_ref()
+            .map(|search| search.status_handle().availability())
+            .unwrap_or_default()
+    }
+
     /// Invoked through a weak edge AFTER a queue tick releases all stream and
     /// watcher locks. This is a snapshot of the current verified startup reconciliation owner, not a
     /// claim that startup reconciliation ran again when a serving watcher gets a new epoch.
@@ -1845,6 +1852,7 @@ impl CheckoutRuntime {
         status.watcher = Some(self.resources()?.scheduler.checkout_watcher_witness());
         let mut status = serde_json::to_value(response.finish(status)?)?;
         status["build"] = serde_json::to_value(crate::build_info::current())?;
+        status["searchIndex"] = serde_json::to_value(self.search_availability())?;
         Ok(status)
     }
 

@@ -104,6 +104,36 @@ race the watcher. Deterministic cached-vs-live divergence belongs to the offline
 regressions, not timing-based browser edits. Git diff coordinates never become indexed
 navigation targets. No-Git and repository text remain explicit and safe.
 
+## Source navigation and browser history (#392)
+
+The real-daemon suites use ordinary Java, Rust and JavaScript fixtures:
+
+- `files.test.cjs`: a measured declaration's one-click Sequence uses its exact ID and
+  complete pin. Back/Forward restores Files selection, indexed basis, source highlight,
+  active line, actual source-panel scroll and focused action without another source read
+  or extra browser-history entries. Working-tree diff lines have no indexed actions.
+- `sequence.test.cjs`: Read method source opens a different callable than the left-tree
+  selection, then Back restores the same source and original selection. Inspector source
+  on an unresolved import offers the explicitly labelled enclosing callable, not a guessed
+  callee. Call graph stays disabled; no #378 browser view is implied.
+- `viewer-shell.test.cjs`: bare and generated pinned `#sequence?sid=…` links wait for
+  authentication and explicit checkout selection. The exact returned seed supplies the
+  method and source. Missing/unknown IDs and mismatched checkout/generation/revision are
+  refused rather than replaced with a successor. Generated links contain checkout and full
+  pin, never credentials.
+- Libraries uses a local Cargo path dependency, authored before daemon startup. Its real
+  immutable candidate source has no workspace Sequence/navigation action, preserves the
+  selected workspace diagram, and renders hostile text safely under the real CSP. The
+  fixture explicitly requests `POST /dependencies/refresh` before awaiting native catalog
+  readiness: a separately investigated startup/serve-registration defect can leave the
+  automatic catalog loading without a worker. This setup does not fix or test automatic
+  catalog startup. No dependency download, Cargo project execution or positive external
+  navigation is claimed.
+
+These are functional assertions, not benchmarks. They observe events or conditions rather
+than fixed sleeps. Resolved-callee producer acceptance belongs to the approved backend
+projection fixture; this source-navigation coverage does not manufacture resolved targets.
+
 The suite runs in the canonical `./tools/verify` browser lane. For a focused run after normal
 setup and build, set `TRELLIS_SUITE_BINARY` to the absolute built binary and run
 `node --test --test-concurrency=1 tests/browser/files.test.cjs` with the same external
@@ -150,3 +180,31 @@ provisioning/build with `TRELLIS_SUITE_BINARY` and `PLAYWRIGHT_BROWSERS_PATH`. I
 also part of `./tools/verify`. Area is physical file lines, including inline test
 lines, not callable-range LOC. Native adapter admission/mutation tests run in
 `tests/treemap-pele.test.cjs`.
+
+## Class acceptance
+
+`classes-pele.test.cjs` serves the exact `web/classes.js` adapter, vendored Pele and
+stylesheets under the product CSP, with synthetic class DTOs. It checks native class
+node and member identities against the original records, encoded repository text,
+fail-closed SVG validation, bounds, the visible card fallback, class menus, members,
+method and member navigation by mouse and keyboard, and stale actions.
+`classes-app.test.cjs` indexes a Java checkout, opens the class through the real shell
+and published daemon response, and follows Read class source and a method member into
+its Pele sequence on the same pin. Both run in `./tools/verify`; run them alone after
+provisioning with `TRELLIS_SUITE_BINARY` and `PLAYWRIGHT_BROWSERS_PATH`.
+
+## Published semantic source navigation
+
+`navigation-resolved.test.cjs` publishes real native extraction plus validated synthetic
+semantic bindings through the hidden test-support-only `navigation-fixture` command.
+The exact same executable then runs the daemon, retaining the complete publication pin.
+No SQL rows or HTTP responses are fabricated. Cases cover zero, one and multiple
+published semantic producers, an unresolved call, and a direct internal callee whose
+source spelling deliberately names a different local function. The browser checks the
+resolved choice, exact selected seed and Back to the source view.
+
+`./tools/verify` builds and preserves a test-support executable for only this suite;
+other browser tests keep the normal binary. For a focused run after browser provisioning,
+run `node --test tests/browser/navigation-resolved.test.cjs`. It builds a test-support
+binary when `TRELLIS_NAVIGATION_FIXTURE_BINARY` is absent. To avoid that build, point the
+variable at a prebuilt test-support `trellis` executable.

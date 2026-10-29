@@ -89,6 +89,7 @@ fn candidate(row: usize) -> SearchCandidate {
             syntax_id,
         },
         card_hash,
+        role: trellis::native_evidence::DeclarationRole::Production,
     }
 }
 

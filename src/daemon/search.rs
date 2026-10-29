@@ -306,6 +306,12 @@ impl SearchService {
         self.status.clone()
     }
 
+    pub(crate) fn unavailable_query(&self) -> SearchQuery {
+        let mut query = SearchQuery::unavailable(Some(self.status.backend()));
+        query.status.unavailable_reason = self.status.unavailable_reason();
+        query
+    }
+
     /// Call before acquiring any checkout/cache snapshot. Ready owners service
     /// queued queries between document batches; only loading is lexical-only.
     /// The shared flag is the caller's original deadline/cancellation flag.
@@ -324,7 +330,7 @@ impl SearchService {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if admission.phase == ModelPhase::Loading {
-                let mut query = SearchQuery::unavailable(Some(self.status.backend()));
+                let mut query = self.unavailable_query();
                 query.budget = budget;
                 return Ok(query);
             }
@@ -1585,6 +1591,7 @@ mod tests {
                     syntax_id: format!("sid:v1:{id:032x}"),
                 },
                 card_hash: format!("{id:064x}"),
+                role: crate::native_evidence::DeclarationRole::Production,
             })
             .collect();
         let heads: Vec<_> = cards
@@ -1648,6 +1655,7 @@ mod tests {
                     service.cache_epoch(),
                     &[],
                     Some(&[1; DIMENSIONS]),
+                    &crate::search_rank::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap()
@@ -1704,6 +1712,7 @@ mod tests {
                     service.cache_epoch(),
                     &[],
                     Some(&[1; DIMENSIONS]),
+                    &crate::search_rank::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap()

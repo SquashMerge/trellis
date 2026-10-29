@@ -22,6 +22,7 @@ function harness() {
   const document = {getElementById:get, createElement:node};
   const window = {TrellisShell:{showMetricInspector() { shown++; }, clearMetricInspector() { cleared++; }}};
   const context = vm.createContext({window, document, URLSearchParams});
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"), context);
   const controller = window.TrellisMetrics.create({context:() => state, request(url) {
     return new Promise((resolve, reject) => requests.push({url, resolve, reject}));
@@ -36,7 +37,7 @@ function harness() {
 const text = node => [node.textContent, ...node.children.map(text)].join(" ");
 const row = (path, value, extra = {}) => ({sourceSetId:"source-set:v1:test", language:"javascript", path, declarationCount:1, roleCounts:{production:1, test:0},
   metrics:{cognitive:value, cyclomatic:0, maintainabilityIndex:value, halstead:{volume:value}}, ...extra});
-const payload = (files = [], options = {}) => ({payload:{metricsVersion:"metrics:v1", ...pin, scope:"revision", aggregate:"max", role:"production", files,
+const payload = (files = [], options = {}) => ({payload:{workbench:true,metricsVersion:"metrics:v1", ...pin, scope:"revision", aggregate:"max", role:"production", files,
   directories:[], ...options}});
 const settle = async () => { await Promise.resolve(); await Promise.resolve(); };
 async function publish(h, files, options) {
@@ -56,17 +57,25 @@ test("quartiles preserve zero, null, ties, empty and strict cuts; maintainabilit
   assert.equal(helpers.band(null, [2, 5, 10], "cognitive"), null);
 });
 
-test("one pinned revision request; actual displayed rows define cuts and color changes do not fetch", async () => {
+test("one pinned workbench request; fixed heat is stable and Relative uses displayed rows without fetching", async () => {
   const h = harness();
   await publish(h, [row("zero.js", 0), row("two.js", 2), row("five.js", 5), row("ten.js", 10), row("hidden.js", 1000), row("empty.js", null)]);
   const query = new URL(h.requests[0].url, "http://local").searchParams;
   assert.equal(query.get("scope"), "revision"); assert.equal(query.get("aggregate"), "max");
-  assert.equal(query.get("role"), "production"); assert.equal(h.get("metric-include-tests").checked, false);
+  assert.equal(query.get("workbench"), "true"); assert.equal(query.get("role"), "production"); assert.equal(h.get("metric-include-tests").checked, false);
   assert.match(text(h.get("metrics-state")), /production callables/);
   assert.equal(query.get("indexGeneration"), generation); assert.equal(query.get("indexRevision"), "1");
   const displayed = ["zero.js", "two.js", "five.js", "ten.js", "empty.js"].map(path => h.controller.decorate(h.node("button"), {scope:"file", path}));
   h.controller.renderLegend(displayed);
-  assert.match(text(h.get("metric-legend")), /≤2.*>2–5.*>5–10.*>10/);
+  assert.match(text(h.get("metric-legend")), /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
+  assert.match(displayed[3].swatch.className, /heat-1/);
+  h.controller.renderLegend([displayed[3]]);
+  assert.match(displayed[3].swatch.className, /heat-1/, "filtering cannot change fixed severity");
+  assert.equal(h.get("metric-relative").checked, false);
+  h.change("metric-relative", true); h.controller.renderLegend(displayed);
+  assert.equal(h.requests.length, 1);
+  assert.match(text(h.get("metric-legend")), /[Rr]elative to visible set.*≤2.*>2–5.*>5–10.*>10/);
+  h.change("metric-relative", false);
   assert.match(text(displayed[0].node), /0/); assert.match(text(displayed[4].node), /—/);
   assert.match(displayed[0].swatch.className, /heat-0/);
   assert.match(displayed[4].swatch.className, /neutral/);
@@ -252,4 +261,58 @@ test("response role must echo selection; test-only file has unavailable producti
   h.requests.at(-1).resolve(payload([file], {scope:"file", topCognitive:[]})); await empty;
   assert.match(text(h.get("metric-inspector-state")), /No production callables.*unavailable, not zero/);
   assert.match(text(h.get("metric-inspector-top")), /Highest cognitive complexity · production callables.*No production callables/);
+});
+
+
+test("excluded file counts use selected minus raw exactly once and sum requires explicit Relative", async () => {
+  const h = harness(), fixture = row("fixtures/input.js", null, {declarationCount:0,roleCounts:{production:2,test:1},excludedReason:"fixture"});
+  await publish(h, [row("mixed.js", 7, {roleCounts:{production:1,test:2}}), fixture]);
+  assert.match(text(h.get("metrics-state")), /5 callables excluded from heat.*1 fixture files/);
+  const inspection = h.controller.inspect({scope:"file",path:fixture.path});
+  h.requests.at(-1).resolve(payload([fixture], {scope:"file",topCognitive:[]})); await inspection;
+  assert.match(text(h.get("metric-inspector-state")), /Excluded from heat: fixture/);
+  h.controller.clearInspection(); h.change("metric-aggregate", "sum");
+  h.requests.at(-1).resolve(payload([row("sum.js", 100)], {aggregate:"sum"})); await settle();
+  const item = h.controller.decorate(h.node("button"), {scope:"file",path:"sum.js"});
+  h.controller.renderLegend([item]); assert.match(item.swatch.className, /neutral/);
+  assert.match(text(h.get("metric-legend")), /relative totals; no callable risk bands/);
+  const count = h.requests.length; h.change("metric-relative", true); h.controller.renderLegend([item]);
+  assert.match(item.swatch.className, /heat-0/); assert.equal(h.requests.length, count);
+});
+
+
+test("layer exclusions warnings remain visible with measured heat and with no indexed files", async () => {
+  const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
+  for (const rows of [[row("measured.js", 7)], []]) {
+    const h = harness(); await publish(h, rows, {layerExclusionsWarning:warning});
+    assert.ok(h.get("metrics-state").textContent.endsWith(warning));
+    assert.match(text(h.get("metrics-state")), /Indexed snapshot · max · production callables/);
+    assert.equal(h.get("metrics-state").children.length, 0, "warning is plain state text");
+    if (rows.length) {
+      const decoration = h.controller.decorate(h.node("button"), {scope:"file",path:"measured.js"});
+      h.controller.renderLegend([decoration]);
+      assert.match(text(decoration.node), /7/); assert.match(decoration.swatch.className, /heat-1/);
+    }
+    await publish(h, rows);
+    assert.ok(!h.get("metrics-state").textContent.includes(warning), "a normal payload clears the warning");
+  }
+});
+
+test("explorer legend names the numbers' metric and shows the shared fixed bands; it is empty without decorated rows (#425)", async () => {
+  const h = harness(); await publish(h, [row("two.js", 2), row("twenty.js", 20)]);
+  const rows = ["two.js", "twenty.js"].map(path => h.controller.decorate(h.node("button"), {scope:"file", path}));
+  h.controller.renderLegend(rows);
+  const legend = h.get("explorer-metric-legend");
+  assert.match(text(legend), /Numbers: Cognitive · max · production callables · Fixed per-callable bands/);
+  const entries = legend.children.filter(node => node.className === "metric-legend-entry");
+  assert.deepEqual(entries.map(entry => [entry.children[0].className, entry.children[1].textContent]),
+    [["metric-swatch heat-0", "≤5"], ["metric-swatch heat-1", ">5–15"], ["metric-swatch heat-2", ">15–30"], ["metric-swatch heat-3", ">30"]]);
+  assert.match(rows[1].swatch.className, /heat-2/, "row swatch uses the same fixed bands as the legend");
+  h.change("metric-color", "maintainabilityIndex");
+  h.controller.renderLegend(["two.js"].map(path => h.controller.decorate(h.node("button"), {scope:"file", path})));
+  assert.match(text(h.get("explorer-metric-legend")), /Numbers: Maintainability · max .*higher is better/);
+  h.controller.renderLegend([]);
+  assert.equal(h.get("explorer-metric-legend").children.length, 0, "no numbered rows (Files section): no legend");
+  h.change("metric-color", "none"); h.controller.renderLegend([]);
+  assert.equal(h.get("explorer-metric-legend").children.length, 0);
 });

@@ -111,6 +111,7 @@ fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {
         cancel: Arc::new(AtomicBool::new(false)),
         stopped: false,
         worker_running: false,
+        worker: None,
         state: "loading",
         catalog: None,
         warnings: vec![],
@@ -200,4 +201,304 @@ fn stale_generation_cancel_and_revision_never_publish() {
     let generation = state.dependencies.lock().unwrap().generation;
     state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
     assert!(state.catalog_snapshot(pin1).is_none());
+}
+
+fn indexed_catalog_fixture() -> (
+    tempfile::TempDir,
+    Arc<DaemonState>,
+    IndexPin,
+    Arc<crate::store::topology::WriterSession>,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("vendor/local-library/src")).unwrap();
+    for (path, text) in [
+        (
+            "Cargo.toml",
+            "[package]\nname='catalog-app'\nversion='0.1.0'\n[dependencies]\nlocal-library={path='vendor/local-library'}\n",
+        ),
+        (
+            "Cargo.lock",
+            "version=4\n[[package]]\nname='catalog-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\n",
+        ),
+        (
+            "vendor/local-library/Cargo.toml",
+            "[package]\nname='local-library'\nversion='0.1.0'\n",
+        ),
+        (
+            "vendor/local-library/src/lib.rs",
+            "pub fn candidate_only() {}\n",
+        ),
+    ] {
+        std::fs::write(workspace.join(path), text).unwrap();
+    }
+    let cargo_home = temp.path().join("cargo-home");
+    std::fs::create_dir(&cargo_home).unwrap();
+    let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let (pin, session) = crate::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let state = new_with_dependency_options(
+        store,
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+        workspace,
+        vec![],
+        Some(CatalogOptions {
+            cargo_home: Some(cargo_home),
+            rust_library: None,
+        }),
+    )
+    .unwrap();
+    assert_eq!(state.store.status().unwrap().revision, pin);
+    (temp, state, pin, session)
+}
+
+async fn assert_catalog_generation_finished(state: &DaemonState, generation: u64, pin: IndexPin) {
+    tokio::time::timeout(
+        crate::testing::HANG_BACKSTOP,
+        state.dependency_idle.notified(),
+    )
+    .await
+    .expect("dependency driver did not publish completion");
+    let index = state.dependencies.lock().unwrap();
+    assert_eq!(index.generation, generation);
+    assert_eq!(index.state, "ready");
+    let catalog = index.catalog.as_ref().unwrap();
+    assert_eq!(catalog.workspace_revision, pin);
+    assert_eq!(catalog.packages.len(), 1);
+    assert_eq!(catalog.packages[0].name, "local-library");
+    assert_eq!(catalog.packages[0].source_state, "present");
+    assert_eq!(catalog.packages[0].index_state, "complete");
+    assert_eq!(catalog.symbols.len(), 1);
+    assert_eq!(catalog.symbols[0].name, "candidate_only");
+}
+
+#[tokio::test]
+async fn enabled_config_replacement_admits_catalog_without_fifo_or_refresh() {
+    let (_temp, state, pin, session) = indexed_catalog_fixture();
+    state.retain_serving_session_without_tick_for_tests(session);
+    // Establish a completed driver, not merely an observed ready publication.
+    state.start_dependency_index();
+    let previous_generation = state.dependencies.lock().unwrap().generation;
+    assert_catalog_generation_finished(&state, previous_generation, pin).await;
+    assert!(state.store.earliest_unfinished_request().unwrap().is_none());
+    let old_config = state.config();
+    let replacement = BrowserConfig::build(
+        old_config.options.clone(),
+        false,
+        &old_config.options.workspace_root,
+        vec![],
+        old_config.dependency_options.clone(),
+    )
+    .unwrap();
+    state.apply_config(replacement);
+    let generation = {
+        let index = state.dependencies.lock().unwrap();
+        assert!(
+            index.worker.is_some(),
+            "enabled configuration publication must admit a catalog driver without FIFO work"
+        );
+        assert!(index.generation > previous_generation);
+        index.generation
+    };
+    assert_catalog_generation_finished(&state, generation, pin).await;
+    assert_eq!(state.store.status().unwrap().revision, pin);
+    assert!(state.store.earliest_unfinished_request().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn initial_enabled_startup_admits_catalog_after_reconciliation_without_fifo() {
+    let (_temp, state, _indexed_pin, session) = indexed_catalog_fixture();
+    drop(session);
+    // Drive the production startup transition and worker step by hand, so the
+    // assertion runs after H without racing a background checkout worker.
+    state.worker_started.store(true, Ordering::Release);
+    state.begin_startup_reconciliation();
+    state.worker_step().unwrap();
+    assert_eq!(state.runtime_phase(), RuntimePhase::Ready);
+    assert!(state.store.earliest_unfinished_request().unwrap().is_none());
+    let pin = state.store.status().unwrap().revision;
+    let generation = {
+        let index = state.dependencies.lock().unwrap();
+        assert!(
+            index.worker.is_some(),
+            "enabled startup must admit a catalog driver after reconciliation without FIFO work"
+        );
+        index.generation
+    };
+    assert_catalog_generation_finished(&state, generation, pin).await;
+    state.release_checkout_runtime_for_fixture();
+}
+
+#[tokio::test]
+async fn disabled_config_cancels_the_prior_generation_without_admitting_a_driver() {
+    let (_temp, state, pin, session) = indexed_catalog_fixture();
+    state.retain_serving_session_without_tick_for_tests(session);
+    state.start_dependency_index();
+    let generation = state.dependencies.lock().unwrap().generation;
+    assert_catalog_generation_finished(&state, generation, pin).await;
+    let prior_cancel = state.dependencies.lock().unwrap().cancel.clone();
+    let old_config = state.config();
+    let disabled = BrowserConfig::build(
+        old_config.options.clone(),
+        false,
+        &old_config.options.workspace_root,
+        vec![],
+        None,
+    )
+    .unwrap();
+    state.apply_config(disabled);
+    assert!(prior_cancel.load(Ordering::Acquire));
+    state.publish_dependency_index(generation, &prior_cancel, Ok(catalog("late", pin)));
+    let index = state.dependencies.lock().unwrap();
+    assert_eq!(index.generation, generation + 1);
+    assert_eq!(index.state, "disabled");
+    assert!(!index.worker_running);
+    assert!(index.catalog.is_none());
+}
+
+#[tokio::test]
+async fn disabling_an_active_catalog_build_keeps_the_successor_disabled() {
+    let (_temp, state, _pin, session) = indexed_catalog_fixture();
+    state.retain_serving_session_without_tick_for_tests(session);
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    *state.dependency_build_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = entered.send(());
+        let _ = wait_release.recv();
+    }));
+    state.start_dependency_index();
+    let entered = tokio::time::timeout(crate::testing::HANG_BACKSTOP, wait_entered).await;
+    if !matches!(entered, Ok(Ok(()))) {
+        drop(release);
+        panic!("catalog build did not reach its configuration snapshot");
+    }
+    let prior_cancel = state.dependencies.lock().unwrap().cancel.clone();
+    let old_config = state.config();
+    let disabled = BrowserConfig::build(
+        old_config.options.clone(),
+        false,
+        &old_config.options.workspace_root,
+        vec![],
+        None,
+    )
+    .unwrap();
+    state.apply_config(disabled);
+    let disabled_generation = state.dependencies.lock().unwrap().generation;
+    // Release the blocking worker before assertions, including failure paths.
+    drop(release);
+    tokio::time::timeout(
+        crate::testing::HANG_BACKSTOP,
+        state.dependency_idle.notified(),
+    )
+    .await
+    .expect("cancelled catalog driver did not finish");
+    assert!(prior_cancel.load(Ordering::Acquire));
+    let index = state.dependencies.lock().unwrap();
+    assert_eq!(index.generation, disabled_generation);
+    assert_eq!(index.state, "disabled");
+    assert!(!index.worker_running);
+    assert!(index.catalog.is_none());
+}
+
+#[tokio::test]
+async fn retirement_cancels_and_joins_an_active_catalog_without_publication() {
+    let (_temp, state, pin, session) = indexed_catalog_fixture();
+    state.retain_serving_session_without_tick_for_tests(session);
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    *state.dependency_build_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = entered.send(());
+        let _ = wait_release.recv();
+    }));
+    state.start_dependency_index();
+    tokio::time::timeout(crate::testing::HANG_BACKSTOP, wait_entered)
+        .await
+        .expect("catalog build did not start")
+        .unwrap();
+    let (generation, cancel) = {
+        let index = state.dependencies.lock().unwrap();
+        (index.generation, index.cancel.clone())
+    };
+    let (stopping, mut wait_stopping) = tokio::sync::oneshot::channel();
+    *state.dependency_stop_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = stopping.send(());
+    }));
+    assert!(matches!(
+        state.request_retire(|_| true),
+        RetireOutcome::Requested
+    ));
+    let retiring = state.clone();
+    let (finished, mut wait_finished) = tokio::sync::oneshot::channel();
+    let retirement = std::thread::spawn(move || {
+        let result = retiring.run_retirement();
+        let _ = finished.send(result);
+    });
+    let stopped_before_completion = tokio::time::timeout(crate::testing::HANG_BACKSTOP, async {
+        tokio::select! {
+            stopped = &mut wait_stopping => {
+                stopped.unwrap();
+                true
+            }
+            result = &mut wait_finished => {
+                result.unwrap().unwrap();
+                false
+            }
+        }
+    })
+    .await
+    .expect("retirement made no progress");
+    // Always release the blocking hook, including the pre-fix failure path.
+    let cancelled_while_active = cancel.load(Ordering::Acquire);
+    let completion_while_active = wait_finished.try_recv();
+    drop(release);
+    if stopped_before_completion {
+        tokio::time::timeout(crate::testing::HANG_BACKSTOP, wait_finished)
+            .await
+            .expect("retirement did not join the catalog build")
+            .unwrap()
+            .unwrap();
+    } else {
+        tokio::time::timeout(
+            crate::testing::HANG_BACKSTOP,
+            state.dependency_idle.notified(),
+        )
+        .await
+        .expect("catalog driver did not finish after releasing the hook");
+    }
+    retirement.join().unwrap();
+    assert!(
+        stopped_before_completion,
+        "retirement completed without cancelling the active catalog"
+    );
+    assert!(
+        cancelled_while_active,
+        "active build did not observe cancellation"
+    );
+    assert!(
+        matches!(
+            completion_while_active,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "retirement completed while the catalog build was still held"
+    );
+    assert_eq!(state.runtime_phase(), RuntimePhase::Retired);
+    {
+        let index = state.dependencies.lock().unwrap();
+        assert!(index.stopped);
+        assert!(!index.worker_running);
+        assert!(index.catalog.is_none());
+    }
+    state.start_dependency_index();
+    assert!(!state.dependencies.lock().unwrap().worker_running);
+    state.publish_dependency_index(generation, &cancel, Ok(catalog("late", pin)));
+    assert!(state.catalog_snapshot(pin).is_none());
 }

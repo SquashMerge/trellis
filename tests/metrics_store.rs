@@ -1155,3 +1155,335 @@ fn invalid_stored_role_is_corruption_even_when_role_selection_would_exclude_the_
     // corruption and scheduled recovery above.
     response.finish(()).unwrap();
 }
+
+#[test]
+fn workbench_population_filters_all_folds_without_changing_file_identity_or_roles() {
+    let (_state, root, store, pin) = fixture_with_sources(&[
+        (
+            "src/eligible/a.js",
+            "function low() { return 1; }\nfunction medium(x) { if (x) return 2; return 3; }\n",
+        ),
+        (
+            "src/eligible/b.rs",
+            "fn production() {}\n#[cfg(test)] mod tests { fn check() {} }\n",
+        ),
+        (
+            "src/quiet.js",
+            "function quiet(x) { if (x) { if (x > 1) return 3; } return 0; }\n",
+        ),
+        (
+            "tests/fixtures/input.js",
+            "function fixture(x) { if (x) return 1; return 0; }\n",
+        ),
+        (
+            "tools/synthetic-cohorts/templates/input.js",
+            "function template(x) { if (x) return 1; return 0; }\n",
+        ),
+        (
+            "custom/input.js",
+            "function hidden(x) { if (x) return 1; return 0; }\n",
+        ),
+        (
+            "web/vendor/bundle.js",
+            "function vendor(x) { if (x) { if (x > 1) { if (x > 2) return 3; } } return 0; }\n",
+        ),
+    ]);
+    fs::create_dir(root.path().join(".trellis")).unwrap();
+    fs::write(root.path().join(".trellis/rules.toml"), "version=1\n[layers.inputs]\norder=1\npaths=['custom/**','src/**']\ndisplay='hidden'\n[layers.authored]\norder=2\npaths=['src/eligible/**']\ndisplay='expanded'\n").unwrap();
+    let response = store.evidence_response().unwrap();
+    let ordinary = response
+        .metrics_at(&MetricsOptions::default(), &mut || Ok(()))
+        .unwrap();
+    assert!(!ordinary.workbench);
+    assert!(
+        ordinary
+            .files
+            .iter()
+            .all(|file| file.excluded_reason.is_none())
+    );
+    let source_set_id = ordinary.files[0].source_set_id.clone();
+    let vendor = response
+        .metrics_at(
+            &MetricsOptions {
+                scope: "file".into(),
+                source_set_id: Some(source_set_id.clone()),
+                language: Some("javascript".into()),
+                path: Some("web/vendor/bundle.js".into()),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let vendor_sid = vendor.declarations[0].sid.clone();
+    assert!(
+        response
+            .metrics_at(
+                &MetricsOptions {
+                    scope: "declaration".into(),
+                    source_set_id: Some(source_set_id.clone()),
+                    path: Some("web/vendor/bundle.js".into()),
+                    sid: Some(vendor_sid),
+                    workbench: true,
+                    ..Default::default()
+                },
+                &mut || Ok(())
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not_found")
+    );
+    let files_before = response.files_at(Some(pin), 0, 100).unwrap();
+    for aggregate in ["sum", "max", "mean"] {
+        let selected = MetricsOptions {
+            pin: Some(pin),
+            role: "production".into(),
+            workbench: true,
+            aggregate: aggregate.into(),
+            top_cognitive: Some(10),
+            ..Default::default()
+        };
+        let data = response.metrics_at(&selected, &mut || Ok(())).unwrap();
+        let eligible = response
+            .metrics_at(
+                &MetricsOptions {
+                    workbench: false,
+                    scope: "directory".into(),
+                    source_set_id: Some(source_set_id.clone()),
+                    path: Some("src/eligible".into()),
+                    ..selected.clone()
+                },
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert!(data.workbench);
+        assert_eq!(data.files.len(), ordinary.files.len());
+        assert_eq!(data.directories[0].declaration_count, 3);
+        assert_eq!(
+            data.directories[0].metrics, eligible.directories[0].metrics,
+            "{aggregate}: every numeric leaf folds only eligible raw callables"
+        );
+        assert_eq!(bytes(&data.top_cognitive), bytes(&eligible.top_cognitive));
+        for file in &data.files {
+            let before = ordinary
+                .files
+                .iter()
+                .find(|row| row.path == file.path)
+                .unwrap();
+            assert_eq!(file.physical_lines, before.physical_lines);
+            assert_eq!(file.file_role, before.file_role);
+            assert_eq!(bytes(&file.role_counts), bytes(&before.role_counts));
+            let reason = match file.path.as_str() {
+                "web/vendor/bundle.js" => Some("vendored"),
+                "tests/fixtures/input.js" | "tools/synthetic-cohorts/templates/input.js" => {
+                    Some("fixture")
+                }
+                "custom/input.js" | "src/quiet.js" => Some("hidden_layer"),
+                _ => None,
+            };
+            assert_eq!(file.excluded_reason, reason);
+            if reason.is_some() {
+                assert_eq!(file.declaration_count, 0);
+                assert!(file.metrics["cognitive"].is_null());
+                let scoped = response
+                    .metrics_at(
+                        &MetricsOptions {
+                            scope: "file".into(),
+                            source_set_id: Some(source_set_id.clone()),
+                            language: Some(file.language.clone()),
+                            path: Some(file.path.clone()),
+                            ..selected.clone()
+                        },
+                        &mut || Ok(()),
+                    )
+                    .unwrap();
+                assert!(scoped.declarations.is_empty());
+                assert!(scoped.top_cognitive.unwrap().is_empty());
+                let directory = file.path.rsplit_once('/').unwrap().0;
+                let scoped = response
+                    .metrics_at(
+                        &MetricsOptions {
+                            scope: "directory".into(),
+                            source_set_id: Some(source_set_id.clone()),
+                            path: Some(directory.into()),
+                            ..selected.clone()
+                        },
+                        &mut || Ok(()),
+                    )
+                    .unwrap();
+                let expected = data
+                    .directories
+                    .iter()
+                    .find(|row| row.path == directory)
+                    .unwrap();
+                assert_eq!(
+                    scoped.directories[0].declaration_count,
+                    expected.declaration_count
+                );
+                assert_eq!(scoped.directories[0].metrics, expected.metrics);
+            } else {
+                let expected = eligible
+                    .files
+                    .iter()
+                    .find(|row| row.path == file.path)
+                    .unwrap();
+                assert_eq!(file.metrics, expected.metrics);
+            }
+        }
+        let all = response
+            .metrics_at(
+                &MetricsOptions {
+                    role: "all".into(),
+                    ..selected.clone()
+                },
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            all.directories[0].declaration_count,
+            ordinary.directories[0].declaration_count - 1
+        );
+        for file in &all.files {
+            if file.path == "web/vendor/bundle.js" {
+                assert_eq!(file.excluded_reason, Some("vendored"));
+                assert_eq!(file.declaration_count, 0);
+            } else {
+                assert!(file.excluded_reason.is_none());
+                let before = ordinary
+                    .files
+                    .iter()
+                    .find(|row| row.path == file.path)
+                    .unwrap();
+                assert_eq!(file.declaration_count, before.declaration_count);
+            }
+        }
+        assert!(
+            !all.top_cognitive
+                .unwrap()
+                .iter()
+                .any(|row| row.path.starts_with("web/vendor/"))
+        );
+    }
+    assert_eq!(response.files_at(Some(pin), 0, 100).unwrap(), files_before);
+    assert!(
+        files_before["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == "web/vendor/bundle.js")
+    );
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn workbench_missing_rules_keeps_explicit_path_exclusions_only() {
+    let (_state, _root, store, _pin) = fixture_with_sources(&[
+        ("custom/hidden.js", "function custom() {}\n"),
+        (
+            "tools/synthetic-cohorts/templates/input.js",
+            "function fixture() {}\n",
+        ),
+        ("web/vendor/bundle.js", "function vendor() {}\n"),
+    ]);
+    let response = store.evidence_response().unwrap();
+    let data = response
+        .metrics_at(
+            &MetricsOptions {
+                workbench: true,
+                role: "production".into(),
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(data.directories[0].declaration_count, 1);
+    assert_eq!(data.files[0].declaration_count, 1);
+    assert_eq!(data.files[0].excluded_reason, None);
+    assert_eq!(data.files[1].excluded_reason, Some("fixture"));
+    assert_eq!(data.files[2].excluded_reason, Some("vendored"));
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn workbench_rules_faults_warn_without_losing_heat_or_explicit_exclusions() {
+    let (_state, root, store, pin) = fixture_with_sources(&[
+        ("src/input.js", "function input() {}\n"),
+        (
+            "tools/synthetic-cohorts/templates/input.js",
+            "function fixture() {}\n",
+        ),
+        ("web/vendor/bundle.js", "function vendor() {}\n"),
+    ]);
+    fs::create_dir(root.path().join(".trellis")).unwrap();
+    for text in [
+        "not valid toml",
+        "version=1\n[layers.a]\norder=1\npaths=['src/**']\ndisplay='hidden'\n[layers.b]\norder=2\npaths=['src/**']\n",
+    ] {
+        fs::write(root.path().join(".trellis/rules.toml"), text).unwrap();
+        let response = store.evidence_response().unwrap();
+        let options = MetricsOptions {
+            pin: Some(pin),
+            role: "production".into(),
+            ..Default::default()
+        };
+        let ordinary = response.metrics_at(&options, &mut || Ok(())).unwrap();
+        assert!(ordinary.layer_exclusions_warning.is_none());
+        assert!(
+            ordinary
+                .files
+                .iter()
+                .all(|file| file.declaration_count == 1)
+        );
+        let data = response
+            .metrics_at(
+                &MetricsOptions {
+                    workbench: true,
+                    ..options
+                },
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert!(data.layer_exclusions_warning.is_some());
+        let production = data
+            .files
+            .iter()
+            .find(|file| file.path == "src/input.js")
+            .unwrap();
+        assert_eq!(production.declaration_count, 1);
+        assert_eq!(production.metrics["cyclomatic"], 1);
+        for file in data.files.iter().filter(|file| file.path != "src/input.js") {
+            assert_eq!(file.declaration_count, 0);
+            assert!(file.excluded_reason.is_some());
+        }
+        response.finish(()).unwrap();
+    }
+}
+
+#[test]
+fn workbench_exclusion_does_not_skip_corrupt_vendor_validation() {
+    let (state, _root, store, pin) =
+        fixture_with_sources(&[("web/vendor/bundle.js", "function vendor() {}\n")]);
+    let db = rusqlite::Connection::open(index_path(state.path())).unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    db.execute("UPDATE native_version_declarations SET role='unknown'", [])
+        .unwrap();
+    drop(db);
+    let response = store.evidence_response().unwrap();
+    let error = response
+        .metrics_at(
+            &MetricsOptions {
+                pin: Some(pin),
+                role: "production".into(),
+                workbench: true,
+                ..Default::default()
+            },
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid declaration role"),
+        "{error:#}"
+    );
+    assert!(store.recovery_pending_for_tests());
+    response.finish(()).unwrap();
+}

@@ -1,6 +1,6 @@
 # MCP read-only pilot: first-release wire contract
 
-**Status: normative read-only MCP wire contract.** [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) records the owner’s #211 direction: a tenth tool, `trellis_search_symbols`, and `toolVersion:2`. The owner approved activation with local voyage-4-nano and fixed weighted-RRF constants (20, 200, 1, 4), without an extra lexical restriction (2026-10-26 item-8 ruling). [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) adds the sixth syntax-tier incoming tool; [#129 architecture rules](rules.md) adds three read-only tools and one no-argument proposal prompt. The original six tool schemas and meanings remain unchanged. [Decision 0007](semantic-evidence/decisions/0007-user-daemon-and-workspace-selection.md) makes `trellis mcp` a thin stdio client of the per-user daemon, with explicit same-repository worktree selection; #107 amends the schemas below. [Decision 0008](semantic-evidence/decisions/0008-daemon-sole-writer.md) makes that daemon the only index and queue writer; [Decision 0009](semantic-evidence/decisions/0009-checkout-worker.md) assigns each active checkout one worker, pipelines relay calls, starts deadlines at protocol acceptance and sets the capacity and pre-resolution failure shape below. This is the agent-facing projection of [#22 semantic evidence](semantic-evidence/contract-v1.md) and [#23 local topology](local-topology.md). #22 owns evidence meaning, identity, validity, coverage and provenance; #23 owns coherent snapshot eligibility. This document owns only the wire projection. The configured client launches `trellis mcp` for one workspace selected by [#23 discovery](local-topology.md#workspace-discovery). The OS user, not an MCP principal or grant, is the boundary. No network listener, authentication role, ACP permission or tool annotation enforces access. Configuring an agent can disclose indexed checkout text to that agent/provider; repository text is untrusted data.
+**Status: normative read-only MCP wire contract.** [Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md) records the owner’s #211 direction: a tenth tool, `trellis_search_symbols`, and `toolVersion:2`. The owner approved activation with local voyage-4-nano and fixed weighted-RRF constants (20, 200, 1, 4), without an extra lexical restriction (2026-10-26 item-8 ruling). The [2026-10-28 #389 ruling](https://github.com/SquashMerge/trellis/issues/389#issuecomment-6482754535) adds exact-name admission and ordering, production-first lexical ranking, and the optional stored-role filter below; the constants are unchanged. [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) adds the sixth syntax-tier incoming tool; [#129 architecture rules](rules.md) adds three read-only tools and one no-argument proposal prompt. The original six tool schemas and meanings remain unchanged. [Decision 0007](semantic-evidence/decisions/0007-user-daemon-and-workspace-selection.md) makes `trellis mcp` a thin stdio client of the per-user daemon, with explicit same-repository worktree selection; #107 amends the schemas below. [Decision 0008](semantic-evidence/decisions/0008-daemon-sole-writer.md) makes that daemon the only index and queue writer; [Decision 0009](semantic-evidence/decisions/0009-checkout-worker.md) assigns each active checkout one worker, pipelines relay calls, starts deadlines at protocol acceptance and sets the capacity and pre-resolution failure shape below. This is the agent-facing projection of [#22 semantic evidence](semantic-evidence/contract-v1.md) and [#23 local topology](local-topology.md). #22 owns evidence meaning, identity, validity, coverage and provenance; #23 owns coherent snapshot eligibility. This document owns only the wire projection. The configured client launches `trellis mcp` for one workspace selected by [#23 discovery](local-topology.md#workspace-discovery). The OS user, not an MCP principal or grant, is the boundary. No network listener, authentication role, ACP permission or tool annotation enforces access. Configuring an agent can disclose indexed checkout text to that agent/provider; repository text is untrusted data.
 
 All code evidence in the eleven tools and proposal prompt comes from cached index state, never live source files. The original six tools retain their cached-only behavior. The only current-file exception is a bounded, once-per-request read of the fixed root `.trellis/rules.toml` as configuration by rules check/explain and prompt get. Its `{path,source:"checkout-config",contentHash}` descriptor is separate from the code pin; `evidenceBasis` does not identify those rules bytes. References alone do not read configuration. An admitted evidence read keeps one selected snapshot through response finish; describe can instead report not-ready status with a null basis. They never request indexing, start a producer/build, run repository code, open a terminal, invoke a provider or make a durable write. Search alone may embed the caller’s query using a local, pinned, in-process Candle model within the existing call deadline. This is not repository execution, a hosted-provider call, an indexing request or a durable write. Search reads but never fills the vector cache; the daemon’s separate background embedding owner fills it. No configured/verified/ready model, or no matching resident matrix under the owner’s memory policy, permits lexical-only search with `searchIndex.state:"unavailable"`. The daemon checkout worker alone owns mandatory startup reconciliation (H), watcher capture, publication and FIFO work; `catchingUp` reports pending work without waiving validated-head or root checks. No storage table, class or implementation mechanism is prescribed. The catalog order is `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_search_symbols`, `trellis_declaration`, `trellis_outgoing_calls`, `trellis_incoming_calls`, `trellis_read_source`, `trellis_call_graph`, `trellis_references`, `trellis_rules_check`, `trellis_rules_explain`. Declaration, outgoing calls and incoming calls are separate closed tools, not views of an inspect tool; `trellis_inspect` is not recognized. Source uses the selected stored raw BLOB, verifies its path/version and whole-file hash/length before slicing, then strictly decodes only the requested LF-delimited range. Other selected readers, including public `source_at`, trust the published native, graph and class rows without re-attesting them against source (owner ruling 2026-10-23, #261). Source reads are not a disk fallback.
 
@@ -70,7 +70,7 @@ Find, search, declaration, outgoing-call and incoming-call data objects contain 
 
 ### `trellis_workspace_describe` (W1)
 
-Input exactly `{schemaVersion:1,workspace?:string}`; no pins or indexing flags. Data exactly `{workspaceLabel:Text,indexState:"indexing"|"reconciling"|"ready"|"unavailable",progress:{completed:UInt,total:UInt|null}|null,watcherDegraded:boolean,languages:LanguageStatus[],toolVersion:2,schemaVersion:1,limits:Limits}`. Label is not an absolute path. `completed<=total` when total known; progress null if ready, unavailable or unmeasured. `LanguageStatus={language:Language,evidenceTier:"syntax",coverage:{selected:UInt,complete:UInt,partial:UInt,failed:UInt,unselected:UInt}}`; these count native coverage tuples, **not** universal language capabilities, and complete+partial+failed=selected. When ready return exactly four languages in #22 order (java, rust, python, javascript), even with zero counts. Otherwise `languages:[]`, null basis, no previous coverage advertised as current. Describe warnings=[], truncated=false, truncationReason=null; partial iff not ready or any selected partial/failed count is nonzero.
+Input exactly `{schemaVersion:1,workspace?:string}`; no pins or indexing flags. Data exactly `{workspaceLabel:Text,indexState:"indexing"|"reconciling"|"ready"|"unavailable",progress:{completed:UInt,total:UInt|null}|null,watcherDegraded:boolean,languages:LanguageStatus[],toolVersion:2,schemaVersion:1,limits:Limits,searchIndex:SearchAvailability}`. `SearchAvailability={backend:"cpu"|"metal"|null,unavailableReason:null|"model_not_configured"|"model_load_failed"}` is daemon-wide diagnostics, not query-pinned readiness or coverage. The same pair appears under `searchIndex` in CLI status. A missing model configuration reports `model_not_configured`; verification/loading failures report `model_load_failed` until a successful load clears the reason. No failure is inferred from an untried, loading or idle model. Standalone registries without a search service have null backend and reason because configuration is unknown. Label is not an absolute path. `completed<=total` when total known; progress null if ready, unavailable or unmeasured. `LanguageStatus={language:Language,evidenceTier:"syntax",coverage:{selected:UInt,complete:UInt,partial:UInt,failed:UInt,unselected:UInt}}`; these count native coverage tuples, **not** universal language capabilities, and complete+partial+failed=selected. When ready return exactly four languages in #22 order (java, rust, python, javascript), even with zero counts. Otherwise `languages:[]`, null basis, no previous coverage advertised as current. Describe warnings=[], truncated=false, truncationReason=null; partial iff not ready or any selected partial/failed count is nonzero.
 
 ### `trellis_find_symbols` (W2)
 
@@ -84,13 +84,19 @@ Input `{schemaVersion:1,workspace?:string,query:string,limit?:UInt,expectedBasis
 
 ### `trellis_search_symbols` (#211)
 
-Input exactly `{schemaVersion:1,workspace?:string,query:string,limit?:UInt,expectedBasis?:Basis}`.
+Input exactly `{schemaVersion:1,workspace?:string,query:string,role?:"any"|"production"|"test",limit?:UInt,expectedBasis?:Basis}`.
 `query` is 1–1024 UTF-8 bytes, with no trimming or normalization; limit defaults to 10 and
-accepts 1–50. No filters, score/debug flag, backend selector, cursor, indexing flag or `view`
-are accepted. Backend configuration is not a new tool input.
+accepts 1–50. `role` defaults to `"any"`, retaining both stored declaration roles and the ranking
+below. `"production"` or `"test"` searches only declarations with that stored measured role,
+without path guessing. Apply it to both arms **before ranking and each depth cutoff**, not to
+the output prefix, so a filtered search can return up to `limit` hits of that role. An invalid
+role value, including explicit null, is typed `invalid_request`. No other filter, score/debug
+flag, backend selector, cursor, indexing flag or `view` is accepted. Backend configuration is
+not a new tool input.
 
-Data exactly `{hits:SearchHit[],documents:DocumentRef[],coverage:Coverage[],
+Data exactly `{role:"any"|"production"|"test",hits:SearchHit[],documents:DocumentRef[],coverage:Coverage[],
 scopeCoverage:LanguageStatus[],provenance:Provenance[],searchIndex:SearchIndexStatus}`.
+`data.role` always echoes the effective role, including the default `"any"` on omission.
 `SearchHit` is exactly `Symbol` plus `{rank:UInt,matchedBy:("lexical"|"vector")[]}`.
 Rank is 1-based and contiguous in the emitted ordered list. `matchedBy` is nonempty, unique,
 and ordered `lexical` before `vector`; it records which bounded ranking arms returned the hit.
@@ -100,22 +106,25 @@ it never enters card hashes, lookup, ranking, ordering or joins.
 `SearchIndexStatus` is exactly:
 `{state:"complete"|"building"|"partial"|"unavailable",modelId:Hash|null,
 modelName:Text|null,backend:"cpu"|"metal"|null,declarations:UInt,embedded:UInt,
-lexical:"complete"|"unavailable",unavailableReason:null|"vector_budget_exceeded"}`.
+lexical:"complete"|"unavailable",unavailableReason:null|"model_not_configured"|"model_load_failed"|"vector_budget_exceeded"}`.
 `declarations` counts eligible candidate declarations at the admitted head; `embedded` counts
 those with a current decoded vector for the active model and satisfies
-`embedded<=declarations`. No configured/verified/ready model, or no matching admitted
+`embedded<=declarations`. These are admitted-head counts, independent of the role filter;
+`scopeCoverage` also remains unfiltered. No configured/verified/ready model, or no matching admitted
 resident matrix (including first search, eviction, head-change races or an oversized head),
 gives `unavailable`, null `modelId`, null `modelName`, and `embedded:0`. The zero is an
-unavailable sentinel, not a measured vector count; `unavailableReason` remains null for
-these cases. Backend selection is independent: report the
+unavailable sentinel, not a measured vector count. `unavailableReason` is
+`model_not_configured` when no model path is configured, or `model_load_failed` after a
+verification/loading failure, cleared by a successful load. Loading, idle residency or a
+missing matrix alone leave the reason null. Backend selection is independent: report the
 backend actually selected whenever known, including while loading/building or when the model
 is unavailable; `backend:null` means only that no backend has been selected. With a ready
 model and an admitted matching resident matrix, `complete` means
 all candidates have vectors, `building` means vectors are missing and a background job is
 running, and `partial` means vectors are missing and no job is running. Missing or evicted
 vectors do not change native coverage or evidence completeness. A candidate without a vector
-can still be returned by the lexical arm. `unavailableReason` is null except when this call
-exhausts its optional vector budget. Then the complete vector arm is discarded, state is
+can still be returned by the lexical arm. If this call exhausts its optional vector budget,
+that query-specific reason takes precedence over model diagnostics. Then the complete vector arm is discarded, state is
 `unavailable`, model identity is null and `embedded:0` is an unavailable sentinel, not an
 observed cache count. `declarations` remains the exact eligible head count and backend remains
 the selected backend. The reason is `vector_budget_exceeded`, all returned hits are lexical,
@@ -124,7 +133,8 @@ partial-result meaning.
 
 Successful search has `lexical:"complete"`. A required head search table that cannot be read
 is a store failure, not a lexical-unavailable success. A query that produces no lexical terms
-has an empty lexical arm, not an unavailable table.
+skips FTS MATCH but still admits eligible exact names; its lexical arm is empty only when no
+such names exist. Term-free queries retain mandatory head/corpus checks and typed store failures.
 
 Search uses only the validated head admitted under W8. `expectedBasis` is optional. A complete
 pin unequal to that admitted head returns `revision_conflict`; retained older revisions are
@@ -140,10 +150,25 @@ Selected partial/failed extraction anywhere in that scope sets `partial:true` an
 `coverageIncomplete/null` before `syntaxOnly/null`, including on zero hits. Missing mandatory
 proof, corrupt digests or mixed revisions fails `store_unavailable`, without partial evidence.
 
-Use the fixed weighted reciprocal rank fusion and deterministic tie-break specified in
-[Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#lexical-query-and-ranking):
-(k, D, wL, wV) = (20, 200, 1, 4), with no extra lexical-arm restriction. These are the
-owner-reviewed #214 evaluation choices, not runtime tuning. Under the
+Use the ranking rules in
+[Decision 0018](semantic-evidence/decisions/0018-semantic-symbol-retrieval.md#lexical-query-and-ranking).
+Exact is stored measured `Declaration.name` equal to the complete raw query byte-for-byte:
+no trimming, case folding, normalization, displayKey parsing or FTS stemming. Before lexical
+depth D, add eligible exact names to ordinary FTS matches, including term-free names and
+names otherwise below D, and deduplicate by (document version, symbolId). This is additive,
+not an exact-only gate. Lexical order is exact first, production before test, then scored
+candidates by BM25 ascending before unscored exact-only candidates within each exact/role
+tier, then symbolId bytes. There is no kind tier. This also governs lexical-only search:
+a weak production match can precede a stronger test match in the same exact/nonexact tier.
+
+The fixed weighted reciprocal rank fusion constants remain (k, D, wL, wV) = (20, 200, 1, 4).
+After ordinary RRF, exact names precede all nonexact candidates; within exact names,
+production precedes test, then the existing RRF score/rank/symbolId tie rules apply.
+Nonexact hybrid hits keep the existing RRF order, without a final production tier.
+At most D candidates per arm survive; `matchedBy` is membership after each cutoff, and
+additionally admitted exact names are lexical members. There is no new score field or
+change to tokenizer, card/model identity, storage schema, publication or trigram lookup.
+These are owner-reviewed choices, not runtime tuning. Under the
 [resident-matrix amendment](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819),
 the vector arm and search-index counts use one immutable published int8 matrix snapshot for
 the admitted index pin and active model, together with the same mandatory index snapshot.

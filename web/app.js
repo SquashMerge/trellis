@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, selectedGit = null, gitSerial = 0, checkoutBusy = false, checkouts = [], sourceSerial = 0;
 const pendingRequests = new Set();
-let status = null;
+let status = null, statusUnavailable = false, indexNotReady = false, staleMessage = "";
 let statusSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null, waitingForJob = false;
@@ -41,6 +41,7 @@ function showHeadObservation(observation) {
     ? `Viewing revision ${IndexPin.label(pin)} · Older than head ${IndexPin.label(head)}`
     : rebuilt ? `Viewing revision ${IndexPin.label(pin)} · Index rebuilt. Reload at head.`
       : failed ? `Viewing revision ${IndexPin.label(pin)} · Head comparison unavailable.` : "";
+  renderIndexStatus();
 }
 function observePinnedHead() {
   if (!token || !selectedRootKey || !status?.revision || !status.workspaceRoot) return;
@@ -93,6 +94,190 @@ let section = "diagrams", sectionSerial = 0, filesSerial = 0, filesDiffSerial = 
 let filesFile = null, filesSymbol = null, filesBasis = "indexed", filesMini = null, filesMatches = null;
 let filesGitStatus = null, filesDiff = null, filesCatalogLoaded = false;
 let diagramSequence = null;
+
+// History owns only opaque keys. Validated source/diagram evidence stays in this session.
+const navigationEntries = new Map();
+const navigationScope = String(Math.random()).slice(2);
+let navigationKey = 0, navigationSerial = 0, navigationLocation = null;
+let sourceInspector = null;
+let routeViewChange = false;
+function showNavigationView(name) {
+  routeViewChange = true;
+  try { window.TrellisShell?.showView(name); } finally { routeViewChange = false; }
+}
+function clearNavigationHistory() {
+  navigationSerial++; navigationEntries.clear(); navigationLocation = null; sourceInspector = null;
+}
+function navigationContext() {
+  const session = epoch, root = selectedRootKey, revision = status?.revision && IndexPin.copy(status.revision);
+  return {session, root, revision};
+}
+function navigationCurrent(context) {
+  return !!token && context.session === epoch && context.root === selectedRootKey && IndexPin.equal(context.revision, status?.revision);
+}
+function navigationError(message) {
+  $("sequence-state").textContent = message;
+  $("error").textContent = message; $("error").hidden = false;
+}
+function rememberNavigation(entry, replace, hash) {
+  if (!window.history?.pushState || !window.history?.replaceState) return;
+  const key = `${navigationScope}:${++navigationKey}`;
+  navigationEntries.set(key, {...entry, hash, ...navigationContext()});
+  window.history[replace ? "replaceState" : "pushState"]({trellisNavigation:key}, "", hash);
+  navigationLocation = navigationSignature();
+}
+function navigationSignature() {
+  return `${window.location?.hash || ""}:${window.history?.state?.trellisNavigation || ""}`;
+}
+function captureSourceEntry() {
+  if (!workspaceSource || !IndexPin.equal(workspaceSource.data.revision, status?.revision) ||
+      $("source-dock")?.hidden || $("workspace-source-panel")?.hidden || (section === "files" && filesBasis !== "indexed")) return null;
+  const focus = document.activeElement;
+  const action = focus?.closest?.(".source-diagram-action");
+  const offsets = id => ({top:$(id)?.scrollTop || 0, left:$(id)?.scrollLeft || 0});
+  return {kind:"source", source:workspaceSource, sourceNavigation:workspaceSource.navigation?.snapshot?.(), section, method:selectedMethod, diagram:diagramSequence,
+    view:["sequence", "classes", "architecture", "treemap", "libraries"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence",
+    showAll:!!$("all-steps").checked, inspector:sourceInspector,
+    file:filesFile, symbol:filesSymbol, basis:filesBasis, mini:filesMini, matches:filesMatches,
+    line:Number($("source").dataset?.navigationLine) || workspaceSource.range?.startLine || 1,
+    focus:action ? {symbol:action.dataset.symbolId} : {id:focus?.id || "source"},
+    scroll:{source:offsets("source"), panel:offsets("workspace-source-panel"), dock:offsets("source-dock"),
+      x:window.scrollX || 0, y:window.scrollY || 0}};
+}
+function sequenceHash(id, revision) {
+  const query = new URLSearchParams({sid:id, rootKey:selectedRootKey, indexGeneration:revision.indexGeneration, indexRevision:String(revision.indexRevision)});
+  return `#sequence?${query}`;
+}
+async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null) {
+  IndexPin.copy(revision);
+  if (!IndexPin.equal(revision, status?.revision) || !token || !selectedRootKey) throw new Error("Source navigation is stale. Refresh the indexed view.");
+  const context = navigationContext(), ticket = ++navigationSerial;
+  const current = () => ticket === navigationSerial && navigationCurrent(context);
+  diagramSerial++;
+  const source = captureSourceEntry();
+  if (source) rememberNavigation(source, true, "#source");
+  else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id && IndexPin.equal(diagramSequence.revision, revision)) {
+    rememberNavigation({kind:"sequence", symbol:selectedMethod, admitted:diagramSequence, showAll:!!$("all-steps").checked}, true, sequenceHash(selectedMethod.id, revision));
+  } else if (!window.location?.hash) rememberNavigation({kind:"unavailable"}, true, "");
+  rememberNavigation({kind, symbol, admitted, showAll:false}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
+  window.TrellisClasses?.reset();
+  clearSource(); diagramSequence = null;
+  await setSection("diagrams");
+  if (!current()) return;
+  $("all-steps").checked = false;
+  if (kind === "class") return openClasses({seed:symbol.id});
+  return selectMethod(symbol, admitted, current);
+}
+async function restoreSourceEntry(entry, current) {
+  // Restore the existing owners before normal section/source rendering rebinds them.
+  filesSerial++; filesDiffSerial++; clearFilesInspector();
+  filesFile = entry.file; filesSymbol = entry.symbol; filesBasis = entry.basis;
+  filesMini = entry.mini; filesMatches = entry.matches; filesDiff = null;
+  selectedMethod = entry.method; diagramSequence = null; $("all-steps").checked = entry.showAll;
+  $("method-source").disabled = !selectedMethod;
+  if ($("method-class")) $("method-class").disabled = !selectedMethod || !classLanguage(selectedMethod.path);
+  workspaceSource = entry.source;
+  await setSection(entry.section);
+  if (!current()) return;
+  diagramSequence = entry.diagram;
+  if (entry.section === "diagrams" && entry.view === "sequence" && entry.diagram && entry.method) {
+    await loadSequence(entry.diagram, true, current);
+    if (!current()) return;
+  }
+  if (entry.section === "diagrams") showNavigationView(entry.view);
+  updateFilesBasis(); renderFiles();
+  if (entry.section === "files" && filesSymbol) {
+    renderFilesSymbolHeader(filesSymbol);
+    if (filesMatches) renderFilesMatches();
+    if (filesMini) await renderFilesMini(filesGuard({symbol:true}));
+    if (!current()) return;
+  }
+  const serial = ++sourceSerial;
+  const sourceCurrent = () => current() && sourceSerial === serial && !(section === "files" && filesBasis !== "indexed");
+  paintCachedSource(entry.source.data, entry.source.range, sourceCurrent, entry.line, entry.sourceNavigation);
+  sourceInspector = entry.inspector;
+  if (entry.inspector) {
+    const inspector = entry.inspector;
+    const readSource = () => {
+      if (navigationCurrent(entry) && sourceInspector === inspector && sourceSerial === serial)
+        return perform(() => showSource(inspector.symbol, entry.revision));
+    };
+    if (inspector.sequence) window.TrellisShell?.selectStep(inspector.symbol, inspector.sequence, readSource, sequenceTargetAction(inspector.sequence, () => navigationCurrent(entry) && sourceInspector === inspector));
+    else window.TrellisShell?.inspectSymbol?.(inspector.symbol, entry.revision, readSource);
+  }
+  if (!sourceCurrent()) return;
+  // Rendering and highlight reveal finish before exact focus/scroll restoration.
+  await new Promise(resolve => window.requestAnimationFrame ? window.requestAnimationFrame(resolve) : resolve());
+  if (!sourceCurrent()) return;
+  const actions = $("source").querySelectorAll?.(".source-diagram-action") || [];
+  const focus = entry.focus.symbol ? Array.from(actions).find(node => node.dataset.symbolId === entry.focus.symbol) : $(entry.focus.id);
+  (focus || $("source")).focus({preventScroll:true});
+  for (const [id, offset] of [["source", entry.scroll.source], ["workspace-source-panel", entry.scroll.panel], ["source-dock", entry.scroll.dock]]) {
+    if ($(id)) { $(id).scrollTop = offset.top; $(id).scrollLeft = offset.left; }
+  }
+  window.scrollTo?.(entry.scroll.x, entry.scroll.y);
+}
+async function readNavigationLocation(force = false) {
+  const signature = navigationSignature();
+  if (!force && signature === navigationLocation) return;
+  navigationLocation = signature;
+  const ticket = ++navigationSerial; diagramSerial++; sourceSerial++;
+  window.TrellisClasses?.reset();
+  // A URL never authenticates or chooses a checkout. Explicit selection retries it.
+  if (!token || !selectedRootKey || !status?.revision) return;
+  const context = navigationContext(), current = () => ticket === navigationSerial && navigationCurrent(context);
+  const candidate = navigationEntries.get(window.history?.state?.trellisNavigation);
+  const entry = candidate?.hash === (window.location?.hash || "") ? candidate : null;
+  try {
+    if (entry) {
+      if (!navigationCurrent(entry)) throw new Error("This history entry is stale. Select source from the current snapshot.");
+      if (entry.kind === "unavailable") return navigationError("This history entry has no saved source view. The current diagram remains open; use Forward to return to its link.");
+      $("error").hidden = true;
+      if (entry.kind === "source") return await restoreSourceEntry(entry, current);
+      clearSource(); diagramSequence = null;
+      await setSection("diagrams");
+      if (!current()) return;
+      if (entry.kind === "class") return await openClasses({seed:entry.symbol.id});
+      $("all-steps").checked = entry.showAll;
+      return await selectMethod(entry.symbol, entry.admitted, current);
+    }
+    const hash = window.location?.hash || "";
+    const oldKey = window.history?.state?.trellisNavigation;
+    if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) throw new Error("This history entry is stale. Open source from the current snapshot.");
+    if (!hash) return;
+    if (!hash.startsWith("#sequence")) {
+      if (hash === "#source" || hash === "#classes" || window.history?.state?.trellisNavigation) throw new Error("This source history is no longer available. Open source from the current snapshot.");
+      return;
+    }
+    if (!hash.startsWith("#sequence?")) throw new Error("Sequence link requires a symbol ID (sid).");
+    const query = new URLSearchParams(hash.slice("#sequence?".length)), id = query.get("sid");
+    if (!id || !id.trim() || query.getAll("sid").length !== 1) throw new Error("Sequence link requires one valid symbol ID (sid).");
+    if (query.has("rootKey") && query.get("rootKey") !== selectedRootKey) throw new Error("Sequence link belongs to a different checkout. Select its checkout first.");
+    const revision = context.revision;
+    if (query.has("indexGeneration") || query.has("indexRevision")) {
+      const value = query.get("indexRevision");
+      if (!/^(0|[1-9][0-9]*)$/.test(value || "")) throw new Error("Sequence link has an invalid index snapshot.");
+      const requested = IndexPin.copy({indexGeneration:query.get("indexGeneration"), indexRevision:Number(value)});
+      if (!IndexPin.equal(requested, revision)) throw new Error("Sequence link is stale for the selected index snapshot. Reload or select a current link.");
+    }
+    clearSource(); diagramSequence = null;
+    await setSection("diagrams");
+    if (!current()) return;
+    window.TrellisShell?.showView("sequence");
+    $("sequence-state").textContent = "Loading sequence link…";
+    const data = await api("/api/sequence", "POST", {seed:id, expectedRevision:revision, showAll:false}, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data?.revision, revision) || data?.seed?.id !== id) throw new Error("Sequence link provenance mismatch. Nothing displayed.");
+    $("all-steps").checked = false;
+    // A resolved route stores only a key in browser history; seed/DTO remain in memory.
+    rememberNavigation({kind:"sequence", symbol:data.seed, admitted:data, showAll:false}, true, hash);
+    await selectMethod(data.seed, data, current);
+  } catch (error) {
+    if (current() && error.name !== "AbortError") navigationError(`Cannot open sequence: ${error.message}`);
+  }
+}
+window.addEventListener?.("popstate", () => { void readNavigationLocation(); });
+window.addEventListener?.("hashchange", () => { void readNavigationLocation(); });
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -185,15 +370,18 @@ async function perform(action, control) {
 function form(id, action) {
   $(id).addEventListener("submit", event => { event.preventDefault(); perform(action, $(id).querySelector("button[type=submit]")); });
 }
-function stale(message) { $("stale").textContent = message; $("stale").hidden = false; }
+function stale(message) { staleMessage = message; $("stale").textContent = message; $("stale").hidden = false; renderIndexStatus(); }
 function clearSource() {
-  sourceSerial++; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
+  sourceSerial++; sourceInspector = null; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
   $("source-path").textContent = "Choose a call to read its cached source snapshot.";
   if (!$("source-dock")?.hidden) window.TrellisShell?.closeSource?.();
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
 function showSelectedGit(git) {
   selectedGit = git || null;
+  const row = checkouts.find(row => row.rootKey === selectedRootKey);
+  if (row) row.git = selectedGit;
+  updateCheckoutOptions();
   updateFilesBasis();
   window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
   if (!status) window.TrellisShell?.updateWorkspace(null);
@@ -215,11 +403,16 @@ async function refreshStatus(followup = false) {
   let data;
   try { data = await api("/api/status"); }
   catch (error) {
+    if (serial === statusSerial && session === epoch) {
+      statusUnavailable = error.code !== "index_not_ready";
+      indexNotReady = error.code === "index_not_ready";
+      renderIndexStatus();
+    }
     if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
       const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
       const listedRoot = selectedWorkspaceRoot, git = selectedGit;
       resetCheckout();
-      selectedRootKey = root; selectedWorkspaceRoot = listedRoot;
+      selectedRootKey = root; selectedWorkspaceRoot = listedRoot; indexNotReady = true;
       showSelectedGit(git);
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
@@ -238,9 +431,10 @@ async function refreshStatus(followup = false) {
   const workspaceChanged = status && status.workspaceRoot !== data.workspaceRoot;
   const nextPin = data.revision == null ? null : IndexPin.copy(data.revision);
   const browseChanged = !status || workspaceChanged || !IndexPin.equal(status.revision, nextPin);
-  if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); clearSource(); }
+  if (status && browseChanged) { clearNavigationHistory(); clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); clearSource(); }
   if (browseChanged) clearDependencyCatalog();
   resetHeadObservation();
+  statusUnavailable = false; indexNotReady = !nextPin;
   status = {...data, revision:nextPin};
   data = status;
   updateFilesBasis();
@@ -249,6 +443,7 @@ async function refreshStatus(followup = false) {
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
   renderCheckoutList();
+  updateCheckoutOptions();
   if (browseChanged && nextPin) {
     void viewerMetrics?.refresh();
     if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
@@ -260,9 +455,10 @@ async function refreshStatus(followup = false) {
   $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   if (job && !activeJob(job)) showJob();
-  $("stale").hidden = true;
+  staleMessage = ""; $("stale").hidden = true;
   if (!nextPin) stale("Index not ready. Retry status after this checkout finishes indexing.");
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
+  renderIndexStatus();
   // A rejected optional catalog must not recursively request status when status is unchanged.
   if (nextPin && (browseChanged || !pairRefreshPending)) void refreshDependencies();
   } finally {
@@ -279,7 +475,7 @@ async function refreshStatus(followup = false) {
   }
 }
 function unexpectedPair(message = "Index snapshot changed. Refresh status.", receivedPair) {
-  clearBrowse(message); clearSource(); sourceCache.clear(); clearDependencyCatalog();
+  clearNavigationHistory(); clearBrowse(message); clearSource(); sourceCache.clear(); clearDependencyCatalog();
   $("files-state").textContent = message;
   $("dependency-state").textContent = message;
   $("dependency-symbol-state").textContent = message;
@@ -331,16 +527,17 @@ const validRootKey = key => typeof key === "string" && /^[0-9a-f]{64}$/.test(key
 function checkoutOption(label, value) { const option = element("option", label); option.value = value; return option; }
 function resetCheckout() {
   // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
-  epoch++; gitSerial++; section = "diagrams"; sectionSerial++; filesGitStatus = null; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
+  epoch++; clearNavigationHistory(); gitSerial++; section = "diagrams"; sectionSerial++; filesGitStatus = null; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
-  status = null; job = null; waitingForJob = false;
+  status = null; statusUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;
   resetHeadObservation();
   ["status", "diagnostics", "job"].forEach(id => $(id).textContent = "");
   $("file-filter").value = "";
   $("stale").hidden = true; $("catching-up").hidden = true;
+  renderIndexStatus();
   $("checkout-root").textContent = "No checkout selected";
   $("workspace").hidden = true; $("index").disabled = true; $("cancel").hidden = true;
   window.TrellisShell?.setConnected(false);
@@ -383,24 +580,57 @@ function checkoutIndexLabel(row) {
     : catchingUp === false ? {text:`Fresh · rev ${label}`, state:"fresh", shape:"○"}
     : {text:`Indexed · idle · rev ${label}`, state:"unknown", shape:"◇"};
 }
-function showCheckoutIndexState(row) {
-  const state = checkoutIndexLabel(row);
+function selectedIndexStatus() {
+  const row = checkouts.find(row => row.rootKey === selectedRootKey);
+  const catchingUp = status?.revision && IndexPin.equal(row?.revision, status.revision) ? row.catchingUp : status?.catchingUp;
+  const base = status?.revision ? checkoutIndexLabel({...row, state:"available", revision:status.revision, catchingUp}) : checkoutIndexLabel(row);
+  if (!selectedRootKey) return {state:"unknown", text:"No checkout selected"};
+  if (checkoutBusy) return {state:"failed", text:"Checkout busy · retry checkout list"};
+  if (statusUnavailable) return {state:"failed", text:"Index status unavailable · retry status"};
+  if (job?.state === "failed") return {state:"failed", text:"Index failed · see Diagnostics"};
+  if (job && activeJob(job)) return {state:"catching-up", text:jobText(job)};
+  if (indexNotReady) return {state:"unknown", text:"Index not ready · retry status"};
+  if (!status?.revision) return {...base, state:"unknown", text:"Loading index status…"};
+  if (headObservation?.failed) return {state:"stale", text:"Head comparison unavailable · see Diagnostics"};
+  const head = headObservation?.head, pin = status.revision;
+  if (head && (head.indexGeneration !== pin.indexGeneration || head.indexRevision > pin.indexRevision)) {
+    return {state:"stale", text:"Viewing retained revision · reload at head"};
+  }
+  if (staleMessage) return {state:"stale", text:"Stale evidence · see Diagnostics"};
+  return base;
+}
+function renderIndexStatus() {
+  const state = selectedIndexStatus();
   $("workspace-index-state")?.setAttribute("data-state", state.state);
-  if ($("workspace-index-label")) $("workspace-index-label").textContent = state.text;
+  $("workspace-index-label").textContent = state.text;
+  renderCheckoutList();
+}
+function updateCheckoutOptions() {
+  for (const option of $("checkout-select").children) {
+    const row = checkouts.find(row => row.rootKey === option.value);
+    if (!row) continue;
+    option.textContent = window.TrellisShell.checkoutLabel(row);
+    option.title = row.workspaceRoot || row.rootKey;
+  }
+  $("checkout-select").title = selectedWorkspaceRoot || "Choose a checkout";
+}
+function showCheckoutIndexState() {
+  renderIndexStatus();
 }
 function renderCheckoutList() {
   const list = $("indexed-checkouts");
   if (!list) return;
   list.replaceChildren();
   for (const row of checkouts) {
-    const li = element("li"), state = checkoutIndexLabel(row);
+    const li = element("li"), state = row.rootKey === selectedRootKey ? selectedIndexStatus() : checkoutIndexLabel(row);
     const name = row.workspaceRoot?.split("/").filter(Boolean).at(-1) || row.rootKey;
     const pick = button(name, () => selectCheckout(row.rootKey));
     pick.className = "checkout-pick"; pick.disabled = !selectable(row);
     pick.title = row.workspaceRoot || row.rootKey;
     pick.setAttribute("aria-pressed", String(row.rootKey === selectedRootKey));
     pick.append(element("span", window.TrellisShell?.formatGit(row.git) || "Git unavailable", "checkout-git"));
-    const freshness = element("span", `${state.shape} ${state.text}`, "checkout-freshness");
+    const shape = state.shape || ({fresh:"○", "catching-up":"◐", failed:"□", stale:"◇", unknown:"◇"}[state.state]);
+    const freshness = element("span", `${shape} ${state.text}`, "checkout-freshness");
     freshness.setAttribute("data-state", state.state); pick.append(freshness);
     li.append(pick); list.append(li);
   }
@@ -440,7 +670,8 @@ async function loadCheckouts() {
     const select = $("checkout-select"), choice = selectedRootKey || "";
     select.replaceChildren(checkoutOption("Choose a checkout", ""));
     for (const row of checkouts) {
-      const option = checkoutOption(`${row.workspaceRoot || row.rootKey} · ${row.state} · ${window.TrellisShell.formatGit(row.git)}`, row.rootKey);
+      const option = checkoutOption(window.TrellisShell.checkoutLabel(row), row.rootKey);
+      option.title = row.workspaceRoot || row.rootKey;
       option.disabled = !selectable(row); select.append(option);
     }
     select.value = choice;
@@ -449,7 +680,7 @@ async function loadCheckouts() {
     $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
       : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
-      : choice ? "Checkout selected." : "Choose a checkout to inspect. No checkout is selected automatically.";
+      : choice ? "" : "Choose a checkout to inspect. No checkout is selected automatically.";
     $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
     if (choice && !busy) showCheckoutIndexState(selected);
     if (recovering) await selectCheckout(choice);
@@ -498,8 +729,10 @@ async function selectCheckout(key) {
     job = await api("/api/jobs/current").catch(error => { if (error.name !== "AbortError") throw error; return null; });
     if (session !== epoch) return;
     waitingForJob = !!job && activeJob(job);
-    if (job) { showJob(); schedulePoll(); }
-    $("checkout-state").textContent = "Checkout ready.";
+    showJob();
+    if (job) schedulePoll();
+    $("checkout-state").textContent = "";
+    void readNavigationLocation(true);
     $("notice").textContent = "Browse folders below. Indexed files expand to methods."
       + (tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "");
   } catch (error) {
@@ -510,7 +743,8 @@ async function selectCheckout(key) {
     $("checkout-state").textContent = cold ? "Index not ready. Retry status after indexing starts." : `Checkout unavailable: ${error.message} Retry status; your selection is unchanged.`;
     $("status").textContent = cold ? "No validated index head is available yet." : "Selected checkout status unavailable.";
     $("refresh").disabled = false;
-    $("stale").hidden = false; $("stale").textContent = $("checkout-state").textContent;
+    stale($("checkout-state").textContent);
+    renderIndexStatus();
   }
 }
 $("checkout-select").addEventListener("change", event => { void selectCheckout(event.target.value); });
@@ -558,7 +792,7 @@ async function showSource(item, revision) {
   return showCachedSource(item.path, item.range, revision);
 }
 let workspaceSource = null;
-function paintCachedSource(data, range, current) {
+function paintCachedSource(data, range, current, startLine = range?.startLine || 1, metadata) {
   workspaceSource = {data, range};
   $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot`;
   const fragment = document.createDocumentFragment();
@@ -570,13 +804,16 @@ function paintCachedSource(data, range, current) {
   });
   $("source").replaceChildren(fragment); $("source").hidden = false;
   window.TrellisShell?.showSource("workspace");
-  window.TrellisNavigation?.attachSource($("source"), {
-    path:data.file.path, revision:data.revision, startLine:range?.startLine || 1,
+  const binding = window.TrellisNavigation?.attachSource($("source"), {
+    path:data.file.path, revision:data.revision, startLine, metadataSnapshot:metadata,
     isCurrent: () => current() && !!token && IndexPin.equal(status?.revision, data.revision) &&
       !(section === "files" && filesBasis !== "indexed") && !$("source-dock")?.hidden && !$("workspace-source-panel")?.hidden,
   });
+  workspaceSource.navigation = binding;
+  return binding;
 }
 async function showCachedSource(path, range, revision, callerCurrent = () => true) {
+  navigationSerial++;
   IndexPin.copy(revision);
   if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
   const serial = ++sourceSerial, session = epoch, root = selectedRootKey;
@@ -630,20 +867,21 @@ function activeJob(value) { return ["queued", "running"].includes(value.state); 
 function jobText(value) {
   const progress = value.progress, total = progress?.total;
   if (value.state === "done") {
-    const pin = status?.revision, files = status?.stats?.files;
-    return `Indexed${pin ? ` · rev ${IndexPin.label(pin)}` : ""}${Number.isSafeInteger(files) ? ` · ${files} files` : ""}`;
+    const pin = value.revision;
+    return `Indexed${pin ? ` · rev ${IndexPin.label(pin)}` : ""}`;
   }
-  if (value.state === "failed") return `Index failed${value.error ? ` · ${describe(value.error)}` : ""}`;
+  if (value.state === "failed") return "Index failed · see Diagnostics";
   const parts = [value.state === "queued" ? "Index queued · accepted" : "Indexing"];
   if (progress?.phase) parts.push(progress.phase);
   if (Number.isSafeInteger(total) && total > 0) parts.push(`${progress.completed ?? 0}/${total}`);
   if (!waitingForJob) parts.push("no longer waiting here");
-  if (value.error) parts.push(describe(value.error));
+  if (value.error) parts.push("see Diagnostics");
   return parts.join(" · ");
 }
 function showJob() {
-  if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }
-  $("job").textContent = jobText(job);
+  if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; renderIndexStatus(); return; }
+  $("job").textContent = `${jobText(job)}${job.error ? `\n${describe(job.error)}` : ""}`;
+  renderIndexStatus();
   $("cancel").hidden = !waitingForJob || !activeJob(job);
   $("index").disabled = waitingForJob && activeJob(job);
 }
@@ -657,6 +895,7 @@ function schedulePoll() {
   }), 700);
 }
 $("index").addEventListener("click", () => perform(async () => {
+  clearNavigationHistory();
   window.TrellisClasses?.reset();
   diagramSerial++; viewerMetrics?.clearInspection(); window.TrellisShell?.resetInspector(); clearSource();
   job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
@@ -718,7 +957,7 @@ async function setSection(name) {
     if (!$("treemap-panel").hidden) await treemap?.refresh();
     else if (!$("architecture-panel").hidden) await architecture?.refresh();
     else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
-    if (cached && current()) paintCachedSource(cached.data, cached.range, current);
+    if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.());
     return;
   }
   viewerMetrics?.clearInspection();
@@ -730,7 +969,7 @@ async function setSection(name) {
   }
   if (workspaceSource && filesBasis === "indexed") {
     const source = workspaceSource;
-    paintCachedSource(source.data, source.range, filesGuard({basis:true}));
+    paintCachedSource(source.data, source.range, filesGuard({basis:true}), source.range?.startLine || 1, source.navigation?.snapshot?.());
   }
   if (filesSymbol) {
     const current = filesGuard({symbol:true});
@@ -746,7 +985,7 @@ async function setSection(name) {
   if (!filesCatalogLoaded && status?.revision) await loadFiles(true);
   if (!filesGitStatus) await refreshGit();
 }
-window.TrellisShell?.setSectionCallback?.(name => { void setSection(name); });
+window.TrellisShell?.setSectionCallback?.(name => { navigationSerial++; diagramSerial++; void setSection(name); });
 function appendFilesOutline(li, file) {
   const state = fileStates.get(file.path);
   if (!state?.outlineOpen) return;
@@ -791,6 +1030,14 @@ async function selectFilesFile(file) {
     loadFilesOutline(file),
   ]);
 }
+function renderFilesSymbolHeader(item) {
+  const symbol = item.symbol, pin = status.revision;
+  $("files-symbol-title").textContent = symbol.qualifiedName || symbol.name;
+  $("files-symbol-kind").textContent = item.nativeKind;
+  $("files-symbol-location").textContent = `${symbol.path}:${symbol.range.startLine}–${symbol.range.endLine} · indexed revision ${IndexPin.label(pin)}`;
+  $("files-symbol-header").textContent = window.TrellisFiles?.headerText(item.header) || "Measured header unavailable";
+  $("files-symbol-return").textContent = item.header?.resultType ? `Return type · ${item.header.resultType}` : "Return type not recorded";
+}
 async function selectFilesSymbol(item) {
   if (section !== "files") return;
   if (item.symbol.path !== filesFile?.path) {
@@ -799,11 +1046,7 @@ async function selectFilesSymbol(item) {
   }
   filesSerial++; filesDiffSerial++; clearFilesInspector(); filesSymbol = item; filesBasis = "indexed"; filesDiff = null;
   const symbol = item.symbol, pin = IndexPin.copy(status.revision), current = filesGuard({symbol:true});
-  $("files-symbol-title").textContent = symbol.qualifiedName || symbol.name;
-  $("files-symbol-kind").textContent = item.nativeKind;
-  $("files-symbol-location").textContent = `${symbol.path}:${symbol.range.startLine}–${symbol.range.endLine} · indexed revision ${IndexPin.label(pin)}`;
-  $("files-symbol-header").textContent = window.TrellisFiles?.headerText(item.header) || "Measured header unavailable";
-  $("files-symbol-return").textContent = item.header?.resultType ? `Return type · ${item.header.resultType}` : "Return type not recorded";
+  renderFilesSymbolHeader(item);
   updateFilesBasis(); renderFiles();
   const callable = ["function", "method"].includes(symbol.kind);
   $("files-mini-state").textContent = callable ? "Loading measured sequence…" : "Sequence not applicable to this noncallable symbol.";
@@ -853,11 +1096,27 @@ async function loadFilesMini(current) {
     filesMini = data; await renderFilesMini(current);
   } catch (error) { filesFailure(error, "files-mini-state", current); }
 }
+function sequenceTargetAction(data, current) {
+  const context = navigationContext(), revision = IndexPin.copy(data.revision);
+  return (declaration, step) => {
+    if (!current() || !navigationCurrent(context) || !IndexPin.equal(revision, status?.revision)) return;
+    const pending = [...data.steps];
+    let found = false;
+    while (pending.length) {
+      const item = pending.pop();
+      if (item === step) { found = true; break; }
+      pending.push(...(item.children || []), ...(item.alternate || []));
+    }
+    if (!found || window.TrellisSequence?.target(data, step)?.declaration !== declaration) return;
+    if (["function", "method"].includes(declaration.kind)) return perform(() => navigateDiagram(declaration, revision));
+    return perform(() => section === "files" ? openFilesLocation(declaration, revision) : showSource(declaration, revision));
+  };
+}
 async function renderFilesMini(current) {
   if (!filesMini || !filesSymbol) return;
   const data = filesMini, revision = data.revision, expanded = new Set(), container = $("files-mini-sequence");
   const readSource = step => { if (current()) return openFilesLocation(step, revision); };
-  const options = {showDetails:false, isCurrent:current};
+  const options = {showDetails:false, isCurrent:current, onOpenTarget:sequenceTargetAction(data, current)};
   options.onUnsupported = reason => { if (current()) { window.TrellisSequence.render(container, data, readSource, expanded, options); $("files-mini-state").textContent += ` · Pele fell back: ${reason}`; } };
   const outcome = window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
@@ -867,10 +1126,7 @@ async function renderFilesMini(current) {
 }
 async function openFilesFull() {
   if (section !== "files" || !filesMini || !filesSymbol || !IndexPin.equal(filesMini.revision, status?.revision)) return;
-  const data = filesMini, symbol = filesSymbol.symbol;
-  await setSection("diagrams"); selectedMethod = symbol; $("all-steps").checked = false;
-  $("method-source").disabled = false; if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
-  window.TrellisShell?.showView("sequence"); renderFiles(); await loadSequence(data);
+  return navigateDiagram(filesSymbol.symbol, filesMini.revision, "sequence", filesMini);
 }
 function updateFilesBasis() {
   if (!$("files-working")) return;
@@ -890,7 +1146,7 @@ async function setFilesBasis(basis) {
   window.TrellisNavigation?.reset(); filesDiff = null; $("files-diff").replaceChildren(); updateFilesBasis();
   if (basis === "indexed") {
     const current = filesGuard({basis:true});
-    if (workspaceSource?.data.file.path === filesFile.path) paintCachedSource(workspaceSource.data, workspaceSource.range, current);
+    if (workspaceSource?.data.file.path === filesFile.path) paintCachedSource(workspaceSource.data, workspaceSource.range, current, workspaceSource.range?.startLine || 1, workspaceSource.navigation?.snapshot?.());
     else await showCachedSource(filesFile.path, filesSymbol?.symbol.range || null, status.revision, current).catch(error => filesFailure(error, "source-path", current));
     return;
   }
@@ -1073,34 +1329,42 @@ async function toggleFile(file) {
     state.error = error.message;
   } finally { if (current()) { state.loading = false; renderFiles(); } }
 }
-async function selectMethod(symbol) {
+async function selectMethod(symbol, admitted = null, callerCurrent = null) {
+  if (!callerCurrent) {
+    const context = navigationContext(), ticket = ++navigationSerial;
+    callerCurrent = () => ticket === navigationSerial && navigationCurrent(context);
+  }
+  if (!callerCurrent()) return;
+  sourceInspector = null;
   viewerMetrics?.clearInspection();
   window.TrellisShell?.showView("sequence");
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
   selectedMethod = symbol; $("method-source").disabled = false;
   clearSource(); renderFiles();
-  await loadSequence();
-  if (selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
+  await loadSequence(admitted, false, callerCurrent);
+  if (callerCurrent() && selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
-async function loadSequence(admitted = null, preserveSource = false) {
+async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   if (!selectedMethod || !status) return;
   const serial = ++diagramSerial, guard = browseGuard(), symbol = selectedMethod, revision = IndexPin.copy(status.revision);
   const surface = sectionSerial;
-  const current = () => guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
+  let published = false;
+  const current = () => (published || callerCurrent()) && guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
   if (!preserveSource) clearSource();
   $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
   await browseRequest(async () => {
-    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
+    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked}, current);
     if (!current()) return;
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
     diagramSequence = data;
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
+    options.onOpenTarget = sequenceTargetAction(data, options.isCurrent);
     // A later group redraw can fail after the initial load succeeded. Preserve
     // the whole pinned DTO rather than leaving an inert, silently folded group.
     options.onUnsupported = reason => {
@@ -1109,7 +1373,7 @@ async function loadSequence(admitted = null, preserveSource = false) {
       $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
-      if (current()) { viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step)); }
+      if (current()) { sourceInspector = {symbol:step, sequence:data}; viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step), options.onOpenTarget); }
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
@@ -1124,6 +1388,7 @@ async function loadSequence(admitted = null, preserveSource = false) {
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
+    published = true;
   }, current, "sequence-state");
 }
 $("file-filter").addEventListener("input", renderFiles);
@@ -1230,7 +1495,7 @@ const viewerMetrics = window.TrellisMetrics?.create({
 });
 const treemap = window.TrellisTreemap?.create({
   request: (path, current) => api(path, "GET", undefined, current),
-  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
+  context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, workspaceRoot:status?.workspaceRoot}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   onConflict: () => unexpectedPair("Treemap snapshot changed. Refresh status before reopening Treemap."),
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
@@ -1248,13 +1513,17 @@ const architecture = window.TrellisArchitecture?.create({
   onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
 });
 window.TrellisShell?.setViewCallback?.(name => {
+  if (!routeViewChange && name !== "sequence") {
+    navigationSerial++; diagramSerial++;
+    if (navigationEntries.get(window.history?.state?.trellisNavigation)?.kind === "class") window.TrellisClasses?.reset();
+  }
   architecture?.clearInspection(); treemap?.clearInspection();
   if (name === "architecture" && section === "diagrams") void architecture?.refresh();
   else architecture?.reset();
   if (name === "treemap" && section === "diagrams") void treemap?.refresh();
   else treemap?.reset();
 });
-window.TrellisShell?.setInspectorClearCallback?.(() => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); treemap?.clearInspection(); });
+window.TrellisShell?.setInspectorClearCallback?.(() => { sourceInspector = null; viewerMetrics?.clearInspection(); architecture?.clearInspection(); treemap?.clearInspection(); });
 function metricDirectorySelection(path) {
   if (!treeRoot || !indexedWorkspace) return null;
   const absolute = `${treeRoot.replace(/\/$/, "")}${path ? "/" + path : ""}`;
@@ -1363,6 +1632,19 @@ async function loadDirectory(path, reset = false) {
   try { await pending; }
   finally { if (state.pending === pending) state.pending = null; }
 }
+// Files of a type Trellis does not index collapse into one quiet, countable marker per folder (#425).
+const unsupportedSourceReason = "Unsupported source type";
+function unsupportedTreeFile(item) {
+  return item.kind === "file" && item.indexedPath == null && item.unindexedReason === unsupportedSourceReason;
+}
+function unsupportedFilesMarker(names) {
+  const row = element("li", undefined, "unsupported-files"), details = element("details");
+  details.append(element("summary", `${names.length} ${names.length === 1 ? "file" : "files"} · unsupported source type · not indexed`));
+  const list = element("ul");
+  for (const name of names) list.append(element("li", name, "unindexed-file"));
+  details.append(list); row.append(details);
+  return row;
+}
 function renderDirectoryTree() {
   treeSerial++;
   const tree = $("file-tree"); tree.replaceChildren();
@@ -1388,9 +1670,11 @@ function renderDirectoryTree() {
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
     if (!state) return;
+    const unsupported = [];
     for (const item of (state.items || []).filter(matches)) {
       if (!showHidden && hiddenTreeEntry(item)) { hidden++; continue; }
       count++;
+      if (unsupportedTreeFile(item)) { unsupported.push(item.name); continue; }
       const row = element("li");
       if (item.kind === "directory") {
         const compact = compactDirectory(item), child = directories.get(item.path);
@@ -1422,6 +1706,7 @@ function renderDirectoryTree() {
       }
       list.append(row);
     }
+    if (unsupported.length) list.append(unsupportedFilesMarker(unsupported));
     if (state.loading) list.append(element("li", "Loading folder…", "detail"));
     if (state.error) {
       const row = element("li", state.error, "warning");
@@ -1446,6 +1731,7 @@ let externalSerial = 0, externalFileSerial = 0, externalSnapshot = null, externa
 let externalWindowStart = 0, externalSelectedRange = null;
 function resetExternalWindow() {
   externalWindowStart = 0; externalSelectedRange = null;
+  $("external-source-hint").hidden = true;
   $("external-previous").disabled = true; $("external-next").disabled = true;
 }
 function clearExternalSources() {
@@ -1595,6 +1881,8 @@ function renderExternalSource(range = externalSelectedRange, windowStart) {
     if (range && number >= range.startLine && number <= range.endLine) line.classList.add("highlight");
     line.append(element("span", String(number), "line-number"), document.createTextNode(content)); fragment.append(line);
   }
+  $("external-source-hint").textContent = "Workspace diagrams are unavailable for this external candidate snapshot.";
+  $("external-source-hint").hidden = false;
   $("external-source").replaceChildren(fragment);
   if (range) {
     $("external-source").focus({preventScroll:true});
@@ -1760,7 +2048,7 @@ async function openClasses(options = {}) {
   if (!token || !status || !window.TrellisClasses) return;
   viewerMetrics?.clearInspection();
   clearSource(); window.TrellisShell?.resetInspector();
-  window.TrellisShell?.showView("classes");
+  showNavigationView("classes");
   return window.TrellisClasses.open(options.seed ? {seed:options.seed} : options);
 }
 function attachClassMenu(node, options) {
@@ -1779,13 +2067,23 @@ function attachClassMenu(node, options) {
     if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) show(event);
   });
 }
+function inspectSourceSymbol(symbol, revision) {
+  if (!sourceWitness(symbol) || !IndexPin.equal(revision, status?.revision)) throw new Error("Source inspection is stale. Refresh the indexed view.");
+  const context = navigationContext(), serial = sourceSerial;
+  const inspector = {symbol}; sourceInspector = inspector;
+  const current = () => navigationCurrent(context) && sourceInspector === inspector && sourceSerial === serial;
+  return window.TrellisShell?.inspectSymbol?.(symbol, revision, () => {
+    if (current()) return perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision));
+  });
+}
 window.TrellisNavigation?.init({
   request: (path, options = {}) => api(path, options.method || "GET", options.body),
   onStale: unexpectedPair,
   currentRevision: () => status?.revision,
   currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
-  openClass: symbol => perform(() => openClasses({seed:symbol.id})),
-  selectMethod: symbol => perform(() => selectMethod(symbol)),
+  openClass: (symbol, revision) => perform(() => navigateDiagram(symbol, revision, "class")),
+  selectMethod: (symbol, revision) => perform(() => navigateDiagram(symbol, revision)),
+  inspectSymbol: (symbol, revision) => perform(() => inspectSourceSymbol(symbol, revision)),
   openSource: (symbol, revision) => perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision)),
   showMenu: (event, actions, options) => window.TrellisClasses?.showContextMenu(event, actions, options),
 });

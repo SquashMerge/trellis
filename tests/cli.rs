@@ -661,7 +661,13 @@ fn daemon_status_uses_selected_head_and_reports_typed_contention() {
         .args(["gc", "--report"])
         .output()
         .unwrap();
-    assert!(report.status.success());
+    assert!(
+        report.status.success(),
+        "gc --report failed: {}\nstdout: {}\nstderr: {}",
+        report.status,
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
     let report: Value = serde_json::from_slice(&report.stdout).unwrap();
     assert_eq!(report["derived"][0]["status"], "busy");
 }
@@ -2073,7 +2079,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             "revision_capture_inputs",
             "revision_documents",
         ],
-        "exact schema-25 native evidence and search table inventory"
+        "exact schema-27 native evidence and search table inventory"
     );
     // Compare all corpus cells, not history-dependent FTS shadow segment bytes.
     for name in names
@@ -2128,7 +2134,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
                 "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
-            _ => panic!("unexpected schema-25 evidence table: {name}"),
+            _ => panic!("unexpected schema-27 evidence table: {name}"),
         };
         let order = if name == "native_version_references" {
             "vid,owner_syntax_id,ordinal"
@@ -2191,7 +2197,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     assert_eq!(
         all_rows.len(),
         36,
-        "retain every native evidence table and logical search corpus in schema-25 snapshot"
+        "retain every native evidence table and logical search corpus in schema-27 snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3095,7 +3101,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 35 native schema-25 evidence tables, logical head search corpus and documents must match after only publication identity normalization"
+            "{name}: all 35 native schema-27 evidence tables, logical head search corpus and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,

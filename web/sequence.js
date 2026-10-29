@@ -15,7 +15,43 @@ function sourceWitness(item) {
     (r.startByte == null || (Number.isSafeInteger(r.startByte) && r.startByte >= 0)) &&
     (r.endByte == null || (Number.isSafeInteger(r.endByte) && r.endByte > (r.startByte ?? -1)));
 }
+function sequenceTarget(view, step) {
+  const evidence = step?.callEvidence, pin = view?.revision;
+  if (!["call", "boundary"].includes(step?.kind) || !step.callId || !sourceWitness(step) ||
+      typeof pin?.indexGeneration !== "string" || !pin.indexGeneration || !Number.isSafeInteger(pin.indexRevision) ||
+      evidence?.boundaryReason !== "none" || evidence.resolution !== "resolved" || evidence.freshness !== "fresh" ||
+      !["direct", "constructor"].includes(evidence.dispatch) || !evidence.provenanceId || typeof step.target !== "string") return null;
+  const participant = view.participants?.find(item => item.id === step.target);
+  const declaration = participant?.declaration;
+  return declaration?.id === step.target && sourceWitness(declaration) ? participant : null;
+}
+function sequenceEvidenceLabel(step, view) {
+  if (!["call", "boundary"].includes(step?.kind) || !step.callId) return "Measured source syntax";
+  const evidence = step.callEvidence;
+  if (!evidence) return "measured syntax; target unverified";
+  if (evidence.boundaryReason === "none" && view && !sequenceTarget(view, step)) return "Target unverified - invalid declaration evidence";
+  const labels = {none:"Resolved declaration", external:"External boundary", unresolved:"Unresolved target",
+    ambiguous:"Ambiguous target", dispatch:"Dispatch boundary", stale:"Stale evidence", nodeLimit:"Target omitted - participant limit",
+    missingEvidence:"Unbound - missing semantic evidence"};
+  return labels[evidence.boundaryReason] || "Target unverified";
+}
+function sequenceTargetActionLabel(declaration) {
+  return ["function", "method"].includes(declaration.kind) ? "Open callee sequence" : "Read declaration source";
+}
+function sequenceEntry(step) {
+  const children = step?.children || [];
+  return step?.kind === "group" && !step.alternate?.length && children.length &&
+    children.every(child => child.kind === "call" && !child.hidden && !child.children?.length && !child.alternate?.length && sourceWitness(child) && child.path === step.path) &&
+    sourceWitness(step) ? children[0] : null;
+}
+const sequenceRenders = new WeakMap();
+function beginSequenceRender(container) {
+  const owner = {}; sequenceRenders.set(container, owner);
+  return () => sequenceRenders.get(container) === owner;
+}
 function drawSequence(container, view, readSource, expandedGroups, options, selection) {
+  const current = options.isCurrent, active = beginSequenceRender(container);
+  options = {...options, isCurrent:() => active() && (!current || current())};
   const groupControls = new Map(), rowControls = [];
   const ns = "http://www.w3.org/2000/svg";
   const make = (tag, attrs = {}, text) => {
@@ -29,14 +65,8 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   const participantById = new Map(allParticipants.map(p => [p.id, p]));
   // A collapsed chain previews its first measured call, never a synthesized
   // call to an inferred common receiver. Later calls can return other types.
-  const entryCall = step => {
-    const children = step.children || [];
-    if (step.kind !== "group" || step.alternate?.length || !children.length ||
-        !children.every(child => child.kind === "call" && !child.hidden &&
-          !child.children?.length && !child.alternate?.length)) return null;
-    return sourceWitness(step) && sourceWitness(children[0]) && step.path === children[0].path ? children[0] : null;
-  };
-  const visibleTargets = new Set([view.seed.id]);
+  const entryCall = sequenceEntry;
+  const visibleTargets = new Set([view.seed.id]), targetProofs = new Map();
   const pending = (view.steps || []).map(step => ({step, depth:0})).reverse();
   let visibleDepth = 0;
   while (pending.length) {
@@ -45,18 +75,20 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     visibleDepth = Math.max(visibleDepth, depth);
     if (step.kind === "group" && !expandedGroups.has(step.id)) {
       const entry = entryCall(step);
-      // A terminal call never introduces a participant lane.
+      const target = sequenceTarget(view, entry);
+      if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, entry); }
       continue;
     }
-    // A target ID in an old DTO is not a witnessed participant.
+    const target = sequenceTarget(view, step);
+    if (target) { visibleTargets.add(target.id); targetProofs.set(target.id, step); }
     pending.push(...[...(step.alternate || []).slice().reverse(), ...(step.children || []).slice().reverse()].map(step => ({step, depth:depth+1})));
   }
   // Hidden chain members and replaced candidate hints must not leave ghost lanes.
   const participants = [...visibleTargets].map(id => participantById.get(id)).filter(Boolean);
   // Keep a readable guard column even for deeply nested input. The canvas scrolls.
   const width = Math.max(720, participants.length * 210 + 80, visibleDepth * 10 + 400);
-  const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Measured source steps; no target or runtime path proof"});
-  svg.append(make("title", {}, `${view.seed.name}: measured source steps, not a target or runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
+  const svg = make("svg", {viewBox:`0 0 ${width} 200`, width, role:"group", "aria-label":"Static possible paths; resolved declarations where evidenced, not a runtime trace"});
+  svg.append(make("title", {}, `${view.seed.name}: measured source steps, not a runtime trace${view.revision?.indexGeneration ? ` · revision ${view.revision.indexGeneration.slice(0, 8)}:${view.revision.indexRevision}` : ""}`));
   const positions = new Map(participants.map((p, i) => [p.id, 130 + i * 210]));
   const origin = positions.get(view.seed.id) || 130;
   const lines = make("g", {class:"sequence-lifelines"}); svg.append(lines);
@@ -68,15 +100,26 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     svg.append(make("rect", {x:x-95, y:10, width:190, height:44, class:"participant"}));
     const text = make("text", {x, y:28, "text-anchor":"middle", class:"sequence-participant-label"}, shorten(p.label, 24));
     text.append(make("title", {}, p.label)); svg.append(text);
+    if (p.declaration && typeof options.onOpenTarget === "function") {
+      const proof = targetProofs.get(p.id);
+      if (proof) {
+        text.setAttribute("role", "button"); text.setAttribute("tabindex", "0");
+        text.setAttribute("aria-label", `${sequenceTargetActionLabel(p.declaration)}: ${p.declaration.name}`);
+        text.setAttribute("data-trellis-target-id", p.id);
+        const open = () => { if ((!options.isCurrent || options.isCurrent()) && sequenceTarget(view, proof) === p) options.onOpenTarget(p.declaration, proof); };
+        text.addEventListener("click", open);
+        text.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
+      }
+    }
     const meta = make("text", {x, y:44, "text-anchor":"middle", class:"sequence-meta"}, (options.showDetails ? kindLabels[p.kind] : compactKinds[p.kind]) || p.kind);
     meta.append(make("title", {}, [kindLabels[p.kind] || p.kind, p.identification].filter(Boolean).join(" — "))); svg.append(meta);
   }
   // These are evidence categories, never runtime certainty or numeric confidence.
-  const provenance = () => ({key:"syntax", label:"Syntax only", dash:"2 4"});
+  const provenance = step => ({key:step.callEvidence?.boundaryReason || "syntax", label:sequenceEvidenceLabel(step, view)});
   const tooltip = step => {
     const range = step.range;
     const location = step.path && range ? `${step.path}:${range.startLine}${range.startColumn != null ? ":" + range.startColumn : ""}–${range.endLine}${range.endColumn != null ? ":" + range.endColumn : ""}` : "";
-    return [`${step.kind}: ${step.label}`, location, "Terminal source only; target unverified"].filter(Boolean).join(" · ");
+    return [`${step.kind}: ${step.label}`, location, sequenceEvidenceLabel(step, view)].filter(Boolean).join(" · ");
   };
   const wrap = (label, limit) => {
     const output = [];
@@ -168,7 +211,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const interactive = sourceWitness(step) && sourceWitness(evidence) && step.path === evidence.path &&
       (!options.isCurrent || options.isCurrent()) &&
       (typeof options.onSelect === "function" || typeof readSource === "function");
-    const call = evidence.kind === "call", proof = call ? provenance(evidence) : null;
+    const call = ["call", "boundary"].includes(evidence.kind) && evidence.callId, proof = call ? provenance(evidence) : null;
     const fullLabel = tooltip(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
     const control = make("g", {class:"sequence-source", "data-source-step-id":step.id,
       ...(interactive ? {role:"button", tabindex:0, "aria-label":`${options.onSelect ? "Inspect" : "Read source"}: ${fullLabel}`, "aria-pressed":String(selection.id === step.id)} : {})});
@@ -176,10 +219,12 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     // text is treated as equivalent, merged, or removed.
     const isControl = ["branch", "loop", "try"].includes(display.kind);
     let label = display.label || display.kind;
+    if (["call", "boundary"].includes(evidence.kind) && evidence.callEvidence) label = `${sequenceEvidenceLabel(evidence, view)} · ${label}`;
     if (options.showDetails) {
       if (!operator && display.kind !== "group" && display.kind !== "call chain" && display.kind !== "call") label = `${display.kind} · ${label}`;
     } else {
       label = analysisKinds.has(display.kind) ? compactAnalysis(display) : (compactLabels.get(label) || label);
+      if (analysisKinds.has(display.kind) && evidence.callEvidence) label = `${sequenceEvidenceLabel(evidence, view)} · ${label}`;
       if (quietGuard(display)) label = "[if prior path continues]";
       if (display.kind === "call") label = label.replace(/^call(?:\s*·\s*|\s+|:\s*)/i, "");
     }
@@ -194,7 +239,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       const suffix = ` · +${step.children.length-1} calls collapsed (entry preview)`;
       // Keep the collapsed count and entry-only claim visible even when the
       // measured name is long. At deep indentation the annotation can wrap.
-      labels = wrap(shorten(evidence.label, Math.max(12, capacity-suffix.length)) + suffix, capacity);
+      labels = wrap((evidence.callEvidence ? `${sequenceEvidenceLabel(evidence, view)} · ` : "") + shorten(evidence.label, Math.max(12, capacity-suffix.length)) + suffix, capacity);
     }
     const extra = (labels.length-1)*16;
     control.append(make("rect", {x, y:top-(operator ? 19 : 15), width:Math.max(1,width-x-24), height:(operator ? 30 : 24)+extra, fill:"transparent", class:"sequence-row-hit"}));
@@ -222,8 +267,16 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       control.addEventListener("click", select);
       control.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } });
     }
+    const target = sequenceTarget(view, evidence);
+    if (target && evidence.kind === "call" && positions.has(target.id)) {
+      const end = positions.get(target.id), arrowY = top + extra + 10;
+      const d = end === origin ? `M ${origin} ${arrowY} h 48 v 18 h -48` : `M ${origin} ${arrowY} H ${end}`;
+      group.append(make("path", {d, class:"sequence-arrow", fill:"none", "data-trellis-call-id":evidence.callId, "data-trellis-target-id":target.id}));
+      const direction = end === origin ? -1 : end > origin ? 1 : -1, headY = arrowY + (end === origin ? 18 : 0);
+      group.append(make("path", {d:`M ${end-direction*7} ${headY-4} L ${end} ${headY} L ${end-direction*7} ${headY+4}`, class:"sequence-arrow", fill:"none"}));
+    }
     group.append(control);
-    return extra;
+    return extra + (target?.id === view.seed.id ? 20 : 0);
   }
   function draw(steps, parent, depth) {
     for (const step of steps || []) {
@@ -236,9 +289,10 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
         control.append(make("rect", {x:x+4, y:y-15, width:88, height:24, class:"sequence-note"}));
         control.append(make("text", {x:x+10, y}, `${expanded ? "▾ Collapse" : "▸ Expand"}`));
         const toggle = () => {
+          if (!options.isCurrent()) return;
           const top = container.scrollTop, left = container.scrollLeft;
           if (expandedGroups.has(step.id)) expandedGroups.delete(step.id); else expandedGroups.add(step.id);
-          const controls = drawSequence(container, view, readSource, expandedGroups, options, selection);
+          const controls = drawSequence(container, view, readSource, expandedGroups, {...options,isCurrent:current}, selection);
           controls.get(step.id)?.focus?.({preventScroll:true});
           container.scrollTop = top; container.scrollLeft = left;
         };
@@ -301,4 +355,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, entry:sequenceEntry, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};

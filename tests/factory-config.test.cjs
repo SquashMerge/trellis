@@ -177,6 +177,7 @@ fi
 # verify hands the browser suite the binary it built (#192).
 for arg in "$@"; do
   if [ "$arg" = tests/browser/sequence-harness.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
+  if [ "$arg" = tests/browser/navigation-resolved.test.cjs ] && [ -z "\${TRELLIS_NAVIGATION_FIXTURE_BINARY:-}" ]; then exit 38; fi
 done
 if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
 if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ] && [ "$2" = install-deps ]; then echo $$ > "$FAKE_VERIFY_HANG_DEPS"; exec sleep 600; fi
@@ -190,47 +191,12 @@ fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
   try {
-    for (const name of ["cargo", "node", "python3"]) {
+    // This test checks orchestration only; the real suites run once in verify.
+    for (const name of ["cargo", "node", "python3", "cp"]) {
       const command = join(fakeDir, name);
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
     }
-    // The #40 smoke needs the real trellis binary, which the fake cargo never
-    // builds. Skip only that script; every other python3 call runs for real.
-    const realPython = spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
-    const pythonShim = join(fakeDir, "python3");
-    writeFileSync(pythonShim, `#!/bin/sh
-case "$1" in
-  tools/verify-40-query-performance.py)
-    line="python3"
-    for arg in "$@"; do line="$line$(printf '\\t')$arg"; done
-    printf '%s\\n' "$line" >> "$FAKE_VERIFY_LOG"
-    exit 0 ;;
-esac
-exec "${realPython}" "$@"
-`);
-    chmodSync(pythonShim, 0o755);
-    // The real python checks (#61 gate, semantic-contract unittests) generate
-    // cohorts through the real node and read its version. Those calls run for
-    // real and unlogged, like the python3 calls above.
-    const realNode = spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8" }).stdout.trim();
-    const nodeShim = join(fakeDir, "node");
-    writeFileSync(nodeShim, `#!/bin/sh
-case "$1" in
-  -v|tools/synthetic-cohorts/generate.mjs|*/tools/synthetic-cohorts/generate.mjs)
-    exec "${realNode}" "$@" ;;
-esac
-${fakeTool.replace("#!/bin/sh\n", "")}`);
-    chmodSync(nodeShim, 0o755);
-    // The gate tests also record the toolchain version with `cargo -V`.
-    const realCargo = spawnSync("sh", ["-c", "command -v cargo"], { encoding: "utf8" }).stdout.trim();
-    const cargoShim = join(fakeDir, "cargo");
-    writeFileSync(cargoShim, `#!/bin/sh
-case "$1" in
-  -V) exec "${realCargo}" "$@" ;;
-esac
-${fakeTool.replace("#!/bin/sh\n", "")}`);
-    chmodSync(cargoShim, 0o755);
     function runVerify(extraEnv = {}, timeout = undefined) {
       const result = spawnSync(config.verify, [], {
         cwd: ROOT,
@@ -247,7 +213,7 @@ ${fakeTool.replace("#!/bin/sh\n", "")}`);
         },
       });
       const commands = readFileSync(log, "utf8").trimEnd().split("\n").map((line) => line.split("\t"));
-      return { result, commands };
+      return { result, commands, output: result.stdout + result.stderr };
     }
     // Lanes run concurrently; commands within a lane keep this order.
     const lanes = {
@@ -256,9 +222,11 @@ ${fakeTool.replace("#!/bin/sh\n", "")}`);
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
+        ["cargo", "build", "--locked", "--features", "test-support", "--bin", "trellis"],
+        ["cp", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis"), join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis-navigation-fixture")],
         ["cargo", "build", "--locked", "--bin", "trellis"],
         ["python3", "tools/verify-40-query-performance.py", "--smoke", "--binary", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis")],
-        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/treemap.test.cjs"],
+        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/treemap.test.cjs", "tests/browser/classes-pele.test.cjs", "tests/browser/classes-app.test.cjs", "tests/browser/navigation-resolved.test.cjs"],
       ],
       tests: [
         ["cargo", "nextest", "--version"],
@@ -268,10 +236,16 @@ ${fakeTool.replace("#!/bin/sh\n", "")}`);
       cohorts: [["node", "--test", "tools/synthetic-cohorts/test/cohorts.test.mjs"]],
       checks: [
         ["node", "--test", "tests/mcp-catalog-sdk.test.mjs"],
+        ["python3", "tools/stage3-watcher-runner-test.py"],
+        ["python3", "tools/verify-67-mixed-performance-test.py"],
+        ["python3", "tools/verify-40-query-performance-test.py"],
+        ["python3", "tools/verify-61-combined-gate-test.py"],
+        ["python3", "-m", "unittest", "discover", "-s", "tools/semantic-contract/test", "-p", "test_*.py"],
+        ["python3", "-m", "unittest", "discover", "-s", "tools/release", "-p", "test_*.py"],
         ["node", "--test", "tests/factory-config.test.cjs"],
         ["node", "docs/semantic-evidence/check-policy.mjs", "--self-test"],
         ["node", "--check", "web/app.js"],
-        ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs"],
+        ["node", "--test", "tests/browse-ui.test.cjs", "tests/sequence-ui.test.cjs", "tests/token-ui.test.cjs", "tests/external-source-ui.test.cjs", "tests/dependency-ui.test.cjs", "tests/shell-ui.test.cjs", "tests/classes-ui.test.cjs", "tests/navigation-ui.test.cjs", "tests/metric-heat.test.cjs", "tests/viewer-metrics-ui.test.cjs", "tests/files-ui.test.cjs", "tests/architecture-ui.test.cjs", "tests/architecture-pele-ui.test.cjs", "tests/treemap-ui.test.cjs", "tests/treemap-pele.test.cjs"],
       ],
     };
     function assertRan(commands, expected) {
@@ -288,20 +262,20 @@ ${fakeTool.replace("#!/bin/sh\n", "")}`);
     assert.deepEqual(setupFailure.commands, lanes.setup, "failed setup must not start other lanes");
     rmSync(log);
     const success = runVerify();
-    assert.equal(success.result.status, 0, success.result.stderr);
+    assert.equal(success.result.status, 0, success.output);
     assertRan(success.commands, lanes);
     rmSync(log);
     // With TRELLIS_BROWSER_SYSTEM_DEPS set, the system packages install in the
     // background and the browser suite runs only after it succeeds (#244).
     const deps = ["node", "tests/browser/node_modules/playwright/cli.js", "install-deps", "chromium"];
     const withDeps = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" });
-    assert.equal(withDeps.result.status, 0, withDeps.result.stderr);
+    assert.equal(withDeps.result.status, 0, withDeps.output);
     assertRan(withDeps.commands, { ...lanes, deps: [deps] });
     assert.match(withDeps.result.stdout, /^verify: Chromium system package install finished in \d+ s \(exit 0\)/m);
     rmSync(log);
     const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
     assert.equal(depsFailure.result.status, 1);
-    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, 5) });
+    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, -1) });
     assert.match(depsFailure.result.stdout, /fake apt failure/);
     assert.match(depsFailure.result.stdout, /Chromium system package install failed \(exit 41\)/);
     assert.match(depsFailure.result.stderr, /failed lane\(s\): rust$/m);

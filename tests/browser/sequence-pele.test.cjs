@@ -21,10 +21,19 @@ test.before(async()=>{
 test.after(async()=>{await browser?.close();await new Promise(resolve=>server?.close(resolve));});
 async function render(view,options={}) {return page.evaluate(async ({view,options})=>{
  const container=document.querySelector("#sequence-diagram");
- const chosen=[];window.picks=chosen;window.current=true;
- const result=await TrellisPeleSequence.render(container,view,null,new Set(),{...options,isCurrent:()=>window.current,onSelect:step=>chosen.push(step)});
+ const chosen=[];window.picks=chosen;window.targetPicks=[];window.current=true;
+ const result=await TrellisPeleSequence.render(container,view,null,new Set(),{...options,isCurrent:()=>window.current,onSelect:step=>chosen.push(step),
+   onOpenTarget:(declaration,step)=>window.targetPicks.push({declaration,step,exact:view.participants.some(participant=>participant.declaration===declaration)&&stepsContain(view.steps,step)})});
+ function stepsContain(roots,original){return roots.some(step=>step===original||stepsContain(step.children||[],original)||stepsContain(step.alternate||[],original));}
  return {status:result.status,reason:result.reason,notes:[...container.querySelectorAll(".pele-note[data-trellis-step-id]")].map(n=>({id:n.dataset.trellisStepId,callId:n.dataset.trellisCallId,text:n.textContent})),svg:!!container.querySelector("svg.pele.trellis-pele"),source:result.source};
  },{view,options});}
+function resolvedView() {
+ const view=fixture("rust"),declaration={...structuredClone(view.seed),id:"exact:target",name:'actual <T> & café',path:"target.rs"};
+ view.participants.push({id:declaration.id,label:declaration.name,kind:"internal",identification:"Fresh exact resolved declaration",declaration});
+ view.steps=[{...view.steps[0],id:"resolved:occurrence",label:"lexical_decoy",target:declaration.id,
+   callEvidence:{boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"proof:occurrence"}}];
+ return view;
+}
 function steps(roots){return roots.flatMap(step=>[step,...steps(step.children||[]),...steps(step.alternate||[])]).filter(step=>!step.hidden);}
 for(const language of ["javascript","rust","java","python"])test(`${language} producer DTO projects original ordered measured notes in Chromium`,async()=>{
  const view=fixture(language), result=await render(view);
@@ -55,23 +64,181 @@ test("pinned Pele shows original punctuation, Unicode and injection as text",asy
  assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
 });
 
-test("witnessed target including hidden, nested and collapsed refuses Pele and visibly explains legacy limitation",async()=>{
- const original=fixture("rust"),leaf=structuredClone(original.steps[0]);
- leaf.id="target-evidence";leaf.target=original.participants[0].id;leaf.children=[];leaf.alternate=[];
- for(const steps of [[leaf],[{...leaf,id:"hidden-parent",hidden:true,children:[leaf],target:null}],
-   [{...leaf,id:"nested-parent",kind:"branch",children:[leaf],target:null}],
-   [{...leaf,id:"collapsed-parent",kind:"group",children:[leaf],target:null}]]) {
-   const view={...original,steps};const outcome=await renderWithVisibleFallback(view);
-   if (steps[0].hidden) {
-     assert.equal(outcome.status,"unsupported");assert.equal(outcome.pele,0);assert.equal(outcome.legacy,1);
-     assert.equal(outcome.rows.length,0,"legacy also hides a hidden target; status must disclose it");
-   } else assertVisibleFallback(outcome,[steps[0].id],steps[0].label);
-   assert.match(outcome.state,/target links are not shown in either sequence renderer/);
+test("resolved declaration adds a safe lane and exact measured message with keyboard target action",async()=>{
+ const view=resolvedView(),call=view.steps[0],target=view.participants.at(-1);
+ const result=await render(view);assert.equal(result.status,"rendered",result.reason);
+ assert.match(result.source,/S->>P1:/);assert.ok(!result.source.includes(target.label),"repository punctuation must be encoded");
+ assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),2);
+ const message=page.locator(`.pele-edge-label[data-trellis-step-id="${call.id}"]`);
+ assert.equal(await message.getAttribute("data-trellis-call-id"),call.callId);
+ assert.match(await message.textContent(),/lexical_decoy/);
+ await message.click();await message.focus();await page.keyboard.press("Enter");
+ assert.deepEqual(await page.evaluate(()=>window.picks.map(step=>step.id)),[call.id,call.id]);
+ const action=page.locator(`.pele-actor[data-trellis-target-id="${target.id}"]`).first();
+ assert.match(await action.getAttribute("aria-label"),/Open callee sequence/);
+ await action.click();await action.focus();await page.keyboard.press("Enter");await page.keyboard.press("Space");
+ assert.deepEqual(await page.evaluate(()=>window.targetPicks.map(item=>({id:item.declaration.id,callId:item.step.callId,exact:item.exact}))),
+   Array.from({length:3},()=>({id:target.id,callId:call.callId,exact:true})));
+ assert.equal(await page.evaluate(()=>window.picks.length),2,"opening declaration must not select or read the call site");
+ await page.evaluate(()=>window.current=false);await action.click({force:true});
+ assert.equal(await page.evaluate(()=>window.targetPicks.length),3);
+ assert.deepEqual(violations.filter(error=>/Content Security Policy|CSP/.test(error)),[]);
+});
+
+test("hidden resolved calls leave no lane; nested and collapsed calls preserve exact occurrence identity",async()=>{
+ const view=resolvedView(),leaf=structuredClone(view.steps[0]);
+ view.steps=[{...leaf,hidden:true}];
+ assert.equal((await render(view)).status,"rendered");
+ assert.equal(await page.locator(".pele-message").count(),0);
+ assert.equal(await page.locator("[data-trellis-target-id]").count(),0);
+ assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),1);
+ view.steps=[{...leaf,id:"resolved:guard",kind:"branch",callId:null,target:null,callEvidence:null,children:[leaf]}];
+ assert.equal((await render(view)).status,"rendered");
+ assert.equal(await page.locator(`.pele-edge-label[data-trellis-step-id="${leaf.id}"]`).getAttribute("data-trellis-call-id"),leaf.callId);
+ const second={...structuredClone(leaf),id:"resolved:second",callId:"second:call",target:null,callEvidence:null};
+ view.steps=[{...leaf,id:"resolved:group",kind:"group",callId:null,target:null,callEvidence:null,children:[leaf,second]}];
+ const collapsed=await render(view);assert.equal(collapsed.status,"rendered",collapsed.reason);
+ const preview=page.locator('.pele-edge-label[data-trellis-step-id="resolved:group"]');
+ assert.equal(await preview.getAttribute("data-trellis-preview-call-id"),leaf.callId);
+ assert.match(await preview.textContent(),/entry preview/);
+ await page.locator("button.sequence-group-control").click();
+ assert.equal(await page.locator(`.pele-edge-label[data-trellis-step-id="${leaf.id}"]`).getAttribute("data-trellis-call-id"),leaf.callId);
+ assert.equal(await page.locator(`.pele-note[data-trellis-step-id="${second.id}"]`).getAttribute("data-trellis-call-id"),second.callId);
+});
+
+test("self targets reuse seed lane and same-name declarations keep separate exact lanes",async()=>{
+ const self=resolvedView();self.participants[0].declaration=structuredClone(self.seed);self.steps[0].target=self.seed.id;
+ const selfResult=await render(self);assert.equal(selfResult.status,"rendered",selfResult.reason);
+ assert.match(selfResult.source,/S->>S:/);
+ assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),1);
+ const selfAction=page.locator(`.pele-actor[data-trellis-target-id="${self.seed.id}"]`).first();
+ await selfAction.focus();await page.keyboard.press("Enter");
+ assert.equal(await page.evaluate(()=>window.targetPicks[0]?.declaration.id),self.seed.id);
+ const view=resolvedView(),first=view.participants.at(-1),other=structuredClone(first);
+ other.id="exact:other-target";other.declaration.id=other.id;other.declaration.path="other-target.rs";
+ view.participants.push(other);view.steps.push({...structuredClone(view.steps[0]),id:"resolved:same-name",callId:"same-name:call",target:other.id});
+ const result=await render(view);assert.equal(result.status,"rendered",result.reason);
+ assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),3);
+ assert.equal(await page.locator(".pele-message").count(),2);
+ for(const participant of [first,other]) await page.locator(`.pele-actor[data-trellis-target-id="${participant.id}"]`).first().click();
+ assert.deepEqual(await page.evaluate(()=>window.targetPicks.map(item=>({id:item.declaration.id,path:item.declaration.path}))),
+   [first,other].map(item=>({id:item.id,path:item.declaration.path})));
+});
+
+test("malformed, contradictory and dangling target evidence refuses Pele without fabricated legacy targets",async()=>{
+ const cases=[
+   view=>{delete view.steps[0].callEvidence;},
+   view=>{delete view.steps[0].target;},
+   view=>{view.steps[0].callEvidence.resolution="ambiguous";},
+   view=>{view.steps[0].target="not-a-participant";},
+   view=>{view.participants.at(-1).declaration.id="different:declaration";},
+   view=>{delete view.participants.at(-1).declaration;},
+   view=>{view.participants.at(-1).declaration.range.startLine=0;},
+   view=>{view.steps[0].callEvidence.freshness="stale";},
+   view=>{view.steps[0].callEvidence.boundaryReason="ambiguous";},
+   view=>{view.steps[0].callEvidence.dispatch="dynamic";},
+   view=>{delete view.steps[0].callEvidence.provenanceId;}
+ ];
+ for(const change of cases) {
+   const view=resolvedView();change(view);
+   const outcome=await renderWithVisibleFallback(view);
+   assertVisibleFallback(outcome,[view.steps[0].id],view.steps[0].label);
+   assert.match(outcome.reason,/target|evidence|declaration/i);
    assert.equal(await page.locator(".sequence-arrow").count(),0);
+   assert.equal(await page.locator("[data-trellis-target-id]").count(),0);
    assert.equal(await page.locator(".sequence-participant-label").count(),1);
  }
- const dangling={...original,steps:[{...leaf,target:"not-a-participant"}]};
- assert.match((await renderWithVisibleFallback(dangling)).reason,/Witnessed call target/);
+ for(const enclosing of ["hidden","branch","group"]) {
+   const view=resolvedView(),leaf=view.steps[0];leaf.target="not-a-participant";
+   if(enclosing==="hidden") leaf.hidden=true;
+   else view.steps=[{...structuredClone(leaf),id:`invalid:${enclosing}`,kind:enclosing,callId:null,target:null,callEvidence:null,children:[leaf]}];
+   const result=await render(view);
+   assert.equal(result.status,"unsupported",`${enclosing} contradictory evidence must not be ignored`);
+   assert.match(result.reason,/target|evidence|declaration/i);
+ }
+});
+
+test("engine boundary states remain labelled source notes without navigation targets",async()=>{
+ const states={external:"External boundary",unresolved:"Unresolved target",ambiguous:"Ambiguous target",dispatch:"Dispatch boundary",
+   stale:"Stale evidence",missingEvidence:"missing semantic evidence",nodeLimit:"participant limit"};
+ const view=resolvedView(),leaf=view.steps[0];
+ view.steps=Object.keys(states).map((reason,i)=>({...structuredClone(leaf),id:`boundary:${reason}`,callId:`boundary:call:${i}`,target:null,
+   callEvidence:{boundaryReason:reason,resolution:reason==="ambiguous"?"ambiguous":"unresolved",dispatch:reason==="dispatch"?"dynamic":"direct",freshness:reason==="stale"?"stale":"fresh",provenanceId:`proof:${i}`}}));
+ const outcome=await render(view);assert.equal(outcome.status,"rendered",outcome.reason);
+ for(const [reason,label] of Object.entries(states)) assert.ok((await page.locator(`.pele-note[data-trellis-step-id="boundary:${reason}"]`).textContent()).includes(label),reason);
+ assert.equal(await page.locator(".pele-message,[data-trellis-target-id]").count(),0);
+ assert.equal(await page.locator(".pele-actor:not(.pele-actor-footer)").count(),1);
+});
+
+test("legacy fallback preserves resolved arrows, declaration actions and original source selection",async()=>{
+ const view=resolvedView();
+ await page.evaluate(view=>{
+   const container=document.querySelector("#sequence-diagram");window.current=true;window.picks=[];window.targetPicks=[];
+   TrellisSequence.render(container,view,null,new Set(),{isCurrent:()=>window.current,onSelect:step=>window.picks.push(step),
+     onOpenTarget:(declaration,step)=>window.targetPicks.push({declaration,step,exact:declaration===view.participants.at(-1).declaration&&step===view.steps[0]})});
+ },view);
+ assert.equal(await page.locator(".sequence-arrow[data-trellis-call-id]").count(),1);
+ assert.equal(await page.locator(".sequence-participant-label").count(),2);
+ const action=page.locator(`.sequence-participant-label[data-trellis-target-id="${view.steps[0].target}"]`);
+ await action.focus();await page.keyboard.press("Enter");await page.keyboard.press("Space");
+ assert.equal(await page.evaluate(()=>window.targetPicks.length),2);
+ assert.equal(await page.evaluate(()=>window.targetPicks.every(item=>item.exact)),true);
+ const row=page.locator(`[data-source-step-id="${view.steps[0].id}"]`);await row.focus();await page.keyboard.press("Enter");
+ assert.equal(await page.evaluate(()=>window.picks[0]?.callId),view.steps[0].callId);
+ await page.evaluate(()=>window.current=false);await action.click({force:true});
+ assert.equal(await page.evaluate(()=>window.targetPicks.length),2);
+});
+
+test("changed resolved message or participant mapping refuses all target and source actions",async()=>{
+ const view=resolvedView();
+ const results=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram"),original=window.pele,results=[];
+   for(const mutation of ["message-id","message-text","participant-id","participant-text","message-order"]) {
+     const changed=structuredClone(view);
+     if(mutation==="message-order") changed.steps.push({...structuredClone(changed.steps[0]),id:"resolved:other",callId:"resolved:other-call",label:"different_call"});
+     container.replaceChildren();let selections=0,sources=0,targets=0;
+     window.pele={render:(...args)=>{
+       const output=original.render(...args);
+       // Change trusted renderer output before production validation, not the installed DOM.
+       let svg=output.svg;
+       if(mutation==="message-id") svg=svg.replace(/(class="pele-edge pele-message" data-id=")[^"]+/,"$1i999");
+       if(mutation==="message-text") svg=svg.replace("lexical_decoy","changed_decoy");
+       if(mutation==="participant-id") svg=svg.replace(/(class="pele-node pele-actor[^"]*" data-id=")P1/,"$1P999");
+       if(mutation==="participant-text") svg=svg.replace("actual &lt;T&gt; &amp; café","altered &lt;T&gt; &amp; café");
+       if(mutation==="message-order") svg=svg.replace(/(class="pele-edge-label" data-id=")i1/,"$1i2");
+       if(svg===output.svg) throw Error(`Mutation ${mutation} did not match renderer output`);
+       return {...output,svg};
+     }};
+     try {
+       const outcome=await TrellisPeleSequence.render(container,changed,()=>sources++,new Set(),{onSelect:()=>selections++,onOpenTarget:()=>targets++});
+       results.push({mutation,status:outcome.status,reason:outcome.reason,nodes:container.childElementCount,selections,sources,targets});
+     }finally{window.pele=original;}
+   }
+   return results;
+ },view);
+ for(const result of results) {
+   assert.equal(result.status,"unsupported",result.mutation);
+   assert.match(result.reason,/Changed Pele message|Changed Pele participant/,result.mutation);
+   assert.equal(result.nodes,0,result.mutation);
+   assert.equal(result.selections+result.sources+result.targets,0,result.mutation);
+ }
+});
+
+test("detached resolved lane and message actions cannot act on a newer pinned view",async()=>{
+ const view=resolvedView();
+ const result=await page.evaluate(async view=>{
+   const container=document.querySelector("#sequence-diagram");let active="old",targets=0,selections=0,sources=0;
+   const first=await TrellisPeleSequence.render(container,view,()=>sources++,new Set(),{isCurrent:()=>active==="old",onSelect:()=>selections++,onOpenTarget:()=>targets++});
+   if(first.status!=="rendered") throw Error(first.reason);
+   const lane=container.querySelector(".pele-actor[data-trellis-target-id]"),message=container.querySelector(".pele-edge-label[data-trellis-step-id]");
+   const next=structuredClone(view);next.revision.indexRevision++;next.steps[0].id="new:resolved:occurrence";
+   active="new";
+   const second=await TrellisPeleSequence.render(container,next,()=>sources++,new Set(),{isCurrent:()=>active==="new",onSelect:()=>selections++,onOpenTarget:()=>targets++});
+   for(const node of [lane,message]) for(const event of [new MouseEvent("click",{bubbles:true}),new KeyboardEvent("keydown",{key:"Enter",bubbles:true}),new KeyboardEvent("keydown",{key:" ",bubbles:true})]) node.dispatchEvent(event);
+   return {status:second.status,targets,selections,sources,newMessage:!!container.querySelector('.pele-edge-label[data-trellis-step-id="new:resolved:occurrence"]')};
+ },view);
+ assert.equal(result.status,"rendered");assert.equal(result.newMessage,true);
+ assert.equal(result.targets+result.selections+result.sources,0);
 });
 
 test("malformed SVG and duplicate IDs fall back without partial diagram",async()=>{
@@ -138,7 +305,7 @@ test("changed visible positional note text with intact IDs refuses source action
    const original=window.pele;
    window.pele={render:(...args)=>{
      const output=original.render(...args);
-     return {...output,svg:output.svg.replace("Static possible paths - target and timing unknown","Static possible paths - target and timing altered")};
+     return {...output,svg:output.svg.replace("Static possible paths - not a runtime trace","Static possible paths - altered runtime trace")};
    }};
    try{return await TrellisPeleSequence.render(container,view,step=>window.sourceActions.push(step),new Set(),{onSelect:step=>window.picks.push(step)});}
    finally{window.pele=original;}

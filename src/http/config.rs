@@ -50,11 +50,12 @@ impl super::DaemonState {
             .explicit_options
             .then(|| Arc::new(config.options.clone()));
         let enabled = config.dependency_options.is_some();
+        let published_config = Arc::new(config);
         {
             // Swap and reset the catalog under its lock, so a refresh that
             // checked the old version cannot schedule against the new one.
             let mut index = self.dependencies.lock().unwrap();
-            *self.config.write().unwrap() = Arc::new(config);
+            *self.config.write().unwrap() = published_config.clone();
             index
                 .cancel
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -65,6 +66,7 @@ impl super::DaemonState {
             index.state = if enabled { "loading" } else { "disabled" };
         }
         *self.explicit_pending.lock().unwrap() = explicit;
+        self.start_dependency_index_for(&published_config);
         self.inbox.wake();
     }
 }

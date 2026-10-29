@@ -445,9 +445,7 @@ fn evidence_read(
                         && let Some(head) = &search_head
                         && !head.resident()?
                     {
-                        return Ok(crate::daemon::search::SearchQuery::unavailable(Some(
-                            search.status_handle().backend(),
-                        )));
+                        return Ok(search.unavailable_query());
                     }
                     match search.query_embedding(query, cancel, deadline, Some(budget.clone())) {
                         Ok(prepared) => Ok(prepared),
@@ -954,7 +952,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     &cancel,
                     &publish,
                 ) {
-                    Ok((read, degraded)) => {
+                    Ok(DescribeResult {
+                        read,
+                        degraded,
+                        search_availability,
+                    }) => {
                         match read {
                             Ok(DescribedSnapshot {
                                 data: Some((status, counts)),
@@ -1000,6 +1002,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         match degraded {
                             Ok(degraded) if envelope.get("data").is_some() => {
                                 envelope["data"]["watcherDegraded"] = serde_json::json!(degraded);
+                                envelope["data"]["searchIndex"] =
+                                    serde_json::to_value(search_availability)?;
                             }
                             Err(error) => envelope = tools::failure(&id, mcp_read_error(&error)),
                             _ => {}
@@ -1050,6 +1054,12 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let limit = args.get("limit").map_or(search::DEFAULT_LIMIT, |value| {
                         wire::uint(value).expect("validated search limit") as usize
                     });
+                    let role =
+                        args.get("role")
+                            .map_or(crate::search_rank::SearchRole::Any, |value| {
+                                serde_json::from_value(value.clone())
+                                    .expect("validated search role")
+                            });
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |runtime, response, sampled, prepared| {
                         let prepared = prepared.expect("search query prepared before admission");
@@ -1066,6 +1076,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             expected.is_none_or(|expected| expected == pin),
                             "revision conflict: expected basis differs from admitted head"
                         );
+                        let policy = response.mcp_search_policy(query, pin, role, &mut check)?;
                         let service = runtime.search_service();
                         let head = runtime.browser_scheduler()?.search_head_slot(false);
                         if service.is_some_and(|service| service.model_configured())
@@ -1084,6 +1095,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 query,
                                 pin,
                                 declarations,
+                                &policy,
                                 &mut check,
                             )?;
                             let head = head.as_ref().expect("published head selected");
@@ -1101,6 +1113,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 service.cache_epoch(),
                                 &lexical,
                                 prepared.vector.as_deref(),
+                                &policy,
                                 &mut vector_check,
                             );
                             match ranked {
@@ -1124,15 +1137,21 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     query,
                                     pin,
                                     declarations,
+                                    &policy,
                                     &mut check,
                                 )?;
-                                let ranked = crate::search_rank::fuse_lexical(&lexical, &mut check);
+                                let ranked =
+                                    crate::search_rank::fuse_lexical(&lexical, &policy, &mut check);
                                 (declarations, ranked, lexical)
                             }
                             None => {
                                 // Standalone registries have no matrix owner.
-                                let candidates =
-                                    response.mcp_search_candidates(query, expected, &mut check)?;
+                                let candidates = response.mcp_search_candidates(
+                                    query,
+                                    Some(pin),
+                                    &policy,
+                                    &mut check,
+                                )?;
                                 let mut vector_check = || {
                                     check()?;
                                     if let Some(budget) = prepared.budget() {
@@ -1149,6 +1168,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                         snapshot,
                                         prepared.model_id(),
                                         prepared.vector.as_deref(),
+                                        &policy,
                                         &mut vector_check,
                                     )
                                 };
@@ -1159,6 +1179,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     _ => crate::search_rank::rank_lexical(
                                         &candidates.cards,
                                         &candidates.lexical,
+                                        &policy,
                                         &mut check,
                                     ),
                                 };
@@ -1174,7 +1195,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 ) =>
                             {
                                 (
-                                    crate::search_rank::fuse_lexical(&lexical, &mut check)?,
+                                    crate::search_rank::fuse_lexical(
+                                        &lexical, &policy, &mut check,
+                                    )?,
                                     true,
                                 )
                             }
@@ -1185,7 +1208,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 {
                                     check()?;
                                     (
-                                        crate::search_rank::fuse_lexical(&lexical, &mut check)?,
+                                        crate::search_rank::fuse_lexical(
+                                            &lexical, &policy, &mut check,
+                                        )?,
                                         true,
                                     )
                                 } else {
@@ -1239,6 +1264,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 symbols,
                                 matched_by,
                                 search_index,
+                                role,
                             },
                             root,
                             sampled,
@@ -1513,6 +1539,12 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
 
 /// Activation, the selected read and published watcher health for one
 /// describe call, on the call's own worker.
+struct DescribeResult {
+    read: anyhow::Result<DescribedSnapshot>,
+    degraded: anyhow::Result<bool>,
+    search_availability: crate::search_model::SearchAvailability,
+}
+
 fn describe(
     registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
     key: &str,
@@ -1521,7 +1553,7 @@ fn describe(
     deadline: std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
     admitted: &dyn Fn(bool),
-) -> anyhow::Result<(anyhow::Result<DescribedSnapshot>, anyhow::Result<bool>)> {
+) -> anyhow::Result<DescribeResult> {
     let existing = registry.blocking_lock().runtime(key);
     let runtime = match existing {
         Some(runtime) => runtime,
@@ -1531,7 +1563,11 @@ fn describe(
         },
     };
     let read = read_describe(&runtime, selected, deadline, cancel, admitted);
-    Ok((read, runtime.mcp_watcher_degraded()))
+    Ok(DescribeResult {
+        read,
+        degraded: runtime.mcp_watcher_degraded(),
+        search_availability: runtime.search_availability(),
+    })
 }
 
 /// Outstanding non-call requests per connection; more are refused at once

@@ -87,10 +87,12 @@ rust() {
   cargo fmt --all -- --check
   cargo clippy --locked --all-targets -- -D warnings
   cargo clippy --locked --all-targets --features test-support -- -D warnings
+  cargo build --locked --features test-support --bin trellis
+  cp "$target_dir/debug/trellis" "$target_dir/debug/trellis-navigation-fixture"
   cargo build --locked --bin trellis
   python3 tools/verify-40-query-performance.py --smoke --binary "$target_dir/debug/trellis"
   browser_system_deps
-  TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs
+  TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/navigation-resolved.test.cjs
 }
 tests() {
   if ! nextest_version=$(cargo nextest --version 2>/dev/null); then
@@ -122,7 +124,7 @@ checks() {
   node --test tests/factory-config.test.cjs
   node docs/semantic-evidence/check-policy.mjs --self-test
   node --check web/app.js
-  node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs
+  node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs
 }
 
 lanes="rust tests semantic cohorts checks"

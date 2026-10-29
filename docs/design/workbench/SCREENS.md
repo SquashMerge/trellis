@@ -175,7 +175,9 @@ All diagram views share:
 
 - Measured sequence for `Store::navigation_at` (`src/store.rs:1732`).
 - Follow the sequence fidelity rules in SPEC §9:
-  - Unresolved calls are drawn as such.
+  - Fresh exact internal targets from the sole published semantic producer have declaration lanes. Measured call steps draw call arrows; source boundaries keep their context as notes, without an unconditional arrow. Select a row to inspect its original call site. Callable targets offer **Open callee sequence**; other declarations offer **Read declaration source**, at the same revision.
+  - Unbound, unresolved, ambiguous, stale, external and dispatch-boundary calls are labelled from engine evidence, with no fabricated declaration targets. Zero or multiple producers keep the measured syntax-only view.
+  - Collapsed chains preview only the first measured call and its proven target. Hidden or folded later calls do not introduce lanes. Full and Files mini sequences use the same targets and history owner.
   - No invented returns or activations.
   - Every guard and alternate is preserved.
 - **Needs:** the existing SequenceView DTO (`docs/sequence-slice-contract.md`).

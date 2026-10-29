@@ -1,5 +1,58 @@
 # File / method / sequence vertical slice
 
+## Current resolved sequence contract (#378)
+
+The sequence is a static possible-path view, not an observed runtime trace. Its syntax
+adapters preserve measured call IDs, source ranges, evaluation order, guards, alternates,
+hidden entries and nested boundaries. Semantic enrichment never flattens or reorders them.
+
+`SequenceView.revision` and `POST /api/sequence.expectedRevision` are `IndexPin` values,
+not integer revisions. All evidence and declaration targets are read inside the same
+selected SQLite transaction. No provider, filesystem read, index request or callee-body
+expansion is performed by enrichment.
+
+The store uses the sole published semantic producer at that selected snapshot. Zero
+producers preserves the syntax-only DTO. Multiple producers preserves syntax and adds
+`multiple semantic producers; showing syntax`; it never picks or merges producers.
+A sole producer that does not cover the seed language also preserves the plain
+syntax-only DTO, including receiver hints, without semantic labels or declarations.
+
+A measured call step may contain `callEvidence`:
+
+- `boundaryReason`: the call-graph engine's `none`, `external`, `unresolved`, `ambiguous`,
+  `dispatch`, `stale`, `nodeLimit`, or `missingEvidence`.
+- Optional `resolution`, `dispatch`, `freshness`, and `provenanceId`: the selected semantic
+  binding/provenance fields, not the older graph-model resolution enum.
+- `target`: present only for a fresh exact resolved internal direct/constructor target
+  located in this snapshot. It is the exact participant ID, not lexical receiver text.
+
+Resolved participants have `declaration: Symbol`; the seed has the same witness in an
+enriched view. Navigation uses that declaration with `view.revision`. Ambiguous candidates,
+external symbols, dispatch possibilities, stale targets and missing evidence never create
+a target lane or declaration action. The legacy step `resolution` stays absent; it is not
+a competing source of semantic truth. Syntax participants are hints, not declarations.
+
+Every measured occurrence is classified by the shared engine **before grouping**. Graph
+answers retain their existing grouping and navigation behavior. Groupable repeated calls
+therefore retain distinct sequence IDs, source positions and evidence. Chain previews
+represent only their first measured call, not a guessed terminal target.
+
+`semanticWarnings` carries the engine's structured warnings (omitted when empty); their
+messages also appear in `warnings`. Existing syntax warnings are preserved. No warning
+code or resolution is invented by the browser. Bounds remain 200 steps, 20 participants
+and depth 24. If a resolved target cannot fit, its boundary is `nodeLimit`, its target is
+absent, and the view is truncated with an explicit participant-limit warning.
+
+Typed integrity, busy and pin failures abort the entire response, never returning a
+partially enriched view. Lanes/arrows prove static declaration targets only: no runtime
+receiver identity, timing, activations or return edges are inferred.
+
+## Original syntax slice notes
+
+The notes below record the initial syntax-only slice; current revision and semantic DTO
+rules above supersede its historical integer-revision and targetless descriptions.
+
+
 Primary interaction: indexed file tree -> expand file INLINE to methods -> click method ->
 sequence diagram alongside tree. This uses no provider calls. Keep existing inspector/question
 features accessible but secondary. Preserve selected root and explicit expansion.

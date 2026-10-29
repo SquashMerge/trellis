@@ -155,6 +155,10 @@ fn native_components(
 pub fn language_of(path: &str) -> s::Language {
     if path.ends_with(".js") {
         s::Language::Javascript
+    } else if path.ends_with(".py") {
+        s::Language::Python
+    } else if path.ends_with(".java") {
+        s::Language::Java
     } else {
         s::Language::Rust
     }
@@ -480,6 +484,31 @@ fn evidence(
     (semantic, captured)
 }
 
+/// Add another validated producer with complete, empty coverage for cardinality fixtures.
+pub fn add_second_producer(
+    publication: &mut trellis::semantic_evidence::SemanticPublication,
+    captured: &mut trellis::semantic_evidence::CapturedComponents,
+) {
+    let id = "semantic.second";
+    let mut producer = publication.producers[0].clone();
+    producer.id = id.into();
+    publication.producers.push(producer.clone());
+    publication.producers.sort_by(|a, b| a.id.cmp(&b.id));
+    for mut coverage in publication.coverage.clone() {
+        coverage.producer_id = id.into();
+        coverage.observed_roles.clear();
+        publication.coverage.push(coverage);
+    }
+    captured.requested_producers.push(producer);
+    captured
+        .producer_executables
+        .insert(id.into(), b"exe".to_vec());
+    captured.artifacts.insert(
+        (id.into(), trellis::native_ids::digest(b"", b"artifact")),
+        b"artifact".to_vec(),
+    );
+}
+
 /// A store that publishes one revision per [`Publisher::publish`] call.
 pub struct Publisher {
     pub store: Store,
@@ -492,7 +521,10 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn open(state: &Path, root: &Path) -> Self {
-        let store = Store::open_for_tests(state, root).unwrap();
+        Self::from_store(Store::open_for_tests(state, root).unwrap(), root)
+    }
+
+    pub fn from_store(store: Store, root: &Path) -> Self {
         let pin = store.index_baseline().unwrap();
         Self {
             store,
@@ -506,6 +538,15 @@ impl Publisher {
 
     /// Writes the spec's files, indexes the workspace and publishes it as the next revision.
     pub fn publish(&mut self, spec: &Spec) -> IndexPin {
+        self.publish_with_semantic(spec, |_, _| {})
+    }
+
+    /// Adjust fixture evidence before the production publication validator admits it.
+    pub fn publish_with_semantic(
+        &mut self,
+        spec: &Spec,
+        transform: impl FnOnce(&mut s::SemanticPublication, &mut s::CapturedComponents),
+    ) -> IndexPin {
         for (path, text) in &spec.files {
             let path = self.root.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -516,7 +557,8 @@ impl Publisher {
             index_workspace_bundle(&options, self.store.root_id(), &self.cancel, |_| {}).unwrap();
         let leader = self.store.publication_for_tests().unwrap();
         self.pin = if spec.producer {
-            let (semantic, captured) = evidence(spec, &native, &self.root);
+            let (mut semantic, mut captured) = evidence(spec, &native, &self.root);
+            transform(&mut semantic, &mut captured);
             self.store
                 .publish_native_semantic(
                     &graph,

@@ -209,7 +209,6 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
     let attached = Command::new("/usr/bin/hdiutil")
         .args(["attach", "-nobrowse", "-mountpoint"])
         .arg(&mount)
-        .arg("-quiet")
         .arg(&image)
         .output()
         .unwrap();
@@ -218,8 +217,16 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
         "hdiutil attach: {}",
         String::from_utf8_lossy(&attached.stderr)
     );
+    // Attach output starts with the whole device, before its partitions.
+    // Keep that identity: a failed eject may already have unmounted the volume.
+    let attach_output = String::from_utf8(attached.stdout).unwrap();
+    let device = attach_output.split_whitespace().next().unwrap();
+    assert!(
+        device.starts_with("/dev/disk"),
+        "hdiutil attach: {attach_output}"
+    );
     struct Mounted {
-        path: std::path::PathBuf,
+        device: std::path::PathBuf,
         attached: bool,
     }
     impl Mounted {
@@ -229,7 +236,7 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
             let mut failures = Vec::new();
             for attempt in 0..4 {
                 let mut command = Command::new("/usr/bin/hdiutil");
-                command.arg("detach").arg(&self.path);
+                command.arg("detach").arg(&self.device);
                 if attempt == 3 {
                     command.arg("-force");
                 }
@@ -254,7 +261,7 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
         }
     }
     let mut mounted = Mounted {
-        path: mount.clone(),
+        device: device.into(),
         attached: true,
     };
     let mounted_device = std::fs::metadata(&mount).unwrap().dev();
@@ -321,6 +328,18 @@ fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
     );
     drop(guard);
     drop(store);
+    // A detach can unmount the volume before failing to eject the image.
+    // Exercise that state: cleanup must still address the attached device.
+    let unmounted = Command::new("/usr/bin/hdiutil")
+        .arg("unmount")
+        .arg(&mount)
+        .output()
+        .unwrap();
+    assert!(
+        unmounted.status.success(),
+        "hdiutil unmount: {}",
+        String::from_utf8_lossy(&unmounted.stderr)
+    );
     mounted.detach().unwrap();
     assert_ne!(
         std::fs::metadata(&mount).unwrap().dev(),

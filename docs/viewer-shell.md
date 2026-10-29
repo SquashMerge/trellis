@@ -57,7 +57,7 @@ and notes are not restored by this presentation behavior.
 ## Metric tree and inspector
 
 Use [`metrics:v1`](metrics.md), explicitly scoped to **production callables** by default. The
-unchecked **Include tests in metrics** checkbox switches the selection to `all`; unchecking it
+unchecked **Include tests and fixtures in metrics** checkbox switches the selection to `all`; unchecking it
 requests `production`. API/CLI omission still defaults to `all`, and `test` is available there.
 Stored native declaration roles are authoritative for Rust, Java, Python and JavaScript under
 Decision 0011; the browser does not classify filenames. Default color is cognitive complexity
@@ -69,7 +69,9 @@ The Diagrams Explorer remains live filesystem metadata. Only `indexedPath` joins
 Directory paths must map inside the verified indexed workspace; outside paths, symlinks, nonindexed
 files and ambiguous source-set/language matches have no metric evidence. Expanding a path for
 metrics never reads source, starts indexing or calls a provider. Compacted directory chains inspect
-their terminal displayed directory. Filtering still searches loaded entries only. Files instead
+their terminal displayed directory. Files the server reports as an unsupported source type
+collapse into one quiet marker per folder that keeps their count and names; other unindexed
+reasons keep their own rows. Filtering still searches loaded entries only. Files instead
 uses the pinned indexed-file catalog: its cached source must remain reachable when a live file
 has been deleted. That catalog is not a claim about the current filesystem or Git changed set.
 
@@ -81,12 +83,17 @@ rankings follow the selected role. Test-only files have unavailable production h
 Callable-range LOC/SLOC may overlap and are not production physical file lines. Per-file
 `roleCounts` describe all measured production/test callables at the pin, not physical line coverage.
 
-Heat cut values are quartiles of finite metric values on the **currently displayed file/directory
-rows**, after loaded-entry filtering, expansion and pagination. Sort values ascending; for n values
-choose cuts at `min(n-1,floor(n*p))` for p=0.25,0.5,0.75. The band is the number of cuts strictly
-less than the value, so ties remain together and repeated cuts may leave empty bands. The legend
-shows the actual cuts (`≤a`, `>a–b`, `>b–c`, `>c`); an empty sample has no invented zero cuts.
-Maintainability reverses color severity only, retaining the original values and higher-is-better label.
+Heat uses the shared [fixed per-callable bands](metrics.md#workbench-heat-395) by default,
+including in the explorer. Explorer rows show a swatch and number; whenever they do, an explorer
+legend names their metric, aggregate and population and states the bands, in every Diagrams view.
+Max and mean use the same bands; sum is neutral
+and labelled relative totals. **Relative**, off by default, explicitly uses quartiles of the
+currently displayed finite file/directory rows after loaded-entry filtering, expansion and
+pagination. The legend always names the scale. Maintainability reverses severity, not values.
+Browser requests set `workbench=true`: tests, fixture roots, authored hidden layers and the
+vendored `web/vendor/` directory do not contribute default heat. Hidden counts describe excluded
+callables/files, not physical lines. Include tests and fixtures restores that population except
+vendor files. Files still exposes excluded indexed source.
 Color selection does not fetch; aggregation refreshes the pinned projection. Role changes clear
 old heat and inspection before fetching; response-currentness checks include role alongside
 aggregate, checkout/session, full pin and request serial. A late same-pin response from another
@@ -109,7 +116,7 @@ local assets. Existing authentication, Host/Origin checks and token behavior rem
 
 The [Treemap tab](treemap.md) shows nested indexed folders and files with physical-line
 area, explicitly labelled “includes inline test lines”. Cognitive/max production heat
-is the default. Hide test files is independent of Include tests in metrics. The
+is the default. Hide test files is independent of Include tests and fixtures in metrics. The
 revision-bound inspector and explicit indexed-source action share the desktop panel
 and mobile drawer with the other views. Tiny and empty files remain in an equivalent
 keyboard file list. Architecture can open an exact file at the same full pin.

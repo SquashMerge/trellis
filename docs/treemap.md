@@ -24,7 +24,7 @@ Defaults are Cognitive / max, production heat, and **Hide test files** enabled.
 Hide test files removes a file with stored test role or a test-only callable
 population (`production=0,test>0`). Mixed files remain visible. Zero/zero does not
 imply production: the stored root role determines empty-file eligibility.
-**Include tests in metrics** independently requests all callables. It neither
+**Include tests and fixtures in metrics** independently requests all callables. It neither
 reveals hidden files nor changes the area units. Showing test files leaves their
 production heat unavailable, not zero.
 
@@ -32,9 +32,14 @@ production heat unavailable, not zero.
 
 Color choices are Prod/test, Cyclomatic, Cognitive, Max nesting, Maintainability,
 Halstead volume and Fan-out. Max/sum/mean are the existing raw callable folds.
-Visible finite file values determine quartile cuts; ties remain together.
-Maintainability alone reverses severity because higher is better. The legend
-shows the actual cuts. “—” means unavailable, not zero. Test files have dashed
+The shared [fixed bands](metrics.md#workbench-heat-395) apply to max/mean; sum is neutral
+and labelled relative totals. **Relative**, off by default, uses visible finite file quartiles;
+ties remain together. Maintainability reverses severity because higher is better. The legend
+always names the scale. Browser `workbench=true` excludes stored tests, fixture roots, authored
+hidden layers and `web/vendor/` from default heat, with hidden counts. Include tests and fixtures
+restores tests/fixtures/hidden-layer metrics, not vendor metrics. All file rows and physical area
+remain; excluded files are still reachable through Files.
+“—” means unavailable, not zero. Test files have dashed
 outlines; full role/count evidence remains in the inspector.
 
 Directories drill down and breadcrumbs go up. Path and language filters act on
@@ -61,10 +66,19 @@ partial interactive diagram. Repository text enters labels and SVG titles throug
 native geometry/font slots; unlabelled tiny tiles remain unlabelled.
 
 The generated-source, SVG and DOM limits remain 512 KiB, 8 MiB and 12000 nodes.
-No `font-size` appears in treemap classDefs. Scope size determines natural layout
-size, up to 4000×4000 px; Pele's nodeWidth/nodeHeight use one tenth of those pixel
-dimensions. Large diagrams scroll within the canvas rather than shrinking all
-text. Desktop panes and mobile Explorer/Inspector drawers keep existing ownership.
+No `font-size` appears in treemap classDefs. The layout fills the diagram box's
+measured size, at least 640×360 px. When that leaves a positive-area file less
+than 2500 px² on average, it grows in the box's aspect ratio, up to 4000 px per
+side; Pele's nodeWidth/nodeHeight use one tenth of those pixel dimensions. A
+resize relayouts the same admitted files once it settles, only when the layout
+size changes, keeping the selection and without another metrics read. Large
+diagrams scroll within the canvas rather than shrinking all text. Desktop panes
+and mobile Explorer/Inspector drawers keep existing ownership.
+
+The root section and its breadcrumb show the checkout directory's name from the
+observed workspace root when one source set owns every indexed file; otherwise,
+or without an observed root, they show the source set. The full label and SVG
+title keep the exact source set.
 
 Root, session, full index pin, role, aggregate and request serial fence responses,
 async rendering and indexed-source actions. Scope/filter changes invalidate pending

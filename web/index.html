@@ -16,6 +16,7 @@
   <script src="/shell.js" defer></script>
   <script src="/classes.js" defer></script>
   <script src="/navigation.js" defer></script>
+  <script src="/metric-heat.js" defer></script>
   <script src="/viewer-metrics.js" defer></script>
   <script src="/files.js" defer></script>
   <script src="/architecture-pele.js" defer></script>
@@ -40,11 +41,7 @@
       <select id="checkout-select" data-testid="checkout-select" disabled><option value="">Choose a checkout</option></select>
       <button id="checkout-retry" type="button" hidden>Retry checkout list</button>
       <span id="checkout-state" role="status" aria-live="polite">Loading checkouts…</span>
-      <span id="checkout-root" class="checkout-root" data-testid="checkout-root">No checkout selected</span>
-      <span id="catching-up" class="warning" role="status" aria-live="polite" hidden>Catching up — evidence may be stale</span>
-      <span id="daemon-state" class="detail" role="status"></span>
     </section>
-    <div class="workspace-identity"><strong id="workspace-name">Code inspection</strong><span id="workspace-meta">Local workspace</span><span id="workspace-git" hidden></span><span id="workspace-index-state" class="index-state" data-state="unknown" role="status"><span class="state-shape" aria-hidden="true"></span><span id="workspace-index-label">Index status unavailable</span></span></div>
     <div class="header-actions">
       <button id="explorer-toggle" class="mobile-toggle" type="button" aria-controls="explorer-panel" aria-expanded="false">Explorer</button>
       <button id="inspector-toggle" class="mobile-toggle" type="button" aria-controls="call-inspector" aria-expanded="false">Inspector</button>
@@ -76,11 +73,29 @@
     <p id="notice" role="status" aria-live="polite">Connect to inspect a checkout. Indexing starts only when you request it.</p>
     <div id="workspace" hidden>
       <section class="workspace-toolbar" aria-labelledby="status-title">
-        <div class="bar workspace-actions"><h2 id="status-title">Workspace</h2><button id="refresh" type="button">Refresh status &amp; view</button><button id="index" type="button">Index workspace</button><button id="cancel" type="button" hidden>Stop waiting</button>
-          <details id="workspace-details"><summary>Status &amp; diagnostics</summary><div class="workspace-status"><p id="status"></p><h3>Diagnostics</h3><pre id="diagnostics"></pre></div></details>
+        <div class="bar workspace-actions">
+          <h2 id="status-title" class="sr-only">Workspace</h2>
+          <span id="workspace-index-state" class="index-state" data-state="unknown" role="status" aria-live="polite"><span class="state-shape" aria-hidden="true"></span><span id="workspace-index-label">Index status unavailable</span></span>
+          <button id="refresh" type="button">Refresh</button>
+          <button id="index" type="button">Index workspace</button>
+          <button id="cancel" type="button" hidden>Stop waiting</button>
+          <div id="retained-pin-status" class="retained-pin-status" role="status" aria-live="polite" hidden><span aria-hidden="true">◇</span><span id="retained-pin-label"></span><button id="reload-head" type="button">Reload at head</button></div>
+          <details id="workspace-details">
+            <summary>Diagnostics</summary>
+            <div class="workspace-status">
+              <h3>Selected checkout</h3>
+              <div class="workspace-identity"><strong id="workspace-name">Code inspection</strong><span id="workspace-meta">Local workspace</span><span id="workspace-git" hidden></span></div>
+              <p id="checkout-root" class="checkout-root" data-testid="checkout-root">No checkout selected</p>
+              <p id="daemon-state" class="detail" role="status"></p>
+              <p id="catching-up" class="warning" role="status" aria-live="polite" hidden>Catching up — evidence may be stale</p>
+              <p id="status"></p>
+              <p id="job" role="status"></p>
+              <p id="stale" class="warning" hidden></p>
+              <h3>Diagnostics</h3>
+              <pre id="diagnostics"></pre>
+            </div>
+          </details>
         </div>
-        <div id="retained-pin-status" class="retained-pin-status" role="status" aria-live="polite" hidden><span aria-hidden="true">◇</span><span id="retained-pin-label"></span><button id="reload-head" type="button">Reload at head</button></div>
-        <p id="job" role="status"></p><p id="stale" class="warning" hidden></p>
       </section>
       <div class="workspace-frame">
         <aside id="explorer-panel" aria-labelledby="files-title" class="file-browser">
@@ -89,7 +104,7 @@
             <ul id="indexed-checkouts" class="plain" aria-label="Indexed checkouts"></ul>
             <p class="detail">Agents can use these indexes through <code>trellis mcp</code>.</p>
           </section>
-          <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><label class="file-hidden-toggle"><input id="show-hidden-files" type="checkbox"/> Show hidden/ignored</label><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
+          <h2 id="files-title">Files</h2><p class="browse-root" id="browse-root"></p><details class="browse-scope"><summary>Index scope &amp; file access</summary><p class="detail" id="browse-scope">Working directory files · indexed files have methods</p></details><label class="file-filter-label" for="file-filter">Filter loaded entries</label><input id="file-filter" placeholder="Path contains…" type="search"/><label class="file-hidden-toggle"><input id="show-hidden-files" type="checkbox"/> Show hidden/ignored</label><details class="browse-options"><summary>Display options</summary><p><label><input id="all-methods" type="checkbox"/> Show all methods</label></p></details><div class="bar"><button hidden="" id="reveal-method">Reveal selected method</button><button hidden="" id="retry-files">Retry file list</button></div><p id="files-state" role="status"></p><div role="group" id="explorer-metric-legend" class="metric-legend explorer-legend" aria-label="Explorer metric legend"></div><ul class="file-tree plain" id="file-tree"></ul><button hidden="" id="more-files">Load more files</button></aside>
         <div class="canvas-area">
           <nav id="diagram-tabs" class="view-tabs" aria-label="Workspace views" role="tablist">
             <button id="view-architecture" role="tab" type="button" aria-selected="false" aria-controls="architecture-panel" tabindex="-1">Architecture</button>
@@ -111,7 +126,8 @@
             </select>
             <label for="metric-aggregate">Aggregation</label>
             <select id="metric-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
-            <label><input id="metric-include-tests" type="checkbox"> Include tests in metrics</label>
+            <label><input id="metric-include-tests" type="checkbox"> Include tests and fixtures in metrics</label>
+            <label><input id="metric-relative" type="checkbox"> Relative</label>
             <div id="metric-legend" class="metric-legend" aria-label="Metric heat legend"></div>
             <p id="metrics-state" role="status" aria-live="polite"></p>
           </div>
@@ -120,7 +136,8 @@
               <div class="architecture-controls">
                 <label for="architecture-color">Color by</label><select id="architecture-color"><option value="layer">Layer</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
                 <label for="architecture-aggregate">Aggregation</label><select id="architecture-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
-                <label><input id="architecture-metric-tests" type="checkbox"> Include tests in metrics</label>
+                <label><input id="architecture-metric-tests" type="checkbox"> Include tests and fixtures in metrics</label>
+                <label><input id="architecture-relative" type="checkbox"> Relative</label>
                 <label><input id="architecture-tests" type="checkbox"> Test-only edges</label>
                 <label><input id="architecture-deviations-only" type="checkbox"> Deviations only</label>
               </div>
@@ -169,11 +186,11 @@
             <div class="architecture-status"><p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p>
             <p id="architecture-focus-state" class="architecture-display-note" role="status" aria-live="polite"></p></div>
             <div id="architecture-legend" class="metric-legend" aria-label="Architecture metric heat legend"></div>
-            <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Select a layer band or directory to expand it; select a module or edge for evidence."></div>
+            <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Select a layer band to fold it or a module chip to open its files; select a file or edge for evidence."></div>
             <div class="architecture-display-footers">
             <div id="architecture-quiet" class="architecture-display-footer" hidden><button id="architecture-quiet-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-quiet-names" class="detail"></span></div>
             <div id="architecture-hidden" class="architecture-display-footer" hidden><button id="architecture-hidden-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-hidden-names" class="detail"></span></div></div>
-            <p class="architecture-edge-legend">Solid: production · Dashed: test-only (never production violations) · Down: allowed · Up / peer / shared outbound: policy verdict shown · Exceptions and unknowns remain explicit.</p>
+            <p class="architecture-edge-legend">Arrows and band chips count reference sites · ↓ downward (allowed) · ↑ upward: always a deviation; an arrow marked “excepted” is a reviewed exception, counted under “excepted” (not ↑) in band chips · arrows ↔ between peers, ← shared outbound; band chip ⇄ counts both when they deviate · → into shared (allowed) · error colour: unexcepted deviation · Solid: production · Dashed: test-only (never production violations) · Exceptions and unknowns remain explicit.</p>
             <details id="architecture-notices" class="warning-disclosure"><summary>Architecture coverage &amp; notices</summary><p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent.</p><div id="architecture-notice-content"></div></details>
           </section>
           <section id="treemap-panel" class="view-panel" role="tabpanel" aria-labelledby="view-treemap" hidden>
@@ -181,7 +198,8 @@
             <div class="treemap-controls">
               <label for="treemap-color">Color by</label><select id="treemap-color"><option value="role">Prod/test</option><option value="cyclomatic">Cyclomatic</option><option value="cognitive" selected>Cognitive</option><option value="maxNesting">Max nesting</option><option value="maintainabilityIndex">Maintainability (inverted heat)</option><option value="halstead.volume">Halstead volume</option><option value="fanOut">Fan-out</option></select>
               <label for="treemap-aggregate">Aggregation</label><select id="treemap-aggregate"><option value="max">max</option><option value="sum">sum</option><option value="mean">mean</option></select>
-              <label><input id="treemap-metric-tests" type="checkbox"> Include tests in metrics</label>
+              <label><input id="treemap-metric-tests" type="checkbox"> Include tests and fixtures in metrics</label>
+              <label><input id="treemap-relative" type="checkbox"> Relative</label>
               <label><input id="treemap-hide-tests" type="checkbox" checked> Hide test files</label>
               <label for="treemap-path">Path contains</label><input id="treemap-path" type="search" placeholder="Filter indexed paths…">
               <label for="treemap-language">Language</label><select id="treemap-language"><option value="">All languages</option><option value="rust">Rust</option><option value="java">Java</option><option value="python">Python</option><option value="javascript">JavaScript</option></select>
@@ -189,7 +207,7 @@
             <p class="treemap-basis">Area: physical file lines · includes inline test lines. Heat: measured callable metrics, not runtime evidence.</p>
             <nav id="treemap-breadcrumbs" aria-label="Treemap directory"></nav>
             <p id="treemap-state" role="status" aria-live="polite">Open Treemap to read indexed file lines and metrics.</p>
-            <div id="treemap-legend" class="metric-legend" aria-label="Treemap heat legend"></div>
+            <div role="group" id="treemap-legend" class="metric-legend" aria-label="Treemap heat legend"></div>
             <div id="treemap-diagram" tabindex="0" aria-label="Lines by folder. Scroll to explore; select a file or directory."></div>
             <details class="treemap-file-list"><summary>Files in this scope · includes empty and tiny files</summary><div id="treemap-files"></div></details>
           </section>
@@ -212,7 +230,7 @@
           <section id="source-dock" aria-label="Read-only source" hidden>
             <div class="source-dock-bar"><div class="dock-tabs" role="tablist" aria-label="Source views"><button id="dock-workspace" role="tab" type="button" aria-selected="true" aria-controls="workspace-source-panel">Workspace source</button><button id="dock-library" role="tab" type="button" aria-selected="false" aria-controls="library-source-panel">Library source</button></div><button id="source-dock-close" type="button" aria-label="Close source panel">Close</button></div>
             <div id="workspace-source-panel" role="tabpanel" aria-labelledby="dock-workspace"><section aria-labelledby="source-title"><div id="files-source-toolbar" hidden><div role="group" aria-label="Source basis"><button id="files-indexed" type="button" aria-pressed="true">Indexed</button><button id="files-working" type="button" aria-pressed="false" hidden>Working tree · uncommitted vs HEAD</button></div><p id="files-git-state" role="status"></p><p id="files-basis-note"></p></div><h2 id="source-title">Source <span class="muted">· read only</span></h2><div id="files-empty" hidden><h3>Read an indexed file</h3><p>Choose a file in the explorer. Source and symbols stay on the shown indexed revision.</p></div><div id="files-diff" role="region" aria-label="Uncommitted changes against HEAD" tabindex="0" hidden></div><p id="source-path">Choose a call to read its cached source snapshot.</p><pre aria-label="Read-only indexed source" id="source" tabindex="0"></pre></section></div>
-            <div id="library-source-panel" role="tabpanel" aria-labelledby="dock-library" hidden><h3>Candidate source <span class="muted">· read only</span></h3><p id="external-source-path" role="status">Choose an indexed definition or a manual source file to read a candidate snapshot.</p><ul class="plain" id="external-warnings"></ul><label for="external-filter">Filter loaded definitions</label><input disabled="" id="external-filter" placeholder="OpenOptions…" type="search"/><ul class="plain" id="external-definitions"></ul><div class="bar"><button disabled="" id="external-previous" type="button">Previous lines</button><button disabled="" id="external-next" type="button">Next lines</button></div><pre aria-label="Read-only external candidate source" id="external-source" tabindex="0"></pre></div>
+            <div id="library-source-panel" role="tabpanel" aria-labelledby="dock-library" hidden><h3>Candidate source <span class="muted">· read only</span></h3><p id="external-source-path" role="status">Choose an indexed definition or a manual source file to read a candidate snapshot.</p><ul class="plain" id="external-warnings"></ul><label for="external-filter">Filter loaded definitions</label><input disabled="" id="external-filter" placeholder="OpenOptions…" type="search"/><ul class="plain" id="external-definitions"></ul><div class="bar"><button disabled="" id="external-previous" type="button">Previous lines</button><button disabled="" id="external-next" type="button">Next lines</button></div><p id="external-source-hint" class="warning" hidden></p><pre aria-label="Read-only external candidate source" id="external-source" tabindex="0"></pre></div>
           </section>
         </div>
         <aside id="call-inspector" class="call-inspector" aria-labelledby="inspector-heading">

@@ -257,6 +257,422 @@ impl GraphSource for SnapshotGraphSource<'_> {
     }
 }
 
+/// Bound the exact facts the shared decoder will read, without loading unrelated tuple facts.
+fn navigation_call_budget(
+    db: &Connection,
+    tuple: i64,
+    call: &[u8],
+    reader: &mut crate::navigation::Reader<'_>,
+) -> Result<bool> {
+    let sql = "SELECT length(CAST(json_object('tuple_id',tuple_id,'revision_id',revision_id,'producer_id',producer_id,'producer_version',producer_version,'language',language,'path',path,'requested',requested,'selected',selected,'state',state,'diagnostic',diagnostic) AS BLOB)) FROM semantic_coverage WHERE tuple_id=?1
+UNION ALL
+SELECT length(CAST(json_object('tuple_id',tuple_id,'kind',kind,'ordinal',ordinal,'role',role) AS BLOB)) FROM semantic_coverage_roles WHERE tuple_id=?1
+UNION ALL
+SELECT length(CAST(json_object('id',id,'version',version,'executable_hash',executable_hash,'kind',kind,'position_encoding',position_encoding) AS BLOB)) FROM semantic_producers WHERE (id,version) IN (SELECT producer_id,producer_version FROM semantic_coverage WHERE tuple_id=?1)
+UNION ALL
+SELECT length(CAST(json_object('id',id,'version',version,'language',language,'ordinal',ordinal) AS BLOB)) FROM semantic_producer_languages WHERE (id,version) IN (SELECT producer_id,producer_version FROM semantic_coverage WHERE tuple_id=?1)
+UNION ALL
+SELECT length(CAST(json_object('binding_id',binding_id,'tuple_id',tuple_id,'ordinal',ordinal,'call_id',hex(call_id),'join_document_language',join_document_language,'join_document_path',join_document_path,'join_native_revision_id',join_native_revision_id,'join_content_hash',join_content_hash,'join_start',join_start,'join_end',join_end,'join_kind',join_kind,'join_status',join_status,'join_diagnostic',join_diagnostic,'resolution',resolution,'declared_kind',declared_kind,'declared_internal_syntax_id',hex(declared_internal_syntax_id),'declared_internal_language',declared_internal_language,'declared_internal_path',declared_internal_path,'declared_internal_native_revision_id',declared_internal_native_revision_id,'declared_external_scheme',declared_external_scheme,'declared_external_symbol',declared_external_symbol,'declared_external_scope',declared_external_scope,'declared_external_language',declared_external_language,'declared_external_path',declared_external_path,'dispatch',dispatch,'possible_dispatch_complete',possible_dispatch_complete,'stale_target',stale_target,'provenance_id',provenance_id) AS BLOB)) FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2
+UNION ALL
+SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'kind',kind,'internal_syntax_id',hex(internal_syntax_id),'internal_language',internal_language,'internal_path',internal_path,'internal_native_revision_id',internal_native_revision_id,'external_scheme',external_scheme,'external_symbol',external_symbol,'external_scope',external_scope,'external_language',external_language,'external_path',external_path) AS BLOB)) FROM semantic_call_candidates WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+UNION ALL
+SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'kind',kind,'internal_syntax_id',hex(internal_syntax_id),'internal_language',internal_language,'internal_path',internal_path,'internal_native_revision_id',internal_native_revision_id,'external_scheme',external_scheme,'external_symbol',external_symbol,'external_scope',external_scope,'external_language',external_language,'external_path',external_path) AS BLOB)) FROM semantic_call_possible_dispatch WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+UNION ALL
+SELECT length(CAST(json_object('binding_id',binding_id,'ordinal',ordinal,'candidate_id',hex(candidate_id)) AS BLOB)) FROM semantic_call_join_candidates WHERE binding_id IN (SELECT binding_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+UNION ALL
+SELECT length(CAST(json_object('tuple_id',tuple_id,'provenance_id',provenance_id,'content_hash',content_hash,'evidence_kind',evidence_kind,'freshness',freshness,'basis_id',basis_id,'capture_id',capture_id,'derived_from_provenance_id',derived_from_provenance_id,'derived_from_record_kind',derived_from_record_kind,'derived_from_fact_digest',derived_from_fact_digest) AS BLOB)) FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2)
+UNION ALL
+SELECT length(CAST(json_object('basis_id',basis_id,'tuple_id',tuple_id,'producer_id',producer_id,'producer_version',producer_version,'producer_hash',producer_hash,'artifact_hash',artifact_hash,'language',language,'source_set_id',source_set_id,'captured_native_revision_id',captured_native_revision_id,'source_manifest_hash',source_manifest_hash,'toolchain_hash',toolchain_hash,'config_hash',config_hash,'dependency_hash',dependency_hash) AS BLOB)) FROM semantic_basis WHERE basis_id IN (SELECT basis_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+UNION ALL
+SELECT length(CAST(json_object('basis_id',basis_id,'ordinal',ordinal,'lookup_key',lookup_key) AS BLOB)) FROM semantic_basis_lookup_dependencies WHERE basis_id IN (SELECT basis_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+UNION ALL
+SELECT length(CAST(json_object('capture_id',capture_id,'proof_id',proof_id,'record_kind',record_kind,'fact_digest',fact_digest,'language',language,'path',path) AS BLOB)) FROM semantic_raw_proofs WHERE (capture_id,proof_id) IN (SELECT capture_id,derived_from_provenance_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+UNION ALL
+SELECT length(CAST(json_object('capture_id',capture_id,'producer_id',producer_id,'artifact_hash',artifact_hash,'source_set_id',source_set_id,'captured_revision',captured_revision,'decoder_version',decoder_version) AS BLOB)) FROM semantic_raw_captures WHERE capture_id IN (SELECT capture_id FROM semantic_provenance WHERE tuple_id=?1 AND provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?2))
+LIMIT ?3";
+    let mut statement = db.prepare(sql)?;
+    let mut rows = statement.query(params![
+        tuple,
+        call,
+        (crate::navigation::QUERY_ROWS + 1) as i64
+    ])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > crate::navigation::QUERY_ROWS || !reader.charge(row.get::<_, i64>(0)? as usize) {
+            reader.clipped();
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn navigation_calls(
+    store: &Store,
+    db: &Connection,
+    selected: &ReadRevision,
+    document: Option<&SelectedDocument>,
+    selector: &crate::navigation::SourceSelector,
+    reader: &mut crate::navigation::Reader<'_>,
+) -> Result<()> {
+    use crate::native_evidence::{Call, Range};
+    let Some(producer) = selector.semantic_producer_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(document) = document else {
+        return Ok(());
+    };
+    let (source_set_id, revision_id): (String, String) = db.query_row(
+        "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
+        [&selected.key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let snapshot = GraphSnapshot {
+        source_set_id: source_set_id.clone(),
+        revision_id: revision_id.clone(),
+    };
+    let mut check = || Ok(());
+    let mut source = SnapshotGraphSource {
+        db,
+        selected,
+        producer: Some(producer.to_string()),
+        snapshot: snapshot.clone(),
+        scopes: BTreeMap::new(),
+        declaration_roles: BTreeMap::new(),
+        facts: GraphFacts::memo(snapshot),
+        check: &mut check,
+    };
+    let Some(languages) = source.producer_languages(producer)? else {
+        return Err(crate::navigation::InvalidRequest(
+            "Semantic producer is not published for the selected revision.",
+        )
+        .into());
+    };
+    if !languages.contains(&document.file.language) {
+        return Ok(());
+    }
+    let key = DocumentKey {
+        source_set_id,
+        language: document.file.language.clone(),
+        path: selector.path.clone(),
+    };
+    let tuple: Option<i64> = db.query_row(
+        "SELECT tuple_id FROM semantic_coverage WHERE revision_id=?1 AND producer_id=?2 AND language=?3 AND path=?4",
+        params![selected.key, producer, key.language, key.path], |row| row.get(0),
+    ).optional()?;
+    let tuple = tuple.context(SelectedIntegrity("missing producer coverage tuple".into()))?;
+    let proof_id = source.scope(&key)?.proof_id();
+    let mut target_documents = BTreeMap::new();
+    let local = document.graph_calls.iter().filter(|call| {
+        call.path == selector.path
+            && call.range.start_line <= selector.line
+            && (call.range.end_line > selector.line
+                || call.range.end_line == selector.line && call.range.end_column > 1)
+    });
+    for (index, measured) in local.enumerate() {
+        if index >= crate::navigation::QUERY_ROWS
+            || !reader.charge(serde_json::to_vec(measured)?.len())
+        {
+            reader.clipped();
+            break;
+        }
+        let call = Call {
+            id: measured.id.clone(),
+            owner_syntax_id: measured.caller.clone(),
+            ordinal: measured.ordinal,
+            document: key.clone(),
+            revision_id: revision_id.clone(),
+            range: Range {
+                start: measured.range.start_byte,
+                end: measured.range.end_byte,
+            },
+            callee_range: measured.callee_range.as_ref().map(|range| Range {
+                start: range.start_byte,
+                end: range.end_byte,
+            }),
+            spelling: measured.callee_text.clone(),
+            region_ids: measured.regions.clone(),
+            provenance_id: proof_id.clone(),
+        };
+        let encoded = id_codec::encode_occ(&call.id).context(SelectedIntegrity(
+            "invalid selected navigation call ID".into(),
+        ))?;
+        if !navigation_call_budget(db, tuple, &encoded, reader)? {
+            break;
+        }
+        let facts = read_semantic_tuple_for_call(
+            db,
+            &selected.key,
+            Some(tuple),
+            None,
+            true,
+            Some(&encoded),
+        )?;
+        let [coverage] = <[_; 1]>::try_from(facts.coverage)
+            .map_err(|_| SelectedIntegrity("corrupt selected semantic coverage".into()))?;
+        let semantic = SemanticDocument {
+            coverage,
+            provenance: facts
+                .provenance
+                .into_iter()
+                .map(|proof| (proof.id.clone(), proof))
+                .collect(),
+            call_bindings: facts.call_bindings,
+            declaration_bindings: vec![],
+            symbols: vec![],
+            type_relationships: vec![],
+        };
+        let Some((id, target_key)) =
+            crate::graph_query::resolved_call_target(Some(&semantic), &call)
+                .map_err(engine_error)?
+        else {
+            continue;
+        };
+        if source.locate(id)?.as_ref() != Some(target_key) {
+            continue;
+        }
+        if !target_documents.contains_key(target_key) {
+            let target = if target_key == &key {
+                document.nodes.clone()
+            } else {
+                store
+                    .selected_graph_document_for(db, &target_key.path, selected)?
+                    .nodes
+            };
+            target_documents.insert(target_key.clone(), target);
+        }
+        if let Some(symbol) = target_documents[target_key]
+            .iter()
+            .find(|symbol| symbol.id == id && symbol.path == target_key.path)
+        {
+            for symbol in reader.symbol_records([symbol.clone()])? {
+                reader.add_call(symbol, &call)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enrich the existing syntax tree at its already selected transaction/revision.
+pub(super) fn sequence_calls(
+    store: &Store,
+    db: &Connection,
+    selected: &ReadRevision,
+    view: &mut crate::behavior::SequenceView,
+) -> Result<()> {
+    use crate::graph_query::{self as engine, BoundaryReason, GraphEdge, GraphNode, Visit};
+    let producers = db
+        .prepare(
+            "SELECT id FROM semantic_revision_producers WHERE revision_id=?1 ORDER BY id LIMIT 2",
+        )?
+        .query_map([&selected.key], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for producer in &producers {
+        if !engine::valid_producer_id(producer) {
+            return Err(SelectedIntegrity("invalid selected semantic producer ID".into()).into());
+        }
+    }
+    if producers.len() != 1 {
+        if producers.len() > 1 {
+            view.warnings
+                .push("multiple semantic producers; showing syntax".into());
+        }
+        return Ok(());
+    }
+    let producer = producers[0].clone();
+    let (source_set_id, revision_id): (String, String) = db.query_row(
+        "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
+        [&selected.key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let snapshot = GraphSnapshot {
+        source_set_id: source_set_id.clone(),
+        revision_id: revision_id.clone(),
+    };
+    let mut check = || Ok(());
+    let mut source = SnapshotGraphSource {
+        db,
+        selected,
+        producer: Some(producer.clone()),
+        snapshot: snapshot.clone(),
+        scopes: BTreeMap::new(),
+        declaration_roles: BTreeMap::new(),
+        facts: GraphFacts::memo(snapshot),
+        check: &mut check,
+    };
+    let languages = source.producer_languages(&producer)?;
+    let key = source
+        .locate(&view.seed.id)?
+        .ok_or_else(|| SelectedIntegrity("selected sequence declaration missing".into()))?;
+    let document = source.document(&key)?;
+    let declaration = document
+        .declarations
+        .get(&view.seed.id)
+        .ok_or_else(|| SelectedIntegrity("selected sequence declaration missing".into()))?
+        .clone();
+    let Some(semantic) = engine::semantic(languages.as_ref(), &document).map_err(engine_error)?
+    else {
+        return Ok(());
+    };
+    // Syntax receiver groups are display hints, not resolved participant lanes.
+    view.participants
+        .retain(|participant| participant.id == view.seed.id);
+    let calls: BTreeMap<_, _> = document
+        .calls
+        .get(&view.seed.id)
+        .into_iter()
+        .flatten()
+        .map(|call| (call.id.as_str(), call))
+        .collect();
+    if let Some(participant) = view.participants.iter_mut().find(|p| p.id == view.seed.id) {
+        participant.declaration = Some(view.seed.clone());
+    }
+    struct Enrichment<'a, 'b> {
+        store: &'a Store,
+        db: &'a Connection,
+        selected: &'a ReadRevision,
+        source: &'b mut dyn GraphSource,
+        semantic: Option<&'a SemanticDocument>,
+        calls: &'a BTreeMap<&'a str, &'a crate::native_evidence::Call>,
+        participants: &'b mut Vec<crate::behavior::Participant>,
+        edges: Vec<GraphEdge>,
+        limited: bool,
+    }
+    impl Enrichment<'_, '_> {
+        fn steps(&mut self, steps: &mut [crate::behavior::SequenceStep]) -> Result<()> {
+            for step in steps {
+                self.source.check_work()?;
+                if let Some(call) = step.call_id.as_deref().and_then(|id| self.calls.get(id)) {
+                    let disposition = engine::call_disposition(self.semantic, call, self.source)
+                        .map_err(engine_error)?;
+                    let mut reason = disposition.boundary_reason;
+                    if reason == BoundaryReason::None {
+                        let (id, key) = disposition.exact_target.expect("eligible target is exact");
+                        if !self.participants.iter().any(|p| &p.id == id) {
+                            if self.participants.len() == 20 {
+                                reason = BoundaryReason::NodeLimit;
+                                self.limited = true;
+                            } else {
+                                let target = self
+                                    .store
+                                    .selected_graph_document_for(self.db, &key.path, self.selected)?
+                                    .nodes
+                                    .into_iter()
+                                    .find(|node| &node.id == id)
+                                    .ok_or_else(|| {
+                                        SelectedIntegrity("selected sequence target missing".into())
+                                    })?;
+                                self.participants.push(crate::behavior::Participant {
+                                    id: id.clone(),
+                                    label: target.name.clone(),
+                                    kind: serde_json::to_value(target.kind)?
+                                        .as_str()
+                                        .ok_or_else(|| {
+                                            SelectedIntegrity("invalid sequence target kind".into())
+                                        })?
+                                        .into(),
+                                    identification:
+                                        "Fresh exact semantic call target in the selected snapshot."
+                                            .into(),
+                                    declaration: Some(target),
+                                });
+                            }
+                        }
+                        if reason == BoundaryReason::None {
+                            step.target = Some(id.clone());
+                        }
+                    }
+                    let selected = disposition.selected;
+                    step.call_evidence = Some(crate::behavior::CallEvidence {
+                        boundary_reason: reason,
+                        resolution: selected.map(|(binding, _)| binding.resolution),
+                        dispatch: selected.map(|(binding, _)| binding.dispatch),
+                        freshness: selected.map(|(_, proof)| proof.freshness),
+                        provenance_id: selected.map(|(binding, _)| binding.provenance_id.clone()),
+                    });
+                    self.edges.push(GraphEdge {
+                        call_site_count: 1,
+                        call: (*call).clone(),
+                        from: call.owner_syntax_id.clone(),
+                        to: step.target.clone(),
+                        binding: selected.map(|(binding, _)| binding.clone()),
+                        visit: if step.target.is_some() {
+                            Visit::New
+                        } else {
+                            Visit::Boundary
+                        },
+                        boundary_reason: reason,
+                    });
+                }
+                self.steps(&mut step.children)?;
+                self.steps(&mut step.alternate)?;
+            }
+            Ok(())
+        }
+    }
+    let mut enrichment = Enrichment {
+        store,
+        db,
+        selected,
+        source: &mut source,
+        semantic: Some(semantic),
+        calls: &calls,
+        participants: &mut view.participants,
+        edges: vec![],
+        limited: false,
+    };
+    enrichment.steps(&mut view.steps)?;
+    let limited = enrichment.limited;
+    let edges = enrichment.edges;
+    if limited {
+        view.truncated = true;
+        view.warnings
+            .push("Sequence participant limit reached; additional targets are not shown.".into());
+    }
+    let request = GraphRequest {
+        source_set_id,
+        revision_id,
+        root_syntax_id: view.seed.id.clone(),
+        semantic_producer_id: Some(producer),
+        depth: 1,
+        max_nodes: 20,
+        max_calls: 200,
+        include_external: true,
+        include_tests: true,
+    };
+    let mut nodes = vec![GraphNode {
+        declaration,
+        depth: 0,
+    }];
+    for participant in &view.participants {
+        if participant.declaration.is_none() || participant.id == view.seed.id {
+            continue;
+        }
+        let key = source
+            .locate(&participant.id)?
+            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+        let target = source
+            .document(&key)?
+            .declarations
+            .get(&participant.id)
+            .cloned()
+            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+        nodes.push(GraphNode {
+            declaration: target,
+            depth: 1,
+        });
+    }
+    view.semantic_warnings =
+        engine::occurrence_warnings(&request, &mut source, languages.as_ref(), &nodes, &edges)
+            .map_err(engine_error)?;
+    view.warnings.extend(
+        view.semantic_warnings
+            .iter()
+            .map(|warning| warning.message.clone()),
+    );
+    Ok(())
+}
+
 impl EvidenceResponse {
     /// Answers one rooted call-graph query over the admitted head. `check` runs during
     /// node and local-call inspection and aborts the query, with no answer, when it fails.

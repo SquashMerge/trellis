@@ -22,7 +22,7 @@ function harness(withApp = false) {
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(path){requests.push(path);throw new Error("Unexpected request "+path);}});
   const run = code => vm.runInContext(code,context);
-  if(withApp)run(fs.readFileSync("web/sequence.js","utf8"));
+  run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
   if(withApp){run(fs.readFileSync("web/files.js","utf8"));run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
   if (withApp) {
@@ -107,6 +107,71 @@ test("inspector uses safe original evidence, never claims candidate confidence",
   assert.doesNotMatch(text(h.get("inspector-content"))+text(h.get("inspector-detail")),/confidence.*1\.0/);
   assert.equal(all(h.get("inspector-detail")).some(n=>n.tagName==="script"),false);
   h.get("inspector-open-source").listeners.click();assert.equal(opened,1);assert.equal(JSON.stringify(step),original);
+});
+test("declaration Inspect uses measured symbol text and pinned revision without reading source",()=>{
+  const h=harness(),symbol={id:"declaration",name:"<script>declaration</script>",kind:"method",path:"src/<tag>.rs",range,provenance:{kind:"syntax"}},revision=view().revision;
+  let opened=0;const original=JSON.stringify(symbol);
+  h.context.window.matchMedia=()=>({matches:true});
+  h.get("explorer-toggle").listeners.click();
+  h.shell.inspectSymbol(symbol,revision,()=>++opened);
+  assert.equal(opened,0);
+  assert.equal(h.get("inspector-title").textContent,symbol.name);
+  assert.equal(h.get("inspector-title").title,symbol.name);
+  assert.equal(h.get("inspector-kind").textContent,"method");
+  assert.equal(h.get("inspector-location").textContent,"src/<tag>.rs:3:2–9:7 · revision 12345678:1");
+  assert.equal(h.get("inspector-target").textContent,"Declaration only · no call target or verified dispatch");
+  assert.match(h.get("inspector-evidence").textContent,/Measured declaration syntax/);
+  assert.equal(h.get("inspector-content").hidden,false);
+  assert.equal(h.get("inspector-clear").disabled,false);
+  assert.equal(h.document.body.classList.contains("explorer-open"),false);
+  assert.equal(h.document.body.classList.contains("inspector-open"),true);
+  assert.equal(h.get("inspector-open-source").textContent,"Read declaration source");
+  assert.equal(h.get("inspector-open-source").disabled,false);
+  assert.equal(h.get("inspector-detail").children[0].tagName,"details");
+  assert.notEqual(h.get("inspector-detail").children[0].open,true);
+  assert.match(text(h.get("inspector-detail")),/<script>declaration<\/script>/);
+  assert.equal(all(h.get("inspector-detail")).some(n=>n.tagName==="script"),false);
+  assert.equal(h.get("inspector-open-source").listeners.click(),1);
+  assert.equal(JSON.stringify(symbol),original);
+  assert.deepEqual(h.requests,[]);
+});
+test("declaration source callbacks are replaced and erased by existing inspector resets",()=>{
+  const h=harness(),symbol={id:"declaration",name:"declared",kind:"function",path:"main.rs",range};let first=0,second=0,step=0;
+  h.shell.inspectSymbol(symbol,view().revision,()=>first++);
+  h.shell.inspectSymbol({...symbol,name:"next"},view().revision,()=>second++);
+  h.get("inspector-open-source").listeners.click();
+  assert.equal(first,0);assert.equal(second,1);
+  h.shell.selectStep(call(),view(),()=>step++);
+  assert.equal(h.get("inspector-open-source").textContent,"Open call site");
+  h.get("inspector-open-source").listeners.click();assert.equal(step,1);assert.equal(second,1);
+  for(const reset of [()=>h.shell.resetInspector(),()=>h.shell.setConnected(false),()=>h.get("inspector-clear").listeners.click()]){
+    h.shell.inspectSymbol(symbol,view().revision,()=>second++);reset();
+    h.get("inspector-open-source").listeners.click();
+    assert.equal(second,1);
+    assert.equal(h.get("inspector-content").hidden,true);
+    assert.equal(h.get("inspector-open-source").disabled,true);
+    assert.equal(h.get("inspector-detail").children.length,0);
+  }
+  assert.deepEqual(h.requests,[]);
+});
+test("declaration Inspect requires source witness, paired revision and explicit callback",()=>{
+  const h=harness(),symbol={id:"declaration",name:"declared",kind:"class",path:"main.rs",range};let opened=0;
+  for(const [item,revision,callback] of [
+    [{...symbol,path:""},view().revision,()=>opened++],
+    [{...symbol,range:{startLine:4,endLine:2}},view().revision,()=>opened++],
+    [symbol,null,()=>opened++],
+    [symbol,{indexGeneration:"",indexRevision:1},()=>opened++],
+    [symbol,{indexGeneration:view().revision.indexGeneration,indexRevision:1.5},()=>opened++],
+    [symbol,view().revision,null]
+  ]){
+    h.shell.inspectSymbol(item,revision,callback);
+    assert.equal(h.get("inspector-open-source").disabled,true);
+    h.get("inspector-open-source").listeners.click();
+  }
+  h.shell.inspectSymbol(null,view().revision,()=>opened++);
+  assert.equal(h.get("inspector-content").hidden,true);
+  assert.equal(opened,0);
+  assert.deepEqual(h.requests,[]);
 });
 test("group keeps first-entry target limitation, full source callback and all guard/alternate children",()=>{
   const h=harness(),group={id:"chain",kind:"group",label:"Original full chain",path:"main.rs",range,children:[call(),call("finish","other")],alternate:[]};let selected;
@@ -209,7 +274,12 @@ test("inspector keeps raw evidence folded and source action before full details"
   assert.ok(html.indexOf('id="inspector-open-source"') < html.indexOf('id="inspector-detail"'));
   const source = fs.readFileSync(path.join(__dirname, "../web/shell.js"), "utf8");
   assert.doesNotMatch(source, /evidence\(step, detail[^;]+\.open = true/);
-  assert.match(source, /"target", "resolution", "candidateSymbols"/);
+  const h = harness(), step = call();
+  h.shell.selectStep(step, view([step]), () => {});
+  const disclosure = h.get("inspector-detail").children[0];
+  assert.equal(disclosure.tagName, "details");
+  assert.notEqual(disclosure.open, true);
+  assert.match(text(disclosure), /"target": "candidate"/);
 });
 
 
@@ -356,4 +426,119 @@ test("Treemap owns its controls and inspector across view and Files transitions"
   assert.equal(h.get("diagram-metrics").hidden, true);
   h.shell.showView("sequence");
   assert.equal(h.get("diagram-metrics").hidden, false);
+});
+
+function resolvedView() {
+  const step = call("bound", "actual"), data = view([step]);
+  const declaration = {id:"actual",name:"actual_target",kind:"function",path:"target.rs",range};
+  data.participants.push({id:declaration.id,label:declaration.name,kind:"internal",declaration});
+  step.callEvidence = {boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"proof"};
+  return {data,step,declaration};
+}
+test("resolved inspector distinguishes callee action, original call site and engine evidence; detached action is inert", () => {
+  const h = harness(), {data,step,declaration} = resolvedView(), opened = [];
+  let sources = 0;
+  h.shell.selectStep(step,data,()=>++sources,(symbol,call)=>opened.push({symbol,call}));
+  assert.match(h.get("inspector-target").textContent,/Resolved declaration · actual_target · target.rs/);
+  assert.match(h.get("inspector-evidence").textContent,/direct · fresh · proof/);
+  const action = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
+  action.listeners.click(); assert.equal(opened[0].symbol,declaration); assert.equal(opened[0].call,step);
+  assert.equal(sources,0); h.get("inspector-open-source").listeners.click(); assert.equal(sources,1);
+  h.shell.resetInspector(); action.listeners.click(); assert.equal(opened.length,1);
+  h.shell.selectStep(step,data,()=>{},()=>opened.push("wrong"));
+  const replaced = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
+  h.shell.selectStep(call(),view(),()=>{}); replaced.listeners.click(); assert.equal(opened.length,1);
+});
+test("app target callback binds original call object and declaration; same-pin session/root/panel replacement is inert", async () => {
+  for (const change of ["epoch++",`selectedRootKey="other"`,"diagramSerial++","selectedMethod={id:'other'}","sectionSerial++"]) {
+    const h = harness(true), {data,step,declaration} = resolvedView(); let targetAction;
+    h.context.window.TrellisShell.selectStep = (_,__,___,target)=>{targetAction=target;};
+    h.context.fetch = async path => response(path === "/api/status" ? {revision:data.revision,workspaceRoot:"/repo"} : data);
+    await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
+    all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+    assert.equal(typeof targetAction,"function");
+    h.run(change);
+    h.context.fetch = ()=>assert.fail("obsolete target fetched");
+    const admitted = h.run("diagramSequence"), original = admitted.steps[0], symbol = admitted.participants.find(p=>p.id===original.target).declaration;
+    await targetAction(symbol,original);
+    assert.equal(h.run("selectedMethod.id"),change.includes("selectedMethod")?"other":data.seed.id);
+  }
+});
+
+test("noncallable resolved target reads exact declaration source instead of requesting a sequence", async () => {
+  const h = harness(true), {data,step,declaration} = resolvedView(); declaration.kind = "class";
+  const requests = [];
+  h.context.fetch = async path => {
+    requests.push(path);
+    if (path === "/api/status") return response({revision:data.revision,workspaceRoot:"/repo"});
+    if (path === "/api/sequence") return response(data);
+    assert.match(path,/^\/api\/source\?/); assert.match(path,/path=target.rs/);
+    return response({revision:data.revision,file:{path:"target.rs",text:"class actual_target {}"}});
+  };
+  await h.run(`selectMethod(${JSON.stringify(data.seed)})`);
+  all(h.get("sequence-diagram")).find(n=>n.attrs["data-source-step-id"]===step.id).listeners.click();
+  const action = all(h.get("inspector-detail")).find(n=>n.attrs["data-trellis-target-id"]===declaration.id);
+  assert.equal(action.textContent,"Read declaration source");
+  await action.listeners.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests.filter(path=>path === "/api/sequence").length,1);
+  assert.ok(requests.some(path=>path.startsWith("/api/source?") && path.includes("path=target.rs")));
+  assert.equal(h.get("workspace-source-panel").hidden,false);
+});
+
+test("one index status reconciles jobs, freshness, stale evidence and unavailable status", () => {
+  const h = harness(true);
+  const label = () => h.get("workspace-index-label").textContent;
+  h.run(`$("stale").hidden=true;status.catchingUp=false;renderIndexStatus();`);
+  assert.match(label(), /^Fresh/);
+  h.run(`job={state:"failed",error:{code:"index_failed",message:"<img src=x>"}};showJob();`);
+  assert.equal(label(), "Index failed · see Diagnostics");
+  assert.ok(!label().includes("index_failed"));
+  assert.match(h.get("job").textContent, /index_failed/);
+  h.run(`job={state:"running",progress:{phase:"capture",total:0,completed:0}};waitingForJob=true;showJob();`);
+  assert.match(label(), /^Indexing · capture/);
+  assert.ok(!label().includes("0/0"));
+  h.run(`job={state:"done"};showJob();stale("Inputs changed");`);
+  assert.match(label(), /^Stale evidence/);
+  h.run(`staleMessage="";$("stale").hidden=true;status.catchingUp=true;renderIndexStatus();`);
+  assert.match(label(), /^Catching up/);
+  h.run(`status.catchingUp=undefined;renderIndexStatus();`);
+  assert.match(label(), /^Indexed · idle/);
+  h.run(`statusUnavailable=true;renderIndexStatus();`);
+  assert.match(label(), /^Index status unavailable/);
+  h.run(`resetCheckout();`);
+  assert.equal(label(), "No checkout selected");
+});
+test("checkout options use short observed identity and honest Git fallbacks as text", () => {
+  const h = harness();
+  const revision = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:7};
+  const base = {workspaceRoot:"/private/long/repo",revision};
+  assert.equal(h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"branch",name:"main"}}}), "repo ⎇ main · rev 12345678:7");
+  assert.match(h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"detached",shortCommit:"abc123"}}}), /repo ⎇ Detached abc123/);
+  assert.match(h.shell.checkoutLabel({...base,git:{state:"unavailable"}}), /repo ⎇ Git unavailable/);
+  assert.match(h.shell.checkoutLabel({...base,revision:null}), /Not indexed$/);
+  const literal = h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"branch",name:"<img src=x>"}}});
+  assert.ok(literal.includes("<img src=x>"));
+  assert.ok(!literal.includes("/private/long"));
+});
+
+test("selected cold and unavailable status never borrow Fresh from checkout discovery", () => {
+  const h=harness(true);
+  h.run(`checkouts[0].revision=status.revision;checkouts[0].catchingUp=false;status=null;renderIndexStatus();`);
+  assert.equal(h.get("workspace-index-label").textContent,"Loading index status…");
+  h.run(`indexNotReady=true;renderIndexStatus();`);
+  assert.equal(h.get("workspace-index-label").textContent,"Index not ready · retry status");
+  h.run(`statusUnavailable=true;renderIndexStatus();`);
+  assert.equal(h.get("workspace-index-state").attrs["data-state"],"failed");
+});
+test("shared status follows retained head observations and completed job details use their own pin", () => {
+  const h=harness(true);
+  h.run(`status.catchingUp=false;headObservation={pin:status.revision,head:{...status.revision,indexRevision:2},failed:false};showHeadObservation(headObservation);`);
+  assert.match(h.get("workspace-index-label").textContent,/retained revision/);
+  h.run(`headObservation={pin:status.revision,head:null,failed:true};showHeadObservation(headObservation);`);
+  assert.match(h.get("workspace-index-label").textContent,/Head comparison unavailable/);
+  h.run(`job={state:"done",revision:{...status.revision,indexRevision:9}};showJob();`);
+  assert.match(h.get("job").textContent,/rev 12345678:9/);
+  assert.doesNotMatch(h.get("job").textContent,/rev 12345678:1/);
+  assert.match(h.get("workspace-index-label").textContent,/Head comparison unavailable/);
 });

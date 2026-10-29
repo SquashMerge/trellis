@@ -243,6 +243,7 @@ fn participant_cap_retains_original_target_on_overflow() {
     let (graph, mut view) = fixture("fn run() { std::fs::OpenOptions::new(); }");
     while view.participants.len() < 20 {
         view.participants.push(Participant {
+            declaration: None,
             id: format!("padding:{}", view.participants.len()),
             label: "padding".into(),
             kind: "boundary".into(),

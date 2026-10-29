@@ -616,7 +616,7 @@ fn old_disposable_format_rebuild_discards_stale_cards_and_regenerates_fts() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        26
+        27
     );
     assert_eq!(corpus(&db).len(), 1);
 }
@@ -629,7 +629,19 @@ fn admitted_search_snapshot_is_head_guarded_and_hydrates_ranked_prefix_only() {
     let first = publish(&store, root.path(), &leader, &cancel);
     let read = store.evidence_response().unwrap();
     let candidates = read
-        .mcp_search_candidates("orchard", Some(first), &mut || Ok(()))
+        .mcp_search_candidates(
+            "orchard",
+            Some(first),
+            &read
+                .mcp_search_policy(
+                    "orchard",
+                    first,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
         .unwrap();
     assert_eq!(candidates.pin, first);
     assert_eq!(candidates.cards.len(), 2);
@@ -662,14 +674,34 @@ fn admitted_search_snapshot_is_head_guarded_and_hydrates_ranked_prefix_only() {
     let second = publish(&store, root.path(), &leader, &cancel);
     let read = store.evidence_response().unwrap();
     let conflict = read
-        .mcp_search_candidates("orchard", Some(first), &mut || Ok(()))
+        .mcp_search_candidates(
+            "orchard",
+            Some(first),
+            &trellis::search_rank::SearchPolicy {
+                exact: BTreeMap::new(),
+                role: trellis::search_rank::SearchRole::Any,
+            },
+            &mut || Ok(()),
+        )
         .unwrap_err();
     assert!(conflict.to_string().contains("revision conflict"));
     assert_eq!(
-        read.mcp_search_candidates("orchard", Some(second), &mut || Ok(()))
-            .unwrap()
-            .cards
-            .len(),
+        read.mcp_search_candidates(
+            "orchard",
+            Some(second),
+            &read
+                .mcp_search_policy(
+                    "orchard",
+                    second,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(())
+                )
+                .unwrap(),
+            &mut || Ok(())
+        )
+        .unwrap()
+        .cards
+        .len(),
         2
     );
 }
@@ -684,19 +716,49 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
         .unwrap();
     let read = store.evidence_response().unwrap();
     let candidates = read
-        .mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
+        .mcp_search_candidates(
+            "the a _",
+            Some(pin),
+            &read
+                .mcp_search_policy(
+                    "the a _",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
         .unwrap();
     assert!(candidates.lexical.is_empty());
     let empty = read.mcp_search_hydrate(&[], pin, &mut || Ok(())).unwrap();
     assert_eq!(empty.scope[1], [1, 0, 1, 0, 0]);
     let error = read
-        .mcp_search_candidates("orchard", Some(pin), &mut || {
-            anyhow::bail!("deadline_exceeded")
-        })
+        .mcp_search_candidates(
+            "orchard",
+            Some(pin),
+            &trellis::search_rank::SearchPolicy {
+                exact: BTreeMap::new(),
+                role: trellis::search_rank::SearchRole::Any,
+            },
+            &mut || anyhow::bail!("deadline_exceeded"),
+        )
         .unwrap_err();
     assert_eq!(error.to_string(), "deadline_exceeded");
     let candidates = read
-        .mcp_search_candidates("orchard", Some(pin), &mut || Ok(()))
+        .mcp_search_candidates(
+            "orchard",
+            Some(pin),
+            &read
+                .mcp_search_policy(
+                    "orchard",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
         .unwrap();
     assert_eq!(
         candidates.lexical.len(),
@@ -714,8 +776,16 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
     store.corrupt_search_fts_for_tests(&leader).unwrap();
     match store.evidence_response() {
         Ok(read) => assert!(
-            read.mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
-                .is_err(),
+            read.mcp_search_candidates(
+                "the a _",
+                Some(pin),
+                &trellis::search_rank::SearchPolicy {
+                    exact: BTreeMap::new(),
+                    role: trellis::search_rank::SearchRole::Any
+                },
+                &mut || Ok(())
+            )
+            .is_err(),
             "termless query cannot hide required head table failure"
         ),
         Err(error) => assert!(
@@ -736,7 +806,15 @@ fn search_hydration_validates_coverage_only_for_hydrated_documents() {
         .unwrap();
     let read = store.evidence_response().unwrap();
     let candidates = read
-        .mcp_search_candidates("the a _", Some(pin), &mut || Ok(()))
+        .mcp_search_candidates(
+            "the a _",
+            Some(pin),
+            &trellis::search_rank::SearchPolicy {
+                exact: BTreeMap::new(),
+                role: trellis::search_rank::SearchRole::Any,
+            },
+            &mut || Ok(()),
+        )
         .unwrap();
     assert!(candidates.lexical.is_empty());
     // #261: a defect in a document no candidate reaches does not fail hydration.
@@ -744,7 +822,19 @@ fn search_hydration_validates_coverage_only_for_hydrated_documents() {
     assert!(empty.symbols.is_empty());
     assert_eq!(empty.scope[1], [1, 1, 0, 0, 1]);
     let other = read
-        .mcp_search_candidates("other", Some(pin), &mut || Ok(()))
+        .mcp_search_candidates(
+            "other",
+            Some(pin),
+            &read
+                .mcp_search_policy(
+                    "other",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
         .unwrap();
     assert_eq!(other.lexical.len(), 1);
     let error = read
@@ -760,7 +850,7 @@ fn search_hydration_validates_coverage_only_for_hydrated_documents() {
 }
 
 #[test]
-fn lexical_bm25_then_sid_order_matches_the_head_fts_without_raw_query_parsing() {
+fn lexical_nonexact_production_bm25_then_sid_matches_head_fts() {
     let (state, root, store, cancel) = fixture();
     fs::write(
         root.path().join("cards.rs"),
@@ -771,14 +861,26 @@ fn lexical_bm25_then_sid_order_matches_the_head_fts_without_raw_query_parsing() 
     let pin = publish(&store, root.path(), &leader, &cancel);
     // Existing fixture reader opens only after publication and is not used for writes.
     let db = Connection::open(db_path(state.path(), root.path())).unwrap();
-    let expression = trellis::search_lexical::query_expression(&db, "orchard")
+    let expression = trellis::search_lexical::query_expression(&db, "orchards")
         .unwrap()
         .unwrap();
     let expected: Vec<Vec<u8>> = db.prepare("SELECT syntax_id FROM head_search_fts WHERE head_search_fts MATCH ?1 ORDER BY bm25(head_search_fts),syntax_id").unwrap()
         .query_map([expression],|row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
     let read = store.evidence_response().unwrap();
     let candidates = read
-        .mcp_search_candidates("orchard", Some(pin), &mut || Ok(()))
+        .mcp_search_candidates(
+            "orchards",
+            Some(pin),
+            &read
+                .mcp_search_policy(
+                    "orchards",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
         .unwrap();
     let expected: Vec<_> = expected
         .into_iter()
@@ -797,8 +899,407 @@ fn lexical_bm25_then_sid_order_matches_the_head_fts_without_raw_query_parsing() 
         "orchard OR punctuation",
         "orchard -punctuation",
     ] {
-        read.mcp_search_candidates(query, Some(pin), &mut || Ok(()))
+        read.mcp_search_candidates(
+            query,
+            Some(pin),
+            &read
+                .mcp_search_policy(
+                    query,
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    }
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn exact_declaration_name_precedes_partial_name_and_body_matches() {
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("cards.rs"),
+        r#"/// Read request status from persistent storage, preserving queued, running,
+/// completed, cancelled and failed outcomes across daemon restarts. The caller
+/// receives the latest committed result together with its request identifier,
+/// submission timestamp and completion details.
+fn read_status_for() {}
+fn request_status() { read_status_for(); }
+#[test]
+fn read_status_for_returns_status() { read_status_for(); }
+"#,
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    let db = Connection::open(db_path(state.path(), root.path())).unwrap();
+    let roles: BTreeMap<String, String> = db
+        .prepare("SELECT name,role FROM native_version_declarations WHERE name IS NOT NULL")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(roles["read_status_for"], "production");
+    assert_eq!(roles["request_status"], "production");
+    assert_eq!(roles["read_status_for_returns_status"], "test");
+    let read = store.evidence_response().unwrap();
+    let candidates = read
+        .mcp_search_candidates(
+            "read_status_for",
+            Some(pin),
+            &read
+                .mcp_search_policy(
+                    "read_status_for",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(candidates.lexical.len(), 3);
+    let hydrated = read
+        .mcp_search_hydrate(&candidates.lexical, pin, &mut || Ok(()))
+        .unwrap();
+    let names: Vec<_> = hydrated
+        .symbols
+        .iter()
+        .map(|hit| hit.symbol.declaration.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        names[0], "read_status_for",
+        "an exact production declaration must lead partial-name and body matches: {names:?}"
+    );
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn lexical_natural_language_prefers_production_to_long_test_names() {
+    let (state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("cards.rs"),
+        r#"/// Read request status from persistent storage, preserving queued, running,
+/// completed, cancelled and failed outcomes across daemon restarts. The caller
+/// receives the latest committed result together with its request identifier,
+/// submission timestamp and completion details.
+fn read_status_for() {}
+#[test]
+fn read_request_status_survives_restart_and_reports_missing_requests() {}
+#[test]
+fn read_request_status_keeps_completed_requests_visible_after_restart() {}
+"#,
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    let db = Connection::open(db_path(state.path(), root.path())).unwrap();
+    let roles: BTreeMap<String, String> = db
+        .prepare("SELECT name,role FROM native_version_declarations WHERE name IS NOT NULL")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(roles["read_status_for"], "production");
+    for name in [
+        "read_request_status_survives_restart_and_reports_missing_requests",
+        "read_request_status_keeps_completed_requests_visible_after_restart",
+    ] {
+        assert_eq!(roles[name], "test");
+    }
+    let read = store.evidence_response().unwrap();
+    let candidates = read
+        .mcp_search_candidates(
+            "read request status",
+            Some(pin),
+            &read
+                .mcp_search_policy(
+                    "read request status",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(candidates.lexical.len(), 3);
+    let hydrated = read
+        .mcp_search_hydrate(&candidates.lexical, pin, &mut || Ok(()))
+        .unwrap();
+    let names: Vec<_> = hydrated
+        .symbols
+        .iter()
+        .map(|hit| hit.symbol.declaration.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        names[0], "read_status_for",
+        "lexical natural-language search must prefer production over long matching test names: {names:?}"
+    );
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn exact_short_stopword_and_camel_names_use_raw_stored_equality() {
+    use trellis::search_rank::SearchRole;
+    let (_state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("cards.rs"),
+        "fn a() {} fn the() {} fn readStatusFor() {} fn caller() { readStatusFor(); }\n",
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    let read = store.evidence_response().unwrap();
+    for query in ["a", "the", "readStatusFor"] {
+        let policy = read
+            .mcp_search_policy(query, pin, SearchRole::Any, &mut || Ok(()))
             .unwrap();
+        assert_eq!(policy.role, SearchRole::Any);
+        assert_eq!(policy.exact.len(), 1, "{query}");
+        let candidates = read
+            .mcp_search_candidates(query, Some(pin), &policy, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(Some(&candidates.lexical[0]), policy.exact.keys().next());
+        if query == "readStatusFor" {
+            assert!(
+                candidates.lexical.len() > 1,
+                "exact retrieval stays additive"
+            );
+        }
+    }
+    for query in [" a", "a ", "A", "ReadStatusFor", "readStatus"] {
+        assert!(
+            read.mcp_search_policy(query, pin, SearchRole::Any, &mut || Ok(()))
+                .unwrap()
+                .exact
+                .is_empty(),
+            "{query:?} must not become a raw exact match"
+        );
+    }
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn exact_match_is_admitted_before_the_lexical_depth_cutoff() {
+    use trellis::search_rank::{CANDIDATE_DEPTH, SearchRole};
+    let (state, root, store, cancel) = fixture();
+    let mut source = format!(
+        "/// {}\nfn target_name() {{}}\n",
+        (0..500)
+            .map(|i| format!("detail{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for i in 0..CANDIDATE_DEPTH + 5 {
+        source.push_str(&format!("fn target_name_partial_{i}() {{}}\n"));
+    }
+    source.push_str("#[test] fn target_name_test() {}\n");
+    fs::write(root.path().join("cards.rs"), source).unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    let read = store.evidence_response().unwrap();
+    let policy = read
+        .mcp_search_policy("target_name", pin, SearchRole::Any, &mut || Ok(()))
+        .unwrap();
+    let exact = policy.exact.keys().next().unwrap();
+    let db = Connection::open(db_path(state.path(), root.path())).unwrap();
+    let expression = trellis::search_lexical::query_expression(&db, "target_name")
+        .unwrap()
+        .unwrap();
+    let old_order: Vec<Vec<u8>> = db.prepare("SELECT syntax_id FROM head_search_fts WHERE head_search_fts MATCH ?1 ORDER BY bm25(head_search_fts),syntax_id").unwrap()
+        .query_map([expression], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    let old_rank = old_order
+        .iter()
+        .position(|sid| format!("sid:v1:{}", hex::encode(sid)) == exact.syntax_id)
+        .unwrap();
+    assert!(
+        old_rank >= CANDIDATE_DEPTH,
+        "fixture must exclude exact from ordinary BM25 depth: {old_rank}"
+    );
+    let candidates = read
+        .mcp_search_candidates("target_name", Some(pin), &policy, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(candidates.lexical.len(), CANDIDATE_DEPTH);
+    assert_eq!(&candidates.lexical[0], exact);
+    assert!(candidates.lexical[1..].iter().all(|key| key != exact));
+    let tests = read
+        .mcp_search_candidates(
+            "target_name",
+            Some(pin),
+            &read
+                .mcp_search_policy("target_name", pin, SearchRole::Test, &mut || Ok(()))
+                .unwrap(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        tests.lexical.len(),
+        1,
+        "role filtering must precede depth truncation"
+    );
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn role_filter_uses_inline_stored_roles_and_keeps_complete_head_counts() {
+    use trellis::{native_evidence::DeclarationRole, search_rank::SearchRole};
+    let (_state, root, store, cancel) = fixture();
+    fs::write(
+        root.path().join("cards.rs"),
+        "fn read_status_for() {}\nfn test_named_status() {}\n#[cfg(test)]\nmod checks { fn read_status_for() {} #[test] fn status_smoke() {} }\n",
+    )
+    .unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    let read = store.evidence_response().unwrap();
+    let count = read.mcp_search_head_count(pin, &mut || Ok(())).unwrap();
+    let any = read
+        .mcp_search_policy("read_status_for", pin, SearchRole::Any, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(any.exact.len(), 2);
+    let all = read
+        .mcp_search_candidates(
+            "status",
+            Some(pin),
+            &read
+                .mcp_search_policy("status", pin, SearchRole::Any, &mut || Ok(()))
+                .unwrap(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(all.cards.len(), count);
+    let exact = read
+        .mcp_search_candidates("read_status_for", Some(pin), &any, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(any.exact[&exact.lexical[0]], DeclarationRole::Production);
+    assert_eq!(any.exact[&exact.lexical[1]], DeclarationRole::Test);
+    for (role, stored, expected_matches) in [
+        (SearchRole::Production, DeclarationRole::Production, 2),
+        (SearchRole::Test, DeclarationRole::Test, 3),
+    ] {
+        let policy = read
+            .mcp_search_policy("read_status_for", pin, role, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(policy.exact.len(), 1);
+        assert_eq!(policy.exact.values().next(), Some(&stored));
+        let candidates = read
+            .mcp_search_candidates(
+                "status",
+                Some(pin),
+                &read
+                    .mcp_search_policy("status", pin, role, &mut || Ok(()))
+                    .unwrap(),
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            candidates.cards.len(),
+            count,
+            "coverage still describes the whole head"
+        );
+        assert_eq!(candidates.lexical.len(), expected_matches);
+        assert!(candidates.lexical.iter().all(|key| {
+            candidates
+                .cards
+                .iter()
+                .any(|card| &card.key == key && card.role == stored)
+        }));
+        assert!(
+            candidates
+                .lexical
+                .iter()
+                .any(|key| policy.exact.contains_key(key))
+        );
+    }
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn query_policy_tracks_admitted_publication_and_has_typed_cancellation() {
+    use trellis::search_rank::SearchRole;
+    let (_state, root, store, cancel) = fixture();
+    let leader = store.publication_for_tests().unwrap();
+    let first = publish(&store, root.path(), &leader, &cancel);
+    let read = store.evidence_response().unwrap();
+    let before = read
+        .mcp_search_policy("orchard", first, SearchRole::Production, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(before.exact.len(), 1);
+    let stopped = read
+        .mcp_search_policy("orchard", first, SearchRole::Any, &mut || {
+            anyhow::bail!("deadline_exceeded")
+        })
+        .unwrap_err();
+    assert_eq!(stopped.to_string(), "deadline_exceeded");
+    read.finish(()).unwrap();
+    drop(read);
+    fs::write(root.path().join("cards.rs"), "#[test] fn orchard() {}\n").unwrap();
+    let second = publish(&store, root.path(), &leader, &cancel);
+    let read = store.evidence_response().unwrap();
+    assert!(
+        read.mcp_search_policy("orchard", first, SearchRole::Any, &mut || Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("revision conflict")
+    );
+    let production = read
+        .mcp_search_policy("orchard", second, SearchRole::Production, &mut || Ok(()))
+        .unwrap();
+    assert!(production.exact.is_empty());
+    assert_eq!(production.role, SearchRole::Production);
+    let tests = read
+        .mcp_search_policy("orchard", second, SearchRole::Test, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(tests.exact.len(), 1);
+    assert!(
+        tests
+            .exact
+            .keys()
+            .all(|key| !before.exact.contains_key(key))
+    );
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn indexed_exact_policy_keeps_language_lookup_derivations_and_raw_equality() {
+    use trellis::search_rank::SearchRole;
+    let (_state, root, store, cancel) = fixture();
+    fs::write(root.path().join("cards.rs"), "fn r#type() {}\n").unwrap();
+    fs::write(root.path().join("names.py"), "def Kelvin():\n    pass\n").unwrap();
+    fs::write(
+        root.path().join("Names.java"),
+        "class Names { void café() {} }\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("names.js"), r"function caf\u00e9() {}").unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    let read = store.evidence_response().unwrap();
+    let count = read.mcp_search_head_count(pin, &mut || Ok(())).unwrap();
+    for query in ["r#type", "Kelvin", "café", r"caf\u00e9"] {
+        let policy = read
+            .mcp_search_policy(query, pin, SearchRole::Any, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(policy.exact.len(), 1, "{query}");
+        let lexical = read
+            .mcp_search_lexical(query, pin, count, &policy, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(lexical.first(), policy.exact.keys().next(), "{query}");
+    }
+    for query in ["type", "Kelvin", "CAFÉ"] {
+        assert!(
+            read.mcp_search_policy(query, pin, SearchRole::Any, &mut || Ok(()))
+                .unwrap()
+                .exact
+                .is_empty(),
+            "{query}"
+        );
     }
     read.finish(()).unwrap();
 }

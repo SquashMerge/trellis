@@ -151,6 +151,10 @@ fn is_syntax_id(id: &str) -> bool {
     })
 }
 
+pub(crate) fn valid_producer_id(id: &str) -> bool {
+    !id.is_empty()
+}
+
 impl GraphRequest {
     /// Rejects out-of-range input as `invalidRequest` naming the field; nothing is clamped.
     pub fn validate(&self) -> std::result::Result<(), GraphError> {
@@ -175,7 +179,11 @@ impl GraphRequest {
         if !is_syntax_id(&self.root_syntax_id) {
             return invalid("rootSyntaxId", "rootSyntaxId must be a syntax ID");
         }
-        if self.semantic_producer_id.as_deref() == Some("") {
+        if self
+            .semantic_producer_id
+            .as_deref()
+            .is_some_and(|id| !valid_producer_id(id))
+        {
             return invalid("semanticProducerId", "semanticProducerId must not be empty");
         }
         Ok(())
@@ -532,7 +540,7 @@ fn selected_incomplete(coverage: &[sem::Coverage]) -> bool {
 }
 
 /// The producer evidence of a document, or `None` when it carries none by design.
-fn semantic<'a>(
+pub(crate) fn semantic<'a>(
     scope: Option<&BTreeSet<String>>,
     doc: &'a DocumentFacts,
 ) -> Result<Option<&'a SemanticDocument>> {
@@ -591,6 +599,72 @@ fn boundary_reason(binding: &CallBinding, proof: &sem::Provenance) -> BoundaryRe
     } else {
         BoundaryReason::None
     }
+}
+
+/// One measured occurrence, before graph grouping or traversal limits.
+pub(crate) struct CallDisposition<'a> {
+    pub selected: Option<(&'a CallBinding, &'a sem::Provenance)>,
+    pub boundary_reason: BoundaryReason,
+    pub exact_target: Option<(&'a String, &'a DocumentKey)>,
+}
+
+pub(crate) fn call_disposition<'a>(
+    semantic: Option<&'a SemanticDocument>,
+    call: &native::Call,
+    source: &mut dyn GraphSource,
+) -> Result<CallDisposition<'a>> {
+    let selected = select_binding(semantic, call)?;
+    let mut reason = selected.map_or(BoundaryReason::MissingEvidence, |(b, p)| {
+        boundary_reason(b, p)
+    });
+    let target = selected.and_then(|(binding, _)| {
+        if binding.resolution != Resolution::Resolved {
+            return None;
+        }
+        match &binding.declared_target {
+            Some(Target::Internal {
+                syntax_id,
+                document,
+                ..
+            }) => Some((syntax_id, document)),
+            _ => None,
+        }
+    });
+    let exact_target = match target {
+        Some((id, key)) if source.locate(id)?.as_ref() == Some(key) => Some((id, key)),
+        _ => None,
+    };
+    if reason == BoundaryReason::None && exact_target.is_none() {
+        reason = BoundaryReason::Stale;
+    }
+    Ok(CallDisposition {
+        selected,
+        boundary_reason: reason,
+        exact_target,
+    })
+}
+
+/// The same pre-grouping eligibility used by rooted expansion, for line navigation.
+pub(crate) fn resolved_call_target<'a>(
+    semantic: Option<&'a SemanticDocument>,
+    call: &native::Call,
+) -> Result<Option<(&'a str, &'a DocumentKey)>> {
+    let Some((binding, proof)) = select_binding(semantic, call)? else {
+        return Ok(None);
+    };
+    if boundary_reason(binding, proof) != BoundaryReason::None
+        || binding.resolution != Resolution::Resolved
+    {
+        return Ok(None);
+    }
+    Ok(match &binding.declared_target {
+        Some(Target::Internal {
+            syntax_id,
+            document,
+            ..
+        }) => Some((syntax_id.as_str(), document)),
+        _ => None,
+    })
 }
 
 /// Evaluates one rooted graph request. The outer error covers read failures, aborts and
@@ -692,31 +766,11 @@ pub fn evaluate(
             let semantic = semantic(scope, &doc)?;
             for call in local {
                 source.check_work()?;
-                let selected = select_binding(semantic, call)?;
-                let mut reason = selected.map_or(BoundaryReason::MissingEvidence, |(b, p)| {
-                    boundary_reason(b, p)
-                });
+                let disposition = call_disposition(semantic, call, source)?;
+                let selected = disposition.selected;
+                let reason = disposition.boundary_reason;
+                let exact_target = disposition.exact_target;
                 let external = selected.is_some_and(|(b, _)| b.resolution == Resolution::External);
-                let target = selected.and_then(|(binding, _)| {
-                    if binding.resolution != Resolution::Resolved {
-                        return None;
-                    }
-                    match &binding.declared_target {
-                        Some(Target::Internal {
-                            syntax_id,
-                            document,
-                            ..
-                        }) => Some((syntax_id, document)),
-                        _ => None,
-                    }
-                });
-                let exact_target = match target {
-                    Some((id, key)) if source.locate(id)?.as_ref() == Some(key) => Some((id, key)),
-                    _ => None,
-                };
-                if reason == BoundaryReason::None && exact_target.is_none() {
-                    reason = BoundaryReason::Stale;
-                }
                 let target_role = exact_target
                     .map(|(id, key)| source.declaration_role(key, id))
                     .transpose()?;
@@ -1133,6 +1187,18 @@ fn select_evidence(
         coverage.into_values().collect(),
         provenance.into_values().collect(),
     ))
+}
+
+/// Engine evidence/warnings for ungrouped measured occurrences in another pinned view.
+pub(crate) fn occurrence_warnings(
+    request: &GraphRequest,
+    source: &mut dyn GraphSource,
+    scope: Option<&BTreeSet<String>>,
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+) -> Result<Vec<Warning>> {
+    let (coverage, provenance) = select_evidence(source, scope, nodes, edges)?;
+    Ok(warnings_v1(request, &coverage, &provenance, edges))
 }
 
 /// Exactly the warnings-v1 set, unique by `(code, provenanceId)` and in contract order.

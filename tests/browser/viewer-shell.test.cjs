@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal) {
+async function published(callback, signal, {library = false, rules = null, git = false} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -67,13 +67,34 @@ async function published(callback, signal) {
   mkdirSync(join(paths.workspace, "roles"));
   writeFileSync(join(paths.workspace, "roles", "mixed.rs"), mixedSource);
   writeFileSync(join(paths.workspace, "roles", "only.rs"), testOnlySource);
+  for (const relative of ["tests/fixtures/input.js", "tools/synthetic-cohorts/templates/input.js", "web/vendor/pele-1.10.0-trellis.2.js"]) {
+    const target = join(paths.workspace, relative); mkdirSync(require("node:path").dirname(target), {recursive:true});
+    writeFileSync(target, "function capturedInput(value) { if (value) { return 1; } return 0; }\n");
+  }
   // Noise the explorer hides by default: a dot-directory and a folder with no indexed files.
   mkdirSync(join(paths.workspace, ".tool-cache"));
   writeFileSync(join(paths.workspace, ".tool-cache", "state.txt"), "cache\n");
   mkdirSync(join(paths.workspace, "assets"));
   writeFileSync(join(paths.workspace, "assets", "notes.txt"), "not source\n");
+  if (library) {
+    mkdirSync(join(paths.workspace, "vendor", "local-library", "src"), {recursive:true});
+    writeFileSync(join(paths.workspace, "Cargo.toml"), "[package]\nname='browser-app'\nversion='0.1.0'\n[dependencies]\nlocal-library={path='vendor/local-library'}\n");
+    writeFileSync(join(paths.workspace, "Cargo.lock"), "version=4\n[[package]]\nname='browser-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\n");
+    writeFileSync(join(paths.workspace, "vendor", "local-library", "Cargo.toml"), "[package]\nname='local-library'\nversion='0.1.0'\n");
+    writeFileSync(join(paths.workspace, "vendor", "local-library", "src", "lib.rs"), "// <img src=x onerror='globalThis.libraryExecuted=true'>\npub fn candidate_only() { unknown_external(); }\n");
+  }
+  if (rules !== null) {
+    mkdirSync(join(paths.workspace, ".trellis"), {recursive:true});
+    writeFileSync(join(paths.workspace, ".trellis/rules.toml"), rules);
+  }
   let server, browser, context;
   try {
+    if (git) {
+      for (const args of [["init", "-q", "-b", "measured-branch"], ["config", "user.name", "Chrome acceptance"],
+        ["config", "user.email", "chrome@example.invalid"], ["add", "."], ["commit", "-qm", "Chrome baseline"]]) {
+        await H.run("git", args, {cwd:paths.workspace, env:paths.env});
+      }
+    }
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
     const pin = JSON.parse(indexed.stdout).status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
@@ -82,9 +103,10 @@ async function published(callback, signal) {
     signal?.addEventListener("abort", () => { void context.close().catch(() => {}); }, {once:true});
     const page = await context.newPage(), requests = [], errors = [];
     page.on("pageerror", error => errors.push(error.message));
+    page.on("console", message => { if (message.type() === "error" && /Content Security Policy|CSP/i.test(message.text())) errors.push(message.text()); });
     page.on("request", request => {
       const url = new URL(request.url());
-      if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method()});
+      if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method(), body:request.method() === "POST" ? request.postDataJSON() : null});
     });
     await page.goto(`${server.base}/`, {waitUntil:"networkidle"});
     assert.deepEqual(requests, [], "opening the viewer does not authenticate or select a checkout");
@@ -105,7 +127,7 @@ async function published(callback, signal) {
     const metricsRequests = requests.filter(row => row.url.pathname.endsWith("/metrics"));
     assert.ok(metricsRequests.length > 0);
     for (const {url, method} of metricsRequests) {
-      assert.equal(method, "GET");
+      assert.equal(method, "GET"); assert.equal(url.searchParams.get("workbench"), "true");
       assert.equal(url.pathname, H.scoped(server.rootKey, "metrics"));
       assert.ok(observedPins.some(value => url.searchParams.get("indexGeneration") === value.indexGeneration &&
         url.searchParams.get("indexRevision") === String(value.indexRevision)), "metrics use a complete displayed pin");
@@ -119,14 +141,14 @@ async function published(callback, signal) {
   }
 }
 async function metrics(server, paths, pin, aggregate, scope = "revision", row, role = "production") {
-  const query = new URLSearchParams({...pin, aggregate, scope, role});
+  const query = new URLSearchParams({...pin, aggregate, scope, role, workbench:"true"});
   if (row) {
     query.set("sourceSetId", row.sourceSetId); query.set("path", row.path); query.set("topCognitive", "3");
     if (scope === "file") query.set("language", row.language);
   }
   const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `metrics?${query}`));
   assert.equal(response.status, 200, JSON.stringify(response.data));
-  assert.equal(response.data.payload.role, role);
+  assert.equal(response.data.payload.workbench, true); assert.equal(response.data.payload.role, role);
   assert.equal(response.data.payload.indexGeneration, pin.indexGeneration);
   assert.equal(response.data.payload.indexRevision, pin.indexRevision);
   return response.data.payload;
@@ -195,20 +217,29 @@ async function assertLegend(page, payload, metric) {
     const indexed = payload[row.directory ? "directories" : "files"].find(item => item.path === path);
     assert.ok(indexed, path);
     const value = valueAt(indexed.metrics);
-    assert.equal(row.value, String(value), `${metric} for ${path} is from the selected snapshot`);
+    assert.equal(row.value, value === null ? "—" : String(value), `${metric} for ${path} is from the selected snapshot`);
     return value;
   });
-  const sorted = [...values].sort((a, b) => a - b);
-  const cuts = [.25, .5, .75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]);
-  assert.deepEqual(legend.map(row => row.text), [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`]);
-  assert.equal(new Set(legend.map(row => row.background)).size, 4, "legend shows four actual, distinct heat colors");
-  assert.ok(legend.every(row => row.background !== "rgba(0, 0, 0, 0)"), "heat is painted, not only class names");
+  const relative = await page.locator("#metric-relative").isChecked();
+  const neutral = payload.aggregate === "sum" && !relative;
+  const fixed = {cognitive:[5,15,30],cyclomatic:[5,10,20],maxNesting:[2,3,4],"halstead.volume":[500,1000,2000],fanOut:[7,15,30]};
+  const sorted = values.filter(value => typeof value === "number").sort((a, b) => a - b);
+  const cuts = relative ? [.25,.5,.75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]) : fixed[metric];
+  const ranges = metric === "maintainabilityIndex" && !relative ? ["≥40","≥20–<40","≥10–<20","<10"] :
+    [`≤${cuts?.[0]}`, `>${cuts?.[0]}–${cuts?.[1]}`, `>${cuts?.[1]}–${cuts?.[2]}`, `>${cuts?.[2]}`];
+  if (neutral) {
+    assert.match(await page.locator("#metric-legend").textContent(), /relative totals; no callable risk bands/);
+    assert.deepEqual(legend, []); assert.ok(rows.every(row => row.band.includes("neutral"))); return values;
+  }
+  assert.deepEqual(legend.map(row => row.text), ranges);
+  assert.equal(new Set(legend.map(row => row.background)).size, 4, "four painted severity colors");
   for (let index = 0; index < rows.length; index++) {
-    const rank = cuts.filter(cut => values[index] > cut).length;
-    const severity = metric === "maintainabilityIndex" ? 3 - rank : rank;
+    if (values[index] === null) { assert.ok(rows[index].band.includes("neutral")); continue; }
+    const severity = metric === "maintainabilityIndex" && !relative ? [40,20,10].filter(cut => values[index] < cut).length :
+      metric === "maintainabilityIndex" ? 3 - cuts.filter(cut => values[index] > cut).length : cuts.filter(cut => values[index] > cut).length;
     assert.ok(rows[index].band.includes(`heat-${severity}`), `${metric}: ${values[index]} severity ${severity}`);
-    assert.ok(legend[rank].band.includes(`heat-${severity}`));
-    assert.equal(rows[index].background, legend[rank].background, "tree heat matches the numeric legend interval");
+    const entry = legend.find(row => row.band.includes(`heat-${severity}`));
+    assert.equal(rows[index].background, entry.background, "tree heat matches the active legend interval");
   }
   return values;
 }
@@ -237,10 +268,21 @@ test("real indexed viewer exposes snapshot metrics, numeric heat legend, raw top
   const freshness = status.data.catchingUp ? "catching-up" : "fresh";
   assert.equal(await checkoutPick.locator(".checkout-freshness").getAttribute("data-state"), freshness);
   assert.equal(await page.locator("#workspace-index-state").getAttribute("data-state"), freshness);
-  assert.match(await page.locator("#workspace-index-label").textContent(), new RegExp(`revision ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
+  assert.match(await page.locator("#workspace-index-label").textContent(), new RegExp(`rev(?:ision)? ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`));
   await expandSources(page);
   let payload = await metrics(server, paths, pin, "max");
   await assertLegend(page, payload, "cognitive");
+  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true", "Sequence shares the explorer heat surface");
+  assert.equal(await page.locator("#metric-relative").isChecked(), false);
+  const heatBefore = await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class");
+  await page.locator("#file-filter").fill("src/flow.js");
+  assert.equal(await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class"), heatBefore, "same file keeps fixed color when explorer filtering changes");
+  await page.locator("#file-filter").fill("");
+  const readsBefore = requests.filter(row => row.url.pathname.endsWith("/metrics")).length;
+  await page.locator("#metric-relative").check(); await assertLegend(page, payload, "cognitive");
+  assert.match(await page.locator("#metric-legend").textContent(), /Relative to visible set/);
+  assert.equal(requests.filter(row => row.url.pathname.endsWith("/metrics")).length, readsBefore);
+  await page.locator("#metric-relative").uncheck(); await assertLegend(page, payload, "cognitive");
   const file = payload.files.find(row => row.path === "src/flow.js");
   await page.locator('.file-pick[title="src/flow.js"]').click();
   const selectedFile = await metrics(server, paths, pin, "max", "file", file);
@@ -466,6 +508,130 @@ test("390px drawers and explicit Files section retain selected evidence without 
 }));
 
 
+
+test("Sequence URLs wait for authentication and checkout, use the returned seed, and refuse invalid context", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+  const seed = await H.seedId(server, paths.token, "transform");
+  const sequenceRequests = () => requests.filter(row => row.url.pathname.endsWith("/sequence"));
+  const pinned = new URLSearchParams({sid:seed, rootKey:server.rootKey, ...pin});
+  async function authenticateRoute(query, {valid = false, backend = false} = {}) {
+    await page.goto("about:blank");
+    const before = sequenceRequests().length;
+    await page.goto(`${server.base}/#sequence?${query}`, {waitUntil:"domcontentloaded"});
+    assert.equal(sequenceRequests().length, before, "a URL never reads evidence before Connect");
+    await page.locator("#token").fill(paths.token);
+    await page.locator("#connect-form button[type=submit]").click();
+    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
+    assert.equal(await page.locator("#checkout-select").inputValue(), "");
+    assert.equal(sequenceRequests().length, before, "authentication alone does not choose a checkout for the route");
+    const responsePromise = valid || backend ? page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence")) : null;
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await page.locator("#workspace").waitFor({state:"visible"});
+    if (valid) {
+      const response = await responsePromise, dto = await response.json();
+      assert.equal(response.status(), 200, JSON.stringify(dto));
+      assert.equal(response.request().postDataJSON().seed, seed); assert.deepEqual(response.request().postDataJSON().expectedRevision, pin);
+      assert.equal(dto.seed.id, seed); assert.equal(dto.seed.name, "transform"); assert.deepEqual(dto.revision, pin);
+      await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+      assert.equal(await page.locator("#method-source").isEnabled(), true);
+      await page.locator("#method-source").click();
+      await assertExactSource(page, flowSource);
+      assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), [String(dto.seed.range.startLine)]);
+    } else {
+      if (responsePromise) assert.notEqual((await responsePromise).status(), 200);
+      await page.waitForFunction(() => !document.querySelector("#error").hidden && document.querySelector("#sequence-state")?.textContent.length > 0);
+      assert.match(await page.locator("#sequence-state").textContent(), /invalid|unavailable|not found|select|snapshot|revision|match|stale|unknown|requires|symbol|seed/i);
+      assert.equal(await page.locator("#sequence-diagram [data-trellis-step-id]").count(), 0, "refusal never displays a guessed successor sequence");
+      assert.equal(await page.locator("#method-source").isEnabled(), false);
+      assert.equal(sequenceRequests().length, before + (backend ? 1 : 0));
+    }
+  }
+  await authenticateRoute(new URLSearchParams({sid:seed}), {valid:true});
+  await authenticateRoute(pinned, {valid:true});
+  for (const patch of [{rootKey:"f".repeat(64)}, {indexGeneration:"00000000-0000-4000-8000-000000000000"}, {indexRevision:String(pin.indexRevision + 1)}]) {
+    const query = new URLSearchParams(pinned);
+    for (const [key, value] of Object.entries(patch)) query.set(key, value);
+    await authenticateRoute(query);
+  }
+  await authenticateRoute(new URLSearchParams({sid:"missing-explicit-callable"}), {backend:true});
+  await authenticateRoute(new URLSearchParams());
+}));
+
+test("Libraries candidate source never sends candidate IDs to workspace sequence or navigation", {timeout:240000}, async () => published(async ({page, paths, server, requests}) => {
+  await expandSources(page); await page.locator('.file-pick[title="src/flow.js"]').click();
+  await page.locator(".method-pick").filter({hasText:"measured"}).click();
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  const selection = await page.locator(".method-pick.selected").textContent();
+  const diagram = await page.locator("#sequence-diagram").textContent();
+  await page.locator("#view-libraries").click();
+  // Explicit fixture setup: serve registration can leave the automatic catalog
+  // loading without a worker (tracked separately from #392 source actions).
+  const started = await H.api(server.base, paths.token, "POST", H.scoped(server.rootKey, "dependencies/refresh"), {});
+  assert.equal(started.status, 202, JSON.stringify(started.data));
+  // Wait for that requested producer, then bind the browser status refresh to
+  // its own new request rather than an older in-flight response.
+  const readyCatalog = await page.evaluate(async ({rootKey, token}) => {
+    const deadline = Date.now() + 30000;
+    for (;;) {
+      const response = await fetch(`/api/checkouts/${rootKey}/dependencies`, {cache:"no-store", headers:{Authorization:`Bearer ${token}`}});
+      const data = await response.json();
+      if (!response.ok || ["failed", "disabled"].includes(data.state)) throw new Error(`Catalog unavailable: ${JSON.stringify(data)}`);
+      if (data.state === "ready") return data;
+      if (Date.now() >= deadline) throw new Error(`Catalog readiness timed out: ${JSON.stringify(data)}`);
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }, {rootKey:server.rootKey, token:paths.token});
+  assert.equal(readyCatalog.state, "ready", JSON.stringify(readyCatalog));
+  const catalogRequest = page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/dependencies"));
+  await page.locator("#dependency-refresh").click();
+  const refreshRequest = await catalogRequest;
+  assert.equal(refreshRequest.method(), "GET");
+  const catalogReply = await refreshRequest.response();
+  assert.ok(catalogReply, "the explicit catalog refresh must return a response");
+  const catalog = await catalogReply.json();
+  assert.equal(catalogReply.status(), 200, JSON.stringify(catalog));
+  assert.equal(catalog.state, "ready", JSON.stringify(catalog));
+  const localPackage = catalog.packages.find(pkg => pkg.name === "local-library");
+  const libraryPresentation = async () => page.evaluate(() => ({state:document.querySelector("#dependency-state")?.textContent,
+    warnings:document.querySelector("#dependency-warnings")?.textContent,
+    buttons:[...document.querySelectorAll("#dependency-packages button")].map(button => ({text:button.textContent, disabled:button.disabled}))}));
+  assert.ok(localPackage, `Missing local path dependency: catalog=${JSON.stringify(catalog)}; UI=${JSON.stringify(await libraryPresentation())}`);
+  assert.equal(localPackage.version, "0.1.0", JSON.stringify(localPackage));
+  assert.equal(localPackage.sourceState, "present", JSON.stringify(localPackage));
+  const pkg = page.locator("#dependency-packages button").filter({hasText:`${localPackage.name} ${localPackage.version}`});
+  try { await pkg.waitFor(); }
+  catch (error) { assert.fail(`Native package not displayed: package=${JSON.stringify(localPackage)}; catalog=${JSON.stringify(catalog)}; UI=${JSON.stringify(await libraryPresentation())}; ${error.message}`); }
+  await pkg.click();
+  const symbolResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/dependencies/source"));
+  await page.locator("#dependency-symbols button").filter({hasText:"candidate_only"}).click();
+  const response = await symbolResponse, snapshot = await response.json();
+  assert.equal(response.status(), 200, JSON.stringify(snapshot));
+  assert.ok(snapshot.id && snapshot.hash && snapshot.rootId);
+  assert.equal(new URL(response.url()).searchParams.get("sourceRef"), snapshot.id);
+  assert.ok(snapshot.definitions.some(item => item.name === "candidate_only"));
+  await page.waitForFunction(hash => document.querySelector("#external-source-path")?.textContent.includes(hash), snapshot.hash);
+  assert.match(await page.locator("#external-source-path").textContent(), /immutable candidate snapshot.*terminal library boundary/);
+  assert.equal(await page.locator("#external-source").isVisible(), true);
+  assert.equal(await page.locator("#external-source .source-diagram-action").count(), 0);
+  assert.equal(await page.locator("#external-source-hint").isVisible(), true);
+  assert.match(await page.locator("#external-source-hint").textContent(), /Workspace diagrams are unavailable/);
+  assert.doesNotMatch(await page.locator("#external-source").textContent(), /Workspace diagrams are unavailable/);
+  assert.equal(await page.locator("#external-source .source-line").evaluateAll(lines => lines.map(line =>
+    [...line.childNodes].filter(node => !node.classList?.contains("line-number")).map(node => node.textContent).join("")).join("\n")), snapshot.file.text);
+  assert.equal(await page.locator("#external-source img").count(), 0);
+  assert.equal(await page.evaluate(() => globalThis.libraryExecuted), undefined);
+  const before = requests.filter(row => /\/(sequence|navigation)$/.test(row.url.pathname)).length;
+  await page.locator("#external-source .source-line").filter({hasText:"pub fn candidate_only"}).click();
+  await page.locator("#external-source").focus(); await page.keyboard.press("Shift+F10");
+  assert.equal(await page.locator(".classes-context-menu").count(), 0, "external source has no workspace action menu");
+  await page.keyboard.press("Escape");
+  assert.equal(requests.filter(row => /\/(sequence|navigation)$/.test(row.url.pathname)).length, before);
+  const ids = new Set(snapshot.definitions.map(item => item.id).filter(Boolean));
+  assert.ok(!requests.some(row => row.body && ids.has(row.body.seed)), "candidate IDs are never workspace sequence seeds");
+  assert.equal(await page.locator(".method-pick.selected").textContent(), selection);
+  await page.locator("#view-sequence").click();
+  assert.equal(await page.locator("#sequence-diagram").textContent(), diagram);
+}, undefined, {library:true}));
+
 async function assertExactSource(page, text) {
   await page.waitForFunction(expected => [...document.querySelectorAll("#source .source-line")].map(line =>
     [...line.childNodes].filter(node => !node.classList?.contains("line-number")).map(node => node.textContent).join("")).join("\n") === expected, text);
@@ -551,7 +717,7 @@ test("retained Files and diagram evidence names the newer head until explicit ke
   const actualHead = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"));
   assert.equal(actualHead.status, 200);
   assert.deepEqual(actualHead.data.revision, head, "explicit reload adopts the current head, independently verified from the daemon");
-  await page.waitForFunction(expected => document.querySelector("#workspace-index-label")?.textContent.includes(`revision ${expected}`), label(head));
+  await page.waitForFunction(expected => new RegExp(`rev(?:ision)? ${expected}`).test(document.querySelector("#workspace-index-label")?.textContent || ""), label(head));
   assert.equal(await page.locator(".method-pick.selected").count(), 0, "reload does not carry an old symbol selection into head");
   assert.equal(await page.locator("#source .source-line").count(), 0, "reload clears old source before a new file selection");
   assert.equal(await banner.isVisible(), false);
@@ -603,3 +769,288 @@ test("explorer hides dot and unindexed folders, status says what was indexed, an
   await page.locator("#inspector-clear").click();
   await page.locator("#call-inspector").waitFor({state:"hidden"});
 }));
+
+test("Sequence explorer excludes fixtures and vendored inputs from heat while Files keeps them visible", {timeout:240000}, async () => published(async ({page, paths, server, pin}) => {
+  const payload = await metrics(server, paths, pin, "max");
+  const inputs = ["tests/fixtures/input.js", "tools/synthetic-cohorts/templates/input.js", "web/vendor/pele-1.10.0-trellis.2.js"];
+  for (const path of inputs) {
+    const row = payload.files.find(row => row.path === path); assert.ok(row, path);
+    assert.equal(row.excludedReason, path.startsWith("web/") ? "vendored" : "fixture");
+    assert.equal(row.declarationCount, 0); assert.equal(row.metrics.cognitive, null);
+    assert.ok(row.roleCounts.production + row.roleCounts.test > 0);
+  }
+  assert.match(await page.locator("#metrics-state").textContent(), /callables excluded from heat.*2 fixture files, 1 vendored files/);
+  await page.locator("#section-files").click();
+  for (const path of inputs) {
+    // Files uses indexed-catalog details, not the live explorer's directory buttons.
+    await page.locator("#file-filter").fill(path);
+    const pick = page.locator("#file-tree .file-pick").filter({hasText:path.split("/").at(-1)});
+    await pick.waitFor(); assert.equal(await pick.count(), 1, path);
+    assert.equal(await pick.getAttribute("title"), path);
+    assert.equal(await pick.locator(".metric-swatch").count(), 0, "Files does not hide or heat excluded files");
+  }
+  await page.locator("#file-filter").fill("");
+  await page.locator("#section-diagrams").click();
+  await page.locator("#metric-include-tests").check();
+  await page.waitForFunction(() => document.querySelector("#metrics-state")?.textContent.includes("all indexed callables"));
+  const included = await metrics(server, paths, pin, "max", "revision", undefined, "all");
+  for (const path of inputs) {
+    const row = included.files.find(row => row.path === path);
+    assert.equal(row.metrics.cognitive === null, path.startsWith("web/"), "Include tests restores fixtures, never vendor inputs");
+  }
+}));
+
+
+test("invalid rules keep Explorer and Treemap heat with a warning while Architecture keeps its typed error", {timeout:240000}, async () => published(async ({page, paths, server, pin}) => {
+  const warning = "Rules unavailable; layer-based heat exclusions were not applied.";
+  const payload = await metrics(server, paths, pin, "max");
+  assert.equal(payload.layerExclusionsWarning, warning);
+  assert.ok(await page.locator("#metrics-state").isVisible());
+  assert.ok((await page.locator("#metrics-state").textContent()).includes(warning));
+  const measured = payload.files.find(row => row.path === "src/flow.js");
+  assert.ok(measured.metrics.cognitive > 0);
+  const fixture = payload.files.find(row => row.path === "tests/fixtures/input.js");
+  assert.equal(fixture.excludedReason, "fixture"); assert.equal(fixture.metrics.cognitive, null);
+  const vendored = payload.files.find(row => row.path.startsWith("web/vendor/"));
+  assert.equal(vendored.excludedReason, "vendored"); assert.equal(vendored.metrics.cognitive, null);
+  await expandSources(page); await assertLegend(page, payload, "cognitive");
+  assert.doesNotMatch(await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class"), /neutral/);
+
+  await page.locator("#view-treemap").click();
+  await page.locator("#treemap-state[data-state=ready]").waitFor();
+  assert.ok(await page.locator("#treemap-state").isVisible());
+  assert.ok((await page.locator("#treemap-state").textContent()).includes(warning));
+  const tiles = page.locator("#treemap-diagram [data-trellis-file-id]");
+  const key = JSON.stringify([measured.sourceSetId, measured.language, measured.path]);
+  const keys = await tiles.evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-file-id")));
+  assert.equal(keys.filter(value => value === key).length, 1);
+  const tile = tiles.nth(keys.indexOf(key));
+  assert.ok(await tile.locator("rect").first().isVisible());
+  const band = [5, 15, 30].filter(cut => measured.metrics.cognitive > cut).length;
+  assert.equal(await tile.locator("rect").first().getAttribute("fill"), ["#343644", "#FFC20A", "#FFAA10", "#FF7A00"][band]);
+  await tile.click();
+  assert.equal(await page.locator("#treemap-inspector-content dt").filter({hasText:/^cognitive$/}).evaluate(node => node.nextElementSibling.textContent), String(measured.metrics.cognitive));
+  await page.locator("#treemap-path").fill("no-matching-files");
+  await page.locator("#treemap-state[data-state=empty]").waitFor();
+  assert.ok((await page.locator("#treemap-state").textContent()).includes(warning));
+
+  const query = new URLSearchParams({...pin, workbench:"true",aggregate:"max",role:"production"});
+  const response = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `architecture?${query}`));
+  assert.equal(response.status, 422, JSON.stringify(response.data));
+  assert.equal(response.data.error.code, "invalid_rules"); assert.equal(Object.hasOwn(response.data, "payload"), false);
+  await page.locator("#view-architecture").click();
+  await page.locator("#architecture-state[data-state=error]").waitFor();
+  assert.match(await page.locator("#architecture-state").textContent(), /invalid_rules.*\.trellis\/rules\.toml/);
+  assert.ok(!(await page.locator("#architecture-panel").textContent()).includes(warning));
+  assert.equal(await page.locator("#architecture-diagram svg, #architecture-diagram [data-trellis-module-id]").count(), 0);
+}, undefined, {rules:'version = 1\n[layers.broken]\norder = "not an integer"\npaths = ["src/**"]\n'}));
+
+
+// Status responses are controlled at the existing API boundary; files, metrics
+// and every displayed revision still come from the real published fixture.
+async function chromeFixture(page, paths, server) {
+  const observed = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "status"));
+  assert.equal(observed.status, 200, JSON.stringify(observed.data));
+  const fixture = {status:structuredClone(observed.data), job:null};
+  const prefix = H.scoped(server.rootKey, "");
+  const pattern = `${server.base}${prefix}**`;
+  const respond = async route => {
+    const suffix = new URL(route.request().url()).pathname.slice(prefix.length);
+    let body;
+    if (suffix === "status") body = fixture.status;
+    else if (suffix === "jobs/current" || suffix.startsWith("jobs/")) body = fixture.job;
+    else if (suffix === "index" && route.request().method() === "POST") body = fixture.job;
+    else return route.continue();
+    await route.fulfill({status:suffix === "index" ? 202 : 200, contentType:"application/json", body:JSON.stringify(body)});
+  };
+  await page.route(pattern, respond);
+  fixture.select = async () => {
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent === "");
+  };
+  fixture.close = () => page.unroute(pattern, respond);
+  return fixture;
+}
+async function assertIndexState(page, state, words) {
+  await page.waitForFunction(expected => document.querySelector("#workspace-index-state")?.dataset.state === expected, state);
+  assert.match(await page.locator("#workspace-index-label").textContent(), words);
+  const shape = await page.locator("#workspace-index-state .state-shape").boundingBox();
+  assert.ok(shape && shape.width > 0 && shape.height > 0, `${state} has a visible shape as well as words`);
+}
+
+test("connected chrome uses one desktop action line, folded details and brand-sized controls without losing narrow drawers", {timeout:240000}, async () => published(async ({page, requests}) => {
+  const toolbar = page.locator(".workspace-toolbar");
+  const header = await page.locator(".app-header").boundingBox();
+  const actions = await toolbar.boundingBox();
+  const frame = await page.locator(".workspace-frame").boundingBox();
+  const primary = await page.locator("#index").boundingBox();
+  assert.ok(header && actions && frame && primary);
+  assert.ok(primary.height >= 44, "explicit Index is a primary action of at least 44px");
+  assert.ok(actions.height <= primary.height + 20, "closed desktop status/actions occupy one compact line");
+  assert.ok(Math.abs(actions.y - (header.y + header.height)) <= 1, "no revision or browse-notice row separates header and actions");
+  assert.ok(Math.abs(frame.y - (actions.y + actions.height)) <= 1, "no job row separates actions from the panes");
+  const headerControls = await Promise.all([".brand", ".section-nav", "#checkout-select", "#logout"].map(selector => page.locator(selector).boundingBox()));
+  assert.ok(headerControls.every(Boolean));
+  assert.ok(Math.max(...headerControls.map(box => box.y)) < Math.min(...headerControls.map(box => box.y + box.height)), "desktop header controls share one row");
+  for (const id of ["workspace-meta", "checkout-root", "status", "diagnostics", "job", "stale"]) {
+    assert.equal(await page.locator(`#${id}`).evaluate(node => node.closest("#workspace-details") !== null), true, `${id} belongs to folded Diagnostics`);
+    assert.equal(await page.locator(`#${id}`).isVisible(), false, `${id} consumes no closed-chrome height`);
+  }
+  assert.equal(await page.locator("#checkout-state").isVisible(), false, "successful selection adds no guidance row");
+  assert.equal(await page.locator("#notice").isVisible(), false, "browse guidance is not a separate connected row");
+  for (const selector of ["#refresh", "#index", "#checkout-select", "#file-filter", "#metric-color", "#metric-aggregate"]) {
+    const style = await page.locator(selector).evaluate(node => ({font:getComputedStyle(node).fontSize, radius:getComputedStyle(node).borderTopLeftRadius}));
+    assert.deepEqual(style, {font:"14px", radius:"8px"}, `${selector} uses interface label and control tokens`);
+  }
+  assert.ok((await page.locator("#refresh").boundingBox()).height < primary.height, "secondary controls stay compact rather than all becoming primary-sized");
+  await capture(page, "chrome-compact-desktop");
+  for (const width of [390, 320]) {
+    await page.setViewportSize({width, height:844});
+    await noOverflow(page, width);
+    for (const selector of ["#checkout-select", "#refresh", "#index", "#workspace-details > summary"]) {
+      const box = await page.locator(selector).boundingBox();
+      assert.ok(box && box.x >= 0 && box.x + box.width <= width + 1, `${selector} remains reachable at ${width}px`);
+    }
+    await page.locator("#explorer-toggle").click();
+    assert.equal(await page.locator("#explorer-panel").isVisible(), true);
+    await page.keyboard.press("Escape");
+    assert.equal(await page.locator("#explorer-panel").isVisible(), false);
+    await capture(page, `chrome-compact-${width}`);
+  }
+  assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "layout and drawer actions never request indexing");
+}));
+
+test("selected status reconciles jobs, catch-up and stale evidence while raw errors stay in Diagnostics and Stop waiting never cancels", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+  const fixture = await chromeFixture(page, paths, server);
+  const failure = '<img src=x onerror=globalThis.statusExecuted=true> index fixture failure';
+  const job = {id:"chrome-fixture-job", state:"failed", progress:{phase:"index", completed:0, total:0},
+    error:{code:"index_failed", message:failure}, finishedAt:1, revision:null};
+  try {
+    fixture.status.catchingUp = false;
+    fixture.status.stats.changedFiles = [];
+    fixture.job = job;
+    await fixture.select();
+    await assertIndexState(page, "failed", /Index failed/i);
+    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /Fresh|0\/0|index_failed/);
+    const selectedCheckout = page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-freshness');
+    assert.match(await selectedCheckout.textContent(), /Index failed/i);
+    assert.doesNotMatch(await selectedCheckout.textContent(), /Fresh/);
+    assert.equal(await page.locator("#job").isVisible(), false);
+    assert.equal(await page.locator("body").evaluate((node, text) => node.innerText.includes(text), failure), false, "raw error text is not exposed in the compact chrome");
+    await page.locator("#workspace-details > summary").click();
+    assert.ok((await page.locator("#job").textContent()).includes(failure));
+    assert.match(await page.locator("#job").textContent(), /index_failed/);
+    assert.equal(await page.locator("#workspace-details img").count(), 0, "error objects render only as inert text");
+    assert.equal(await page.evaluate(() => globalThis.statusExecuted), undefined);
+    await capture(page, "chrome-failed-diagnostics");
+    await page.locator("#workspace-details > summary").click();
+
+    fixture.job = {...job, state:"done", error:null, revision:pin};
+    fixture.status.catchingUp = true;
+    await fixture.select();
+    await assertIndexState(page, "catching-up", /Catching up/i);
+    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /Fresh|0\/0/);
+    fixture.status.catchingUp = false;
+    fixture.status.stats.changedFiles = ["src/flow.js"];
+    await fixture.select();
+    await assertIndexState(page, "stale", /Stale evidence/i);
+    await page.locator("#workspace-details > summary").click();
+    assert.match(await page.locator("#stale").textContent(), /1 inputs differ/);
+    await page.locator("#workspace-details > summary").click();
+    fixture.status.stats.changedFiles = [];
+    await fixture.select();
+    await assertIndexState(page, "fresh", /Fresh/i);
+    assert.doesNotMatch(await page.locator("#job").textContent(), /0\/0/);
+    assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false, "selecting or refreshing status never indexes");
+
+    fixture.job = {...job, state:"running", error:null, finishedAt:null, progress:{phase:"capture", completed:0, total:0}};
+    const accepted = page.waitForResponse(response => new URL(response.url()).pathname === H.scoped(server.rootKey, "index"));
+    await page.locator("#index").click();
+    assert.equal((await accepted).status(), 202);
+    await assertIndexState(page, "catching-up", /Indexing.*capture/i);
+    assert.doesNotMatch(await page.locator("#workspace-index-label").textContent(), /0\/0/);
+    assert.equal(await page.locator("#cancel").isVisible(), true);
+    await page.locator("#cancel").click();
+    assert.equal(await page.locator("#cancel").isVisible(), false);
+    assert.match(await page.locator("#workspace-index-label").textContent(), /no longer waiting/i);
+    assert.equal(await page.locator("#index").isEnabled(), true);
+    assert.equal(requests.filter(row => row.method === "POST" && row.url.pathname.endsWith("/index")).length, 1, "only the explicit Index button requests a job");
+    assert.equal(requests.some(row => row.url.pathname.endsWith("/cancel")), false, "Stop waiting has no durable job cancellation request");
+    // Reloading selection re-observes that same accepted job, not a fabricated cancellation.
+    await fixture.select();
+    assert.equal(await page.locator("#cancel").isVisible(), true);
+    await assertIndexState(page, "catching-up", /Indexing/i);
+    await page.locator("#cancel").click();
+  } finally { await fixture.close(); }
+}));
+
+test("checkout picker uses observed branch, detached and unavailable Git labels, keeps exact roots discoverable and treats malicious branch text as text", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+  const listing = await H.api(server.base, paths.token, "GET", "/api/checkouts");
+  assert.equal(listing.status, 200, JSON.stringify(listing.data));
+  const observed = listing.data.checkouts.find(row => row.rootKey === server.rootKey);
+  const gitResponse = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "git"));
+  assert.equal(gitResponse.status, 200, JSON.stringify(gitResponse.data));
+  assert.equal(gitResponse.data.git.state, "available");
+  assert.equal(gitResponse.data.git.head.name, "measured-branch");
+  const shortRevision = `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`;
+  assert.equal(await page.locator(`#checkout-select option[value="${server.rootKey}"]`).textContent(), `workspace ⎇ measured-branch · ${shortRevision}`, "the real measured Git branch labels the published checkout");
+  const branch = '<svg onload="globalThis.branchExecuted=true">' + "-long-branch".repeat(12);
+  const available = {...gitResponse.data.git, head:{...gitResponse.data.git.head, name:branch}};
+  const rows = [
+    {...observed, git:available},
+    {...observed, rootKey:"b".repeat(64), workspaceRoot:join(paths.workspace, "busy"), state:"storage_busy", git:{state:"unavailable", reason:"not_repository"}},
+    {...observed, rootKey:"c".repeat(64), workspaceRoot:join(paths.workspace, "unavailable"), state:"unavailable", git:{state:"unavailable", reason:"not_repository"}},
+  ];
+  const pattern = `${server.base}/api/checkouts`;
+  const respond = route => route.fulfill({status:200, contentType:"application/json", body:JSON.stringify({...listing.data, checkouts:rows})});
+  const gitPattern = `${server.base}${H.scoped(server.rootKey, "git")}`;
+  const respondGit = route => route.fulfill({status:200, contentType:"application/json", body:JSON.stringify({...gitResponse.data, git:rows[0].git})});
+  await page.route(pattern, respond);
+  await page.route(gitPattern, respondGit);
+  try {
+    await page.locator("#logout").click();
+    await page.locator("#token").fill(paths.token);
+    await page.locator("#connect-form button[type=submit]").click();
+    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
+    assert.equal(await page.locator("#checkout-select").inputValue(), "", "even a measured branch never auto-selects a checkout");
+    const option = page.locator(`#checkout-select option[value="${server.rootKey}"]`);
+    assert.equal(await option.textContent(), `workspace ⎇ ${branch} · ${shortRevision}`);
+    assert.equal(await option.getAttribute("title"), observed.workspaceRoot);
+    for (const row of rows.slice(1)) assert.equal(await page.locator(`#checkout-select option[value="${row.rootKey}"]`).isDisabled(), true, `${row.state} entries cannot be selected`);
+    assert.equal(await page.locator("#checkout-retry").isVisible(), true);
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent === "");
+    assert.equal(await page.locator("#checkout-select").getAttribute("title"), observed.workspaceRoot);
+    assert.equal(await page.locator("#workspace-name").getAttribute("title"), observed.workspaceRoot);
+    assert.equal(await page.locator(".app-header svg, #indexed-checkouts svg").count(), 0);
+    assert.equal(await page.evaluate(() => globalThis.branchExecuted), undefined);
+    for (const width of [390, 320]) {
+      await page.setViewportSize({width, height:844});
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px long branch does not create document overflow`);
+      const picker = await page.locator("#checkout-select").boundingBox();
+      assert.ok(picker && picker.x >= 0 && picker.x + picker.width <= width + 1);
+    }
+    await page.setViewportSize({width:1440, height:900});
+    assert.equal(await page.locator("#checkout-root").isVisible(), false);
+    await page.locator("#workspace-details > summary").click();
+    assert.equal(await page.locator("#checkout-root").textContent(), observed.workspaceRoot);
+    await page.locator("#workspace-details > summary").click();
+    for (const [git, expected] of [
+      [{...available, head:{...available.head, kind:"detached", name:null}}, `Detached ${available.head.shortCommit}`],
+      [{state:"unavailable", reason:"not_repository"}, "Git unavailable"],
+    ]) {
+      rows[0].git = git;
+      const refreshed = page.waitForResponse(response => response.url() === pattern);
+      await page.locator("#checkout-retry").click();
+      assert.equal((await refreshed).status(), 200);
+      await page.waitForFunction(({key, label}) => [...document.querySelector("#checkout-select").options].find(option => option.value === key)?.textContent.includes(label), {key:server.rootKey, label:expected});
+      assert.equal(await option.textContent(), `workspace ⎇ ${expected} · ${shortRevision}`);
+      assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "retry retains explicit selection of the same available checkout");
+    }
+    assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
+    await capture(page, "chrome-checkout-git-unavailable");
+  } finally {
+    await page.unroute(pattern, respond);
+    await page.unroute(gitPattern, respondGit);
+  }
+}, undefined, {git:true}));

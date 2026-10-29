@@ -62,6 +62,7 @@ struct DependencyIndex {
     cancel: Arc<AtomicBool>,
     stopped: bool,
     worker_running: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
     state: &'static str,
     catalog: Option<Arc<Catalog>>,
     warnings: Vec<String>,
@@ -228,6 +229,12 @@ pub struct DaemonState {
     #[cfg(feature = "test-support")]
     maintenance_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     dependencies: Mutex<DependencyIndex>,
+    #[cfg(test)]
+    dependency_idle: tokio::sync::Notify,
+    #[cfg(test)]
+    dependency_build_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    dependency_stop_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, feature = "test-support"))]
     dependency_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(all(test, feature = "test-support"))]
@@ -436,6 +443,7 @@ pub fn new_with_config(
             cancel: Arc::new(AtomicBool::new(false)),
             stopped: false,
             worker_running: false,
+            worker: None,
             state: if config.dependency_options.is_some() {
                 "loading"
             } else {
@@ -444,6 +452,12 @@ pub fn new_with_config(
             catalog: None,
             warnings: Vec::new(),
         }),
+        #[cfg(test)]
+        dependency_idle: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        dependency_build_hook: Mutex::new(None),
+        #[cfg(test)]
+        dependency_stop_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
         dependency_capture_hook: Mutex::new(None),
         #[cfg(all(test, feature = "test-support"))]
@@ -1421,6 +1435,7 @@ impl DaemonState {
             if self.runtime.lock().unwrap().session().is_none() {
                 return Ok(());
             }
+            self.start_dependency_index();
         }
         let retained = self.runtime.lock().unwrap().session().cloned();
         if let Some(ref session) = retained
@@ -1692,66 +1707,84 @@ impl DaemonState {
         self: &Arc<Self>,
         config: &Arc<BrowserConfig>,
     ) -> bool {
-        {
-            let mut index = self.dependencies.lock().unwrap();
-            if !Arc::ptr_eq(&self.config(), config) || config.dependency_options.is_none() {
-                return false;
-            }
-            if !index.request_build() {
-                return !index.stopped;
-            }
+        let mut index = self.dependencies.lock().unwrap();
+        if !Arc::ptr_eq(&self.config(), config) || config.dependency_options.is_none() {
+            return false;
+        }
+        if !index.request_build() {
+            return !index.stopped;
         }
         let state = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let (generation, cancel) = {
-                    let mut index = state.dependencies.lock().unwrap();
-                    if index.stopped {
-                        index.worker_running = false;
-                        return;
-                    }
-                    (index.generation, index.cancel.clone())
-                };
-                let worker = state.clone();
-                let worker_cancel = cancel.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let result = (|| {
-                        // Each generation builds with the configuration current
-                        // when it starts; a replaced one bumps the generation.
-                        let config = worker.config();
-                        let options = config
-                            .dependency_options
-                            .clone()
-                            .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
-                        let revision = worker.store.status()?.revision;
-                        Catalog::build(
-                            &config.options.workspace_root,
-                            revision,
-                            &options,
-                            &worker_cancel,
-                        )
-                    })();
-                    worker.publish_dependency_index(generation, &worker_cancel, result);
-                })
-                .await;
-                if result.is_err() {
-                    // Error publication does not access the database.
-                    state.publish_dependency_index(
-                        generation,
-                        &cancel,
-                        Err(anyhow::anyhow!("worker failed")),
-                    );
-                }
-                let mut index = state.dependencies.lock().unwrap();
-                if index.stopped || index.generation == generation {
+        // Install the handle under the admission lock, so close cannot miss a
+        // newly admitted driver. No Tokio progress is needed to join it.
+        match std::thread::Builder::new()
+            .name("trellis-catalog".into())
+            .spawn(move || state.run_dependency_index())
+        {
+            Ok(worker) => {
+                index.worker = Some(worker);
+                true
+            }
+            Err(_) => {
+                index.worker_running = false;
+                index.state = "failed";
+                index.warnings = vec!["Dependency catalog worker could not start".into()];
+                false
+            }
+        }
+    }
+
+    fn run_dependency_index(&self) {
+        loop {
+            let (generation, cancel, config) = {
+                let mut index = self.dependencies.lock().unwrap();
+                let config = self.config();
+                if index.stopped || config.dependency_options.is_none() {
                     index.worker_running = false;
+                    #[cfg(test)]
+                    self.dependency_idle.notify_one();
                     return;
                 }
-                // Refresh bursts coalesce to the latest generation. Only this driver
-                // can launch catalog work, and its previous blocking worker has exited.
+                (index.generation, index.cancel.clone(), config)
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = (|| {
+                    // Configuration, generation and cancellation were captured
+                    // together before this blocking build was admitted.
+                    let options = config
+                        .dependency_options
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("dependency catalog disabled"))?;
+                    let revision = self.store.status()?.revision;
+                    #[cfg(test)]
+                    {
+                        let hook = self.dependency_build_hook.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    Catalog::build(&config.options.workspace_root, revision, &options, &cancel)
+                })();
+                self.publish_dependency_index(generation, &cancel, result);
+            }));
+            if result.is_err() {
+                // Error publication does not access the database.
+                self.publish_dependency_index(
+                    generation,
+                    &cancel,
+                    Err(anyhow::anyhow!("worker failed")),
+                );
             }
-        });
-        true
+            let mut index = self.dependencies.lock().unwrap();
+            if index.stopped || index.generation == generation {
+                index.worker_running = false;
+                #[cfg(test)]
+                self.dependency_idle.notify_one();
+                return;
+            }
+            // Refresh bursts coalesce to the latest generation. Only this driver
+            // can launch catalog work, and its previous build has exited.
+        }
     }
     fn publish_dependency_index(
         &self,
@@ -1797,7 +1830,7 @@ impl DaemonState {
             .cloned()
     }
     pub fn cancel_active(&self) {
-        {
+        let worker = {
             let mut dependencies = self.dependencies.lock().unwrap();
             dependencies.stopped = true;
             dependencies.cancel.store(true, Ordering::Release);
@@ -1808,6 +1841,16 @@ impl DaemonState {
                 dependencies.warnings =
                     vec!["Dependency indexing cancelled during shutdown".into()];
             }
+            dependencies.worker.take()
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.dependency_stop_hook.lock().unwrap().take() {
+            hook();
+        }
+        // The driver needs the catalog lock to finish. Join before close drops
+        // SQLite witnesses, and never while holding that lock.
+        if let Some(worker) = worker {
+            let _ = worker.join();
         }
         self.jobs
             .lock()
@@ -2068,7 +2111,7 @@ async fn guard_common(
 }
 #[cfg(feature = "test-support")]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route(
             "/",
             get(|| async {
@@ -2093,6 +2136,15 @@ pub fn router(state: Arc<DaemonState>) -> Router {
                 (
                     [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                     include_str!("../web/viewer-metrics.js"),
+                )
+            }),
+        )
+        .route(
+            "/metric-heat.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/metric-heat.js"),
                 )
             }),
         )
@@ -2257,7 +2309,8 @@ pub fn router(state: Arc<DaemonState>) -> Router {
                     include_str!("../web/style.css"),
                 )
             }),
-        )
+        );
+    router
         .route(
             "/healthz",
             get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }),
@@ -3017,8 +3070,20 @@ async fn sequence(
         )
     })?
     .map_err(|e| {
-        if e.chain()
-            .any(|cause| cause.downcast_ref::<crate::store::PinExpired>().is_some())
+        if e.chain().any(|cause| {
+            cause.downcast_ref::<crate::store::PinExpired>().is_some()
+                || cause
+                    .downcast_ref::<crate::store::SelectedIntegrity>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::store::topology::StorageBusy>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::store::RebuildInProgress>()
+                    .is_some()
+                || cause.downcast_ref::<rusqlite::Error>().is_some()
+        }) || e.to_string().starts_with("storage_busy")
+            || e.to_string().starts_with("store_unavailable")
             || e.to_string().starts_with("revision conflict")
             || e.to_string().starts_with("index_not_ready")
             || e.to_string().starts_with("incompatible_index")
@@ -3359,7 +3424,7 @@ impl ProvisionedBrowser {
 
     pub fn router(self) -> Router {
         let state = Arc::new(self);
-        Router::new()
+        let router = Router::new()
             .route(
                 "/",
                 get(|| async {
@@ -3384,6 +3449,15 @@ impl ProvisionedBrowser {
                     (
                         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
                         include_str!("../web/viewer-metrics.js"),
+                    )
+                }),
+            )
+            .route(
+                "/metric-heat.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/metric-heat.js"),
                     )
                 }),
             )
@@ -3611,7 +3685,8 @@ impl ProvisionedBrowser {
                         &include_bytes!("../web/brand/trellis-logo-dark-v1.webp")[..],
                     )
                 }),
-            )
+            );
+        router
             .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
             .route(
                 "/healthz",
@@ -4168,7 +4243,7 @@ fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOpti
             let name = pair.split_once('=').ok_or_else(invalid)?.0;
             if !matches!(
                 name,
-                "indexGeneration" | "indexRevision" | "aggregate" | "role"
+                "indexGeneration" | "indexRevision" | "aggregate" | "role" | "workbench"
             ) {
                 return Err(invalid());
             }
@@ -4233,6 +4308,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
                     | "role"
                     | "metrics"
                     | "topCognitive"
+                    | "workbench"
             ) || fields.insert(name, decode(value)?).is_some()
             {
                 return Err(invalid());
@@ -4252,6 +4328,13 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
     }
     if let Some(value) = fields.remove("role") {
         options.role = value;
+    }
+    if let Some(value) = fields.remove("workbench") {
+        options.workbench = match value.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(invalid()),
+        };
     }
     if let Some(value) = fields.remove("topCognitive") {
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -4483,7 +4566,7 @@ async fn provisioned_core_answer(
             let (body, catching_up) = match result {
                 Ok(answer) => answer,
                 Err(error) => {
-                    if architecture && let Some(diagnostic) = crate::rules::diagnostic(&error) {
+                    if let Some(diagnostic) = crate::rules::diagnostic(&error) {
                         return Ok((
                             (
                                 StatusCode::UNPROCESSABLE_ENTITY,

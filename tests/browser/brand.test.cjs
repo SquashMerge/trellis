@@ -103,10 +103,13 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 390,"mobile token input remains in viewport");
     assert.equal(await page.locator("#connect-form button[type=submit]").isVisible(),true);
     await page.setViewportSize({width:1440,height:900});
-    const checkoutRequests=[];
+    const checkoutRequests=[], sourceMetadataRequests=[];
     page.on("request",request=>{
-      const pathname=new URL(request.url()).pathname;
-      if(pathname.startsWith("/api/checkouts/")) checkoutRequests.push(pathname.split("/").slice(4).join("/"));
+      const url=new URL(request.url()), pathname=url.pathname;
+      if(pathname.startsWith("/api/checkouts/")) {
+        checkoutRequests.push(pathname.split("/").slice(4).join("/"));
+        if(pathname.endsWith("/symbols")) sourceMetadataRequests.push({url,method:request.method()});
+      }
     });
     await H.connect(page,server,paths.token);
     const tabs=page.getByRole("tablist",{name:"Workspace views"}).getByRole("tab");
@@ -163,7 +166,15 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     for (const file of ["inter-variable.woff2","manrope-variable.woff2","jetbrains-mono-latin.woff2"]) {
       assert.ok(fontResponses.some(response => response.url === `${server.base}/fonts/${file}` && response.status === 200),`local font response missing: ${file}; ${JSON.stringify(fontResponses)}`);
     }
-    assert.ok(checkoutRequests.every(route=>! /^(?:symbols|symbol|query|views|annotations|questions|jev|acp)(?:\/|$)/.test(route)),JSON.stringify(checkoutRequests));
+    await page.locator("#source .source-diagram-action[data-symbol-id]").first().waitFor();
+    assert.equal(sourceMetadataRequests.length,1,"opening source reads one bounded declaration page");
+    const metadata=sourceMetadataRequests[0];
+    assert.equal(metadata.method,"GET");
+    assert.equal(metadata.url.pathname,H.scoped(server.rootKey,"symbols"));
+    assert.deepEqual(Object.fromEntries(metadata.url.searchParams),{
+      path:"flow.js",indexGeneration:pin.indexGeneration,indexRevision:String(pin.indexRevision),offset:"0",limit:"200"
+    });
+    assert.ok(checkoutRequests.every(route=>! /^(?:symbol|query|views|annotations|questions|jev|acp)(?:\/|$)/.test(route)),JSON.stringify(checkoutRequests));
     assert.deepEqual(errors,[],"no CSP, font, or application errors");
     if (process.env.TRELLIS_BRAND_REPORT) {
       const report = resolve(process.env.TRELLIS_BRAND_REPORT);

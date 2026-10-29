@@ -35,7 +35,10 @@ function harness(windowOptions = {}, withMetrics = false) {
     document: {addEventListener() {}, getElementById: get, createElement: node, createElementNS: (ns, tag) => node(tag), createDocumentFragment: node, createTextNode: text => ({textContent:text,children:[]}), body: node()},
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
-  if (withMetrics) run(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"));
+  if (withMetrics) {
+    run(fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8"));
+    run(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"));
+  }
   run(source);
   run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
   // The app receives the production scoped URL; legacy suffixes below remain the
@@ -57,6 +60,20 @@ function harness(windowOptions = {}, withMetrics = false) {
   return {context, run, get, blobs, downloads, timers, networkUrls};
 }
 
+
+// Minimal browser history: traversal dispatch is explicit so races are deterministic.
+function historyWindow(hash = "") {
+  const location = {hash}, entries = [{state:null, hash}], events = {};
+  let position = 0;
+  const history = {
+    get state() { return entries[position].state; },
+    get length() { return entries.length; },
+    replaceState(state, _, next) { entries[position] = {state, hash:next}; location.hash = next; },
+    pushState(state, _, next) { entries.splice(++position); entries.push({state, hash:next}); location.hash = next; },
+    go(delta) { position += delta; location.hash = entries[position].hash; },
+  };
+  return {location, history, events, addEventListener(type, fn) { events[type] = fn; }};
+}
 
 const symbol = id => ({id, name:id, path:"src/a.js", range:{startLine:1,endLine:5}});
 const view = id => ({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},seed:symbol(id),participants:[{id,label:id,kind:"method"},{id:"unknown",label:"external?",kind:"boundary"}],steps:[],warnings:[],hiddenSteps:0,truncated:false});
@@ -493,6 +510,25 @@ test("server unindexed reasons are plain text, legacy reasons remain, and indexe
   assert.equal(h.run('fileStates.size'), 0);
 });
 
+test("unsupported source type files collapse into one quiet counted marker per folder (#425)", async () => {
+  const h = harness();
+  const unsupported = name => ({...treeFile(name), unindexedReason:'Unsupported source type'});
+  h.context.fetch = async path => response(path.includes('path=docs')
+    ? treePage('docs', [unsupported('docs/guide.md')])
+    : treePage('', [folder('docs'), unsupported('Cargo.toml'), unsupported('<img src=x>.lock'), {...treeFile('a.ts'), unindexedReason:'TypeScript indexing not supported yet'}, treeFile('lib.rs', 'lib.rs')]));
+  await h.run('loadTreeRoot()');
+  await h.run("toggleDirectory('docs')");
+  const markers = descendants(h.get('file-tree')).filter(n => n.className === 'unsupported-files');
+  assert.equal(markers.length, 2, 'one marker per folder');
+  assert.match(text(markers[0]), /1 file · unsupported source type · not indexed/);
+  assert.match(text(markers[1]), /2 files · unsupported source type · not indexed/);
+  assert.match(text(markers[1]), /Cargo\.toml/); assert.match(text(markers[1]), /<img src=x>\.lock/);
+  assert.ok(descendants(h.get('file-tree')).every(n => n.tagName !== 'img'), 'names stay text');
+  const rendered = text(h.get('file-tree'));
+  assert.equal((rendered.match(/Unsupported source type/g) || []).length, 0, 'no per-file unsupported rows');
+  assert.match(rendered, /TypeScript indexing not supported yet/, 'other unindexed reasons keep their own rows');
+});
+
 test("index scope mismatch stays in primary roots and action label, same root adds no warning", async () => {
   const h = harness();
   h.context.fetch = async () => response(treePage('', []));
@@ -870,7 +906,7 @@ test("shared source rejects missing, empty, inverted and noninteger witnessed ra
 
 const metricPin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
 const metricFile = {path:"src/a.js",sourceSetId:"main",language:"javascript",declarationCount:1,roleCounts:{production:1,test:0},metrics:{cognitive:7}};
-const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,metricsVersion:"metrics:v1",scope,aggregate:"max",role:"production",files,directories,topCognitive:[]},catchingUp:false});
+const metricsResponse = (scope, {files = [metricFile], directories = [], pin = metricPin} = {}) => response({payload:{...pin,workbench:true,metricsVersion:"metrics:v1",scope,aggregate:"max",role:"production",files,directories,topCognitive:[]},catchingUp:false});
 
 test("selecting a sequence step fences an already pending file metrics inspection", async () => {
   const h = harness({}, true), pending = deferred();
@@ -1250,4 +1286,90 @@ test("dot entries and indexed-snapshot folders without files stay hidden until S
   rendered = text(h.get('file-tree'));
   assert.match(rendered, /build\//, "folders stay visible while the indexed snapshot is unknown");
   assert.doesNotMatch(rendered, /\.git/);
+});
+
+
+test("sid routes wait for an admitted checkout, resolve only the requested seed, and store no source in browser state", async () => {
+  const browser = historyWindow("#sequence?sid=explicit%3Aid"), h = harness(browser), requests = [];
+  h.run("selectedRootKey=null; token=''");
+  await h.run("readNavigationLocation()"); assert.equal(h.networkUrls.length, 0);
+  h.run(`token='synthetic'; selectedRootKey='${ROOT}'`);
+  h.context.fetch = async (path, options) => { requests.push([path, options]); return response(view("explicit:id")); };
+  await h.run("readNavigationLocation(true)");
+  assert.equal(h.run("selectedMethod.id"), "explicit:id");
+  assert.deepEqual(requests.map(([path]) => path), ["/api/sequence"]);
+  assert.equal(JSON.parse(requests[0][1].body).seed, "explicit:id");
+  assert.deepEqual(Object.keys(browser.history.state), ["trellisNavigation"]);
+  assert.equal(browser.history.length, 1);
+});
+
+for (const hash of ["#sequence", "#sequence?sid=", "#sequence?sid=a&sid=b", `#sequence?sid=a&rootKey=${"b".repeat(64)}`,
+  "#sequence?sid=a&indexGeneration=87654321-1234-4123-8123-123456789abc&indexRevision=1"]) {
+  test(`invalid or mismatched route refuses requests: ${hash}`, async () => {
+    const h = harness(historyWindow(hash));
+    await h.run("readNavigationLocation()");
+    assert.equal(h.networkUrls.length, 0);
+    assert.equal(h.get("error").hidden, false);
+    assert.match(h.get("sequence-state").textContent, /Cannot open sequence/);
+    assert.equal(h.run("selectedMethod"), null);
+  });
+}
+
+for (const invalidate of ["clearNavigationHistory()", "epoch++", "selectedRootKey=null", "status.revision={indexGeneration:'87654321-1234-4123-8123-123456789abc',indexRevision:1}"]) {
+  test(`late sid response cannot publish after ${invalidate}`, async () => {
+    const browser = historyWindow("#sequence?sid=old"), h = harness(browser), old = deferred();
+    h.context.fetch = () => old.promise;
+    const pending = h.run("readNavigationLocation()");
+    await Promise.resolve(); await Promise.resolve();
+    h.run(invalidate); old.resolve(response(view("old"))); await pending;
+    assert.equal(h.run("selectedMethod"), null);
+    assert.equal(h.get("error").hidden, true);
+  });
+}
+
+test("Back/new hash fences old sid responses without adding traversal entries", async () => {
+  const browser = historyWindow("#sequence?sid=old"), h = harness(browser), old = deferred();
+  h.context.fetch = () => old.promise;
+  const pending = h.run("readNavigationLocation()");
+  await Promise.resolve(); await Promise.resolve();
+  browser.location.hash = "#sequence?sid=new";
+  h.context.fetch = async () => response(view("new"));
+  await h.run("readNavigationLocation()");
+  old.resolve(response(view("old"))); await pending;
+  assert.equal(h.run("selectedMethod.id"), "new");
+  assert.equal(browser.history.length, 1);
+  await h.run("readNavigationLocation()");
+  assert.equal(browser.history.length, 1);
+});
+
+test("navigation callbacks bind the explicit source pin and switch Files before sequence selection", async () => {
+  let owner;
+  const browser = historyWindow(), h = harness({...browser, TrellisNavigation:{init(value){owner=value;}, reset(){}}});
+  h.context.fetch = async () => response(view("target"));
+  h.run("section='files'; document.body.classList.add('files-section')");
+  await owner.selectMethod(symbol("target"), view("target").revision);
+  assert.equal(h.run("section"), "diagrams");
+  assert.equal(h.run("selectedMethod.id"), "target");
+  const query = new URLSearchParams(browser.location.hash.split("?")[1]);
+  assert.equal(query.get("sid"), "target"); assert.equal(query.get("rootKey"), ROOT);
+  assert.equal(query.get("indexGeneration"), view("target").revision.indexGeneration);
+  assert.equal(browser.history.length, 2);
+  const requests = h.networkUrls.length;
+  await owner.selectMethod(symbol("stale"), {...view("target").revision,indexRevision:2});
+  assert.equal(h.networkUrls.length, requests); assert.match(h.get("error").textContent, /stale/);
+});
+
+
+test("captured declaration Inspect source rejects replaced Inspector and changed source scope at the same pin", async () => {
+  const h=harness(), callbacks=[];
+  h.context.window.TrellisShell.inspectSymbol=(symbol,revision,readSource)=>callbacks.push(readSource);
+  h.context.fetch=async()=>response(view("next"));
+  h.run(`inspectSourceSymbol(${JSON.stringify(symbol("first"))},status.revision)`);
+  h.run(`inspectSourceSymbol(${JSON.stringify(symbol("second"))},status.revision)`);
+  await callbacks[0](); assert.equal(h.networkUrls.length,0);
+  h.run("sourceSerial++"); await callbacks[1](); assert.equal(h.networkUrls.length,0);
+  h.run(`inspectSourceSymbol(${JSON.stringify(symbol("third"))},status.revision)`);
+  await h.run(`selectMethod(${JSON.stringify(symbol("next"))})`);
+  const count=h.networkUrls.length; await callbacks[2](); assert.equal(h.networkUrls.length,count);
+  assert.equal(h.run("selectedMethod.id"),"next");
 });

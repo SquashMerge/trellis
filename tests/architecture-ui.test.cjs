@@ -16,7 +16,7 @@ function fixture(aggregate = "max", hash = "rules-one", role = "production") {
   const site = {role:"production",relationKind:"rust_path",spelling:"crate::b",lines:{start:2,end:2},range:{start:10,end:18},ownerSyntaxId:"owner",callId:null};
   const pair = {source:a,target:b,count:7,sites:[site],omittedSites:6,mapping:"structural"};
   return {...pin,state:"ready",rulesFile:{path:".trellis/rules.toml",source:"checkout-config",contentHash:hash},
-    aggregate,role,metricsVersion:"metrics:v1",evidenceTier:"syntax",semanticComplete:false,
+    aggregate,role,workbench:true,metricsVersion:"metrics:v1",evidenceTier:"syntax",semanticComplete:false,
     layers:[{name:"UI",order:1,shared:false},{name:"Storage",order:2,shared:false}],
     modules:[{identity:a,layer:"UI",physicalLines:4,declarationCount:2,roleCounts:{production:2,test:1},metrics:{cognitive:3,cyclomatic:4,maintainabilityIndex:80,halstead:{volume:12},fanIn:{value:null,unavailable:"not-measured"}},revisionId:"revision-a",contentHash:"hash-a",provenanceId:"native"},
       {identity:b,layer:"Storage",physicalLines:8,declarationCount:0,roleCounts:{production:0,test:2},metrics:{cognitive:null,cyclomatic:null},revisionId:"revision-b",contentHash:"hash-b",provenanceId:"native"}],
@@ -41,7 +41,7 @@ function harness() {
     clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
-  vm.runInNewContext(pinSource + "\n" + source, {window,document,URLSearchParams,console});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console});
   const controller = window.TrellisArchitecture.create({request:(url,current,options) => {calls.push({url,current,options});return response(url,options);},context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
@@ -51,10 +51,11 @@ function harness() {
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
   const h = harness();assert.equal(h.calls.length,0);await h.controller.refresh();
   assert.equal(h.calls.length,1);const query = new URL(h.calls[0].url,"http://local").searchParams;
-  assert.equal(query.get("role"),"production");assert.equal(h.get("architecture-metric-tests").checked,false);
+  assert.equal(query.get("workbench"),"true");assert.equal(query.get("role"),"production");assert.equal(h.get("architecture-metric-tests").checked,false);
   assert.equal(query.get("aggregate"),"max");assert.equal(query.get("indexGeneration"),pin.indexGeneration);assert.equal(query.get("indexRevision"),"1");
   const {view,options} = h.renders[0];assert.equal(options.moduleValue(view.modules[0]),3);assert.equal(options.moduleValue(view.modules[1]),null);
-  assert.match(options.layerLabel(view.layers[0]),/^1 · UI · 1 files · max cognitive \(max\) 3\nUp deviation: 0 · /);
+  assert.equal(options.layerLabel(view.layers[0]),"1 · UI · 1 file · max cognitive (max) 3");
+  assert.deepEqual([...options.layerStats(view.layers[0])].map(stat => [stat.text, stat.tone]),[["↓7","neutral"]],"only non-zero counts become chips");
   assert.equal(h.reads.length,0);options.onSelectModule(view.modules[0]);
   assert.match(text(h.get("architecture-inspector-content")),/4 physical file lines · 2 production callables/);
   assert.match(text(h.get("architecture-inspector-content")),/not-measured/);
@@ -397,5 +398,152 @@ test("no_layers keeps a rules-hash-qualified authoring basis for orphan edits an
     assert.equal(body.baseHash,"rules-one");assert.equal(body.operations[0].index,2);assert.equal(body.operations[0].type,mode==="Edit reason" ? "editException" : "removeException");
     await h.get("architecture-confirm").fire("click");assert.match(h.get("architecture-state").textContent,/Rules committed/);assert.equal(h.renders.length,0);
     await h.get("architecture-unassigned").fire("click");assert.match(text(h.get("architecture-review-list")),/File assignment inventory is unavailable/);
+  }
+});
+
+
+test("Relative uses admitted display modules, collapsed representation is stable, and sum is neutral", async () => {
+  const h = harness(), dto = fixture();
+  dto.layers.push({name:"Hidden",order:3,shared:false,display:"hidden"});
+  dto.modules.push({...dto.modules[0],identity:identity("hidden/hot.rs"),layer:"Hidden",metrics:{cognitive:100},declarationCount:0,excludedReason:"hidden_layer"});
+  dto.modules[0].metrics.cognitive = 7;
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const module = dto.modules[0]; assert.equal(h.get("architecture-relative").checked, false);
+  assert.equal(h.renders.at(-1).options.moduleBand(module), 1);
+  h.get("architecture-relative").checked = true; await h.get("architecture-relative").fire("change");
+  assert.match(text(h.get("architecture-legend")), /Relative to visible set.*≤7.*>7–7.*>7–7.*>7/);
+  await h.renders.at(-1).options.onToggleLayer(dto.layers[0]);
+  assert.match(text(h.get("architecture-legend")), /≤7.*>7–7/); assert.equal(h.calls.length, 1);
+  h.get("architecture-relative").checked = false; await h.get("architecture-relative").fire("change");
+  assert.equal(h.renders.at(-1).options.moduleBand(module), 1);
+  assert.match(h.get("architecture-state").textContent, /6 callables excluded from heat.*1 authored hidden-layer files/);
+  h.setResponse(async () => ({payload:fixture("sum")})); h.get("architecture-aggregate").value = "sum"; await h.get("architecture-aggregate").fire("change");
+  const rendered = h.renders.at(-1); assert.equal(rendered.options.moduleBand(rendered.view.modules[0]), null);
+  assert.match(text(h.get("architecture-legend")), /relative totals/);
+  h.get("architecture-relative").checked = true; await h.get("architecture-relative").fire("change");
+  assert.equal(h.renders.at(-1).options.moduleBand(h.renders.at(-1).view.modules[0]), 0); assert.equal(h.calls.length, 2);
+});
+
+const edge = (sourceLayer, destinationLayer, count, status = "conforms", extra = {}) =>
+  ({sourceLayer,destinationLayer,role:"production",count,status,excepted:false,exceptionReason:null,pairs:[],...extra});
+test("layer stats chip only non-zero production counts by verdict, with deviations in the error tone", async () => {
+  const h = harness(), dto = fixture();
+  dto.layers.push({name:"Peer",order:2,shared:false},{name:"Shared",order:null,shared:true});
+  dto.edges = [edge("UI","Storage",7), edge("Storage","UI",56,"deviates"), edge("Storage","UI",4,"deviates",{excepted:true,exceptionReason:"Reviewed"}),
+    edge("Storage","Peer",3,"deviates"), edge("Storage","Shared",9), edge("Shared","UI",2,"deviates"),
+    {...edge("Storage","UI",11,"deviates"),role:"test"}];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const {options} = h.renders[0], stats = name => JSON.parse(JSON.stringify(options.layerStats(dto.layers.find(layer => layer.name === name)).map(stat => [stat.text, stat.tone])));
+  assert.deepEqual(stats("Storage"), [["↑56","error"],["⇄3","error"],["→shared 9","neutral"],["excepted 4","neutral"]], "test-only sites never count; excepted sites are not deviations");
+  assert.deepEqual(stats("UI"), [["↓7","neutral"]]);
+  assert.deepEqual(stats("Shared"), [["⇄2","error"]], "shared outbound is a deviation, not upward");
+  assert.deepEqual(stats("Peer"), [], "a layer without outgoing references has no chips");
+  assert.match(options.layerStats(dto.layers[1])[0].label, /^56 outgoing production reference sites · upward deviation$/);
+});
+
+test("one chip per module: a file and its same-named directory form one module that opens to files", async () => {
+  const {commonDirectory, groupModules} = harness().window.TrellisArchitecture;
+  assert.equal(commonDirectory(["src/store.rs", "src/store/a.rs", "src/model.rs"]), "src/");
+  assert.equal(commonDirectory(["web/app.js"]), "web/");
+  assert.equal(commonDirectory(["build.rs", "tools/x.py"]), "");
+  const modules = paths => paths.map(path => ({identity:identity(path)}));
+  assert.deepEqual(JSON.parse(JSON.stringify(groupModules(modules(["src/store.rs", "src/store/a.rs", "src/model.rs", "src/a.b.rs"]), "src/").map(([name, files]) => [name, files.length]))),
+    [["a.b", 1], ["model", 1], ["store", 2]]);
+  const h = harness(), dto = fixture();
+  const base = dto.modules[0];
+  dto.modules = ["src/store.rs", "src/store/a.rs", "src/store/deep/b.rs", "src/model.rs"].map((path, i) => ({...base, identity:identity(path), metrics:{cognitive:i}}));
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const display = () => h.renders.at(-1).options.display;
+  assert.equal(display().expanded("UI"), false, "#391: a band without a display hint starts collapsed");
+  const top = display().entries("UI", dto.modules);
+  const plain = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(plain(top.map(entry => [entry.type, entry.name ?? entry.shown])), [["module","model"],["directory","store\n2 · 3 files"]]);
+  assert.match(top[1].label, /^store\n3 files · max 2\nsrc\/store$/);
+  await h.renders.at(-1).options.onToggleDirectory(top[1]);
+  const opened = display().entries("UI", dto.modules)[1];
+  assert.equal(opened.open, true);
+  assert.deepEqual(plain(opened.entries.map(entry => [entry.type, entry.name ?? entry.shown])), [["module","store.rs"],["module","a"],["module","deep"]],
+    "the root file comes first, then nested modules one level down");
+});
+
+test("mod.rs and __init__.py are their module's root file, never nested mod or __init__ chips", async () => {
+  const {groupModules} = harness().window.TrellisArchitecture;
+  const modules = paths => paths.map(path => ({identity:identity(path)}));
+  const plain = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(plain(groupModules(modules(["src/daemon/mod.rs", "src/daemon/client.rs", "src/pkg/__init__.py"].filter(path => path.startsWith("src/daemon/"))), "src/daemon/").map(([name]) => name)),
+    ["client", "mod.rs"], "a band rooted at the module directory names its root file, not \"mod\"");
+  assert.deepEqual(plain(groupModules(modules(["pkg/__init__.py", "pkg/util.py"]), "pkg/").map(([name]) => name)), ["__init__.py", "util"]);
+  const h = harness(), dto = fixture(), base = dto.modules[0];
+  dto.modules = ["src/daemon/mod.rs", "src/daemon/client.rs", "src/daemon/registry/mod.rs", "src/daemon/registry/table.rs", "src/pkg/__init__.py", "src/pkg/util.py", "src/main.rs"]
+    .map(path => ({...base, identity:identity(path)}));
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const entries = () => h.renders.at(-1).options.display.entries("UI", dto.modules);
+  assert.deepEqual(plain(entries().map(entry => entry.name ?? entry.shown.split("\n")[0])), ["daemon", "main", "pkg"]);
+  for (const index of [0, 2]) await h.renders.at(-1).options.onToggleDirectory(entries()[index]);
+  const [daemon, , pkg] = entries();
+  assert.deepEqual(plain(daemon.entries.map(entry => entry.name ?? entry.shown.split("\n")[0])), ["daemon/mod.rs", "client", "registry"], "mod.rs opens first as the module root");
+  assert.deepEqual(plain(pkg.entries.map(entry => entry.name)), ["pkg/__init__.py", "util"]);
+  await h.renders.at(-1).options.onToggleDirectory(daemon.entries[2]);
+  assert.deepEqual(plain(entries()[0].entries[2].entries.map(entry => entry.name)), ["registry/mod.rs", "table"]);
+});
+
+// Walk one render's display the way the projection does: band by band, expansion before entries.
+function drawnEntries(display, layers, modules) {
+  let total = 0;
+  const count = list => { for (const entry of list) { total++; if (entry.type === "directory" && entry.open) count(entry.entries); } };
+  const lists = [];
+  for (const layer of layers) {
+    if (!display.expanded(layer)) { lists.push(null); continue; }
+    const list = display.entries(layer, modules.filter(module => module.layer === layer)); count(list); lists.push(list);
+  }
+  return {total, lists};
+}
+test("one render draws at most the 150-chip cap, notes included, with one overflow note per truncated list", async () => {
+  const h = harness(), dto = fixture(), base = dto.modules[0];
+  dto.layers = Array.from({length:6}, (_, i) => ({name:`L${i}`, order:i + 1, shared:false, display:"expanded"}));
+  // Each band: 60 measured single-file modules, one unmeasured file and one two-file module opened below.
+  dto.modules = dto.layers.flatMap(({name}) => [
+    ...Array.from({length:60}, (_, i) => ({...base, layer:name, identity:identity(`${name}/m${String(i).padStart(2, "0")}.rs`)})),
+    {...base, layer:name, declarationCount:0, identity:identity(`${name}/unmeasured.rs`)},
+    ...["a", "b"].map(file => ({...base, layer:name, identity:identity(`${name}/aa/${file}.rs`)}))]);
+  dto.edges = [];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const first = h.renders.at(-1).options.display.entries("L0", dto.modules.filter(module => module.layer === "L0"));
+  await h.renders.at(-1).options.onToggleDirectory(first[0]);
+  const {display} = h.renders.at(-1).options;
+  const {total, lists} = drawnEntries(display, dto.layers.map(layer => layer.name), dto.modules);
+  assert.equal(total, 150, "chips and every kind of note share one exact bound");
+  assert.equal(lists[0].length, 41, "40 module entries (39 chips and the overflow note), then the unmeasured note");
+  assert.equal(lists[0][0].type, "directory"); assert.equal(lists[0][0].open, true); assert.equal(lists[0][0].entries.length, 2);
+  assert.match(lists[0][39].label, /^22 files not drawn · diagram size cap\nselect to list this layer's files$/);
+  assert.match(lists[0][40].label, /^1 file · metrics unavailable/);
+  assert.deepEqual(lists.map(list => list?.length ?? null), [41, 41, 41, 25, null, null], "bands past the spent budget stay folded instead of drawing empty boxes");
+  assert.match(lists[3].at(-1).label, /^37 files not drawn/, "the last list ends on its overflow note; no further notes once the budget is spent");
+});
+
+test("unhinted test and fixture layers are hidden until tests and fixtures are included; an authored hint wins", async () => {
+  const h = harness();
+  let hinted = null;
+  const payload = role => {
+    const dto = fixture("max", "rules-one", role), base = dto.modules[0]; dto.modules[1].roleCounts = {production:1,test:2};
+    dto.layers.push({name:"Fixtures",order:0,shared:false,display:hinted});
+    dto.modules.push({...base, identity:identity("tests/fixtures/a.rs"), layer:"Fixtures", roleCounts:{production:3,test:0}, ...(role === "production" ? {excludedReason:"fixture"} : {})},
+      {...base, identity:identity("tests/b.rs"), layer:"Fixtures", roleCounts:{production:0,test:2}});
+    dto.edges.push(edge("Fixtures","UI",1));
+    return dto;
+  };
+  h.setResponse(async url => ({payload:payload(new URL(url, "http://local").searchParams.get("role"))})); await h.controller.refresh();
+  assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), false);
+  assert.equal(h.get("architecture-hidden").hidden, false);
+  assert.match(h.get("architecture-hidden-toggle").textContent, /1 hidden layer · 2 files · 1 production edge/);
+  assert.equal(h.get("architecture-hidden-names").textContent, "Fixtures (tests/fixtures; include them to show)");
+  h.get("architecture-metric-tests").checked = true; await h.get("architecture-metric-tests").fire("change");
+  assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), true, "Include tests and fixtures draws the layer");
+  assert.equal(h.get("architecture-hidden").hidden, true);
+  h.get("architecture-metric-tests").checked = false; await h.get("architecture-metric-tests").fire("change");
+  for (const hint of ["expanded", "collapsed"]) {
+    hinted = hint; await h.controller.refresh();
+    assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), true, `an authored ${hint} hint wins over the default test-layer hiding`);
+    assert.equal(h.renders.at(-1).options.display.expanded("Fixtures"), hint === "expanded");
   }
 });

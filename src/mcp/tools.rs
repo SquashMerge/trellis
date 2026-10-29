@@ -101,11 +101,22 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             ],
             &["schemaVersion", "rule", "target"],
         ),
-        "trellis_find_symbols" | "trellis_search_symbols" => (
+        "trellis_find_symbols" => (
             &[
                 "schemaVersion",
                 "query",
                 "limit",
+                "expectedBasis",
+                "workspace",
+            ],
+            &["schemaVersion", "query"],
+        ),
+        "trellis_search_symbols" => (
+            &[
+                "schemaVersion",
+                "query",
+                "limit",
+                "role",
                 "expectedBasis",
                 "workspace",
             ],
@@ -198,7 +209,13 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             } else {
                 256
             };
-            if q.is_empty() || q.len() > max_bytes {
+            if q.is_empty()
+                || q.len() > max_bytes
+                || (name == "trellis_search_symbols"
+                    && !o.get("role").is_none_or(|role| {
+                        matches!(role.as_str(), Some("any" | "production" | "test"))
+                    }))
+            {
                 return Err("invalid_request");
             }
             limit(o)
@@ -810,6 +827,34 @@ mod tests {
     }
 
     #[test]
+    fn search_role_is_optional_closed_and_does_not_change_find() {
+        let name = "trellis_search_symbols";
+        assert_eq!(validate(name, Some(&good(name))), Ok(()));
+        for role in ["any", "production", "test"] {
+            let mut args = good(name);
+            args["role"] = json!(role);
+            assert_eq!(validate(name, Some(&args)), Ok(()));
+            check("trellis_find_symbols", &args, "invalid_request");
+        }
+        for role in [
+            json!(""),
+            json!("Any"),
+            json!("tests"),
+            json!(" production"),
+            json!("test "),
+            json!(null),
+            json!(true),
+            json!(1),
+            json!([]),
+            json!({}),
+        ] {
+            let mut args = good(name);
+            args["role"] = role;
+            check(name, &args, "invalid_request");
+        }
+    }
+
+    #[test]
     fn source_path_hash_and_line_matrix() {
         let n = "trellis_read_source";
         for path in [
@@ -876,6 +921,7 @@ mod tests {
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
             "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":2,"schemaVersion":1,
+            "searchIndex":{"backend":null,"unavailableReason":null},
             "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
         assert_eq!(describe(&json!(7), workspace.label()), describe_expected);
