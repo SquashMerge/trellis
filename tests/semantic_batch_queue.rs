@@ -1598,3 +1598,75 @@ fn lookup_budget_spans_the_rejoin_after_a_cutoff_edit() {
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
     assert!(world.head().index_revision > advanced.index_revision);
 }
+
+#[test]
+fn commit_contention_after_in_loop_watcher_publication_requeues_and_completes() {
+    use std::os::unix::net::UnixStream;
+    let marker = Builder::new()
+        .prefix("semantic-cutoff-busy-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = marker.path().join("cutoff.sock");
+    let busy = marker.path().join("commit-busy.marker");
+    let world = World::new(four_language_workspace, &[]);
+    let (descriptor, sha) = four_language_batch(&world);
+    world.stop_daemon();
+    fs::write(
+        world.root.join("java/u00000.java"),
+        "class U00000 { void f() { h(); } }\n",
+    )
+    .unwrap();
+    let log = world._temp.path().join("daemon.log");
+    let _daemon = LoggedDaemon::start(
+        &world.home,
+        &log,
+        &[
+            (
+                "TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET",
+                socket.to_str().unwrap(),
+            ),
+            ("TRELLIS_TEST_SEMANTIC_COMMIT_BUSY", busy.to_str().unwrap()),
+        ],
+    );
+    let advanced: IndexPin =
+        serde_json::from_value(restart_and_index(&world, &[])["publishedRevision"].clone())
+            .unwrap();
+    let child = world
+        .import_command(&descriptor, &sha)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&socket.with_extension("ready"), "watcher cutoff");
+    assert_eq!(world.head(), advanced);
+    // The watcher publishes this edit inside the import's retry loop, moving the head past the
+    // pin the request started from. The COMMIT of the final attempt is then busy.
+    fs::write(
+        world.root.join("rust/u00000.rs"),
+        "fn u00000() { late(); }\n",
+    )
+    .unwrap();
+    drop(UnixStream::connect(&socket).unwrap());
+    let output = child.wait_with_output().unwrap();
+    let imported = succeeded(&output);
+    assert!(busy.exists(), "the COMMIT failed from contention once");
+    let published: IndexPin =
+        serde_json::from_value(imported["publishedRevision"].clone()).unwrap();
+    assert!(
+        published.index_revision >= advanced.index_revision + 2,
+        "the watcher published inside the loop before the batch"
+    );
+    assert_eq!(imported["report"]["descriptorSha256"], sha);
+    assert_eq!(world.head(), published);
+    assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 1);
+    let queue = world.queue();
+    assert!(
+        queue.iter().all(|row| row.1 == "done" && row.2.is_none()),
+        "contention left no request running or failed: {queue:?}"
+    );
+    let log = fs::read_to_string(&log).unwrap();
+    assert!(
+        !log.contains("leave running for verified recovery"),
+        "the busy COMMIT was requeued by the running daemon, not left to a new incarnation: {log}"
+    );
+}

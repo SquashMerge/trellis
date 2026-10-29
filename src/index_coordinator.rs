@@ -1338,7 +1338,14 @@ fn drain_requests_observed_with_cancel(
         let outcome = (|| {
             if request.request_kind == crate::store::requests::RequestKind::SemanticImport {
                 before_publish = Some(Some(store.index_baseline()?));
-                return run_semantic_batch_request(store, session, &request, watcher, cancel);
+                return run_semantic_batch_request(
+                    store,
+                    session,
+                    &request,
+                    watcher,
+                    cancel,
+                    &mut before_publish,
+                );
             }
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
             let mut coordinator = IndexJobCoordinator::prepare_with_session(
@@ -1790,6 +1797,7 @@ fn run_semantic_batch_request(
     request: &Request,
     watcher: Option<&OwningWatcher>,
     cancel: &CancelFlag,
+    before_publish: &mut Option<Option<IndexPin>>,
 ) -> Result<IndexPin> {
     use crate::{
         semantic_batch::{BatchCounters, BatchLimits, LookupBudget, StageOwner, stage_batch},
@@ -1825,6 +1833,9 @@ fn run_semantic_batch_request(
     for _ in 0..8 {
         store.verify_writer_session(session)?;
         let destination_pin = store.index_baseline()?;
+        // A busy COMMIT is requeued only against the pin this attempt published from;
+        // a watcher publication in an earlier attempt moved the head past the first one.
+        *before_publish = Some(Some(destination_pin));
         // Destination edits apply only once the native revision differs from the captured one.
         #[cfg(feature = "test-support")]
         let mutations = {
