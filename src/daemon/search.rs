@@ -1585,6 +1585,7 @@ mod tests {
                     syntax_id: format!("sid:v1:{id:032x}"),
                 },
                 card_hash: format!("{id:064x}"),
+                role: crate::native_evidence::DeclarationRole::Production,
             })
             .collect();
         let heads: Vec<_> = cards
@@ -1648,6 +1649,7 @@ mod tests {
                     service.cache_epoch(),
                     &[],
                     Some(&[1; DIMENSIONS]),
+                    &crate::search_rank::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap()
@@ -1704,6 +1706,7 @@ mod tests {
                     service.cache_epoch(),
                     &[],
                     Some(&[1; DIMENSIONS]),
+                    &crate::search_rank::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap()

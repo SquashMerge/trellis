@@ -1,10 +1,12 @@
 # Decision 0018: semantic symbol retrieval
 
 - Status: owner-ratified direction on #211 (2026-10-21), amended by the 2026-10-25 parity and
-  backend rulings, the 2026-10-26 item-8 approval, and the
-  [2026-10-27 resident-matrix ruling](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819).
+  backend rulings, the 2026-10-26 item-8 approval, the
+  [2026-10-27 resident-matrix ruling](https://github.com/SquashMerge/trellis/issues/358#issuecomment-6441405819), and the
+  [2026-10-28 exact-name ranking and role-filter ruling](https://github.com/SquashMerge/trellis/issues/389#issuecomment-6482754535).
   The initial reviewed constants are
-  (k, D, wL, wV) = (20, 200, 1, 4), with no additional lexical-arm restriction.
+  (k, D, wL, wV) = (20, 200, 1, 4), unchanged by the additive exact-name rule and
+  optional stored-role filter below; no exact-only gate is added.
 - Amends: #24’s catalog/wire projection and #23’s optional-vector-cache topology as stated in
   their amended sections. No #22 evidence record, identity, provenance or warning shape changes.
 - Scope: one card/vector per eligible named declaration; no AST chunks, summary vectors,
@@ -128,21 +130,69 @@ order, and retain at most 32 terms for both card and query, as the accepted prop
 Insert the card’s transformed terms as text into FTS. Only query terms are emitted as quoted
 FTS5 string literals, joined with ` OR ` and bound as a SQL parameter to MATCH. Card insertion
 is not a MATCH expression. Raw caller text never enters the FTS query parser.
-No terms gives an empty lexical arm before FTS runs, not an error or post-error fallback.
-Errors after FTS runs follow the existing typed contention/store rules, never raw-query retry
-or vector-only best-effort success. Decision 0013’s two trigram tables/rules are unchanged.
+No terms skips FTS MATCH, but does not skip exact-name admission below. Errors after FTS
+runs follow the existing typed contention/store rules, never raw-query retry or vector-only
+best-effort success. Mandatory head/corpus checks and observed store faults remain typed
+failures, including for term-free queries. Decision 0013’s two trigram tables/rules are unchanged.
 
-Candidates are unique by (document version, symbolId). The lexical arm ranks eligible head
-candidates by BM25 ascending then symbolId bytes and cuts at depth D; l is its 1-based rank.
-The vector arm ranks candidates with current decoded vectors by cosine descending then
-symbolId bytes, also at depth D; v is its 1-based rank. Fusion is
-wL/(k+l) + wV/(k+v); an absent arm contributes zero. Sort score descending, then smaller
-available arm rank, then l (absent last), then symbolId bytes. matchedBy records the arms
-that returned the candidate, not an inferred relevance explanation.
+The [#389 owner ruling](https://github.com/SquashMerge/trellis/issues/389#issuecomment-6482754535)
+ratifies the [ranking amendment](https://github.com/SquashMerge/trellis/issues/389#issuecomment-6482250936)
+and adds the optional `trellis_search_symbols` input `role:"any"|"production"|"test"`, default
+`"any"`. `production` or `test` admits only declarations with that stored measured role; `any`
+retains both. Apply this filter to **both arms before ranking and depth cutoffs**, not to the
+returned prefix, so a filtered search can return up to `limit` hits of the requested role.
+There is no path guessing. Invalid values are typed `invalid_request`; successful data echoes
+the effective `role`. Scope coverage and search-index counts keep their admitted-head meaning,
+not filtered-result counts. No other filter, score/debug input or backend selector is added.
 
-The initial weighted-RRF constants are **k=20, D=200, wL=1 and wV=4**. Each arm applies its existing deterministic ordering and retains at most 200 candidates before fusion. For a candidate with 1-based lexical rank l and vector rank v, its score is `1/(20+l) + 4/(20+v)`; an absent arm contributes exactly zero. Sort by score descending, then smaller available arm rank, then l with absent last, then symbolId UTF-8 bytes, as specified above. Fusion contributions are evaluated in binary64, lexical first and vector second. D is an internal candidate depth, not a change to the public response limit.
+Exact means stored measured `Declaration.name` equals the **complete raw query byte-for-byte**.
+Do not trim, case-fold, normalize, parse displayKey, compare substrings or use FTS stemming to
+determine exactness. Use names and roles from stored declarations at the admitted head, not
+read-time source parsing or paths. No kind preference is added: functions, methods and eligible
+containers use the same ordering rules.
 
-The lexical arm has **no additional exact-phrase, literal, identifier, substring, language or query-category gate**. It uses the shared card/query 32-term transform, bound quoted OR expression, BM25 ascending and symbolId-byte tie-break already specified in this record. No terms means an empty lexical arm. A store or FTS failure is still a typed failure, never vector-only best-effort success. `matchedBy` records arm membership after each depth cutoff, not relevance. These constants and any future lexical restriction are reviewed contract choices, not silent runtime tuning. This adds no score field or cross-call/backend ranking-equality promise.
+Candidates are unique by (document version, symbolId). Before the lexical depth D cutoff,
+add all eligible exact-name declarations to ordinary FTS matches, even if their names yield
+no terms or their ordinary BM25 position would be below D. Deduplicate the union by that full
+candidate key. This is additive retrieval, never an exact-only gate: nonexact FTS matches remain
+eligible. Sort the union by:
+
+1. Exact name before nonexact.
+2. Stored production role before stored test role.
+3. Within each exact/role tier, candidates with an FTS score first, in BM25 ascending order;
+   exact-only candidates without an FTS score follow.
+4. SymbolId bytes for equal BM25 or for unscored exact-only candidates.
+
+Retain at most D candidates, even when more than D exact names exist; l is the retained
+candidate’s 1-based lexical rank. The same rule governs lexical-only search. In particular,
+a weak one-term production match can outrank a stronger test match in its exact/nonexact tier.
+Tests are retained unless the caller selects production, but may fall beyond the depth cutoff.
+
+The role-filtered vector arm ranks candidates with current decoded vectors by cosine
+descending then symbolId bytes, also at depth D; v is its 1-based rank. Ordinary fusion is
+wL/(k+l) + wV/(k+v); an absent arm contributes zero. Its existing order is score descending,
+then smaller available arm rank, then l (absent last), then symbolId bytes. After fusion,
+**exact names precede nonexact candidates regardless of RRF score**. Within exact names,
+production precedes test, then the existing RRF order applies. Nonexact hybrid candidates
+keep the existing RRF order; there is no final production tier for nonexact hits. These rules
+apply on every search route, including lexical-only and optional-vector-budget fallback.
+`matchedBy` records the arms that returned the candidate after their depth cutoffs, not an
+inferred relevance explanation. An additionally admitted exact candidate is lexical membership,
+not a third arm.
+
+The weighted-RRF constants remain **k=20, D=200, wL=1 and wV=4**. For a candidate with
+1-based lexical rank l and vector rank v, its score is `1/(20+l) + 4/(20+v)`; an absent arm
+contributes exactly zero. Fusion contributions are evaluated in binary64, lexical first and
+vector second. D is an internal candidate depth, not a change to the public response limit.
+The raw-name exact admission and ordering above do not change the shared card/query 32-term
+transform, bound quoted OR expression or tokenizer. There is no additional exact-phrase,
+literal, substring, language or query-category gate. A no-term query has only eligible exact
+names in its lexical arm, which is empty when none exist. A store or FTS failure remains typed,
+never vector-only best-effort success. Constants and future lexical restrictions are reviewed
+contract choices, not silent runtime tuning. No card/model identity, storage schema, publication,
+trigram, evidence closure, failure or limit change follows from #389. The role input and echo
+are its only wire-field additions; there is no score field or cross-call/backend ranking-equality
+promise.
 
 The resident int8 head matrix is published as an immutable snapshot for one complete
 index pin and active model. The single existing background fill owner builds it, patches
@@ -221,7 +271,8 @@ scope rule; vector completeness and selected backend are separate searchIndex me
 
 1. Both catalogs list ten tools in the specified order, schemas stay closed, describe reports
    toolVersion 2, existing tools/prompt remain unchanged, and the existing catalog headroom
-   check still passes. Search has no score/filter/backend input.
+   check still passes. Search accepts only the optional stored-role filter above, with an
+   effective-role echo; no score/debug input, other filter or backend input is added.
 2. Native card facts come from the existing capture/parse; displayKey changes cannot change
    card bytes/rank; source edits change the appropriate version-owned card/hash atomically.
 3. Head publication atomically updates search FTS rows; retaining/releasing old revisions

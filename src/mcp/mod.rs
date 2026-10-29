@@ -1050,6 +1050,12 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let limit = args.get("limit").map_or(search::DEFAULT_LIMIT, |value| {
                         wire::uint(value).expect("validated search limit") as usize
                     });
+                    let role =
+                        args.get("role")
+                            .map_or(crate::search_rank::SearchRole::Any, |value| {
+                                serde_json::from_value(value.clone())
+                                    .expect("validated search role")
+                            });
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |runtime, response, sampled, prepared| {
                         let prepared = prepared.expect("search query prepared before admission");
@@ -1066,6 +1072,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             expected.is_none_or(|expected| expected == pin),
                             "revision conflict: expected basis differs from admitted head"
                         );
+                        let policy = response.mcp_search_policy(query, pin, role, &mut check)?;
                         let service = runtime.search_service();
                         let head = runtime.browser_scheduler()?.search_head_slot(false);
                         if service.is_some_and(|service| service.model_configured())
@@ -1084,6 +1091,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 query,
                                 pin,
                                 declarations,
+                                &policy,
                                 &mut check,
                             )?;
                             let head = head.as_ref().expect("published head selected");
@@ -1101,6 +1109,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 service.cache_epoch(),
                                 &lexical,
                                 prepared.vector.as_deref(),
+                                &policy,
                                 &mut vector_check,
                             );
                             match ranked {
@@ -1124,15 +1133,21 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     query,
                                     pin,
                                     declarations,
+                                    &policy,
                                     &mut check,
                                 )?;
-                                let ranked = crate::search_rank::fuse_lexical(&lexical, &mut check);
+                                let ranked =
+                                    crate::search_rank::fuse_lexical(&lexical, &policy, &mut check);
                                 (declarations, ranked, lexical)
                             }
                             None => {
                                 // Standalone registries have no matrix owner.
-                                let candidates =
-                                    response.mcp_search_candidates(query, expected, &mut check)?;
+                                let candidates = response.mcp_search_candidates(
+                                    query,
+                                    Some(pin),
+                                    &policy,
+                                    &mut check,
+                                )?;
                                 let mut vector_check = || {
                                     check()?;
                                     if let Some(budget) = prepared.budget() {
@@ -1149,6 +1164,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                         snapshot,
                                         prepared.model_id(),
                                         prepared.vector.as_deref(),
+                                        &policy,
                                         &mut vector_check,
                                     )
                                 };
@@ -1159,6 +1175,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     _ => crate::search_rank::rank_lexical(
                                         &candidates.cards,
                                         &candidates.lexical,
+                                        &policy,
                                         &mut check,
                                     ),
                                 };
@@ -1174,7 +1191,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 ) =>
                             {
                                 (
-                                    crate::search_rank::fuse_lexical(&lexical, &mut check)?,
+                                    crate::search_rank::fuse_lexical(
+                                        &lexical, &policy, &mut check,
+                                    )?,
                                     true,
                                 )
                             }
@@ -1185,7 +1204,9 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 {
                                     check()?;
                                     (
-                                        crate::search_rank::fuse_lexical(&lexical, &mut check)?,
+                                        crate::search_rank::fuse_lexical(
+                                            &lexical, &policy, &mut check,
+                                        )?,
                                         true,
                                     )
                                 } else {
@@ -1239,6 +1260,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 symbols,
                                 matched_by,
                                 search_index,
+                                role,
                             },
                             root,
                             sampled,

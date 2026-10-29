@@ -11626,6 +11626,7 @@ async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
                 envelope["evidenceBasis"],
                 SearchMcpFixture::basis(fixture.current)
             );
+            assert_eq!(envelope["data"]["role"], "any");
             let hits = envelope["data"]["hits"].as_array().unwrap();
             assert_eq!(hits.len(), count, "{reply}");
             for (index, hit) in hits.iter().enumerate() {
@@ -11666,6 +11667,7 @@ async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
             assert_eq!(envelope["partial"], false);
             assert_eq!(envelope["truncated"], false);
             assert_eq!(envelope["data"]["searchIndex"]["lexical"], "complete");
+            assert_eq!(envelope["data"]["role"], "any");
             schema_pairs.push(search_schema_pair(&reply));
         }
         drop(reader);
@@ -11679,6 +11681,139 @@ async fn mcp_search_both_modes_use_real_lexical_cards_without_optional_cache() {
     for suffix in ["-wal", "-shm", "-journal"] {
         assert!(!PathBuf::from(format!("{}{suffix}", fixture.vectors.display())).exists());
     }
+    validate_structured_content(&schema_pairs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_search_role_filters_stored_inline_roles_before_limit_and_keeps_exact_names() {
+    // Both roles share a normal path: the test role comes from the inline marker.
+    let source = r#"
+pub fn read_status_for() {}
+#[cfg(test)]
+mod inline {
+    pub fn read_status_for() {}
+    #[test]
+    fn read_status_for_is_observed() {}
+}
+"#;
+    let fixture = SearchMcpFixture::new(&[("a.rs", source)], false).await;
+    let mut schema_pairs = Vec::new();
+    for legacy in [false, true] {
+        let (mut client, mut reader, session) =
+            socket_session(&fixture.identity, &fixture.registry, 211, None);
+        search_socket_initialize(&mut client, &mut reader, legacy);
+        let mut declarations = None;
+        for (index, role) in [None, Some("any"), Some("production"), Some("test")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut args = json!({"schemaVersion":1,"query":"read_status_for","limit":1});
+            if let Some(role) = role {
+                args["role"] = json!(role);
+            }
+            let reply = search_socket_ask(&mut client, &mut reader, legacy, 1 + index as u64, args);
+            tool(&reply, None, !legacy);
+            let envelope = &reply["result"]["structuredContent"];
+            let data = &envelope["data"];
+            assert_eq!(data["role"], role.unwrap_or("any"));
+            let hits = data["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0]["name"], "read_status_for");
+            assert_eq!(hits[0]["rank"], 1);
+            assert_eq!(hits[0]["matchedBy"], json!(["lexical"]));
+            let expected_role = if role == Some("test") {
+                "test"
+            } else {
+                "production"
+            };
+            assert_eq!(hits[0]["role"], expected_role);
+            assert_eq!(emitted_document(data, &hits[0])["document"]["path"], "a.rs");
+            // Filtering is a retrieval choice, not a smaller published head/status.
+            if let Some(expected) = &declarations {
+                assert_eq!(&data["searchIndex"]["declarations"], expected);
+            } else {
+                declarations = Some(data["searchIndex"]["declarations"].clone());
+            }
+            let declaration_args = json!({"schemaVersion":1,"symbolId":hits[0]["symbolId"],
+                "expectedBasis":envelope["evidenceBasis"]});
+            schema_pairs.push(search_schema_pair(&reply));
+            writeln!(
+                client,
+                "{}",
+                call(
+                    legacy,
+                    json!(10 + index),
+                    "trellis_declaration",
+                    declaration_args
+                )
+            )
+            .unwrap();
+            let declaration = next_reply(&mut reader);
+            tool(&declaration, None, !legacy);
+            assert_eq!(
+                declaration["result"]["structuredContent"]["data"]["declaration"]["name"],
+                "read_status_for"
+            );
+            assert_eq!(
+                declaration["result"]["structuredContent"]["data"]["declaration"]["role"],
+                expected_role
+            );
+            schema_pairs.push(json!({"name":"trellis_declaration",
+                "structuredContent":declaration["result"]["structuredContent"]}));
+        }
+        let reply = search_socket_ask(
+            &mut client,
+            &mut reader,
+            legacy,
+            20,
+            json!({"schemaVersion":1,"query":"read_status_for","role":"any","limit":50}),
+        );
+        tool(&reply, None, !legacy);
+        let hits = reply["result"]["structuredContent"]["data"]["hits"]
+            .as_array()
+            .unwrap();
+        assert!(
+            hits.len() >= 3,
+            "exact retrieval must keep nonexact matches: {reply}"
+        );
+        assert_eq!(hits[0]["name"], "read_status_for");
+        assert_eq!(hits[0]["role"], "production");
+        assert_eq!(hits[1]["name"], "read_status_for");
+        assert_eq!(hits[1]["role"], "test");
+        assert!(
+            hits.iter()
+                .any(|hit| hit["name"] == "read_status_for_is_observed")
+        );
+        schema_pairs.push(search_schema_pair(&reply));
+        // The existing find tool does not acquire a role parameter or echo field.
+        for (id, role) in [(21, None), (22, Some("test"))] {
+            let mut args = json!({"schemaVersion":1,"query":"read_status_for"});
+            if let Some(role) = role {
+                args["role"] = json!(role);
+            }
+            writeln!(
+                client,
+                "{}",
+                call(legacy, json!(id), "trellis_find_symbols", args)
+            )
+            .unwrap();
+            let found = next_reply(&mut reader);
+            tool(&found, role.map(|_| "invalid_request"), !legacy);
+            if role.is_none() {
+                assert!(
+                    found["result"]["structuredContent"]["data"]
+                        .get("role")
+                        .is_none()
+                );
+            }
+            schema_pairs.push(json!({"name":"trellis_find_symbols",
+                "structuredContent":found["result"]["structuredContent"]}));
+        }
+        drop(reader);
+        drop(client);
+        session.join().unwrap().unwrap();
+    }
+    assert!(!fixture.vectors.exists());
     validate_structured_content(&schema_pairs);
 }
 
@@ -11762,6 +11897,31 @@ async fn mcp_search_closed_inputs_and_utf8_query_byte_boundaries() {
                 arguments,
             );
             tool(&reply, Some(code), !legacy);
+            schema_pairs.push(search_schema_pair(&reply));
+        }
+        for (index, role) in [
+            json!(""),
+            json!("Any"),
+            json!("tests"),
+            json!(" production"),
+            json!("test "),
+            json!(null),
+            json!(true),
+            json!(1),
+            json!([]),
+            json!({}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let reply = search_socket_ask(
+                &mut client,
+                &mut reader,
+                legacy,
+                30 + index as u64,
+                json!({"schemaVersion":1,"query":"café","role":role}),
+            );
+            tool(&reply, Some("invalid_request"), !legacy);
             schema_pairs.push(search_schema_pair(&reply));
         }
         drop(reader);
@@ -12389,11 +12549,7 @@ async fn mcp_search_hybrid_ranks_both_arms_and_vector_only_with_partial_then_com
         );
         let hits = envelope["data"]["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 2);
-        let expected_names = if complete {
-            ["orchard", "unrelated"]
-        } else {
-            ["unrelated", "orchard"]
-        };
+        let expected_names = ["orchard", "unrelated"];
         for (index, (hit, name)) in hits.iter().zip(expected_names).enumerate() {
             assert_eq!(hit["name"], name);
             assert_eq!(hit["rank"], index + 1);
@@ -12436,6 +12592,22 @@ async fn mcp_search_hybrid_ranks_both_arms_and_vector_only_with_partial_then_com
         assert_eq!(envelope["truncated"], false);
         assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
         schema_pairs.push(search_schema_pair(&reply));
+        if !complete {
+            let nonexact = search_socket_ask(
+                &mut client,
+                &mut reader,
+                false,
+                3,
+                json!({"schemaVersion":1,"query":"orchards","limit":10}),
+            );
+            tool(&nonexact, None, true);
+            let data = &nonexact["result"]["structuredContent"]["data"];
+            assert_eq!(data["hits"][0]["name"], "unrelated");
+            assert_eq!(data["hits"][0]["matchedBy"], json!(["vector"]));
+            assert_eq!(data["hits"][1]["name"], "orchard");
+            assert_eq!(data["hits"][1]["matchedBy"], json!(["lexical"]));
+            schema_pairs.push(search_schema_pair(&nonexact));
+        }
     }
     drop(reader);
     drop(client);
