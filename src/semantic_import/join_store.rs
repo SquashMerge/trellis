@@ -44,7 +44,13 @@ pub(super) trait NativeFacts {
 pub(super) trait JoinFacts {
     type Operation;
     fn operation(&self) -> Result<Self::Operation>;
-    fn reserve_operation(&self, operation: &mut Self::Operation, bytes: u64) -> Result<()>;
+    /// Admits `bytes()` into `operation`. The estimate is lazy: a backend without a live
+    /// budget never evaluates it, so its overflow checks cannot fail the unmetered oracle.
+    fn reserve_operation(
+        &self,
+        operation: &mut Self::Operation,
+        bytes: impl FnOnce() -> Result<u64>,
+    ) -> Result<()>;
     fn join_reserved(
         &self,
         document: &native::DocumentKey,
@@ -176,37 +182,35 @@ impl Deref for MethodSummary {
     }
 }
 
-/// Complete declaration, presence and method lookups for one claim set.
+/// Admits the bytes of each returned row before it is built. A backend without a live budget
+/// never calls it.
+pub(super) type RowReserve<'a> = &'a mut dyn FnMut(u64) -> Result<()>;
+
+/// Complete declaration, presence and method lookups for one claim set. Each lookup is one
+/// pass over its rows: a metered backend admits a row's bytes through `reserve` before it
+/// builds the row, so no separate sizing query precedes the fetch.
 pub(super) trait GlobalJoinReads {
-    fn declarations_clone_bytes(&self, _key: &ScopedKey) -> Result<u64> {
-        Ok(0)
-    }
-    fn source_methods_clone_bytes(
+    fn declarations(
         &self,
-        _document: &native::DocumentKey,
-        _symbol: &str,
-    ) -> Result<u64> {
-        Ok(0)
+        key: &ScopedKey,
+        reserve: RowReserve<'_>,
+    ) -> Result<Vec<(native::DocumentKey, String)>>;
+    /// `(declared, information)` presence of one symbol.
+    fn presence(&self, symbol: &str) -> Result<(bool, bool)>;
+    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
+        Ok(self.presence(symbol)?.1)
     }
-    fn target_methods_clone_bytes(
-        &self,
-        _document: &native::DocumentKey,
-        _symbol: &str,
-    ) -> Result<u64> {
-        Ok(0)
-    }
-    fn declarations(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>>;
-    fn is_declared_symbol(&self, symbol: &str) -> Result<bool>;
-    fn is_information_symbol(&self, symbol: &str) -> Result<bool>;
     fn source_methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>>;
     fn target_methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>>;
 }
 
@@ -345,7 +349,7 @@ pub(super) trait JoinSink {
     fn reference_claim(&mut self, proof_id: &str, row: semantic::Reference) -> Result<()>;
     fn reference_slot(&self, reference_id: &str) -> Result<Option<usize>>;
     fn reference_count(&self) -> usize;
-    /// The disposable SQL bridge is unmetered here until its slice-3 removal.
+    /// Logical clone bytes; zero for the unmetered in-memory sink.
     fn reference_clone_bytes(&self, _slot: usize) -> Result<u64> {
         Ok(0)
     }
@@ -353,7 +357,7 @@ pub(super) trait JoinSink {
     /// Replaces the row at `slot`, or appends when `slot` is `None`. Returns the slot.
     fn put_reference(&mut self, slot: Option<usize>, row: semantic::Reference) -> Result<usize>;
     fn call_binding_count(&self) -> usize;
-    /// The disposable SQL bridge is unmetered here until its slice-3 removal.
+    /// Logical clone bytes; zero for the unmetered in-memory sink.
     fn call_binding_clone_bytes(&self, _slot: usize) -> Result<u64> {
         Ok(0)
     }

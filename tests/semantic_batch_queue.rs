@@ -576,7 +576,7 @@ fn commit_contention_requeues_the_request_instead_of_rejoining_or_failing() {
     let marker = home_marker.path().join("commit-busy.marker");
     // The first COMMIT fails from contention and rolls back; the request is requeued typed
     // `storage_busy` instead of being re-joined (which would charge the lookup budget again).
-    // This fixture costs 432 lookup steps per join. A limit of 631 admits one join but
+    // This fixture costs 376 lookup steps per join. A limit of 631 admits one join but
     // not two, so an in-request re-join after the failed COMMIT hits `limit_exceeded`.
     let world = World::new(
         four_language_workspace,
@@ -1627,8 +1627,8 @@ fn lookup_budget_spans_the_rejoin_after_a_cutoff_edit() {
         .tempdir_in("/tmp")
         .unwrap();
     let socket = marker.path().join("cutoff.sock");
-    // This fixture costs 419 lookup steps before the late edit and 398 afterwards. The
-    // limit admits either join alone, but not their cumulative in-request work (817).
+    // This fixture costs 355 lookup steps before the late edit and 326 afterwards. The
+    // limit admits either join alone, but not their cumulative in-request work (681).
     let (world, output, advanced, _, _) = import_with_cutoff_edit(
         &[
             ("TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET", &socket),

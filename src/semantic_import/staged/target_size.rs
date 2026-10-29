@@ -105,6 +105,7 @@ pub(in crate::semantic_import) fn shape(target: &semantic::Target) -> Result<(u6
 }
 /// Pinned Rust 1.99.1 driftsort has minimum 48 scratch slots beyond insertion sort.
 pub(in crate::semantic_import) fn stable_sort<T>(count: usize) -> Result<u64> {
+    super::sizes::note_estimate();
     if count <= 20 {
         return Ok(0);
     }
@@ -113,6 +114,7 @@ pub(in crate::semantic_import) fn stable_sort<T>(count: usize) -> Result<u64> {
         .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()).into())
 }
 pub(in crate::semantic_import) fn target_slots(count: usize) -> Result<u64> {
+    super::sizes::note_estimate();
     (count as u64)
         .checked_mul(size_of::<semantic::Target>() as u64)
         .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()).into())

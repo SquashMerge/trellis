@@ -12,6 +12,11 @@ use std::{
 pub const STAGE_PREFIX: &str = "semantic-stage-";
 const STAGE_DB: &str = "stage.db";
 
+/// The join emits `out_*` one document at a time, so `ord` is document-major. Within one
+/// document each family is in contract order, which is all the per-document publisher reads.
+/// The global contract order of provenance (raw ID, then evidence kind) and of references
+/// (reference ID) is the key `(derived_from, kind_rank)` and `reference_id`. Nothing in
+/// production reads that global order, so no index is spent on the provenance key.
 const STAGE_SCHEMA: &str = "
 CREATE TABLE header(singleton INTEGER PRIMARY KEY CHECK(singleton=1), descriptor_sha256 TEXT NOT NULL, descriptor_bytes BLOB NOT NULL);
 CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, UNIQUE(language,path));
@@ -33,34 +38,9 @@ CREATE TABLE g_presence(side INTEGER NOT NULL, symbol TEXT NOT NULL, declared IN
 CREATE TABLE g_methods(side INTEGER NOT NULL, ord INTEGER NOT NULL, symbol TEXT NOT NULL, local_language TEXT NOT NULL, local_path TEXT NOT NULL, owner_language TEXT NOT NULL, owner_path TEXT NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL, PRIMARY KEY(side,ord)) WITHOUT ROWID;
 CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_language,owner_path,ord);
 CREATE INDEX g_methods_target ON g_methods(side,symbol,local_language,local_path,ord);
-CREATE TABLE f_symbols(side INTEGER NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE TABLE f_bindings(side INTEGER NOT NULL, ord INTEGER NOT NULL, provenance_id TEXT NOT NULL, syntax_id TEXT, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE INDEX f_bindings_provenance ON f_bindings(side, provenance_id);
-CREATE TABLE f_refclaims(side INTEGER NOT NULL, proof_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, proof_id)) WITHOUT ROWID;
-CREATE TABLE f_refs(side INTEGER NOT NULL, slot INTEGER NOT NULL, ref_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, slot)) WITHOUT ROWID;
-CREATE UNIQUE INDEX f_refs_id ON f_refs(side, ref_id);
-CREATE TABLE f_calls(side INTEGER NOT NULL, slot INTEGER NOT NULL, provenance_id TEXT NOT NULL, call_id TEXT, body TEXT NOT NULL, PRIMARY KEY(side, slot)) WITHOUT ROWID;
-CREATE INDEX f_calls_provenance ON f_calls(side, provenance_id);
-CREATE TABLE f_rels(side INTEGER NOT NULL, ord INTEGER NOT NULL, provenance_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE INDEX f_rels_provenance ON f_rels(side, provenance_id);
-CREATE TABLE f_diag(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, code TEXT NOT NULL, PRIMARY KEY(side, language, path, code)) WITHOUT ROWID;
-CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, requested INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, eligible INTEGER NOT NULL DEFAULT 0, unsupported INTEGER NOT NULL DEFAULT 0, omitted INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE w_unsupported_claims(proof_id TEXT PRIMARY KEY) WITHOUT ROWID;
-CREATE TABLE w_cap_targets(language TEXT NOT NULL, path TEXT NOT NULL, symbol TEXT NOT NULL, target BLOB NOT NULL, PRIMARY KEY(language, path, symbol, target)) WITHOUT ROWID;
-CREATE INDEX w_cap_targets_symbol ON w_cap_targets(symbol);
-CREATE TABLE w_prov(raw_id TEXT NOT NULL, kind INTEGER NOT NULL, PRIMARY KEY(raw_id, kind)) WITHOUT ROWID;
-CREATE TABLE w_outcomes(proof_id TEXT PRIMARY KEY, outcome INTEGER NOT NULL) WITHOUT ROWID;
-CREATE TABLE w_refrows(ref_id TEXT PRIMARY KEY, body TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE w_reftargets(ref_id TEXT NOT NULL, ord INTEGER NOT NULL, target TEXT NOT NULL, PRIMARY KEY(ref_id, ord)) WITHOUT ROWID;
-CREATE TABLE w_refproofs(ref_id TEXT NOT NULL, raw_id TEXT NOT NULL, PRIMARY KEY(ref_id, raw_id)) WITHOUT ROWID;
-CREATE TABLE w_accepted(raw_id TEXT PRIMARY KEY, ref_id TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE w_calls(ord INTEGER PRIMARY KEY, raw_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE w_callres(ord INTEGER PRIMARY KEY, raw_id TEXT NOT NULL, call_id TEXT, body TEXT NOT NULL);
-CREATE INDEX w_callres_site ON w_callres(call_id);
-CREATE TABLE w_sitetargets(call_id TEXT NOT NULL, canon BLOB NOT NULL, target TEXT NOT NULL, PRIMARY KEY(call_id, canon)) WITHOUT ROWID;
-CREATE TABLE w_observed(language TEXT NOT NULL, path TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(language, path, role)) WITHOUT ROWID;
+CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, requested INTEGER NOT NULL, failed INTEGER NOT NULL, eligible INTEGER NOT NULL, unsupported INTEGER NOT NULL, unsupported_claims INTEGER NOT NULL, claims INTEGER NOT NULL);
 CREATE TABLE out_coverage(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL UNIQUE, artifact INTEGER, derived_from TEXT, derived_kind TEXT, derived_digest TEXT, body TEXT NOT NULL);
+CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL UNIQUE, artifact INTEGER, derived_from TEXT, derived_kind TEXT, derived_digest TEXT, kind_rank INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE TABLE out_symbols(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE out_declaration_bindings(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE out_references(ord INTEGER PRIMARY KEY, reference_id TEXT NOT NULL UNIQUE, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
@@ -79,26 +59,7 @@ pub const JOIN_TABLES: &[&str] = &[
     "g_definitions",
     "g_presence",
     "g_methods",
-    "f_symbols",
-    "f_bindings",
-    "f_refclaims",
-    "f_refs",
-    "f_calls",
-    "f_rels",
-    "f_diag",
     "w_docs",
-    "w_unsupported_claims",
-    "w_cap_targets",
-    "w_prov",
-    "w_outcomes",
-    "w_refrows",
-    "w_reftargets",
-    "w_refproofs",
-    "w_accepted",
-    "w_calls",
-    "w_callres",
-    "w_sitetargets",
-    "w_observed",
     "out_coverage",
     "out_provenance",
     "out_symbols",

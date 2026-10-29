@@ -812,6 +812,15 @@ impl World {
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
     ) -> anyhow::Result<SemanticPublication> {
+        self.memory_rejoin(descriptor, mutations)
+            .map(|result| result.publication)
+    }
+
+    fn memory_rejoin(
+        &self,
+        descriptor: &(PathBuf, String),
+        mutations: DestinationMutations,
+    ) -> anyhow::Result<trellis::semantic_import::RejoinResult> {
         let MemoryAdmission {
             parsed,
             r1,
@@ -870,8 +879,29 @@ impl World {
             &basis,
             parsed.producer.position_encoding,
         )
-        .map(|result| result.publication)
     }
+}
+
+/// The per-language claim tallies of a report, by language name.
+fn report_tallies(report: &Value) -> std::collections::BTreeMap<String, [u64; 5]> {
+    report["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let count = |name: &str| row[name].as_u64().unwrap();
+            (
+                row["language"].as_str().unwrap().to_owned(),
+                [
+                    count("requested"),
+                    count("matched"),
+                    count("skipped"),
+                    count("ambiguous"),
+                    count("unsupported"),
+                ],
+            )
+        })
+        .collect()
 }
 
 fn assert_same_publication(staged: &SemanticPublication, memory: &SemanticPublication, case: &str) {
@@ -979,12 +1009,18 @@ fn definitions_world() -> World {
 #[test]
 fn staged_and_memory_join_stores_produce_identical_publications() {
     let check = |world: &World, descriptor: &(PathBuf, String), mutations, case: &str| {
-        let (mut admitted, _, _) = world
+        let (mut admitted, sealed, _) = world
             .join_with(descriptor, &BatchLimits::PRODUCTION, mutations)
             .unwrap();
         let staged = testing::staged_publication(&mut admitted).unwrap();
-        let memory = world.memory_publication(descriptor, mutations);
+        let rejoined = world.memory_rejoin(descriptor, mutations).unwrap();
+        let memory = rejoined.publication;
         assert_same_publication(&staged, &memory, case);
+        assert_eq!(
+            report_tallies(sealed.report()),
+            report_tallies(&rejoined.report),
+            "{case}: report tallies"
+        );
         let full = world.full_validation(descriptor, mutations, &staged);
         let reference = world.full_validation(descriptor, mutations, &memory);
         assert_eq!(
@@ -1149,6 +1185,64 @@ fn complexity_fixtures() -> Vec<Fixture> {
         artifacts: vec![("java", vec![local_a, local_b])],
     });
 
+    // Java overrides whose target method lives in another document: the global method
+    // summary, not the overriding document, supplies the target and its owner predicate.
+    let child = "class Child extends Base { void f() {} }";
+    let child_doc = |base_f: &str| {
+        let doc = DocSpec::new("A.java");
+        let doc = occ_at(doc, child, ("Child", 0), None, "pkg Child#", 1);
+        let doc = occ_at(doc, child, ("Base", 0), None, "pkg Base#", 8);
+        occ_at(doc, child, ("f", 0), None, "pkg Child#f().", 1)
+            .symbol("pkg Child#", 7, &["pkg Base#"])
+            .symbol("pkg Child#f().", 26, &[base_f])
+    };
+    let script_base = "class Base { f() {} }";
+    let script_doc = occ_at(
+        DocSpec::new("B.js"),
+        script_base,
+        ("Base", 0),
+        None,
+        "pkg Base#",
+        1,
+    );
+    let script_doc = occ_at(script_doc, script_base, ("f", 0), None, "pkg Base#f().", 1)
+        .symbol("pkg Base#", 7, &[])
+        .symbol("pkg Base#f().", 26, &[]);
+    fixtures.push(Fixture {
+        name: "java override owner in another language",
+        files: vec![
+            ("A.java".into(), child.into()),
+            ("B.js".into(), script_base.into()),
+        ],
+        artifacts: vec![
+            ("java", vec![child_doc("pkg Base#f().")]),
+            ("javascript", vec![script_doc]),
+        ],
+    });
+    // The foreign method's owner type is named by a different symbol, so its owner predicate
+    // fails and no override may be published. A lookup confined to the overriding document
+    // would miss the method and publish one.
+    let java_base = "class Base { void f() {} }";
+    let mismatched = occ_at(
+        DocSpec::new("B.java"),
+        java_base,
+        ("Base", 0),
+        None,
+        "pkg Other#",
+        1,
+    );
+    let mismatched = occ_at(mismatched, java_base, ("f", 0), None, "pkg Base#f().", 1)
+        .symbol("pkg Other#", 7, &[])
+        .symbol("pkg Base#f().", 26, &[]);
+    fixtures.push(Fixture {
+        name: "foreign java method owner predicate fails",
+        files: vec![
+            ("A.java".into(), child.into()),
+            ("B.java".into(), java_base.into()),
+        ],
+        artifacts: vec![("java", vec![child_doc("pkg Base#f()."), mismatched])],
+    });
+
     let mut files = Vec::new();
     let mut docs = Vec::new();
     for ordinal in 0..3 {
@@ -1301,19 +1395,27 @@ fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
             let mutations = DestinationMutations::default();
             let codes = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
             let seen = codes.clone();
-            testing::before_join_closure(move |conn| {
-                let mut statement = conn.prepare("SELECT code FROM f_diag").unwrap();
-                let rows = statement
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .unwrap();
-                seen.borrow_mut().extend(rows.map(Result::unwrap));
+            // Captured diagnostics are document-local Common results; nothing persists them.
+            testing::observe_document_common(move |side, _document, facts, _conn| {
+                if side == 0 {
+                    seen.borrow_mut()
+                        .extend(facts.diagnostics.values().flatten().cloned());
+                }
             });
-            let (mut admitted, _, _) = world
-                .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
-                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            let joined = world.join_with(&descriptor, &BatchLimits::PRODUCTION, mutations);
+            testing::clear_document_common_observer();
+            let (mut admitted, sealed, _) =
+                joined.unwrap_or_else(|error| panic!("{case}: {error:#}"));
             let staged = testing::staged_publication(&mut admitted).unwrap();
-            let memory = world.memory_publication(&descriptor, mutations);
+            let rejoined = world.memory_rejoin(&descriptor, mutations).unwrap();
+            let memory = rejoined.publication;
             assert_same_publication(&staged, &memory, &case);
+            // The per-document tallies sum to the whole-corpus oracle's report counts.
+            assert_eq!(
+                report_tallies(sealed.report()),
+                report_tallies(&rejoined.report),
+                "{case}: report tallies"
+            );
             world
                 .full_validation(&descriptor, mutations, &staged)
                 .unwrap_or_else(|error| panic!("{case}: full validation: {error:#}"));
@@ -1351,6 +1453,22 @@ fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
                         .any(|r| r.kind == trellis::semantic_evidence::RelationshipKind::Overrides),
                     "{case}"
                 );
+            }
+            let overrides: Vec<_> = staged
+                .type_relationships
+                .iter()
+                .filter(|r| r.kind == trellis::semantic_evidence::RelationshipKind::Overrides)
+                .collect();
+            if fixture.name == "java override owner in another language" {
+                assert_eq!(overrides.len(), 1, "{case}");
+                assert!(
+                    matches!(&overrides[0].target, trellis::semantic_evidence::Target::Internal { document, .. }
+                        if document.path == "B.js" && document.language == "javascript"),
+                    "{case}: {overrides:?}"
+                );
+            }
+            if fixture.name == "foreign java method owner predicate fails" {
+                assert!(overrides.is_empty(), "{case}: {overrides:?}");
             }
         }
     }
@@ -1962,6 +2080,85 @@ fn a_new_destination_clears_the_destination_tables() {
     let (coverage_after, provenance_after) = rows(&mut admitted);
     assert_eq!(coverage_after, coverage + 1);
     assert_eq!(provenance_after, provenance);
+}
+
+#[test]
+fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    for changed in [false, true] {
+        if changed {
+            write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+            world.republish();
+        }
+        let (mut admitted, _, counters) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let ledger = &counters.staged_row_attempts;
+        let owners = [
+            "seed:retained-native",
+            "nat_docs",
+            "nat_declarations",
+            "g_definitions",
+            "g_presence",
+            "g_methods",
+            "w_docs",
+            "out_coverage",
+            "out_provenance",
+            "out_symbols",
+            "out_declaration_bindings",
+            "out_references",
+            "out_call_bindings",
+            "out_type_relationships",
+        ];
+        assert!(
+            ledger.keys().all(|owner| owners.contains(&owner.as_str())),
+            "changed {changed}: {ledger:?}"
+        );
+        let conn = admitted.stage_mut().conn().unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            tables.iter().all(|t| !t.starts_with("f_")
+                && !t.starts_with("ix_")
+                && (!t.starts_with("w_") || t == "w_docs")),
+            "no whole-corpus mirror table: {tables:?}"
+        );
+        // Each final row is one charged insertion; the decision table holds one row per
+        // captured document.
+        for table in owners
+            .iter()
+            .filter(|o| o.starts_with("out_") || **o == "w_docs")
+        {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                ledger.get(*table).copied().unwrap_or(0),
+                rows as u64,
+                "changed {changed}: {table}"
+            );
+        }
+        let captured_documents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nat_docs WHERE rev=0", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ledger["w_docs"], captured_documents as u64);
+        assert!(ledger["out_references"] > 0 && ledger["out_provenance"] > 0);
+    }
 }
 
 #[test]

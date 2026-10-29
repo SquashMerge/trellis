@@ -573,7 +573,14 @@ pub fn staged_publication(batch: &mut AdmittedBatch) -> Result<semantic::Semanti
     let producer = batch.producer().producer();
     let conn = batch.stage_mut().conn()?;
     fn rows<T: serde::de::DeserializeOwned>(conn: &Connection, table: &str) -> Result<Vec<T>> {
-        let mut statement = conn.prepare(&format!("SELECT body FROM {table} ORDER BY ord"))?;
+        // Provenance and references read in their global contract order by indexed key; the
+        // other families' document-major `ord` is already their contract order.
+        let order = match table {
+            "out_provenance" => "derived_from, kind_rank",
+            "out_references" => "reference_id",
+            _ => "ord",
+        };
+        let mut statement = conn.prepare(&format!("SELECT body FROM {table} ORDER BY {order}"))?;
         let bodies = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;

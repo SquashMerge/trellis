@@ -936,8 +936,7 @@ fn declaration_targets<S: JoinStore, G: GlobalJoinReads>(
     symbol: &str,
     operation: &mut S::Operation,
 ) -> Result<Vec<semantic::Target>> {
-    store.reserve_operation(
-        operation,
+    store.reserve_operation(operation, || {
         staged::sizes::sum(&[
             std::mem::size_of::<ScopedKey>() as u64,
             symbol.len() as u64,
@@ -946,22 +945,24 @@ fn declaration_targets<S: JoinStore, G: GlobalJoinReads>(
             } else {
                 0
             },
-        ])?,
-    )?;
+        ])
+    })?;
     let key = scoped_key(symbol, document);
-    store.reserve_operation(operation, index.declarations_clone_bytes(&key)?)?;
-    let rows = index.declarations(&key)?;
-    let revisions = (rows.len() as u64)
-        .checked_mul(store.revision_id().len() as u64)
-        .ok_or_else(|| crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into()))?;
-    store.reserve_operation(
-        operation,
+    let rows = index.declarations(&key, &mut |bytes| {
+        store.reserve_operation(operation, || Ok(bytes))
+    })?;
+    store.reserve_operation(operation, || {
+        let revisions = (rows.len() as u64)
+            .checked_mul(store.revision_id().len() as u64)
+            .ok_or_else(|| {
+                crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into())
+            })?;
         staged::sizes::sum(&[
             std::mem::size_of::<Vec<semantic::Target>>() as u64,
             staged::target_size::target_slots(rows.len())?,
             revisions,
-        ])?,
-    )?;
+        ])
+    })?;
     let mut targets = Vec::with_capacity(rows.len());
     targets.extend(
         rows.into_iter()
@@ -1026,14 +1027,13 @@ fn measure_occurrence<S: JoinStore>(
                 _ => true,
             });
         if compatible {
-            store.reserve_operation(operation, binding.candidate_ids[0].len() as u64)?;
+            store.reserve_operation(operation, || Ok(binding.candidate_ids[0].len() as u64))?;
         }
         compatible.then(|| binding.candidate_ids[0].clone())
     } else {
         None
     };
-    store.reserve_operation(
-        operation,
+    store.reserve_operation(operation, || {
         staged::sizes::sum(&[
             (std::mem::size_of::<OccurrenceRow>() - 3 * std::mem::size_of::<semantic::Join>())
                 as u64,
@@ -1041,8 +1041,8 @@ fn measure_occurrence<S: JoinStore>(
             claim.fact_digest.len() as u64,
             staged::sizes::document(doc)?,
             symbol.len() as u64,
-        ])?,
-    )?;
+        ])
+    })?;
     Ok(Some(MeasuredOccurrence {
         row: OccurrenceRow {
             proof_id: claim.captured_proof_id.clone(),
@@ -1073,15 +1073,14 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
         &claim.envelope.record_kind,
         &claim.fact_digest,
     )?;
-    store.reserve_operation(
-        operation,
+    store.reserve_operation(operation, || {
         staged::sizes::sum(&[
             std::mem::size_of::<native::DocumentKey>() as u64,
             store.source_set_id().len() as u64,
             claim.language.len() as u64,
             claim.envelope.relative_path.len() as u64,
-        ])?,
-    )?;
+        ])
+    })?;
     let doc = native::DocumentKey {
         source_set_id: store.source_set_id().to_owned(),
         language: claim.language.clone(),
@@ -1124,8 +1123,7 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
             return Ok(None);
         };
         if roles & 1 != 0 && measured.row.binding.status == semantic::JoinStatus::Exact {
-            store.reserve_operation(
-                operation,
+            store.reserve_operation(operation, || {
                 staged::sizes::sum(&[
                     std::mem::size_of::<ScopedKey>() as u64,
                     symbol.len() as u64,
@@ -1138,8 +1136,8 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
                     staged::sizes::document(&doc)?,
                     std::mem::size_of::<String>() as u64,
                     measured.row.binding.candidate_ids[0].len() as u64,
-                ])?,
-            )?;
+                ])
+            })?;
             global.exact_definition(
                 scoped_key(symbol, &doc),
                 doc.clone(),
@@ -1179,15 +1177,14 @@ fn emit_join_symbols<S: JoinStore, G: GlobalJoinReads, K: JoinSink>(
             continue;
         }
         let mut operation = store.operation()?;
-        store.reserve_operation(
-            &mut operation,
+        store.reserve_operation(&mut operation, || {
             staged::sizes::sum(&[
                 std::mem::size_of::<native::DocumentKey>() as u64,
                 source_set_id.len() as u64,
                 claim.language.len() as u64,
                 claim.envelope.relative_path.len() as u64,
-            ])?,
-        )?;
+            ])
+        })?;
         let doc = native::DocumentKey {
             source_set_id: source_set_id.to_owned(),
             language: claim.language.clone(),
@@ -1201,8 +1198,7 @@ fn emit_join_symbols<S: JoinStore, G: GlobalJoinReads, K: JoinSink>(
         let display_name = claim.envelope.raw["displayName"]
             .as_str()
             .filter(|s| !s.is_empty());
-        store.reserve_operation(
-            &mut operation,
+        store.reserve_operation(&mut operation, || {
             staged::sizes::sum(&[
                 std::mem::size_of::<semantic::Symbol>() as u64,
                 key.len() as u64,
@@ -1213,8 +1209,8 @@ fn emit_join_symbols<S: JoinStore, G: GlobalJoinReads, K: JoinSink>(
                 },
                 display_name.map_or(0, |s| s.len() as u64),
                 claim.captured_proof_id.len() as u64,
-            ])?,
-        )?;
+            ])
+        })?;
         out.symbol(semantic::Symbol {
             key: symbol_key(key, &doc),
             display_name: display_name.map(str::to_owned),
@@ -1234,7 +1230,7 @@ fn join_occurrences<S: IndexedJoinStore, K: JoinSink>(
     let mut role_sites = None;
     for ordinal in 0..index.occurrence_count() {
         let mut operation = store.operation()?;
-        store.reserve_operation(&mut operation, index.occurrence_clone_bytes(ordinal)?)?;
+        store.reserve_operation(&mut operation, || index.occurrence_clone_bytes(ordinal))?;
         let row = index.occurrence(ordinal)?;
         join_occurrence(
             admitted_encoding,
@@ -1270,8 +1266,7 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         call,
     } = measured;
     let claim = store.claim(&proof_id, "occurrence", &fact_digest)?;
-    store.reserve_operation(
-        operation,
+    store.reserve_operation(operation, || {
         staged::sizes::sum(&[
             std::mem::size_of::<semantic::SymbolKey>() as u64,
             symbol.len() as u64,
@@ -1280,27 +1275,25 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             } else {
                 0
             },
-        ])?,
-    )?;
+        ])
+    })?;
     let key = symbol_key(&symbol, &doc);
     let mut asserted = declaration_targets(store, index, &doc, &symbol, operation)?;
     if asserted.is_empty()
         && key.scope == semantic::SymbolScope::Global
-        && !index.is_declared_symbol(&symbol)?
-        && !index.is_information_symbol(&symbol)?
+        && index.presence(&symbol)? == (false, false)
     {
-        store.reserve_operation(
-            operation,
+        store.reserve_operation(operation, || {
             staged::sizes::sum(&[
                 staged::sizes::symbol_key(&key)?,
                 4 * std::mem::size_of::<semantic::Target>() as u64,
-            ])?,
-        )?;
+            ])
+        })?;
         asserted.push(semantic::Target::External {
             symbol: key.clone(),
         });
     }
-    store.reserve_operation(operation, staged::target_size::sort(&asserted)?)?;
+    store.reserve_operation(operation, || staged::target_size::sort(&asserted))?;
     asserted.sort_by_key(|t| {
         native_ids::canonical(&serde_json::to_value(t).expect("serializable target"))
     });
@@ -1320,8 +1313,7 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     };
     if roles & 1 != 0 {
         out.join(&claim.captured_proof_id, &binding)?;
-        store.reserve_operation(
-            operation,
+        store.reserve_operation(operation, || {
             staged::sizes::sum(&[
                 (std::mem::size_of::<semantic::DeclarationBinding>()
                     - std::mem::size_of::<semantic::Join>()) as u64,
@@ -1336,8 +1328,8 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 } else {
                     0
                 },
-            ])?,
-        )?;
+            ])
+        })?;
         out.declaration_binding(semantic::DeclarationBinding {
             syntax_id: (binding.status == semantic::JoinStatus::Exact)
                 .then(|| binding.candidate_ids[0].clone()),
@@ -1382,10 +1374,9 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 }),
             _ => false,
         };
-        store.reserve_operation(
-            operation,
-            staged::sizes::map_entries::<semantic::Role, ()>(7)?,
-        )?;
+        store.reserve_operation(operation, || {
+            staged::sizes::map_entries::<semantic::Role, ()>(7)
+        })?;
         let mut assigned = BTreeSet::new();
         if declaration_site {
             assigned.insert(semantic::Role::Definition);
@@ -1396,13 +1387,12 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             .is_none_or(|(owner, _, _)| owner != &doc)
         {
             let mut cache_operation = store.operation()?;
-            store.reserve_operation(
-                &mut cache_operation,
+            store.reserve_operation(&mut cache_operation, || {
                 staged::sizes::sum(&[
                     std::mem::size_of::<native::DocumentKey>() as u64,
                     staged::sizes::document(&doc)?,
-                ])?,
-            )?;
+                ])
+            })?;
             let sites = store.role_sites_reserved(&doc, &mut cache_operation)?;
             *role_sites = Some((doc.clone(), sites, cache_operation));
         }
@@ -1411,10 +1401,9 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             assigned.insert(semantic::Role::Import);
         }
         if !declaration_site && sites.types.contains(&site) && {
-            store.reserve_operation(
-                operation,
-                index.type_uses_clone_bytes(&doc, site.0, site.1)?,
-            )?;
+            store.reserve_operation(operation, || {
+                index.type_uses_clone_bytes(&doc, site.0, site.1)
+            })?;
             let keys = index.type_uses(&doc, site.0, site.1)?;
             keys.len() == 1 && keys.contains(&symbol)
         } {
@@ -1451,13 +1440,12 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         }
         if !assigned.is_empty() {
             for target in resolved.iter().chain(candidates.iter()) {
-                store.reserve_operation(operation, staged::sizes::target(target)?)?;
+                store.reserve_operation(operation, || staged::sizes::target(target))?;
                 index.put_reference_claim(&r.id, &claim.captured_proof_id, target.clone())?;
             }
         }
         if !assigned.is_empty() {
-            store.reserve_operation(
-                operation,
+            store.reserve_operation(operation, || {
                 staged::sizes::sum(&[
                     std::mem::size_of::<semantic::Reference>() as u64,
                     r.id.len() as u64,
@@ -1472,8 +1460,8 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                         .map_or(Ok(0), staged::sizes::target_payload)?,
                     staged::sizes::targets(&candidates)?,
                     claim.captured_proof_id.len() as u64,
-                ])?,
-            )?;
+                ])
+            })?;
             let reference = semantic::Reference {
                 id: r.id.clone(),
                 owner_syntax_id: r.owner_syntax_id.clone(),
@@ -1494,18 +1482,17 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 candidates: candidates.clone(),
                 provenance_id: claim.captured_proof_id.clone(),
             };
-            store.reserve_operation(operation, staged::sizes::reference(&reference)?)?;
+            store.reserve_operation(operation, || staged::sizes::reference(&reference))?;
             out.reference_claim(&claim.captured_proof_id, reference.clone())?;
             #[cfg(test)]
             complexity_work(|work| work.reference_map_lookups += 1);
             if let Some(slot) = out.reference_slot(&r.id)? {
-                store.reserve_operation(operation, out.reference_clone_bytes(slot)?)?;
+                store.reserve_operation(operation, || out.reference_clone_bytes(slot))?;
                 let mut prior = out.reference(slot)?;
                 assigned.extend(prior.roles.iter().copied());
-                store.reserve_operation(
-                    operation,
-                    (assigned.len() * std::mem::size_of::<semantic::Role>()) as u64,
-                )?;
+                store.reserve_operation(operation, || {
+                    Ok((assigned.len() * std::mem::size_of::<semantic::Role>()) as u64)
+                })?;
                 prior.roles = assigned.into_iter().collect();
                 if prior.roles.contains(&semantic::Role::Definition) {
                     prior.site = semantic::ReferenceSite::Declaration;
@@ -1529,7 +1516,7 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 .filter(|j| j.status == semantic::JoinStatus::Exact)
                 .unwrap_or(&call)
         };
-        store.reserve_operation(operation, staged::sizes::join(selected)?)?;
+        store.reserve_operation(operation, || staged::sizes::join(selected))?;
         let candidate = if call.status == semantic::JoinStatus::Exact {
             call.clone()
         } else if invocation
@@ -1568,15 +1555,14 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                     })
             }) {
                 index.put_call_reference(&claim.captured_proof_id, &reference.candidate_ids[0])?;
-                store.reserve_operation(
-                    operation,
+                store.reserve_operation(operation, || {
                     staged::sizes::sum(&[
                         (std::mem::size_of::<semantic::CallBinding>()
                             - std::mem::size_of::<semantic::Join>()) as u64,
                         candidate.candidate_ids[0].len() as u64,
                         claim.captured_proof_id.len() as u64,
-                    ])?,
-                )?;
+                    ])
+                })?;
                 out.put_call_binding(
                     None,
                     semantic::CallBinding {
@@ -1607,24 +1593,22 @@ fn settle_join_references<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
 ) -> Result<()> {
     for slot in 0..out.reference_count() {
         let mut operation = store.operation()?;
-        store.reserve_operation(&mut operation, out.reference_clone_bytes(slot)?)?;
+        store.reserve_operation(&mut operation, || out.reference_clone_bytes(slot))?;
         let mut reference = out.reference(slot)?;
         let (mut claims, _claims_reservation) = index.take_reference_claims(&reference.id)?;
-        store.reserve_operation(
-            &mut operation,
-            staged::target_size::stable_sort::<(String, semantic::Target)>(claims.len())?,
-        )?;
+        store.reserve_operation(&mut operation, || {
+            staged::target_size::stable_sort::<(String, semantic::Target)>(claims.len())
+        })?;
         claims.sort_by(|a, b| a.0.cmp(&b.0));
         if let Some((proof, _)) = claims.first() {
-            store.reserve_operation(&mut operation, proof.len() as u64)?;
+            store.reserve_operation(&mut operation, || Ok(proof.len() as u64))?;
             reference.provenance_id = proof.clone();
         }
-        store.reserve_operation(
-            &mut operation,
-            staged::target_size::target_slots(claims.len())?,
-        )?;
+        store.reserve_operation(&mut operation, || {
+            staged::target_size::target_slots(claims.len())
+        })?;
         let mut targets: Vec<_> = claims.into_iter().map(|(_, target)| target).collect();
-        store.reserve_operation(&mut operation, staged::target_size::sort(&targets)?)?;
+        store.reserve_operation(&mut operation, || staged::target_size::sort(&targets))?;
         targets.sort_by_key(|target| {
             native_ids::canonical(&serde_json::to_value(target).expect("serializable target"))
         });
@@ -1646,12 +1630,11 @@ fn settle_join_references<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     }
     for slot in 0..out.call_binding_count() {
         let mut operation = store.operation()?;
-        store.reserve_operation(&mut operation, out.call_binding_clone_bytes(slot)?)?;
+        store.reserve_operation(&mut operation, || out.call_binding_clone_bytes(slot))?;
         let mut binding = out.call_binding(slot)?;
-        store.reserve_operation(
-            &mut operation,
-            index.call_reference_clone_bytes(&binding.provenance_id)?,
-        )?;
+        store.reserve_operation(&mut operation, || {
+            index.call_reference_clone_bytes(&binding.provenance_id)
+        })?;
         let reference_slot = match index.call_reference(&binding.provenance_id)? {
             Some(id) => {
                 #[cfg(test)]
@@ -1661,10 +1644,9 @@ fn settle_join_references<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             None => None,
         };
         if let Some(slot_of_reference) = reference_slot {
-            store.reserve_operation(
-                &mut operation,
-                out.reference_clone_bytes(slot_of_reference)?,
-            )?;
+            store.reserve_operation(&mut operation, || {
+                out.reference_clone_bytes(slot_of_reference)
+            })?;
             let reference = out.reference(slot_of_reference)?;
             binding.resolution = reference.resolution;
             binding.declared_target = reference.declared_target;
@@ -1684,13 +1666,14 @@ fn reserved_key_bytes<S: JoinStore>(
     key: &native::Key,
     operation: &mut S::Operation,
 ) -> Result<Vec<u8>> {
-    let (length, scratch) = staged::group_size::key_bytes(key)?;
-    store.reserve_operation(
-        operation,
-        staged::sizes::sum(&[length, scratch, std::mem::size_of::<Vec<u8>>() as u64])?,
-    )?;
+    let mut capacity = 0;
+    store.reserve_operation(operation, || {
+        let (length, scratch) = staged::group_size::key_bytes(key)?;
+        capacity = usize::try_from(length)?;
+        staged::sizes::sum(&[length, scratch, std::mem::size_of::<Vec<u8>>() as u64])
+    })?;
     let value = serde_json::to_value(key)?;
-    let mut bytes = Vec::with_capacity(usize::try_from(length)?);
+    let mut bytes = Vec::with_capacity(capacity);
     native_ids::canonical_into(&value, &mut |part| bytes.extend_from_slice(part));
     Ok(bytes)
 }
@@ -1728,10 +1711,9 @@ fn method_target_owner_matches<S: JoinStore, I: DocumentJoinState>(
             && method.range.end <= owner.range.end
         {
             let mut keys_operation = store.operation()?;
-            store.reserve_operation(
-                &mut keys_operation,
-                index.type_uses_clone_bytes(&owner.document, name.start, name.end)?,
-            )?;
+            store.reserve_operation(&mut keys_operation, || {
+                index.type_uses_clone_bytes(&owner.document, name.start, name.end)
+            })?;
             let keys = index.type_uses(&owner.document, name.start, name.end)?;
             if keys.len() == 1
                 && keys
@@ -1760,10 +1742,9 @@ fn discover_join_methods<S: IndexedJoinStore>(store: &S, index: &mut S::Index) -
                 continue;
             };
             let mut symbols_operation = store.operation()?;
-            store.reserve_operation(
-                &mut symbols_operation,
-                index.type_uses_clone_bytes(&declaration.document, range.start, range.end)?,
-            )?;
+            store.reserve_operation(&mut symbols_operation, || {
+                index.type_uses_clone_bytes(&declaration.document, range.start, range.end)
+            })?;
             for symbol in index.type_uses(&declaration.document, range.start, range.end)? {
                 let summary = MethodSummary {
                     target_owner_matches: method_target_owner_matches(
@@ -1794,21 +1775,20 @@ fn discover_relationship_claims<S: JoinStore, I: DocumentJoinState>(
         let source = claim.envelope.raw["sourceSymbol"].as_str();
         let target = claim.envelope.raw["targetSymbol"].as_str();
         let mut operation = store.operation()?;
-        store.reserve_operation(
-            &mut operation,
+        store.reserve_operation(&mut operation, || {
             staged::sizes::sum(&[
                 std::mem::size_of::<RelationshipRow>() as u64,
                 claim.captured_proof_id.len() as u64,
                 source.map_or(0, |s| s.len() as u64),
                 target.map_or(0, |s| s.len() as u64),
-            ])?,
-        )?;
+            ])
+        })?;
         let row = RelationshipRow {
             proof_id: claim.captured_proof_id.clone(),
             source_symbol: source.map(str::to_owned),
             target_symbol: target.map(str::to_owned),
         };
-        store.reserve_operation(&mut operation, staged::sizes::relationship(&row)?)?;
+        store.reserve_operation(&mut operation, || staged::sizes::relationship(&row))?;
         index.put_relationship(language, path, row.clone())?;
         if let (Some(source), Some(target)) = (&row.source_symbol, &row.target_symbol) {
             index.put_relationship_endpoint(language, path, source, target, &row)?;
@@ -1844,7 +1824,8 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             note_parsed_type_document(doc);
         }
         let mut relationship_operation = store.operation()?;
-        let mut reserve_bases = |bytes| store.reserve_operation(&mut relationship_operation, bytes);
+        let mut reserve_bases =
+            |bytes: LazyBytes<'_>| store.reserve_operation(&mut relationship_operation, bytes);
         let bases = match doc.language.as_str() {
             "java" => direct_java_types(bytes, &mut reserve_bases)?,
             "javascript" => direct_script_types(
@@ -1863,39 +1844,34 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             )?,
             _ => continue,
         };
-        store.reserve_operation(
-            &mut relationship_operation,
-            std::mem::size_of::<BTreeMap<(usize, usize), native::Range>>() as u64,
-        )?;
+        store.reserve_operation(&mut relationship_operation, || {
+            Ok(std::mem::size_of::<BTreeMap<(usize, usize), native::Range>>() as u64)
+        })?;
         let mut java_bases = BTreeMap::new();
         if doc.language == "java" {
             for (owner, base, _) in &bases {
                 if let std::collections::btree_map::Entry::Vacant(entry) =
                     java_bases.entry((owner.start, owner.end))
                 {
-                    store.reserve_operation(
-                        &mut relationship_operation,
-                        staged::sizes::map_entries::<(usize, usize), native::Range>(1)?,
-                    )?;
+                    store.reserve_operation(&mut relationship_operation, || {
+                        staged::sizes::map_entries::<(usize, usize), native::Range>(1)
+                    })?;
                     entry.insert(base.clone());
                 }
             }
         }
-        store.reserve_operation(
-            &mut relationship_operation,
-            index.relationships_clone_bytes(&doc.language, &doc.path)?,
-        )?;
+        store.reserve_operation(&mut relationship_operation, || {
+            index.relationships_clone_bytes(&doc.language, &doc.path)
+        })?;
         let document_relationships = index.relationships(&doc.language, &doc.path)?;
         for (owner_range, base_range, kind) in bases {
             let mut operation = store.operation()?;
-            store.reserve_operation(
-                &mut operation,
-                index.type_uses_clone_bytes(doc, owner_range.start, owner_range.end)?,
-            )?;
-            store.reserve_operation(
-                &mut operation,
-                index.type_uses_clone_bytes(doc, base_range.start, base_range.end)?,
-            )?;
+            store.reserve_operation(&mut operation, || {
+                index.type_uses_clone_bytes(doc, owner_range.start, owner_range.end)
+            })?;
+            store.reserve_operation(&mut operation, || {
+                index.type_uses_clone_bytes(doc, base_range.start, base_range.end)
+            })?;
             let owner = index.type_uses(doc, owner_range.start, owner_range.end)?;
             let base = index.type_uses(doc, base_range.start, base_range.end)?;
             if owner.len() != 1 || base.len() != 1 {
@@ -1914,13 +1890,12 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 && !target_symbol.starts_with("local ")
                 && !index.is_information_symbol(target_symbol)?
             {
-                store.reserve_operation(
-                    &mut operation,
+                store.reserve_operation(&mut operation, || {
                     staged::sizes::sum(&[
                         staged::target_size::target_slots(4)?,
                         target_symbol.len() as u64,
-                    ])?,
-                )?;
+                    ])
+                })?;
                 target_candidates.push(semantic::Target::External {
                     symbol: symbol_key(target_symbol, doc),
                 });
@@ -1934,15 +1909,14 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 }
                 continue;
             };
-            store.reserve_operation(
-                &mut operation,
+            store.reserve_operation(&mut operation, || {
                 index.relationship_endpoints_clone_bytes(
                     &doc.language,
                     &doc.path,
                     source_symbol,
                     target_symbol,
-                )?,
-            )?;
+                )
+            })?;
             for claim in index.relationship_endpoints(
                 &doc.language,
                 &doc.path,
@@ -1950,14 +1924,13 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 target_symbol,
             )? {
                 let mut output_operation = store.operation()?;
-                store.reserve_operation(
-                    &mut output_operation,
+                store.reserve_operation(&mut output_operation, || {
                     staged::sizes::sum(&[
                         std::mem::size_of::<semantic::TypeRelationship>() as u64,
                         staged::sizes::target_payload(&source)?,
                         staged::sizes::target_payload(&target)?,
-                    ])?,
-                )?;
+                    ])
+                })?;
                 out.type_relationship(semantic::TypeRelationship {
                     kind,
                     source: source.clone(),
@@ -1975,11 +1948,9 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 ) else {
                     continue;
                 };
-                store.reserve_operation(
-                    &mut operation,
-                    index.source_methods_clone_bytes(doc, source_symbol)?,
-                )?;
-                let source_methods = index.source_methods(doc, source_symbol)?;
+                let source_methods = index.source_methods(doc, source_symbol, &mut |bytes| {
+                    store.reserve_operation(&mut operation, || Ok(bytes))
+                })?;
                 #[cfg(test)]
                 complexity_work(|work| work.method_lookup_rows += source_methods.len());
                 let [source_method] = source_methods.as_slice() else {
@@ -1996,11 +1967,9 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 else {
                     continue;
                 };
-                store.reserve_operation(
-                    &mut operation,
-                    index.target_methods_clone_bytes(doc, target_symbol)?,
-                )?;
-                let target_methods = index.target_methods(doc, target_symbol)?;
+                let target_methods = index.target_methods(doc, target_symbol, &mut |bytes| {
+                    store.reserve_operation(&mut operation, || Ok(bytes))
+                })?;
                 #[cfg(test)]
                 complexity_work(|work| work.method_lookup_rows += target_methods.len());
                 if target_methods.len() > 1 {
@@ -2030,10 +1999,9 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                     .and_then(|r| java_bases.get(&(r.start, r.end)))
                 {
                     Some(range) => {
-                        store.reserve_operation(
-                            &mut operation,
-                            index.type_uses_clone_bytes(doc, range.start, range.end)?,
-                        )?;
+                        store.reserve_operation(&mut operation, || {
+                            index.type_uses_clone_bytes(doc, range.start, range.end)
+                        })?;
                         index.type_uses(doc, range.start, range.end)?
                     }
                     None => BTreeSet::new(),
@@ -2068,8 +2036,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 let mut destination =
                     declaration_target(store, index, doc, target_symbol, &mut operation)?;
                 if destination.is_none() && target_method.is_none() {
-                    store.reserve_operation(
-                        &mut operation,
+                    store.reserve_operation(&mut operation, || {
                         staged::sizes::sum(&[
                             std::mem::size_of::<semantic::Target>() as u64,
                             target_symbol.len() as u64,
@@ -2078,20 +2045,19 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                             } else {
                                 0
                             },
-                        ])?,
-                    )?;
+                        ])
+                    })?;
                     destination = Some(semantic::Target::External {
                         symbol: symbol_key(target_symbol, doc),
                     });
                 }
                 if let Some(destination) = destination {
-                    store.reserve_operation(
-                        &mut operation,
+                    store.reserve_operation(&mut operation, || {
                         staged::sizes::sum(&[
                             std::mem::size_of::<semantic::TypeRelationship>() as u64,
                             claim.proof_id.len() as u64,
-                        ])?,
-                    )?;
+                        ])
+                    })?;
                     out.type_relationship(semantic::TypeRelationship {
                         kind: semantic::RelationshipKind::Overrides,
                         source: source_target,
@@ -2119,10 +2085,9 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 let Some(name) = &declaration.name_range else {
                     continue;
                 };
-                store.reserve_operation(
-                    &mut enum_operation,
-                    index.type_uses_clone_bytes(doc, name.start, name.end)?,
-                )?;
+                store.reserve_operation(&mut enum_operation, || {
+                    index.type_uses_clone_bytes(doc, name.start, name.end)
+                })?;
                 let keys = index.type_uses(doc, name.start, name.end)?;
                 if keys.len() != 1 {
                     continue;
@@ -2142,8 +2107,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 }) {
                     let key = claim.target_symbol.as_deref().unwrap();
                     let mut output_operation = store.operation()?;
-                    store.reserve_operation(
-                        &mut output_operation,
+                    store.reserve_operation(&mut output_operation, || {
                         staged::sizes::sum(&[
                             std::mem::size_of::<semantic::TypeRelationship>() as u64,
                             declaration.syntax_id.len() as u64,
@@ -2156,8 +2120,8 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                                 0
                             },
                             claim.proof_id.len() as u64,
-                        ])?,
-                    )?;
+                        ])
+                    })?;
                     out.type_relationship(semantic::TypeRelationship {
                         kind: semantic::RelationshipKind::Extends,
                         source: semantic::Target::Internal {
@@ -2181,26 +2145,32 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
 /// from producer flags. The exact raw occurrence at that span supplies endpoint identity.
 type DirectBase = (native::Range, native::Range, semantic::RelationshipKind);
 
+/// A lazily computed byte estimate handed to a reservation callback. A callback without a
+/// live budget (the in-memory oracle) drops it unevaluated.
+type LazyBytes<'a> = &'a mut dyn FnMut() -> Result<u64>;
+
 // Count and build from the same parsed tree. Only Rust-owned output is admitted here;
-// tree-sitter's C tree allocation is not covered by this reservation.
+// tree-sitter's C tree allocation is not covered by this reservation. The counting walk is
+// part of the estimate, so an unmetered caller builds the Vec by ordinary growth.
 fn collect_direct_bases(
-    reserve: &mut impl FnMut(u64) -> Result<()>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
     mut emit: impl FnMut(&mut dyn FnMut(DirectBase) -> Result<()>) -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
     let mut count = 0usize;
-    emit(&mut |_| {
-        count = count.checked_add(1).ok_or_else(|| {
-            crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into())
+    reserve(&mut || {
+        emit(&mut |_| {
+            count = count.checked_add(1).ok_or_else(|| {
+                crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into())
+            })?;
+            Ok(())
         })?;
-        Ok(())
+        let slots = (count as u64)
+            .checked_mul(std::mem::size_of::<DirectBase>() as u64)
+            .ok_or_else(|| {
+                crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into())
+            })?;
+        staged::sizes::sum(&[std::mem::size_of::<Vec<DirectBase>>() as u64, slots])
     })?;
-    let slots = (count as u64)
-        .checked_mul(std::mem::size_of::<DirectBase>() as u64)
-        .ok_or_else(|| crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into()))?;
-    reserve(staged::sizes::sum(&[
-        std::mem::size_of::<Vec<DirectBase>>() as u64,
-        slots,
-    ])?)?;
     let mut result = Vec::with_capacity(count);
     emit(&mut |row| {
         result.push(row);
@@ -2211,7 +2181,7 @@ fn collect_direct_bases(
 
 fn direct_java_types(
     source: &[u8],
-    reserve: &mut impl FnMut(u64) -> Result<()>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
     #[cfg(test)]
     complexity_work(|work| work.java_type_parses += 1);
@@ -2337,10 +2307,10 @@ fn walk_named_reverse<'t>(
 fn reserve_role_span(
     spans: &mut BTreeSet<(usize, usize)>,
     span: (usize, usize),
-    reserve: &mut impl FnMut(u64) -> Result<()>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<()> {
     if !spans.contains(&span) {
-        reserve(staged::sizes::map_entries::<(usize, usize), ()>(1)?)?;
+        reserve(&mut || staged::sizes::map_entries::<(usize, usize), ()>(1))?;
         spans.insert(span);
     }
     Ok(())
@@ -2353,9 +2323,9 @@ fn source_role_sites(language: &str, source: &[u8]) -> Result<RoleSites> {
 fn source_role_sites_reserved(
     language: &str,
     source: &[u8],
-    reserve: &mut impl FnMut(u64) -> Result<()>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<RoleSites> {
-    reserve(std::mem::size_of::<RoleSites>() as u64)?;
+    reserve(&mut || Ok(std::mem::size_of::<RoleSites>() as u64))?;
     let grammar: tree_sitter::Language = match language {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
@@ -2501,7 +2471,7 @@ fn source_role_sites_reserved(
 fn js_direct_class_span(
     node: tree_sitter::Node<'_>,
     spans: &mut BTreeSet<(usize, usize)>,
-    reserve: &mut impl FnMut(u64) -> Result<()>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<()> {
     let span = match node.kind() {
         "identifier" => Some((node.start_byte(), node.end_byte())),
@@ -2519,7 +2489,7 @@ fn collect_role_leaf_spans_reserved(
     node: tree_sitter::Node<'_>,
     language: &str,
     spans: &mut BTreeSet<(usize, usize)>,
-    reserve: &mut impl FnMut(u64) -> Result<()>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<()> {
     walk_named_reverse(node, &mut |node| {
         let leaf = match language {
@@ -2543,7 +2513,7 @@ fn direct_script_types(
     language: tree_sitter::Language,
     owner_kind: &str,
     clause_kind: &str,
-    reserve: &mut impl FnMut(u64) -> Result<()>,
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language)?;

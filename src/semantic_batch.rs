@@ -41,6 +41,9 @@ pub struct BatchCounters {
     pub document_cache_high_water_entries: u64,
     pub active_document_groups_high_water: u64,
     pub candidate_group_high_water: u64,
+    /// Charged staged-row attempts of the latest join attempt, by owning table, including the
+    /// retained native seed under `seed:retained-native`. Their sum is the attempt's row meter.
+    pub staged_row_attempts: std::collections::BTreeMap<String, u64>,
 }
 
 impl BatchCounters {
@@ -73,6 +76,7 @@ impl BatchCounters {
         self.candidate_group_high_water = self
             .candidate_group_high_water
             .max(join.candidate_group_high_water);
+        self.staged_row_attempts = join.staged_row_attempts.clone();
     }
 }
 

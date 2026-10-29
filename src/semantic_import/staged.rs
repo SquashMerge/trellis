@@ -1,7 +1,15 @@
-//! The staged join backend: claims, native facts, global indexes and output rows live in
-//! `stage.db`, and the native facts of one document at a time are served from a byte-bounded
-//! LRU of document groups. The binding, ambiguity and rejoin rules are the ones the in-memory
-//! backend runs (`join_inventory_indexed`); this module only supplies the storage.
+//! The staged join backend: claims, native facts, compact global indexes and output rows live
+//! in `stage.db`, and the native facts of one document at a time are served from a
+//! byte-bounded LRU of document groups. The binding, ambiguity and rejoin rules are the ones
+//! the in-memory backend runs; this module streams them one document at a time:
+//!
+//! 1. captured global discovery (`g_*` side 0: exact definitions, presence, methods);
+//! 2. per captured document, its captured join and whole-document eligibility (`w_docs`);
+//! 3. eligible destination global discovery (`g_*` side 1);
+//! 4. per destination document, both joins recomputed and settled into validated `out_*` rows
+//!    and its coverage; then the SQL closure.
+//!
+//! No per-occurrence or per-fact corpus is persisted between documents.
 use super::{
     CoordinateMap, DestinationMutations, MeasuredFacts, Position, RoleSites, ScopedKey,
     compose_join, document_coordinates,
@@ -25,7 +33,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -37,6 +45,7 @@ use std::{
 mod claim_size;
 pub(super) mod group_size;
 mod live;
+mod settle;
 pub(super) mod sizes;
 mod streaming;
 pub(super) mod target_size;
@@ -45,17 +54,6 @@ use live::{LiveBudget, Reservation};
 const DOCUMENT_SQL: &str =
     "SELECT ord, language, path FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 128";
 
-const PROVENANCE_SQL: &str = "SELECT raw_id, kind FROM w_prov ORDER BY raw_id, kind";
-const REFERENCES_SQL: &str = "SELECT ref_id, body FROM w_refrows ORDER BY ref_id";
-const RESOLVE_CALLS_SQL: &str = "SELECT raw_id, body FROM w_calls ORDER BY ord";
-const CALLS_SQL: &str = "SELECT raw_id, body FROM w_callres ORDER BY ord";
-const SITE_TARGETS_SQL: &str =
-    "SELECT call_id, canon, target FROM w_sitetargets ORDER BY call_id, canon";
-const REFERENCE_CLAIMS_SQL: &str =
-    "SELECT proof_id, body FROM f_refclaims WHERE side=1 ORDER BY proof_id";
-const SYMBOLS_SQL: &str = "SELECT body FROM f_symbols WHERE side=1 ORDER BY ord";
-const BINDINGS_SQL: &str = "SELECT body FROM f_bindings WHERE side=1 ORDER BY ord";
-
 /// The ordered cursor queries of the join, for plan tests.
 #[cfg(feature = "test-support")]
 pub(crate) fn cursor_sql() -> Vec<String> {
@@ -63,14 +61,6 @@ pub(crate) fn cursor_sql() -> Vec<String> {
         document_claim_sql(false),
         document_claim_sql(true),
         DOCUMENT_SQL.to_owned(),
-        PROVENANCE_SQL.to_owned(),
-        REFERENCES_SQL.to_owned(),
-        RESOLVE_CALLS_SQL.to_owned(),
-        SITE_TARGETS_SQL.to_owned(),
-        CALLS_SQL.to_owned(),
-        REFERENCE_CLAIMS_SQL.to_owned(),
-        SYMBOLS_SQL.to_owned(),
-        BINDINGS_SQL.to_owned(),
     ];
     queries.extend(streaming::cursor_sql().into_iter().map(str::to_owned));
     queries
@@ -87,10 +77,6 @@ fn to_json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
-fn from_json<T: DeserializeOwned>(text: &str) -> Result<T> {
-    Ok(serde_json::from_str(text)?)
-}
-
 fn canonical_target(target: &semantic::Target) -> Result<Vec<u8>> {
     Ok(crate::native_ids::canonical(&serde_json::to_value(target)?))
 }
@@ -105,6 +91,10 @@ pub(super) struct JoinCtx<'a> {
     counters: RefCell<BatchCounters>,
     cache: RefCell<DocCache>,
     rows: Cell<u64>,
+    /// `rows` by owning table: every charged attempt is filed under exactly one owner.
+    ledger: RefCell<BTreeMap<&'static str, u64>>,
+    /// Cumulative (lookup steps, row attempts) at the end of each pass, for the diagnostic.
+    passes: RefCell<Vec<(&'static str, u64, u64)>>,
     /// The stage file size when the join started, the base of the output-bytes meter.
     stage_base: u64,
     mutations: DestinationMutations,
@@ -141,35 +131,33 @@ impl JoinCtx<'_> {
         Ok(())
     }
 
-    /// Accounts real insertion attempts, including ignored duplicates and replacements.
-    /// The return value reports crossing a physical-output check boundary.
-    fn reserve_rows(&self, count: u64) -> Result<bool> {
+    /// Accounts real insertion attempts, including ignored duplicates and replacements, under
+    /// their owner. The return value reports crossing a physical-output check boundary.
+    fn reserve_rows(&self, owner: &'static str, count: u64) -> Result<bool> {
         let previous = self.rows.get();
         let rows = previous
             .checked_add(count)
             .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
         self.rows.set(rows);
+        let mut ledger = self.ledger.borrow_mut();
+        let entry = ledger.entry(owner).or_default();
+        *entry = entry.saturating_add(count);
         if rows > self.limits.staged_rows {
             return Err(ScipCaptureError::LimitExceeded("staged rows".into()).into());
         }
         Ok(previous / OUTPUT_CHECK_ROWS != rows / OUTPUT_CHECK_ROWS)
     }
 
-    fn row(&self) -> Result<()> {
-        if self.reserve_rows(1)? {
-            self.check_output()?;
-        }
-        Ok(())
+    /// Records the cumulative lookup steps and row attempts at the end of a pass.
+    fn pass(&self, name: &'static str) {
+        self.passes
+            .borrow_mut()
+            .push((name, self.budget.borrow().used(), self.rows.get()));
     }
 
-    /// Both statements run on this private stage owner, with no intervening mutation.
-    fn insert_select(&self, count_sql: &str, insert_sql: &str) -> Result<()> {
-        let count = self
-            .conn
-            .query_row(count_sql, [], |row| row.get::<_, i64>(0))?;
-        let crossed = self.reserve_rows(u64::try_from(count)?)?;
-        self.conn.execute(insert_sql, [])?;
-        if crossed {
+    /// Charges one insertion attempt into `table` before it runs.
+    fn row(&self, table: &'static str) -> Result<()> {
+        if self.reserve_rows(table, 1)? {
             self.check_output()?;
         }
         Ok(())
@@ -480,6 +468,14 @@ struct DocumentClaims {
 }
 
 impl DocumentClaims {
+    /// Claims other than symbol information: those the report tallies.
+    fn non_information(&self) -> u64 {
+        self.claims
+            .iter()
+            .filter(|claim| claim.envelope.record_kind != "symbolInformation")
+            .count() as u64
+    }
+
     fn coordinate_bytes(&self, admitted_encoding: u8) -> Result<u64> {
         let mut counts = [0usize; 3];
         for claim in &self.claims {
@@ -716,8 +712,12 @@ impl JoinFacts for StagedSide<'_> {
     fn operation(&self) -> Result<Reservation> {
         self.ctx.live.reserve(0)
     }
-    fn reserve_operation(&self, operation: &mut Reservation, bytes: u64) -> Result<()> {
-        operation.grow(bytes)
+    fn reserve_operation(
+        &self,
+        operation: &mut Reservation,
+        bytes: impl FnOnce() -> Result<u64>,
+    ) -> Result<()> {
+        operation.grow(bytes()?)
     }
     fn join_reserved(
         &self,
@@ -1104,7 +1104,7 @@ impl<'a> JoinStore for StagedSide<'a> {
         super::source_role_sites_reserved(
             document.language.as_str(),
             group.text.as_bytes(),
-            &mut |bytes| operation.grow(bytes),
+            &mut |bytes| operation.grow(bytes()?),
         )
     }
 
@@ -1121,182 +1121,6 @@ fn local_columns(key: &ScopedKey) -> (&str, &str) {
     }
 }
 
-/// The join's facts for one side as rows in `f_*`; later passes revise them by slot.
-pub(super) struct StagedFactSink<'a> {
-    ctx: &'a JoinCtx<'a>,
-    side: u8,
-    symbols: i64,
-    bindings: i64,
-    references: i64,
-    calls: i64,
-    relationships: i64,
-}
-
-impl<'a> StagedFactSink<'a> {
-    pub(super) fn new(ctx: &'a JoinCtx<'a>, side: u8) -> Self {
-        Self {
-            ctx,
-            side,
-            symbols: 0,
-            bindings: 0,
-            references: 0,
-            calls: 0,
-            relationships: 0,
-        }
-    }
-
-    fn execute(&self, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<()> {
-        self.ctx.row()?;
-        self.ctx.conn.prepare_cached(sql)?.execute(values)?;
-        Ok(())
-    }
-
-    fn body(&self, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<String> {
-        Ok(self
-            .ctx
-            .conn
-            .prepare_cached(sql)?
-            .query_row(values, |row| row.get(0))?)
-    }
-}
-
-impl JoinSink for StagedFactSink<'_> {
-    fn symbol(&mut self, row: semantic::Symbol) -> Result<()> {
-        let body = to_json(&row)?;
-        self.execute(
-            "INSERT INTO f_symbols VALUES(?1,?2,?3)",
-            &[&self.side, &self.symbols, &body],
-        )?;
-        self.symbols += 1;
-        Ok(())
-    }
-
-    fn declaration_binding(&mut self, row: semantic::DeclarationBinding) -> Result<()> {
-        let body = to_json(&row)?;
-        self.execute(
-            "INSERT INTO f_bindings VALUES(?1,?2,?3,?4,?5)",
-            &[
-                &self.side,
-                &self.bindings,
-                &row.provenance_id,
-                &row.syntax_id,
-                &body,
-            ],
-        )?;
-        self.bindings += 1;
-        Ok(())
-    }
-
-    fn join(&mut self, _proof_id: &str, _join: &semantic::Join) -> Result<()> {
-        Ok(())
-    }
-
-    fn reference_claim(&mut self, proof_id: &str, row: semantic::Reference) -> Result<()> {
-        let body = to_json(&row)?;
-        self.execute(
-            "INSERT OR REPLACE INTO f_refclaims VALUES(?1,?2,?3)",
-            &[&self.side, &proof_id, &body],
-        )
-    }
-
-    fn reference_slot(&self, reference_id: &str) -> Result<Option<usize>> {
-        Ok(self
-            .ctx
-            .conn
-            .prepare_cached("SELECT slot FROM f_refs WHERE side=?1 AND ref_id=?2")?
-            .query_row(params![self.side, reference_id], |row| row.get::<_, i64>(0))
-            .optional()?
-            .map(|slot| slot as usize))
-    }
-
-    fn reference_count(&self) -> usize {
-        self.references as usize
-    }
-
-    fn reference(&self, slot: usize) -> Result<semantic::Reference> {
-        from_json(&self.body(
-            "SELECT body FROM f_refs WHERE side=?1 AND slot=?2",
-            &[&self.side, &(slot as i64)],
-        )?)
-    }
-
-    fn put_reference(&mut self, slot: Option<usize>, row: semantic::Reference) -> Result<usize> {
-        let body = to_json(&row)?;
-        match slot {
-            Some(slot) => {
-                self.ctx
-                    .conn
-                    .prepare_cached("UPDATE f_refs SET body=?3 WHERE side=?1 AND slot=?2")?
-                    .execute(params![self.side, slot as i64, body])?;
-                Ok(slot)
-            }
-            None => {
-                let slot = self.references;
-                self.execute(
-                    "INSERT INTO f_refs VALUES(?1,?2,?3,?4)",
-                    &[&self.side, &slot, &row.id, &body],
-                )?;
-                self.references += 1;
-                Ok(slot as usize)
-            }
-        }
-    }
-
-    fn call_binding_count(&self) -> usize {
-        self.calls as usize
-    }
-
-    fn call_binding(&self, slot: usize) -> Result<semantic::CallBinding> {
-        from_json(&self.body(
-            "SELECT body FROM f_calls WHERE side=?1 AND slot=?2",
-            &[&self.side, &(slot as i64)],
-        )?)
-    }
-
-    fn put_call_binding(
-        &mut self,
-        slot: Option<usize>,
-        row: semantic::CallBinding,
-    ) -> Result<usize> {
-        let body = to_json(&row)?;
-        match slot {
-            Some(slot) => {
-                self.ctx
-                    .conn
-                    .prepare_cached("UPDATE f_calls SET body=?3 WHERE side=?1 AND slot=?2")?
-                    .execute(params![self.side, slot as i64, body])?;
-                Ok(slot)
-            }
-            None => {
-                let slot = self.calls;
-                self.execute(
-                    "INSERT INTO f_calls VALUES(?1,?2,?3,?4,?5)",
-                    &[&self.side, &slot, &row.provenance_id, &row.call_id, &body],
-                )?;
-                self.calls += 1;
-                Ok(slot as usize)
-            }
-        }
-    }
-
-    fn type_relationship(&mut self, row: semantic::TypeRelationship) -> Result<()> {
-        let body = to_json(&row)?;
-        self.execute(
-            "INSERT INTO f_rels VALUES(?1,?2,?3,?4)",
-            &[&self.side, &self.relationships, &row.provenance_id, &body],
-        )?;
-        self.relationships += 1;
-        Ok(())
-    }
-
-    fn diagnostic(&mut self, document: &native::DocumentKey, code: &str) -> Result<()> {
-        self.execute(
-            "INSERT OR IGNORE INTO f_diag VALUES(?1,?2,?3,?4)",
-            &[&self.side, &document.language, &document.path, &code],
-        )
-    }
-}
-
 fn exists(conn: &Connection, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<bool> {
     Ok(conn
         .prepare_cached(sql)?
@@ -1309,17 +1133,10 @@ fn language_of(name: &str) -> Result<semantic::Language> {
     Ok(serde_json::from_value(serde_json::json!(name))?)
 }
 
+/// The evidence kind's discriminant, which follows its declared (`Ord`) order, so ordering by
+/// `(derived_from, kind_rank)` is the contract's (raw ID, evidence kind) provenance order.
 fn kind_rank(kind: semantic::EvidenceKind) -> i64 {
     kind as i64
-}
-
-fn rank_kind(rank: i64) -> Result<semantic::EvidenceKind> {
-    Ok(match rank {
-        1 => semantic::EvidenceKind::DeclarationBinding,
-        2 => semantic::EvidenceKind::SemanticReference,
-        3 => semantic::EvidenceKind::TypeRelationship,
-        _ => anyhow::bail!("invalid staged evidence kind"),
-    })
 }
 
 /// The captured basis of a document, from the batch header and the document's artifact (§4.4 e).
@@ -1389,7 +1206,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
         let mut ord = 0i64;
         while let Some(document) = stream.next_document()? {
             ctx.check_cancel()?;
-            ctx.row()?;
+            ctx.row("nat_docs")?;
             conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6)")?
                 .execute(params![
                     rev,
@@ -1409,7 +1226,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
             }
             let text = std::str::from_utf8(&rows.source).context("non-UTF8 native source")?;
             for declaration in &rows.declarations {
-                ctx.row()?;
+                ctx.row("nat_declarations")?;
                 let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
                     text.get(range.start..range.end) == declaration.name.as_deref()
                 });
@@ -1511,6 +1328,31 @@ const REFERENCES: usize = 4;
 const CALLS: usize = 5;
 const RELATIONSHIPS: usize = 6;
 
+/// The source-eligibility decision of one captured document: the single `w_docs` row its
+/// eligibility pass writes, and everything coverage later needs from that pass.
+#[derive(Default, Clone, Copy)]
+struct DocFlags {
+    requested: bool,
+    failed: bool,
+    eligible: bool,
+    unsupported: bool,
+    /// Claims whose captured and destination anchors are both unsupported. No settled fact
+    /// can claim one of them, so they keep the `unsupported` outcome.
+    unsupported_claims: u64,
+    /// Claims other than symbol information: the document's report denominator.
+    claims: u64,
+}
+
+/// Admitted claims whose source is not a document of the captured revision. Admission binds
+/// every staged claim to a listed source, so this guards against a broken stage, not input.
+const UNLISTED_CLAIM_DOCUMENT_SQL: &str = "SELECT 1 FROM sources s WHERE EXISTS \
+    (SELECT 1 FROM claims c WHERE c.source_ord=s.ord) AND NOT EXISTS (SELECT 1 FROM nat_docs d \
+    WHERE d.rev=0 AND d.language=s.language AND d.path=s.path) LIMIT 1";
+
+const DOCUMENT_FLAGS_SQL: &str = "SELECT w.requested, w.failed, w.eligible, w.unsupported, \
+    w.unsupported_claims, w.claims, c.exclusion FROM sources s LEFT JOIN w_docs w ON \
+    w.source_ord=s.ord LEFT JOIN coverage c ON c.source_ord=s.ord WHERE s.language=?1 AND s.path=?2";
+
 impl StagedJoin<'_> {
     fn conn(&self) -> &Connection {
         self.ctx.conn
@@ -1530,23 +1372,6 @@ impl StagedJoin<'_> {
         counts[table] += 1;
         self.emitted.set(counts);
         ord
-    }
-
-    fn key(&self, language: &str, path: &str) -> native::DocumentKey {
-        native::DocumentKey {
-            source_set_id: self.captured.header.source_set.id.clone(),
-            language: language.to_owned(),
-            path: path.to_owned(),
-        }
-    }
-
-    fn mark(&self, column: &str, language: &str, path: &str) -> Result<()> {
-        self.conn()
-            .prepare_cached(&format!(
-                "UPDATE w_docs SET {column}=1 WHERE source_ord=(SELECT ord FROM sources WHERE language=?1 AND path=?2)"
-            ))?
-            .execute(params![language, path])?;
-        Ok(())
     }
 
     fn unchanged(&self, document: &native::DocumentKey) -> Result<bool> {
@@ -1581,942 +1406,350 @@ impl StagedJoin<'_> {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    fn captured_has(&self, sql: &str, proof: &str) -> Result<bool> {
-        exists(self.conn(), sql, &[&proof])
+    /// Prepays the document-key copies of `views` document-local views before they are made.
+    fn view_keys(&self, document: &native::DocumentKey, views: u64) -> Result<Reservation> {
+        let key = sizes::sum(&[
+            std::mem::size_of::<native::DocumentKey>() as u64,
+            sizes::document(document)?,
+        ])?;
+        self.ctx.live.reserve(
+            key.checked_mul(views)
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+        )
     }
 
-    fn captured_association(&self, proof: &str) -> Result<bool> {
-        for sql in [
-            "SELECT 1 FROM f_bindings WHERE side=0 AND provenance_id=?1 AND syntax_id IS NOT NULL",
-            "SELECT 1 FROM f_refclaims WHERE side=0 AND proof_id=?1",
-            "SELECT 1 FROM f_calls WHERE side=0 AND provenance_id=?1 AND call_id IS NOT NULL",
-            "SELECT 1 FROM f_rels WHERE side=0 AND provenance_id=?1",
-        ] {
-            if self.captured_has(sql, proof)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn captured_call(&self, proof: &str) -> Result<Option<semantic::CallBinding>> {
-        let body: Option<String> = self
+    fn exclusion(&self, document: &native::DocumentKey) -> Result<Option<String>> {
+        Ok(self
             .conn()
             .prepare_cached(
-                "SELECT body FROM f_calls WHERE side=0 AND provenance_id=?1 AND call_id IS NOT NULL ORDER BY slot DESC LIMIT 1",
+                "SELECT c.exclusion FROM sources s JOIN coverage c ON c.source_ord=s.ord WHERE s.language=?1 AND s.path=?2",
             )?
-            .query_row([proof], |row| row.get(0))
-            .optional()?;
-        body.map(|body| from_json(&body)).transpose()
+            .query_row(params![document.language, document.path], |row| row.get(0))
+            .optional()?
+            .flatten())
     }
 
-    fn captured_reference(&self, proof: &str) -> Result<Option<semantic::Reference>> {
-        let body: Option<String> = self
-            .conn()
-            .prepare_cached("SELECT body FROM f_refclaims WHERE side=0 AND proof_id=?1")?
-            .query_row([proof], |row| row.get(0))
-            .optional()?;
-        body.map(|body| from_json(&body)).transpose()
-    }
-
-    /// Marks which captured documents are requested, failed, unsupported and eligible for the
-    /// destination join.
-    fn eligibility(&self) -> Result<()> {
-        let conn = self.conn();
-        let enc = self.admitted_encoding;
-        self.ctx.insert_select(
-            "SELECT COUNT(*) FROM sources",
-            "INSERT INTO w_docs(source_ord) SELECT ord FROM sources",
-        )?;
+    /// Pass 2: with the complete captured context, joins one captured document at a time and
+    /// decides its whole-document source eligibility. Only the decision row survives; the
+    /// document's captured facts are released before the next document.
+    fn eligibility(&self, global: &streaming::CompletedGlobal<'_>) -> Result<()> {
+        if exists(self.conn(), UNLISTED_CLAIM_DOCUMENT_SQL, &[])? {
+            anyhow::bail!("missing admitted claim document");
+        }
         for document in self.captured.documents() {
             let document = document?;
-            if !self
+            self.ctx.check_cancel()?;
+            let mut flags = DocFlags::default();
+            if self
                 .producer
                 .languages
                 .contains(&language_of(&document.language)?)
             {
-                continue;
+                let reason = self.exclusion(&document)?;
+                if reason.as_deref() != Some("notRequested") {
+                    flags.requested = true;
+                }
+                if reason.as_deref() == Some("failed")
+                    || (reason.as_deref() != Some("notRequested") && !self.unchanged(&document)?)
+                {
+                    flags.failed = true;
+                }
             }
-            let reason: Option<String> = conn
+            let claims = DocumentClaims::load(&self.captured, &document)?;
+            if !claims.claims.is_empty() {
+                flags.claims = claims.non_information();
+                let _keys = self.view_keys(&document, 1)?;
+                let local =
+                    streaming::claims_side(&self.captured, document.clone(), Rc::new(claims))?;
+                let (facts, _facts_reservation) =
+                    streaming::join_document(&local, global, self.admitted_encoding)?;
+                #[cfg(feature = "test-support")]
+                crate::semantic_batch::testing::run_document_common_observer(
+                    0,
+                    &document,
+                    &facts,
+                    self.conn(),
+                );
+                self.classify(&document, &local, &facts, &mut flags)?;
+            }
+            self.ctx.row("w_docs")?;
+            self.conn()
                 .prepare_cached(
-                    "SELECT c.exclusion FROM sources s JOIN coverage c ON c.source_ord=s.ord WHERE s.language=?1 AND s.path=?2",
+                    "INSERT INTO w_docs SELECT ord,?3,?4,?5,?6,?7,?8 FROM sources WHERE language=?1 AND path=?2",
                 )?
-                .query_row(params![document.language, document.path], |row| row.get(0))
-                .optional()?
-                .flatten();
-            if reason.as_deref() != Some("notRequested") {
-                self.mark("requested", &document.language, &document.path)?;
-            }
-            if reason.as_deref() == Some("failed")
-                || (reason.as_deref() != Some("notRequested") && !self.unchanged(&document)?)
-            {
-                self.mark("failed", &document.language, &document.path)?;
-            }
-        }
-        for document in self.captured.documents() {
-            let local = streaming::document_side(&self.captured, document?)?;
-            let mut destination = None;
-            for claim in local.claims() {
-                let claim = claim?;
-                local.charge(1)?;
-                local.lookup_proof(
-                    &claim.captured_proof_id,
-                    &claim.envelope.record_kind,
-                    &claim.fact_digest,
-                )?;
-                let doc = self.key(&claim.language, &claim.envelope.relative_path);
-                self.mark("requested", &doc.language, &doc.path)?;
-                local
-                    .doc_row(&doc)?
-                    .context("captured claim outside source manifest")?;
-                local
-                    .bytes_of(&doc)?
-                    .context("missing captured claim source")?;
-                if !self.unchanged(&doc)? {
-                    self.mark("failed", &doc.language, &doc.path)?;
-                    continue;
-                }
-                if claim.envelope.record_kind != "occurrence" {
-                    self.mark("eligible", &doc.language, &doc.path)?;
-                    continue;
-                }
-                let range = local.occurrence_range(&claim, enc)?;
-                if range.start == range.end {
-                    self.mark("eligible", &doc.language, &doc.path)?;
-                    continue;
-                }
-                let roles = claim.envelope.raw["symbolRoles"]
-                    .as_u64()
-                    .context("invalid raw roles")?;
-                let proof = claim.captured_proof_id.as_str();
-                let captured_declaration = self.captured_has(
-                    "SELECT 1 FROM f_bindings WHERE side=0 AND provenance_id=?1 AND syntax_id IS NOT NULL",
-                    proof,
-                )?;
-                let captured_reference = self.captured_reference(proof)?.is_some();
-                let required = if captured_declaration || (!captured_reference && roles & 1 != 0) {
-                    semantic::JoinKind::DeclarationName
-                } else {
-                    semantic::JoinKind::Reference
-                };
-                if destination.is_none() {
-                    destination = Some(streaming::native_document_side(
-                        &self.destination,
-                        doc.clone(),
-                    )?);
-                }
-                let destination = destination.as_ref().expect("destination native view");
-                let mut captured_operation = local.operation()?;
-                let mut destination_operation = destination.operation()?;
-                let first =
-                    local.join_reserved(&doc, range.clone(), required, &mut captured_operation)?;
-                let second =
-                    destination.join_reserved(&doc, range, required, &mut destination_operation)?;
-                let authored = self.captured_association(proof)?;
-                if !authored
-                    && first.status == semantic::JoinStatus::Unsupported
-                    && second.status == semantic::JoinStatus::Unsupported
-                {
-                    self.ctx.row()?;
-                    conn.prepare_cached("INSERT OR IGNORE INTO w_unsupported_claims VALUES(?1)")?
-                        .execute([proof])?;
-                    self.mark("unsupported", &doc.language, &doc.path)?;
-                    self.mark("eligible", &doc.language, &doc.path)?;
-                    continue;
-                }
-                if !authored
-                    && first.status == semantic::JoinStatus::Unmatched
-                    && second.status == semantic::JoinStatus::Unmatched
-                {
-                    self.mark("eligible", &doc.language, &doc.path)?;
-                    continue;
-                }
-                let mut exact = first.status == semantic::JoinStatus::Exact
-                    && second.status == semantic::JoinStatus::Exact;
-                if captured_reference && required != semantic::JoinKind::Reference {
-                    let first_reference = local.join_reserved(
-                        &doc,
-                        first.anchor.range.clone(),
-                        semantic::JoinKind::Reference,
-                        &mut captured_operation,
-                    )?;
-                    let second_reference = destination.join_reserved(
-                        &doc,
-                        first.anchor.range.clone(),
-                        semantic::JoinKind::Reference,
-                        &mut destination_operation,
-                    )?;
-                    exact &= first_reference.status == semantic::JoinStatus::Exact
-                        && second_reference.status == semantic::JoinStatus::Exact;
-                }
-                if let Some(binding) = self.captured_call(proof)? {
-                    let call = destination.join_reserved(
-                        &doc,
-                        binding.join.anchor.range.clone(),
-                        binding.join.anchor.kind,
-                        &mut destination_operation,
-                    )?;
-                    let first_call = local.join_reserved(
-                        &doc,
-                        binding.join.anchor.range.clone(),
-                        binding.join.anchor.kind,
-                        &mut captured_operation,
-                    )?;
-                    exact &= call.status == semantic::JoinStatus::Exact
-                        && first_call.status == semantic::JoinStatus::Exact
-                        && first_call.candidate_ids == binding.join.candidate_ids;
-                    let mut same_call = false;
-                    if let Some(id) = second.candidate_ids.first() {
-                        let calls = match call.candidate_ids.first() {
-                            Some(call_id) => destination.calls_with_id(
-                                &doc,
-                                call_id,
-                                &mut destination_operation,
-                            )?,
-                            None => vec![],
-                        };
-                        same_call = destination
-                            .references_with_id(&doc, id, &mut destination_operation)?
-                            .iter()
-                            .any(|reference| {
-                                &reference.id == id
-                                    && calls.iter().any(|candidate| {
-                                        call.candidate_ids == vec![candidate.id.clone()]
-                                            && candidate.owner_syntax_id
-                                                == reference.owner_syntax_id
-                                            && candidate.range.start <= reference.range.start
-                                            && reference.range.end <= candidate.range.end
-                                            && candidate
-                                                .callee_range
-                                                .as_ref()
-                                                .is_none_or(|callee| callee == &reference.range)
-                                    })
-                            });
-                    }
-                    exact &= same_call;
-                }
-                self.mark(
-                    if exact { "eligible" } else { "failed" },
-                    &doc.language,
-                    &doc.path,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl StagedJoin<'_> {
-    fn fill_captured_targets(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(
-            "SELECT body FROM f_bindings WHERE side=0 AND syntax_id IS NOT NULL ORDER BY ord",
-        )?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let binding: semantic::DeclarationBinding = from_json(&row.get::<_, String>(0)?)?;
-            let Some(syntax_id) = &binding.syntax_id else {
-                continue;
-            };
-            let document = &binding.join.anchor.document;
-            for symbol in &binding.symbols {
-                let target = semantic::Target::Internal {
-                    syntax_id: syntax_id.clone(),
-                    document: document.clone(),
-                    revision_id: self.captured_id().to_owned(),
-                };
-                self.ctx.row()?;
-                conn.prepare_cached("INSERT OR IGNORE INTO w_cap_targets VALUES(?1,?2,?3,?4)")?
-                    .execute(params![
-                        document.language,
-                        document.path,
-                        symbol.symbol,
-                        canonical_target(&target)?
-                    ])?;
-            }
+                .execute(params![
+                    document.language,
+                    document.path,
+                    flags.requested,
+                    flags.failed,
+                    flags.eligible,
+                    flags.unsupported,
+                    i64::try_from(flags.unsupported_claims)?,
+                    i64::try_from(flags.claims)?,
+                ])?;
         }
         Ok(())
     }
 
-    fn captured_targets(
+    /// Classifies each claim of one captured document against its captured facts and the
+    /// destination's measured anchors. A later failing claim fails the whole document.
+    fn classify(
         &self,
         document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<Vec<semantic::Target>> {
-        self.ctx.charge(1)?;
-        let mut statement = self.conn().prepare_cached(
-            "SELECT target FROM w_cap_targets WHERE language=?1 AND path=?2 AND symbol=?3 ORDER BY target",
-        )?;
-        let rows = statement
-            .query_map(params![document.language, document.path, symbol], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        self.ctx.charge(rows.len())?;
-        rows.iter()
-            .map(|bytes| Ok(serde_json::from_slice(bytes)?))
-            .collect()
-    }
-
-    /// Whether a rejoined target still names a measured, unchanged declaration.
-    fn retarget(&self, target: &mut semantic::Target) -> Result<bool> {
-        match target {
-            semantic::Target::External { symbol }
-                if exists(
-                    self.conn(),
-                    "SELECT 1 FROM w_cap_targets WHERE symbol=?1 LIMIT 1",
-                    &[&symbol.symbol],
-                )? =>
-            {
-                Ok(false)
-            }
-            semantic::Target::Internal {
-                syntax_id,
-                document,
-                revision_id,
-            } => {
-                let original = self
-                    .declaration_status(self.captured.rev, document, syntax_id)?
-                    .iter()
-                    .any(|(named, _)| *named);
-                if !original {
-                    return Ok(false);
-                }
-                let candidates: Vec<_> = self
-                    .declaration_status(self.destination.rev, document, syntax_id)?
-                    .into_iter()
-                    .filter(|(named, _)| *named)
-                    .collect();
-                if candidates.len() != 1
-                    || self.destination.doc_row(document)?.is_none()
-                    || !candidates[0].1
-                {
-                    return Ok(false);
-                }
-                *revision_id = self.destination_id().to_owned();
-                Ok(true)
-            }
-            _ => Ok(true),
-        }
-    }
-
-    /// Runs the emission validator's row-local checks for the row stemming from raw proof
-    /// `raw`: the proof is the captured claim's document and the facts are that document's
-    /// destination group. `anchor` is the document the row itself names.
-    fn check_row(
-        &self,
-        raw: &str,
-        kind: semantic::EvidenceKind,
-        anchor: Option<&native::DocumentKey>,
-        check: impl for<'a> FnOnce(
-            &'a EmissionValidator<'_>,
-            &semantic::Provenance,
-            &semantic::DocumentFacts<'a>,
-        ) -> Result<()>,
+        local: &StagedSide<'_>,
+        facts: &super::JoinedFacts,
+        flags: &mut DocFlags,
     ) -> Result<()> {
-        let claim = self
-            .captured
-            .proof(raw)?
-            .context("dangling semantic fact provenance")?;
-        let document = self.key(&claim.language, &claim.path);
-        anyhow::ensure!(
-            anchor.is_none_or(|anchor| anchor == &document),
-            "semantic fact/provenance tuple mismatch"
-        );
-        let group = self
-            .destination
-            .group(&document)?
-            .context("missing destination document")?;
-        let proof = self.validator.fact_proof(
-            &self.id_for(raw, kind),
-            document,
-            kind,
-            &group.document.content_hash,
-        );
-        let source = group.text.as_bytes();
-        let key = &group.document.key;
-        let sources = |candidate: &native::DocumentKey| (candidate == key).then_some(source);
-        let declaration = |id: &str| {
-            group
-                .declaration_ids
-                .get(id)
-                .and_then(|found| found.first())
-                .map(|index| &group.native.declarations[*index])
-        };
-        let reference = |id: &str| {
-            group
-                .reference_ids
-                .get(id)
-                .and_then(|found| found.first())
-                .map(|index| &group.native.references[*index])
-        };
-        let known = |id: &str, document: &native::DocumentKey| -> Result<bool> {
-            Ok(!self
-                .declaration_status(self.destination.rev, document, id)?
-                .is_empty())
-        };
-        check(
-            &self.validator,
-            &proof,
-            &semantic::DocumentFacts {
-                native: &group.native,
-                sources: &sources,
-                declaration: &declaration,
-                reference: &reference,
-                known: &known,
-            },
-        )
-    }
-
-    fn id_for(&self, raw: &str, kind: semantic::EvidenceKind) -> String {
-        rejoin_provenance_id(raw, self.destination_id(), kind)
-    }
-
-    fn source(&self, raw: &str, kind: semantic::EvidenceKind) -> Result<()> {
-        self.ctx.row()?;
-        self.conn()
-            .prepare_cached("INSERT OR IGNORE INTO w_prov VALUES(?1,?2)")?
-            .execute(params![raw, kind_rank(kind)])?;
-        Ok(())
-    }
-
-    fn observe(&self, document: &native::DocumentKey, role: semantic::Role) -> Result<()> {
-        self.ctx.row()?;
-        self.conn()
-            .prepare_cached("INSERT OR IGNORE INTO w_observed VALUES(?1,?2,?3)")?
-            .execute(params![
-                document.language,
-                document.path,
-                serde_json::to_value(role)?.as_str().unwrap_or_default()
-            ])?;
-        Ok(())
-    }
-
-    fn outcome(&self, raw: &str, outcome: i64) -> Result<()> {
-        self.ctx.row()?;
-        self.conn()
-            .prepare_cached("INSERT OR REPLACE INTO w_outcomes VALUES(?1,?2)")?
-            .execute(params![raw, outcome])?;
-        Ok(())
-    }
-
-    fn omit(&self, language: &str, path: &str) -> Result<()> {
-        self.mark("omitted", language, path)
-    }
-
-    fn proof_document(&self, raw: &str) -> Result<Option<native::DocumentKey>> {
-        Ok(self
-            .filtered
-            .proof(raw)?
-            .map(|claim| self.key(&claim.language, &claim.path)))
-    }
-
-    fn emit(&self, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<()> {
-        self.ctx.row()?;
-        self.conn().prepare_cached(sql)?.execute(values)?;
-        Ok(())
-    }
-
-    fn symbols(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(SYMBOLS_SQL)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            self.ctx.check_cancel()?;
-            let mut symbol: semantic::Symbol = from_json(&row.get::<_, String>(0)?)?;
-            if let Some(claim) = self.filtered.proof(&symbol.provenance_id)? {
-                let doc = self.key(&claim.language, &claim.path);
-                let targets = self.captured_targets(&doc, &symbol.key.symbol)?;
-                if !targets.is_empty() {
-                    symbol.declarations = targets;
-                }
-            }
-            let mut all = true;
-            for target in &mut symbol.declarations {
-                if !self.retarget(target)? {
-                    all = false;
-                    break;
-                }
-            }
-            if all {
-                let raw = symbol.provenance_id.clone();
-                self.source(&raw, semantic::EvidenceKind::DeclarationBinding)?;
-                symbol.provenance_id =
-                    self.id_for(&raw, semantic::EvidenceKind::DeclarationBinding);
-                #[cfg(feature = "test-support")]
-                crate::semantic_batch::testing::edit_row("symbol", &mut symbol)?;
-                self.check_row(
-                    &raw,
-                    semantic::EvidenceKind::DeclarationBinding,
-                    None,
-                    |v, p, f| v.symbol(&symbol, p, f),
-                )?;
-                let body = to_json(&symbol)?;
-                self.emit(
-                    "INSERT INTO out_symbols VALUES(?1,?2,?3)",
-                    &[&self.next_ord(SYMBOLS), &symbol.provenance_id, &body],
-                )?;
-            } else if let Some(claim) = self.filtered.proof(&symbol.provenance_id)? {
-                self.omit(&claim.language, &claim.path)?;
+        let enc = self.admitted_encoding;
+        let mut sets = local.operation()?;
+        let entry = sizes::map_entries::<&str, ()>(1)?;
+        let mut declarations = BTreeSet::new();
+        let mut calls = BTreeMap::new();
+        let mut associations = BTreeSet::new();
+        for binding in &facts.declaration_bindings {
+            if binding.syntax_id.is_some() {
+                sets.grow(sizes::sum(&[entry, entry])?)?;
+                declarations.insert(binding.provenance_id.as_str());
+                associations.insert(binding.provenance_id.as_str());
             }
         }
-        Ok(())
-    }
-
-    fn bindings(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(BINDINGS_SQL)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let mut binding: semantic::DeclarationBinding = from_json(&row.get::<_, String>(0)?)?;
-            let Some(syntax_id) = binding.syntax_id.clone() else {
-                continue;
-            };
-            let captured: Option<String> = conn
-                .prepare_cached(
-                    "SELECT syntax_id FROM f_bindings WHERE side=0 AND provenance_id=?1 AND syntax_id IS NOT NULL ORDER BY ord DESC LIMIT 1",
-                )?
-                .query_row([&binding.provenance_id], |row| row.get(0))
-                .optional()?;
-            if captured.as_deref() != Some(syntax_id.as_str()) {
-                continue;
-            }
-            let raw = binding.provenance_id.clone();
-            self.source(&raw, semantic::EvidenceKind::DeclarationBinding)?;
-            self.outcome(&raw, 1)?;
-            self.observe(&binding.join.anchor.document, semantic::Role::Definition)?;
-            binding.provenance_id = self.id_for(&raw, semantic::EvidenceKind::DeclarationBinding);
-            #[cfg(feature = "test-support")]
-            crate::semantic_batch::testing::edit_row("declarationBinding", &mut binding)?;
-            self.check_row(
-                &raw,
-                semantic::EvidenceKind::DeclarationBinding,
-                Some(&binding.join.anchor.document),
-                |v, p, f| v.declaration_binding(&binding, p, f),
-            )?;
-            let body = to_json(&binding)?;
-            self.emit(
-                "INSERT INTO out_declaration_bindings VALUES(?1,?2,?3)",
-                &[&self.next_ord(BINDINGS), &binding.provenance_id, &body],
-            )?;
+        for proof in facts.reference_claims.keys() {
+            sets.grow(entry)?;
+            associations.insert(proof.as_str());
         }
-        Ok(())
-    }
-
-    /// Calls whose captured reference still retargets, held until references are final.
-    fn stage_calls(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare("SELECT body FROM f_calls WHERE side=1 ORDER BY slot")?;
-        let mut rows = statement.query([])?;
-        let mut ord = 0i64;
-        while let Some(row) = rows.next()? {
-            let mut call: semantic::CallBinding = from_json(&row.get::<_, String>(0)?)?;
-            let Some(old) = self.captured_reference(&call.provenance_id)? else {
-                continue;
-            };
-            call.resolution = old.resolution;
-            call.declared_target = old.declared_target.clone();
-            call.candidates = old.candidates.clone();
-            let mut all = true;
-            for target in call
-                .declared_target
-                .iter_mut()
-                .chain(call.candidates.iter_mut())
-            {
-                if !self.retarget(target)? {
-                    all = false;
-                    break;
-                }
-            }
-            if all {
-                call.stale_target = matches!(
-                    call.declared_target,
-                    Some(semantic::Target::Internal { .. })
-                )
-                .then_some(false);
-                self.source(
-                    &call.provenance_id,
-                    semantic::EvidenceKind::SemanticReference,
-                )?;
-                self.ctx.row()?;
-                conn.prepare_cached("INSERT INTO w_calls VALUES(?1,?2,?3)")?
-                    .execute(params![ord, call.provenance_id, to_json(&call)?])?;
-                ord += 1;
-            } else {
-                let document = &call.join.anchor.document;
-                self.omit(&document.language, &document.path)?;
+        for binding in &facts.call_bindings {
+            if binding.call_id.is_some() {
+                sets.grow(sizes::sum(&[
+                    entry,
+                    sizes::map_entries::<&str, &semantic::CallBinding>(1)?,
+                ])?)?;
+                // The last binding of a proof is the one the whole-corpus map kept.
+                calls.insert(binding.provenance_id.as_str(), binding);
+                associations.insert(binding.provenance_id.as_str());
             }
         }
-        Ok(())
-    }
-
-    /// Merges the destination's reference claims into one row per reference.
-    fn reference_claims(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(REFERENCE_CLAIMS_SQL)?;
-        let mut rows = statement.query([])?;
-        let mut target_ord = 0i64;
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let mut reference: semantic::Reference = from_json(&row.get::<_, String>(1)?)?;
-            let Some(prior) = self.captured_reference(&raw)? else {
-                continue;
-            };
+        for relationship in &facts.type_relationships {
+            sets.grow(entry)?;
+            associations.insert(relationship.provenance_id.as_str());
+        }
+        let unchanged = self.unchanged(document)?;
+        let mut destination: Option<(Reservation, StagedSide<'_>)> = None;
+        for claim in local.claims() {
+            let claim = claim?;
             anyhow::ensure!(
-                prior.document == reference.document && prior.range == reference.range,
-                "captured reference anchor differs"
+                claim.language == document.language
+                    && claim.envelope.relative_path == document.path,
+                "captured claim outside its document"
             );
-            reference.roles.retain(|role| prior.roles.contains(role));
-            if reference.roles.is_empty() {
+            flags.requested = true;
+            local
+                .bytes_of(document)?
+                .context("missing captured claim source")?;
+            if !unchanged {
+                flags.failed = true;
                 continue;
             }
-            reference.resolution = prior.resolution;
-            reference.declared_target = prior.declared_target.clone();
-            reference.candidates = prior.candidates.clone();
-            let mut all = true;
-            for target in reference
-                .declared_target
-                .iter_mut()
-                .chain(reference.candidates.iter_mut())
-            {
-                if !self.retarget(target)? {
-                    all = false;
-                    break;
-                }
-            }
-            if !all {
-                self.omit(&reference.document.language, &reference.document.path)?;
+            if claim.envelope.record_kind != "occurrence" {
+                flags.eligible = true;
                 continue;
             }
-            for target in reference
-                .declared_target
-                .iter()
-                .chain(&reference.candidates)
-            {
-                self.ctx.row()?;
-                conn.prepare_cached("INSERT INTO w_reftargets VALUES(?1,?2,?3)")?
-                    .execute(params![reference.id, target_ord, to_json(target)?])?;
-                target_ord += 1;
+            let range = local.occurrence_range(&claim, enc)?;
+            if range.start == range.end {
+                flags.eligible = true;
+                continue;
             }
-            self.ctx.row()?;
-            conn.prepare_cached("INSERT OR IGNORE INTO w_refproofs VALUES(?1,?2)")?
-                .execute(params![reference.id, raw])?;
-            self.ctx.row()?;
-            conn.prepare_cached("INSERT OR REPLACE INTO w_accepted VALUES(?1,?2)")?
-                .execute(params![raw, reference.id])?;
-            self.source(&raw, semantic::EvidenceKind::SemanticReference)?;
-            let stored: Option<String> = conn
-                .prepare_cached("SELECT body FROM w_refrows WHERE ref_id=?1")?
-                .query_row([&reference.id], |row| row.get(0))
-                .optional()?;
-            if let Some(stored) = stored {
-                let mut row: semantic::Reference = from_json(&stored)?;
-                let roles: BTreeSet<_> =
-                    row.roles.iter().chain(&reference.roles).copied().collect();
-                row.roles = roles.into_iter().collect();
-                if row.roles.contains(&semantic::Role::Definition) {
-                    row.site = semantic::ReferenceSite::Declaration;
-                }
-                conn.prepare_cached("UPDATE w_refrows SET body=?2 WHERE ref_id=?1")?
-                    .execute(params![row.id, to_json(&row)?])?;
+            let roles = claim.envelope.raw["symbolRoles"]
+                .as_u64()
+                .context("invalid raw roles")?;
+            let proof = claim.captured_proof_id.as_str();
+            let captured_declaration = declarations.contains(proof);
+            let captured_reference = facts.reference_claims.contains_key(proof);
+            let required = if captured_declaration || (!captured_reference && roles & 1 != 0) {
+                semantic::JoinKind::DeclarationName
             } else {
-                self.ctx.row()?;
-                conn.prepare_cached("INSERT INTO w_refrows VALUES(?1,?2)")?
-                    .execute(params![reference.id, to_json(&reference)?])?;
+                semantic::JoinKind::Reference
+            };
+            if destination.is_none() {
+                let keys = self.view_keys(document, 1)?;
+                destination = Some((
+                    keys,
+                    streaming::native_document_side(&self.destination, document.clone())?,
+                ));
+            }
+            let destination = &destination.as_ref().expect("destination native view").1;
+            let mut captured_operation = local.operation()?;
+            let mut destination_operation = destination.operation()?;
+            let first =
+                local.join_reserved(document, range.clone(), required, &mut captured_operation)?;
+            let second =
+                destination.join_reserved(document, range, required, &mut destination_operation)?;
+            let authored = associations.contains(proof);
+            if !authored
+                && first.status == semantic::JoinStatus::Unsupported
+                && second.status == semantic::JoinStatus::Unsupported
+            {
+                flags.unsupported = true;
+                flags.unsupported_claims += 1;
+                flags.eligible = true;
+                continue;
+            }
+            if !authored
+                && first.status == semantic::JoinStatus::Unmatched
+                && second.status == semantic::JoinStatus::Unmatched
+            {
+                flags.eligible = true;
+                continue;
+            }
+            let mut exact = first.status == semantic::JoinStatus::Exact
+                && second.status == semantic::JoinStatus::Exact;
+            if captured_reference && required != semantic::JoinKind::Reference {
+                let first_reference = local.join_reserved(
+                    document,
+                    first.anchor.range.clone(),
+                    semantic::JoinKind::Reference,
+                    &mut captured_operation,
+                )?;
+                let second_reference = destination.join_reserved(
+                    document,
+                    first.anchor.range.clone(),
+                    semantic::JoinKind::Reference,
+                    &mut destination_operation,
+                )?;
+                exact &= first_reference.status == semantic::JoinStatus::Exact
+                    && second_reference.status == semantic::JoinStatus::Exact;
+            }
+            if let Some(binding) = calls.get(proof) {
+                let call = destination.join_reserved(
+                    document,
+                    binding.join.anchor.range.clone(),
+                    binding.join.anchor.kind,
+                    &mut destination_operation,
+                )?;
+                let first_call = local.join_reserved(
+                    document,
+                    binding.join.anchor.range.clone(),
+                    binding.join.anchor.kind,
+                    &mut captured_operation,
+                )?;
+                exact &= call.status == semantic::JoinStatus::Exact
+                    && first_call.status == semantic::JoinStatus::Exact
+                    && first_call.candidate_ids == binding.join.candidate_ids;
+                let mut same_call = false;
+                if let Some(id) = second.candidate_ids.first() {
+                    let calls = match call.candidate_ids.first() {
+                        Some(call_id) => destination.calls_with_id(
+                            document,
+                            call_id,
+                            &mut destination_operation,
+                        )?,
+                        None => vec![],
+                    };
+                    same_call = destination
+                        .references_with_id(document, id, &mut destination_operation)?
+                        .iter()
+                        .any(|reference| {
+                            &reference.id == id
+                                && calls.iter().any(|candidate| {
+                                    call.candidate_ids == vec![candidate.id.clone()]
+                                        && candidate.owner_syntax_id == reference.owner_syntax_id
+                                        && candidate.range.start <= reference.range.start
+                                        && reference.range.end <= candidate.range.end
+                                        && candidate
+                                            .callee_range
+                                            .as_ref()
+                                            .is_none_or(|callee| callee == &reference.range)
+                                })
+                        });
+                }
+                exact &= same_call;
+            }
+            if exact {
+                flags.eligible = true;
+            } else {
+                flags.failed = true;
             }
         }
         Ok(())
     }
 
-    fn references(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(REFERENCES_SQL)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let mut reference: semantic::Reference = from_json(&row.get::<_, String>(1)?)?;
-            let mut targets: Vec<semantic::Target> = {
-                self.ctx.charge(1)?;
-                let mut statement =
-                    conn.prepare_cached("SELECT target FROM w_reftargets WHERE ref_id=?1")?;
-                let found = statement
-                    .query_map([&id], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                self.ctx.charge(found.len())?;
-                found
-                    .iter()
-                    .map(|target| from_json(target))
-                    .collect::<Result<_>>()?
-            };
-            targets.sort_by_key(|target| {
-                crate::native_ids::canonical(
-                    &serde_json::to_value(target).expect("serializable target"),
-                )
-            });
-            targets.dedup();
-            reference.declared_target = None;
-            reference.candidates.clear();
-            if targets.len() > 1 {
-                reference.resolution = semantic::Resolution::Ambiguous;
-                reference.candidates = targets;
-            } else if let Some(target) = targets.pop() {
-                reference.resolution = if matches!(target, semantic::Target::Internal { .. }) {
-                    semantic::Resolution::Resolved
-                } else {
-                    semantic::Resolution::External
-                };
-                reference.declared_target = Some(target);
-            } else {
-                reference.resolution = semantic::Resolution::Unresolved;
-            }
-            let outcome = if reference.resolution == semantic::Resolution::Ambiguous {
-                3
-            } else {
-                1
-            };
-            let proofs = {
-                self.ctx.charge(1)?;
-                let mut statement =
-                    conn.prepare_cached("SELECT raw_id FROM w_refproofs WHERE ref_id=?1")?;
-                let found = statement
-                    .query_map([&id], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                self.ctx.charge(found.len())?;
-                found
-            };
-            self.outcome(&reference.provenance_id, outcome)?;
-            for proof in proofs {
-                self.outcome(&proof, outcome)?;
-            }
-            for role in &reference.roles {
-                self.observe(&reference.document, *role)?;
-            }
-            let raw = reference.provenance_id.clone();
-            reference.provenance_id = self.id_for(&raw, semantic::EvidenceKind::SemanticReference);
-            #[cfg(feature = "test-support")]
-            crate::semantic_batch::testing::edit_row("reference", &mut reference)?;
-            self.check_row(
-                &raw,
-                semantic::EvidenceKind::SemanticReference,
-                Some(&reference.document),
-                |v, p, f| v.reference(&reference, p, f),
-            )?;
-            let body = to_json(&reference)?;
-            self.emit(
-                "INSERT INTO out_references VALUES(?1,?2,?3,?4)",
-                &[
-                    &self.next_ord(REFERENCES),
-                    &reference.id,
-                    &reference.provenance_id,
-                    &body,
-                ],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Resolves each staged call binding from its final reference, then settles every native
-    /// call site that more than one binding reaches. Contradictory exact evidence becomes
-    /// `ambiguous` over the union of the asserted targets (contract-v1 CallBinding), exactly as
-    /// the whole-publication validator requires, so no contradictory site reaches the stage.
-    fn resolve_calls(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(RESOLVE_CALLS_SQL)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let mut call: semantic::CallBinding = from_json(&row.get::<_, String>(1)?)?;
-            let body: Option<String> = conn
-                .prepare_cached(
-                    "SELECT r.body FROM w_accepted a JOIN out_references r ON r.reference_id=a.ref_id WHERE a.raw_id=?1",
-                )?
-                .query_row([&raw], |row| row.get(0))
-                .optional()?;
-            let Some(body) = body else {
-                continue;
-            };
-            let reference: semantic::Reference = from_json(&body)?;
-            call.resolution = reference.resolution;
-            call.declared_target = reference.declared_target.clone();
-            call.candidates = reference.candidates.clone();
-            call.stale_target = call.declared_target.as_ref().and_then(|target| {
-                matches!(target, semantic::Target::Internal { .. }).then_some(false)
-            });
-            #[cfg(feature = "test-support")]
-            crate::semantic_batch::testing::edit_row("callResolution", &mut call)?;
-            self.ctx.row()?;
-            conn.prepare_cached("INSERT INTO w_callres(raw_id, call_id, body) VALUES(?1,?2,?3)")?
-                .execute(params![raw, call.call_id, to_json(&call)?])?;
-            if let Some(site) = &call.call_id {
-                for target in call.declared_target.iter().chain(&call.candidates) {
-                    self.ctx.row()?;
-                    conn.prepare_cached("INSERT OR IGNORE INTO w_sitetargets VALUES(?1,?2,?3)")?
-                        .execute(params![
-                            site,
-                            crate::native_ids::canonical(&serde_json::to_value(target)?),
-                            to_json(target)?
-                        ])?;
-                }
-            }
-        }
-        self.settle_call_sites()
-    }
-
-    /// One pass over the site targets in `(site, canonical target)` order. A site asserting more
-    /// than one distinct target is rewritten to the ambiguous union on every binding that
-    /// reaches it; only that one site's targets are held at a time.
-    fn settle_call_sites(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(SITE_TARGETS_SQL)?;
-        let mut rows = statement.query([])?;
-        let mut site: Option<String> = None;
-        let mut asserted: Vec<(Vec<u8>, String)> = Vec::new();
-        while let Some(row) = rows.next()? {
-            self.ctx.charge(1)?;
-            let id: String = row.get(0)?;
-            if site.as_ref() != Some(&id)
-                && let Some(done) = site.replace(id)
-            {
-                self.settle_call_site(&done, std::mem::take(&mut asserted))?;
-            }
-            asserted.push((row.get(1)?, row.get(2)?));
-        }
-        if let Some(done) = site {
-            self.settle_call_site(&done, asserted)?;
-        }
-        Ok(())
-    }
-
-    fn settle_call_site(&self, site: &str, asserted: Vec<(Vec<u8>, String)>) -> Result<()> {
-        if asserted.len() < 2 {
-            return Ok(());
-        }
-        let conn = self.conn();
-        let union = asserted
-            .iter()
-            .map(|(_, target)| from_json(target))
-            .collect::<Result<Vec<semantic::Target>>>()?;
-        let bindings = {
-            self.ctx.charge(1)?;
-            let mut statement =
-                conn.prepare_cached("SELECT ord, body FROM w_callres WHERE call_id=?1")?;
-            let found = statement
-                .query_map([site], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            self.ctx.charge(found.len())?;
-            found
+    /// The eligibility decision and producer exclusion recorded for one source document.
+    fn document_flags(&self, document: &native::DocumentKey) -> Result<(DocFlags, Option<String>)> {
+        type Row = (
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        );
+        let row: Option<Row> = self
+            .conn()
+            .prepare_cached(DOCUMENT_FLAGS_SQL)?
+            .query_row(params![document.language, document.path], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .optional()?;
+        let Some((requested, failed, eligible, unsupported, unsupported_claims, claims, excluded)) =
+            row
+        else {
+            return Ok((DocFlags::default(), None));
         };
-        for (ord, body) in bindings {
-            let mut call: semantic::CallBinding = from_json(&body)?;
-            if call.resolution == semantic::Resolution::Ambiguous
-                && call.declared_target.is_none()
-                && call.candidates == union
-            {
-                continue;
-            }
-            call.resolution = semantic::Resolution::Ambiguous;
-            call.declared_target = None;
-            call.candidates = union.clone();
-            call.stale_target = None;
-            conn.prepare_cached("UPDATE w_callres SET body=?2 WHERE ord=?1")?
-                .execute(params![ord, to_json(&call)?])?;
-        }
-        Ok(())
+        Ok((
+            DocFlags {
+                requested: requested.unwrap_or_default(),
+                failed: failed.unwrap_or_default(),
+                eligible: eligible.unwrap_or_default(),
+                unsupported: unsupported.unwrap_or_default(),
+                unsupported_claims: u64::try_from(unsupported_claims.unwrap_or_default())?,
+                claims: u64::try_from(claims.unwrap_or_default())?,
+            },
+            excluded,
+        ))
     }
 
-    fn calls(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(CALLS_SQL)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let mut call: semantic::CallBinding = from_json(&row.get::<_, String>(1)?)?;
-            self.outcome(
-                &raw,
-                if call.resolution == semantic::Resolution::Ambiguous {
-                    3
-                } else {
-                    1
-                },
-            )?;
-            self.observe(&call.join.anchor.document, semantic::Role::Call)?;
-            call.provenance_id = self.id_for(&raw, semantic::EvidenceKind::SemanticReference);
-            #[cfg(feature = "test-support")]
-            crate::semantic_batch::testing::edit_row("callBinding", &mut call)?;
-            self.check_row(
-                &raw,
-                semantic::EvidenceKind::SemanticReference,
-                Some(&call.join.anchor.document),
-                |v, p, f| v.call_binding(&call, p, f),
-            )?;
-            let body = to_json(&call)?;
-            self.emit(
-                "INSERT INTO out_call_bindings VALUES(?1,?2,?3)",
-                &[&self.next_ord(CALLS), &call.provenance_id, &body],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn relationships(&self) -> Result<()> {
-        let conn = self.conn();
-        let mut statement = conn.prepare("SELECT body FROM f_rels WHERE side=0 ORDER BY ord")?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let mut relationship: semantic::TypeRelationship =
-                from_json(&row.get::<_, String>(0)?)?;
-            let raw = relationship.provenance_id.clone();
-            let Some(document) = self.proof_document(&raw)? else {
-                continue;
-            };
-            if self.retarget(&mut relationship.source)?
-                && self.retarget(&mut relationship.target)?
-            {
-                self.source(&raw, semantic::EvidenceKind::TypeRelationship)?;
-                self.outcome(&raw, 1)?;
-                self.observe(&document, semantic::Role::Type)?;
-                relationship.provenance_id =
-                    self.id_for(&raw, semantic::EvidenceKind::TypeRelationship);
-                #[cfg(feature = "test-support")]
-                crate::semantic_batch::testing::edit_row("typeRelationship", &mut relationship)?;
-                self.check_row(
-                    &raw,
-                    semantic::EvidenceKind::TypeRelationship,
-                    None,
-                    |v, p, f| v.type_relationship(&relationship, p, f),
-                )?;
-                let body = to_json(&relationship)?;
-                self.emit(
-                    "INSERT INTO out_type_relationships VALUES(?1,?2,?3)",
-                    &[
-                        &self.next_ord(RELATIONSHIPS),
-                        &relationship.provenance_id,
-                        &body,
-                    ],
-                )?;
+    /// Pass 4: in destination document order, settles each eligible document's final rows and
+    /// emits every document's coverage. Nothing of a document outlives its iteration except
+    /// its emitted `out_*` rows and the bounded per-language tally.
+    fn settle(
+        &self,
+        captured: &streaming::CompletedGlobal<'_>,
+        destination: &streaming::CompletedGlobal<'_>,
+    ) -> Result<BTreeMap<semantic::Language, LanguageTally>> {
+        let manifest_hash = self.destination_manifest_hash()?;
+        let mut tallies = BTreeMap::new();
+        for document in self.destination.documents() {
+            let document = document?;
+            self.ctx.check_cancel()?;
+            let (flags, excluded) = self.document_flags(&document)?;
+            let outcome = if flags.eligible && !flags.failed {
+                self.settle_document(&document, captured, destination, &manifest_hash)?
             } else {
-                self.omit(&document.language, &document.path)?;
+                settle::DocumentOutcome::default()
+            };
+            let language = language_of(&document.language)?;
+            if self.producer.languages.contains(&language) {
+                self.coverage(
+                    &document,
+                    language,
+                    flags,
+                    excluded.as_deref(),
+                    &outcome,
+                    &mut tallies,
+                )?;
             }
         }
-        Ok(())
+        Ok(tallies)
     }
-}
 
-/// The claim counts and document states of one language, for the bounded report.
-#[derive(Default)]
-struct LanguageTally {
-    documents: u64,
-    counts: [u64; 5],
-    complete: u64,
-    partial: u64,
-    failed: u64,
-    omitted: u64,
-    unsupported_documents: u64,
-}
-
-impl StagedJoin<'_> {
     fn destination_manifest_hash(&self) -> Result<String> {
         let mut hasher = SourceManifestHasher::new(&self.destination_header.source_set.id);
         let mut statement = self.conn().prepare_cached(
@@ -2533,113 +1766,46 @@ impl StagedJoin<'_> {
         Ok(hasher.finish())
     }
 
-    fn provenance(&self) -> Result<()> {
-        let conn = self.conn();
-        let destination_manifest_hash = self.destination_manifest_hash()?;
-        let lookup = |proof: &str, kind: &str, digest: &str| -> Result<RawClaimDocument> {
-            conn.prepare_cached(
-                "SELECT s.language, s.path, a.sha256 FROM claims c JOIN sources s ON s.ord=c.source_ord \
-                 JOIN artifacts a ON a.ordinal=c.artifact WHERE c.proof_id=?1 AND c.record_kind=?2 AND c.fact_digest=?3",
-            )?
-            .query_row(params![proof, kind, digest], |row| {
-                Ok(RawClaimDocument {
-                    language: row.get(0)?,
-                    path: row.get(1)?,
-                    artifact_hash: row.get(2)?,
-                })
-            })
-            .optional()?
-            .ok_or_else(|| ScipCaptureError::MissingProof.into())
+    fn coverage(
+        &self,
+        doc: &native::DocumentKey,
+        language: semantic::Language,
+        flags: DocFlags,
+        excluded: Option<&str>,
+        outcome: &settle::DocumentOutcome,
+        tallies: &mut BTreeMap<semantic::Language, LanguageTally>,
+    ) -> Result<()> {
+        let DocFlags {
+            requested,
+            failed,
+            unsupported,
+            ..
+        } = flags;
+        let partial = excluded == Some("unsupported")
+            || unsupported
+            || outcome.omitted
+            || outcome.diagnostics;
+        let state = if !requested {
+            semantic::CoverageState::NotRequested
+        } else if failed {
+            semantic::CoverageState::Failed
+        } else if excluded == Some("unsupported") {
+            semantic::CoverageState::Omitted
+        } else if partial {
+            semantic::CoverageState::Partial
+        } else {
+            semantic::CoverageState::Complete
         };
-        let mut statement = conn.prepare(PROVENANCE_SQL)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            self.ctx.check_cancel()?;
-            let raw: String = row.get(0)?;
-            let kind = rank_kind(row.get(1)?)?;
-            let claim = self
-                .captured
-                .proof(&raw)?
-                .context("missing raw fact for joined provenance")?;
-            self.captured
-                .check_proof(&raw, &claim.record_kind, &claim.fact_digest)?;
-            let doc = self.key(&claim.language, &claim.path);
-            let basis = self
-                .basis
-                .basis_for(&doc)?
-                .context("missing immutable captured basis")?;
-            anyhow::ensure!(
-                basis.revision_id == self.captured_id()
-                    && basis.artifact_hash == claim.artifact_hash
-                    && basis.source_manifest_hash == self.descriptor.source_manifest_hash
-                    && basis.producer_id == self.producer.id
-                    && basis.language == language_of(&doc.language)?,
-                "captured semantic basis differs from authenticated inventory"
-            );
-            let (_, destination) = self
-                .destination
-                .doc_row(&doc)?
-                .context("missing destination document")?;
-            let captured_hash = self.captured.doc_row(&doc)?.map(|(_, d)| d.content_hash);
-            let header = &self.destination_header.revision;
-            let freshness = if captured_hash.is_none_or(|hash| hash != destination.content_hash) {
-                semantic::Freshness::Stale
-            } else if basis.revision_id != header.id
-                || basis.source_manifest_hash != destination_manifest_hash
-                || basis.toolchain_hash != header.toolchain_hash
-                || basis.config_hash != header.config_hash
-                || basis.dependency_hash != header.dependency_hash
-                || basis.producer_version != self.producer.version
-                || basis.producer_hash != self.producer.executable_hash
-                || !self.producer.languages.contains(&basis.language)
-            {
-                semantic::Freshness::PossiblyStale
-            } else {
-                semantic::Freshness::Fresh
-            };
-            let derived_kind: semantic::RecordKind =
-                serde_json::from_value(serde_json::json!(claim.record_kind))?;
-            let provenance = semantic::Provenance {
-                id: self.id_for(&raw, kind),
-                producer_id: self.producer.id.clone(),
-                document: doc,
-                revision_id: header.id.clone(),
-                content_hash: destination.content_hash.clone(),
-                evidence_kind: kind,
-                basis: Some(basis),
-                freshness,
-                derived_from: Some(semantic::DerivedFrom {
-                    provenance_id: raw.clone(),
-                    record_kind: derived_kind,
-                    fact_digest: claim.fact_digest.clone(),
-                }),
-            };
-            self.validator.provenance(&provenance, &lookup)?;
-            let artifact: i64 = conn
-                .prepare_cached("SELECT artifact FROM claims WHERE proof_id=?1")?
-                .query_row([&raw], |row| row.get(0))?;
-            let body = to_json(&provenance)?;
-            self.emit(
-                "INSERT INTO out_provenance VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                &[
-                    &self.next_ord(PROVENANCE),
-                    &provenance.id,
-                    &artifact,
-                    &raw,
-                    &claim.record_kind,
-                    &claim.fact_digest,
-                    &body,
-                ],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn coverage(&self) -> Result<BTreeMap<semantic::Language, LanguageTally>> {
-        let conn = self.conn();
-        let mut tallies: BTreeMap<semantic::Language, LanguageTally> = BTreeMap::new();
-        let all_roles = |language: semantic::Language| -> Vec<semantic::Role> {
-            [
+        let row = semantic::Coverage {
+            producer_id: self.producer.id.clone(),
+            language,
+            source_set_id: doc.source_set_id.clone(),
+            document_path: doc.path.clone(),
+            revision_id: self.destination_id().to_owned(),
+            requested,
+            selected: requested && state != semantic::CoverageState::Omitted,
+            state,
+            supported_roles: [
                 semantic::Role::Definition,
                 semantic::Role::Read,
                 semantic::Role::Write,
@@ -2650,146 +1816,110 @@ impl StagedJoin<'_> {
             ]
             .into_iter()
             .filter(|r| language != semantic::Language::Java || *r != semantic::Role::Alias)
-            .collect()
-        };
-        for doc in self.destination.documents() {
-            let doc = doc?;
-            let language = language_of(&doc.language)?;
-            if !self.producer.languages.contains(&language) {
-                continue;
-            }
-            let flags: Option<(bool, bool, bool, bool)> = conn
-                .prepare_cached(
-                    "SELECT w.requested, w.failed, w.unsupported, w.omitted FROM sources s \
-                     JOIN w_docs w ON w.source_ord=s.ord WHERE s.language=?1 AND s.path=?2",
-                )?
-                .query_row(params![doc.language, doc.path], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })
-                .optional()?;
-            let (requested, failed, unsupported, omitted) = flags.unwrap_or_default();
-            let excluded: Option<String> = conn
-                .prepare_cached(
-                    "SELECT c.exclusion FROM sources s JOIN coverage c ON c.source_ord=s.ord WHERE s.language=?1 AND s.path=?2",
-                )?
-                .query_row(params![doc.language, doc.path], |row| row.get(0))
-                .optional()?
-                .flatten();
-            let diagnostics = exists(
-                conn,
-                "SELECT 1 FROM f_diag WHERE side=0 AND language=?1 AND path=?2",
-                &[&doc.language, &doc.path],
-            )?;
-            let excluded = excluded.as_deref();
-            let partial = excluded == Some("unsupported") || unsupported || omitted || diagnostics;
-            let state = if !requested {
-                semantic::CoverageState::NotRequested
-            } else if failed {
-                semantic::CoverageState::Failed
-            } else if excluded == Some("unsupported") {
-                semantic::CoverageState::Omitted
-            } else if partial {
-                semantic::CoverageState::Partial
-            } else {
-                semantic::CoverageState::Complete
-            };
-            let observed: BTreeSet<semantic::Role> = {
-                self.ctx.charge(1)?;
-                let mut statement = conn
-                    .prepare_cached("SELECT role FROM w_observed WHERE language=?1 AND path=?2")?;
-                let names = statement
-                    .query_map(params![doc.language, doc.path], |row| {
-                        row.get::<_, String>(0)
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                names
-                    .iter()
-                    .map(|name| Ok(serde_json::from_value(serde_json::json!(name))?))
-                    .collect::<Result<_>>()?
-            };
-            let row = semantic::Coverage {
-                producer_id: self.producer.id.clone(),
-                language,
-                source_set_id: doc.source_set_id.clone(),
-                document_path: doc.path.clone(),
-                revision_id: self.destination_id().to_owned(),
-                requested,
-                selected: requested && state != semantic::CoverageState::Omitted,
-                state,
-                supported_roles: all_roles(language),
-                observed_roles: observed.into_iter().collect(),
-                diagnostic: if failed {
-                    Some(
-                        if excluded == Some("failed") {
-                            "excluded_failed_by_producer"
-                        } else {
-                            "unmeasurable_source_anchor"
-                        }
-                        .into(),
-                    )
-                } else if excluded == Some("unsupported") {
-                    Some("excluded_by_producer".into())
-                } else if unsupported {
-                    Some("unsupported_native_gap".into())
-                } else if partial {
-                    Some("unmeasurable_internal_target".into())
-                } else {
-                    None
-                },
-            };
-            self.validator.coverage(&row, &|language, path| {
-                exists(
-                    conn,
-                    "SELECT 1 FROM nat_docs WHERE rev=?1 AND language=?2 AND path=?3",
-                    &[&self.destination.rev, &language, &path],
+            .collect(),
+            observed_roles: outcome.observed.iter().copied().collect(),
+            diagnostic: if failed {
+                Some(
+                    if excluded == Some("failed") {
+                        "excluded_failed_by_producer"
+                    } else {
+                        "unmeasurable_source_anchor"
+                    }
+                    .into(),
                 )
-                .unwrap_or(false)
-            })?;
-            let body = to_json(&row)?;
-            self.emit(
-                "INSERT INTO out_coverage VALUES(?1,?2,?3,?4)",
-                &[&self.next_ord(COVERAGE), &doc.language, &doc.path, &body],
-            )?;
-            let mut counts = [0u64; 5];
-            let mut statement = conn.prepare_cached(
-                "SELECT o.outcome, COUNT(*) FROM claims c JOIN sources s ON s.ord=c.source_ord \
-                 JOIN w_outcomes o ON o.proof_id=c.proof_id WHERE s.language=?1 AND s.path=?2 \
-                 AND c.record_kind<>'symbolInformation' GROUP BY o.outcome",
-            )?;
-            let grouped = statement
-                .query_map(params![doc.language, doc.path], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for (outcome, count) in grouped {
-                counts[0] += count;
-                counts[if state == semantic::CoverageState::Failed {
-                    2
-                } else {
-                    outcome as usize
-                }] += count;
-            }
-            anyhow::ensure!(
-                counts[0] == counts[1] + counts[2] + counts[3] + counts[4],
-                "incomplete semantic import claim tally"
-            );
-            let tally = tallies.entry(language).or_default();
-            tally.documents += 1;
-            for (total, count) in tally.counts.iter_mut().zip(counts) {
-                *total += count;
-            }
-            match state {
-                semantic::CoverageState::Complete => tally.complete += 1,
-                semantic::CoverageState::Partial => tally.partial += 1,
-                semantic::CoverageState::Failed => tally.failed += 1,
-                semantic::CoverageState::Omitted => tally.omitted += 1,
-                _ => {}
-            }
-            tally.unsupported_documents += u64::from(unsupported);
+            } else if excluded == Some("unsupported") {
+                Some("excluded_by_producer".into())
+            } else if unsupported {
+                Some("unsupported_native_gap".into())
+            } else if partial {
+                Some("unmeasurable_internal_target".into())
+            } else {
+                None
+            },
+        };
+        let conn = self.conn();
+        self.validator.coverage(&row, &|language, path| {
+            exists(
+                conn,
+                "SELECT 1 FROM nat_docs WHERE rev=?1 AND language=?2 AND path=?3",
+                &[&self.destination.rev, &language, &path],
+            )
+            .unwrap_or(false)
+        })?;
+        let body = to_json(&row)?;
+        self.emit(
+            "out_coverage",
+            "INSERT INTO out_coverage VALUES(?1,?2,?3,?4)",
+            &[&self.next_ord(COVERAGE), &doc.language, &doc.path, &body],
+        )?;
+        // [requested, matched, skipped, ambiguous, unsupported]; every claim without a settled
+        // outcome is skipped, and a failed document skips all of its claims.
+        let mut counts = [flags.claims, 0, 0, 0, 0];
+        if state == semantic::CoverageState::Failed {
+            counts[2] = flags.claims;
+        } else {
+            counts[1] = outcome.matched;
+            counts[3] = outcome.ambiguous;
+            counts[4] = flags.unsupported_claims;
+            counts[2] = counts[1]
+                .checked_add(counts[3])
+                .and_then(|settled| settled.checked_add(counts[4]))
+                .and_then(|settled| flags.claims.checked_sub(settled))
+                .context("incomplete semantic import claim tally")?;
         }
-        Ok(tallies)
+        let tally = tallies.entry(language).or_default();
+        tally.documents += 1;
+        for (total, count) in tally.counts.iter_mut().zip(counts) {
+            *total += count;
+        }
+        match state {
+            semantic::CoverageState::Complete => tally.complete += 1,
+            semantic::CoverageState::Partial => tally.partial += 1,
+            semantic::CoverageState::Failed => tally.failed += 1,
+            semantic::CoverageState::Omitted => tally.omitted += 1,
+            _ => {}
+        }
+        tally.unsupported_documents += u64::from(unsupported);
+        Ok(())
     }
 
+    fn emit(&self, table: &'static str, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<()> {
+        self.ctx.row(table)?;
+        self.conn().prepare_cached(sql)?.execute(values)?;
+        Ok(())
+    }
+
+    fn run(&self) -> Result<serde_json::Value> {
+        let encoding = self.admitted_encoding;
+        self.ctx.pass("native");
+        let captured = streaming::discover_side(&self.captured, encoding)?;
+        self.ctx.pass("captured discovery");
+        self.eligibility(&captured)?;
+        self.ctx.pass("eligibility");
+        let destination = streaming::discover_side(&self.filtered, encoding)?;
+        self.ctx.pass("destination discovery");
+        let tallies = self.settle(&captured, &destination)?;
+        self.ctx.pass("settlement");
+        #[cfg(feature = "test-support")]
+        crate::semantic_batch::testing::run_before_closure_hook(self.conn());
+        self.closure()?;
+        self.report(tallies)
+    }
+}
+
+/// The claim counts and document states of one language, for the bounded report.
+#[derive(Default)]
+struct LanguageTally {
+    documents: u64,
+    counts: [u64; 5],
+    complete: u64,
+    partial: u64,
+    failed: u64,
+    omitted: u64,
+    unsupported_documents: u64,
+}
+
+impl StagedJoin<'_> {
     fn closure(&self) -> Result<()> {
         self.ctx.check_output()?;
         let conn = self.conn();
@@ -2946,38 +2076,49 @@ impl StagedJoin<'_> {
         );
         Ok(report)
     }
+}
 
-    fn run(&self) -> Result<serde_json::Value> {
-        let conn = self.conn();
-        let mut sink = StagedFactSink::new(self.ctx, 0);
-        streaming::join_side(&self.captured, self.admitted_encoding, &mut sink)?;
-        self.eligibility()?;
-        let mut sink = StagedFactSink::new(self.ctx, 1);
-        streaming::join_side(&self.filtered, self.admitted_encoding, &mut sink)?;
-        self.fill_captured_targets()?;
-        self.ctx.insert_select(
-            "SELECT COUNT(*) FROM claims WHERE record_kind<>'symbolInformation'",
-            "INSERT INTO w_outcomes SELECT proof_id, 2 FROM claims WHERE record_kind<>'symbolInformation'",
-        )?;
-        conn.execute(
-            "UPDATE w_outcomes SET outcome=4 WHERE proof_id IN (SELECT proof_id FROM w_unsupported_claims)",
-            [],
-        )?;
-        self.symbols()?;
-        self.bindings()?;
-        self.stage_calls()?;
-        self.reference_claims()?;
-        self.references()?;
-        self.resolve_calls()?;
-        self.calls()?;
-        self.relationships()?;
-        self.provenance()?;
-        let tallies = self.coverage()?;
-        #[cfg(feature = "test-support")]
-        crate::semantic_batch::testing::run_before_closure_hook(conn);
-        self.closure()?;
-        self.report(tallies)
+/// The seed owner: native rows an earlier attempt left in the stage.
+const RETAINED_SEED: &str = "seed:retained-native";
+
+/// Opt-in (`TRELLIS_INDEX_DIAGNOSTICS=1`) table-by-table ledger of one successful join
+/// attempt: charged row attempts by owner and the physical stage bytes of each table with its
+/// indexes. Best effort; carries no IDs, paths or pins, and never stops the join.
+fn emit_ledger_diagnostic(ctx: &JoinCtx<'_>, lookup_steps: u64) {
+    if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() != Ok("1") {
+        return;
     }
+    let physical = (|| -> Result<BTreeMap<String, i64>> {
+        let mut statement = ctx.conn.prepare(
+            "SELECT COALESCE(s.tbl_name, d.name), SUM(d.pgsize) FROM dbstat d \
+             LEFT JOIN sqlite_schema s ON s.name=d.name GROUP BY 1",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    })();
+    let pages = (|| -> Result<(u64, i64)> {
+        let freelist: i64 = ctx
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        Ok((stage_bytes(ctx.conn)?, freelist))
+    })();
+    let line = serde_json::json!({
+        "rowAttempts": *ctx.ledger.borrow(),
+        "rowAttemptTotal": ctx.rows.get(),
+        "passes": ctx.passes.borrow().iter().map(|(pass, lookup, rows)| {
+            serde_json::json!({"pass": pass, "lookupSteps": lookup, "rowAttempts": rows})
+        }).collect::<Vec<_>>(),
+        "lookupSteps": lookup_steps,
+        "stageBaseBytes": ctx.stage_base,
+        "stageBytes": pages.as_ref().ok().map(|(bytes, _)| *bytes),
+        "freelistPages": pages.as_ref().ok().map(|(_, pages)| *pages),
+        "physicalBytes": physical.as_ref().ok(),
+        "physicalBytesError": physical.as_ref().err().map(|error| format!("{error:#}")),
+    });
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "semantic-join-ledger {line}");
 }
 
 /// Joins an admitted batch against the captured revision and `destination`, writing only
@@ -3009,6 +2150,8 @@ pub fn join_staged(
             ..DocCache::default()
         }),
         rows: Cell::new(0),
+        ledger: RefCell::new(BTreeMap::new()),
+        passes: RefCell::new(Vec::new()),
         stage_base: stage_bytes(parts.conn)?,
         mutations: if shared {
             DestinationMutations::default()
@@ -3083,6 +2226,7 @@ pub fn join_staged(
                 descriptor_sha256: parts.descriptor_sha256,
             };
             let report = join.run()?;
+            emit_ledger_diagnostic(&ctx, ctx.budget.borrow().used());
             Ok(JoinedBatch::seal(
                 captured_pin,
                 destination,
@@ -3093,7 +2237,7 @@ pub fn join_staged(
             ))
         };
     let result = reset_for_destination(ctx.conn, destination).and_then(|attempt| {
-        ctx.reserve_rows(retained_rows(ctx.conn)?)?;
+        ctx.reserve_rows(RETAINED_SEED, retained_rows(ctx.conn)?)?;
         ctx.check_output()?;
         if shared {
             store.with_native_reader(captured_pin, |reader| body(attempt, reader, reader))
@@ -3104,7 +2248,16 @@ pub fn join_staged(
         }
     });
     *budget = ctx.budget.into_inner();
-    ctx.counters.borrow_mut().join_reservation_high_water_bytes = ctx.live.high_water();
+    {
+        let mut join_counters = ctx.counters.borrow_mut();
+        join_counters.join_reservation_high_water_bytes = ctx.live.high_water();
+        join_counters.staged_row_attempts = ctx
+            .ledger
+            .borrow()
+            .iter()
+            .map(|(owner, rows)| ((*owner).to_owned(), *rows))
+            .collect();
+    }
     counters.absorb_join(&ctx.counters.borrow());
     result
 }

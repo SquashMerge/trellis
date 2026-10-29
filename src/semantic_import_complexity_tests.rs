@@ -602,7 +602,13 @@ fn java_relationship_indexes_visit_each_snapshot_once_and_preserve_method_multip
             claims,
         };
         reset_work();
+        let estimates = staged::sizes::estimates();
         let facts = join_inventory(&inventory, &native, &sources, 1).unwrap();
+        assert_eq!(
+            staged::sizes::estimates(),
+            estimates,
+            "the unmetered memory oracle never evaluates a staged size estimate"
+        );
         let work = COMPLEXITY_WORK.with(|work| *work.borrow());
         assert_eq!(work.method_index_rows, native.declarations.len());
         assert_eq!(work.method_lookup_rows, 4 * count);
@@ -758,7 +764,13 @@ fn java_override_uses_global_method_owner_from_another_language() {
         exclusions: vec![],
         claims,
     };
+    let estimates = staged::sizes::estimates();
     let facts = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    assert_eq!(
+        staged::sizes::estimates(),
+        estimates,
+        "the unmetered memory oracle never evaluates a staged size estimate"
+    );
     let overrides: Vec<_> = facts
         .type_relationships
         .iter()
@@ -779,7 +791,7 @@ fn direct_base_rows_preserve_order_and_admit_output_before_build() {
     let source = b"interface I extends First, pkg.Second<T> {} class A extends pkg.Base<T> implements X, Y {}";
     let mut bytes = 0;
     let rows = direct_java_types(source, &mut |amount| {
-        bytes += amount;
+        bytes += amount()?;
         Ok(())
     })
     .unwrap();
@@ -795,7 +807,8 @@ fn direct_base_rows_preserve_order_and_admit_output_before_build() {
     );
     let mut passes = 0;
     let denied = collect_direct_bases(
-        &mut |_| {
+        &mut |bytes| {
+            bytes()?;
             Err(crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into()).into())
         },
         |emit| {
