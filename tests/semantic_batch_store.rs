@@ -2599,6 +2599,74 @@ fn real_typescript_empty_module_markers_publish_and_rejoin_without_measured_anch
     real_module_marker_batch("javascript");
 }
 
+/// Real scip-typescript 0.4.0 bytes for issue #444: its reference occurrences carry no
+/// enclosing range, and calls bind at their exact measured callee spans on both join paths.
+#[test]
+fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue444-javascript-calls");
+    let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
+    let (lib, main) = (read("src/lib.js"), read("src/main.js"));
+    let world = world(|root| write_files(root, &[("src/lib.js", &lib), ("src/main.js", &main)]));
+    let mut fixture = world.fixture().reference("scip-typescript");
+    let ordinal = fixture.artifact(
+        "javascript",
+        vec![DocSpec::new("src/lib.js"), DocSpec::new("src/main.js")],
+    );
+    fixture.override_artifact_raw(ordinal, fs::read(fixture_dir.join("index.scip")).unwrap());
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&staged, &memory, "real scip-typescript calls");
+    let mut callees: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|binding| {
+            let range = &binding.join.anchor.range;
+            assert!(binding.call_id.is_some());
+            &main[range.start..range.end]
+        })
+        .collect();
+    callees.sort();
+    assert_eq!(
+        callees,
+        ["Widget", "helper", "plain", "plain", "register", "run"]
+    );
+    let helper = staged
+        .call_bindings
+        .iter()
+        .find(|binding| {
+            let range = &binding.join.anchor.range;
+            &main[range.start..range.end] == "helper"
+        })
+        .unwrap();
+    assert_eq!(helper.resolution, Resolution::Resolved);
+
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    assert_eq!(published.call_bindings.len(), 6);
+    // An unrelated edit rejoins every unchanged call binding at the new revision.
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    let head = world.store.index_baseline().unwrap();
+    assert_eq!(
+        world.store.semantic_at(head).unwrap().call_bindings.len(),
+        6
+    );
+}
+
 #[test]
 fn real_python_empty_module_markers_publish_and_rejoin_without_measured_anchors() {
     real_module_marker_batch("python");
