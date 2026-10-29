@@ -3099,7 +3099,44 @@ async fn final_selected_check_survives_a_slow_git_lookup() {
         ..Default::default()
     };
     let slow = temp.path().join("slow-next-git");
-    let path = stalling_git_path(temp.path(), &slow, true);
+    // Membership is fixed fixture input here; this test exercises final-check
+    // retry, not real Git startup during the preceding bounded selection.
+    let search = std::env::var_os("PATH").unwrap();
+    let git = std::env::split_paths(&search)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on PATH");
+    let common = main.join(".git").canonicalize().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            r#"#!/bin/sh
+if [ "$#" -eq 5 ] && [ "$1" = -C ] &&
+   [ "$3" = rev-parse ] && [ "$4" = --path-format=absolute ] &&
+   [ "$5" = --git-common-dir ]; then
+  case "$2" in '{}'|'{}')
+    if [ -e '{}' ] && rm '{}'; then exec sleep 3; fi
+    printf '%s\n' '{}'
+    exit 0 ;;
+  esac
+fi
+exec '{}' "$@"
+"#,
+            main.display(),
+            linked.display(),
+            slow.display(),
+            slow.display(),
+            common.display(),
+            git.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&search))).unwrap();
     let socket = temp.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     struct FixtureGuard {
