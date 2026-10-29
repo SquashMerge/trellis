@@ -219,11 +219,9 @@ impl DaemonState {
             Some(head) if head.request_kind == crate::store::requests::RequestKind::Index => {
                 Some(head.options(std::path::Path::new(self.store.workspace_root()))?)
             }
-            Some(head) => {
-                head.semantic_options()?;
-                None
-            }
-            None => None,
+            // A semantic head is never decoded here: an undecodable row would otherwise block
+            // startup reconciliation on every attempt. It settles at claim instead.
+            _ => None,
         };
         if self.store.is_recreate_pending() {
             if explicit {

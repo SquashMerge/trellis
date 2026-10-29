@@ -190,7 +190,7 @@ fi
 if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contract/test/run.mjs ]; then exit 29; fi
 `;
   try {
-    for (const name of ["cargo", "node"]) {
+    for (const name of ["cargo", "node", "python3"]) {
       const command = join(fakeDir, name);
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
@@ -210,6 +210,27 @@ esac
 exec "${realPython}" "$@"
 `);
     chmodSync(pythonShim, 0o755);
+    // The real python checks (#61 gate, semantic-contract unittests) generate
+    // cohorts through the real node and read its version. Those calls run for
+    // real and unlogged, like the python3 calls above.
+    const realNode = spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8" }).stdout.trim();
+    const nodeShim = join(fakeDir, "node");
+    writeFileSync(nodeShim, `#!/bin/sh
+case "$1" in
+  -v|tools/synthetic-cohorts/generate.mjs|*/tools/synthetic-cohorts/generate.mjs)
+    exec "${realNode}" "$@" ;;
+esac
+${fakeTool.replace("#!/bin/sh\n", "")}`);
+    chmodSync(nodeShim, 0o755);
+    // The gate tests also record the toolchain version with `cargo -V`.
+    const realCargo = spawnSync("sh", ["-c", "command -v cargo"], { encoding: "utf8" }).stdout.trim();
+    const cargoShim = join(fakeDir, "cargo");
+    writeFileSync(cargoShim, `#!/bin/sh
+case "$1" in
+  -V) exec "${realCargo}" "$@" ;;
+esac
+${fakeTool.replace("#!/bin/sh\n", "")}`);
+    chmodSync(cargoShim, 0o755);
     function runVerify(extraEnv = {}, timeout = undefined) {
       const result = spawnSync(config.verify, [], {
         cwd: ROOT,

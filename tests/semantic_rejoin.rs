@@ -1,20 +1,31 @@
-use serde_json::json;
+#![cfg(feature = "test-support")]
 use std::{
     collections::BTreeMap,
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
 use trellis::{
-    capture::Capture,
-    indexer::IndexOptions,
-    native_evidence as native, native_ids,
-    scip_admission::{
-        CapturedScipInventory, ReferenceProfileAdmission, TrustedSelection,
-        decode_reference_profile,
-    },
-    semantic_evidence as semantic,
+    capture::Capture, indexer::IndexOptions, native_evidence as native, native_ids,
+    scip_raw::CapturedScipInventory, semantic_batch::testing, semantic_evidence as semantic,
     semantic_import::rejoin_inventory,
 };
+
+fn admit(
+    capture: &Capture,
+    producer: &str,
+    language: &str,
+    artifact: &[u8],
+    cancel: &Arc<AtomicBool>,
+) -> CapturedScipInventory {
+    let (descriptor, pages) =
+        testing::single_artifact_batch(capture, producer, language, artifact).unwrap();
+    let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+    let mut inventories =
+        testing::admit_in_memory_from_capture(capture, &descriptor, &pages, &[artifact], cancel)
+            .unwrap();
+    assert_eq!(inventories.len(), 1);
+    inventories.remove(0)
+}
 
 const WIRE: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
 
@@ -64,58 +75,10 @@ fn fixture_with_extra_occurrences(
     fs::write(physical.join("artifact.scip"), &bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(physical.clone());
-    let first = Capture::admit(&options, &cancel, &|_| {}).unwrap();
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
-    let first_native =
-        native::from_capture(&first, &physical, &identity.record_id, &cancel).unwrap();
-    let (set, rev) = (first_native.source_set, first_native.revision);
-    let file = &first.files[0];
-    let doc = json!({"language":"javascript","relativePath":"src/A.js","contentHash":file.hash});
-    let source_manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(
-            &json!([{"document":{"sourceSetId":set.id,"language":"javascript","path":"src/A.js"},"contentHash":file.hash}]),
-        ),
-    );
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let producer = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "scip-typescript")
-        .unwrap();
-    let uri = format!("file://{}", physical.display());
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
-        "producer":{"name":producer["name"],"version":producer["version"],"executableHash":producer["executableHash"],"positionEncoding":2},
-        "sourceSet":{"id":set.id,"rootId":set.root_id,"languages":set.languages,"dependencies":set.dependencies},
-        "sourceRevision":rev.id,"sourceManifestHash":source_manifest_hash,
-        "components":{"toolchainHash":rev.toolchain_hash,"configHash":rev.config_hash,"dependencyHash":rev.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":uri,"textDocumentEncoding":1},
-        "sourceDocuments":[doc],"documents":[doc],"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"", &bytes),"language":"javascript","documents":["src/A.js"]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
     let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let selection = TrustedSelection {
-        expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-        profile_id: "mac-mini-m5-pro-v1".into(),
-        producer_name: "scip-typescript".into(),
-    };
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &selection,
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
     let sources = capture
         .files
@@ -286,58 +249,7 @@ fn two_document_fixture_for_language(
     let identity =
         trellis::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
     let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
-    let docs: Vec<_> = capture
-        .files
-        .iter()
-        .map(|f| json!({"language":f.language,"relativePath":f.path,"contentHash":f.hash}))
-        .collect();
-    let manifest_hash = native_ids::digest(
-        b"",
-        &native_ids::canonical(&json!(
-            native
-                .revision
-                .documents
-                .iter()
-                .map(|d| json!({"document":d.key,"contentHash":d.content_hash}))
-                .collect::<Vec<_>>()
-        )),
-    );
-    let profile: serde_json::Value = serde_json::from_str(include_str!(
-        "../docs/semantic-evidence/hardware/mac-mini-m5-pro-v1.json"
-    ))
-    .unwrap();
-    let pinned = profile["semanticProducers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == producer_name)
-        .unwrap();
-    let manifest = json!({"formatVersion":1,"trustOrigin":"referenceProfile","completion":"complete","decoderVersion":"scip-0.10.0/CapturedScipFactV1/1","profileId":profile["profileId"],
-        "producer":{"name":pinned["name"],"version":pinned["version"],"executableHash":pinned["executableHash"],"positionEncoding":2},
-        "sourceSet":{"id":native.source_set.id,"rootId":native.source_set.root_id,"languages":native.source_set.languages,"dependencies":native.source_set.dependencies},
-        "sourceRevision":native.revision.id,"sourceManifestHash":manifest_hash,
-        "components":{"toolchainHash":native.revision.toolchain_hash,"configHash":native.revision.config_hash,"dependencyHash":native.revision.dependency_hash},
-        "metadata":{"protocolVersion":0,"projectRoot":format!("file://{}",physical.display()),"textDocumentEncoding":1},
-        "sourceDocuments":docs,"documents":docs,"exclusions":[],
-        "artifacts":[{"kind":"scipBinary","path":"artifact.scip","hash":native_ids::digest(b"",&bytes),"language":language,"documents":[a_path,b_path]}]});
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(physical.join("manifest.json"), &manifest_bytes).unwrap();
-    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &TrustedSelection {
-            expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-            profile_id: "mac-mini-m5-pro-v1".into(),
-            producer_name: producer_name.into(),
-        },
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let inventory = admit(&capture, producer_name, language, &bytes, &cancel);
     let sources = capture
         .files
         .iter()
@@ -370,7 +282,7 @@ fn basis(
                     producer_id: "scip-typescript".into(),
                     producer_version: "0.0".into(),
                     producer_hash: "0".repeat(64),
-                    artifact_hash: inventory.artifact_hash.clone(),
+                    artifact_hash: inventory.artifact_hashes[0].clone(),
                     language: semantic::Language::Javascript,
                     source_set_id: doc.key.source_set_id.clone(),
                     revision_id: native.revision.id.clone(),
@@ -394,6 +306,18 @@ fn producer() -> semantic::Producer {
         position_encoding: semantic::PositionEncoding::Utf16,
     }
 }
+/// The `index`th coverage row of a join by (language, path): the per-document state the report
+/// no longer carries.
+fn document_row(publication: &semantic::SemanticPublication, index: usize) -> serde_json::Value {
+    let mut rows: Vec<_> = publication.coverage.iter().collect();
+    rows.sort_by(|a, b| {
+        (a.language, a.document_path.as_bytes()).cmp(&(b.language, b.document_path.as_bytes()))
+    });
+    let row = rows[index];
+    serde_json::json!({"language": row.language, "path": row.document_path, "state": row.state,
+        "diagnostic": row.diagnostic})
+}
+
 #[test]
 fn unchanged_caller_revalidates_destination_and_mints_raw_linked_proofs() {
     let (_root, captured, sources, inventory) = fixture();
@@ -475,30 +399,9 @@ fn two_distinct_raw_claims_on_one_declaration_rejoin_as_separate_proofs() {
     binary.documents[0].occurrences.push(second);
     let bytes = binary.write_to_bytes().unwrap();
     fs::write(&artifact_path, &bytes).unwrap();
-    let manifest_path = physical.join("manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(&manifest_path, &manifest_bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let options = IndexOptions::new(physical.clone());
-    let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &physical.join("artifact.scip"),
-        &bytes,
-        &physical.join("manifest.json"),
-        &manifest_bytes,
-        &TrustedSelection {
-            expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-            profile_id: "mac-mini-m5-pro-v1".into(),
-            producer_name: "scip-typescript".into(),
-        },
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let capture = Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
+    let inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
     let result = rejoin_inventory(
         &inventory,
         &captured,
@@ -618,8 +521,8 @@ fn authored_reference_does_not_require_an_unused_declaration_family() {
                     .iter()
                     .any(|row| row.id == reference.id)
             );
-            assert_eq!(result.report["documents"][0]["matched"], 2);
-            assert_eq!(result.report["documents"][0]["skipped"], 0);
+            assert_eq!(result.report["languages"][0]["matched"], 2);
+            assert_eq!(result.report["languages"][0]["skipped"], 0);
         } else {
             assert_eq!(
                 result.publication.coverage[0].state,
@@ -632,8 +535,8 @@ fn authored_reference_does_not_require_an_unused_declaration_family() {
             assert!(result.publication.references.is_empty(), "{case}");
             assert!(result.publication.call_bindings.is_empty(), "{case}");
             assert!(result.publication.type_relationships.is_empty(), "{case}");
-            assert_eq!(result.report["documents"][0]["matched"], 0, "{case}");
-            assert_eq!(result.report["documents"][0]["skipped"], 2, "{case}");
+            assert_eq!(result.report["languages"][0]["matched"], 0, "{case}");
+            assert_eq!(result.report["languages"][0]["skipped"], 2, "{case}");
         }
     }
 }
@@ -718,11 +621,11 @@ fn authenticated_unmatched_occurrences_stay_skipped_without_failing_independent_
                 proof.derived_from.as_ref().unwrap().provenance_id != claim.captured_proof_id
             })
         }));
-        assert_eq!(result.report["documents"][0]["requested"], 3);
-        assert_eq!(result.report["documents"][0]["matched"], 1);
-        assert_eq!(result.report["documents"][0]["skipped"], 2);
-        assert_eq!(result.report["documents"][0]["ambiguous"], 0);
-        assert_eq!(result.report["documents"][0]["unsupported"], 0);
+        assert_eq!(result.report["languages"][0]["requested"], 3);
+        assert_eq!(result.report["languages"][0]["matched"], 1);
+        assert_eq!(result.report["languages"][0]["skipped"], 2);
+        assert_eq!(result.report["languages"][0]["ambiguous"], 0);
+        assert_eq!(result.report["languages"][0]["unsupported"], 0);
     }
 }
 
@@ -769,10 +672,10 @@ fn ambiguous_destination_declaration_fails_the_whole_caller_tuple() {
     assert!(result.publication.references.is_empty());
     assert!(result.publication.call_bindings.is_empty());
     assert!(result.publication.type_relationships.is_empty());
-    assert_eq!(result.report["documents"][0]["matched"], 0);
+    assert_eq!(result.report["languages"][0]["matched"], 0);
     assert_eq!(
-        result.report["documents"][0]["skipped"],
-        result.report["documents"][0]["requested"]
+        result.report["languages"][0]["skipped"],
+        result.report["languages"][0]["requested"]
     );
 }
 
@@ -846,10 +749,10 @@ fn missing_destination_source_anchor_fails_even_when_bytes_and_occurrence_ids_ma
     assert!(result.publication.references.is_empty());
     assert!(result.publication.call_bindings.is_empty());
     assert!(result.publication.type_relationships.is_empty());
-    assert_eq!(result.report["documents"][0]["matched"], 0);
+    assert_eq!(result.report["languages"][0]["matched"], 0);
     assert_eq!(
-        result.report["documents"][0]["skipped"],
-        result.report["documents"][0]["requested"]
+        result.report["languages"][0]["skipped"],
+        result.report["languages"][0]["requested"]
     );
 }
 #[test]
@@ -903,10 +806,10 @@ fn call_failed_target_drops_only_its_raw_claim_and_matches_reference_resolution(
             claim.envelope.raw["symbol"] == "external pkg other."
         );
     }
-    assert_eq!(result.report["documents"][0]["state"], "partial");
-    assert_eq!(result.report["documents"][0]["matched"], 2);
-    assert_eq!(result.report["documents"][0]["skipped"], 1);
-    assert_eq!(result.report["documents"][0]["ambiguous"], 0);
+    assert_eq!(document_row(&result.publication, 0)["state"], "partial");
+    assert_eq!(result.report["languages"][0]["matched"], 2);
+    assert_eq!(result.report["languages"][0]["skipped"], 2);
+    assert_eq!(result.report["languages"][0]["ambiguous"], 0);
 }
 
 #[test]
@@ -929,30 +832,10 @@ fn same_anchor_use_and_definition_claims_have_one_declaration_site_in_both_order
         binary.documents[0].occurrences.push(use_claim);
         let bytes = binary.write_to_bytes().unwrap();
         fs::write(&artifact_path, &bytes).unwrap();
-        let manifest_path = physical.join("manifest.json");
-        let mut manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        fs::write(&manifest_path, &manifest_bytes).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let capture =
             Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
-        let admission = ReferenceProfileAdmission::from_trusted_selection(
-            &capture,
-            &artifact_path,
-            &bytes,
-            &manifest_path,
-            &manifest_bytes,
-            &TrustedSelection {
-                expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-                profile_id: "mac-mini-m5-pro-v1".into(),
-                producer_name: "scip-typescript".into(),
-            },
-            &cancel,
-        )
-        .unwrap();
-        let mut inventory = decode_reference_profile(&admission, &cancel).unwrap();
+        let mut inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
         inventory.claims.sort_by_key(|claim| {
             let definition = claim.envelope.raw["symbolRoles"]
                 .as_u64()
@@ -1048,9 +931,9 @@ fn contradictory_exact_targets_remain_ambiguous_with_all_raw_links() {
         })
         .collect();
     assert_eq!(proofs.len(), 2);
-    assert_eq!(result.report["documents"][0]["requested"], 3);
-    assert_eq!(result.report["documents"][0]["matched"], 1);
-    assert_eq!(result.report["documents"][0]["ambiguous"], 2);
+    assert_eq!(result.report["languages"][0]["requested"], 4);
+    assert_eq!(result.report["languages"][0]["matched"], 2);
+    assert_eq!(result.report["languages"][0]["ambiguous"], 2);
 }
 
 #[test]
@@ -1096,10 +979,10 @@ fn plain_reference_failed_target_does_not_admit_its_raw_proof() {
             claim.envelope.raw["symbol"] == "external pkg other."
         );
     }
-    assert_eq!(result.report["documents"][0]["state"], "partial");
-    assert_eq!(result.report["documents"][0]["matched"], 2);
-    assert_eq!(result.report["documents"][0]["skipped"], 1);
-    assert_eq!(result.report["documents"][0]["ambiguous"], 0);
+    assert_eq!(document_row(&result.publication, 0)["state"], "partial");
+    assert_eq!(result.report["languages"][0]["matched"], 2);
+    assert_eq!(result.report["languages"][0]["skipped"], 2);
+    assert_eq!(result.report["languages"][0]["ambiguous"], 0);
 }
 
 #[test]
@@ -1127,29 +1010,9 @@ fn unresolved_claim_does_not_make_one_exact_internal_target_ambiguous() {
     document.symbols.push(info);
     let bytes = binary.write_to_bytes().unwrap();
     fs::write(&artifact_path, &bytes).unwrap();
-    let manifest_path = physical.join("manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["artifacts"][0]["hash"] = json!(native_ids::digest(b"", &bytes));
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    fs::write(&manifest_path, &manifest_bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
-    let admission = ReferenceProfileAdmission::from_trusted_selection(
-        &capture,
-        &artifact_path,
-        &bytes,
-        &manifest_path,
-        &manifest_bytes,
-        &TrustedSelection {
-            expected_manifest_hash: native_ids::digest(b"", &manifest_bytes),
-            profile_id: "mac-mini-m5-pro-v1".into(),
-            producer_name: "scip-typescript".into(),
-        },
-        &cancel,
-    )
-    .unwrap();
-    let inventory = decode_reference_profile(&admission, &cancel).unwrap();
+    let inventory = admit(&capture, "scip-typescript", "javascript", &bytes, &cancel);
     let result = rejoin_inventory(
         &inventory,
         &captured,
@@ -1194,10 +1057,10 @@ fn unresolved_claim_does_not_make_one_exact_internal_target_ambiguous() {
             .lookup(&raw.provenance_id, "occurrence", &raw.fact_digest)
             .unwrap();
     }
-    assert_eq!(result.report["documents"][0]["state"], "complete");
-    assert_eq!(result.report["documents"][0]["matched"], 3);
-    assert_eq!(result.report["documents"][0]["skipped"], 0);
-    assert_eq!(result.report["documents"][0]["ambiguous"], 0);
+    assert_eq!(document_row(&result.publication, 0)["state"], "complete");
+    assert_eq!(result.report["languages"][0]["matched"], 4);
+    assert_eq!(result.report["languages"][0]["skipped"], 0);
+    assert_eq!(result.report["languages"][0]["ambiguous"], 0);
 }
 
 #[test]
@@ -1263,8 +1126,8 @@ fn contradictory_plain_references_keep_both_raw_proofs_on_one_r2_reference() {
             "raw={raw_id} raw_ids={raw_ids:?} proofs={proofs:?} reference={reference:?}"
         );
     }
-    assert_eq!(result.report["documents"][0]["ambiguous"], 2);
-    assert_eq!(result.report["documents"][0]["skipped"], 0);
+    assert_eq!(result.report["languages"][0]["ambiguous"], 2);
+    assert_eq!(result.report["languages"][0]["skipped"], 0);
 }
 
 #[test]
@@ -1296,7 +1159,7 @@ fn required_call_invocation_and_reference_must_both_be_unique_at_r2() {
             .iter()
             .any(|c| c.join.anchor.document == a)
     );
-    assert_eq!(baseline.report["documents"][0]["state"], "complete");
+    assert_eq!(document_row(&baseline.publication, 0)["state"], "complete");
     for failure in [
         "missing_invocation",
         "missing_reference",
@@ -1418,9 +1281,11 @@ fn required_call_invocation_and_reference_must_both_be_unique_at_r2() {
                 "{failure}"
             );
         }
-        assert_eq!(result.report["documents"][0]["matched"], 0, "{failure}");
+        // Only the independent document B still matches; every claim of A is skipped.
+        assert_eq!(result.report["languages"][0]["matched"], 1, "{failure}");
         assert_eq!(
-            result.report["documents"][0]["skipped"], result.report["documents"][0]["requested"],
+            result.report["languages"][0]["skipped"].as_u64().unwrap() + 1,
+            result.report["languages"][0]["requested"].as_u64().unwrap(),
             "{failure}"
         );
     }
@@ -1494,9 +1359,11 @@ fn plain_reference_needs_reference_even_with_exact_callee() {
             .iter()
             .all(|p| p.document != a)
     );
+    // Only the independent document B still matches; every claim of A is skipped.
+    assert_eq!(result.report["languages"][0]["matched"], 1);
     assert_eq!(
-        result.report["documents"][0]["skipped"],
-        result.report["documents"][0]["requested"]
+        result.report["languages"][0]["skipped"].as_u64().unwrap() + 1,
+        result.report["languages"][0]["requested"].as_u64().unwrap()
     );
 }
 
@@ -1641,12 +1508,10 @@ fn changed_target_rejoins_only_with_one_measured_stable_id() {
             .iter()
             .all(|p| p.document != b)
     );
-    assert_eq!(omitted.report["documents"][0]["path"], "src/A.js");
-    assert_eq!(omitted.report["documents"][0]["requested"], 2);
-    assert_eq!(omitted.report["documents"][0]["matched"], 1);
-    assert_eq!(omitted.report["documents"][0]["skipped"], 1);
-    assert_eq!(omitted.report["documents"][1]["requested"], 1);
-    assert_eq!(omitted.report["documents"][1]["skipped"], 1);
+    assert_eq!(document_row(&omitted.publication, 0)["path"], "src/A.js");
+    assert_eq!(omitted.report["languages"][0]["requested"], 3);
+    assert_eq!(omitted.report["languages"][0]["matched"], 1);
+    assert_eq!(omitted.report["languages"][0]["skipped"], 2);
     assert_eq!(omitted.report["languages"][0]["requested"], 3);
     assert_eq!(omitted.report["languages"][0]["matched"], 1);
     assert_eq!(omitted.report["languages"][0]["skipped"], 2);
@@ -1793,10 +1658,10 @@ fn same_target_plain_reference_claims_keep_roles_and_every_raw_proof() {
                 .lookup(&raw.provenance_id, "occurrence", &raw.fact_digest)
                 .unwrap();
         }
-        assert_eq!(result.report["documents"][0]["requested"], 3);
-        assert_eq!(result.report["documents"][0]["matched"], 3);
-        assert_eq!(result.report["documents"][0]["skipped"], 0);
-        assert_eq!(result.report["documents"][0]["ambiguous"], 0);
+        assert_eq!(result.report["languages"][0]["requested"], 4);
+        assert_eq!(result.report["languages"][0]["matched"], 3);
+        assert_eq!(result.report["languages"][0]["skipped"], 1);
+        assert_eq!(result.report["languages"][0]["ambiguous"], 0);
     }
 }
 
@@ -1823,7 +1688,7 @@ fn java_changed_base_body_does_not_invent_a_filtered_join_diagnostic() {
         2,
     )
     .unwrap();
-    assert_eq!(baseline.report["documents"][0]["state"], "complete");
+    assert_eq!(document_row(&baseline.publication, 0)["state"], "complete");
     assert_eq!(baseline.publication.type_relationships.len(), 1);
     let physical = fs::canonicalize(root.path()).unwrap();
     fs::write(
@@ -1862,9 +1727,9 @@ fn java_changed_base_body_does_not_invent_a_filtered_join_diagnostic() {
     )
     .unwrap();
     assert_eq!(result.publication.type_relationships.len(), 1);
-    assert_eq!(result.report["documents"][0]["state"], "complete");
-    assert!(result.report["documents"][0]["diagnostic"].is_null());
-    assert_eq!(result.report["documents"][1]["state"], "failed");
+    assert_eq!(document_row(&result.publication, 0)["state"], "complete");
+    assert!(document_row(&result.publication, 0)["diagnostic"].is_null());
+    assert_eq!(document_row(&result.publication, 1)["state"], "failed");
     let base = captured
         .declarations
         .iter()
@@ -1897,7 +1762,7 @@ fn java_changed_base_body_does_not_invent_a_filtered_join_diagnostic() {
         )
         .unwrap();
         assert!(omitted.publication.type_relationships.is_empty());
-        assert_eq!(omitted.report["documents"][0]["state"], "partial");
+        assert_eq!(document_row(&omitted.publication, 0)["state"], "partial");
     }
 }
 
@@ -1933,8 +1798,8 @@ fn java_captured_relationship_diagnostic_still_marks_unchanged_a_partial() {
     )
     .unwrap();
     assert!(result.publication.type_relationships.is_empty());
-    assert_eq!(result.report["documents"][0]["state"], "partial");
-    assert!(!result.report["documents"][0]["diagnostic"].is_null());
+    assert_eq!(document_row(&result.publication, 0)["state"], "partial");
+    assert!(!document_row(&result.publication, 0)["diagnostic"].is_null());
 }
 
 #[test]
@@ -2020,9 +1885,9 @@ fn changed_base_body_preserves_captured_relationship_with_unique_r2_endpoints() 
             proof.basis.as_ref().unwrap().revision_id,
             captured.revision.id
         );
-        assert_eq!(result.report["documents"][0]["state"], "complete");
-        assert_eq!(result.report["documents"][0]["matched"], 3);
-        assert_eq!(result.report["documents"][1]["state"], "failed");
+        assert_eq!(document_row(&result.publication, 0)["state"], "complete");
+        assert_eq!(result.report["languages"][0]["matched"], 3);
+        assert_eq!(document_row(&result.publication, 1)["state"], "failed");
         assert!(
             result
                 .publication
@@ -2057,7 +1922,7 @@ fn changed_base_body_preserves_captured_relationship_with_unique_r2_endpoints() 
             )
             .unwrap();
             assert!(omitted.publication.type_relationships.is_empty());
-            assert_eq!(omitted.report["documents"][0]["state"], "partial");
+            assert_eq!(document_row(&omitted.publication, 0)["state"], "partial");
             assert!(
                 omitted.publication.declaration_bindings.iter().any(|b| b
                     .join

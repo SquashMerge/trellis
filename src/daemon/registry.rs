@@ -1928,7 +1928,7 @@ impl CheckoutRuntime {
                     })?;
                     let report = resources
                         .store
-                        .semantic_import_report_at(pin, &options.producer_name)?
+                        .semantic_batch_report_at(pin, &options.descriptor_sha256)?
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "store_unavailable: completed semantic request missing report"

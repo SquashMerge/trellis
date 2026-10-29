@@ -2,16 +2,19 @@
 use crate::{
     model::CancelFlag,
     native_ids::{canonical, digest},
+    semantic_batch::{BatchCounters, BatchLimits},
 };
 use protobuf::Message;
 use scip::types::{self, occurrence};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufReader, Read};
 use std::sync::atomic::Ordering;
 
-pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/1";
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/2";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Completion {
     Complete,
@@ -62,49 +65,6 @@ fn cancelled(flag: &CancelFlag) -> Result<(), ScipCaptureError> {
 pub(crate) fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
-/// Digest the exact payload bytes of each already-admitted Index.documents field.
-/// The caller must first complete `decode_authenticated`; this does not admit bytes.
-pub(crate) fn admitted_document_wire_digests(
-    artifact: &[u8],
-    flag: &CancelFlag,
-) -> Result<BTreeMap<(String, String), String>, ScipCaptureError> {
-    wire(artifact, Node::Index, 0, &mut WireBudget::default(), flag)?;
-    let index = types::Index::parse_from_bytes(artifact).map_err(|_| invalid("protobuf parse"))?;
-    let mut payloads = Vec::new();
-    let mut i = 0;
-    while i < artifact.len() {
-        let tag = varint(artifact, &mut i)?;
-        if tag & 7 == 0 {
-            varint(artifact, &mut i)?;
-            continue;
-        }
-        let len = usize::try_from(varint(artifact, &mut i)?).map_err(|_| limit("field length"))?;
-        let end = i
-            .checked_add(len)
-            .filter(|end| *end <= artifact.len())
-            .ok_or_else(|| invalid("truncated field"))?;
-        if tag >> 3 == 2 {
-            payloads.push(sha(&artifact[i..end]));
-        }
-        i = end;
-    }
-    if payloads.len() != index.documents.len() {
-        return Err(invalid("document wire identity mismatch"));
-    }
-    let mut digests = BTreeMap::new();
-    for (document, digest) in index.documents.iter().zip(payloads) {
-        if digests
-            .insert(
-                (document.language.clone(), document.relative_path.clone()),
-                digest,
-            )
-            .is_some()
-        {
-            return Err(invalid("duplicate document wire identity"));
-        }
-    }
-    Ok(digests)
-}
 #[derive(Debug)]
 pub(crate) struct AuthenticatedScipDocument<'a> {
     pub language: String,
@@ -112,6 +72,7 @@ pub(crate) struct AuthenticatedScipDocument<'a> {
     pub source_bytes: &'a [u8],
     pub content_hash: String,
 }
+#[cfg(test)]
 pub(crate) struct AuthenticatedScipInput<'a> {
     pub artifact_bytes: &'a [u8],
     pub artifact_hash: String,
@@ -145,6 +106,7 @@ pub struct CapturedClaim {
     pub fact_digest: String,
     pub captured_proof_id: String,
     pub language: String,
+    pub artifact_hash: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawProofIdentity {
@@ -153,11 +115,12 @@ pub(crate) struct RawProofIdentity {
     pub(crate) fact_digest: String,
     pub(crate) language: String,
     pub(crate) path: String,
+    pub(crate) artifact_hash: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProofInventory {
-    pub(crate) artifact_hash: String,
+    pub(crate) artifact_hashes: Vec<String>,
     pub(crate) source_manifest_hash: String,
     pub(crate) exclusions: Vec<Exclusion>,
     pub(crate) claims: Vec<RawProofIdentity>,
@@ -202,7 +165,7 @@ impl ProofInventory {
 
 #[derive(Debug, Clone)]
 pub struct CapturedScipInventory {
-    pub artifact_hash: String,
+    pub artifact_hashes: Vec<String>,
     pub decoder_version: String,
     pub source_manifest_hash: String,
     pub completion: Completion,
@@ -212,7 +175,7 @@ pub struct CapturedScipInventory {
 impl CapturedScipInventory {
     pub(crate) fn proof_identities(&self) -> ProofInventory {
         ProofInventory {
-            artifact_hash: self.artifact_hash.clone(),
+            artifact_hashes: self.artifact_hashes.clone(),
             source_manifest_hash: self.source_manifest_hash.clone(),
             exclusions: self.exclusions.clone(),
             claims: self
@@ -224,6 +187,7 @@ impl CapturedScipInventory {
                     fact_digest: claim.fact_digest.clone(),
                     language: claim.language.clone(),
                     path: claim.envelope.relative_path.clone(),
+                    artifact_hash: claim.artifact_hash.clone(),
                 })
                 .collect(),
         }
@@ -255,6 +219,7 @@ enum Wire {
 }
 #[derive(Clone, Copy)]
 enum Node {
+    #[cfg(test)]
     Index,
     Metadata,
     Tool,
@@ -271,8 +236,11 @@ fn field(node: Node, n: u64) -> Option<(u8, Wire, usize)> {
     use Node::*;
     use Wire::*;
     Some(match (node, n) {
+        #[cfg(test)]
         (Index, 1) => (2, Message(Metadata), 1),
+        #[cfg(test)]
         (Index, 2) => (2, Message(Document), 1000),
+        #[cfg(test)]
         (Index, 3) => (2, Message(Symbol), 10000),
         (Metadata, 1) => (0, Scalar, 1),
         (Metadata, 2) => (2, Message(Tool), 1),
@@ -323,20 +291,35 @@ fn varint(b: &[u8], i: &mut usize) -> Result<u64, ScipCaptureError> {
     }
     Err(invalid("varint overflow"))
 }
-#[derive(Default)]
-struct WireBudget {
-    fields: usize,
-    relationships: usize,
-    candidates: usize,
+struct WireBudget<'a> {
+    fields: u64,
+    relationships: u64,
+    candidates: u64,
+    limits: &'a BatchLimits,
+}
+impl<'a> WireBudget<'a> {
+    fn new(limits: &'a BatchLimits) -> Self {
+        WireBudget {
+            fields: 0,
+            relationships: 0,
+            candidates: 0,
+            limits,
+        }
+    }
+}
+impl Default for WireBudget<'static> {
+    fn default() -> Self {
+        WireBudget::new(&BatchLimits::PRODUCTION)
+    }
 }
 fn wire(
     b: &[u8],
     node: Node,
     depth: usize,
-    budget: &mut WireBudget,
+    budget: &mut WireBudget<'_>,
     flag: &CancelFlag,
 ) -> Result<(), ScipCaptureError> {
-    if depth > 16 {
+    if depth as u64 > budget.limits.message_depth {
         return Err(limit("message depth"));
     }
     let mut i = 0;
@@ -344,7 +327,7 @@ fn wire(
     let mut ranges = 0u8;
     while i < b.len() {
         budget.fields += 1;
-        if budget.fields > 1_000_000 {
+        if budget.fields > budget.limits.wire_fields {
             return Err(limit("wire fields"));
         }
         if budget.fields.is_multiple_of(1024) {
@@ -354,6 +337,13 @@ fn wire(
         let n = tag >> 3;
         let wt = (tag & 7) as u8;
         let (expected, kind, max) = field(node, n).ok_or_else(|| invalid("unknown field"))?;
+        let (max, max_name) = match (node, n) {
+            (Node::Document, 2) => (budget.limits.document_occurrences, "document entries"),
+            (Node::Document, 3) => (budget.limits.document_symbols, "document entries"),
+            (Node::Signature, 2) => (budget.limits.signature_occurrences, "signature occurrences"),
+            _ => (max as u64, "repeated field"),
+        };
+        let max = usize::try_from(max).unwrap_or(usize::MAX);
         if wt != expected && !(matches!(kind, Wire::Packed) && wt == 2) {
             return Err(invalid("field wire type"));
         }
@@ -380,8 +370,11 @@ fn wire(
             {
                 budget.candidates += 1;
             }
-            if budget.relationships > 20000 || budget.candidates > 100000 {
-                return Err(limit("global entries"));
+            if budget.relationships > budget.limits.relationships_per_artifact {
+                return Err(limit("relationships"));
+            }
+            if budget.candidates > budget.limits.candidates {
+                return Err(limit("candidate facts"));
             }
         }
         let count = counts.entry(n).or_default();
@@ -389,7 +382,7 @@ fn wire(
             *count += 1;
         }
         if *count > max {
-            return Err(limit("repeated field"));
+            return Err(limit(max_name));
         }
         if wt == 0 {
             varint(b, &mut i)?;
@@ -406,7 +399,7 @@ fn wire(
                 varint(&b[..end], &mut k)?;
                 budget.fields += 1;
                 *count += 1;
-                if budget.fields > 1_000_000 || *count > max {
+                if budget.fields > budget.limits.wire_fields || *count > max {
                     return Err(limit("packed values"));
                 }
                 if budget.fields.is_multiple_of(1024) {
@@ -671,57 +664,61 @@ fn occurrence(
         json!({"range":range(o,false,positions)?,"enclosingRange":range(o,true,positions)?,"symbol":o.symbol,"symbolRoles":o.symbol_roles,"syntaxKind":syntax}),
     )
 }
-// Conservative envelope expansion bound before any relationship JSON or canonical bytes exist.
-// Strings may be copied into JSON and canonical output; fixed overhead covers keys/escaping.
-const MAX_CLAIM_BYTES: usize = 128 * 1024 * 1024;
-fn reserve_claim(total: &mut usize, strings: &[&str]) -> Result<(), ScipCaptureError> {
+// Conservative envelope expansion bound for one document unit, before any relationship JSON or
+// canonical bytes exist. Strings may be copied into JSON and canonical output; fixed overhead
+// covers keys/escaping.
+fn reserve_claim(total: &mut usize, max: usize, strings: &[&str]) -> Result<(), ScipCaptureError> {
     let bytes = strings
         .iter()
         .try_fold(512usize, |size, text| {
             size.checked_add(text.len().checked_mul(6)?)
         })
-        .ok_or_else(|| limit("claim expansion"))?;
+        .ok_or_else(|| limit("unit expansion"))?;
     *total = total
         .checked_add(bytes)
-        .filter(|v| *v <= MAX_CLAIM_BYTES)
-        .ok_or_else(|| limit("claim expansion"))?;
+        .filter(|v| *v <= max)
+        .ok_or_else(|| limit("unit expansion"))?;
     Ok(())
 }
-fn claim_budget(index: &types::Index, flag: &CancelFlag) -> Result<(), ScipCaptureError> {
+fn reserve_document(
+    d: &types::Document,
+    max: usize,
+    flag: &CancelFlag,
+) -> Result<usize, ScipCaptureError> {
     let mut total = 0usize;
     let mut traversed = 0usize;
-    for d in &index.documents {
-        for o in &d.occurrences {
-            reserve_claim(&mut total, &[&d.relative_path, &d.language, &o.symbol])?;
+    for o in &d.occurrences {
+        reserve_claim(&mut total, max, &[&d.relative_path, &d.language, &o.symbol])?;
+        traversed += 1;
+        if traversed.is_multiple_of(1024) {
+            cancelled(flag)?;
+        }
+    }
+    for s in &d.symbols {
+        reserve_claim(
+            &mut total,
+            max,
+            &[
+                &d.relative_path,
+                &d.language,
+                &s.symbol,
+                &s.display_name,
+                &s.enclosing_symbol,
+            ],
+        )?;
+        for r in &s.relationships {
+            reserve_claim(
+                &mut total,
+                max,
+                &[&d.relative_path, &d.language, &s.symbol, &r.symbol],
+            )?;
             traversed += 1;
             if traversed.is_multiple_of(1024) {
                 cancelled(flag)?;
             }
         }
-        for s in &d.symbols {
-            reserve_claim(
-                &mut total,
-                &[
-                    &d.relative_path,
-                    &d.language,
-                    &s.symbol,
-                    &s.display_name,
-                    &s.enclosing_symbol,
-                ],
-            )?;
-            for r in &s.relationships {
-                reserve_claim(
-                    &mut total,
-                    &[&d.relative_path, &d.language, &s.symbol, &r.symbol],
-                )?;
-                traversed += 1;
-                if traversed.is_multiple_of(1024) {
-                    cancelled(flag)?;
-                }
-            }
-        }
     }
-    Ok(())
+    Ok(total)
 }
 fn symbol(
     s: &types::SymbolInformation,
@@ -763,13 +760,12 @@ fn symbol(
         relationships,
     ))
 }
-fn emit(
-    claims: &mut Vec<CapturedClaim>,
-    input: &AuthenticatedScipInput<'_>,
+fn make_claim(
+    artifact: &AuthenticatedArtifact<'_>,
     d: &types::Document,
     kind: &str,
     raw: Value,
-) {
+) -> CapturedClaim {
     let envelope = CapturedScipFactV1 {
         format_version: 1,
         record_kind: kind.into(),
@@ -784,23 +780,354 @@ fn emit(
     let proof = digest(
         b"trellis.capture-proof.v1\0",
         &canonical(
-            &json!({"producerId":input.producer_id,"artifactHash":input.artifact_hash,"sourceSetId":input.source_set_id,"sourceRevision":input.source_revision,"language":d.language,"relativePath":d.relative_path,"factDigest":fact}),
+            &json!({"producerId":artifact.producer_id,"artifactHash":artifact.artifact_hash,"sourceSetId":artifact.source_set_id,"sourceRevision":artifact.source_revision,"language":d.language,"relativePath":d.relative_path,"factDigest":fact}),
         ),
     );
-    claims.push(CapturedClaim {
+    CapturedClaim {
         envelope,
         canonical_bytes: bytes,
         fact_digest: fact,
         captured_proof_id: proof,
         language: d.language.clone(),
-    });
+        artifact_hash: artifact.artifact_hash.to_owned(),
+    }
 }
+
+/// Authenticated context of one artifact, supplied by the caller before any byte is decoded.
+pub struct AuthenticatedArtifact<'a> {
+    pub artifact_hash: &'a str,
+    pub producer_id: &'a str,
+    pub producer_version: &'a str,
+    pub source_set_id: &'a str,
+    pub source_revision: &'a str,
+    pub position_encoding: u8,
+    pub protocol_version: i32,
+    pub text_document_encoding: i32,
+    pub project_root_uri: &'a str,
+    /// Source documents assigned to this artifact; every one must appear exactly once.
+    pub assigned_documents: u64,
+}
+/// Identity of the document unit being decoded, handed to the sink before its claims.
+pub struct UnitDocument<'a> {
+    pub path: &'a str,
+    pub language: &'a str,
+    pub wire_digest: &'a str,
+}
+/// One assigned document's authenticated source, returned by the caller's resolver.
+pub struct DocumentSource<'s> {
+    pub bytes: Cow<'s, [u8]>,
+    pub content_hash: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactSummary {
+    pub documents: u64,
+    pub external_symbols: u64,
+    pub relationships: u64,
+}
+/// Receiver of one artifact's claims, one document unit at a time.
+pub trait ClaimSink {
+    fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError>;
+    fn claim(&mut self, claim: CapturedClaim) -> Result<(), ScipCaptureError>;
+    fn end_document(&mut self) -> Result<(), ScipCaptureError>;
+}
+/// Collects claims in memory; `finish` applies the language/path/bytes sort and dedup and the
+/// digest-collision check that the whole-Index decoder applied.
+#[derive(Default)]
+pub struct VecSink {
+    claims: Vec<CapturedClaim>,
+    paths: BTreeSet<String>,
+}
+impl VecSink {
+    pub fn finish(mut self) -> Result<Vec<CapturedClaim>, ScipCaptureError> {
+        self.claims.sort_by(|a, b| {
+            a.language
+                .as_bytes()
+                .cmp(b.language.as_bytes())
+                .then(
+                    a.envelope
+                        .relative_path
+                        .as_bytes()
+                        .cmp(b.envelope.relative_path.as_bytes()),
+                )
+                .then(a.canonical_bytes.cmp(&b.canonical_bytes))
+        });
+        self.claims
+            .dedup_by(|a, b| a.language == b.language && a.canonical_bytes == b.canonical_bytes);
+        let mut digests = BTreeMap::new();
+        for claim in &self.claims {
+            if let Some(bytes) = digests.insert(&claim.fact_digest, &claim.canonical_bytes)
+                && bytes != &claim.canonical_bytes
+            {
+                return Err(ScipCaptureError::DigestCollision);
+            }
+        }
+        Ok(self.claims)
+    }
+}
+impl ClaimSink for VecSink {
+    fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError> {
+        if self.paths.insert(doc.path.to_string()) {
+            Ok(())
+        } else {
+            Err(invalid("duplicate document path"))
+        }
+    }
+    fn claim(&mut self, claim: CapturedClaim) -> Result<(), ScipCaptureError> {
+        self.claims.push(claim);
+        Ok(())
+    }
+    fn end_document(&mut self) -> Result<(), ScipCaptureError> {
+        Ok(())
+    }
+}
+
+struct ArtifactReader<R> {
+    reader: BufReader<R>,
+    remaining: u64,
+}
+impl<R: Read> ArtifactReader<R> {
+    fn byte(&mut self, truncated: &str) -> Result<u8, ScipCaptureError> {
+        if self.remaining == 0 {
+            return Err(invalid(truncated));
+        }
+        let mut byte = [0u8];
+        self.reader
+            .read_exact(&mut byte)
+            .map_err(|_| invalid("artifact read"))?;
+        self.remaining -= 1;
+        Ok(byte[0])
+    }
+    fn varint(&mut self) -> Result<u64, ScipCaptureError> {
+        let mut v = 0u64;
+        for shift in (0..=63).step_by(7) {
+            let x = self.byte("truncated varint")?;
+            if shift == 63 && x > 1 {
+                return Err(invalid("varint overflow"));
+            }
+            v |= u64::from(x & 127) << shift;
+            if x < 128 {
+                return Ok(v);
+            }
+        }
+        Err(invalid("varint overflow"))
+    }
+}
+/// The one live decode unit. Creation and drop keep the live count and high-water marks.
+struct UnitBuffer<'c> {
+    bytes: Vec<u8>,
+    counters: &'c mut BatchCounters,
+}
+impl<'c> UnitBuffer<'c> {
+    fn new(counters: &'c mut BatchCounters, len: usize) -> Self {
+        counters.live_unit_buffers += 1;
+        counters.live_unit_buffers_high_water = counters
+            .live_unit_buffers_high_water
+            .max(counters.live_unit_buffers);
+        counters.unit_buffer_high_water_bytes =
+            counters.unit_buffer_high_water_bytes.max(len as u64);
+        UnitBuffer {
+            bytes: vec![0; len],
+            counters,
+        }
+    }
+}
+impl Drop for UnitBuffer<'_> {
+    fn drop(&mut self) {
+        self.counters.live_unit_buffers -= 1;
+    }
+}
+
+/// Decode one authenticated artifact as a stream of top-level units. Each unit is length-checked
+/// against the unit limit before it is allocated, walked, then parsed and emitted on its own, so
+/// one document unit is live at a time. Metadata is merged as `parse_from_bytes` merges repeated
+/// fields and is validated at the end of the artifact.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_streaming<'s, R: Read>(
+    reader: R,
+    byte_length: u64,
+    artifact: &AuthenticatedArtifact<'_>,
+    resolve: &mut dyn FnMut(&str, &str) -> Result<DocumentSource<'s>, ScipCaptureError>,
+    counters: &mut BatchCounters,
+    limits: &BatchLimits,
+    sink: &mut dyn ClaimSink,
+    cancel: &CancelFlag,
+) -> Result<ArtifactSummary, ScipCaptureError> {
+    cancelled(cancel)?;
+    if byte_length > limits.artifact_bytes {
+        return Err(limit("artifact bytes"));
+    }
+    let capacity = byte_length.clamp(1, 1 << 20) as usize;
+    let mut input = ArtifactReader {
+        reader: BufReader::with_capacity(capacity, reader),
+        remaining: byte_length,
+    };
+    let mut budget = WireBudget::new(limits);
+    budget.fields = counters.wire_fields;
+    budget.candidates = counters.candidates;
+    let max_unit = usize::try_from(limits.unit_expansion_bytes).unwrap_or(usize::MAX);
+    let mut metadata: Option<types::Metadata> = None;
+    let mut documents = 0u64;
+    let mut external_symbols = 0u64;
+    let mut traversed = 0usize;
+    while input.remaining > 0 {
+        cancelled(cancel)?;
+        budget.fields += 1;
+        if budget.fields > limits.wire_fields {
+            return Err(limit("wire fields"));
+        }
+        let tag = input.varint()?;
+        let number = tag >> 3;
+        if !matches!(number, 1..=3) {
+            return Err(invalid("unknown field"));
+        }
+        if tag & 7 != 2 {
+            return Err(invalid("field wire type"));
+        }
+        let len = input.varint()?;
+        if len > input.remaining {
+            return Err(invalid("protobuf parse"));
+        }
+        if len > limits.unit_expansion_bytes {
+            return Err(limit("unit expansion"));
+        }
+        if number == 3 {
+            external_symbols += 1;
+            if external_symbols > limits.external_symbols {
+                return Err(limit("index entries"));
+            }
+        }
+        let len = usize::try_from(len).map_err(|_| limit("unit expansion"))?;
+        let mut unit = UnitBuffer::new(counters, len);
+        input
+            .reader
+            .read_exact(&mut unit.bytes)
+            .map_err(|_| invalid("artifact read"))?;
+        input.remaining -= len as u64;
+        let node = match number {
+            1 => Node::Metadata,
+            2 => Node::Document,
+            _ => Node::Symbol,
+        };
+        let walked = wire(&unit.bytes, node, 1, &mut budget, cancel);
+        unit.counters.wire_fields = budget.fields;
+        unit.counters.candidates = budget.candidates;
+        walked?;
+        match number {
+            1 => metadata
+                .get_or_insert_with(types::Metadata::new)
+                .merge_from_bytes(&unit.bytes)
+                .map_err(|_| invalid("protobuf parse"))?,
+            3 => {
+                let s = types::SymbolInformation::parse_from_bytes(&unit.bytes)
+                    .map_err(|_| invalid("protobuf parse"))?;
+                traversed += 1;
+                if traversed.is_multiple_of(1024) {
+                    cancelled(cancel)?;
+                }
+                let _ = symbol(
+                    &s,
+                    artifact.position_encoding,
+                    cancel,
+                    &mut traversed,
+                    false,
+                )?;
+            }
+            _ => {
+                let wire_digest = sha(&unit.bytes);
+                let d = types::Document::parse_from_bytes(&unit.bytes)
+                    .map_err(|_| invalid("protobuf parse"))?;
+                unknown(&d.special_fields)?;
+                if !valid_path(&d.relative_path) {
+                    return Err(invalid("unlisted document"));
+                }
+                sink.begin_document(&UnitDocument {
+                    path: &d.relative_path,
+                    language: &d.language,
+                    wire_digest: &wire_digest,
+                })?;
+                let source = resolve(&d.relative_path, &d.language)?;
+                if !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
+                    return Err(invalid("document source binding"));
+                }
+                let raw = known(d.position_encoding)?;
+                if !(0..=3).contains(&raw)
+                    || raw != 0 && raw != i32::from(artifact.position_encoding)
+                {
+                    return Err(invalid("position encoding"));
+                }
+                let reserved = reserve_document(&d, max_unit, cancel)?;
+                unit.counters.unit_reservation_high_water_bytes = unit
+                    .counters
+                    .unit_reservation_high_water_bytes
+                    .max(reserved as u64);
+                let text =
+                    std::str::from_utf8(&source.bytes).map_err(|_| invalid("non-UTF8 source"))?;
+                let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
+                for o in &d.occurrences {
+                    traversed += 1;
+                    if traversed.is_multiple_of(1024) {
+                        cancelled(cancel)?;
+                    }
+                    let raw = occurrence(o, &mut positions)?;
+                    sink.claim(make_claim(artifact, &d, "occurrence", raw))?;
+                }
+                validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+                for s in &d.symbols {
+                    traversed += 1;
+                    if traversed.is_multiple_of(1024) {
+                        cancelled(cancel)?;
+                    }
+                    let (info, rels) =
+                        symbol(s, artifact.position_encoding, cancel, &mut traversed, true)?;
+                    sink.claim(make_claim(artifact, &d, "symbolInformation", info))?;
+                    for r in rels {
+                        traversed += 1;
+                        if traversed.is_multiple_of(1024) {
+                            cancelled(cancel)?;
+                        }
+                        sink.claim(make_claim(artifact, &d, "relationship", r))?;
+                    }
+                }
+                sink.end_document()?;
+                documents += 1;
+            }
+        }
+    }
+    if let Some(meta) = metadata.as_ref() {
+        unknown(&meta.special_fields)?;
+        if known(meta.version)? != artifact.protocol_version
+            || known(meta.text_document_encoding)? != artifact.text_document_encoding
+            || !meta.project_root.is_empty() && meta.project_root != artifact.project_root_uri
+        {
+            return Err(invalid("metadata binding"));
+        }
+        if let Some(tool) = meta.tool_info.as_ref() {
+            unknown(&tool.special_fields)?;
+            if !tool.name.is_empty() && tool.name != artifact.producer_id
+                || !tool.version.is_empty() && tool.version != artifact.producer_version
+            {
+                return Err(invalid("tool binding"));
+            }
+        }
+    }
+    if documents != artifact.assigned_documents {
+        return Err(invalid("missing artifact document"));
+    }
+    Ok(ArtifactSummary {
+        documents,
+        external_symbols,
+        relationships: budget.relationships,
+    })
+}
+
+/// Whole-artifact decoder over an in-memory artifact: the streaming decoder into a `VecSink`.
+#[cfg(test)]
 pub(crate) fn decode_authenticated(
     input: &AuthenticatedScipInput<'_>,
     flag: &CancelFlag,
 ) -> Result<CapturedScipInventory, ScipCaptureError> {
     cancelled(flag)?;
-    if input.artifact_bytes.len() > 64 * 1024 * 1024 {
+    if input.artifact_bytes.len() as u64 > BatchLimits::PRODUCTION.artifact_bytes {
         return Err(limit("artifact bytes"));
     }
     if sha(input.artifact_bytes) != input.artifact_hash {
@@ -814,50 +1141,6 @@ pub(crate) fn decode_authenticated(
     {
         return Err(ScipCaptureError::InvalidAdmission("decoder context".into()));
     }
-    cancelled(flag)?;
-    wire(
-        input.artifact_bytes,
-        Node::Index,
-        0,
-        &mut WireBudget::default(),
-        flag,
-    )?;
-    cancelled(flag)?;
-    let index = types::Index::parse_from_bytes(input.artifact_bytes)
-        .map_err(|_| invalid("protobuf parse"))?;
-    unknown(&index.special_fields)?;
-    if let Some(meta) = index.metadata.as_ref() {
-        unknown(&meta.special_fields)?;
-        if known(meta.version)? != input.protocol_version
-            || known(meta.text_document_encoding)? != input.text_document_encoding
-            || !meta.project_root.is_empty() && meta.project_root != input.project_root_uri
-        {
-            return Err(invalid("metadata binding"));
-        }
-        if let Some(tool) = meta.tool_info.as_ref() {
-            unknown(&tool.special_fields)?;
-            if !tool.name.is_empty() && tool.name != input.producer_id
-                || !tool.version.is_empty() && tool.version != input.producer_version
-            {
-                return Err(invalid("tool binding"));
-            }
-        }
-    }
-    if index.documents.len() > 1000 || index.external_symbols.len() > 10000 {
-        return Err(limit("index entries"));
-    }
-    claim_budget(&index, flag)?;
-    let mut count = 0usize;
-    let mut traversed = 0usize;
-    let mut relationships = 0usize;
-    for s in &index.external_symbols {
-        traversed += 1;
-        if traversed.is_multiple_of(1024) {
-            cancelled(flag)?;
-        }
-        let _ = symbol(s, input.position_encoding, flag, &mut traversed, false)?;
-        relationships += s.relationships.len();
-    }
     let mut admitted = BTreeMap::new();
     for d in &input.documents {
         if d.content_hash != sha(d.source_bytes)
@@ -869,127 +1152,71 @@ pub(crate) fn decode_authenticated(
             ));
         }
     }
-    let mut seen = BTreeSet::new();
-    let mut claims = Vec::new();
-    for d in &index.documents {
-        cancelled(flag)?;
-        unknown(&d.special_fields)?;
-        if !seen.insert(d.relative_path.as_str()) {
-            return Err(invalid("duplicate document path"));
-        }
+    let artifact = AuthenticatedArtifact {
+        artifact_hash: &input.artifact_hash,
+        producer_id: &input.producer_id,
+        producer_version: &input.producer_version,
+        source_set_id: &input.source_set_id,
+        source_revision: &input.source_revision,
+        position_encoding: input.position_encoding,
+        protocol_version: input.protocol_version,
+        text_document_encoding: input.text_document_encoding,
+        project_root_uri: &input.project_root_uri,
+        assigned_documents: admitted.len() as u64,
+    };
+    let mut resolve = |path: &str, language: &str| {
         let source = admitted
-            .get(d.relative_path.as_str())
+            .get(path)
             .ok_or_else(|| invalid("unlisted document"))?;
-        if source.language != d.language
-            || d.text.as_bytes() != source.source_bytes && !d.text.is_empty()
-        {
+        if source.language != language {
             return Err(invalid("document source binding"));
         }
-        let raw = known(d.position_encoding)?;
-        if !(0..=3).contains(&raw) || raw != 0 && raw != i32::from(input.position_encoding) {
-            return Err(invalid("position encoding"));
-        }
-        if d.occurrences.len() > 10000 || d.symbols.len() > 10000 {
-            return Err(limit("document entries"));
-        }
-        let text =
-            std::str::from_utf8(source.source_bytes).map_err(|_| invalid("non-UTF8 source"))?;
-        let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
-        for o in &d.occurrences {
-            count += 1;
-            if count > 100000 {
-                return Err(limit("candidate facts"));
-            }
-            if count.is_multiple_of(1024) {
-                cancelled(flag)?;
-            }
-            emit(
-                &mut claims,
-                input,
-                d,
-                "occurrence",
-                occurrence(o, &mut positions)?,
-            );
-        }
-        validate_positions(text, input.position_encoding, &mut positions, flag)?;
-        for s in &d.symbols {
-            traversed += 1;
-            if traversed.is_multiple_of(1024) {
-                cancelled(flag)?;
-            }
-            let (info, rels) = symbol(s, input.position_encoding, flag, &mut traversed, true)?;
-            count += 1;
-            relationships += rels.len();
-            if count + rels.len() > 100000 {
-                return Err(limit("candidate facts"));
-            }
-            emit(&mut claims, input, d, "symbolInformation", info);
-            for r in rels {
-                count += 1;
-                if count.is_multiple_of(1024) {
-                    cancelled(flag)?;
-                }
-                emit(&mut claims, input, d, "relationship", r);
-            }
-        }
-    }
-    if relationships > 20000 {
-        return Err(limit("relationships"));
-    }
-    if seen.len() != admitted.len() {
-        return Err(invalid("missing artifact document"));
-    }
-    claims.sort_by(|a, b| {
-        a.language
-            .as_bytes()
-            .cmp(b.language.as_bytes())
-            .then(
-                a.envelope
-                    .relative_path
-                    .as_bytes()
-                    .cmp(b.envelope.relative_path.as_bytes()),
-            )
-            .then(a.canonical_bytes.cmp(&b.canonical_bytes))
-    });
-    claims.dedup_by(|a, b| a.language == b.language && a.canonical_bytes == b.canonical_bytes);
-    let mut digests = BTreeMap::new();
-    for claim in &claims {
-        if let Some(bytes) = digests.insert(&claim.fact_digest, &claim.canonical_bytes)
-            && bytes != &claim.canonical_bytes
-        {
-            return Err(ScipCaptureError::DigestCollision);
-        }
-    }
+        Ok(DocumentSource {
+            bytes: Cow::Borrowed(source.source_bytes),
+            content_hash: source.content_hash.clone(),
+        })
+    };
+    let mut sink = VecSink::default();
+    decode_streaming(
+        input.artifact_bytes,
+        input.artifact_bytes.len() as u64,
+        &artifact,
+        &mut resolve,
+        &mut BatchCounters::default(),
+        &BatchLimits::PRODUCTION,
+        &mut sink,
+        flag,
+    )?;
     Ok(CapturedScipInventory {
-        artifact_hash: input.artifact_hash.clone(),
+        artifact_hashes: vec![input.artifact_hash.clone()],
         decoder_version: input.decoder_version.into(),
         source_manifest_hash: input.source_manifest_hash.clone(),
         completion: input.completion,
         exclusions: input.exclusions.clone(),
-        claims,
+        claims: sink.finish()?,
     })
 }
-
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
-    const FULL: &str = "12580a087372632f412e6a73220a6a617661736372697074120b0a0300090a120241231801120c42060800100d180e12024223120e4a080800100d1800200e120242231a130a02412322080a024223100118012811320166300112180a087372632f422e6a73220a6a6176617363726970743001";
-    const EXTERNAL: &str = "12580a087372632f412e6a73220a6a617661736372697074120b0a0300090a120241231801120c42060800100d180e12024223120e4a080800100d1800200e120242231a130a02412322080a024223100118012811320166300112180a087372632f422e6a73220a6a61766173637269707430011a0b0a0965787465726e616c23";
-    const SIGNATURE: &str = "124c0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a270a02412328113201663a1c220a6a6176617363726970742a0366282912090a0300000112024123";
-    const OMITTED: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
-    const LEGACY: &str =
+    pub(super) const FULL: &str = "12580a087372632f412e6a73220a6a617661736372697074120b0a0300090a120241231801120c42060800100d180e12024223120e4a080800100d1800200e120242231a130a02412322080a024223100118012811320166300112180a087372632f422e6a73220a6a6176617363726970743001";
+    pub(super) const EXTERNAL: &str = "12580a087372632f412e6a73220a6a617661736372697074120b0a0300090a120241231801120c42060800100d180e12024223120e4a080800100d1800200e120242231a130a02412322080a024223100118012811320166300112180a087372632f422e6a73220a6a61766173637269707430011a0b0a0965787465726e616c23";
+    pub(super) const SIGNATURE: &str = "124c0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a270a02412328113201663a1c220a6a6176617363726970742a0366282912090a0300000112024123";
+    pub(super) const OMITTED: &str = "122e0a087372632f412e6a73220a6a617661736372697074120b0a0300090a1202412318011a090a0241232811320166";
+    pub(super) const LEGACY: &str =
         "122a0a087372632f412e6a73220a6a61766173637269707412100a03000a0e12076c6f63616c203018013001";
-    const BRANCHES: &str = "12440a087372632f412e6a73220a6a61766173637269707412120a04000d000e1202422352060800100c1810121642060800100d180e120242235a080800100c180020103001";
-    fn decoded(wire_hex: &str) -> Result<CapturedScipInventory, ScipCaptureError> {
-        let bytes = hex::decode(wire_hex).unwrap();
-        let a: &[u8] = if wire_hex == LEGACY {
+    pub(super) const BRANCHES: &str = "12440a087372632f412e6a73220a6a61766173637269707412120a04000d000e1202422352060800100c1810121642060800100d180e120242235a080800100c180020103001";
+    pub(super) fn vector_documents(wire_hex: &str) -> Vec<AuthenticatedScipDocument<'static>> {
+        let a: &'static [u8] = if wire_hex == LEGACY {
             b"0123456789call\n"
         } else {
             b"function f(){g();}\n"
         };
-        let b = b"function g(){}\n";
-        let docs = if wire_hex == FULL || wire_hex == EXTERNAL {
+        let b: &'static [u8] = b"function g(){}\n";
+        if wire_hex == FULL || wire_hex == EXTERNAL {
             vec![
                 AuthenticatedScipDocument {
                     language: "javascript".into(),
@@ -1013,10 +1240,15 @@ mod tests {
                 source_bytes: a,
                 content_hash: sha(a),
             }]
-        };
-        let input = AuthenticatedScipInput {
-            artifact_hash: sha(&bytes),
-            artifact_bytes: &bytes,
+        }
+    }
+    pub(super) fn vector_input<'a>(
+        bytes: &'a [u8],
+        documents: Vec<AuthenticatedScipDocument<'a>>,
+    ) -> AuthenticatedScipInput<'a> {
+        AuthenticatedScipInput {
+            artifact_hash: sha(bytes),
+            artifact_bytes: bytes,
             producer_id: "scip-test".into(),
             profile_id: "synthetic-test-profile".into(),
             source_set_id: "app".into(),
@@ -1031,11 +1263,15 @@ mod tests {
             position_encoding: 1,
             protocol_version: 0,
             text_document_encoding: 1,
-            documents: docs,
-        };
+            documents,
+        }
+    }
+    fn decoded(wire_hex: &str) -> Result<CapturedScipInventory, ScipCaptureError> {
+        let bytes = hex::decode(wire_hex).unwrap();
+        let input = vector_input(&bytes, vector_documents(wire_hex));
         decode_authenticated(&input, &Arc::new(AtomicBool::new(false)))
     }
-    fn var(mut x: usize) -> Vec<u8> {
+    pub(super) fn var(mut x: usize) -> Vec<u8> {
         let mut b = Vec::new();
         while x >= 128 {
             b.push((x as u8) | 128);
@@ -1044,13 +1280,13 @@ mod tests {
         b.push(x as u8);
         b
     }
-    fn message(n: u8, body: &[u8]) -> Vec<u8> {
+    pub(super) fn message(n: u8, body: &[u8]) -> Vec<u8> {
         let mut out = vec![(n << 3) | 2];
         out.extend(var(body.len()));
         out.extend(body);
         out
     }
-    fn base_doc(mut fields: Vec<u8>, encoding: u8) -> Vec<u8> {
+    pub(super) fn base_doc(mut fields: Vec<u8>, encoding: u8) -> Vec<u8> {
         let mut doc = message(1, b"src/A.js");
         doc.extend(message(4, b"javascript"));
         doc.append(&mut fields);
@@ -1103,9 +1339,63 @@ mod tests {
         assert_eq!(&alternate[88..90], &[0x30, 0x01]);
         alternate[1] += 1;
         alternate.splice(88..90, [0x30, 0x81, 0x00]);
-        let flag = Arc::new(AtomicBool::new(false));
-        let first = admitted_document_wire_digests(&original, &flag).unwrap();
-        let second = admitted_document_wire_digests(&alternate, &flag).unwrap();
+        struct Digests(BTreeMap<(String, String), String>);
+        impl ClaimSink for Digests {
+            fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError> {
+                self.0.insert(
+                    (doc.language.to_owned(), doc.path.to_owned()),
+                    doc.wire_digest.to_owned(),
+                );
+                Ok(())
+            }
+            fn claim(&mut self, _claim: CapturedClaim) -> Result<(), ScipCaptureError> {
+                Ok(())
+            }
+            fn end_document(&mut self) -> Result<(), ScipCaptureError> {
+                Ok(())
+            }
+        }
+        let wire_digests = |bytes: &[u8]| {
+            let documents = vector_documents(FULL);
+            let hash = sha(bytes);
+            let artifact = AuthenticatedArtifact {
+                artifact_hash: &hash,
+                producer_id: "scip-test",
+                producer_version: "1.0.0",
+                source_set_id: "app",
+                source_revision: "r1",
+                position_encoding: 1,
+                protocol_version: 0,
+                text_document_encoding: 1,
+                project_root_uri: "file:///synthetic",
+                assigned_documents: documents.len() as u64,
+            };
+            let mut resolve = |path: &str, _language: &str| {
+                let document = documents
+                    .iter()
+                    .find(|document| document.relative_path == path)
+                    .ok_or_else(|| invalid("unlisted document"))?;
+                Ok(DocumentSource {
+                    bytes: Cow::Borrowed(document.source_bytes),
+                    content_hash: document.content_hash.clone(),
+                })
+            };
+            let mut sink = Digests(BTreeMap::new());
+            decode_streaming(
+                bytes,
+                bytes.len() as u64,
+                &artifact,
+                &mut resolve,
+                &mut BatchCounters::default(),
+                &BatchLimits::PRODUCTION,
+                &mut sink,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            sink.0
+        };
+        let first = wire_digests(&original);
+        let second = wire_digests(&alternate);
         assert_ne!(
             first[&("javascript".into(), "src/A.js".into())],
             second[&("javascript".into(), "src/A.js".into())]
@@ -1515,14 +1805,18 @@ mod tests {
         let baseline = (0..10)
             .flat_map(|number| document(number, 10000))
             .collect::<Vec<_>>();
-        let mut budget = WireBudget::default();
+        let limits = BatchLimits {
+            candidates: 100_000,
+            ..BatchLimits::PRODUCTION
+        };
+        let mut budget = WireBudget::new(&limits);
         wire(&baseline, Node::Index, 0, &mut budget, &flag)
-            .expect("100000 candidates within per-document and global wire caps");
+            .expect("100000 candidates within per-document and batch wire caps");
         assert_eq!(budget.candidates, 100000);
         let bytes = [baseline, document(10, 1)].concat();
         assert!(matches!(
-            wire(&bytes, Node::Index, 0, &mut WireBudget::default(), &flag),
-            Err(ScipCaptureError::LimitExceeded(reason)) if reason == "global entries"
+            wire(&bytes, Node::Index, 0, &mut WireBudget::new(&limits), &flag),
+            Err(ScipCaptureError::LimitExceeded(reason)) if reason == "candidate facts"
         ));
     }
     #[test]
@@ -1755,11 +2049,13 @@ mod tests {
         doc.relative_path = "src/A.js".into();
         doc.language = "javascript".into();
         doc.symbols.push(symbol);
-        let mut index = types::Index::new();
-        index.documents.push(doc);
         assert!(matches!(
-            claim_budget(&index, &Arc::new(AtomicBool::new(false))),
-            Err(ScipCaptureError::LimitExceeded(_))
+            reserve_document(
+                &doc,
+                BatchLimits::PRODUCTION.unit_expansion_bytes as usize,
+                &Arc::new(AtomicBool::new(false))
+            ),
+            Err(ScipCaptureError::LimitExceeded(reason)) if reason == "unit expansion"
         ));
     }
     #[test]

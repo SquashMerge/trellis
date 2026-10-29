@@ -1,0 +1,155 @@
+{
+  "baseCommit": "20ff2b12a33794eb03e428cb7af48a55a90697a3",
+  "cohortManifest": {
+    "path": "tools/synthetic-cohorts/manifest-v2.json",
+    "sha256": "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259"
+  },
+  "formatVersion": 1,
+  "generator": {
+    "name": "trellis-synthetic-scip",
+    "path": "tools/semantic-contract/generate-performance-scip.py",
+    "sha256": "2ab4bd728456fed67be7c8628b444c41c92a38a991ad2388d2271f8111dc3984",
+    "version": "1"
+  },
+  "sizes": {
+    "large": {
+      "artifacts": [
+        {
+          "bytes": 27352533,
+          "documents": 2500,
+          "language": "java",
+          "occurrences": 282500,
+          "relationships": 0,
+          "relativePath": "java.scip",
+          "sha256": "0a9291dc692f44435e1a30e0ece6ae2f5e426b3209558bb396dc2fee01057b63",
+          "symbols": 97500
+        },
+        {
+          "bytes": 28423949,
+          "documents": 2500,
+          "language": "rust",
+          "occurrences": 285360,
+          "relationships": 0,
+          "relativePath": "rust.scip",
+          "sha256": "7d289640b9e0b3fa3c9910602982a2053deb18a63755109db21a9f31c8538c12",
+          "symbols": 98400
+        },
+        {
+          "bytes": 27485033,
+          "documents": 2500,
+          "language": "python",
+          "occurrences": 285000,
+          "relationships": 0,
+          "relativePath": "python.scip",
+          "sha256": "a39d4045ce29fe6a8e84ffe0c9dad44ccc6bc6563a754be865d1dd80ffabfe88",
+          "symbols": 97500
+        },
+        {
+          "bytes": 29087533,
+          "documents": 2500,
+          "language": "javascript",
+          "occurrences": 285000,
+          "relationships": 0,
+          "relativePath": "javascript.scip",
+          "sha256": "f18df5f4f64cf1af31966e6d699425ad3d85e7abc92991a30a428e64c2d6eb67",
+          "symbols": 97500
+        }
+      ],
+      "inventorySha256": "1f0a85ef28fe378a6a2c6a4454d3d79d7e68d5c3df3904653d0a82c32df6272d"
+    },
+    "medium": {
+      "artifacts": [
+        {
+          "bytes": 5208783,
+          "documents": 250,
+          "language": "java",
+          "occurrences": 53000,
+          "relationships": 0,
+          "relativePath": "java.scip",
+          "sha256": "93b66716060f93f25a4ac0d387806a7e4c2d173a8e0e31203ecfdd5aab1de60f",
+          "symbols": 18000
+        },
+        {
+          "bytes": 5471014,
+          "documents": 250,
+          "language": "rust",
+          "occurrences": 54145,
+          "relationships": 0,
+          "relativePath": "rust.scip",
+          "sha256": "3bb75147de0199eec8d625d6d15d89a5d278935bae7ebe884b8e9e0d54e9cde1",
+          "symbols": 18375
+        },
+        {
+          "bytes": 5373783,
+          "documents": 250,
+          "language": "python",
+          "occurrences": 54750,
+          "relationships": 0,
+          "relativePath": "python.scip",
+          "sha256": "5fc1ef0f69fb1f20dbc2aec3be982606e39e4075068b38f33fe2b38b21d96f28",
+          "symbols": 18500
+        },
+        {
+          "bytes": 5672033,
+          "documents": 250,
+          "language": "javascript",
+          "occurrences": 54750,
+          "relationships": 0,
+          "relativePath": "javascript.scip",
+          "sha256": "b84625a51a1fbf5d99d02c9caefeb2acf652acec08fb581eb34b6da43d554924",
+          "symbols": 18500
+        }
+      ],
+      "inventorySha256": "bb5d1f5a1639128a0f7022e500fdf0aa9a29abc46a7881f2f6636f43221da819"
+    },
+    "small": {
+      "artifacts": [
+        {
+          "bytes": 513783,
+          "documents": 25,
+          "language": "java",
+          "occurrences": 5300,
+          "relationships": 0,
+          "relativePath": "java.scip",
+          "sha256": "3a5e3bd0bc35a4620de8eebf0a5d46396b79f2f546b415f49a7ac7a8abb89de8",
+          "symbols": 1800
+        },
+        {
+          "bytes": 500336,
+          "documents": 25,
+          "language": "rust",
+          "occurrences": 5304,
+          "relationships": 0,
+          "relativePath": "rust.scip",
+          "sha256": "7fecefe5986656bcb1a6cf75faeab6c1de74855a470685fc06dcea4ba2f4a79c",
+          "symbols": 1800
+        },
+        {
+          "bytes": 530058,
+          "documents": 25,
+          "language": "python",
+          "occurrences": 5475,
+          "relationships": 0,
+          "relativePath": "python.scip",
+          "sha256": "74c2d142d23988057a502eda6e19510dd0bcfc0eba8851a495e98d0a2530ee35",
+          "symbols": 1850
+        },
+        {
+          "bytes": 559883,
+          "documents": 25,
+          "language": "javascript",
+          "occurrences": 5475,
+          "relationships": 0,
+          "relativePath": "javascript.scip",
+          "sha256": "5f58f7ce154891049836508262085838e46ee1bb99abef605df9cf81761547ed",
+          "symbols": 1850
+        }
+      ],
+      "inventorySha256": "f0847f6f50c3bd506e7f7e5f8862bf4fe2b3101004644a780c8dc824bb4b5e1e"
+    }
+  },
+  "syntheticProfile": {
+    "path": "docs/semantic-evidence/synthetic-profiles/trellis-synthetic-scip-v1.json",
+    "sha256": "42c312be3eb14029569a7e1d2a0563964b1eb7e1939f91d857ac49aeec080e84"
+  }
+}

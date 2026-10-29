@@ -244,7 +244,10 @@ fn evidence(
     };
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([(producer.id.clone(), b"exe".to_vec())]),
-        artifacts: BTreeMap::from([(producer.id.clone(), b"artifact".to_vec())]),
+        artifacts: BTreeMap::from([(
+            (producer.id.clone(), native_ids::digest(b"", b"artifact")),
+            b"artifact".to_vec(),
+        )]),
         sources: native
             .revision
             .documents
@@ -455,9 +458,13 @@ fn populated_history_partitions_documents_and_producers() {
     captured
         .producer_executables
         .insert(second_producer.id.clone(), b"exe".to_vec());
-    captured
-        .artifacts
-        .insert(second_producer.id.clone(), b"artifact".to_vec());
+    captured.artifacts.insert(
+        (
+            second_producer.id.clone(),
+            native_ids::digest(b"", b"artifact"),
+        ),
+        b"artifact".to_vec(),
+    );
 
     let producer = semantic.producers[0].id.clone();
     let leader = store.publication_for_tests().unwrap();

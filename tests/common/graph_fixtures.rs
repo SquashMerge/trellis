@@ -454,7 +454,13 @@ fn evidence(
     requested.version = spec.requested_version.clone();
     let captured = s::CapturedComponents {
         producer_executables: BTreeMap::from([(producer.id.clone(), b"exe".to_vec())]),
-        artifacts: BTreeMap::from([(producer.id.clone(), b"artifact".to_vec())]),
+        artifacts: BTreeMap::from([(
+            (
+                producer.id.clone(),
+                trellis::native_ids::digest(b"", b"artifact"),
+            ),
+            b"artifact".to_vec(),
+        )]),
         sources: native
             .revision
             .documents

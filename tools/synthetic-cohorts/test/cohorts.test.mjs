@@ -144,3 +144,31 @@ test("two cohorts match pinned bytes, hashes, inventory and exact per-language t
     rmSync(b, { recursive: true, force: true });
   }
 });
+
+test("single-size generation matches the full generation", { timeout: 300000 }, () => {
+  const temp = mkdtempSync(join(tmpdir(), "trellis-cohort-size-"));
+  try {
+    const pinned = JSON.parse(readFileSync(pin));
+    assert.notEqual(run(["--out", join(temp, "bad"), "--size", "tiny"]).status, 0);
+    assert.notEqual(run(["--out", join(temp, "bad"), "--size"]).status, 0);
+    assert.notEqual(run(["--size", "small", "--out", join(temp, "bad")]).status, 0);
+    assert.deepEqual(readdirSync(temp), []);
+    const small = join(temp, "small");
+    const result = run(["--out", small, "--size", "small"]);
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    const manifest = JSON.parse(readFileSync(join(small, "manifest.json")));
+    assert.deepEqual(Object.keys(manifest.totals), ["small"]);
+    assert.deepEqual(manifest.totals.small, pinned.totals.small);
+    assert.deepEqual(manifest.files, pinned.files.filter((entry) => entry.path.startsWith("small/")));
+    assert.equal(manifest.files.length, 100);
+    assert.deepEqual({ ...manifest, totals: null, files: null }, { ...pinned, totals: null, files: null });
+    assert.deepEqual(inventory(small), [...manifest.files.map((entry) => entry.path), "manifest.json"].sort());
+    for (const entry of manifest.files) {
+      const bytes = readFileSync(join(small, entry.path));
+      assert.equal(bytes.length, entry.sourceBytes, `length ${entry.path}`);
+      assert.equal(createHash("sha256").update(bytes).digest("hex"), entry.sha256, `hash ${entry.path}`);
+    }
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});

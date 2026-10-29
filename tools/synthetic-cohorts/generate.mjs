@@ -105,16 +105,25 @@ function localGroups(first, last) {
   return groups;
 }
 
+const usage = "Usage: node tools/synthetic-cohorts/generate.mjs --out <nonexistent-directory> [--size small|medium|large]";
+
+function parseArgs(args) {
+  if ((args.length !== 2 && args.length !== 4) || args[0] !== "--out" || !args[1]) throw new Error(usage);
+  if (args.length === 2) return { out: args[1], only: null };
+  if (args[2] !== "--size" || !sizes.some(([size]) => size === args[3])) throw new Error(usage);
+  return { out: args[1], only: args[3] };
+}
+
 function main(args) {
-  if (args.length !== 2 || args[0] !== "--out" || !args[1])
-    throw new Error("Usage: node tools/synthetic-cohorts/generate.mjs --out <nonexistent-directory>");
-  const out = resolve(args[1]);
+  const parsed = parseArgs(args);
+  const out = resolve(parsed.out);
   if (existsSync(out)) throw new Error(`Output already exists: ${out}`);
   mkdirSync(out);
   try {
     const files = [];
     const totals = {};
     for (const [size, total, bytes] of sizes) {
+      if (parsed.only && parsed.only !== size) continue;
       totals[size] = { files: total * languages.length, sourceBytes: bytes };
       for (const [language, extension] of languages) {
         const ordinal = languages.findIndex(([value]) => value === language);

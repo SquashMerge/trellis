@@ -158,3 +158,75 @@ family gap makes native coverage partial with a diagnostic without erasing
 supported/observed roles. It does not by itself falsify complete semantic producer
 coverage. Production reports must be complete and native intents must mirror them;
 missing reports and authored overrides fail closed.
+
+
+## Synthetic SCIP for the combined performance gate (#61)
+
+```sh
+node tools/synthetic-cohorts/generate.mjs --out /fresh/cohort --size large
+python3 tools/semantic-contract/generate-performance-scip.py \
+  --cohort /fresh/cohort --size large --out /fresh/scip
+python3 -m unittest discover -s tools/semantic-contract/test -p 'test_*.py'
+```
+
+The generator verifies the cohort against the checked-in `manifest-v2.json`
+(bytes, lengths and SHA-256 hashes) and writes `<language>.scip` for the four
+languages plus `inventory.json`. Document paths are relative to the size
+directory (`java/Clarge0000.java`), so they match the captured source root.
+The artifacts are deterministic synthetic SCIP: `tool_info` is
+`trellis-synthetic-scip` version `1`, positions are UTF-8, there is no project
+root and no relationships. Each callable gets a definition and
+SymbolInformation, and each body gets at most two provable direct calls.
+
+The producer identity is the generator's source SHA-256, pinned by
+`docs/semantic-evidence/synthetic-profiles/trellis-synthetic-scip-v1.json`
+(`identityKind: generatorSource`). It is not a real producer executable and
+nothing here qualifies one. Editing the generator changes that SHA: regenerate
+the profile and `docs/semantic-evidence/performance-gate-preparation.json`
+(`test_profile_pins_generator_source_sha256` fails on drift).
+
+The generator writes no descriptor or pages. `semantic_batch.py` is the importable
+batch emitter the runner uses after probing the workspace:
+`write_batch(out_dir, header, sources, coverage, artifacts)` writes the source and
+coverage pages (a page closes before the next row would exceed 1,000 rows or
+1 MiB), any inline artifacts and `descriptor.json`, and returns the descriptor path
+and SHA-256. It requires a new or empty `out_dir` and non-empty source and coverage
+rows (checked before anything is written); the optional `root` keyword names the
+workspace root that descriptor paths are relative to (default `out_dir`). `canonical`, `source_manifest_hash` and `DESCRIPTOR_KEYS` are shared
+with the runner and its tests.
+
+### Qualifying a combined-gate report
+
+```sh
+python3 tools/semantic-contract/qualify-performance.py --report /path/to/report.json
+python3 -m unittest discover -s tools/semantic-contract/test -p test_performance_qualification.py
+```
+
+`qualify(report, policy, cohorts)` fills the `qualification` object, the
+per-size `median`, `peakWorkerRssBytes` and `evaluations`, and the campaign
+`status`. The CLI prints the qualified report as JSON; it exits 1 for
+`unqualified` and 2 for an unreadable report. Thresholds come from
+`docs/semantic-evidence/benchmark-policy-v1.json` and `cohorts-v1.json`; nothing
+is hard-coded or extrapolated. Wall time uses the median of the three raw
+samples; RSS and storage require every sample within the limit. The steady
+ratio and peak ratio apply to medium and large only.
+
+A criterion is `notMeasured` for a smoke report, off the reference host, with a
+missing repetition or instrumentation value, or while its flag is false (the
+steady ratio needs `denominatorRatified`, the peak ratio needs
+`sqlitePeakMethodReviewed`). Both flags are true since the owner ruling of
+2026-10-28 (https://github.com/SquashMerge/trellis/pull/405#issuecomment-6484495019),
+so `passed` is reachable, but only for a full report from the reference host with
+every repetition, denominator and peak value present. Status precedence is
+`unqualified` > `failed` > `notMeasured` > `passed`. The
+output always carries `authoritativeAcceptance: false` and `issue11: "open"`.
+
+The report must contain `small`, `medium` and `large` exactly once. A missing size
+is `notMeasured` (reason `missing size <size>`); a duplicate is `unqualified`. The
+runner's `policy` object is preserved; the derived per-size limits are written to
+`qualification.limits`. A preflight failure is input with a `statusReasons` string
+starting with `preflight`; it yields `unqualified`, and re-qualifying qualifier
+output never adds that label to a fault. Malformed JSON or an unexpected policy
+shape exits 2. Small-size storage evaluations carry status `notApplicable` (not
+`passed`/`failed`/`notMeasured`); the report renderer must accept it and it does
+not affect the campaign status.

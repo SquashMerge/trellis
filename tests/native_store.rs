@@ -240,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        25
+        26
     );
     let count: i64 = db
         .query_row(
@@ -842,7 +842,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        25
+        26
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -3121,7 +3121,7 @@ fn schemas16_19_23_and24_recreate_exclusively_without_migration_and_preserve_que
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            25
+            26
         );
         assert_eq!(
             rebuilt
@@ -3130,7 +3130,7 @@ fn schemas16_19_23_and24_recreate_exclusively_without_migration_and_preserve_que
                     0
                 ))
                 .unwrap(),
-            25
+            26
         );
         for table in [
             "native_version_references",
@@ -3168,14 +3168,18 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
     let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
     store.set_retention_clock_for_tests(1_002, 2);
     let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
-    let capture_id = store.with_index_sql_for_tests(|db| {
-        db.execute("INSERT INTO semantic_raw_captures(producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,manifest_bytes,decoder_version) SELECT 'fixture','artifact',source_set_id,native_revision_id,x'01',x'02','fixture' FROM native_revisions WHERE published_index_revision=?1", [r1.index_revision as i64])?;
+    let (batch_id, capture_id) = store.with_index_sql_for_tests(|db| {
+        let hash = "0".repeat(64);
+        db.execute("INSERT INTO semantic_raw_batches(producer_id,producer_version,profile_id,source_set_id,captured_revision,source_manifest_hash,descriptor_sha256,descriptor_bytes,decoder_version) SELECT 'fixture','fixture','fixture',source_set_id,native_revision_id,?2,?2,x'02','fixture' FROM native_revisions WHERE published_index_revision=?1", rusqlite::params![r1.index_revision as i64, hash])?;
+        let batch_id = db.last_insert_rowid();
+        db.execute("INSERT INTO semantic_raw_captures(batch_id,ordinal,language,producer_id,artifact_hash,source_set_id,captured_revision,binary_bytes,decoder_version) SELECT ?1,0,'javascript','fixture',?3,source_set_id,native_revision_id,x'01','fixture' FROM native_revisions WHERE published_index_revision=?2", rusqlite::params![batch_id, r1.index_revision as i64, hash])?;
         let capture_id = db.last_insert_rowid();
+        db.execute("INSERT INTO semantic_raw_exclusions(batch_id,language,path,reason) VALUES(?1,'javascript','flow.js','failed')", [batch_id])?;
         for i in 0..70_u32 {
             db.execute("INSERT INTO semantic_raw_proofs(capture_id,proof_id,record_kind,fact_digest,language,path,canonical_bytes) VALUES(?1,?2,'occurrence',?3,'javascript','flow.js',x'03')",rusqlite::params![capture_id,format!("unselected-{i}"),format!("{i:064x}")])?;
         }
-        db.execute("INSERT INTO semantic_revision_raw_selections(revision_id,producer_id,capture_id,captured_pin) VALUES(?1,'fixture',?2,?3)",rusqlite::params![format!("pin:v1:{}:{}",r2.index_generation,r2.index_revision),capture_id,format!("pin:v1:{}:{}",r1.index_generation,r1.index_revision)])?;
-        Ok(capture_id)
+        db.execute("INSERT INTO semantic_revision_raw_selections(revision_id,producer_id,batch_id,captured_pin) VALUES(?1,'fixture',?2,?3)",rusqlite::params![format!("pin:v1:{}:{}",r2.index_generation,r2.index_revision),batch_id,format!("pin:v1:{}:{}",r1.index_generation,r1.index_revision)])?;
+        Ok((batch_id, capture_id))
     }).unwrap();
     // Keep r1 younger than the release horizon while r2 becomes due, so an
     // unrelated r1 release cannot drain leftover proof batches.
@@ -3215,8 +3219,8 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
     store
         .with_index_sql_for_tests(|db| {
             let selections: i64 = db.query_row(
-                "SELECT count(*) FROM semantic_revision_raw_selections WHERE capture_id=?1",
-                [capture_id],
+                "SELECT count(*) FROM semantic_revision_raw_selections WHERE batch_id=?1",
+                [batch_id],
                 |r| r.get(0),
             )?;
             let proofs: i64 = db.query_row(
@@ -3229,7 +3233,15 @@ fn selected_capture_keeps_r1_and_all_raw_proofs_until_last_selector_expires() {
                 [capture_id],
                 |r| r.get(0),
             )?;
-            assert_eq!((selections, proofs, captures), (0, 0, 0));
+            let (batches, exclusions): (i64, i64) = db.query_row(
+                "SELECT (SELECT count(*) FROM semantic_raw_batches WHERE batch_id=?1),(SELECT count(*) FROM semantic_raw_exclusions WHERE batch_id=?1)",
+                [batch_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(
+                (selections, proofs, captures, batches, exclusions),
+                (0, 0, 0, 0, 0)
+            );
             Ok(())
         })
         .unwrap();
@@ -3263,7 +3275,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=26").unwrap();
+    db.execute_batch("PRAGMA user_version=27").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3283,13 +3295,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 25);
+    assert_eq!(metadata_version, 26);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
