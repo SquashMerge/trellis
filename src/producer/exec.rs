@@ -266,7 +266,17 @@ fn terminate(child: &mut Child, pgid: i32, limits: &Limits) -> (Option<ExitStatu
     }
     // The leader may have exited while descendants still run.
     unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    let status = child.wait().ok();
+    // A SIGKILLed leader is reaped at once; the bound only covers a leader
+    // stuck in the kernel.
+    let reap_deadline = Instant::now() + limits.kill_wait;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Err(_) => break None,
+            Ok(None) if Instant::now() >= reap_deadline => break None,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
     let deadline = Instant::now() + limits.kill_wait;
     while process_info::group_exists(pgid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -344,9 +354,17 @@ pub fn spawn_producer(
     let mut status = None;
     let mut ending = Ending::Exited;
     loop {
-        if let Some(exited) = child.try_wait().context("wait for producer")? {
-            status = Some(exited);
-            break;
+        match child.try_wait() {
+            Ok(Some(exited)) => {
+                status = Some(exited);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Leave no group behind even when the leader cannot be polled.
+                terminate(&mut child, pgid, limits);
+                return Err(e).context("wait for producer");
+            }
         }
         let now = Instant::now();
         if cancel.load(Ordering::SeqCst) {

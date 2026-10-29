@@ -411,6 +411,27 @@ fn sweep_keeps_dirs_in_keep_set() {
 }
 
 #[test]
+fn sweep_removes_corrupt_records_but_keeps_unreadable_ones() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    for n in [1, 2] {
+        state.create_run_dir(&run_id(n)).unwrap();
+    }
+    let corrupt = state.run_dir(&run_id(1)).unwrap();
+    fs::write(corrupt.join("run.json"), br#"{"unknown":true}"#).unwrap();
+    // A directory where the record belongs fails to read for a non-corrupt reason.
+    let unreadable = state.run_dir(&run_id(2)).unwrap();
+    fs::create_dir(unreadable.join("run.json")).unwrap();
+    let report = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert!(!corrupt.exists());
+    assert!(unreadable.join("run.json").is_dir());
+    assert_eq!(report.unreadable_runs, [run_id(2)]);
+    assert!(report.abandoned_runs.is_empty());
+}
+
+#[test]
 fn sweep_removes_unreferenced_pickup_dirs() {
     let fixture = fixture();
     let state = state(&fixture);

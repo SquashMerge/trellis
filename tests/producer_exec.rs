@@ -74,9 +74,22 @@ fn pids(pidfile: &Path) -> Vec<libc::pid_t> {
 }
 
 /// Kills the descendants a test started if an assertion fails first.
-struct Reaper(PathBuf);
+struct Reaper(PathBuf, bool);
+impl Reaper {
+    fn new(path: PathBuf) -> Self {
+        Reaper(path, true)
+    }
+
+    /// Call once every recorded process is confirmed gone; the PIDs may be reused afterwards.
+    fn disarm(&mut self) {
+        self.1 = false;
+    }
+}
 impl Drop for Reaper {
     fn drop(&mut self) {
+        if !self.1 {
+            return;
+        }
         if let Ok(text) = fs::read_to_string(&self.0) {
             for pid in text.lines().filter_map(|l| l.parse::<libc::pid_t>().ok()) {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -96,7 +109,7 @@ fn wait_all_gone(pids: &[libc::pid_t]) {
 fn timeout_terminates_group() {
     let run_dir = Run::new();
     let pidfile = run_dir.path("pids");
-    let _reaper = Reaper(pidfile.clone());
+    let mut reaper = Reaper::new(pidfile.clone());
     let spec = run_dir.spec(&json!({"tree": pidfile, "sleep": true}));
     let limits = Limits {
         timeout: Duration::from_millis(1500),
@@ -107,6 +120,7 @@ fn timeout_terminates_group() {
     assert!(!outcome.diagnostics.group_survived);
     assert!(outcome.diagnostics.exit.signal_name.is_some());
     wait_all_gone(&pids(&pidfile));
+    reaper.disarm();
 }
 
 #[test]
@@ -213,7 +227,7 @@ fn nonzero_exit_reports_code_and_tail() {
 fn cancel_terminates_whole_tree() {
     let run_dir = Run::new();
     let pidfile = run_dir.path("pids");
-    let _reaper = Reaper(pidfile.clone());
+    let mut reaper = Reaper::new(pidfile.clone());
     let spec = run_dir.spec(&json!({"tree": pidfile, "sleep": true}));
     let cancel = AtomicBool::new(false);
     let group = std::sync::Mutex::new(None);
@@ -240,13 +254,14 @@ fn cancel_terminates_whole_tree() {
     assert_eq!(all.len(), 3);
     assert_eq!(all[0], outcome.process.pgid);
     wait_all_gone(&all);
+    reaper.disarm();
 }
 
 #[test]
 fn normal_exit_reaps_lingering_descendants() {
     let run_dir = Run::new();
     let pidfile = run_dir.path("pids");
-    let _reaper = Reaper(pidfile.clone());
+    let mut reaper = Reaper::new(pidfile.clone());
     let spec = run_dir.spec(&json!({"tree": pidfile, "exit": 0}));
     let outcome = run(&spec, &fast());
     assert_eq!(outcome.ending, Ending::Exited);
@@ -255,6 +270,7 @@ fn normal_exit_reaps_lingering_descendants() {
     let all = pids(&pidfile);
     assert_eq!(all.len(), 3);
     wait_all_gone(&all);
+    reaper.disarm();
 }
 
 #[test]

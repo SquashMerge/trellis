@@ -243,14 +243,47 @@ fn whole_words(text: &str, word: &str) -> usize {
         .count()
 }
 
-/// Paths into the producer module: `crate::producer`, `trellis::producer` or
-/// any `producer::` that is a whole word (not `semantic_producer::`).
+/// Whether `prefix` ends in a path into this crate (`crate::` or `trellis::`).
+fn ends_in_crate_path(prefix: &str) -> bool {
+    let prefix = prefix.trim_end();
+    ["crate::", "trellis::"].iter().any(|root| {
+        prefix.strip_suffix(root).is_some_and(|head| {
+            !head
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_word_char(c) || c == ':')
+        })
+    })
+}
+
+/// Whether `at` sits inside a `{ ... }` tree opened right after a crate path.
+fn in_crate_use_tree(text: &str, at: usize) -> bool {
+    let mut depth = 0_usize;
+    for (open, c) in text[..at].char_indices().rev() {
+        match c {
+            '}' => depth += 1,
+            '{' if depth > 0 => depth -= 1,
+            '{' if ends_in_crate_path(&text[..open]) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// References to the producer module: any whole-word `producer` followed by
+/// `::`, preceded by `crate::` or `trellis::` whatever follows (`use
+/// crate::producer as p;`), or a member of a `use crate::{...}` tree. Not
+/// `semantic_producer`, `producer_id` or a bare local named `producer`.
 fn producer_paths(text: &str) -> usize {
     text.match_indices("producer")
         .filter(|(at, _)| {
             let before = text[..*at].chars().next_back();
-            let after = text[at + "producer".len()..].trim_start();
-            !before.is_some_and(is_word_char) && after.starts_with("::")
+            let after = &text[at + "producer".len()..];
+            !before.is_some_and(is_word_char)
+                && !after.chars().next().is_some_and(is_word_char)
+                && (after.trim_start().starts_with("::")
+                    || ends_in_crate_path(&text[..*at])
+                    || in_crate_use_tree(text, *at))
         })
         .count()
 }
@@ -332,6 +365,19 @@ fn scanner_sees_what_it_must_and_ignores_what_it_must() {
     );
     assert!(lex(source, false).contains("\"\""));
     assert_eq!(producer_paths("let semantic_producer::x; producer_id"), 0);
+    assert_eq!(
+        producer_paths("let producer = 1; fn f(producerId: u8) { producer }"),
+        0
+    );
+    for aliased in [
+        "use crate::producer as p;",
+        "use crate::{producer as p};",
+        "use crate::{store, producer};",
+        "use trellis::producer;",
+        "use trellis::{producer as p};",
+    ] {
+        assert_eq!(producer_paths(aliased), 1, "{aliased}");
+    }
 }
 
 #[test]
@@ -416,16 +462,21 @@ fn no_download_clients_in_src() {
                 "{file} uses reqwest beyond URL parsing"
             );
         }
-        for forbidden in [
-            "npm install",
-            "pip install",
-            "cargo install",
-            "rustup component",
-        ] {
-            assert!(
-                !text.contains(forbidden),
-                "{file} installs software: {forbidden}"
-            );
+    }
+    // Install commands are spelled in string literals, so scan those.
+    for (file, text) in production(|_| true, true) {
+        for literal in string_literals(&text) {
+            for forbidden in [
+                "npm install",
+                "pip install",
+                "cargo install",
+                "rustup component",
+            ] {
+                assert!(
+                    !literal.contains(forbidden),
+                    "{file} installs software: {forbidden}"
+                );
+            }
         }
     }
 }

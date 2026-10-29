@@ -124,6 +124,9 @@ pub struct SweepReport {
     pub abandoned_runs: Vec<String>,
     pub killed_groups: Vec<i32>,
     pub removed_pickups: Vec<String>,
+    /// Runs whose record could not be read for a reason other than
+    /// corruption; their directories are left in place.
+    pub unreadable_runs: Vec<String>,
 }
 
 pub fn now_millis() -> u64 {
@@ -385,7 +388,9 @@ impl StateDir {
     ///
     /// A non-terminal run owned by another daemon is marked
     /// `failed/abandoned` and stripped; its group is killed only when the
-    /// recorded leader is still the process that started it. A pickup
+    /// recorded leader is still the process that started it. A run directory
+    /// whose record fails its closed parse is removed; one that cannot be read
+    /// for another reason is left and reported. A pickup
     /// directory that no request names is removed.
     pub fn sweep(
         &self,
@@ -400,11 +405,23 @@ impl StateDir {
             let dir = self.run_dir(&run_id)?;
             let mut record = match record {
                 Ok(Some(record)) => record,
-                // A record that cannot be read names no group; the directory goes.
-                Ok(None) | Err(_) => {
+                // No record, or one that fails its closed parse, names no
+                // group; the directory goes.
+                Ok(None) => {
                     if !kept(&dir) {
                         remove_tree(&dir)?;
                     }
+                    continue;
+                }
+                Err(e) if e.to_string().starts_with(PRODUCER_STATE_CORRUPT) => {
+                    if !kept(&dir) {
+                        remove_tree(&dir)?;
+                    }
+                    continue;
+                }
+                // An I/O fault says nothing about the record: leave it and report.
+                Err(_) => {
+                    report.unreadable_runs.push(run_id);
                     continue;
                 }
             };

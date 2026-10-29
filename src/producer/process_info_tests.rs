@@ -60,5 +60,5 @@ fn start_time_is_stable_per_process_and_none_when_gone() {
     assert_ne!(start_time(std::process::id() as libc::pid_t), Some(first));
     drop(group);
     assert_eq!(start_time(pid), None);
-    assert!(!group_exists(pid));
+    crate::testing::wait_until("group emptied", || !group_exists(pid));
 }
