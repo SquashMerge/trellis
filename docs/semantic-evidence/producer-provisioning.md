@@ -10,22 +10,26 @@ Pins live in [`hardware/mac-mini-m5-pro-v1.json`](hardware/mac-mini-m5-pro-v1.js
 |---|---|---|---|---|---|
 | scip-typescript | 0.4.0 | `npm install -g @sourcegraph/scip-typescript@0.4.0` under a mise-managed node | npm global `bin/` entry, a symlink to the package's `dist/src/main.js`, next to a native `node` | `packageManifestVersion`: `package.json` name and version of the launcher's package equal the pin | node v24.22.1 (the profile text says 24.11.1; the node binary is hashed into the run's provenance, not compared with that text) |
 | scip-python | 0.6.6 | `npm install -g @sourcegraph/scip-python@0.6.6` under the same node | npm global `bin/` entry, a symlink to the package's `index.js`, next to a native `node` | `packageManifestVersion` | node v24.22.1 |
-| scip-java | 0.12.3 | `coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3` | a standalone launcher file on the declared `PATH` | `executableSha256` equals the pinned `executableHash` | system OpenJDK 25.0.3 on `PATH`, plus a coursier-cached Temurin 17 selected by the build config |
+| scip-java | 0.12.3 | `coursier bootstrap --standalone com.sourcegraph:scip-java_2.13:0.12.3` | a standalone launcher file on the declared `PATH` | `executableSha256` equals the pinned `executableHash` | mise-installed Temurin 25.0.3 (`~/.local/share/mise/installs/java/temurin-25.0.3+9.0.LTS/bin`) on the declared `PATH`; the scip-java JVM is Temurin 17.0.20.1, see below |
 | rust-analyzer | 1.98.1 | `rustup component add rust-analyzer` on toolchain 1.98.1 | the `rustup` proxy on the declared `PATH`; the real binary is `$RUSTUP_HOME/toolchains/1.98.1-<triple>/bin/rust-analyzer` | `executableSha256` of that binary equals the pin | `1.98.1-aarch64-apple-darwin` |
 
 A shim launcher (mise, asdf, pyenv) or a shim `node` is refused with `producer_unavailable`: detection reads files and never executes a shim to ask its version.
 
-The scip-java and rust-analyzer rows are confirmed by the strict runs of the slices that add their tests. The scip-java row was confirmed against a strict run that used the cached coursier Temurin 17 `javac` with system OpenJDK 25.0.3 on `PATH`.
+The scip-java and rust-analyzer rows are confirmed by the strict runs of the slices that add their tests. The scip-java row was confirmed against a strict run with the mise Temurin 25.0.3 on the declared `PATH` and Temurin 17.0.20.1 in the coursier archive cache.
+
+### scip-java JVM prerequisite
+
+Restricted scip-java runs with `COURSIER_MODE=offline` (`src/producer/profiles.rs`). The restricted worktree omits build files and writes an `lsif-java.json` with no `jvm` field, so scip-java uses its default JVM, Temurin 17.0.20.1. That JDK must already be present in `COURSIER_ARCHIVE_CACHE` as a host prerequisite, because Trellis downloads nothing. On the reference host it is at `~/Library/Caches/Coursier/arc/https/github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%252B1/OpenJDK17U-jdk_aarch64_mac_hotspot_17.0.20.1_1.tar.gz/jdk-17.0.20.1+1`, created on 2026-08-21. The exact command that provisioned it is not recoverable. It is a coursier archive-cache entry from a prior manual coursier-driven JVM fetch by the owner (for example `cs java --jvm temurin:17` or an earlier online scip-java run), not from anything Trellis ran.
 
 ## Declared environment
 
 The CLI sends a closed environment: `PATH`, `HOME`, and `RUSTUP_HOME`, `CARGO_HOME`, `COURSIER_CACHE` and `COURSIER_ARCHIVE_CACHE` when set. The daemon resolves producers only from it. The tests override `HOME` with a temporary directory, so `tests/support/real_producers.rs` computes the rest from the **real** `HOME` first:
 
-- `PATH`: the caller's `PATH` without any `shims` directory, then `$HOME/.local/share/mise/installs/node/*/bin` (newest first), then `/usr/bin` and `/bin`;
+- `PATH`: the caller's `PATH` without any `shims` directory, then the non-shim `$HOME/.local/share/mise/installs/node/*/bin` and `.../installs/java/*/bin` directories (real version directories only, not the `temurin-25` style symlinks; newest first), then `/usr/bin` and `/bin`;
 - `RUSTUP_HOME=$HOME/.rustup` and `CARGO_HOME=$HOME/.cargo`;
 - `COURSIER_CACHE` and `COURSIER_ARCHIVE_CACHE`: `$HOME/Library/Caches/Coursier/{v1,arc}` on macOS and `$HOME/.cache/coursier/{v1,arc}` on Linux.
 
-No shell activation is needed or used.
+No shell activation is needed or used: the mise tool directories are added to the declared `PATH` directly, and the shims are never used.
 
 ## CI
 
