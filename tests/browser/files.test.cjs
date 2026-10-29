@@ -365,15 +365,16 @@ test("Files declaration Sequence and browser traversal restore the exact pinned 
   const historyLength = await page.evaluate(() => history.length);
   async function returned() {
     await page.waitForFunction(line => document.body.classList.contains("files-section") && document.querySelector("#source")?.dataset.navigationLine === String(line), method.symbol.range.startLine);
-    await assertSource(page, navigationSource, method.symbol.range);
-    assert.equal(await page.locator("#files-indexed").getAttribute("aria-pressed"), "true");
-    assert.equal(await page.locator(`.files-symbol-pick[data-symbol-id="${method.symbol.id}"]`).getAttribute("aria-pressed"), "true");
-    assert.equal(await page.locator("#files-symbol-title").textContent(), method.symbol.name);
+    // Source paints before the async mini render; restored focus marks completion.
     await page.waitForFunction(({id, scroll}) => {
       const panel = document.querySelector("#workspace-source-panel"), focus = document.activeElement;
       return focus?.dataset.symbolId === id && focus.classList.contains("source-diagram-action") &&
         Math.abs(panel.scrollTop - scroll.top) <= 1 && panel.scrollLeft === scroll.left;
     }, {id:method.symbol.id, scroll});
+    await assertSource(page, navigationSource, method.symbol.range);
+    assert.equal(await page.locator("#files-indexed").getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator(`.files-symbol-pick[data-symbol-id="${method.symbol.id}"]`).getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator("#files-symbol-title").textContent(), method.symbol.name);
     assert.equal(sourceReads(requests), sourceCount, "Back reuses the captured source snapshot");
     assert.equal(await page.evaluate(() => history.length), historyLength, "traversal never appends history");
   }
