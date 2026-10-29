@@ -1972,6 +1972,15 @@
         "workspace": {
           "type": "string",
           "maxLength": 4096
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "any",
+            "production",
+            "test"
+          ],
+          "default": "any"
         }
       },
       "required": [
@@ -3183,6 +3192,14 @@
                 },
                 "searchIndex": {
                   "$ref": "#/$defs/SearchIndexStatus"
+                },
+                "role": {
+                  "type": "string",
+                  "enum": [
+                    "any",
+                    "production",
+                    "test"
+                  ]
                 }
               },
               "required": [
@@ -3191,7 +3208,8 @@
                 "coverage",
                 "scopeCoverage",
                 "provenance",
-                "searchIndex"
+                "searchIndex",
+                "role"
               ],
               "type": "object"
             },

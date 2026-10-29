@@ -447,12 +447,15 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
         "SQLite did not flush a genuine hot journal"
     );
     let hot_journal = std::fs::read(&journal).unwrap();
+    // Release the retained session and watcher synchronously; Weak::upgrade
+    // alone cannot prove that the last Arc's fields have finished dropping.
+    state.release_checkout_runtime_for_fixture();
     let retired = Arc::downgrade(&state);
     drop(leader);
     drop(app);
     drop(state);
-    // The queue ticker's in-flight blocking worker may still own the old state.
-    // Wait for actual owner release, never a guessed delay or a relaxed fence.
+    // The worker can still hold a local use guard in its post-step queue probe.
+    // Wait for that strong owner to return after the retained fields are clear.
     let deadline = std::time::Instant::now() + trellis::testing::HANG_BACKSTOP;
     while retired.upgrade().is_some() {
         assert!(

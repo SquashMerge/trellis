@@ -213,6 +213,7 @@ impl HeadSlot {
             .filter(|p| p.pin == pin && p.model_id == model_id && p.epoch == epoch)
             .map(|p| p.matrix.active_count()))
     }
+    #[allow(clippy::too_many_arguments)] // Keep admitted pin/model/epoch and per-query policy explicit.
     pub fn rank(
         &self,
         pin: IndexPin,
@@ -220,6 +221,7 @@ impl HeadSlot {
         epoch: u64,
         lexical: &[SearchCandidateKey],
         query: Option<&[i8]>,
+        policy: &crate::search_rank::SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<SearchRanking>> {
         self.touch();
@@ -249,7 +251,8 @@ impl HeadSlot {
         else {
             return Ok(None);
         };
-        let ranked = crate::search_rank::rank_matrix(&published.matrix, lexical, query, check)?;
+        let ranked =
+            crate::search_rank::rank_matrix(&published.matrix, lexical, query, policy, check)?;
         drop(state);
         Ok(Some(ranked))
     }
@@ -634,6 +637,7 @@ mod tests {
                         syntax_id: "sid:v1:00000000000000000000000000000001".into(),
                     },
                     card_hash: "a".repeat(64),
+                    role: crate::native_evidence::DeclarationRole::Production,
                 }]
                 .into(),
             ),
@@ -740,6 +744,7 @@ mod tests {
                 1,
                 &[],
                 Some(&vec![1; crate::search_embed::DIMENSIONS]),
+                &crate::search_rank::SearchPolicy::default(),
                 &mut || Ok(()),
             )
             .unwrap()
@@ -751,6 +756,7 @@ mod tests {
                 syntax_id: "sid:v1:00000000000000000000000000000002".into(),
             },
             card_hash: "b".repeat(64),
+            role: crate::native_evidence::DeclarationRole::Production,
         };
         head.begin();
         head.build(
@@ -769,9 +775,17 @@ mod tests {
         )
         .unwrap();
         assert!(
-            head.rank(pin(1), "model", 1, &[], None, &mut || Ok(()))
-                .unwrap()
-                .is_none()
+            head.rank(
+                pin(1),
+                "model",
+                1,
+                &[],
+                None,
+                &crate::search_rank::SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap()
+            .is_none()
         );
         // An old hash arriving after deletion cannot fill a reused slot.
         head.committed(
@@ -781,10 +795,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            head.rank(pin(2), "model", 1, &[], None, &mut || Ok(()))
-                .unwrap()
-                .unwrap()
-                .embedded,
+            head.rank(
+                pin(2),
+                "model",
+                1,
+                &[],
+                None,
+                &crate::search_rank::SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap()
+            .unwrap()
+            .embedded,
             0
         );
         head.committed(
@@ -794,10 +816,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            head.rank(pin(2), "model", 1, &[], None, &mut || Ok(()))
-                .unwrap()
-                .unwrap()
-                .embedded,
+            head.rank(
+                pin(2),
+                "model",
+                1,
+                &[],
+                None,
+                &crate::search_rank::SearchPolicy::default(),
+                &mut || Ok(())
+            )
+            .unwrap()
+            .unwrap()
+            .embedded,
             1
         );
     }

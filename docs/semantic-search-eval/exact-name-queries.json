@@ -1,0 +1,167 @@
+{
+  "format": "trellis-semantic-search-exact-name-eval/v1",
+  "repository": "SquashMerge/trellis",
+  "resolvedAt": {
+    "sourceCommit": null,
+    "baseCommit": "49ca2fcccf0a82b801ae0761de314bccbc0512f4",
+    "indexGeneration": "7cec6dda-27a5-4682-9268-0f5e2fd74b24",
+    "indexRevision": 1,
+    "nativeRevisionId": "revision:v2:8375127b5ad1671bedc462032712e74575a954a1a9af6cbf6891b2afde0328f8",
+    "extractorVersion": "native-v6-delta-v1",
+    "sourceManifest": [
+      {
+        "language": "javascript",
+        "path": "web/sequence.js",
+        "contentHash": "b4e590ec5e63b8d13ab752e0647c970ad47258326e09fb7fa6e07c56ae9c22a9"
+      },
+      {
+        "language": "rust",
+        "path": "src/rules/glob_language.rs",
+        "contentHash": "a8c8e3a7973727dad01aa66a02ffa17bc58ec2b63ffedc4a9758f72e69c61421"
+      },
+      {
+        "language": "rust",
+        "path": "src/store.rs",
+        "contentHash": "7a0b47a46180821cf748d21a75f8a40189a1b1dc04abf9776076197b36f910f5"
+      },
+      {
+        "language": "rust",
+        "path": "src/store/requests.rs",
+        "contentHash": "907b894bb4c87c80685929d487f08354261f75981494d180cd52103f35b016b3"
+      }
+    ]
+  },
+  "provenance": "Measured declarations and captured source from the stopped private #379 native snapshot used by #389 investigation, not the original dogfood pin or a new #389 capture. baseCommit is context only; the snapshot may contain uncommitted implementation. Pin and captured-source hashes, not baseCommit alone, identify this supplement. No new query/card vectors or retrieval-quality receipt is implied.",
+  "queries": [
+    {
+      "id": "x01",
+      "category": "exact_name",
+      "shape": "snake_case",
+      "query": "read_status_for",
+      "role": "any",
+      "answers": [
+        {
+          "language": "rust",
+          "path": "src/store.rs",
+          "qualifiedName": "read_status_for",
+          "name": "read_status_for",
+          "kind": "method",
+          "role": "production",
+          "startLine": 13151,
+          "declarationId": "sid:v1:7f677c3d75677b199bff0ff03946d9d3"
+        }
+      ],
+      "expectedFirstRole": "production"
+    },
+    {
+      "id": "x02",
+      "category": "exact_name",
+      "shape": "snake_case",
+      "query": "enqueue_request",
+      "role": "any",
+      "answers": [
+        {
+          "language": "rust",
+          "path": "src/store/requests.rs",
+          "qualifiedName": "enqueue_request",
+          "name": "enqueue_request",
+          "kind": "method",
+          "role": "production",
+          "startLine": 1185,
+          "declarationId": "sid:v1:df0fa4c02ba692ab40c5ddb5636200e5"
+        }
+      ],
+      "expectedFirstRole": "production"
+    },
+    {
+      "id": "x03",
+      "category": "exact_name",
+      "shape": "camelCase",
+      "query": "renderSequence",
+      "role": "any",
+      "answers": [
+        {
+          "language": "javascript",
+          "path": "web/sequence.js",
+          "qualifiedName": "renderSequence",
+          "name": "renderSequence",
+          "kind": "function",
+          "role": "production",
+          "startLine": 3,
+          "declarationId": "sid:v1:d6a901e25b1b03105aa9c3c80ddd665a"
+        }
+      ],
+      "expectedFirstRole": "production"
+    },
+    {
+      "id": "x04",
+      "category": "exact_name",
+      "shape": "same_name",
+      "query": "compile",
+      "role": "any",
+      "answers": [
+        {
+          "language": "rust",
+          "path": "src/rules/glob_language.rs",
+          "qualifiedName": "compile",
+          "name": "compile",
+          "kind": "method",
+          "role": "production",
+          "startLine": 137,
+          "declarationId": "sid:v1:54cf1b196119bb9617986c62494808fd"
+        },
+        {
+          "language": "rust",
+          "path": "src/rules/glob_language.rs",
+          "qualifiedName": "tests.compile",
+          "name": "compile",
+          "kind": "function",
+          "role": "test",
+          "startLine": 435,
+          "declarationId": "sid:v1:ce2c85318b6827a74eeb09b494453a8f"
+        }
+      ],
+      "expectedFirstRole": "production"
+    },
+    {
+      "id": "x05",
+      "category": "exact_name",
+      "shape": "same_name",
+      "query": "compile",
+      "role": "production",
+      "answers": [
+        {
+          "language": "rust",
+          "path": "src/rules/glob_language.rs",
+          "qualifiedName": "compile",
+          "name": "compile",
+          "kind": "method",
+          "role": "production",
+          "startLine": 137,
+          "declarationId": "sid:v1:54cf1b196119bb9617986c62494808fd"
+        }
+      ],
+      "expectedFirstRole": "production"
+    },
+    {
+      "id": "x06",
+      "category": "exact_name",
+      "shape": "same_name",
+      "query": "compile",
+      "role": "test",
+      "answers": [
+        {
+          "language": "rust",
+          "path": "src/rules/glob_language.rs",
+          "qualifiedName": "tests.compile",
+          "name": "compile",
+          "kind": "function",
+          "role": "test",
+          "startLine": 435,
+          "declarationId": "sid:v1:ce2c85318b6827a74eeb09b494453a8f"
+        }
+      ],
+      "expectedFirstRole": "test"
+    }
+  ]
+}

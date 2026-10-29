@@ -15,3 +15,5 @@
 7. Implement this ruling through the #168 Factory run. The documentation slice records the contract; producer, index, MCP, catalog, semantic fixtures and verification follow in later slices.
 
 `find.includeTests` (default true), test-filtered `scopeCoverage`, and production-first ranking within a match tier are later work. #120, #129 and #163 production-only metrics/references using role, and #172, are separate follow-ups after #168. Semantic test discovery (runner configuration, `harness = false`) and frameworks beyond those listed are out of scope.
+
+The later [#389 amendment in Decision 0018](0018-semantic-symbol-retrieval.md) ratifies exact-name and production-first lexical ranking, plus the stored-role filter, for `trellis_search_symbols` only. The deferred find and coverage behavior above is unchanged.
