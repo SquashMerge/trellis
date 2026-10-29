@@ -281,6 +281,20 @@ fn paged(id: &Value, name: &str, mut envelope: Value, offset: u64, modern: bool)
     for (index, (field, item)) in items.into_iter().enumerate().skip(offset as usize) {
         let size = serde_json::to_vec(&item).map_or(usize::MAX, |bytes| bytes.len() + 1);
         if used.saturating_add(size) > budget {
+            if index as u64 == offset {
+                // The estimate keeps headroom; a lone first item is judged by its
+                // actual complete frame (nextOffset, summary and LF) instead.
+                let mut single = envelope.clone();
+                single["data"][field]
+                    .as_array_mut()
+                    .expect("paged array")
+                    .push(item);
+                single["data"]["page"]["nextOffset"] =
+                    json!((offset + 1 < total).then_some(offset + 1));
+                if frame_bytes(&single) < super::wire::RESPONSE_BYTES {
+                    return capped_whole(id, name, single, modern);
+                }
+            }
             next = Some(index as u64);
             break;
         }
@@ -500,6 +514,66 @@ mod tests {
         assert_eq!(rules["instances"][0]["evidence"], json!([1, 2, 3, 4, 5]));
         assert_eq!(rules["instances"][0]["omittedEvidence"], 2);
         assert_eq!(rules["instances"][1]["omittedEvidence"], 0);
+    }
+
+    /// A lone first item is admitted exactly when its complete line plus LF fits
+    /// the unchanged cap, whatever headroom the page estimate keeps.
+    #[test]
+    fn a_singleton_page_fits_exactly_at_the_cap_and_fails_one_byte_over() {
+        let id = json!(7);
+        for modern in [false, true] {
+            for trailing in [false, true] {
+                let whole = |reason: usize| {
+                    let mut unresolved = vec![json!({"reason":"x".repeat(reason)})];
+                    if trailing {
+                        unresolved.push(json!({"reason":"tail"}));
+                    }
+                    let mut whole = envelope(
+                        &id,
+                        json!({"indexGeneration":"g","indexRevision":1,"modules":[],
+                        "externalPackages":[],"production":[],"tests":[],"unresolved":unresolved,
+                        "counts":{"unresolvedSites":unresolved.len()}}),
+                    );
+                    whole["workspace"] = json!("/checkout");
+                    whole["catchingUp"] = json!(false);
+                    whole
+                };
+                let line = |result: &Value| {
+                    serde_json::to_vec(&response(&id, result.clone()))
+                        .unwrap()
+                        .len()
+                };
+                let empty = capped(&id, "trellis_references", whole(0), Some(0), modern);
+                // Each added ASCII byte of the reason adds one byte to the line.
+                // The empty frame can hold the tail item too, so converge on the
+                // singleton frame's own length.
+                let mut at_cap = super::super::wire::RESPONSE_BYTES - 1 - line(&empty);
+                let mut fits = capped(&id, "trellis_references", whole(at_cap), Some(0), modern);
+                for _ in 0..4 {
+                    at_cap += super::super::wire::RESPONSE_BYTES - 1 - line(&fits);
+                    fits = capped(&id, "trellis_references", whole(at_cap), Some(0), modern);
+                }
+                let data = &fits["structuredContent"]["data"];
+                assert_eq!(data["unresolved"].as_array().unwrap().len(), 1, "{modern}");
+                assert_eq!(
+                    data["page"]["nextOffset"],
+                    if trailing { json!(1) } else { json!(null) }
+                );
+                assert_eq!(line(&fits) + 1, super::super::wire::RESPONSE_BYTES);
+                let over = capped(
+                    &id,
+                    "trellis_references",
+                    whole(at_cap + 1),
+                    Some(0),
+                    modern,
+                );
+                assert_eq!(
+                    over["structuredContent"]["error"]["code"],
+                    "response_too_large"
+                );
+                assert!(line(&over) < super::super::wire::RESPONSE_BYTES);
+            }
+        }
     }
 
     #[test]
