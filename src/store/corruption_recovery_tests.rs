@@ -32,6 +32,7 @@ impl ReaderFamily {
                         path: "f0.js".into(),
                         line: 1,
                         semantic_producer_id: None,
+                        semantic_producer_policy: None,
                     },
                 );
                 let result = store.navigation_at(&request)?;

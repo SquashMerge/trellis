@@ -585,7 +585,7 @@ test("declaration menus expose exact Sequence, Inspect and source actions withou
   h.request=async()=>response([{symbol:method,reason:"declaration",matchKind:"measured",action:"sequence"}]);
   await h.nav.open(h.event(),{path:method.path,line:4});
   assert.equal(h.selected.length+h.inspected.length+h.openedSources.length,0);
-  const sequence=h.latest.actions.find(a=>a.label.startsWith("Sequence ·"));assert.ok(sequence);
+  const sequence=h.latest.actions.find(a=>a.label.startsWith("Sequence · syntax ·"));assert.ok(sequence);
   assert.ok(h.latest.actions.find(a=>a.label.startsWith("Inspect ·")));
   assert.ok(h.latest.actions.find(a=>a.label.startsWith("Read declaration source")));
   assert.equal(h.latest.actions.find(a=>a.label.startsWith("Call graph")).disabled,true);
@@ -596,7 +596,7 @@ test("enclosing callable and supported class actions use measured identity, not 
   const h=harness(),method=declaration(),cls=declaration("A","class");
   h.request=async()=>response([{symbol:method,reason:"enclosing",matchKind:"measured",action:"sequence"}]);
   await h.nav.open(h.event(),{path:method.path,line:5});
-  const enclosing=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing"));assert.ok(enclosing);
+  const enclosing=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing · syntax"));assert.ok(enclosing);
   enclosing.run();assert.equal(h.selected[0],method);
   h.request=async()=>response([{symbol:cls,reason:"declaration",matchKind:"measured",action:"class"}]);
   await h.nav.open(h.event(),{path:cls.path,line:4});
@@ -616,7 +616,7 @@ test("only explicit call/resolved targets get resolved-callee sequence actions",
     {symbol:method,reason:"call",matchKind:"resolved",action:"sequence"}]);
   await h.nav.open(h.event(),{path:"src/A.java",line:20});
   const actions=h.latest.actions.filter(a=>a.label.startsWith("Sequence"));assert.equal(actions.length,1);
-  assert.match(actions[0].label,/Sequence of callee/);actions[0].run();assert.equal(h.selected[0],method);
+  assert.match(actions[0].label,/Sequence of callee · resolved/);actions[0].run();assert.equal(h.selected[0],method);
 });
 
 test("new diagram and inspector callbacks recheck all menu scope boundaries",async()=>{
@@ -694,4 +694,38 @@ test("resolved choices distinguish native callsite ranges and retain exact same-
   await h.nav.open(h.event(),{path:"src/A.java",line:20});
   const duplicate=h.latest.actions.filter(a=>a.label.startsWith("Sequence of callee"));
   assert.match(duplicate[0].label,/call call-1/);assert.match(duplicate[1].label,/call call-2/);
+});
+
+test("all source lookups inject solePublished while closed member selectors remain syntax-only",async()=>{
+  const h=harness();await h.nav.open(h.event(),{path:"src/A.java",line:4});
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{
+    expectedRevision:response().revision,path:"src/A.java",line:4,semanticProducerPolicy:"solePublished"});
+  const p=h.pane([4]);await p.button.fire("click").done;
+  assert.equal(h.calls[1].options.body.semanticProducerPolicy,"solePublished");
+  await h.nav.open(h.event(),{classId:"A",memberName:"run",startByte:10,endByte:60});
+  assert.equal(Object.hasOwn(h.calls[2].options.body,"semanticProducerPolicy"),false);
+  const before=h.calls.length;
+  await h.nav.open(h.event(),{path:"src/A.java",line:4,semanticProducerPolicy:"solePublished"});
+  await h.nav.open(h.event(),{path:"src/A.java",line:4,semanticProducerId:"producer"});
+  assert.equal(h.calls.length,before);
+});
+
+test("source retries retain solePublished without accepting policy from caller",async()=>{
+  const h=harness();h.request=async()=>{throw Error("offline");};
+  await h.nav.open(h.event(),{path:"src/A.java",line:4});
+  h.request=async()=>response([]);await h.latest.actions.find(a=>a.label==="Try navigation again").run();
+  assert.equal(h.calls.length,2);assert.equal(h.calls[1].options.body.semanticProducerPolicy,"solePublished");
+});
+
+test("multiple producer warning leaves only explicitly labelled syntax choices and no callee action",async()=>{
+  const h=harness(),method=declaration();
+  const warning="multiple semantic producers; showing syntax";
+  h.request=async()=>response([
+    {symbol:method,reason:"enclosing",action:"sequence",matchKind:"measured"},
+    {symbol:declaration("guess"),reason:"call",action:"sequence",matchKind:"syntaxCandidate"}],{warnings:[warning]});
+  await h.nav.open(h.event(),{path:"src/A.java",line:5});
+  assert.equal(h.latest.actions.some(a=>a.label.startsWith("Sequence of callee")),false);
+  const syntax=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing · syntax"));assert.ok(syntax);
+  assert.equal(h.latest.actions.find(a=>a.label===warning).disabled,true);
+  syntax.run();assert.equal(h.selected[0],method);
 });

@@ -426,7 +426,7 @@ test("390px Files keeps cached noncallable source, safe labels, no-Git reason an
   const navigationResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/navigation"));
   await page.keyboard.press("Shift+F10");
   const request = await navigation;
-  assert.deepEqual(request.postDataJSON(), {expectedRevision:pin, path:"Watcher.java", line:2});
+  assert.deepEqual(request.postDataJSON(), {expectedRevision:pin, path:"Watcher.java", line:2, semanticProducerPolicy:"solePublished"});
   const response = await navigationResponse, navigationDto = await response.json();
   assert.equal(response.status(), 200, JSON.stringify(navigationDto));
   assert.deepEqual(navigationDto.revision, pin);

@@ -180,3 +180,19 @@ provisioning/build with `TRELLIS_SUITE_BINARY` and `PLAYWRIGHT_BROWSERS_PATH`. I
 also part of `./tools/verify`. Area is physical file lines, including inline test
 lines, not callable-range LOC. Native adapter admission/mutation tests run in
 `tests/treemap-pele.test.cjs`.
+
+## Published semantic source navigation
+
+`navigation-resolved.test.cjs` publishes real native extraction plus validated synthetic
+semantic bindings through the hidden test-support-only `navigation-fixture` command.
+The exact same executable then runs the daemon, retaining the complete publication pin.
+No SQL rows or HTTP responses are fabricated. Cases cover zero, one and multiple
+published semantic producers, an unresolved call, and a direct internal callee whose
+source spelling deliberately names a different local function. The browser checks the
+resolved choice, exact selected seed and Back to the source view.
+
+`./tools/verify` builds and preserves a test-support executable for only this suite;
+other browser tests keep the normal binary. For a focused run after browser provisioning,
+run `node --test tests/browser/navigation-resolved.test.cjs`. It builds a test-support
+binary when `TRELLIS_NAVIGATION_FIXTURE_BINARY` is absent. To avoid that build, point the
+variable at a prebuilt test-support `trellis` executable.

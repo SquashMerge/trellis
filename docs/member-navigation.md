@@ -24,6 +24,12 @@ Unresolved calls are not globally name-matched. Syntax candidates, same-class na
 sequence participant labels are not resolved callees. The enclosing measured method remains a
 sequence choice when no eligible callee binding exists.
 
+For resolved-callee navigation, the browser uses the sole published semantic producer at the source
+snapshot. With none, it shows syntax choices only. With several, it also shows
+`multiple semantic producers; showing syntax`. There is no producer picker. Menus label measured
+declarations as **syntax** and eligible callees as **resolved**; selecting a producer alone does not
+turn an unresolved, stale, external or dispatch-only binding into a callee action.
+
 External/library source stays a separate read-only surface. Its catalog and source-hash identities
 are not workspace syntax IDs, so it has no workspace Sequence or Class diagram action. Matching a
 path or name does not change that boundary. Working-tree-only text likewise has no indexed actions.
@@ -52,8 +58,10 @@ not fetch source. Menus are invalidated by scope/session/revision changes or dis
 new diagram clears stale source actions. Existing authentication, source guards and provider allowances
 remain unchanged.
 
-`POST /api/navigation` accepts either `{expectedRevision, path, line}` or
-`{expectedRevision, classId, memberName, startByte, endByte}`. Member names and byte ranges must match
+`POST /api/navigation` accepts either `{expectedRevision, path, line, semanticProducerId?, semanticProducerPolicy?}`
+or `{expectedRevision, classId, memberName, startByte, endByte}`. The browser explicitly requests
+`semanticProducerPolicy: "solePublished"`; an API caller may instead name one published producer.
+With neither option, the API remains syntax-only. Member names and byte ranges must match
 one stored member exactly. Results contain original measured symbols with action/reason/certainty,
 plus warnings and partial-index/limit status. Type links remain syntax candidates, not resolved types.
 The response is bounded to 512KiB. Evidence records and Java cached-source parsing have separate bounds.

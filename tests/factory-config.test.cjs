@@ -177,6 +177,7 @@ fi
 # verify hands the browser suite the binary it built (#192).
 for arg in "$@"; do
   if [ "$arg" = tests/browser/sequence-harness.test.cjs ] && [ -z "\${TRELLIS_SUITE_BINARY:-}" ]; then exit 37; fi
+  if [ "$arg" = tests/browser/navigation-resolved.test.cjs ] && [ -z "\${TRELLIS_NAVIGATION_FIXTURE_BINARY:-}" ]; then exit 38; fi
 done
 if [ "\${FAKE_VERIFY_FAIL_DEPS:-0}" = 1 ] && [ "$2" = install-deps ]; then echo "fake apt failure"; exit 41; fi
 if [ -n "\${FAKE_VERIFY_HANG_DEPS:-}" ] && [ "$2" = install-deps ]; then echo $$ > "$FAKE_VERIFY_HANG_DEPS"; exec sleep 600; fi
@@ -191,7 +192,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
 `;
   try {
     // This test checks orchestration only; the real suites run once in verify.
-    for (const name of ["cargo", "node", "python3"]) {
+    for (const name of ["cargo", "node", "python3", "cp"]) {
       const command = join(fakeDir, name);
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
@@ -221,9 +222,11 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
         ["cargo", "clippy", "--locked", "--all-targets", "--features", "test-support", "--", "-D", "warnings"],
+        ["cargo", "build", "--locked", "--features", "test-support", "--bin", "trellis"],
+        ["cp", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis"), join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis-navigation-fixture")],
         ["cargo", "build", "--locked", "--bin", "trellis"],
         ["python3", "tools/verify-40-query-performance.py", "--smoke", "--binary", join(resolvePath(ROOT, process.env.CARGO_TARGET_DIR || "target"), "debug", "trellis")],
-        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/treemap.test.cjs"],
+        ["node", "--test", "--test-concurrency=1", "tests/browser/sequence-harness.test.cjs", "tests/browser/pele-block-labels.test.cjs", "tests/browser/sequence-pele.test.cjs", "tests/browser/sequence.test.cjs", "tests/browser/sequence-cost.test.cjs", "tests/browser/brand.test.cjs", "tests/browser/connect.test.cjs", "tests/browser/viewer-shell.test.cjs", "tests/browser/files.test.cjs", "tests/browser/architecture-pele.test.cjs", "tests/browser/architecture.test.cjs", "tests/browser/treemap.test.cjs", "tests/browser/navigation-resolved.test.cjs"],
       ],
       tests: [
         ["cargo", "nextest", "--version"],
@@ -272,7 +275,7 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     rmSync(log);
     const depsFailure = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1", FAKE_VERIFY_FAIL_DEPS: "1" });
     assert.equal(depsFailure.result.status, 1);
-    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, 5) });
+    assertRan(depsFailure.commands, { ...lanes, deps: [deps], rust: lanes.rust.slice(0, -1) });
     assert.match(depsFailure.result.stdout, /fake apt failure/);
     assert.match(depsFailure.result.stdout, /Chromium system package install failed \(exit 41\)/);
     assert.match(depsFailure.result.stderr, /failed lane\(s\): rust$/m);

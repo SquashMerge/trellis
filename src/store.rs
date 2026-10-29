@@ -20444,7 +20444,6 @@ impl Store {
         &self,
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
-        request.validate()?;
         self.with_evidence(|tx| self.navigation_in(tx, request, false))
     }
     fn navigation_in(
@@ -20453,9 +20452,42 @@ impl Store {
         request: &crate::navigation::NavigationRequest,
         pre_startup: bool,
     ) -> Result<crate::navigation::NavigationResult> {
+        request.validate()?;
         let selected =
             self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
         let revision = selected.pin;
+        // Policy selection is local to this exact selected snapshot, never the head.
+        let mut producer_bytes = Vec::new();
+        let mut multiple_producers = false;
+        let effective_request = match request {
+            crate::navigation::NavigationRequest::Source(selector)
+                if selector.semantic_producer_policy.is_some() =>
+            {
+                let producers = tx.prepare(
+                    "SELECT CASE WHEN length(CAST(id AS BLOB))<=?2 THEN id END FROM semantic_revision_producers WHERE revision_id=?1 ORDER BY id LIMIT 2",
+                )?.query_map(params![selected.key, crate::navigation::RECORD_BYTES], |row| row.get::<_, Option<String>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut ids = Vec::new();
+                for producer in producers {
+                    let producer = producer.context(SelectedIntegrity(
+                        "selected semantic producer exceeds navigation budget".into(),
+                    ))?;
+                    selected_ensure!(
+                        crate::graph_query::valid_producer_id(&producer),
+                        "invalid selected semantic producer ID"
+                    );
+                    producer_bytes.push(serde_json::to_vec(&producer)?.len());
+                    ids.push(producer);
+                }
+                multiple_producers = ids.len() > 1;
+                let mut selector = selector.clone();
+                selector.semantic_producer_policy = None;
+                selector.semantic_producer_id = if ids.len() == 1 { ids.pop() } else { None };
+                Some(crate::navigation::NavigationRequest::Source(selector))
+            }
+            _ => None,
+        };
+        let request = effective_request.as_ref().unwrap_or(request);
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
         // consumes a selected document, authenticate it against that source BLOB
@@ -20521,6 +20553,14 @@ impl Store {
                 .as_ref()
                 .map(|document| document.nodes.as_slice()),
             &mut |reader, selector| {
+                if multiple_producers {
+                    reader.warn("multiple semantic producers; showing syntax");
+                }
+                for bytes in &producer_bytes {
+                    if !reader.charge(*bytes) {
+                        return Ok(());
+                    }
+                }
                 graph_read::navigation_calls(
                     self,
                     tx,

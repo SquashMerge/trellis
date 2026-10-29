@@ -5,9 +5,13 @@ Use cached revision-bound evidence, not bare-name grep guesses. No repository ex
 providers, reindex/schema change or changes to inspected repositories.
 
 POST /api/navigation request (deny unknown fields):
-- Source selector: {expectedRevision, path, line, semanticProducerId?} (1-based whole source line).
-  `semanticProducerId` is an optional explicit published producer ID; absent/null is syntax-only,
-  and an empty/unknown producer is an invalid request. No automatic producer selection or merge.
+- Source selector: {expectedRevision, path, line, semanticProducerId?, semanticProducerPolicy?} (1-based whole source line).
+  `semanticProducerId` is an optional explicit published producer ID. `semanticProducerPolicy` may
+  be `"solePublished"`; it is mutually exclusive with an explicit ID. With neither, navigation stays
+  syntax-only. Empty/unknown IDs, unknown policies and conflicting selectors are invalid requests.
+  The browser requests `"solePublished"`: select the sole published producer at the exact source pin;
+  none means syntax-only; several mean syntax-only plus `multiple semantic producers; showing syntax`.
+  Never merge producers or substitute the current head. No producer picker is provided.
 - Member selector: {expectedRevision, classId, memberName, startByte, endByte}.
 Selectors are exclusive. Member selector MUST match a recorded ClassMember by name+exact byte range;
 never trust typeHint/name as resolution. Source selector must validate path/line against cached file.
@@ -113,4 +117,7 @@ byte `range`; repeated sites remain distinct. Unresolved, ambiguous, stale, exte
 failed/omitted/unrequested coverage and non-callable targets do not gain callee actions. The measured
 enclosing method remains available. A missing required in-scope coverage row is typed corruption,
 not a successful partial navigation result. Existing navigation row, evidence and response budgets also cover these reads.
-Browser producer selection remains a separate owner decision; this optional API never picks one.
+The browser explicitly requests the owner-approved `solePublished` policy. The bounded producer
+lookup and call projection share the selected read transaction. Without that policy or an explicit
+ID, the API stays syntax-only. Menu labels distinguish measured syntax declarations from resolved
+callee choices; the latter still require every #40 eligibility check.

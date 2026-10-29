@@ -157,7 +157,7 @@ test("published import candidate keeps partial provenance and original source",{
  const navigation = await navigationPromise, targets = await navigation.json();
  assert.equal(navigation.status(), 200, JSON.stringify(targets)); assert.deepEqual(targets.revision, pin);
  assert.equal(targets.targets.some(target => target.reason === "call" && target.matchKind === "resolved"), false, "import candidate has no resolved workspace callee");
- const enclosing = page.getByRole("menuitem", {name:/^Sequence · enclosing · measured/});
+ const enclosing = page.getByRole("menuitem", {name:/^Sequence · enclosing · syntax · measured/});
  await enclosing.waitFor();
  assert.equal(await page.getByRole("menuitem", {name:/Sequence of callee/}).count(), 0, "never guess a callee from import spelling");
  assert.equal(await page.getByRole("menuitem", {name:/Call graph/}).isDisabled(), true);

@@ -62,7 +62,7 @@
     if (selector.expectedRevision !== undefined && !window.TrellisIndexPin.equal(selector.expectedRevision, revision)) return null;
     if (source) {
       if (typeof selector.path !== "string" || !selector.path || selector.path.length > 4096 || !positive(selector.line)) return null;
-      return {expectedRevision: revision, path: selector.path, line: selector.line};
+      return {expectedRevision: revision, path: selector.path, line: selector.line, semanticProducerPolicy: "solePublished"};
     }
     if (typeof selector.classId !== "string" || !selector.classId || selector.classId.length > 4096 ||
         typeof selector.memberName !== "string" || !selector.memberName || selector.memberName.length > 4096 ||
@@ -111,7 +111,9 @@
     const close = {label: "Close navigation", run: () => { if (current()) serial++; }};
     const notice = label => ({label: text(label), disabled: true, run() {}});
     const body = selectorBody(selector, revision);
-    const retry = {label: "Try navigation again", run: () => { if (current()) return open(anchor, body, {isCurrent}); }};
+    const retry = {label: "Try navigation again", run: () => {
+      if (current()) return open(anchor, body?.path ? {expectedRevision: revision, path: body.path, line: body.line} : body, {isCurrent});
+    }};
     if (!body) { display([notice("Navigation unavailable: select a current indexed line or member."), close]); return; }
     display([notice("Finding cached navigation targets…"), close]);
     // Focus dismissal and another non-navigation menu do not necessarily produce
@@ -156,15 +158,15 @@
         const label = labels[index] + suffix;
         const run = callback => () => { if (current()) { serial++; return callback(symbol, revision); } };
         if (target.reason === "declaration" && typeof owner.openSource === "function")
-          actions.push({label: `Read declaration source · ${label}`, run: run(owner.openSource)});
+          actions.push({label: `Read declaration source · syntax · ${label}`, run: run(owner.openSource)});
         if (callable(symbol) && typeof owner.selectMethod === "function") {
-          const prefix = target.reason === "enclosing" ? "Sequence · enclosing" : target.reason === "call" ? "Sequence of callee" : "Sequence";
+          const prefix = target.reason === "enclosing" ? "Sequence · enclosing · syntax" : target.reason === "call" ? "Sequence of callee · resolved" : "Sequence · syntax";
           actions.push({label: `${prefix} · ${label}`, run: run(owner.selectMethod)});
         }
         if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py)$/i.test(symbol.path) && typeof owner.openClass === "function")
-          actions.push({label: `Class diagram · ${label}`, run: run(owner.openClass)});
+          actions.push({label: `Class diagram · syntax · ${label}`, run: run(owner.openClass)});
         if (["declaration", "enclosing"].includes(target.reason) && typeof owner.inspectSymbol === "function")
-          actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · ${label}`, run: run(owner.inspectSymbol)});
+          actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · syntax · ${label}`, run: run(owner.inspectSymbol)});
       }
       if (!actions.length) actions.push(notice("No measured declaration or resolved callee on this line. Candidate type and call targets cannot be opened as navigation."));
       actions.push(notice("Call graph · not available yet"));
@@ -221,8 +223,8 @@
         action.setAttribute("data-source-action", "sequence");
         // A CSS label keeps controls out of source text and native copy/selection.
         action.setAttribute("data-label", "Sequence");
-        action.setAttribute("aria-label", `Sequence for ${text(symbol.name)} · ${text(symbol.id)}`);
-        action.setAttribute("title", `Sequence · ${text(symbol.name)} · ${text(symbol.id)}`);
+        action.setAttribute("aria-label", `Sequence for ${text(symbol.name)} · syntax · ${text(symbol.id)}`);
+        action.setAttribute("title", `Sequence · syntax · ${text(symbol.name)} · ${text(symbol.id)}`);
         action.addEventListener("click", event => {
           event.stopPropagation();
           if (usable()) { activate(lines.indexOf(symbol.range.startLine)); serial++; return owner.selectMethod(symbol, revision); }

@@ -39,7 +39,7 @@ pub enum NavigationRequest {
     Source(SourceSelector),
     Member(MemberSelector),
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceSelector {
     pub expected_revision: IndexPin,
@@ -47,6 +47,13 @@ pub struct SourceSelector {
     pub line: usize,
     #[serde(default)]
     pub semantic_producer_id: Option<String>,
+    #[serde(default)]
+    pub semantic_producer_policy: Option<SemanticProducerPolicy>,
+}
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SemanticProducerPolicy {
+    SolePublished,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -75,6 +82,7 @@ impl NavigationRequest {
                         .split('/')
                         .any(|p| p.is_empty() || p == "." || p == "..")
                     && (1..=10_000_000).contains(&s.line)
+                    && !(s.semantic_producer_id.is_some() && s.semantic_producer_policy.is_some())
                     && s.semantic_producer_id
                         .as_deref()
                         .is_none_or(crate::graph_query::valid_producer_id),
@@ -125,7 +133,7 @@ pub(crate) struct Reader<'a> {
     symbols: Option<&'a [Symbol]>,
 }
 impl Reader<'_> {
-    fn warn(&mut self, message: &str) {
+    pub(crate) fn warn(&mut self, message: &str) {
         let message: String = message.chars().take(512).collect();
         if !self.result.warnings.contains(&message) {
             if self.result.warnings.len() < WARNINGS {
@@ -430,9 +438,7 @@ pub(crate) fn navigate(
     match request {
         NavigationRequest::Source(s) => {
             reader.source(s)?;
-            if s.semantic_producer_id.is_some() {
-                calls(&mut reader, s)?;
-            }
+            calls(&mut reader, s)?;
         }
         NavigationRequest::Member(s) => reader.member(s)?,
     }

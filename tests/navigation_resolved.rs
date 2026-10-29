@@ -9,7 +9,9 @@ use trellis::{
 };
 #[path = "common/graph_fixtures.rs"]
 mod graph_fixtures;
-use graph_fixtures::{Bind, PRODUCER, Publisher, Spec, bind, calls_of, syntax_id};
+use graph_fixtures::{
+    Bind, PRODUCER, Publisher, Spec, add_second_producer, bind, calls_of, syntax_id,
+};
 
 fn request(pin: IndexPin, path: &str, line: usize, producer: Option<&str>) -> NavigationRequest {
     serde_json::from_value(
@@ -252,4 +254,134 @@ fn missing_in_scope_coverage_is_corrupt_not_partial_navigation() {
             .contains("missing producer coverage tuple"),
         "{error:#}"
     );
+}
+
+fn sole_request(pin: IndexPin) -> NavigationRequest {
+    serde_json::from_value(json!({
+        "expectedRevision":pin, "path":"a.rs", "line":2,
+        "semanticProducerPolicy":"solePublished"
+    }))
+    .unwrap()
+}
+
+#[test]
+fn sole_published_policy_zero_one_multiple_and_retained_cardinality() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let files = [("a.rs", "fn a() {\n b();\n}\nfn b() {}\n")];
+    let zero = publisher.publish(&Spec::syntax_only(&files));
+    let mut spec = Spec::new(&files);
+    spec.bindings = vec![bind("a", 0, "b")];
+    let one = publisher.publish(&spec);
+    let multiple = publisher.publish_with_semantic(&spec, add_second_producer);
+    for pin in [zero, one, multiple] {
+        let result = publisher.store.navigation_at(&sole_request(pin)).unwrap();
+        assert_eq!(result.revision, pin);
+        assert_eq!(
+            callees(&result),
+            if pin == one { vec!["b"] } else { vec![] }
+        );
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning == "multiple semantic producers; showing syntax"),
+            pin == multiple
+        );
+        assert!(
+            result
+                .targets
+                .iter()
+                .any(|target| target.reason == "enclosing" && target.symbol.name == "a")
+        );
+        assert!(!result.truncated);
+    }
+    // A non-policy request never inherits automatic selection, even on a sole-producer pin.
+    assert!(callees(&navigate(&publisher.store, one, 2, None)).is_empty());
+    // An explicit producer remains usable even when cardinality is multiple.
+    assert_eq!(
+        callees(&navigate(&publisher.store, multiple, 2, Some(PRODUCER))),
+        vec!["b"]
+    );
+    assert!(
+        callees(&navigate(
+            &publisher.store,
+            multiple,
+            2,
+            Some("semantic.second")
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn sole_policy_unresolved_call_keeps_measured_enclosing_fallback() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[("a.rs", "fn a() {\n b();\n}\nfn b() {}\n")]);
+    spec.bindings = vec![Bind {
+        resolution: Resolution::Unresolved,
+        ..bind("a", 0, "b")
+    }];
+    let pin = publisher.publish(&spec);
+    let result = publisher.store.navigation_at(&sole_request(pin)).unwrap();
+    assert!(callees(&result).is_empty());
+    assert!(
+        result
+            .targets
+            .iter()
+            .any(|target| target.reason == "enclosing" && target.symbol.name == "a")
+    );
+}
+
+#[test]
+fn policy_validation_rejects_unknown_and_combined_selectors_and_null_stays_syntax() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let pin = publisher.publish(&Spec::new(&[("a.rs", "fn a() {}\n")]));
+    for policy in [json!("first"), json!(""), json!({}), json!(true)] {
+        assert!(
+            serde_json::from_value::<NavigationRequest>(json!({
+                "expectedRevision":pin,"path":"a.rs","line":1,"semanticProducerPolicy":policy
+            }))
+            .is_err()
+        );
+    }
+    let combined: NavigationRequest = serde_json::from_value(json!({
+        "expectedRevision":pin,"path":"a.rs","line":1,
+        "semanticProducerId":PRODUCER,"semanticProducerPolicy":"solePublished"
+    }))
+    .unwrap();
+    assert!(
+        combined
+            .validate()
+            .unwrap_err()
+            .downcast_ref::<InvalidRequest>()
+            .is_some()
+    );
+    for error in [
+        publisher.store.navigation_at(&combined).unwrap_err(),
+        publisher
+            .store
+            .evidence_response()
+            .unwrap()
+            .navigation_at(&combined)
+            .unwrap_err(),
+    ] {
+        assert!(
+            error.downcast_ref::<InvalidRequest>().is_some(),
+            "{error:#}"
+        );
+    }
+    let null: NavigationRequest = serde_json::from_value(json!({
+        "expectedRevision":pin,"path":"a.rs","line":1,"semanticProducerPolicy":null
+    }))
+    .unwrap();
+    match null {
+        NavigationRequest::Source(selector) => {
+            assert!(selector.semantic_producer_policy.is_none());
+            assert!(selector.semantic_producer_id.is_none());
+        }
+        _ => panic!("source selector expected"),
+    }
 }
