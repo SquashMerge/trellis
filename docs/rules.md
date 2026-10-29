@@ -95,15 +95,20 @@ paths = ["tests/fixtures/**"]
 display = "hidden" # "expanded" | "collapsed" | "hidden"
 ```
 
-- `"expanded"` draws the band with its directory chips open on first view.
-- `"collapsed"` draws a one-line summary band until the viewer expands it.
+- `"expanded"` draws the band open on its module chips on first view.
+- `"collapsed"` draws a one-line summary band (header and count chips) until the viewer
+  opens it. This is the same as no `display` field.
 - `"hidden"` leaves the band out of the diagram and lists it in a footer line
   (`N hidden layers · M files · E edges`) from which the viewer can show it.
 
 Any other value, or a non-string, is a located `invalid_rules` schema error.
-Without the field the browser chooses: bands start collapsed, and a layer with no
+Without the field a band starts collapsed (#391 ruling), and a layer with no
 cross-layer production references is collapsed into the "quiet layers" footer.
 That automatic collapsing never applies to a layer with an explicit `display`.
+Under the default production metrics population, a test or fixture layer **without**
+a `display` field (#424: every file is under a fixture root or holds only stored test
+callables) joins the hidden footer until **Include tests and fixtures** is on. An
+authored `display` hint on such a layer always wins.
 Assignment, verdicts, reference counts, exceptions and every check, explain,
 references and MCP result are unchanged. The Architecture layer inventory carries
 `layers[].display` (`null` when absent). Under the explicit #395 browser

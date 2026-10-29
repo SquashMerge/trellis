@@ -2,9 +2,9 @@
 
 Architecture is a tab in Diagrams for reviewing dependencies and authoring reviewed
 exceptions in the checkout. It shows authored layer bands and directed
-**structural references · syntax evidence**, not compiler-resolved calls. A module is one
+**structural references · syntax evidence**, not compiler-resolved calls. A native module is one
 indexed file with its full `(sourceSetId, language, path, sid)` identity. Paths are labels,
-not inferred package names or identities.
+not inferred package names or identities; module chips (below) only group them for display.
 
 ## Layers and evidence
 
@@ -36,6 +36,34 @@ Reviewed exceptions retain their underlying verdict and reason. Upward counts ca
 the word **deviation** as well as error color; peer/shared deviations are not called
 upward references. Same-layer sites remain in evidence totals rather than module arrows.
 Unassigned endpoints and unresolved sites remain explicit unknown evidence.
+
+## Module chips and counts (#424)
+
+An open band draws **one chip per module**, not per file. Bands start collapsed unless
+their authored `display` is `"expanded"` (#391 ruling; see [rules](rules.md#layer-display-hint)). A module is a browser display
+grouping computed from the existing response, not an identity or a new API field: the
+first path component below the band's common directory, where a file and its same-named
+directory form one module (`src/store.rs` and `src/store/**` are `store`), and a
+directory's `mod.rs` or `__init__.py` is that module's root file. A one-file
+module is that file's chip. Selecting a module chip opens it one level (its root file,
+then nested modules) down to file chips; selecting a band header folds or opens it.
+Chips show the module's maximum (minimum for Maintainability) displayed metric and its
+measured file count; files without selected callables remain counted in a note.
+
+Band headers show only the **non-zero** outgoing production reference-site counts as
+compact chips: `↑` upward deviation and `⇄` peer or shared-outbound deviation in the
+error colour, then `↓` downward, `→shared`, `allowed` (by `layer_policy`), `excepted`
+and `unknown`. Arrows between bands carry the same counts (`↑52`, `↓8 excepted`), with
+the direction and verdict in their accessible names. These are sums of the summary
+edges, so they equal the `$layers` instances' `referenceCount` from
+`trellis rules check --format json` on the same pin and rules.
+
+The SPEC §9 size cap applies to chips: at most 40 per band or open module and 150 in
+the whole diagram, counting every note. The rest of a list becomes one visible "N files
+not drawn" note that opens the layer's complete file list in the inspector. Once the
+budget is spent, further bands and modules stay folded and no more notes are added; the
+status line reports the total not drawn. Test and fixture layers without a `display`
+hint stay in the hidden footer until **Include tests and fixtures in metrics** is on.
 
 Click a module or select it with Enter/Space to inspect its identity, layer, captured
 physical file lines, callable count, every metric and incident references. Select a

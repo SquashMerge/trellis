@@ -2,6 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {mkdirSync, readFileSync, writeFileSync, rmSync} = require("node:fs");
+const {spawnSync} = require("node:child_process");
 const {dirname, join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
@@ -28,6 +29,8 @@ const sources = new Map([
 for (let i = 0; i < 33; i++) sources.set(`src/leaf_${i}.rs`, `pub fn leaf_${i}(value: i32) -> i32 { ${i % 3 ? "value + 1" : "if value > 0 { value } else { 0 }"} }\n`);
 const names = [...sources.keys()].map(path => path.slice(4, -3));
 sources.set("src/lib.rs", names.map(name => `pub mod ${name};`).join("\n") + "\n");
+// A two-file module: `low.rs` and `low/` form one `low` module chip.
+sources.set("src/low/extra.rs", "pub fn extra(value: i32) -> i32 { if value > 1 { value } else { 1 } }\n");
 const rules = `version = 1
 [layers.top]
 order = 1
@@ -40,7 +43,7 @@ order = 2
 paths = ["src/peer.rs"]
 [layers.low]
 order = 3
-paths = ["src/low.rs", "src/leaf_2?.rs", "src/leaf_3?.rs"]
+paths = ["src/low.rs", "src/low/**", "src/leaf_2?.rs", "src/leaf_3?.rs"]
 [layers.shared]
 shared = true
 paths = ["src/shared.rs"]
@@ -58,10 +61,10 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(config, callback) {
+async function published(config, callback, extra = new Map()) {
   const paths = H.fixture("", "placeholder.txt");
   rmSync(paths.source);
-  for (const [path, text] of sources) {
+  for (const [path, text] of [...sources, ...extra]) {
     const target = join(paths.workspace, path);
     mkdirSync(dirname(target), {recursive:true}); writeFileSync(target, text);
   }
@@ -163,7 +166,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(dto.indexGeneration, pin.indexGeneration); assert.equal(dto.indexRevision, pin.indexRevision);
   assert.equal(dto.state, "ready"); assert.equal(dto.evidenceTier, "syntax"); assert.equal(dto.semanticComplete, false);
   assert.equal(dto.role, "production");
-  assert.equal(dto.modules.length, 41);
+  assert.equal(dto.modules.length, 42);
   assert.equal(new Set(dto.modules.map(module => identityKey(module.identity))).size, dto.modules.length);
   const cli = await H.run(H.binary, ["references", "--workspace", paths.workspace, "--pin", `${pin.indexGeneration}:${pin.indexRevision}`, "--limit", "5"], {env:paths.env});
   const references = JSON.parse(cli.stdout).payload;
@@ -328,13 +331,13 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await ready(page);
   assert.equal(await page.locator("#architecture-tests").isChecked(), true);
   assert.equal(await module.locator("rect").first().getAttribute("fill"), heat);
-  const testEdge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 test sites\s+deviation$/});
+  const testEdge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 test sites · upward\s+deviation$/});
   await testEdge.focus(); await page.keyboard.press("Enter");
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "low → top");
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /2 exact test structural reference sites.*hypothetical policy only/is);
   await page.locator("#architecture-tests").uncheck();
   await page.waitForFunction(() => ![...document.querySelectorAll('#architecture-diagram [role=button]')].some(node => node.getAttribute("aria-label")?.includes("test sites")));
-  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites\s+deviation$/});
+  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation$/});
   await edge.click();
   const edgeDetail = await page.locator("#architecture-inspector-content").textContent();
   assert.match(edgeDetail, /2 exact production structural reference sites.*deviates/is);
@@ -436,62 +439,125 @@ const bandStates = page => page.locator("#architecture-diagram [data-trellis-lay
 const moduleIds = page => page.locator("#architecture-diagram [data-trellis-module-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-module-id")).sort());
 const focused = (page, selector) => page.locator(selector).evaluate(node => document.activeElement === node);
 
-test("Architecture starts summary-first: collapsed bands, deviations only, quiet footer, keyboard expansion and directory drill-down", {timeout:240000}, async () => published(rules, async selected => {
+// `trellis rules check` exits nonzero on production deviations; its JSON still reports every instance.
+function rulesCheck(selected) {
+  const {pin, paths} = selected;
+  const result = spawnSync(H.binary, ["rules", "check", "--format", "json", "--workspace", paths.workspace, "--pin", `${pin.indexGeneration}:${pin.indexRevision}`],
+    {env:paths.env, encoding:"utf8", maxBuffer:64 * 1024 * 1024, timeout:120000});
+  assert.ok(result.stdout, result.stderr);
+  return JSON.parse(result.stdout).payload;
+}
+// Expected header chips per layer from the CLI's own $layers instances (production, outgoing).
+function expectedChips(check, layers) {
+  const byName = new Map(layers.map(layer => [layer.name, layer])), totals = new Map();
+  for (const row of check.instances) {
+    if (row.rule !== "$layers" || !row.sourceLayer || !row.destinationLayer || row.sourceLayer === row.destinationLayer) continue;
+    const source = byName.get(row.sourceLayer), destination = byName.get(row.destinationLayer), ordered = !source.shared && !destination.shared;
+    const key = row.excepted ? "excepted" : row.status === "deviates" ? (ordered && destination.order < source.order ? "↑" : "⇄") :
+      row.status !== "conforms" ? "unknown" : destination.shared ? "→shared" : ordered && destination.order > source.order ? "↓" : "allowed";
+    const counts = totals.get(row.sourceLayer) || new Map();
+    counts.set(key, (counts.get(key) || 0) + row.referenceCount); totals.set(row.sourceLayer, counts);
+  }
+  const order = ["↑", "⇄", "↓", "→shared", "allowed", "excepted", "unknown"];
+  return new Map([...totals].map(([layer, counts]) => [layer, order.filter(key => counts.get(key)).map(key => `${key}${/^[↑⇄↓]$/.test(key) ? "" : " "}${counts.get(key)}`)]));
+}
+const chipTexts = (page, layer) => page.locator(`#architecture-diagram [data-trellis-layer-id="${layer}"] > text.trellis-architecture-stat`)
+  .evaluateAll(nodes => nodes.map(node => [node.textContent, node.getAttribute("data-tone")]));
+
+test("Architecture draws module chips per band, count chips matching rules check, compact arrows and opens a module to its files", {timeout:240000}, async () => published(rules, async selected => {
   const {page} = selected;
   await ready(page);
   const dto = (await architecture(selected)).data.payload;
   const flagged = dto.edges.filter(edge => edge.role === "production" && ((edge.status === "deviates" && !edge.excepted) || edge.status === "unknown"));
   assert.equal(await page.locator("#architecture-deviations-only").isChecked(), true, "production deviations exist, so review starts focused");
-  assert.equal(await page.locator("#architecture-diagram [data-trellis-module-id]").count(), 0, "bands start collapsed: no file chips");
-  assert.deepEqual(await bandStates(page), ["low", "mid", "peer", "shared", "top"].map(name => [name, "false"]));
+  assert.deepEqual(await bandStates(page), ["low", "mid", "peer", "shared", "top"].map(name => [name, "false"]), "#391: bands without a display hint start collapsed");
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), flagged.map(summaryKey).sort(), "only deviating or unknown production edges are drawn");
   assert.match(await page.locator("#architecture-focus-state").textContent(), /Showing 5 layers and 5 files/);
   assert.equal(await page.locator("#architecture-quiet-toggle").textContent(), "▸ 1 quiet layer · 0 files · 0 production edges");
   assert.equal(await page.locator("#architecture-quiet-names").textContent(), hostileLayer, "quiet layer names are text, never markup");
-  assert.equal(await page.locator("#architecture-hidden").isVisible(), false, "no authored hidden layers");
-  await capture(page, "architecture-summary-default");
-  const [height, viewport] = await page.locator("#architecture-diagram").evaluate(node => [node.scrollHeight, node.clientHeight]);
-  assert.ok(height < 1.5 * viewport, `the collapsed summary stays about one canvas tall (${height}px in ${viewport}px)`);
-
+  const lowModule = dto.modules.find(module => module.identity.path === "src/low.rs");
+  const lowModules = dto.modules.filter(module => module.layer === "low");
   const low = '#architecture-diagram [data-trellis-layer-id="low"]';
+  assert.equal(await page.locator("#architecture-diagram [data-trellis-module-id]").count(), 0, "collapsed bands draw no chips");
+  assert.match(await page.locator(low).getAttribute("aria-label"), /^3 · low · \d+ files/, "the band's one toggle is named by its layer");
+  const folded = page.locator("#architecture-diagram .pele-node").filter({hasText:new RegExp(`^${lowModules.length} files folded$`)});
+  assert.equal(await folded.count(), 1); assert.equal(await folded.getAttribute("role"), null, "the folded summary is not a second toggle");
   await page.locator(low).focus();
   await rerendered(page, () => page.keyboard.press("Enter"));
   assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true");
   assert.equal(await focused(page, low), true, "keyboard focus stays on the band after it re-renders");
-  await page.waitForFunction(() => document.querySelector("#architecture-inspector-title")?.textContent === "low");
-  const lowModule = dto.modules.find(module => module.identity.path === "src/low.rs");
-  const lowModules = dto.modules.filter(module => module.layer === "low");
-  assert.ok(lowModules.every(module => module.declarationCount > 0));
-  assert.deepEqual(await moduleIds(page), [identityKey(lowModule.identity)], "deviations only shows involved files");
-  assert.ok((await page.locator("#architecture-diagram [role=button]").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")))).some(label => label.includes(`${lowModules.length - 1} files outside deviations`)));
+  const focusedIds = await moduleIds(page);
+  assert.ok(focusedIds.includes(identityKey(lowModule.identity)), "deviations only draws the involved file");
+  assert.ok(!focusedIds.includes(identityKey(dto.modules.find(module => module.identity.path === "src/low/extra.rs").identity)), "uninvolved files stay out of focus");
+  assert.ok((await page.locator("#architecture-diagram [role=button]").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")))).some(label => label === `${lowModules.length - 1} files outside deviations`));
 
-  await page.locator("#architecture-deviations-only").focus();
-  await rerendered(page, () => page.keyboard.press("Space"));
-  assert.equal(await page.locator("#architecture-deviations-only").isChecked(), false);
-  assert.equal(await page.locator("#architecture-diagram [data-trellis-module-id]").count(), 0, "an expanded band aggregates many files into a directory chip");
-  const directory = `#architecture-diagram [data-trellis-directory-id='${JSON.stringify(["low", "src/"])}']`;
-  assert.match(await page.locator(directory).getAttribute("aria-label"), new RegExp(`^src/\\n${lowModules.length} files · max \\d+$`));
-  assert.equal(await page.locator(directory).getAttribute("aria-expanded"), "false");
-  await page.locator(directory).focus();
+  // Header chips: non-zero counts only, deviations in the error tone, equal to `trellis rules check`.
+  const chips = expectedChips(rulesCheck(selected), dto.layers);
+  assert.deepEqual(chips.get("low"), ["↑2"], "the fixture's low layer has a 2-site upward deviation");
+  for (const layer of ["low", "mid", "peer", "shared", "top"]) {
+    const drawn = await chipTexts(page, layer);
+    assert.deepEqual(drawn.map(([text]) => text), chips.get(layer) || [], `${layer} chips match rules check`);
+    for (const [text, tone] of drawn) assert.equal(tone, /^[↑⇄]/.test(text) ? "error" : "neutral", text);
+  }
+  const arrow = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation$/});
+  assert.equal(await arrow.locator("text").textContent(), "↑2", "the arrow carries the compact count");
+  assert.equal(await arrow.locator("rect").getAttribute("stroke"), "#FF8E9A", "an upward deviation uses the error colour");
+  await capture(page, "architecture-modules-default");
+  const [height, viewport] = await page.locator("#architecture-diagram").evaluate(node => [node.scrollHeight, node.clientHeight]);
+  assert.ok(height < 4 * viewport, `the module picture stays a few canvases tall, not a poster (${height}px in ${viewport}px)`);
+
+  await rerendered(page, () => page.locator("#architecture-deviations-only").uncheck());
+  const lowGroup = `#architecture-diagram [data-trellis-directory-id='${JSON.stringify(["low", "src/low"])}']`;
+  assert.match(await page.locator(lowGroup).getAttribute("aria-label"), /^low\n2 files · max \d+\nsrc\/low$/, "low.rs and low/ form one module chip");
+  assert.match(await page.locator(lowGroup).locator("text").textContent(), /^low\d+ · 2 files$/);
+  assert.equal(await page.locator(lowGroup).getAttribute("aria-expanded"), "false");
+  assert.ok(!(await moduleIds(page)).includes(identityKey(lowModule.identity)), "a module's files stay folded in its chip");
+  await page.locator(lowGroup).focus();
   await rerendered(page, () => page.keyboard.press("Enter"));
-  assert.equal(await page.locator(directory).getAttribute("aria-expanded"), "true");
-  assert.equal(await focused(page, directory), true);
-  assert.deepEqual(await moduleIds(page), lowModules.map(module => identityKey(module.identity)).sort(), "drilling into the directory shows its files");
+  assert.equal(await page.locator(lowGroup).getAttribute("aria-expanded"), "true");
+  assert.equal(await focused(page, lowGroup), true, "keyboard focus stays on the module after it re-renders");
+  const extra = dto.modules.find(module => module.identity.path === "src/low/extra.rs");
+  assert.ok((await moduleIds(page)).includes(identityKey(lowModule.identity)) && (await moduleIds(page)).includes(identityKey(extra.identity)), "an open module shows its files");
   await rerendered(page, () => page.keyboard.press("Enter"));
-  assert.equal(await page.locator("#architecture-diagram [data-trellis-module-id]").count(), 0, "the directory collapses again");
+  assert.ok(!(await moduleIds(page)).includes(identityKey(extra.identity)), "the module folds again");
+
+  await page.locator(low).focus();
+  await rerendered(page, () => page.keyboard.press("Enter"));
+  assert.equal(await page.locator(low).getAttribute("aria-expanded"), "false");
+  assert.deepEqual(await chipTexts(page, "low"), (chips.get("low") || []).map(text => [text, /^[↑⇄]/.test(text) ? "error" : "neutral"]), "a folded band keeps its count chips");
+  await rerendered(page, () => page.keyboard.press("Enter"));
+  assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true");
 
   await page.locator("#architecture-quiet-toggle").focus();
   await rerendered(page, () => page.keyboard.press("Enter"));
-  assert.equal(await page.locator("#architecture-quiet-toggle").getAttribute("aria-expanded"), "true");
   assert.ok((await bandStates(page)).some(([name]) => name === hostileLayer), "the quiet layer is drawn on request");
   assert.equal(await page.locator("#architecture-diagram img").count(), 0);
   const stored = await displayStore(selected);
   assert.deepEqual(stored.open, [["low", true]]);
   assert.equal(stored.deviationsOnly, false); assert.equal(stored.quiet, true); assert.deepEqual(stored.drilled, []);
   await rerendered(page, () => page.locator("#architecture-refresh").click());
-  assert.equal(await page.locator(low).getAttribute("aria-expanded"), "true", "expansion is remembered for this checkout");
-  assert.equal(await page.locator("#architecture-deviations-only").isChecked(), false);
+  assert.equal(await page.locator("#architecture-deviations-only").isChecked(), false, "display choices are remembered for this checkout");
 }));
+
+test("Architecture hides test and fixture layers until tests and fixtures are included", {timeout:240000}, async () => {
+  const config = `${rules}[layers.fixtures]\norder = 0\npaths = ["tests/fixtures/**"]\n`;
+  const extra = new Map([["tests/fixtures/sample.rs", "pub fn sample(value: i32) -> i32 { if value > 0 { value } else { 0 } }\n"]]);
+  await published(config, async selected => {
+    const {page} = selected;
+    await ready(page);
+    const dto = (await architecture(selected)).data.payload;
+    assert.equal(dto.modules.find(module => module.layer === "fixtures").excludedReason, "fixture");
+    assert.ok(!(await bandStates(page)).some(([name]) => name === "fixtures"), "the fixture layer is not drawn first, or at all, by default");
+    assert.match(await page.locator("#architecture-hidden-toggle").textContent(), /1 hidden layer · 1 file/);
+    assert.equal(await page.locator("#architecture-hidden-names").textContent(), "fixtures (tests/fixtures; include them to show)");
+    await rerendered(page, () => page.locator("#architecture-deviations-only").uncheck());
+    await page.locator("#architecture-metric-tests").check();
+    await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("all indexed callables"));
+    await ready(page);
+    assert.equal(await page.locator("#architecture-hidden").isVisible(), false);
+    assert.match(await page.locator("#architecture-quiet-names").textContent(), /fixtures/, "with tests included the edge-free fixture layer is an ordinary quiet layer");
+  }, extra);
+});
 
 test("Architecture applies authored display hints without changing evaluation", {timeout:240000}, async () => {
   const hinted = rules.replace("[layers.peer]\norder = 2\n", "[layers.peer]\norder = 2\ndisplay = \"hidden\"\n")
@@ -565,7 +631,7 @@ test("Architecture review keeps exact evidence, independent filters and all unas
   const {page} = selected;
   await ready(page);
   const dto = (await architecture(selected)).data.payload;
-  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites\s+deviation$/});
+  const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation$/});
   // In the summary a skip-level count can sit under a peer count; select it by keyboard.
   await edge.focus(); await page.keyboard.press("Enter");
   await page.locator("#architecture-review-panel").waitFor({state:"visible"});

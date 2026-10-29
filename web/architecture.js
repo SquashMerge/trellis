@@ -20,6 +20,37 @@
   const labels = {loc:"LOC (callable ranges)", sloc:"SLOC (callable ranges)", commentLines:"Comment lines (callable ranges)",
     cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
     fanOut:"Fan-out (call sites)", fanIn:"Fan-in", halstead:"Halstead", parameters:"Parameters", exits:"Exits"};
+  const STATS = [["up", "↑", "upward deviation", true], ["cross", "⇄", "peer or shared deviation", true], ["down", "↓", "downward"],
+    ["shared", "→shared ", "into shared"], ["allowed", "allowed ", "allowed by policy"], ["excepted", "excepted ", "excepted"], ["unknown", "unknown ", "unknown"]];
+  // SPEC §9 size cap: chips per band or open module, and in the whole diagram.
+  const ENTRY_CAP = 40, BOX_CAP = 150;
+  const stem = name => { const dot = name.lastIndexOf("."); return dot > 0 ? name.slice(0, dot) : name; };
+  // A directory module's own root file: shown first when it opens, never as a "mod" chip.
+  const ROOT_FILES = new Set(["mod.rs", "__init__.py"]);
+  // Longest common directory ("" or ending in "/") of a band's file paths.
+  function commonDirectory(paths) {
+    let shared = null;
+    for (const path of paths) {
+      const parts = path.split("/").slice(0, -1);
+      if (shared === null) { shared = parts; continue; }
+      let i = 0;
+      while (i < shared.length && i < parts.length && shared[i] === parts[i]) i++;
+      shared = shared.slice(0, i);
+    }
+    return shared?.length ? `${shared.join("/")}/` : "";
+  }
+  // A module is the first path component below `base`; a file and its same-named
+  // directory (Rust's `store.rs` and `store/`) form one module. Paths stay labels.
+  function groupModules(modules, base) {
+    const groups = new Map();
+    for (const module of modules) {
+      const rest = module.identity.path.slice(base.length), slash = rest.indexOf("/");
+      const name = slash >= 0 ? rest.slice(0, slash) : ROOT_FILES.has(rest) ? rest : stem(rest);
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push(module);
+    }
+    return [...groups].sort(([a], [b]) => a.localeCompare(b));
+  }
   function create({request, context, readSource, openTreemap, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
@@ -95,24 +126,33 @@
     function layerLabel(layer) {
       const modules = view.modules.filter(module => module.layer === layer.name);
       const values = modules.map(module => metricValue(module.metrics, metric)).filter(finite);
-      const outgoing = view.edges.filter(edge => edge.sourceLayer === layer.name && edge.role === "production");
-      const byName = new Map(view.layers.map(item => [item.name, item]));
-      let down = 0, up = 0, upDeviation = 0, other = 0, exceptions = 0;
-      for (const edge of outgoing) {
-        const destination = byName.get(edge.destinationLayer);
-        if (edge.excepted) exceptions += edge.count;
-        if (!layer.shared && destination && !destination.shared && destination.order > layer.order) down += edge.count;
-        else if (!layer.shared && destination && !destination.shared && destination.order < layer.order) {
-          up += edge.count;
-          if (edge.status === "deviates" && !edge.excepted) upDeviation += edge.count;
-        }
-        else if (edge.status === "deviates" && !edge.excepted) other += edge.count;
-      }
       const packages = (view.references?.externalPackages || []).filter(item => layerOf(item.identity) === layer.name);
       const max = values.length ? String(values.reduce((most, value) => Math.max(most, value), -Infinity)) : "—";
-      // Compact summary: a collapsed band is one short block, not a poster.
-      return [`${layer.shared ? "Shared" : layer.order} · ${layer.name} · ${modules.length} files${packages.length ? ` · ${packages.length} external packages` : ""}${metric === "layer" ? "" : ` · max ${metric} (${aggregate}) ${max}`}`,
-        `Up deviation: ${upDeviation} · peer/shared: ${other} · prod ↓${down} ↑${up} · excepted ${exceptions}`].join("\n");
+      // The narrow shared box stacks its header; ordered bands keep one line.
+      const parts = [`${layer.shared ? "Shared" : layer.order} · ${layer.name}`, `${plural(modules.length, "file")}${packages.length ? ` · ${packages.length} external packages` : ""}`];
+      if (metric !== "layer") parts.push(`max ${metric} (${aggregate}) ${max}`);
+      return parts.join(layer.shared ? "\n" : " · ");
+    }
+    // Outgoing production reference sites by verdict: the same summary edges the arrows draw.
+    function layerCounts(layer) {
+      const byName = new Map(view.layers.map(item => [item.name, item]));
+      const counts = {up:0, cross:0, down:0, shared:0, allowed:0, excepted:0, unknown:0};
+      for (const edge of view.edges) {
+        if (edge.sourceLayer !== layer.name || edge.role !== "production") continue;
+        const destination = byName.get(edge.destinationLayer), ordered = !layer.shared && destination && !destination.shared;
+        if (edge.excepted) counts.excepted += edge.count;
+        else if (edge.status === "deviates") counts[ordered && destination.order < layer.order ? "up" : "cross"] += edge.count;
+        else if (edge.status !== "conforms") counts.unknown += edge.count;
+        else if (destination?.shared) counts.shared += edge.count;
+        else counts[ordered && destination.order > layer.order ? "down" : "allowed"] += edge.count;
+      }
+      return counts;
+    }
+    // Only non-zero counts become chips; deviations carry the error tone and a glyph.
+    function layerStats(layer) {
+      const counts = layerCounts(layer);
+      return STATS.filter(([key]) => counts[key] > 0).map(([key, glyph, words, error]) =>
+        ({key, count:counts[key], text:`${glyph}${counts[key]}`, label:`${counts[key]} outgoing production reference sites · ${words}`, tone:error ? "error" : "neutral"}));
     }
     // Summary-first display (#391): presentation state only, remembered per checkout.
     let shown = null, shownRoot = null;
@@ -138,7 +178,16 @@
     }
     // Authored rules.toml presentation hint (#391 ruling); absent leaves the choice to the browser.
     const hint = layer => ["expanded", "collapsed", "hidden"].includes(layer.display) ? layer.display : null;
+    // Bands open on module chips unless the authored hint asks for a collapsed summary.
+    // #391 ruling: an absent hint starts collapsed like "collapsed"; "expanded" opens on module chips.
     const expanded = layer => shown.open.has(layer.name) ? shown.open.get(layer.name) : hint(layer) === "expanded";
+    // A test or fixture layer: every file is a fixture input or holds only test callables.
+    function testLayer(layer, modules) {
+      const members = modules.filter(module => module.layer === layer.name);
+      const test = module => module.excludedReason === "fixture" || (module.roleCounts?.production === 0 && module.roleCounts?.test > 0);
+      const empty = module => !module.excludedReason && module.roleCounts?.production === 0 && module.roleCounts?.test === 0;
+      return members.some(test) && members.every(module => test(module) || empty(module));
+    }
     const flagged = edge => (edge.status === "deviates" && !edge.excepted) || edge.status === "unknown";
     function summary(payload) {
       const production = payload.edges.filter(edge => edge.role === "production"), focusEdges = production.filter(flagged);
@@ -148,17 +197,16 @@
         .filter(identity => identity && !external(identity)).map(moduleKey));
       const deviates = production.some(edge => edge.status === "deviates" && !edge.excepted);
       const focus = focusEdges.length > 0 && (shown.deviationsOnly ?? deviates);
+      // Unhinted test and fixture layers join the hidden footer until tests and fixtures are included;
+      // an authored display hint always wins.
+      const tests = new Set(role === "production" ? payload.layers.filter(layer => hint(layer) === null && testLayer(layer, payload.modules)).map(layer => layer.name) : []);
+      const hidden = payload.layers.filter(layer => hint(layer) === "hidden" || tests.has(layer.name));
       // Automatic quiet collapse applies only to layers without an authored display hint.
-      const quiet = payload.layers.filter(layer => hint(layer) === null && !active.has(layer.name));
-      const hidden = payload.layers.filter(layer => hint(layer) === "hidden");
-      const layers = new Set(payload.layers.filter(layer => hint(layer) === "hidden" ? shown.hidden : quiet.includes(layer) ? shown.quiet :
+      const quiet = payload.layers.filter(layer => hint(layer) === null && !hidden.includes(layer) && !active.has(layer.name));
+      const layers = new Set(payload.layers.filter(layer => hidden.includes(layer) ? shown.hidden : quiet.includes(layer) ? shown.quiet :
         !focus || focusLayers.has(layer.name)).map(layer => layer.name));
       const hiddenEdges = production.filter(edge => hidden.some(layer => layer.name === edge.sourceLayer || layer.name === edge.destinationLayer)).length;
-      return {focusEdges, focus, quiet, hidden, hiddenEdges, layers, involved};
-    }
-    function directoryOf(path, depth) {
-      const parts = path.split("/").slice(0, -1);
-      return parts.length ? parts.slice(0, depth).join("/") + "/" : "./";
+      return {focusEdges, focus, quiet, hidden, tests, hiddenEdges, layers, involved};
     }
     function worst(modules) {
       if (metric === "layer") return undefined;
@@ -166,31 +214,51 @@
       if (!values.length) return null;
       return metric === "maintainabilityIndex" ? Math.min(...values) : Math.max(...values);
     }
-    // Directory chips first; files appear only when a directory is drilled into.
-    function entries(layerKey, modules, layout, scale) {
+    // One chip per module; a click opens it one level, down to file chips.
+    function level(layerKey, base, members, scale) {
+      return groupModules(members, base).map(([name, files]) => {
+        files.sort((a, b) => a.identity.path.localeCompare(b.identity.path));
+        if (files.length === 1) return {type:"module", module:files[0], name};
+        const prefix = `${base}${name}`, key = JSON.stringify([layerKey, prefix]), open = shown.drilled.has(key), value = worst(files);
+        const amount = value === undefined ? "" : `${metric === "maintainabilityIndex" ? "min" : "max"} ${display(value)}`;
+        // An open module lists its own root file (`store.rs`, `store/mod.rs`, `pkg/__init__.py`) before its nested modules.
+        const inner = `${prefix}/`, root = file => !file.identity.path.startsWith(inner) || ROOT_FILES.has(file.identity.path.slice(inner.length));
+        const children = () => [...files.filter(root).map(module => ({type:"module", module, name:module.identity.path.slice(base.length)})),
+          ...level(layerKey, inner, files.filter(file => !root(file)), scale)];
+        return {type:"directory", key, open, size:files.length, band:scale.band(value), entries:[], children:open ? children : null,
+          label:`${name}\n${plural(files.length, "file")}${amount ? ` · ${amount}` : ""}\n${prefix}`,
+          shown:`${name}\n${value === undefined ? "" : `${display(value)} · `}${plural(files.length, "file")}`};
+      });
+    }
+    // Every chip and note costs one unit of the diagram budget, so a render never draws more
+    // than BOX_CAP. Past the cap, the rest of a list becomes one note that opens the full file list.
+    function capped(layerKey, list, budget) {
+      const room = Math.min(ENTRY_CAP, budget.left), kept = list.length > room ? list.slice(0, Math.max(0, room - 1)) : list;
+      budget.left -= kept.length;
+      for (const entry of kept) {
+        if (!entry.children) continue;
+        // With the budget spent, an open module stays folded rather than drawing an empty box.
+        if (budget.left > 0) entry.entries = capped(layerKey, entry.children(), budget); else entry.open = false;
+      }
+      if (kept.length === list.length) return kept;
+      const omitted = list.slice(kept.length).reduce((sum, entry) => sum + (entry.size ?? 1), 0);
+      budget.truncated += omitted;
+      if (budget.left < 1) return kept;
+      budget.left -= 1;
+      return [...kept, {type:"note", layerKey, label:`${plural(omitted, "file")} not drawn · diagram size cap\nselect to list ${layerKey === null ? "unassigned" : "this layer's"} files`,
+        shown:`${plural(omitted, "file")}\nnot drawn (cap)`}];
+    }
+    function entries(layerKey, modules, layout, scale, budget) {
       const involved = module => layout.involved.has(moduleKey(module.identity));
       const visible = layout.focus ? modules.filter(involved) : modules;
       const measured = visible.filter(module => module.declarationCount > 0 || involved(module));
-      let depth = Math.max(1, ...measured.map(module => module.identity.path.split("/").length - 1)), groups;
-      do {
-        groups = new Map();
-        for (const module of measured) {
-          const directory = directoryOf(module.identity.path, depth);
-          if (!groups.has(directory)) groups.set(directory, []);
-          groups.get(directory).push(module);
-        }
-      } while (groups.size > 12 && --depth >= 1);
-      const result = [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([directory, members]) => {
-        members.sort((a, b) => a.identity.path.localeCompare(b.identity.path));
-        if (members.length === 1) return {type:"module", module:members[0]};
-        const key = JSON.stringify([layerKey, directory]), open = shown.drilled.has(key), value = worst(members);
-        const label = `${directory}\n${members.length} files${value === undefined ? "" : ` · ${metric === "maintainabilityIndex" ? "min" : "max"} ${display(value)}`}`;
-        return {type:"directory", key, label, open, band:scale.band(value), entries:open ? members.map(module => ({type:"module", module})) : []};
-      });
-      const lines = [], unmeasured = visible.length - measured.length, hidden = modules.length - visible.length;
-      if (unmeasured) lines.push(`${plural(unmeasured, "file")} · metrics unavailable`, `no ${callables()}`);
-      if (hidden) lines.push(`${plural(hidden, "file")} outside deviations`);
-      if (lines.length) result.push({type:"note", layerKey, label:lines.join("\n")});
+      // Names come from every band member, so focus never renames a module.
+      const result = capped(layerKey, level(layerKey, commonDirectory(modules.map(module => module.identity.path)), measured, scale), budget);
+      // Notes are chip-sized: a short drawn label, the full sentence as the accessible name.
+      const unmeasured = visible.length - measured.length, hidden = modules.length - visible.length;
+      const note = entry => { if (budget.left > 0) { budget.left -= 1; result.push(entry); } };
+      if (unmeasured) note({type:"note", layerKey, label:`${plural(unmeasured, "file")} · metrics unavailable\nno ${callables()}`, shown:`${plural(unmeasured, "file")}\nno metrics`});
+      if (hidden) note({type:"note", layerKey, label:`${plural(hidden, "file")} outside deviations`, shown:`${plural(hidden, "file")}\nnot deviating`});
       return result;
     }
     function footer(id, layers, open, text) {
@@ -203,6 +271,7 @@
       const files = layers => payload.modules.filter(module => layers.some(layer => layer.name === module.layer)).length;
       footer("quiet", layout.quiet, shown.quiet, `${plural(layout.quiet.length, "quiet layer")} · ${plural(files(layout.quiet), "file")} · 0 production edges`);
       footer("hidden", layout.hidden, shown.hidden, `${plural(layout.hidden.length, "hidden layer")} · ${plural(files(layout.hidden), "file")} · ${plural(layout.hiddenEdges, "production edge")}`);
+      get("architecture-hidden-names").textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
       const box = get("architecture-deviations-only");
       box.disabled = !layout.focusEdges.length; box.checked = layout.focus;
       get("architecture-focus-state").textContent = !layout.focusEdges.length ? "No deviating or unknown production references." :
@@ -246,17 +315,17 @@
       const scale = createScale(metric, aggregate, values, relative);
       legend(scale);
       displayState(payload, layout);
-      const unassigned = payload.modules.filter(module => module.layer === null).length;
+      const unassigned = payload.modules.filter(module => module.layer === null).length, budget = {left:BOX_CAP, truncated:0};
       try {
         if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
         const outcome = await window.TrellisArchitecturePele.render(get("architecture-diagram"), payload, {
           showTests, metric, aggregate, isCurrent:active,
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
           moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
-          layerLabel,
-          display:{layers:layout.layers, expanded:name => expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, scale),
+          layerLabel, layerStats,
+          display:{layers:layout.layers, expanded:name => budget.left > 0 && expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, scale, budget),
             edge:edge => !layout.focus || flagged(edge),
-            unassigned:layout.focus ? null : {label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, expanded:shown.unassigned}},
+            unassigned:layout.focus ? null : {label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
           onSelectModule:module => { if (active() && payload.modules.includes(module)) inspect("module", module); },
           onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) inspect("edge", edge); },
           onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },
@@ -280,7 +349,7 @@
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
-        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}${layout.focus ? " · deviations only" : ""}. Metrics: ${aggregate}, ${population()} · ${exclusions(payload.modules)}.`, "ready");
+        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}${layout.focus ? " · deviations only" : ""}${budget.truncated ? ` · ${plural(budget.truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""}. Metrics: ${aggregate}, ${population()} · ${exclusions(payload.modules)}.`, "ready");
         return true;
       } catch (error) {
         if (!active()) return false;
@@ -702,5 +771,5 @@
     });
     return {refresh, reset, clearInspection};
   }
-  window.TrellisArchitecture = {create, moduleKey, quartiles, band, metricValue};
+  window.TrellisArchitecture = {create, moduleKey, quartiles, band, metricValue, commonDirectory, groupModules};
 })();
