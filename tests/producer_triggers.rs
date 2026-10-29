@@ -21,8 +21,8 @@ use trellis::store::{
 #[path = "support/producer.rs"]
 mod support;
 use support::{
-    Checkout, cache_dir, data_dir, producer_status, start_checkout, state_dir, stop_daemon,
-    stub_env, tripwire_dir, write_mode,
+    Checkout, cache_dir, data_dir, start_checkout, state_dir, stop_daemon, stub_env, tripwire_dir,
+    write_mode,
 };
 
 #[path = "support/semantic_batch.rs"]
@@ -69,6 +69,38 @@ impl Fixture {
             .unwrap()
     }
 
+    /// `trellis producer status`, through the armed environment: a daemon this call has to
+    /// launch carries the tripwire `PATH`, the stub registration and the test intervals.
+    fn status(&self) -> Value {
+        let output = self.run(&["producer", "status"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    /// The pid of the serving daemon.
+    fn daemon_pid(&self) -> i32 {
+        fs::read_to_string(self.checkout.home.join("daemon.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// Launch the daemon again after `stop_daemon`, through the armed environment, so no
+    /// other call can launch an unarmed one. Returns the new pid.
+    fn restart_daemon_after_stop(&self) -> i32 {
+        let old = self.daemon_pid();
+        self.status();
+        let new = self.daemon_pid();
+        assert_ne!(old, new, "the daemon was relaunched");
+        assert!(trellis::testing::process_running(new));
+        new
+    }
+
     fn index_db(&self) -> PathBuf {
         roots(&self.checkout).index_db(&identity(&self.checkout))
     }
@@ -81,7 +113,7 @@ impl Fixture {
     }
 
     fn pickup_state(&self) -> Value {
-        let status = producer_status(&self.checkout);
+        let status = self.status();
         status["producers"]
             .as_array()
             .unwrap()
@@ -103,10 +135,15 @@ impl Fixture {
         let runs = state_dir(&self.checkout).join("runs");
         let entries = fs::read_dir(&runs).map_or(0, |dir| dir.count());
         assert_eq!(entries, 0, "{phase}: a run directory exists");
-        let status = producer_status(&self.checkout);
+        let status = self.status();
         assert_eq!(status["activeRun"], Value::Null, "{phase}");
         let producers = status["producers"].as_array().unwrap();
-        assert!(!producers.is_empty());
+        // The serving daemon is the armed one: it registered the stub.
+        let stub = producers
+            .iter()
+            .find(|producer| producer["name"] == "trellis-synthetic-scip")
+            .unwrap_or_else(|| panic!("{phase}: the stub is not registered: {status}"));
+        assert_eq!(stub["detection"]["result"], "available", "{phase}: {stub}");
         for producer in producers {
             assert_eq!(
                 producer["lastRun"],
@@ -293,10 +330,21 @@ fn no_trigger_starts_a_producer() {
     let _ = fs::DirBuilder::new().mode(0o700).create(&pickups);
     let residue = pickups.join(RESIDUE);
     fs::DirBuilder::new().mode(0o700).create(&residue).unwrap();
+    // The artifact changes while the daemon is down, so the activation check has something
+    // observable to import.
+    let before_restart = fx.pickup_state()["sha256"].clone();
+    let offline = fx.javascript_bytes(1);
+    assert_ne!(before_restart, sha256(&offline).as_str());
     stop_daemon(&fx.checkout.home);
-    fx.assert_no_producer_started("restart (status launches the daemon)");
+    fs::write(&fx.artifact, &offline).unwrap();
+    let armed = fx.restart_daemon_after_stop();
+    fx.assert_no_producer_started("restart");
     trellis::testing::wait_until("the sweep to remove the residue", || !residue.exists());
-    fx.assert_no_producer_started("startup sweep");
+    trellis::testing::wait_until("the activation check to import the offline bytes", || {
+        fx.pickup_state()["sha256"] == sha256(&offline).as_str()
+    });
+    assert_eq!(fx.daemon_pid(), armed, "the armed daemon is still serving");
+    fx.assert_no_producer_started("startup sweep and activation check");
 
     // Native watcher: an edit publishes a new head.
     let before = head(&fx.checkout);
@@ -311,8 +359,9 @@ fn no_trigger_starts_a_producer() {
     fx.assert_no_producer_started("native watcher event");
 
     // Pickup watcher: different valid bytes are re-imported.
-    let regenerated = fx.javascript_bytes(1);
+    let regenerated = fx.javascript_bytes(2);
     let digest = sha256(&regenerated);
+    assert_ne!(fx.pickup_state()["sha256"], digest.as_str());
     fs::write(&fx.artifact, &regenerated).unwrap();
     trellis::testing::wait_until("the pickup watcher to re-import", || {
         let last = fx.pickup_state();

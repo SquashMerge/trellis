@@ -126,6 +126,8 @@ pub fn decide_with_retry(
 pub struct PickupOwner {
     workflow: Arc<std::sync::Mutex<()>>,
     watch: PickupWatch,
+    /// Set by `shutdown`: a retired owner records nothing more.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The nearest existing ancestor of `path`, canonicalized, with the missing tail re-appended.
@@ -245,9 +247,34 @@ impl PickupOwner {
         }));
     }
 
-    /// Stop the watch. Called before the runtime's handles are dropped.
+    /// Stop the watch and wait out an import in flight, so a retired owner can never record
+    /// into `pickup.json` after a successor runtime has taken over. The runtime is already
+    /// closing, so an in-flight import ends without waiting on this caller.
     pub fn shutdown(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         self.watch.shutdown();
+        drop(self.workflow.lock().unwrap());
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_workflow(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.workflow.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Re-read the configuration and match the watches to it.
+    fn resync(&self, store: &Store) {
+        let _workflow = self.workflow.lock().unwrap();
+        let (roots, identity) = store.state_topology();
+        if let Ok(Some(state)) = StateDir::existing(roots, identity) {
+            self.watch
+                .sync(state.read_pickup_config().ok().flatten().as_ref());
+        }
     }
 
     /// Block until startup reconciliation has finished, so its sweep cannot remove the pickup
@@ -489,6 +516,7 @@ impl PickupOwner {
         let _ = state.remove_pickup_dir(&generation_id);
         let (reply, last) = result?;
         if let Some(last) = last
+            && !self.closed.load(std::sync::atomic::Ordering::Acquire)
             && let Some(entry) = config.entries.iter_mut().find(|e| e.producer == producer)
         {
             entry.last_imported = Some(last);
@@ -544,5 +572,9 @@ impl Host for WatchHost {
 
     fn retry_due(&self, producer: &str) -> bool {
         self.owner.retry_due(&self.store, producer)
+    }
+
+    fn resync(&self) {
+        self.owner.resync(&self.store);
     }
 }

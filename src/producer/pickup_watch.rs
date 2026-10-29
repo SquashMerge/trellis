@@ -238,6 +238,9 @@ pub trait Host: Send + Sync {
     fn import(&self, producer: &str) -> anyhow::Result<()>;
     /// Whether a failed outcome for the producer's already-hashed bytes is due again.
     fn retry_due(&self, producer: &str) -> bool;
+    /// Re-read the pickup configuration and `sync` the watch to it (a read that failed at
+    /// startup is retried at each stat check).
+    fn resync(&self) {}
 }
 
 enum Msg {
@@ -248,6 +251,8 @@ struct Armed {
     artifact: PathBuf,
     watcher: Option<RecommendedWatcher>,
     tracker: Tracker,
+    /// A degraded watch is armed again at this time, once per stat-check interval.
+    rearm_at: Instant,
 }
 
 impl Armed {
@@ -335,6 +340,7 @@ impl PickupWatch {
                 Armed {
                     watcher: arm(&self.shared, producer, &artifact),
                     tracker: Tracker::new(Instant::now(), &intervals),
+                    rearm_at: Instant::now() + intervals.check,
                     artifact,
                 }
             });
@@ -378,6 +384,7 @@ impl PickupWatch {
 
 fn run(shared: &Shared, rx: &Receiver<Msg>, host: &dyn Host) {
     let mut activated = false;
+    let mut resync_at = Instant::now() + Intervals::current().check;
     loop {
         let busy = shared
             .entries
@@ -414,6 +421,10 @@ fn run(shared: &Shared, rx: &Receiver<Msg>, host: &dyn Host) {
         if phase != HostPhase::Ready {
             continue;
         }
+        if now >= resync_at {
+            resync_at = now + intervals.check;
+            host.resync();
+        }
         step_all(shared, host, &intervals, now);
     }
 }
@@ -425,7 +436,8 @@ fn step_all(shared: &Shared, host: &dyn Host, intervals: &Intervals, now: Instan
             .iter_mut()
             .filter_map(|(producer, armed)| {
                 // A watch that failed or errored is retried at each stat check.
-                if !armed.healthy() && armed.tracker.is_idle() {
+                if !armed.healthy() && armed.tracker.is_idle() && now >= armed.rearm_at {
+                    armed.rearm_at = now + intervals.check;
                     armed.watcher = arm(shared, producer, &armed.artifact);
                 }
                 let artifact = armed.artifact.clone();

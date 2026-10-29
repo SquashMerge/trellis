@@ -565,7 +565,12 @@ fn leading_ident(text: &str) -> &str {
 /// `self::super::` or `crate::producer::`, including the members of a `use` tree.
 fn sibling_references(text: &str, siblings: &[String]) -> Vec<String> {
     let mut found = Vec::new();
-    for prefix in ["super::", "crate::producer::", "trellis::producer::"] {
+    for prefix in [
+        "super::",
+        "producer::",
+        "crate::producer::",
+        "trellis::producer::",
+    ] {
         for (at, _) in text.match_indices(prefix) {
             let before = text[..at].chars().next_back();
             // `super::super::` and `self::super::` still end in one of the prefixes.
@@ -595,9 +600,16 @@ fn sibling_references(text: &str, siblings: &[String]) -> Vec<String> {
                     }
                     parts
                 }
+                None if rest.trim_start().starts_with('*') => vec!["*"],
                 None => vec![rest],
             };
             for member in members {
+                // A glob or an alias of the parent brings siblings in without naming them.
+                let member = member.trim();
+                if member == "*" || member.starts_with("self ") || member == "self" {
+                    found.push(member.to_owned());
+                    continue;
+                }
                 let ident = leading_ident(member);
                 if siblings.iter().any(|s| s == ident) {
                     found.push(ident.to_owned());
@@ -625,6 +637,10 @@ fn sibling_scanner_reads_paths_and_use_trees() {
     assert_eq!(seen("use crate::producer::run::Run;"), ["run"]);
     assert_eq!(seen("use self::super::exec;"), ["exec"]);
     assert!(seen("use super::{NOT_FOUND, ProducerName}; super::TrustProfile").is_empty());
+    assert_eq!(seen("use super::*;"), ["*"]);
+    assert_eq!(seen("use crate::{producer::run};"), ["run"]);
+    assert_eq!(seen("use super::{self as p, NOT_FOUND};"), ["self as p"]);
+    assert_eq!(seen("use crate::producer::*;"), ["*"]);
 }
 
 #[test]
