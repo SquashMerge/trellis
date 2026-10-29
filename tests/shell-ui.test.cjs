@@ -485,3 +485,60 @@ test("noncallable resolved target reads exact declaration source instead of requ
   assert.ok(requests.some(path=>path.startsWith("/api/source?") && path.includes("path=target.rs")));
   assert.equal(h.get("workspace-source-panel").hidden,false);
 });
+
+test("one index status reconciles jobs, freshness, stale evidence and unavailable status", () => {
+  const h = harness(true);
+  const label = () => h.get("workspace-index-label").textContent;
+  h.run(`$("stale").hidden=true;status.catchingUp=false;renderIndexStatus();`);
+  assert.match(label(), /^Fresh/);
+  h.run(`job={state:"failed",error:{code:"index_failed",message:"<img src=x>"}};showJob();`);
+  assert.equal(label(), "Index failed · see Diagnostics");
+  assert.ok(!label().includes("index_failed"));
+  assert.match(h.get("job").textContent, /index_failed/);
+  h.run(`job={state:"running",progress:{phase:"capture",total:0,completed:0}};waitingForJob=true;showJob();`);
+  assert.match(label(), /^Indexing · capture/);
+  assert.ok(!label().includes("0/0"));
+  h.run(`job={state:"done"};showJob();stale("Inputs changed");`);
+  assert.match(label(), /^Stale evidence/);
+  h.run(`staleMessage="";$("stale").hidden=true;status.catchingUp=true;renderIndexStatus();`);
+  assert.match(label(), /^Catching up/);
+  h.run(`status.catchingUp=undefined;renderIndexStatus();`);
+  assert.match(label(), /^Indexed · idle/);
+  h.run(`statusUnavailable=true;renderIndexStatus();`);
+  assert.match(label(), /^Index status unavailable/);
+  h.run(`resetCheckout();`);
+  assert.equal(label(), "No checkout selected");
+});
+test("checkout options use short observed identity and honest Git fallbacks as text", () => {
+  const h = harness();
+  const revision = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:7};
+  const base = {workspaceRoot:"/private/long/repo",revision};
+  assert.equal(h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"branch",name:"main"}}}), "repo ⎇ main · rev 12345678:7");
+  assert.match(h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"detached",shortCommit:"abc123"}}}), /repo ⎇ Detached abc123/);
+  assert.match(h.shell.checkoutLabel({...base,git:{state:"unavailable"}}), /repo ⎇ Git unavailable/);
+  assert.match(h.shell.checkoutLabel({...base,revision:null}), /Not indexed$/);
+  const literal = h.shell.checkoutLabel({...base,git:{state:"available",head:{kind:"branch",name:"<img src=x>"}}});
+  assert.ok(literal.includes("<img src=x>"));
+  assert.ok(!literal.includes("/private/long"));
+});
+
+test("selected cold and unavailable status never borrow Fresh from checkout discovery", () => {
+  const h=harness(true);
+  h.run(`checkouts[0].revision=status.revision;checkouts[0].catchingUp=false;status=null;renderIndexStatus();`);
+  assert.equal(h.get("workspace-index-label").textContent,"Loading index status…");
+  h.run(`indexNotReady=true;renderIndexStatus();`);
+  assert.equal(h.get("workspace-index-label").textContent,"Index not ready · retry status");
+  h.run(`statusUnavailable=true;renderIndexStatus();`);
+  assert.equal(h.get("workspace-index-state").attrs["data-state"],"failed");
+});
+test("shared status follows retained head observations and completed job details use their own pin", () => {
+  const h=harness(true);
+  h.run(`status.catchingUp=false;headObservation={pin:status.revision,head:{...status.revision,indexRevision:2},failed:false};showHeadObservation(headObservation);`);
+  assert.match(h.get("workspace-index-label").textContent,/retained revision/);
+  h.run(`headObservation={pin:status.revision,head:null,failed:true};showHeadObservation(headObservation);`);
+  assert.match(h.get("workspace-index-label").textContent,/Head comparison unavailable/);
+  h.run(`job={state:"done",revision:{...status.revision,indexRevision:9}};showJob();`);
+  assert.match(h.get("job").textContent,/rev 12345678:9/);
+  assert.doesNotMatch(h.get("job").textContent,/rev 12345678:1/);
+  assert.match(h.get("workspace-index-label").textContent,/Head comparison unavailable/);
+});

@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, selectedGit = null, gitSerial = 0, checkoutBusy = false, checkouts = [], sourceSerial = 0;
 const pendingRequests = new Set();
-let status = null;
+let status = null, statusUnavailable = false, indexNotReady = false, staleMessage = "";
 let statusSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null, waitingForJob = false;
@@ -41,6 +41,7 @@ function showHeadObservation(observation) {
     ? `Viewing revision ${IndexPin.label(pin)} · Older than head ${IndexPin.label(head)}`
     : rebuilt ? `Viewing revision ${IndexPin.label(pin)} · Index rebuilt. Reload at head.`
       : failed ? `Viewing revision ${IndexPin.label(pin)} · Head comparison unavailable.` : "";
+  renderIndexStatus();
 }
 function observePinnedHead() {
   if (!token || !selectedRootKey || !status?.revision || !status.workspaceRoot) return;
@@ -369,7 +370,7 @@ async function perform(action, control) {
 function form(id, action) {
   $(id).addEventListener("submit", event => { event.preventDefault(); perform(action, $(id).querySelector("button[type=submit]")); });
 }
-function stale(message) { $("stale").textContent = message; $("stale").hidden = false; }
+function stale(message) { staleMessage = message; $("stale").textContent = message; $("stale").hidden = false; renderIndexStatus(); }
 function clearSource() {
   sourceSerial++; sourceInspector = null; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
   $("source-path").textContent = "Choose a call to read its cached source snapshot.";
@@ -378,6 +379,9 @@ function clearSource() {
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
 function showSelectedGit(git) {
   selectedGit = git || null;
+  const row = checkouts.find(row => row.rootKey === selectedRootKey);
+  if (row) row.git = selectedGit;
+  updateCheckoutOptions();
   updateFilesBasis();
   window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
   if (!status) window.TrellisShell?.updateWorkspace(null);
@@ -399,11 +403,16 @@ async function refreshStatus(followup = false) {
   let data;
   try { data = await api("/api/status"); }
   catch (error) {
+    if (serial === statusSerial && session === epoch) {
+      statusUnavailable = error.code !== "index_not_ready";
+      indexNotReady = error.code === "index_not_ready";
+      renderIndexStatus();
+    }
     if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
       const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
       const listedRoot = selectedWorkspaceRoot, git = selectedGit;
       resetCheckout();
-      selectedRootKey = root; selectedWorkspaceRoot = listedRoot;
+      selectedRootKey = root; selectedWorkspaceRoot = listedRoot; indexNotReady = true;
       showSelectedGit(git);
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
@@ -425,6 +434,7 @@ async function refreshStatus(followup = false) {
   if (status && browseChanged) { clearNavigationHistory(); clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); clearSource(); }
   if (browseChanged) clearDependencyCatalog();
   resetHeadObservation();
+  statusUnavailable = false; indexNotReady = !nextPin;
   status = {...data, revision:nextPin};
   data = status;
   updateFilesBasis();
@@ -433,6 +443,7 @@ async function refreshStatus(followup = false) {
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
   renderCheckoutList();
+  updateCheckoutOptions();
   if (browseChanged && nextPin) {
     void viewerMetrics?.refresh();
     if (section === "diagrams" && !$("architecture-panel").hidden) void architecture?.refresh();
@@ -444,9 +455,10 @@ async function refreshStatus(followup = false) {
   $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   if (job && !activeJob(job)) showJob();
-  $("stale").hidden = true;
+  staleMessage = ""; $("stale").hidden = true;
   if (!nextPin) stale("Index not ready. Retry status after this checkout finishes indexing.");
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
+  renderIndexStatus();
   // A rejected optional catalog must not recursively request status when status is unchanged.
   if (nextPin && (browseChanged || !pairRefreshPending)) void refreshDependencies();
   } finally {
@@ -520,11 +532,12 @@ function resetCheckout() {
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
-  status = null; job = null; waitingForJob = false;
+  status = null; statusUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;
   resetHeadObservation();
   ["status", "diagnostics", "job"].forEach(id => $(id).textContent = "");
   $("file-filter").value = "";
   $("stale").hidden = true; $("catching-up").hidden = true;
+  renderIndexStatus();
   $("checkout-root").textContent = "No checkout selected";
   $("workspace").hidden = true; $("index").disabled = true; $("cancel").hidden = true;
   window.TrellisShell?.setConnected(false);
@@ -567,24 +580,57 @@ function checkoutIndexLabel(row) {
     : catchingUp === false ? {text:`Fresh · rev ${label}`, state:"fresh", shape:"○"}
     : {text:`Indexed · idle · rev ${label}`, state:"unknown", shape:"◇"};
 }
-function showCheckoutIndexState(row) {
-  const state = checkoutIndexLabel(row);
+function selectedIndexStatus() {
+  const row = checkouts.find(row => row.rootKey === selectedRootKey);
+  const catchingUp = status?.revision && IndexPin.equal(row?.revision, status.revision) ? row.catchingUp : status?.catchingUp;
+  const base = status?.revision ? checkoutIndexLabel({...row, state:"available", revision:status.revision, catchingUp}) : checkoutIndexLabel(row);
+  if (!selectedRootKey) return {state:"unknown", text:"No checkout selected"};
+  if (checkoutBusy) return {state:"failed", text:"Checkout busy · retry checkout list"};
+  if (statusUnavailable) return {state:"failed", text:"Index status unavailable · retry status"};
+  if (job?.state === "failed") return {state:"failed", text:"Index failed · see Diagnostics"};
+  if (job && activeJob(job)) return {state:"catching-up", text:jobText(job)};
+  if (indexNotReady) return {state:"unknown", text:"Index not ready · retry status"};
+  if (!status?.revision) return {...base, state:"unknown", text:"Loading index status…"};
+  if (headObservation?.failed) return {state:"stale", text:"Head comparison unavailable · see Diagnostics"};
+  const head = headObservation?.head, pin = status.revision;
+  if (head && (head.indexGeneration !== pin.indexGeneration || head.indexRevision > pin.indexRevision)) {
+    return {state:"stale", text:"Viewing retained revision · reload at head"};
+  }
+  if (staleMessage) return {state:"stale", text:"Stale evidence · see Diagnostics"};
+  return base;
+}
+function renderIndexStatus() {
+  const state = selectedIndexStatus();
   $("workspace-index-state")?.setAttribute("data-state", state.state);
-  if ($("workspace-index-label")) $("workspace-index-label").textContent = state.text;
+  $("workspace-index-label").textContent = state.text;
+  renderCheckoutList();
+}
+function updateCheckoutOptions() {
+  for (const option of $("checkout-select").children) {
+    const row = checkouts.find(row => row.rootKey === option.value);
+    if (!row) continue;
+    option.textContent = window.TrellisShell.checkoutLabel(row);
+    option.title = row.workspaceRoot || row.rootKey;
+  }
+  $("checkout-select").title = selectedWorkspaceRoot || "Choose a checkout";
+}
+function showCheckoutIndexState() {
+  renderIndexStatus();
 }
 function renderCheckoutList() {
   const list = $("indexed-checkouts");
   if (!list) return;
   list.replaceChildren();
   for (const row of checkouts) {
-    const li = element("li"), state = checkoutIndexLabel(row);
+    const li = element("li"), state = row.rootKey === selectedRootKey ? selectedIndexStatus() : checkoutIndexLabel(row);
     const name = row.workspaceRoot?.split("/").filter(Boolean).at(-1) || row.rootKey;
     const pick = button(name, () => selectCheckout(row.rootKey));
     pick.className = "checkout-pick"; pick.disabled = !selectable(row);
     pick.title = row.workspaceRoot || row.rootKey;
     pick.setAttribute("aria-pressed", String(row.rootKey === selectedRootKey));
     pick.append(element("span", window.TrellisShell?.formatGit(row.git) || "Git unavailable", "checkout-git"));
-    const freshness = element("span", `${state.shape} ${state.text}`, "checkout-freshness");
+    const shape = state.shape || ({fresh:"○", "catching-up":"◐", failed:"□", stale:"◇", unknown:"◇"}[state.state]);
+    const freshness = element("span", `${shape} ${state.text}`, "checkout-freshness");
     freshness.setAttribute("data-state", state.state); pick.append(freshness);
     li.append(pick); list.append(li);
   }
@@ -624,7 +670,8 @@ async function loadCheckouts() {
     const select = $("checkout-select"), choice = selectedRootKey || "";
     select.replaceChildren(checkoutOption("Choose a checkout", ""));
     for (const row of checkouts) {
-      const option = checkoutOption(`${row.workspaceRoot || row.rootKey} · ${row.state} · ${window.TrellisShell.formatGit(row.git)}`, row.rootKey);
+      const option = checkoutOption(window.TrellisShell.checkoutLabel(row), row.rootKey);
+      option.title = row.workspaceRoot || row.rootKey;
       option.disabled = !selectable(row); select.append(option);
     }
     select.value = choice;
@@ -633,7 +680,7 @@ async function loadCheckouts() {
     $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
       : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
-      : choice ? "Checkout selected." : "Choose a checkout to inspect. No checkout is selected automatically.";
+      : choice ? "" : "Choose a checkout to inspect. No checkout is selected automatically.";
     $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
     if (choice && !busy) showCheckoutIndexState(selected);
     if (recovering) await selectCheckout(choice);
@@ -682,8 +729,9 @@ async function selectCheckout(key) {
     job = await api("/api/jobs/current").catch(error => { if (error.name !== "AbortError") throw error; return null; });
     if (session !== epoch) return;
     waitingForJob = !!job && activeJob(job);
-    if (job) { showJob(); schedulePoll(); }
-    $("checkout-state").textContent = "Checkout ready.";
+    showJob();
+    if (job) schedulePoll();
+    $("checkout-state").textContent = "";
     void readNavigationLocation(true);
     $("notice").textContent = "Browse folders below. Indexed files expand to methods."
       + (tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "");
@@ -695,7 +743,8 @@ async function selectCheckout(key) {
     $("checkout-state").textContent = cold ? "Index not ready. Retry status after indexing starts." : `Checkout unavailable: ${error.message} Retry status; your selection is unchanged.`;
     $("status").textContent = cold ? "No validated index head is available yet." : "Selected checkout status unavailable.";
     $("refresh").disabled = false;
-    $("stale").hidden = false; $("stale").textContent = $("checkout-state").textContent;
+    stale($("checkout-state").textContent);
+    renderIndexStatus();
   }
 }
 $("checkout-select").addEventListener("change", event => { void selectCheckout(event.target.value); });
@@ -818,20 +867,21 @@ function activeJob(value) { return ["queued", "running"].includes(value.state); 
 function jobText(value) {
   const progress = value.progress, total = progress?.total;
   if (value.state === "done") {
-    const pin = status?.revision, files = status?.stats?.files;
-    return `Indexed${pin ? ` · rev ${IndexPin.label(pin)}` : ""}${Number.isSafeInteger(files) ? ` · ${files} files` : ""}`;
+    const pin = value.revision;
+    return `Indexed${pin ? ` · rev ${IndexPin.label(pin)}` : ""}`;
   }
-  if (value.state === "failed") return `Index failed${value.error ? ` · ${describe(value.error)}` : ""}`;
+  if (value.state === "failed") return "Index failed · see Diagnostics";
   const parts = [value.state === "queued" ? "Index queued · accepted" : "Indexing"];
   if (progress?.phase) parts.push(progress.phase);
   if (Number.isSafeInteger(total) && total > 0) parts.push(`${progress.completed ?? 0}/${total}`);
   if (!waitingForJob) parts.push("no longer waiting here");
-  if (value.error) parts.push(describe(value.error));
+  if (value.error) parts.push("see Diagnostics");
   return parts.join(" · ");
 }
 function showJob() {
-  if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; return; }
-  $("job").textContent = jobText(job);
+  if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; renderIndexStatus(); return; }
+  $("job").textContent = `${jobText(job)}${job.error ? `\n${describe(job.error)}` : ""}`;
+  renderIndexStatus();
   $("cancel").hidden = !waitingForJob || !activeJob(job);
   $("index").disabled = waitingForJob && activeJob(job);
 }

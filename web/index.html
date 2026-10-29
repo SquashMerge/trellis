@@ -41,11 +41,7 @@
       <select id="checkout-select" data-testid="checkout-select" disabled><option value="">Choose a checkout</option></select>
       <button id="checkout-retry" type="button" hidden>Retry checkout list</button>
       <span id="checkout-state" role="status" aria-live="polite">Loading checkouts…</span>
-      <span id="checkout-root" class="checkout-root" data-testid="checkout-root">No checkout selected</span>
-      <span id="catching-up" class="warning" role="status" aria-live="polite" hidden>Catching up — evidence may be stale</span>
-      <span id="daemon-state" class="detail" role="status"></span>
     </section>
-    <div class="workspace-identity"><strong id="workspace-name">Code inspection</strong><span id="workspace-meta">Local workspace</span><span id="workspace-git" hidden></span><span id="workspace-index-state" class="index-state" data-state="unknown" role="status"><span class="state-shape" aria-hidden="true"></span><span id="workspace-index-label">Index status unavailable</span></span></div>
     <div class="header-actions">
       <button id="explorer-toggle" class="mobile-toggle" type="button" aria-controls="explorer-panel" aria-expanded="false">Explorer</button>
       <button id="inspector-toggle" class="mobile-toggle" type="button" aria-controls="call-inspector" aria-expanded="false">Inspector</button>
@@ -77,11 +73,29 @@
     <p id="notice" role="status" aria-live="polite">Connect to inspect a checkout. Indexing starts only when you request it.</p>
     <div id="workspace" hidden>
       <section class="workspace-toolbar" aria-labelledby="status-title">
-        <div class="bar workspace-actions"><h2 id="status-title">Workspace</h2><button id="refresh" type="button">Refresh status &amp; view</button><button id="index" type="button">Index workspace</button><button id="cancel" type="button" hidden>Stop waiting</button>
-          <details id="workspace-details"><summary>Status &amp; diagnostics</summary><div class="workspace-status"><p id="status"></p><h3>Diagnostics</h3><pre id="diagnostics"></pre></div></details>
+        <div class="bar workspace-actions">
+          <h2 id="status-title" class="sr-only">Workspace</h2>
+          <span id="workspace-index-state" class="index-state" data-state="unknown" role="status" aria-live="polite"><span class="state-shape" aria-hidden="true"></span><span id="workspace-index-label">Index status unavailable</span></span>
+          <button id="refresh" type="button">Refresh</button>
+          <button id="index" type="button">Index workspace</button>
+          <button id="cancel" type="button" hidden>Stop waiting</button>
+          <div id="retained-pin-status" class="retained-pin-status" role="status" aria-live="polite" hidden><span aria-hidden="true">◇</span><span id="retained-pin-label"></span><button id="reload-head" type="button">Reload at head</button></div>
+          <details id="workspace-details">
+            <summary>Diagnostics</summary>
+            <div class="workspace-status">
+              <h3>Selected checkout</h3>
+              <div class="workspace-identity"><strong id="workspace-name">Code inspection</strong><span id="workspace-meta">Local workspace</span><span id="workspace-git" hidden></span></div>
+              <p id="checkout-root" class="checkout-root" data-testid="checkout-root">No checkout selected</p>
+              <p id="daemon-state" class="detail" role="status"></p>
+              <p id="catching-up" class="warning" role="status" aria-live="polite" hidden>Catching up — evidence may be stale</p>
+              <p id="status"></p>
+              <p id="job" role="status"></p>
+              <p id="stale" class="warning" hidden></p>
+              <h3>Diagnostics</h3>
+              <pre id="diagnostics"></pre>
+            </div>
+          </details>
         </div>
-        <div id="retained-pin-status" class="retained-pin-status" role="status" aria-live="polite" hidden><span aria-hidden="true">◇</span><span id="retained-pin-label"></span><button id="reload-head" type="button">Reload at head</button></div>
-        <p id="job" role="status"></p><p id="stale" class="warning" hidden></p>
       </section>
       <div class="workspace-frame">
         <aside id="explorer-panel" aria-labelledby="files-title" class="file-browser">
