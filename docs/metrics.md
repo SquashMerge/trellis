@@ -6,7 +6,7 @@
 
 Metrics options accept exactly `role=production|all|test`; CLI uses `--role`. Omitted API/CLI
 options default to `all`. The Viewer and Architecture explicitly request `production` by default;
-their unchecked **Include tests in metrics** controls select `all` when checked. Test-only
+their unchecked **Include tests and fixtures in metrics** controls select `all` when checked. Test-only
 selection is available through API/CLI, not a third browser control. The payload echoes `role`.
 
 Role comes directly from each pinned native `Declaration.role` under
@@ -23,6 +23,67 @@ Each file row also carries `roleCounts: {production, test}` for all measured cal
 independent of the role selection; `declarationCount` is the selected count. Manifest-selected
 file/directory rows remain present with count zero and null numeric aggregates when the selected
 population is empty. A declaration selector excluded by role returns `not_found`.
+
+## Workbench heat (#395)
+
+Architecture, Treemap and the shared Diagrams explorer (including beside Sequence) use
+one fixed scale. Sequence itself does not invent metric values for call steps.
+`max` and `mean` use these per-callable bands; `mean` is the existing API name for average.
+Intervals include fractional averages, not just integer scores.
+
+| Metric | Low | Moderate | High | Hotspot |
+|---|---|---|---|---|
+| cognitive | ≤5 | >5–15 | >15–30 | >30 |
+| cyclomatic | ≤5 | >5–10 | >10–20 | >20 |
+| maxNesting | ≤2 | >2–3 | >3–4 | >4 |
+| sloc | ≤30 | >30–60 | >60–120 | >120 |
+| parameters | ≤3 | >3–5 | >5–7 | >7 |
+| fanOut | ≤7 | >7–15 | >15–30 | >30 |
+| maintainabilityIndex | ≥40 | ≥20–<40 | ≥10–<20 | <10 |
+| halstead.volume | ≤500 | >500–1000 | >1000–2000 | >2000 |
+
+Maintainability is higher-is-better; heat severity is inverted, values are not.
+`loc`, `commentLines`, `fanIn` and `exits` are informational and neutral by default.
+`sum` is neutral and labelled “relative totals; no callable risk bands”. It does
+not silently use quartiles. **Relative**, off by default in each view, explicitly
+switches to quartiles of the visible finite values and labels the legend “Relative
+to visible set”. Ties remain together: sorted cuts use
+`min(n-1, floor(n*p))` for `p=0.25,0.5,0.75`, with strict `value > cut` comparisons.
+Null and nonfinite values are unavailable, never zero. Changing filters cannot
+change a fixed colour. Changing Relative or colour does not fetch metrics.
+
+### Workbench population
+
+Browser requests explicitly send `workbench=true` on `/metrics` and `/architecture`;
+the payload echoes the choice. HTTP accepts only `workbench=true|false`. Authored rules
+are live configuration, not pinned code; Architecture uses the same captured configuration
+for assignments, the rules hash and metric exclusions. Omitted API/CLI options retain the existing full
+population (`workbench=false`, `role=all`). This is a view population choice, not
+a new stored role, metric definition, index format or source-only memo key.
+
+The default browser `role=production` uses stored declaration roles and additionally
+excludes fixture inputs under `tests/fixtures/` and
+`tools/synthetic-cohorts/templates/`, plus files assigned by the existing layer
+matcher to authored `display="hidden"` layers. The **Include tests and fixtures in
+metrics** checkbox requests `role=all` and restores those tests/fixtures/hidden-layer
+contributions. Expanding a layer, quiet-layer folding, path filtering and client
+visibility do not change this selected callable population. Missing rules add no
+layer exclusions; explicit fixture roots still apply.
+
+Under `workbench=true`, `web/vendor/` is the clear vendored/generated path rule:
+its files, including the bundled Pele renderer, never contribute metrics, even
+with tests included. First-party Pele adapters outside that directory remain
+eligible. This rule is documented and exact; it does not guess from filenames or
+layer names. No broad `web/` exclusion applies.
+
+Filtering happens once before file, directory, top-cognitive and declaration folds.
+File rows remain with physical lines and all-role `roleCounts`; an excluded
+population has count zero and null metric leaves. An optional file `excludedReason`
+(`fixture`, `vendored` or `hidden_layer`) identifies deliberate whole-file exclusion.
+Displayed hidden-callable counts use all-role counts minus selected count, without
+double-counting test fixtures. Files remains an independent complete indexed catalog,
+so excluded source is still reachable. Architecture references, assignments and
+policy totals are unchanged. All selected source/fact validation remains in force.
 
 ## Declaration boundary and lines
 

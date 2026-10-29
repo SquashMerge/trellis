@@ -10,16 +10,7 @@
   };
   const finite = value => typeof value === "number" && Number.isFinite(value);
   const display = value => finite(value) ? String(value) : "—";
-  const metricValue = (metrics, metric) => metric.split(".").reduce((value, key) => value?.[key], metrics);
-  const quartiles = values => {
-    const sorted = values.filter(finite).sort((a, b) => a - b);
-    return sorted.length ? [.25, .5, .75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]) : [];
-  };
-  const band = (value, cuts, metric) => {
-    if (!finite(value) || cuts.length !== 3) return null;
-    const rank = cuts.filter(cut => value > cut).length;
-    return metric === "maintainabilityIndex" ? 3 - rank : rank;
-  };
+  const {metricValue, quartiles, relativeBand:band, createScale} = window.TrellisMetricHeat;
   const pair = value => value && typeof value.indexGeneration === "string" &&
     Number.isSafeInteger(value.indexRevision) && value.indexRevision >= 0
     ? {indexGeneration:value.indexGeneration, indexRevision:value.indexRevision} : null;
@@ -28,11 +19,18 @@
     cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
     halstead:"Halstead", fanIn:"Fan-in", fanOut:"Fan-out (call sites)", parameters:"Parameters", exits:"Exits"};
   function create({request, context, onConflict = () => {}, onChange = () => {}}) {
-    let metric = "cognitive", aggregate = "max", role = "production", epoch = 0, refreshSerial = 0, inspectionSerial = 0;
+    let metric = "cognitive", aggregate = "max", role = "production", relative = false, epoch = 0, refreshSerial = 0, inspectionSerial = 0;
     let projection = null, projectionGuard = null, selected = null, loading = false;
     let decorations = [];
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
+    function exclusions(rows) {
+      const hidden = rows.reduce((sum, row) => sum + Math.max(0,
+        (row.roleCounts?.production ?? 0) + (row.roleCounts?.test ?? 0) - row.declarationCount), 0);
+      const reasons = [["fixture", "fixture"], ["vendored", "vendored"], ["hidden_layer", "authored hidden-layer"]]
+        .map(([reason, label]) => `${rows.filter(row => row.excludedReason === reason).length} ${label} files`);
+      return `${hidden} callables excluded from heat · excluded files: ${reasons.join(", ")}`;
+    }
     const text = (id, value) => { if (get(id)) get(id).textContent = value; };
     function capture() {
       const now = context();
@@ -72,7 +70,7 @@
       return candidates.length === 1 ? candidates[0] : null;
     }
     function url(scope, guard, row) {
-      const query = new URLSearchParams({scope, aggregate:guard.aggregate, role:guard.role,
+      const query = new URLSearchParams({scope, aggregate:guard.aggregate, role:guard.role, workbench:"true",
         indexGeneration:guard.pin.indexGeneration, indexRevision:String(guard.pin.indexRevision)});
       if (row) {
         query.set("path", row.path); query.set("sourceSetId", row.sourceSetId);
@@ -88,7 +86,7 @@
         const error = new Error("Indexed snapshot changed. Refresh status.");
         error.code = "revision_conflict"; error.status = 409; throw error;
       }
-      if (payload.metricsVersion !== "metrics:v1" || payload.aggregate !== guard.aggregate || payload.role !== guard.role || payload.scope !== scope ||
+      if (payload.workbench !== true || payload.metricsVersion !== "metrics:v1" || payload.aggregate !== guard.aggregate || payload.role !== guard.role || payload.scope !== scope ||
           !Array.isArray(payload.files) || !Array.isArray(payload.directories)) throw new Error("Invalid metrics response.");
       return payload;
     }
@@ -110,7 +108,7 @@
         const data = await request(url("revision", guard));
         if (!current(guard) || serial !== refreshSerial) return;
         projection = payloadOf(data, guard, "revision"); projectionGuard = guard; loading = false;
-        text("metrics-state", `Indexed snapshot · ${aggregate} · ${population()}${data.catchingUp ? " · index catching up" : ""}`);
+        text("metrics-state", `Indexed snapshot · ${aggregate} · ${population()} · ${exclusions(projection.files)}${data.catchingUp ? " · index catching up" : ""}`);
         onChange();
         if (selected) await inspect(selected);
       } catch (error) {
@@ -172,6 +170,7 @@
         const result = candidates[0];
         text("metric-inspector-state", result.declarationCount === 0 ? `No ${callables()}. Numeric aggregates are unavailable, not zero.` :
           `${result.declarationCount} ${callables()}${data.catchingUp ? " · index catching up" : ""}`);
+        if (result.excludedReason) text("metric-inspector-state", `Excluded from heat: ${result.excludedReason} · ${exclusions([result])}`);
         renderValues(result.metrics); renderTop(payload.topCognitive);
       } catch (error) {
         if (!current(guard) || serial !== inspectionSerial) return;
@@ -204,20 +203,26 @@
       for (const item of decorations) if (!visible.includes(item)) item.node.remove();
       decorations = visible;
       const values = usable() ? visible.map(item => metricValue(match(item.selection)?.metrics, metric)).filter(finite) : [];
-      const cuts = quartiles(values);
+      if (!usable()) {
+        for (const item of decorations) item.swatch.className = "metric-swatch neutral";
+        target?.append(make("span", `No measured values · ${population()} · — unavailable, not zero`)); return;
+      }
+      const scale = createScale(metric, aggregate, values, relative);
       for (const item of decorations) {
-        const color = item.guard && current(item.guard) ? band(item.value, cuts, metric) : null;
+        const color = item.guard && current(item.guard) ? scale.band(item.value) : null;
         item.swatch.className = `metric-swatch${color === null ? " neutral" : ` heat-${color}`}`;
       }
-      if (!cuts.length) { target?.append(make("span", `No measured values · ${population()} · — unavailable, not zero`)); return; }
-      target?.append(make("span", `Displayed file/directory rows · ${aggregate} · ${population()}${metric === "maintainabilityIndex" ? " · higher is better" : ""}`));
-      const ranges = [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`];
-      ranges.forEach((range, rank) => {
+      target?.append(make("span", `${scale.label}${values.length ? " · Displayed file/directory rows" : ""} · ${aggregate} · ${population()}`));
+      for (const {label, band} of scale.entries) {
         const entry = make("span", undefined, "metric-legend-entry");
-        const severity = metric === "maintainabilityIndex" ? 3 - rank : rank;
-        entry.append(make("span", undefined, `metric-swatch heat-${severity}`), make("span", range)); target?.append(entry);
-      });
+        entry.append(make("span", undefined, `metric-swatch${band === null ? " neutral" : ` heat-${band}`}`), make("span", label)); target?.append(entry);
+      }
+      if (relative) target?.append(make("span", "Ties stay together · — unavailable"));
     }
+    if (get("metric-relative")) get("metric-relative").checked = false;
+    get("metric-relative")?.addEventListener("change", event => {
+      relative = event.target.checked; onChange();
+    });
     if (get("metric-color")) get("metric-color").value = metric;
     if (get("metric-aggregate")) get("metric-aggregate").value = aggregate;
     if (get("metric-include-tests")) get("metric-include-tests").checked = false;

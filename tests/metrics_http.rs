@@ -1049,3 +1049,36 @@ async fn selected_metrics_reports_catching_up_from_same_admission() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn workbench_metrics_option_is_explicit_and_strict() {
+    let (base, _runtime, browser, key) = fixture().await;
+    let app = browser.router();
+    for (query, expected) in [
+        ("", false),
+        ("?workbench=false", false),
+        ("?workbench=true&role=production", true),
+    ] {
+        let (status, data) = request(app.clone(), &key, query).await;
+        assert_eq!(status, StatusCode::OK, "{data}");
+        assert_eq!(data["payload"]["workbench"], expected);
+    }
+    for query in [
+        "?workbench=",
+        "?workbench=1",
+        "?workbench=True",
+        "?workbench=false&workbench=true",
+        "?workbench=false&%77orkbench=true",
+    ] {
+        let (status, data) = request(app.clone(), &key, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {data}");
+        assert_eq!(data["error"]["code"], "invalid_request");
+    }
+    fs::create_dir_all(base.path().join("checkout/.trellis")).unwrap();
+    fs::write(base.path().join("checkout/.trellis/rules.toml"), "bad toml").unwrap();
+    let (status, data) = request(app.clone(), &key, "?workbench=false").await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    let (status, data) = request(app, &key, "?workbench=true").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{data}");
+    assert_eq!(data["error"]["code"], "invalid_rules");
+}

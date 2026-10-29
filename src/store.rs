@@ -1137,6 +1137,7 @@ impl ReadRevision {
 pub struct MetricsOptions {
     pub pin: Option<IndexPin>,
     pub role: String,
+    pub workbench: bool,
     pub scope: String,
     pub source_set_id: Option<String>,
     pub language: Option<String>,
@@ -1153,6 +1154,7 @@ impl Default for MetricsOptions {
             pin: None,
             scope: "revision".into(),
             role: "all".into(),
+            workbench: false,
             source_set_id: None,
             language: None,
             path: None,
@@ -1227,6 +1229,8 @@ pub struct MetricsFileRow {
     pub physical_lines: usize,
     pub file_role: DeclarationRole,
     pub role_counts: MetricsRoleCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_reason: Option<&'static str>,
     pub declaration_count: usize,
     pub metrics: serde_json::Value,
 }
@@ -1280,6 +1284,7 @@ pub struct MetricsTopCognitiveScore {
 pub struct MetricsPayload {
     pub metrics_version: &'static str,
     pub role: String,
+    pub workbench: bool,
     pub index_generation: String,
     pub index_revision: u64,
     pub scope: String,
@@ -1601,7 +1606,7 @@ impl EvidenceResponse {
             "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
             "rulesFile": config.as_ref().map(crate::rules::descriptor),
             "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
-            "role": options.role, "evidenceTier": "syntax", "semanticComplete": false,
+            "role": options.role, "workbench": options.workbench, "evidenceTier": "syntax", "semanticComplete": false,
             "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
         });
         if payload["state"] != "ready" {
@@ -1617,13 +1622,15 @@ impl EvidenceResponse {
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
         let mut rules = evaluated.data;
         let assignments = evaluated.layers;
-        let metrics = self.metrics_at(
+        let metrics = self.metrics_at_with_config(
             &MetricsOptions {
                 pin: Some(snapshot.pin),
                 role: options.role.clone(),
+                workbench: options.workbench,
                 aggregate: options.aggregate.clone(),
                 ..MetricsOptions::default()
             },
+            Some(config),
             check,
         )?;
         let files: BTreeMap<_, _> = metrics
@@ -1688,6 +1695,9 @@ impl EvidenceResponse {
             row["declarationCount"] = serde_json::json!(file.declaration_count);
             row["roleCounts"] = serde_json::json!(file.role_counts);
             row["metrics"] = file.metrics.clone();
+            if let Some(reason) = file.excluded_reason {
+                row["excludedReason"] = serde_json::json!(reason);
+            }
             modules.push(row);
         }
         drop(assignments);
@@ -2052,6 +2062,21 @@ impl EvidenceResponse {
         check: &mut (impl FnMut() -> Result<()> + Send),
     ) -> Result<MetricsPayload> {
         options.validate()?;
+        check()?;
+        let config = if options.workbench {
+            crate::rules::load(Path::new(self.store.workspace_root()))?
+        } else {
+            None
+        };
+        self.metrics_at_with_config(options, config.as_ref(), check)
+    }
+
+    fn metrics_at_with_config(
+        &self,
+        options: &MetricsOptions,
+        config: Option<&crate::rules::Config>,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<MetricsPayload> {
         let progress = MetricsReadCheck {
             check: Mutex::new(check),
             failure: Mutex::new(None),
@@ -2110,6 +2135,22 @@ impl EvidenceResponse {
         if options.scope != "revision" && included.is_empty() {
             anyhow::bail!("not_found: metrics selector");
         }
+        let hidden_layers = if options.workbench && options.role == "production" {
+            if let Some(config) = config {
+                crate::rules::hidden_layer_paths(
+                    config,
+                    &included
+                        .iter()
+                        .map(|key| key.path.as_str())
+                        .collect::<Vec<_>>(),
+                    &mut || progress.check(),
+                )?
+            } else {
+                BTreeSet::new()
+            }
+        } else {
+            BTreeSet::new()
+        };
         let mut declarations = Vec::new();
         let mut files = Vec::new();
         let mut top_cognitive = options
@@ -2117,7 +2158,7 @@ impl EvidenceResponse {
             .map(|_| Vec::<MetricsTopCognitiveRow>::new());
         let mut directories: BTreeMap<(String, String), crate::metrics::Accumulator> =
             BTreeMap::new();
-        // Read only the selected version; no checkout filesystem access.
+        // Read source and native rows only from the selected version.
         // Every SQL read runs in order on this request's connection and snapshot.
         // Metrics run on workers, a chunk behind the
         // reads, and are accepted strictly in manifest order: the first failure
@@ -2248,7 +2289,26 @@ impl EvidenceResponse {
                     DeclarationRole::Test => role_counts.test += 1,
                 }
             }
-            rows.retain(|row| options.role == "all" || options.role == row.role.as_str());
+            // Workbench population only: stored roles, file identity and policy stay intact.
+            // Validate and measure every file before excluding its callable contributions.
+            let excluded_reason = if !options.workbench {
+                None
+            } else if key.path.starts_with("web/vendor/") {
+                Some("vendored")
+            } else if options.role == "production"
+                && (key.path.starts_with("tests/fixtures/")
+                    || key.path.starts_with("tools/synthetic-cohorts/templates/"))
+            {
+                Some("fixture")
+            } else if hidden_layers.contains(&key.path) {
+                Some("hidden_layer")
+            } else {
+                None
+            };
+            rows.retain(|row| {
+                excluded_reason.is_none()
+                    && (options.role == "all" || options.role == row.role.as_str())
+            });
             let mut file_fold = crate::metrics::Accumulator::default();
             let mut parents = vec![String::new()];
             let mut directory = String::new();
@@ -2358,6 +2418,7 @@ impl EvidenceResponse {
                     physical_lines,
                     file_role,
                     role_counts,
+                    excluded_reason,
                     declaration_count: file_fold.count(),
                     metrics: file_fold.project(&options.aggregate, &names)?,
                 });
@@ -2566,6 +2627,7 @@ impl EvidenceResponse {
         Ok(MetricsPayload {
             metrics_version: crate::metrics::VERSION,
             role: options.role.clone(),
+            workbench: options.workbench,
             index_generation: selected.pin.index_generation.to_string(),
             index_revision: selected.pin.index_revision,
             scope: options.scope.clone(),

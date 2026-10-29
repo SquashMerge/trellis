@@ -16,7 +16,7 @@ function fixture(aggregate = "max", hash = "rules-one", role = "production") {
   const site = {role:"production",relationKind:"rust_path",spelling:"crate::b",lines:{start:2,end:2},range:{start:10,end:18},ownerSyntaxId:"owner",callId:null};
   const pair = {source:a,target:b,count:7,sites:[site],omittedSites:6,mapping:"structural"};
   return {...pin,state:"ready",rulesFile:{path:".trellis/rules.toml",source:"checkout-config",contentHash:hash},
-    aggregate,role,metricsVersion:"metrics:v1",evidenceTier:"syntax",semanticComplete:false,
+    aggregate,role,workbench:true,metricsVersion:"metrics:v1",evidenceTier:"syntax",semanticComplete:false,
     layers:[{name:"UI",order:1,shared:false},{name:"Storage",order:2,shared:false}],
     modules:[{identity:a,layer:"UI",physicalLines:4,declarationCount:2,roleCounts:{production:2,test:1},metrics:{cognitive:3,cyclomatic:4,maintainabilityIndex:80,halstead:{volume:12},fanIn:{value:null,unavailable:"not-measured"}},revisionId:"revision-a",contentHash:"hash-a",provenanceId:"native"},
       {identity:b,layer:"Storage",physicalLines:8,declarationCount:0,roleCounts:{production:0,test:2},metrics:{cognitive:null,cyclomatic:null},revisionId:"revision-b",contentHash:"hash-b",provenanceId:"native"}],
@@ -41,7 +41,7 @@ function harness() {
     clearArchitectureInspector:() => {get("architecture-inspector").hidden=true;get("architecture-inspector-content").replaceChildren();},
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
-  vm.runInNewContext(pinSource + "\n" + source, {window,document,URLSearchParams,console});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console});
   const controller = window.TrellisArchitecture.create({request:(url,current,options) => {calls.push({url,current,options});return response(url,options);},context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
@@ -51,7 +51,7 @@ function harness() {
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
   const h = harness();assert.equal(h.calls.length,0);await h.controller.refresh();
   assert.equal(h.calls.length,1);const query = new URL(h.calls[0].url,"http://local").searchParams;
-  assert.equal(query.get("role"),"production");assert.equal(h.get("architecture-metric-tests").checked,false);
+  assert.equal(query.get("workbench"),"true");assert.equal(query.get("role"),"production");assert.equal(h.get("architecture-metric-tests").checked,false);
   assert.equal(query.get("aggregate"),"max");assert.equal(query.get("indexGeneration"),pin.indexGeneration);assert.equal(query.get("indexRevision"),"1");
   const {view,options} = h.renders[0];assert.equal(options.moduleValue(view.modules[0]),3);assert.equal(options.moduleValue(view.modules[1]),null);
   assert.match(options.layerLabel(view.layers[0]),/^1 · UI · 1 files · max cognitive \(max\) 3\nUp deviation: 0 · /);
@@ -398,4 +398,27 @@ test("no_layers keeps a rules-hash-qualified authoring basis for orphan edits an
     await h.get("architecture-confirm").fire("click");assert.match(h.get("architecture-state").textContent,/Rules committed/);assert.equal(h.renders.length,0);
     await h.get("architecture-unassigned").fire("click");assert.match(text(h.get("architecture-review-list")),/File assignment inventory is unavailable/);
   }
+});
+
+
+test("Relative uses admitted display modules, collapsed representation is stable, and sum is neutral", async () => {
+  const h = harness(), dto = fixture();
+  dto.layers.push({name:"Hidden",order:3,shared:false,display:"hidden"});
+  dto.modules.push({...dto.modules[0],identity:identity("hidden/hot.rs"),layer:"Hidden",metrics:{cognitive:100},declarationCount:0,excludedReason:"hidden_layer"});
+  dto.modules[0].metrics.cognitive = 7;
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const module = dto.modules[0]; assert.equal(h.get("architecture-relative").checked, false);
+  assert.equal(h.renders.at(-1).options.moduleBand(module), 1);
+  h.get("architecture-relative").checked = true; await h.get("architecture-relative").fire("change");
+  assert.match(text(h.get("architecture-legend")), /Relative to visible set.*≤7.*>7–7.*>7–7.*>7/);
+  await h.renders.at(-1).options.onToggleLayer(dto.layers[0]);
+  assert.match(text(h.get("architecture-legend")), /≤7.*>7–7/); assert.equal(h.calls.length, 1);
+  h.get("architecture-relative").checked = false; await h.get("architecture-relative").fire("change");
+  assert.equal(h.renders.at(-1).options.moduleBand(module), 1);
+  assert.match(h.get("architecture-state").textContent, /6 callables excluded from heat.*1 authored hidden-layer files/);
+  h.setResponse(async () => ({payload:fixture("sum")})); h.get("architecture-aggregate").value = "sum"; await h.get("architecture-aggregate").fire("change");
+  const rendered = h.renders.at(-1); assert.equal(rendered.options.moduleBand(rendered.view.modules[0]), null);
+  assert.match(text(h.get("architecture-legend")), /relative totals/);
+  h.get("architecture-relative").checked = true; await h.get("architecture-relative").fire("change");
+  assert.equal(h.renders.at(-1).options.moduleBand(h.renders.at(-1).view.modules[0]), 0); assert.equal(h.calls.length, 2);
 });

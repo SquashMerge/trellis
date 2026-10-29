@@ -16,25 +16,23 @@
     : JSON.stringify([identity.sourceSetId, identity.language, identity.path, identity.sid]);
   const targetLabel = identity => external(identity)
     ? `${identity.package} (${identity.language}${identity.standardLibrary ? " stdlib" : " package"})` : identity.path;
-  const metricValue = (metrics, name) => name.split(".").reduce((value, key) => value?.[key], metrics);
-  const quartiles = values => {
-    const sorted = values.filter(finite).sort((a, b) => a - b);
-    return sorted.length ? [.25, .5, .75].map(p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]) : [];
-  };
-  const band = (value, cuts, metric) => {
-    if (!finite(value) || cuts.length !== 3) return null;
-    const rank = cuts.filter(cut => value > cut).length;
-    return metric === "maintainabilityIndex" ? 3 - rank : rank;
-  };
+  const {metricValue, quartiles, relativeBand:band, createScale} = window.TrellisMetricHeat;
   const labels = {loc:"LOC (callable ranges)", sloc:"SLOC (callable ranges)", commentLines:"Comment lines (callable ranges)",
     cognitive:"Cognitive", cyclomatic:"Cyclomatic", maxNesting:"Max nesting", maintainabilityIndex:"Maintainability (higher is better)",
     fanOut:"Fan-out (call sites)", fanIn:"Fan-in", halstead:"Halstead", parameters:"Parameters", exits:"Exits"};
   function create({request, context, readSource, openTreemap, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null;
-    let metric = "cognitive", aggregate = "max", role = "production", showTests = false;
+    let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
+    function exclusions(rows) {
+      const hidden = rows.reduce((sum, row) => sum + Math.max(0,
+        (row.roleCounts?.production ?? 0) + (row.roleCounts?.test ?? 0) - row.declarationCount), 0);
+      const reasons = [["fixture", "fixture"], ["vendored", "vendored"], ["hidden_layer", "authored hidden-layer"]]
+        .map(([reason, label]) => `${rows.filter(row => row.excludedReason === reason).length} ${label} files`);
+      return `${hidden} callables excluded from heat · excluded files: ${reasons.join(", ")}`;
+    }
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
@@ -68,7 +66,7 @@
         const error = new Error("Architecture snapshot changed. Refresh status."); error.code = "revision_conflict"; error.status = 409; throw error;
       }
       if (!["ready", "missing_rules", "no_layers"].includes(payload.state) || payload.aggregate !== c.aggregate || payload.role !== c.role ||
-          payload.metricsVersion !== "metrics:v1" ||
+          payload.workbench !== true || payload.metricsVersion !== "metrics:v1" ||
           payload.evidenceTier !== "syntax" || payload.semanticComplete !== false ||
           !Array.isArray(payload.layers) || !Array.isArray(payload.modules) || !Array.isArray(payload.edges) ||
           (["ready", "no_layers"].includes(payload.state) && (typeof payload.rulesFile?.contentHash !== "string" || !payload.rulesFile.contentHash))) {
@@ -176,7 +174,7 @@
       return metric === "maintainabilityIndex" ? Math.min(...values) : Math.max(...values);
     }
     // Directory chips first; files appear only when a directory is drilled into.
-    function entries(layerKey, modules, layout, cuts) {
+    function entries(layerKey, modules, layout, scale) {
       const involved = module => layout.involved.has(moduleKey(module.identity));
       const visible = layout.focus ? modules.filter(involved) : modules;
       const measured = visible.filter(module => module.declarationCount > 0 || involved(module));
@@ -194,7 +192,7 @@
         if (members.length === 1) return {type:"module", module:members[0]};
         const key = JSON.stringify([layerKey, directory]), open = shown.drilled.has(key), value = worst(members);
         const label = `${directory}\n${members.length} files${value === undefined ? "" : ` · ${metric === "maintainabilityIndex" ? "min" : "max"} ${display(value)}`}`;
-        return {type:"directory", key, label, open, band:band(value, cuts, metric), entries:open ? members.map(module => ({type:"module", module})) : []};
+        return {type:"directory", key, label, open, band:scale.band(value), entries:open ? members.map(module => ({type:"module", module})) : []};
       });
       const lines = [], unmeasured = visible.length - measured.length, hidden = modules.length - visible.length;
       if (unmeasured) lines.push(`${plural(unmeasured, "file")} · metrics unavailable`, `no ${callables()}`);
@@ -230,26 +228,30 @@
       after?.(); refocus(target);
     }
     const flip = (set, key) => { if (set.has(key)) set.delete(key); else set.add(key); };
-    function legend(cuts) {
+    function legend(scale) {
       const target = get("architecture-legend"); target.replaceChildren();
       if (metric === "layer") { paragraph(target, "Layer membership · neutral chips; no metric heat."); return; }
-      paragraph(target, `${metric} · ${aggregate} · visible native file modules · ${population()}${metric === "maintainabilityIndex" ? " · higher is better; heat inverted" : ""}`);
-      if (!cuts.length) { paragraph(target, `No measured values · ${population()} · — is unavailable, not zero.`); return; }
-      const ranges = [`≤${cuts[0]}`, `>${cuts[0]}–${cuts[1]}`, `>${cuts[1]}–${cuts[2]}`, `>${cuts[2]}`];
-      ranges.forEach((range, rank) => {
+      paragraph(target, `${scale.label} · ${metric} · ${aggregate} · visible layer file modules (collapsed summaries included) · ${population()}`);
+      for (const {label, band} of scale.entries) {
         const entry = make("span", undefined, "metric-legend-entry");
-        entry.append(make("span", undefined, `metric-swatch heat-${metric === "maintainabilityIndex" ? 3 - rank : rank}`), make("span", range)); target.append(entry);
-      });
-      target.append(make("span", "Low heat → high heat · ties stay together · — unavailable"));
+        entry.append(make("span", undefined, `metric-swatch${band === null ? " neutral" : ` heat-${band}`}`), make("span", label)); target.append(entry);
+      }
+      if (relative) target.append(make("span", "Low heat → high heat · ties stay together · — unavailable"));
     }
     async function render() {
       if (!usable() || view.state !== "ready") return false;
       const c = basis, payload = view, ticket = ++renderSerial;
       const active = () => current(c) && view === payload && ticket === renderSerial && payload.rulesFile.contentHash === c.rulesHash;
       clearInspection(); get("architecture-diagram").replaceChildren();
-      const cuts = metric === "layer" ? [] : quartiles(payload.modules.map(module => metricValue(module.metrics, metric)));
-      legend(cuts);
       const layout = summary(payload);
+      // Collapsing layers or directories changes representation, not their module population.
+      const visible = payload.modules.filter(module =>
+        (module.layer === null ? !layout.focus && shown.unassigned : layout.layers.has(module.layer)) &&
+        (!layout.focus || layout.involved.has(moduleKey(module.identity))) &&
+        (module.declarationCount > 0 || layout.involved.has(moduleKey(module.identity))));
+      const values = visible.map(module => metricValue(module.metrics, metric));
+      const scale = createScale(metric, aggregate, values, relative);
+      legend(scale);
       displayState(payload, layout);
       const unassigned = payload.modules.filter(module => module.layer === null).length;
       try {
@@ -257,9 +259,9 @@
         const outcome = await window.TrellisArchitecturePele.render(get("architecture-diagram"), payload, {
           showTests, metric, aggregate, isCurrent:active,
           moduleValue:module => metric === "layer" ? undefined : metricValue(module.metrics, metric),
-          moduleBand:module => metric === "layer" ? null : band(metricValue(module.metrics, metric), cuts, metric),
+          moduleBand:module => metric === "layer" ? null : scale.band(metricValue(module.metrics, metric)),
           layerLabel,
-          display:{layers:layout.layers, expanded:name => expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, cuts),
+          display:{layers:layout.layers, expanded:name => expanded(payload.layers.find(layer => layer.name === name)), entries:(key, modules) => entries(key, modules, layout, scale),
             edge:edge => !layout.focus || flagged(edge),
             unassigned:layout.focus ? null : {label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, expanded:shown.unassigned}},
           onSelectModule:module => { if (active() && payload.modules.includes(module)) inspect("module", module); },
@@ -285,7 +287,7 @@
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
-        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}${layout.focus ? " · deviations only" : ""}. Metrics: ${aggregate}, ${population()}.`, "ready");
+        state(`${payload.modules.length} native file modules · ${production} production / ${tests} test-only cross-layer reference sites${showTests ? " · tests shown" : " · tests hidden"}${layout.focus ? " · deviations only" : ""}. Metrics: ${aggregate}, ${population()} · ${exclusions(payload.modules)}.`, "ready");
         return true;
       } catch (error) {
         if (!active()) return false;
@@ -301,7 +303,7 @@
       loadDisplay(c.rootKey);
       state("Reading indexed architecture and reviewed rules…", "loading"); get("architecture-diagram").setAttribute("aria-busy", "true");
       try {
-        const query = new URLSearchParams({aggregate:c.aggregate, role:c.role, indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
+        const query = new URLSearchParams({aggregate:c.aggregate, role:c.role, workbench:"true", indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision)});
         const data = await request(`/api/architecture?${query}`, () => current(c));
         if (!current(c)) return;
         const payload = payloadOf(data, c);
@@ -369,7 +371,8 @@
         paragraph(target, `Layer: ${record.layer ?? "Unassigned / unknown"} · ${record.physicalLines} physical file lines · ${record.declarationCount} ${callables()}.`);
         paragraph(target, `${aggregate} · metrics:v1 · ${population()}. Callable-range LOC may overlap; it is not physical file lines.`);
         disclosure(target, "Native file-module identity and captured source", {identity:record.identity, revisionId:record.revisionId, contentHash:record.contentHash, provenanceId:record.provenanceId});
-        if (record.declarationCount === 0) paragraph(target, `No ${callables()}. Numeric aggregates are unavailable, not zero.`);
+        if (record.excludedReason) paragraph(target, `Excluded from heat: ${record.excludedReason} · ${exclusions([record])}`);
+        else if (record.declarationCount === 0) paragraph(target, `No ${callables()}. Numeric aggregates are unavailable, not zero.`);
         values(target, record.metrics);
         if (record.physicalLines > 0) {
           const button = make("button", "Read indexed file source"); button.type = "button";
@@ -679,6 +682,8 @@
     get("architecture-confirm").addEventListener("click", applyDraft);
     get("architecture-rules-reload").addEventListener("click", reloadRules);
     get("architecture-cancel").addEventListener("click", () => { if (!editBusy) { invalidatePreview(); draft = null; get("architecture-editor").hidden = true; } });
+    get("architecture-relative").checked = false;
+    get("architecture-relative").addEventListener("change", event => { relative = event.target.checked; return render(); });
     get("architecture-color").value = metric; get("architecture-aggregate").value = aggregate;
     get("architecture-tests").checked = showTests;
     get("architecture-metric-tests").checked = false;

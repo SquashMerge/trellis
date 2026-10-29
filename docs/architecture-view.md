@@ -26,7 +26,7 @@ Layer edges count reference **sites**, not module pairs or rule-check instances.
 Production references are solid. Test references are dashed and toggleable. Stored
 roles determine this split: `cfg(test)` is test, while `cfg(feature="test-support")`
 remains production under Decision 0011. The **Test-only edges** overlay does not change production reference totals,
-policy or metric role selection. The separate **Include tests in metrics** checkbox changes heat
+policy or metric role selection. The separate **Include tests and fixtures in metrics** checkbox changes heat
 without changing which reference edges are shown.
 
 Downward references, including skipped orders, conform. Upward references deviate.
@@ -82,7 +82,7 @@ The color choices are Layer, Cyclomatic, Cognitive, Max nesting, Maintainability
 Halstead volume and Fan-out. Layer mode uses neutral module chips and explicit
 membership, not an invented numeric metric. Numeric aggregates are max (default), sum
 and mean over raw [`metrics:v1`](metrics.md) callable scores. Heat explicitly starts with
-`role=production`; the unchecked **Include tests in metrics** checkbox requests `all` when checked.
+`role=production`; the unchecked **Include tests and fixtures in metrics** checkbox requests `all` when checked.
 Omitted API/CLI role remains `all`; `test` is available through those transports. The Architecture
 payload echoes `role` (rather than `metricsScope`). Stored native declaration roles are authoritative
 for Rust, Java, Python and JavaScript under Decision 0011, not browser path heuristics or runner
@@ -95,9 +95,16 @@ Callable-range LOC/SLOC can overlap and are not physical production file lines; 
 production-LOC measurement is claimed.
 
 Band headers show the maximum available displayed module value at the chosen
-aggregate, not a mean of file means. Heat uses the Viewer shell's deterministic
-visible-value quartiles, with ties together and the actual cuts in the legend.
-Maintainability reverses severity only because higher is better.
+aggregate, not a mean of file means. Heat uses the shared
+[fixed bands](metrics.md#workbench-heat-395) for max/mean. Sum is neutral and labelled relative
+totals. **Relative**, off by default, uses modules in the admitted layers and visible
+unassigned inventory, after deviations focus and measured/involved filtering. Collapsed
+layer/directory summaries include their member modules in that basis; expanding them does not
+move the cuts. Quiet/hidden layer display filters can change the Relative basis. Maintainability reverses severity, not values.
+Browser requests set `workbench=true`; stored tests, fixture roots, authored hidden layers and
+`web/vendor/` do not contribute default heat. Counts report excluded callables and files.
+Include tests and fixtures restores tests/fixtures/hidden-layer metrics, but not vendor metrics.
+Module identities, physical lines, reference totals and Files access remain unchanged.
 
 ## Revision and rendering boundaries
 
