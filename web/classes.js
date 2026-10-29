@@ -1,4 +1,119 @@
 /* Cached syntax only. No source or provider request occurs on selection. */
+// Pele draws measured class declarations only. Positions bind each native class
+// node and member line to the original DTO object; no relation is ever drawn.
+(() => {
+  "use strict";
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const ROOT_STYLE = "--_bg:var(--pele-bg,#fff);--_fg:var(--pele-fg,#1f1f1f);--_m:var(--pele-muted,#6e6e6e);--_l:var(--pele-line,#1f1f1f);--_s:var(--pele-surface,#f3f3f3);--_a:var(--pele-surface-alt,#e6e6e6);--_b:var(--pele-border,#8a8a8a);--_c:var(--pele-accent,#5b7bd5);color:var(--_fg);--_r:var(--pele-radius,4px);--_hw:var(--pele-heading-weight,bold);--_fm:var(--pele-font-mono,monospace);font:14px sans-serif;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:var(--pele-font,sans-serif)";
+  const tags = new Set(["svg", "g", "path", "rect", "text", "tspan"]);
+  const attrs = new Set(["xmlns", "class", "viewBox", "width", "height", "fill", "role", "aria-roledescription", "transform", "stroke", "font-size", "data-id", "d", "x", "y", "rx", "text-anchor", "font-weight", "xml:space"]);
+  // Bounds match the card view: 24 classes and 200 members per compartment.
+  // Pele itself rejects sources over 50,000 characters.
+  const MAX_CLASSES = 24, MAX_MEMBERS = 200, MAX_SOURCE = 50000, LABEL = 60, MEMBER = 96;
+  function unsupported(reason) { const error = new Error(reason); error.code = "unsupported"; throw error; }
+  // Pele decodes numeric entities into SVG text. Escape everything outside a
+  // small literal alphabet so repository text cannot become Mermaid grammar.
+  const encode = value => Array.from(String(value)).map(c => /[A-Za-z0-9 ._-]/.test(c) ? c : `#${c.codePointAt(0)};`).join("");
+  // Display text only: control characters and whitespace runs become one space.
+  const tidy = value => String(value).replace(/[\u0000-\u001f\u007f\s]+/g, " ").trim();
+  const clip = (value, max) => { const chars = Array.from(value); return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : value; };
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  function witness(item) {
+    const r = item?.range;
+    return typeof item?.path === "string" && !!item.path.trim() && !!r &&
+      Number.isSafeInteger(r.startLine) && r.startLine > 0 && Number.isSafeInteger(r.endLine) && r.endLine >= r.startLine;
+  }
+  function project(nodes, options = {}) {
+    if (!Array.isArray(nodes) || nodes.length > MAX_CLASSES) unsupported("Too many classes for Pele");
+    const open = options.membersOpen || new Set(), seen = new Set(), classes = [], lines = ["classDiagram"];
+    for (const [index, node] of nodes.entries()) {
+      const definition = node?.class, symbol = definition?.symbol;
+      if (typeof node?.id !== "string" || !node.id || seen.has(node.id) || !symbol || symbol.id !== node.id ||
+          typeof symbol.name !== "string" || !witness(symbol) || !Array.isArray(definition.fields) || !Array.isArray(definition.methods)) unsupported("Unsupported class declaration");
+      seen.add(node.id);
+      const alias = `C${index}`, label = clip(tidy(symbol.name), LABEL);
+      if (!label) unsupported("Unsupported class name");
+      const fields = definition.fields, methods = definition.methods;
+      const annotation = tidy([definition.language, definition.declarationKind, node.id === options.seed ? "focus" : null,
+        plural(fields.length, "field"), plural(methods.length, "method")].filter(Boolean).join(" · "));
+      const members = [];
+      if (open.has(node.id)) {
+        for (const [kind, list] of [["field", fields], ["method", methods]]) {
+          for (const member of list.slice(0, MAX_MEMBERS)) {
+            const name = clip(tidy(member?.name ?? ""), MEMBER), type = clip(tidy(member?.typeHint ?? ""), MEMBER);
+            if (!name) unsupported("Unsupported class member");
+            // A literal "()" makes Pele draw a method; every other character is encoded.
+            const raw = kind === "method" ? `${encode(name)}()${type ? " " + encode(type) : ""}` : encode(type ? `${name}: ${type}` : name);
+            const text = kind === "method" ? `${name}()${type ? " : " + type : ""}` : type ? `${name}: ${type}` : name;
+            members.push({kind, member, raw, text});
+          }
+        }
+      }
+      lines.push(`class ${alias}["${encode(label)}"] {`, `<<${encode(annotation)}>>`, ...members.map(item => item.raw), "}");
+      const omitted = Math.max(0, fields.length - MAX_MEMBERS) + Math.max(0, methods.length - MAX_MEMBERS);
+      classes.push({alias, node, label, annotation, members, open:open.has(node.id), omitted});
+    }
+    const source = lines.join("\n") + "\n";
+    if (source.length > MAX_SOURCE) unsupported("Class Mermaid source too large");
+    return {source, classes};
+  }
+  function validatedSvg(raw, projection) {
+    if (typeof raw !== "string" || new TextEncoder().encode(raw).length > 8 * 1024 * 1024) unsupported("Class SVG output too large");
+    const start = /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" class="pele pele-class"/;
+    const signature = ` style="${ROOT_STYLE}"`;
+    if (!start.test(raw) || raw.split(signature).length !== 2) unsupported("Changed Pele class root/theme");
+    const safe = raw.replace(signature, "").replace(start, '<svg xmlns="http://www.w3.org/2000/svg" class="pele pele-class trellis-pele"')
+      .replaceAll(' style="rx:var(--_r)"', ' rx="var(--_r)"');
+    if (/\sstyle\s*=|<style\b/i.test(safe)) unsupported("Unexpected inline class style");
+    // Reject active/resource markup before DOM parsing.
+    if (/<\/?(?:script|foreignObject|image|a)\b/i.test(safe)) unsupported("Unexpected class SVG element");
+    const root = new DOMParser().parseFromString(safe, "image/svg+xml").documentElement;
+    if (root.localName !== "svg" || root.namespaceURI !== SVG_NS || root.querySelector("parsererror")) unsupported("Invalid class SVG");
+    let count = 0;
+    for (const node of [root, ...root.querySelectorAll("*")]) {
+      if (++count > 12000 || node.namespaceURI !== SVG_NS || !tags.has(node.localName)) unsupported("Unexpected class SVG element");
+      for (const a of node.attributes) if (!attrs.has(a.name) || /url\s*\(|javascript:|<|>|[\u0000-\u001f]/i.test(a.value)) unsupported("Unexpected class SVG attribute");
+    }
+    const groups = [...root.querySelectorAll(".pele-node")];
+    if (groups.length !== projection.classes.length || root.querySelectorAll("[data-id]").length !== projection.classes.length ||
+        root.querySelectorAll(".pele-edge, .pele-edge-label, .pele-cluster").length) unsupported("Missing, extra or related Pele class node");
+    const controls = [];
+    for (const [i, item] of projection.classes.entries()) {
+      const group = groups[i];
+      if (group.getAttribute("data-id") !== item.alias || group.getAttribute("class") !== "pele-node pele-class") unsupported("Changed Pele class identity or order");
+      const annotations = group.querySelectorAll(":scope > .pele-annotation"), labels = group.querySelectorAll(":scope > .pele-label");
+      if (annotations.length !== 1 || annotations[0].textContent !== `«${item.annotation}»`) unsupported("Changed Pele class annotation");
+      if (labels.length !== 1 || labels[0].textContent.replace(/\s+/g, "") !== item.label.replace(/\s+/g, "")) unsupported("Changed Pele class label");
+      const members = [...group.querySelectorAll(".pele-member")];
+      if (members.length !== item.members.length || group.querySelectorAll("text").length !== 2 + members.length) unsupported("Changed Pele class members");
+      for (const [j, expected] of item.members.entries()) {
+        const kind = expected.kind === "method" ? "pele-method" : "pele-attribute";
+        if (members[j].getAttribute("class") !== `pele-member ${kind}` || members[j].textContent !== expected.text) unsupported("Changed Pele member identity or text");
+      }
+      controls.push({group, item, members:members.map((node, j) => ({node, ...item.members[j]}))});
+    }
+    return {root, controls};
+  }
+  // Returns the validated, unattached SVG and its native-node → DTO mapping.
+  // The caller owns actions, guards and installation.
+  function render(nodes, options = {}) {
+    try {
+      const projection = project(nodes, options);
+      if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
+      const raw = window.pele.render(projection.source, {fontSize:14, responsive:false, links:false, images:false}).svg;
+      const {root, controls} = validatedSvg(raw, projection);
+      for (const {group, item, members} of controls) {
+        group.setAttribute("data-trellis-class-id", item.node.id);
+        if (item.node.id === options.seed) group.classList.add("trellis-class-seed");
+        members.forEach(({node, kind}, j) => { node.setAttribute("data-trellis-member-kind", kind); node.setAttribute("data-trellis-member-index", String(j)); });
+      }
+      return {status:"rendered", root, controls, source:projection.source};
+    } catch (error) {
+      return {status:"unsupported", reason:String(error?.message || error)};
+    }
+  }
+  window.TrellisPeleClasses = Object.freeze({project, validatedSvg, render});
+})();
 (function () {
   "use strict";
   const MAX_NODES = 24;
@@ -8,6 +123,9 @@
   let menuContext = null, menuExpanded = null, menuOnClose = null, menuScroll = new Map();
   let bound = false, snapshot = null, diagramGeneration = 0, displayTicket = 0;
   let controls, changeButton, allButton, chooser = null, showAll = false, membersOpen = new Set();
+  // "pele" or "cards". Cards remain the visible fallback when Pele cannot
+  // represent the returned declarations faithfully (Decision 0014 §2).
+  let renderer = null, rendererNote = "";
   const currentView = () => snapshot && valid(snapshot) && displayTicket === serial;
   function closeChooser() { if (chooser) chooser.remove(); chooser = null; }
   function selectedHierarchy(data) {
@@ -20,7 +138,7 @@
   function updateStatus() {
     const nodes = visibleNodes(diagram);
     const partial = diagram.truncated || diagram.nodes.length > MAX_NODES;
-    state(`${nodes.length} measured declarations shown · no proven class relationships.${partial ? " Partial diagram; some index or diagram details are omitted. See notices." : ""}${diagram.requireIndex ? " Index workspace to populate class declarations." : ""}`, diagram.requireIndex ? "unindexed" : partial ? "partial" : "ready");
+    state(`${nodes.length} measured declarations shown · no proven class relationships.${partial ? " Partial diagram; some index or diagram details are omitted. See notices." : ""}${diagram.requireIndex ? " Index workspace to populate class declarations." : ""}${rendererNote}`, diagram.requireIndex ? "unindexed" : partial ? "partial" : "ready");
     controls.hidden = false;
     allButton.textContent = showAll ? "Show selected classes" : "Show all returned classes";
     allButton.setAttribute("aria-pressed", String(showAll));
@@ -303,37 +421,44 @@
       {label: "Focus this class", run: guarded(() => loadDiagram(node.id, [], true))}
     ];
   }
+  // Member intents shared by both renderers. `anchor` is the rendered member
+  // row; its connection proves the action is still on screen.
+  function memberIntents(definition, member, method, c, generation, anchor) {
+    const label = `${member.name}${method ? "()" : ""}${member.typeHint ? ": " + member.typeHint : ""}`;
+    const select = method && member.symbolId ? () => {
+      if (!valid(c) || generation !== diagramGeneration || displayTicket !== serial || ui.panel.hidden) return;
+      return invoke(() => api.selectMethod({id: member.symbolId, name: member.name, kind: "method", path: member.path, range: {...member.range}, parent: definition.symbol.id, accessor: false, provenance: definition.symbol.provenance}), c);
+    } : null;
+    const canNavigate = typeof api.navigateMember === "function";
+    const navigate = event => {
+      // Stop here synchronously: a member intent must not also open its class menu.
+      event.preventDefault(); event.stopPropagation();
+      const ticket = displayTicket;
+      const isCurrent = () => snapshot === c && valid(c) && generation === diagramGeneration &&
+        ticket === displayTicket && ticket === serial && !ui.panel.hidden && anchor.isConnected &&
+        membersOpen.has(definition.symbol.id);
+      if (!canNavigate || !isCurrent()) return;
+      // Names and type hints are display text, never a global search selector.
+      return api.navigateMember(event, {classId: definition.symbol.id, memberName: member.name,
+        startByte: member.range.startByte, endByte: member.range.endByte}, {isCurrent});
+    };
+    return {label, select, navigate, canNavigate};
+  }
   function compartment(definition, name, members, c, generation) {
     const section = el("section", undefined, "classes-compartment");
     section.append(el("h4", `${name} (${members.length})`));
     const list = el("div", undefined, "classes-members");
     list.tabIndex = 0; list.setAttribute("aria-label", `${name} of ${definition.symbol.name}`);
     for (const member of members.slice(0, 200)) {
-      const label = `${member.name}${name === "Methods" ? "()" : ""}${member.typeHint ? ": " + member.typeHint : ""}`;
-      const method = name === "Methods" && member.symbolId;
-      const row = el("div", undefined, "classes-member"); row.title = label;
-      const memberName = el(method ? "button" : "span", `${member.name}${name === "Methods" ? "()" : ""}`, "classes-member-name");
-      if (method) {
+      const row = el("div", undefined, "classes-member");
+      const {label, select, navigate, canNavigate} = memberIntents(definition, member, name === "Methods", c, generation, row);
+      row.title = label;
+      const memberName = el(select ? "button" : "span", `${member.name}${name === "Methods" ? "()" : ""}`, "classes-member-name");
+      if (select) {
         memberName.type = "button"; memberName.setAttribute("aria-label", `Show sequence for ${label}`);
-        memberName.addEventListener("click", () => {
-          if (!valid(c) || generation !== diagramGeneration || displayTicket !== serial || ui.panel.hidden) return;
-          return invoke(() => api.selectMethod({id: member.symbolId, name: member.name, kind: "method", path: member.path, range: {...member.range}, parent: definition.symbol.id, accessor: false, provenance: definition.symbol.provenance}), c);
-        });
+        memberName.addEventListener("click", select);
       }
       row.append(memberName);
-      const canNavigate = typeof api.navigateMember === "function";
-      const navigate = event => {
-        // Stop here synchronously: a member intent must not also open its class menu.
-        event.preventDefault(); event.stopPropagation();
-        const ticket = displayTicket;
-        const isCurrent = () => snapshot === c && valid(c) && generation === diagramGeneration &&
-          ticket === displayTicket && ticket === serial && !ui.panel.hidden && row.isConnected &&
-          membersOpen.has(definition.symbol.id);
-        if (!canNavigate || !isCurrent()) return;
-        // Names and type hints are display text, never a global search selector.
-        return api.navigateMember(event, {classId: definition.symbol.id, memberName: member.name,
-          startByte: member.range.startByte, endByte: member.range.endByte}, {isCurrent});
-      };
       row.addEventListener("contextmenu", navigate);
       row.addEventListener("keydown", event => {
         if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) return navigate(event);
@@ -392,16 +517,77 @@
       const c = snapshot, generation = diagramGeneration;
       reveal.addEventListener("click", () => {
         if (!valid(c) || generation !== diagramGeneration || displayTicket !== serial) return;
-        if (membersOpen.has(node.id)) membersOpen.delete(node.id); else membersOpen.add(node.id);
-        render(diagram); cards.get(node.id).querySelector(".classes-members-toggle").focus({preventScroll: true});
+        // Collapsing can make the class representable by Pele again.
+        toggleMembers(node.id);
       });
       article.append(reveal, content);
       if (node.class.truncated) article.append(el("div", "Partial declaration · read source for details", "classes-node-notice"));
     } else article.append(el("p", "No unique indexed class match. This hint cannot expand.", "classes-hint-note"));
     return article;
   }
+  function relationshipLedger() {
+    const ledger = el("details", undefined, "classes-relationships");
+    ledger.append(el("summary", "No proven class relationships"), el("p", "Class declarations are shown without inferred hierarchy or type targets."));
+    return ledger;
+  }
+  function toggleMembers(id) {
+    if (!currentView()) return;
+    const top = ui.diagram.scrollTop, left = ui.diagram.scrollLeft;
+    if (membersOpen.has(id)) membersOpen.delete(id); else membersOpen.add(id);
+    render(diagram); updateStatus();
+    ui.diagram.scrollTop = top; ui.diagram.scrollLeft = left;
+    const anchor = cards.get(id);
+    (renderer === "pele" ? anchor : anchor?.querySelector(".classes-members-toggle"))?.focus({preventScroll: true});
+  }
+  // Pele owns layout only. Each native node and member line was validated
+  // against its original DTO record; actions use those records, never SVG text.
+  function renderPele(outcome) {
+    const c = snapshot, generation = diagramGeneration;
+    const guarded = action => () => { if (valid(c) && generation === diagramGeneration && displayTicket === serial) return action(); };
+    renderer = "pele"; stage = null; positions = new Map(); cards = new Map();
+    const notices = el("ul", undefined, "classes-pele-notices");
+    for (const {group, item, members} of outcome.controls) {
+      const node = item.node, definition = node.class, fullName = definition.qualifiedName || node.label;
+      const counts = `${definition.fields.length} ${definition.fields.length === 1 ? "field" : "fields"} · ${definition.methods.length} ${definition.methods.length === 1 ? "method" : "methods"}`;
+      group.setAttribute("role", "button"); group.setAttribute("tabindex", "0");
+      group.setAttribute("aria-haspopup", "menu"); group.setAttribute("aria-expanded", "false");
+      group.setAttribute("aria-label", `${fullName} · ${definition.symbol.path} · ${item.annotation} · members ${item.open ? "shown" : "hidden"}. Class actions available.`);
+      const actions = () => [{label: item.open ? "Hide members" : `Show members · ${counts}`, run: guarded(() => toggleMembers(node.id))}, ...classActions(node)];
+      const open = event => showContextMenu(event, actions());
+      group.addEventListener("click", open);
+      group.addEventListener("contextmenu", open);
+      group.addEventListener("keydown", event => {
+        if (event.target !== group) return;
+        if (["Enter", " ", "ContextMenu"].includes(event.key) || (event.shiftKey && event.key === "F10")) open(event);
+      });
+      cards.set(node.id, group);
+      for (const {node: line, kind, member} of members) {
+        const {label, select, navigate, canNavigate} = memberIntents(definition, member, kind === "method", c, generation, line);
+        if (!select && !canNavigate) continue;
+        line.setAttribute("role", "button"); line.setAttribute("tabindex", "0");
+        if (member.symbolId) line.setAttribute("data-trellis-symbol-id", member.symbolId);
+        if (canNavigate) line.setAttribute("aria-haspopup", "menu");
+        line.setAttribute("aria-label", select ? `Show sequence for ${label}` : `Navigate member ${label}`);
+        const activate = event => { event.preventDefault(); event.stopPropagation(); return select ? select() : navigate(event); };
+        line.addEventListener("click", activate);
+        line.addEventListener("contextmenu", navigate);
+        line.addEventListener("keydown", event => {
+          if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) return navigate(event);
+          if (event.key === "Enter" || event.key === " ") return activate(event);
+        });
+      }
+      if (item.omitted) notices.append(el("li", `${fullName}: first 200 fields and first 200 methods shown; ${item.omitted} more omitted. Read class source for more.`));
+      if (definition.truncated) notices.append(el("li", `${fullName}: partial declaration · read source for details.`));
+    }
+    ui.diagram.replaceChildren(outcome.root, ...(notices.children.length ? [notices] : []), relationshipLedger());
+  }
   function render(data) {
     const nodes = visibleNodes(data), ids = new Set(nodes.map(node => node.id));
+    const outcome = window.TrellisPeleClasses ? window.TrellisPeleClasses.render(nodes, {seed, membersOpen}) : {status: "unsupported", reason: "Pele asset unavailable"};
+    if (outcome.status === "rendered") { rendererNote = " Pele rendered."; renderPele(outcome); return; }
+    rendererNote = ` Pele fell back: ${outcome.reason}.`;
+    if (renderer !== "cards") { ui.diagram.replaceChildren(); stage = null; positions = new Map(); cards = new Map(); }
+    renderer = "cards";
     if (!stage) { stage = el("div", undefined, "classes-stage"); ui.diagram.append(stage); }
     // Reserve stable grid slots across expansions. No force simulation or DTO mutation.
     for (const id of positions.keys()) if (!ids.has(id)) positions.delete(id);
@@ -423,8 +609,7 @@
     const coords = id => { const slot = positions.get(id), row = Math.floor(slot / 2); return {x: 24 + (slot % 2) * STEP_X, y: rowTops[row], rowBottom: rowTops[row] + rowHeights[row], height: membersOpen.has(id) ? OPEN_HEIGHT : HEIGHT}; };
     const priorEdges = stage.querySelector(".classes-edges"); if (priorEdges) priorEdges.remove();
     const existingLedger = ui.diagram.querySelector(".classes-relationships"); if (existingLedger) existingLedger.remove();
-    const ledger = el("details", undefined, "classes-relationships");
-    ledger.append(el("summary", "No proven class relationships"), el("p", "Class declarations are shown without inferred hierarchy or type targets."));
+    const ledger = relationshipLedger();
     for (const node of nodes) {
       const old = cards.get(node.id), fresh = card(node), pos = coords(node.id);
       // Preserve the actual DOM node identity and position, replacing only its contents.

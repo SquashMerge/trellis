@@ -79,3 +79,31 @@ button.classes-member-type { color: var(--link); text-decoration: underline; tex
 .classes-choice-note { color: var(--secondary); margin: 8px 0; }
 .classes-chooser > button { margin-right: 8px; }
 .classes-relation-record { font: 12px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--secondary); }
+
+/* Pele class declarations. The pinned inline root declarations are removed
+   before parsing and recreated here under the strict CSP. */
+#classes-diagram svg.pele.trellis-pele {
+  display: block; max-width: none; height: auto; margin: 24px;
+  --pele-bg: var(--bg); --pele-fg: var(--ink); --pele-muted: var(--muted);
+  --pele-line: var(--line-strong); --pele-surface: var(--node);
+  --pele-surface-alt: var(--card); --pele-border: var(--line-strong);
+  --pele-accent: var(--link); --pele-font: var(--sans); --pele-font-mono: var(--mono);
+  --_bg: var(--pele-bg); --_fg: var(--pele-fg); --_m: var(--pele-muted);
+  --_l: var(--pele-line); --_s: var(--pele-surface);
+  --_a: var(--pele-surface-alt); --_b: var(--pele-border);
+  --_c: var(--pele-accent); color: var(--_fg);
+  --_r: var(--pele-radius, 5px); --_hw: var(--pele-heading-weight, 500);
+  --_fm: var(--pele-font-mono); font: 14px var(--sans);
+  letter-spacing: normal; word-spacing: normal; text-transform: none; direction: ltr;
+}
+#classes-diagram[aria-busy="true"] svg.trellis-pele { opacity: .55; pointer-events: none; }
+#classes-diagram .trellis-pele .pele-label, #classes-diagram .trellis-pele .pele-member { font-family: var(--mono); }
+#classes-diagram .trellis-pele .pele-node[role="button"] { cursor: pointer; }
+#classes-diagram .trellis-pele .pele-node[role="button"]:hover > rect { stroke: var(--link); stroke-width: 2; }
+#classes-diagram .trellis-pele .pele-node[role="button"]:focus-visible { outline: none; }
+#classes-diagram .trellis-pele .pele-node[role="button"]:focus-visible > rect { stroke: var(--focus); stroke-width: 3; }
+#classes-diagram .trellis-pele .trellis-class-seed > rect { stroke: var(--selected); stroke-width: 2; }
+#classes-diagram .trellis-pele .pele-member[role="button"] { cursor: pointer; fill: var(--link); }
+#classes-diagram .trellis-pele .pele-member[role="button"]:hover,
+#classes-diagram .trellis-pele .pele-member[role="button"]:focus-visible { text-decoration: underline; outline: none; fill: var(--ink); }
+.classes-pele-notices { margin: 0 24px 12px; padding-left: 20px; color: var(--warning); font-size: 13px; overflow-wrap: anywhere; }

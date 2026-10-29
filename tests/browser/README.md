@@ -181,6 +181,18 @@ also part of `./tools/verify`. Area is physical file lines, including inline tes
 lines, not callable-range LOC. Native adapter admission/mutation tests run in
 `tests/treemap-pele.test.cjs`.
 
+## Class acceptance
+
+`classes-pele.test.cjs` serves the exact `web/classes.js` adapter, vendored Pele and
+stylesheets under the product CSP, with synthetic class DTOs. It checks native class
+node and member identities against the original records, encoded repository text,
+fail-closed SVG validation, bounds, the visible card fallback, class menus, members,
+method and member navigation by mouse and keyboard, and stale actions.
+`classes-app.test.cjs` indexes a Java checkout, opens the class through the real shell
+and published daemon response, and follows Read class source and a method member into
+its Pele sequence on the same pin. Both run in `./tools/verify`; run them alone after
+provisioning with `TRELLIS_SUITE_BINARY` and `PLAYWRIGHT_BROWSERS_PATH`.
+
 ## Published semantic source navigation
 
 `navigation-resolved.test.cjs` publishes real native extraction plus validated synthetic
