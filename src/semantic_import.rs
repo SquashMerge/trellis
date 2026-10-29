@@ -488,6 +488,19 @@ fn module_definition(claim: &CapturedClaim) -> bool {
                         && last.name == "__init__"
                         && !prefix.is_empty()
                         && prefix.iter().all(package)
+                        && claim
+                            .envelope
+                            .relative_path
+                            .strip_suffix("/__init__.py")
+                            .or_else(|| claim.envelope.relative_path.strip_suffix(".py"))
+                            .is_some_and(|path| {
+                                prefix
+                                    .iter()
+                                    .map(|descriptor| descriptor.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                                    == path.replace('/', ".")
+                            })
                 })
         }
         _ => false,

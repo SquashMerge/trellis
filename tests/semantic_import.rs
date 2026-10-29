@@ -9,7 +9,7 @@ use trellis::{
     capture::Capture,
     indexer::IndexOptions,
     native_evidence as native, native_ids,
-    scip_raw::CapturedScipInventory,
+    scip_raw::{CapturedScipInventory, ScipCaptureError},
     semantic_batch::testing,
     semantic_evidence as semantic,
     semantic_import::{MeasuredFacts, join_inventory},
@@ -613,6 +613,18 @@ fn module_marker_exception_rejects_other_empty_occurrences() {
         ),
         ("python", "scip-python python pkg 0 f().", 1, 17),
         ("python", "scip-python python pkg 0 C#", 1, 7),
+        (
+            "python",
+            "scip-python python pkg 0 `other.module`/__init__:",
+            1,
+            0,
+        ),
+        (
+            "javascript",
+            "scip-typescript npm pkg 1.0.0 other/`A.js`/",
+            1,
+            0,
+        ),
         ("python", "scip-python python pkg 0 `src.A`/__init__:", 8, 0),
     ] {
         let source = if language == "python" {
@@ -626,9 +638,13 @@ fn module_marker_exception_rejects_other_empty_occurrences() {
             vec![(0, 0, symbol, roles)],
             vec![(symbol, kind, vec![])],
         );
+        let error = join_inventory(&inventory, &native, &sources, 2).unwrap_err();
         assert!(
-            join_inventory(&inventory, &native, &sources, 2).is_err(),
-            "empty non-module-definition occurrence must fail: {language} {symbol} roles={roles}"
+            matches!(
+                error.downcast_ref::<ScipCaptureError>(),
+                Some(ScipCaptureError::InvalidArtifact(_))
+            ),
+            "empty non-module-definition occurrence must fail typed: {language} {symbol} roles={roles}: {error:#}"
         );
     }
 }
@@ -652,9 +668,13 @@ fn module_marker_exception_rejects_reversed_ranges() {
     ] {
         claim.envelope.raw["symbol"] = json!(symbol);
         claim.envelope.raw["range"] = json!({"encoding":"legacy","values":[0,1,0]});
+        let error = occurrence_range(&claim, source, 2).unwrap_err();
         assert!(
-            occurrence_range(&claim, source, 2).is_err(),
-            "reversed {symbol}"
+            matches!(
+                error.downcast_ref::<ScipCaptureError>(),
+                Some(ScipCaptureError::InvalidArtifact(_))
+            ),
+            "reversed {symbol}: {error:#}"
         );
     }
 }
