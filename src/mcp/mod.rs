@@ -1091,7 +1091,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 query,
                                 pin,
                                 declarations,
-                                role,
+                                &policy,
                                 &mut check,
                             )?;
                             let head = head.as_ref().expect("published head selected");
@@ -1133,7 +1133,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                     query,
                                     pin,
                                     declarations,
-                                    role,
+                                    &policy,
                                     &mut check,
                                 )?;
                                 let ranked =
@@ -1142,8 +1142,12 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             }
                             None => {
                                 // Standalone registries have no matrix owner.
-                                let candidates = response
-                                    .mcp_search_candidates(query, expected, role, &mut check)?;
+                                let candidates = response.mcp_search_candidates(
+                                    query,
+                                    Some(pin),
+                                    &policy,
+                                    &mut check,
+                                )?;
                                 let mut vector_check = || {
                                     check()?;
                                     if let Some(budget) = prepared.budget() {

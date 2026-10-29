@@ -632,7 +632,14 @@ fn admitted_search_snapshot_is_head_guarded_and_hydrates_ranked_prefix_only() {
         .mcp_search_candidates(
             "orchard",
             Some(first),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "orchard",
+                    first,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -670,7 +677,10 @@ fn admitted_search_snapshot_is_head_guarded_and_hydrates_ranked_prefix_only() {
         .mcp_search_candidates(
             "orchard",
             Some(first),
-            trellis::search_rank::SearchRole::Any,
+            &trellis::search_rank::SearchPolicy {
+                exact: BTreeMap::new(),
+                role: trellis::search_rank::SearchRole::Any,
+            },
             &mut || Ok(()),
         )
         .unwrap_err();
@@ -679,7 +689,14 @@ fn admitted_search_snapshot_is_head_guarded_and_hydrates_ranked_prefix_only() {
         read.mcp_search_candidates(
             "orchard",
             Some(second),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "orchard",
+                    second,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(())
+                )
+                .unwrap(),
             &mut || Ok(())
         )
         .unwrap()
@@ -702,7 +719,14 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
         .mcp_search_candidates(
             "the a _",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "the a _",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -713,7 +737,10 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
         .mcp_search_candidates(
             "orchard",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &trellis::search_rank::SearchPolicy {
+                exact: BTreeMap::new(),
+                role: trellis::search_rank::SearchRole::Any,
+            },
             &mut || anyhow::bail!("deadline_exceeded"),
         )
         .unwrap_err();
@@ -722,7 +749,14 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
         .mcp_search_candidates(
             "orchard",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "orchard",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -745,7 +779,10 @@ fn termless_search_retains_scope_and_requires_fts_and_cancellation_is_typed() {
             read.mcp_search_candidates(
                 "the a _",
                 Some(pin),
-                trellis::search_rank::SearchRole::Any,
+                &trellis::search_rank::SearchPolicy {
+                    exact: BTreeMap::new(),
+                    role: trellis::search_rank::SearchRole::Any
+                },
                 &mut || Ok(())
             )
             .is_err(),
@@ -772,7 +809,10 @@ fn search_hydration_validates_coverage_only_for_hydrated_documents() {
         .mcp_search_candidates(
             "the a _",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &trellis::search_rank::SearchPolicy {
+                exact: BTreeMap::new(),
+                role: trellis::search_rank::SearchRole::Any,
+            },
             &mut || Ok(()),
         )
         .unwrap();
@@ -785,7 +825,14 @@ fn search_hydration_validates_coverage_only_for_hydrated_documents() {
         .mcp_search_candidates(
             "other",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "other",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -824,7 +871,14 @@ fn lexical_nonexact_production_bm25_then_sid_matches_head_fts() {
         .mcp_search_candidates(
             "orchards",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "orchards",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -848,7 +902,14 @@ fn lexical_nonexact_production_bm25_then_sid_matches_head_fts() {
         read.mcp_search_candidates(
             query,
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    query,
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -890,7 +951,14 @@ fn read_status_for_returns_status() { read_status_for(); }
         .mcp_search_candidates(
             "read_status_for",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "read_status_for",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -949,7 +1017,14 @@ fn read_request_status_keeps_completed_requests_visible_after_restart() {}
         .mcp_search_candidates(
             "read request status",
             Some(pin),
-            trellis::search_rank::SearchRole::Any,
+            &read
+                .mcp_search_policy(
+                    "read request status",
+                    pin,
+                    trellis::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -985,10 +1060,10 @@ fn exact_short_stopword_and_camel_names_use_raw_stored_equality() {
         let policy = read
             .mcp_search_policy(query, pin, SearchRole::Any, &mut || Ok(()))
             .unwrap();
-        assert!(policy.allowed.is_none());
+        assert_eq!(policy.role, SearchRole::Any);
         assert_eq!(policy.exact.len(), 1, "{query}");
         let candidates = read
-            .mcp_search_candidates(query, Some(pin), SearchRole::Any, &mut || Ok(()))
+            .mcp_search_candidates(query, Some(pin), &policy, &mut || Ok(()))
             .unwrap();
         assert_eq!(Some(&candidates.lexical[0]), policy.exact.keys().next());
         if query == "readStatusFor" {
@@ -1048,13 +1123,20 @@ fn exact_match_is_admitted_before_the_lexical_depth_cutoff() {
         "fixture must exclude exact from ordinary BM25 depth: {old_rank}"
     );
     let candidates = read
-        .mcp_search_candidates("target_name", Some(pin), SearchRole::Any, &mut || Ok(()))
+        .mcp_search_candidates("target_name", Some(pin), &policy, &mut || Ok(()))
         .unwrap();
     assert_eq!(candidates.lexical.len(), CANDIDATE_DEPTH);
     assert_eq!(&candidates.lexical[0], exact);
     assert!(candidates.lexical[1..].iter().all(|key| key != exact));
     let tests = read
-        .mcp_search_candidates("target_name", Some(pin), SearchRole::Test, &mut || Ok(()))
+        .mcp_search_candidates(
+            "target_name",
+            Some(pin),
+            &read
+                .mcp_search_policy("target_name", pin, SearchRole::Test, &mut || Ok(()))
+                .unwrap(),
+            &mut || Ok(()),
+        )
         .unwrap();
     assert_eq!(
         tests.lexical.len(),
@@ -1082,16 +1164,18 @@ fn role_filter_uses_inline_stored_roles_and_keeps_complete_head_counts() {
         .unwrap();
     assert_eq!(any.exact.len(), 2);
     let all = read
-        .mcp_search_candidates("status", Some(pin), SearchRole::Any, &mut || Ok(()))
+        .mcp_search_candidates(
+            "status",
+            Some(pin),
+            &read
+                .mcp_search_policy("status", pin, SearchRole::Any, &mut || Ok(()))
+                .unwrap(),
+            &mut || Ok(()),
+        )
         .unwrap();
     assert_eq!(all.cards.len(), count);
     let exact = read
-        .mcp_search_candidates(
-            "read_status_for",
-            Some(pin),
-            SearchRole::Any,
-            &mut || Ok(()),
-        )
+        .mcp_search_candidates("read_status_for", Some(pin), &any, &mut || Ok(()))
         .unwrap();
     assert_eq!(any.exact[&exact.lexical[0]], DeclarationRole::Production);
     assert_eq!(any.exact[&exact.lexical[1]], DeclarationRole::Test);
@@ -1105,7 +1189,14 @@ fn role_filter_uses_inline_stored_roles_and_keeps_complete_head_counts() {
         assert_eq!(policy.exact.len(), 1);
         assert_eq!(policy.exact.values().next(), Some(&stored));
         let candidates = read
-            .mcp_search_candidates("status", Some(pin), role, &mut || Ok(()))
+            .mcp_search_candidates(
+                "status",
+                Some(pin),
+                &read
+                    .mcp_search_policy("status", pin, role, &mut || Ok(()))
+                    .unwrap(),
+                &mut || Ok(()),
+            )
             .unwrap();
         assert_eq!(
             candidates.cards.len(),
@@ -1113,12 +1204,12 @@ fn role_filter_uses_inline_stored_roles_and_keeps_complete_head_counts() {
             "coverage still describes the whole head"
         );
         assert_eq!(candidates.lexical.len(), expected_matches);
-        assert!(
+        assert!(candidates.lexical.iter().all(|key| {
             candidates
-                .lexical
+                .cards
                 .iter()
-                .all(|key| policy.allowed.as_ref().unwrap().contains(key))
-        );
+                .any(|card| &card.key == key && card.role == stored)
+        }));
         assert!(
             candidates
                 .lexical
@@ -1161,7 +1252,7 @@ fn query_policy_tracks_admitted_publication_and_has_typed_cancellation() {
         .mcp_search_policy("orchard", second, SearchRole::Production, &mut || Ok(()))
         .unwrap();
     assert!(production.exact.is_empty());
-    assert!(production.allowed.as_ref().unwrap().is_empty());
+    assert_eq!(production.role, SearchRole::Production);
     let tests = read
         .mcp_search_policy("orchard", second, SearchRole::Test, &mut || Ok(()))
         .unwrap();
@@ -1172,5 +1263,43 @@ fn query_policy_tracks_admitted_publication_and_has_typed_cancellation() {
             .keys()
             .all(|key| !before.exact.contains_key(key))
     );
+    read.finish(()).unwrap();
+}
+
+#[test]
+fn indexed_exact_policy_keeps_language_lookup_derivations_and_raw_equality() {
+    use trellis::search_rank::SearchRole;
+    let (_state, root, store, cancel) = fixture();
+    fs::write(root.path().join("cards.rs"), "fn r#type() {}\n").unwrap();
+    fs::write(root.path().join("names.py"), "def Kelvin():\n    pass\n").unwrap();
+    fs::write(
+        root.path().join("Names.java"),
+        "class Names { void café() {} }\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("names.js"), r"function caf\u00e9() {}").unwrap();
+    let leader = store.publication_for_tests().unwrap();
+    let pin = publish(&store, root.path(), &leader, &cancel);
+    let read = store.evidence_response().unwrap();
+    let count = read.mcp_search_head_count(pin, &mut || Ok(())).unwrap();
+    for query in ["r#type", "Kelvin", "café", r"caf\u00e9"] {
+        let policy = read
+            .mcp_search_policy(query, pin, SearchRole::Any, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(policy.exact.len(), 1, "{query}");
+        let lexical = read
+            .mcp_search_lexical(query, pin, count, &policy, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(lexical.first(), policy.exact.keys().next(), "{query}");
+    }
+    for query in ["type", "Kelvin", "CAFÉ"] {
+        assert!(
+            read.mcp_search_policy(query, pin, SearchRole::Any, &mut || Ok(()))
+                .unwrap()
+                .exact
+                .is_empty(),
+            "{query}"
+        );
+    }
     read.finish(()).unwrap();
 }

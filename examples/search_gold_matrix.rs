@@ -1,7 +1,8 @@
 //! Corrected #214 relevance replay using saved CPU or Metal raw F32 output.
 //! No model loading, inference, network, latency or publication-performance claims.
-//! Legacy BM25/RRF replay only: saved rows lack measured name/role metadata,
-//! so the empty ranking policy does not validate the #389 amendment.
+//! Legacy BM25/RRF replay only: saved rows lack measured name/role metadata.
+//! Fixture roles are production and the policy is unrestricted; this does not
+//! validate the #389 amendment.
 //!
 //! Run once per backend with --backend cpu|metal --docs DOCS.jsonl
 //! --queries QUERIES.jsonl --lexical LEXICAL.json --output NEW_DIRECTORY.
@@ -351,6 +352,7 @@ fn main() -> Result<()> {
                 syntax_id: sid.clone(),
             },
             card_hash: digest(sid.as_bytes()),
+            role: trellis::native_evidence::DeclarationRole::Production,
         })
         .collect::<Vec<_>>()
         .into();

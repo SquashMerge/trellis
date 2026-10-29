@@ -26,20 +26,24 @@ pub enum SearchRole {
     Test,
 }
 
+impl SearchRole {
+    pub fn accepts(self, role: crate::native_evidence::DeclarationRole) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Production => role == crate::native_evidence::DeclarationRole::Production,
+            Self::Test => role == crate::native_evidence::DeclarationRole::Test,
+        }
+    }
+}
+
 /// Measured declaration metadata selected from the same admitted index head.
 #[derive(Clone, Debug, Default)]
 pub struct SearchPolicy {
     pub exact: BTreeMap<SearchCandidateKey, crate::native_evidence::DeclarationRole>,
-    pub allowed: Option<BTreeSet<SearchCandidateKey>>,
+    pub role: SearchRole,
 }
 
 impl SearchPolicy {
-    pub fn accepts(&self, key: &SearchCandidateKey) -> bool {
-        self.allowed
-            .as_ref()
-            .is_none_or(|allowed| allowed.contains(key))
-    }
-
     pub fn exact_priority(&self, key: &SearchCandidateKey) -> u8 {
         match self.exact.get(key) {
             Some(crate::native_evidence::DeclarationRole::Production) => 0,
@@ -53,6 +57,7 @@ impl SearchPolicy {
 pub struct SearchCandidate {
     pub key: SearchCandidateKey,
     pub card_hash: String,
+    pub role: crate::native_evidence::DeclarationRole,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,21 +185,21 @@ impl<'a> RankingState<'a> {
             crate::store::SelectedIntegrity("store_unavailable: duplicate search candidate".into())
         );
         let mut fused = BTreeMap::new();
-        for (index, key) in lexical
-            .iter()
-            .filter(|key| policy.accepts(key))
-            .take(CANDIDATE_DEPTH)
-            .enumerate()
-        {
+        for key in lexical {
+            if fused.len() == CANDIDATE_DEPTH {
+                break;
+            }
             check()?;
-            ensure!(
-                ordinals
-                    .binary_search_by(|ordinal| candidates[*ordinal].key.cmp(key))
-                    .is_ok(),
-                crate::store::SelectedIntegrity(
-                    "store_unavailable: lexical candidate outside admitted head".into()
-                )
-            );
+            let index = ordinals
+                .binary_search_by(|ordinal| candidates[*ordinal].key.cmp(key))
+                .map_err(|_| {
+                    crate::store::SelectedIntegrity(
+                        "store_unavailable: lexical candidate outside admitted head".into(),
+                    )
+                })?;
+            if !policy.role.accepts(candidates[ordinals[index]].role) {
+                continue;
+            }
             ensure!(
                 !fused.contains_key(key),
                 crate::store::SelectedIntegrity(
@@ -205,7 +210,7 @@ impl<'a> RankingState<'a> {
                 key.clone(),
                 RankedHit {
                     key: key.clone(),
-                    lexical_rank: Some(index + 1),
+                    lexical_rank: Some(fused.len() + 1),
                     vector_rank: None,
                 },
             );
@@ -232,7 +237,7 @@ impl<'a> RankingState<'a> {
     }
 
     fn offer_score(&mut self, ordinal: usize, cosine: f32) {
-        if !self.policy.accepts(&self.candidates[ordinal].key) {
+        if !self.policy.role.accepts(self.candidates[ordinal].role) {
             return;
         }
         let scored = VectorScore {
@@ -290,8 +295,8 @@ pub(crate) fn rank_lexical(
     state.finish(check)
 }
 
-/// Fuse a lexical arm whose head membership was validated by the admitted store
-/// read. Used when the optional vector arm exhausts its budget without a matrix.
+/// Fuse a lexical arm whose head membership and role filter were validated by
+/// the admitted store read. Used when the vector budget expires without a matrix.
 pub(crate) fn fuse_lexical(
     lexical: &[SearchCandidateKey],
     policy: &SearchPolicy,
@@ -300,12 +305,7 @@ pub(crate) fn fuse_lexical(
     check()?;
     let mut seen = BTreeSet::new();
     let mut hits = Vec::with_capacity(lexical.len().min(CANDIDATE_DEPTH));
-    for (index, key) in lexical
-        .iter()
-        .filter(|key| policy.accepts(key))
-        .take(CANDIDATE_DEPTH)
-        .enumerate()
-    {
+    for (index, key) in lexical.iter().take(CANDIDATE_DEPTH).enumerate() {
         check()?;
         ensure!(
             seen.insert(key),
@@ -426,6 +426,7 @@ struct MatrixRow {
     version_id: i64,
     syntax_id: [u8; 16],
     card_hash: [u8; 32],
+    role: crate::native_evidence::DeclarationRole,
 }
 
 fn compact_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
@@ -470,6 +471,7 @@ impl MatrixRow {
                 version_id: candidate.key.version_id,
                 syntax_id,
                 card_hash,
+                role: candidate.role,
             }),
             _ => Err(crate::store::SelectedIntegrity(
                 "store_unavailable: noncanonical search candidate".into(),
@@ -489,6 +491,7 @@ impl MatrixRow {
                 syntax_id: expand_hex(&self.syntax_id, "sid:v1:"),
             },
             card_hash: expand_hex(&self.card_hash, ""),
+            role: self.role,
         }
     }
 }
@@ -1249,18 +1252,19 @@ pub fn rank_matrix(
         crate::search_vectors::InvalidVector
     );
     let mut fused: Vec<MatrixFusedHit> = Vec::with_capacity(2 * CANDIDATE_DEPTH);
-    for (index, key) in lexical
-        .iter()
-        .filter(|key| policy.accepts(key))
-        .take(CANDIDATE_DEPTH)
-        .enumerate()
-    {
+    for key in lexical {
+        if fused.len() == CANDIDATE_DEPTH {
+            break;
+        }
         check()?;
         let row = matrix.ordinal(key).ok_or_else(|| {
             crate::store::SelectedIntegrity(
                 "store_unavailable: lexical candidate outside admitted head".into(),
             )
         })? as u32;
+        if !policy.role.accepts(matrix.rows[row as usize].role) {
+            continue;
+        }
         ensure!(
             !fused.iter().any(|hit| hit.row == row),
             crate::store::SelectedIntegrity(
@@ -1269,22 +1273,10 @@ pub fn rank_matrix(
         );
         fused.push(MatrixFusedHit {
             row,
-            lexical_rank: Some(index + 1),
+            lexical_rank: Some(fused.len() + 1),
             vector_rank: None,
         });
     }
-    let allowed = if let Some(keys) = &policy.allowed {
-        let mut rows = BTreeSet::new();
-        for key in keys {
-            check()?;
-            if let Some(row) = matrix.ordinal(key) {
-                rows.insert(row);
-            }
-        }
-        Some(rows)
-    } else {
-        None
-    };
     let mut exact = BTreeMap::new();
     for key in policy.exact.keys() {
         check()?;
@@ -1297,10 +1289,7 @@ pub fn rank_matrix(
         let query = direction(query);
         let _scoring = crate::search_model::SearchPhaseTimer::start("vector_scoring");
         matrix.visit_direction(&query, check, &mut |ordinal, cosine| {
-            if allowed
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&ordinal))
-            {
+            if !policy.role.accepts(matrix.rows[ordinal].role) {
                 return Ok(());
             }
             let scored = MatrixVectorScore {
@@ -1581,6 +1570,7 @@ mod tests {
                 syntax_id: format!("sid:v1:{index:032x}"),
             },
             card_hash: format!("{hash:064x}"),
+            role: crate::native_evidence::DeclarationRole::Production,
         }
     }
     fn vector(x: i8, y: i8) -> Vec<i8> {
@@ -1599,7 +1589,8 @@ mod tests {
         let mut writer =
             crate::search_vectors::VectorCacheWriter::open(&directory.path().join("vectors.db"))
                 .unwrap();
-        let cards: Vec<_> = (0..5).map(|index| candidate(index, index)).collect();
+        let mut cards: Vec<_> = (0..5).map(|index| candidate(index, index)).collect();
+        cards[1].role = DeclarationRole::Test;
         let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
         writer
             .put(&model, &cards[0].card_hash, &vector(1, 0))
@@ -1612,7 +1603,7 @@ mod tests {
                 (cards[2].key.clone(), DeclarationRole::Production),
                 (cards[4].key.clone(), DeclarationRole::Production),
             ]),
-            allowed: None,
+            role: SearchRole::Any,
         };
         let query = vector(1, 0);
         let snapshot = writer.snapshot().unwrap();
@@ -1667,14 +1658,22 @@ mod tests {
     }
 
     #[test]
-    fn role_filter_refills_vector_depth_and_keeps_whole_head_coverage() {
+    fn role_filter_refills_depth_and_keeps_whole_head_coverage() {
+        use crate::native_evidence::DeclarationRole;
+
         let directory = tempfile::tempdir().unwrap();
         let model = format!("{:064x}", 1);
         let mut writer =
             crate::search_vectors::VectorCacheWriter::open(&directory.path().join("vectors.db"))
                 .unwrap();
         let cards: Vec<_> = (0..2 * CANDIDATE_DEPTH + 1)
-            .map(|index| candidate(index, 0))
+            .map(|index| {
+                let mut card = candidate(index, 0);
+                if index >= CANDIDATE_DEPTH {
+                    card.role = DeclarationRole::Test;
+                }
+                card
+            })
             .collect();
         let query = vector(1, 0);
         writer.put(&model, &cards[0].card_hash, &query).unwrap();
@@ -1683,19 +1682,77 @@ mod tests {
         for ordinal in 0..cards.len() {
             matrix.insert(ordinal, &query).unwrap();
         }
+        let lexical: Vec<_> = cards.iter().map(|card| card.key.clone()).collect();
+        for (role, start) in [
+            (SearchRole::Production, 0),
+            (SearchRole::Test, CANDIDATE_DEPTH),
+        ] {
+            let policy = SearchPolicy {
+                role,
+                ..SearchPolicy::default()
+            };
+            let ranked = rank_snapshot(
+                &cards,
+                &[],
+                Some(&snapshot),
+                Some(&model),
+                Some(&query),
+                &policy,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let resident =
+                rank_matrix(&matrix, &[], Some(&query), &policy, &mut || Ok(())).unwrap();
+            assert_eq!(ranked.hits, resident.hits);
+            assert_eq!(ranked.hits.len(), CANDIDATE_DEPTH);
+            assert_eq!(ranked.embedded, cards.len() as u64);
+            assert_eq!(resident.embedded, ranked.embedded);
+            for (index, hit) in ranked.hits.iter().enumerate() {
+                assert_eq!(hit.key, cards[start + index].key);
+                assert_eq!(hit.vector_rank, Some(index + 1));
+                assert_eq!(hit.lexical_rank, None);
+            }
+            let lexical_ranked = rank_lexical(&cards, &lexical, &policy, &mut || Ok(())).unwrap();
+            let resident = rank_matrix(&matrix, &lexical, None, &policy, &mut || Ok(())).unwrap();
+            assert_eq!(resident.hits, lexical_ranked.hits);
+            assert_eq!(resident.embedded, cards.len() as u64);
+            assert_eq!(lexical_ranked.hits.len(), CANDIDATE_DEPTH);
+            for (index, hit) in lexical_ranked.hits.iter().enumerate() {
+                assert_eq!(hit.key, cards[start + index].key);
+                assert_eq!(hit.lexical_rank, Some(index + 1));
+                assert_eq!(hit.vector_rank, None);
+            }
+        }
+    }
+
+    #[test]
+    fn role_filter_with_no_matches_keeps_whole_head_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = format!("{:064x}", 1);
+        let mut writer =
+            crate::search_vectors::VectorCacheWriter::open(&directory.path().join("vectors.db"))
+                .unwrap();
+        let cards = [candidate(1, 0), candidate(2, 0)];
+        let query = vector(1, 0);
+        writer.put(&model, &cards[0].card_hash, &query).unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        let matrix = SearchMatrix::from_snapshot(
+            cards.to_vec().into(),
+            Some(&snapshot),
+            &model,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let lexical: Vec<_> = cards.iter().map(|card| card.key.clone()).collect();
         let policy = SearchPolicy {
-            exact: BTreeMap::new(),
-            allowed: Some(
-                cards
-                    .iter()
-                    .skip(CANDIDATE_DEPTH)
-                    .map(|card| card.key.clone())
-                    .collect(),
-            ),
+            role: SearchRole::Test,
+            ..SearchPolicy::default()
         };
+        let resident =
+            rank_matrix(&matrix, &lexical, Some(&query), &policy, &mut || Ok(())).unwrap();
         let ranked = rank_snapshot(
             &cards,
-            &[],
+            &lexical,
             Some(&snapshot),
             Some(&model),
             Some(&query),
@@ -1703,48 +1760,29 @@ mod tests {
             &mut || Ok(()),
         )
         .unwrap();
-        let resident = rank_matrix(&matrix, &[], Some(&query), &policy, &mut || Ok(())).unwrap();
-        assert_eq!(ranked.hits, resident.hits);
-        assert_eq!(ranked.hits.len(), CANDIDATE_DEPTH);
-        assert_eq!(ranked.embedded, cards.len() as u64);
-        assert_eq!(resident.embedded, ranked.embedded);
-        for (index, hit) in ranked.hits.iter().enumerate() {
-            assert_eq!(hit.key, cards[CANDIDATE_DEPTH + index].key);
-            assert_eq!(hit.vector_rank, Some(index + 1));
-            assert_eq!(hit.lexical_rank, None);
-        }
-        let empty_policy = SearchPolicy {
-            allowed: Some(BTreeSet::new()),
-            ..SearchPolicy::default()
-        };
-        let empty = rank_matrix(&matrix, &[], Some(&query), &empty_policy, &mut || Ok(())).unwrap();
-        assert!(empty.hits.is_empty());
-        assert_eq!(empty.embedded, cards.len() as u64);
-        let empty_snapshot = rank_snapshot(
-            &cards,
-            &[],
-            Some(&snapshot),
-            Some(&model),
-            Some(&query),
-            &empty_policy,
-            &mut || Ok(()),
-        )
-        .unwrap();
-        assert!(empty_snapshot.hits.is_empty());
-        assert_eq!(empty_snapshot.embedded, empty.embedded);
+        assert!(resident.hits.is_empty());
+        assert_eq!(resident.hits, ranked.hits);
+        assert_eq!(resident.embedded, cards.len() as u64);
+        assert_eq!(ranked.embedded, resident.embedded);
+        assert!(
+            rank_lexical(&cards, &lexical, &policy, &mut || Ok(()))
+                .unwrap()
+                .hits
+                .is_empty()
+        );
     }
 
     #[test]
     fn lexical_only_preserves_measured_role_order_and_filters_before_ranks() {
         use crate::native_evidence::DeclarationRole;
 
-        let cards: Vec<_> = (0..3).map(|index| candidate(index, index)).collect();
-        // The store supplies exact production, other production, then test.
-        // SID order alone would put the test first.
+        let mut cards: Vec<_> = (0..3).map(|index| candidate(index, index)).collect();
+        cards[1].role = DeclarationRole::Test;
+        // The store supplies exact production, then other names by lexical order.
         let lexical = [2, 1, 0].map(|ordinal| cards[ordinal].key.clone());
         let mut policy = SearchPolicy {
             exact: BTreeMap::from([(cards[2].key.clone(), DeclarationRole::Production)]),
-            allowed: None,
+            role: SearchRole::Any,
         };
         let ranked = rank_lexical(&cards, &lexical, &policy, &mut || Ok(())).unwrap();
         assert_eq!(
@@ -1753,9 +1791,10 @@ mod tests {
         );
         let fallback = fuse_lexical(&lexical, &policy, &mut || Ok(())).unwrap();
         assert_eq!(fallback.hits, ranked.hits);
-        policy.allowed = Some([cards[2].key.clone(), cards[0].key.clone()].into());
+        policy.role = SearchRole::Production;
         let filtered = rank_lexical(&cards, &lexical, &policy, &mut || Ok(())).unwrap();
-        let fallback = fuse_lexical(&lexical, &policy, &mut || Ok(())).unwrap();
+        let admitted = [cards[2].key.clone(), cards[0].key.clone()];
+        let fallback = fuse_lexical(&admitted, &policy, &mut || Ok(())).unwrap();
         assert_eq!(fallback.hits, filtered.hits);
         assert_eq!(filtered.hits.len(), 2);
         assert_eq!(filtered.hits[0].key, cards[2].key);
@@ -1766,8 +1805,48 @@ mod tests {
     }
 
     #[test]
+    fn matrix_role_metadata_survives_candidate_roundtrip_and_delta_reuse() {
+        use crate::native_evidence::DeclarationRole;
+
+        let mut test = candidate(2, 0);
+        test.role = DeclarationRole::Test;
+        let production = candidate(1, 0);
+        let mut matrix =
+            SearchMatrix::new([production.clone(), test.clone()].into(), &mut || Ok(())).unwrap();
+        let query = vector(1, 0);
+        matrix.insert(0, &query).unwrap();
+        matrix.insert(1, &query).unwrap();
+        assert_eq!(matrix.candidate(0), Some(production.clone()));
+        assert_eq!(matrix.candidate_for_key(&test.key), Some(test.clone()));
+        let policy = SearchPolicy {
+            role: SearchRole::Test,
+            ..SearchPolicy::default()
+        };
+        let ranked = rank_matrix(&matrix, &[], Some(&query), &policy, &mut || Ok(())).unwrap();
+        assert_eq!(ranked.hits.len(), 1);
+        assert_eq!(ranked.hits[0].key, test.key);
+        assert_eq!(ranked.embedded, 2);
+
+        let mut replacement = production;
+        replacement.role = DeclarationRole::Test;
+        let ordinal = matrix.ordinal(&replacement.key).unwrap();
+        matrix
+            .apply_delta(
+                &[replacement.key.version_id],
+                vec![(replacement.clone(), Some(query.clone()))],
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(matrix.ordinal(&replacement.key), Some(ordinal));
+        assert_eq!(matrix.candidate(ordinal), Some(replacement));
+        let ranked = rank_matrix(&matrix, &[], Some(&query), &policy, &mut || Ok(())).unwrap();
+        assert_eq!(ranked.hits.len(), 2);
+        assert_eq!(ranked.embedded, 2);
+    }
+
+    #[test]
     fn resident_capacity_matches_estimate_with_missing_and_complete_vectors() {
-        assert_eq!(std::mem::size_of::<MatrixRow>(), 56);
+        assert_eq!(std::mem::size_of::<MatrixRow>(), 64);
         for count in [1, 16, 17, 257, 1024] {
             let cards: Vec<_> = (0..count).map(|i| candidate(i, i)).collect();
             let mut matrix = SearchMatrix::new(cards.clone().into(), &mut || Ok(())).unwrap();
@@ -1801,6 +1880,7 @@ mod tests {
                     syntax_id: sid,
                 },
                 card_hash: hash,
+                role: crate::native_evidence::DeclarationRole::Production,
             };
             let result = SearchMatrix::new([card].into(), &mut || Ok(()));
             assert!(

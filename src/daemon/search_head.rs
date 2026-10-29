@@ -637,6 +637,7 @@ mod tests {
                         syntax_id: "sid:v1:00000000000000000000000000000001".into(),
                     },
                     card_hash: "a".repeat(64),
+                    role: crate::native_evidence::DeclarationRole::Production,
                 }]
                 .into(),
             ),
@@ -755,6 +756,7 @@ mod tests {
                 syntax_id: "sid:v1:00000000000000000000000000000002".into(),
             },
             card_hash: "b".repeat(64),
+            role: crate::native_evidence::DeclarationRole::Production,
         };
         head.begin();
         head.build(

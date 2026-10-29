@@ -108,14 +108,16 @@ fn two_document_edits_and_deletion_patch_exactly_without_retained_candidates() {
         .mcp_search_head_count(second, &mut || Ok(()))
         .unwrap();
     assert_eq!(count, edited.len());
-    let lexical = response
-        .mcp_search_lexical(
+    let policy = response
+        .mcp_search_policy(
             "orchard",
             second,
-            count,
             crate::search_rank::SearchRole::Any,
             &mut || Ok(()),
         )
+        .unwrap();
+    let lexical = response
+        .mcp_search_lexical("orchard", second, count, &policy, &mut || Ok(()))
         .unwrap();
     assert!(!lexical.is_empty());
     assert!(
@@ -124,12 +126,7 @@ fn two_document_edits_and_deletion_patch_exactly_without_retained_candidates() {
             .all(|key| edited.iter().any(|card| &card.key == key))
     );
     let combined = response
-        .mcp_search_candidates(
-            "orchard",
-            Some(second),
-            crate::search_rank::SearchRole::Any,
-            &mut || Ok(()),
-        )
+        .mcp_search_candidates("orchard", Some(second), &policy, &mut || Ok(()))
         .unwrap();
     assert_eq!(combined.pin, second);
     assert_eq!(combined.cards, edited.as_ref());
@@ -224,7 +221,7 @@ fn split_reads_reject_wrong_head_and_invalid_previous_pins() {
                 "orchard",
                 wrong,
                 2,
-                crate::search_rank::SearchRole::Any,
+                &crate::search_rank::SearchPolicy::default(),
                 &mut || Ok(()),
             )
             .unwrap_err(),
@@ -335,7 +332,7 @@ fn cancellation_preserves_original_type_and_discards_work_in_every_read() {
                 "orchard",
                 second,
                 3,
-                crate::search_rank::SearchRole::Any,
+                &crate::search_rank::SearchPolicy::default(),
                 &mut stop_after(2),
             )
             .unwrap_err(),
@@ -482,7 +479,14 @@ fn canonical_head_count_matches_eligible_cards_not_all_native_declarations() {
             "orchard",
             pin,
             count,
-            crate::search_rank::SearchRole::Any,
+            &response
+                .mcp_search_policy(
+                    "orchard",
+                    pin,
+                    crate::search_rank::SearchRole::Any,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
             &mut || Ok(()),
         )
         .unwrap();
@@ -493,7 +497,7 @@ fn canonical_head_count_matches_eligible_cards_not_all_native_declarations() {
                 "a",
                 pin,
                 count,
-                crate::search_rank::SearchRole::Any,
+                &crate::search_rank::SearchPolicy::default(),
                 &mut || Ok(())
             )
             .unwrap()
@@ -533,7 +537,7 @@ fn cold_count_detects_missing_and_extra_fts_rows_even_without_query_terms() {
                     query,
                     pin,
                     count,
-                    crate::search_rank::SearchRole::Any,
+                    &crate::search_rank::SearchPolicy::default(),
                     &mut || Ok(()),
                 )
                 .unwrap_err();
@@ -573,7 +577,7 @@ fn lexical_required_corpus_faults_fail_even_without_query_terms() {
                 "a",
                 pin,
                 2,
-                crate::search_rank::SearchRole::Any,
+                &crate::search_rank::SearchPolicy::default(),
                 &mut || Ok(()),
             )
             .unwrap_err();
@@ -585,4 +589,186 @@ fn lexical_required_corpus_faults_fail_even_without_query_terms() {
         assert!(!error.is::<SearchDeltaColdRebuild>());
         assert!(response.mcp_search_head(Some(pin), &mut || Ok(())).is_err());
     }
+}
+
+#[test]
+fn exact_policy_and_lexical_plans_use_indexed_candidate_joins() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.path().join("edited.rs"),
+        "fn orchard() { unique_needle(); } fn orchard_other() {}\n",
+    )
+    .unwrap();
+    let pin = fixture.publish();
+    let response = fixture.store.evidence_response().unwrap();
+    let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+    let lookup_keys = json(&search_exact_lookup_keys("orchard")).unwrap();
+    let policy_plan: Vec<String> = response
+        .db
+        .prepare(&format!("EXPLAIN QUERY PLAN {SEARCH_POLICY_SQL}"))
+        .unwrap()
+        .query_map(
+            params![key, lookup_keys, "orchard", Option::<&str>::None],
+            |row| row.get(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        policy_plan
+            .iter()
+            .any(|step| step.contains("SEARCH d USING INDEX native_version_declarations_lookup")),
+        "{policy_plan:?}"
+    );
+    assert!(
+        policy_plan.iter().all(|step| !step.starts_with("SCAN d")),
+        "{policy_plan:?}"
+    );
+
+    for (query, expected_count) in [("unique_needle", 1), ("orchard", 3)] {
+        let policy = response
+            .mcp_search_policy(query, pin, crate::search_rank::SearchRole::Any, &mut || {
+                Ok(())
+            })
+            .unwrap();
+        let expression = crate::search_lexical::query_expression(&response.db, query).unwrap();
+        let sql = search_lexical_sql(expression.is_some());
+        let plan: Vec<String> = response
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(
+                params![
+                    key,
+                    query,
+                    Option::<&str>::None,
+                    expression,
+                    crate::search_rank::CANDIDATE_DEPTH as i64
+                ],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let fts = plan
+            .iter()
+            .position(|step| step.starts_with("SCAN head_search_fts VIRTUAL TABLE INDEX"))
+            .unwrap_or_else(|| panic!("{plan:?}"));
+        for alias in ["c", "m", "d"] {
+            let indexed = plan
+                .iter()
+                .position(|step| step.starts_with(&format!("SEARCH {alias} USING")))
+                .unwrap_or_else(|| panic!("{plan:?}"));
+            assert!(fts < indexed, "{plan:?}");
+            assert!(
+                plan.iter()
+                    .all(|step| !step.starts_with(&format!("SCAN {alias} "))),
+                "{plan:?}"
+            );
+        }
+        assert!(
+            plan.iter().all(|step| !step.contains("AUTOMATIC")),
+            "{plan:?}"
+        );
+        let lexical = response
+            .mcp_search_lexical(query, pin, 3, &policy, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(lexical.len(), expected_count, "{query}");
+        let hydrated = response
+            .mcp_search_hydrate(&lexical, pin, &mut || Ok(()))
+            .unwrap();
+        assert!(hydrated.symbols.iter().all(|hit| {
+            hit.symbol
+                .declaration
+                .name
+                .as_deref()
+                .unwrap()
+                .starts_with("orchard")
+        }));
+    }
+    response.finish(()).unwrap();
+}
+
+#[test]
+fn candidate_roles_follow_selected_declarations_in_head_and_delta() {
+    use crate::native_evidence::DeclarationRole;
+    let fixture = Fixture::new();
+    let first = fixture.publish();
+    let original = fixture.head(first);
+    assert!(
+        original
+            .iter()
+            .all(|card| card.role == DeclarationRole::Production)
+    );
+    fs::write(
+        fixture.root.path().join("edited.rs"),
+        "#[test] fn orchard() {} fn orchard_helper() {}\n",
+    )
+    .unwrap();
+    let second = fixture.publish();
+    let delta = fixture.delta(first, second);
+    assert_eq!(
+        delta
+            .added
+            .iter()
+            .filter(|card| card.role == DeclarationRole::Test)
+            .count(),
+        1
+    );
+    assert_eq!(
+        delta
+            .added
+            .iter()
+            .filter(|card| card.role == DeclarationRole::Production)
+            .count(),
+        1
+    );
+    assert_eq!(patched(&original, &delta), fixture.head(second).as_ref());
+}
+
+#[test]
+fn invalid_selected_role_fails_whole_head_and_delta() {
+    let fixture = Fixture::new();
+    let first = fixture.publish();
+    fixture.edit();
+    let second = fixture.publish();
+    {
+        let db = fixture.store.cache_write().unwrap();
+        db.pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        db.execute(
+            "UPDATE native_version_declarations SET role='invalid' WHERE vid IN
+             (SELECT vid FROM revision_documents WHERE path='edited.rs' AND revision_id=?1)",
+            [format!(
+                "pin:v1:{}:{}",
+                second.index_generation, second.index_revision
+            )],
+        )
+        .unwrap();
+    }
+    let response = fixture.store.evidence_response().unwrap();
+    for error in [
+        response
+            .mcp_search_head(Some(second), &mut || Ok(()))
+            .unwrap_err(),
+        response
+            .mcp_search_head_delta(first, second, &mut || Ok(()))
+            .unwrap_err(),
+    ] {
+        assert!(error.is::<SelectedIntegrity>(), "{error:#}");
+        assert!(
+            error.to_string().contains("invalid declaration role"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
+fn exact_lookup_prefilter_includes_raw_javascript_fallback() {
+    let query = r"invalid\uQQQQ";
+    assert!(crate::native_evidence::lookup("javascript", query).is_err());
+    assert!(search_exact_lookup_keys(query).contains(query));
+    assert!(search_exact_lookup_keys("r#type").contains("type"));
+    assert!(search_exact_lookup_keys("Kelvin").contains("Kelvin"));
+    assert!(search_exact_lookup_keys(r"caf\u00e9").contains("café"));
 }

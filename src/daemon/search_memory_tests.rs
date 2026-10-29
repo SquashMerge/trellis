@@ -25,6 +25,7 @@ fn cards(rows: usize) -> Arc<[SearchCandidate]> {
                 syntax_id: format!("sid:v1:{row:032x}"),
             },
             card_hash: format!("{row:064x}"),
+            role: crate::native_evidence::DeclarationRole::Production,
         })
         .collect::<Vec<_>>()
         .into()

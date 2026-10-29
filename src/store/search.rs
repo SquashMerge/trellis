@@ -252,7 +252,54 @@ fn search_candidate(row: &rusqlite::Row<'_>) -> Result<crate::search_rank::Searc
             syntax_id: stored_id_row(row, 1, false)?,
         },
         card_hash,
+        role: crate::native_evidence::DeclarationRole::from_stored(&row.get::<_, String>(3)?)
+            .map_err(|error| SelectedIntegrity(error.to_string()))?,
     })
+}
+
+// Extraction and native-input validation derive lookup_key from the raw name.
+// Include every supported language's derivation, including JavaScript's raw
+// fallback, then retain binary raw-name equality after this indexed prefilter.
+fn search_exact_lookup_keys(query: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from([query.to_owned()]);
+    for language in ["rust", "python", "java", "javascript"] {
+        if let Ok(key) = crate::native_evidence::lookup(language, query) {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
+const SEARCH_POLICY_SQL: &str = "SELECT c.vid,c.syntax_id,d.role
+     FROM native_version_declarations d
+     CROSS JOIN native_version_search_cards c ON c.vid=d.vid AND c.syntax_id=d.syntax_id
+     CROSS JOIN revision_documents m ON m.vid=d.vid AND m.revision_id=?1
+     WHERE d.lookup_key IN (SELECT value FROM json_each(?2))
+       AND d.name=?3 COLLATE BINARY AND (?4 IS NULL OR d.role=?4)";
+
+// Keep the matched FTS set as the outer loop. A reorderable inner join lets
+// SQLite choose a full revision-membership scan, even for selective MATCHes.
+fn search_lexical_sql(has_expression: bool) -> String {
+    let matched = if has_expression {
+        "SELECT vid,syntax_id,bm25(head_search_fts) AS score
+         FROM head_search_fts WHERE head_search_fts MATCH ?4"
+    } else {
+        "SELECT vid,syntax_id,CAST(NULL AS REAL) AS score
+         FROM head_search_fts WHERE 0 AND ?4 IS NULL"
+    };
+    format!(
+        "WITH matched AS MATERIALIZED ({matched})
+         SELECT f.vid,f.syntax_id,f.score,d.role
+         FROM matched f
+         CROSS JOIN native_version_search_cards c ON c.vid=f.vid AND c.syntax_id=f.syntax_id
+         CROSS JOIN revision_documents m ON m.vid=f.vid AND m.revision_id=?1
+         CROSS JOIN native_version_declarations d ON d.vid=f.vid AND d.syntax_id=f.syntax_id
+         WHERE ?3 IS NULL OR d.role=?3
+         ORDER BY (d.name=?2 COLLATE BINARY) DESC,
+                  CASE d.role WHEN 'production' THEN 0 ELSE 1 END,
+                  f.score IS NULL,f.score,f.syntax_id
+         LIMIT ?5"
+    )
 }
 
 fn search_role_filter(role: crate::search_rank::SearchRole) -> Option<&'static str> {
@@ -386,7 +433,7 @@ impl EvidenceResponse {
             admit(count)?;
             let _phase = crate::search_model::SearchPhaseTimer::start("head_candidates");
             let mut statement = self.db.prepare(
-                "SELECT c.vid,c.syntax_id,c.card_hash
+                "SELECT c.vid,c.syntax_id,c.card_hash,d.role
                  FROM native_version_search_cards c
                  JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
                  JOIN document_versions v ON v.vid=c.vid
@@ -513,7 +560,7 @@ impl EvidenceResponse {
                 "WITH added(vid) AS MATERIALIZED
                  (SELECT vid FROM revision_documents WHERE revision_id=?1
                   EXCEPT SELECT vid FROM revision_documents WHERE revision_id=?2)
-                 SELECT c.vid,c.syntax_id,c.card_hash,v.vid,d.vid
+                 SELECT c.vid,c.syntax_id,c.card_hash,d.role,v.vid,d.vid
                  FROM added
                  CROSS JOIN native_version_search_cards c ON c.vid=added.vid
                  LEFT JOIN document_versions v ON v.vid=c.vid
@@ -529,13 +576,12 @@ impl EvidenceResponse {
                     added.len() < added_count,
                     SelectedIntegrity("store_unavailable: delta added count mismatch".into())
                 );
-                let candidate = search_candidate(row)?;
                 ensure!(
-                    row.get::<_, Option<i64>>(3)?.is_some()
-                        && row.get::<_, Option<i64>>(4)?.is_some(),
+                    row.get::<_, Option<i64>>(4)?.is_some()
+                        && row.get::<_, Option<i64>>(5)?.is_some(),
                     SelectedIntegrity("store_unavailable: search candidate owner absent".into())
                 );
-                added.push(candidate);
+                added.push(search_candidate(row)?);
             }
             ensure!(
                 added.len() == added_count && removed_version_ids.len() == removed_count,
@@ -579,8 +625,8 @@ impl EvidenceResponse {
         })
     }
 
-    /// Query-specific metadata from this admitted head, without loading source
-    /// or card text. The vector arm uses allowed keys before its depth cutoff.
+    /// Exact-name metadata from this admitted head, without loading source
+    /// or card text. Candidate and matrix roles provide the role filter.
     pub fn mcp_search_policy(
         &self,
         query: &str,
@@ -594,20 +640,18 @@ impl EvidenceResponse {
                 selected.pin == expected,
                 "revision conflict: expected basis differs from admitted head"
             );
-            let role = search_role_filter(role);
             let mut policy = crate::search_rank::SearchPolicy {
                 exact: BTreeMap::new(),
-                allowed: role.map(|_| BTreeSet::new()),
+                role,
             };
-            let mut statement = self.db.prepare(
-                "SELECT c.vid,c.syntax_id,d.role,d.name=?2 COLLATE BINARY
-                 FROM native_version_search_cards c
-                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
-                 JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id
-                 WHERE (?3 IS NULL OR d.role=?3)
-                   AND (?3 IS NOT NULL OR d.name=?2 COLLATE BINARY)",
-            )?;
-            let mut rows = statement.query(params![selected.key, query, role])?;
+            let lookup_keys = json(&search_exact_lookup_keys(query))?;
+            let mut statement = self.db.prepare(SEARCH_POLICY_SQL)?;
+            let mut rows = statement.query(params![
+                selected.key,
+                lookup_keys,
+                query,
+                search_role_filter(role)
+            ])?;
             while let Some(row) = rows.next()? {
                 check()?;
                 let key = crate::search_rank::SearchCandidateKey {
@@ -618,12 +662,7 @@ impl EvidenceResponse {
                 let stored_role =
                     crate::native_evidence::DeclarationRole::from_stored(&stored_role)
                         .map_err(|error| SelectedIntegrity(error.to_string()))?;
-                if row.get::<_, Option<bool>>(3)?.unwrap_or(false) {
-                    policy.exact.insert(key.clone(), stored_role);
-                }
-                if let Some(allowed) = &mut policy.allowed {
-                    allowed.insert(key);
-                }
+                policy.exact.insert(key, stored_role);
             }
             Ok(policy)
         })
@@ -637,7 +676,7 @@ impl EvidenceResponse {
         query: &str,
         expected: IndexPin,
         expected_cards: usize,
-        role: crate::search_rank::SearchRole,
+        policy: &crate::search_rank::SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<crate::search_rank::SearchCandidateKey>> {
         use crate::search_rank::{CANDIDATE_DEPTH, SearchCandidateKey};
@@ -653,61 +692,62 @@ impl EvidenceResponse {
             );
             let _phase = crate::search_model::SearchPhaseTimer::start("lexical_search");
             let expression = crate::search_lexical::query_expression(&self.db, query)?;
-            let matched = if expression.is_some() {
-                "SELECT vid,syntax_id,bm25(head_search_fts) AS score
-                 FROM head_search_fts WHERE head_search_fts MATCH ?4"
-            } else {
-                "SELECT vid,syntax_id,CAST(NULL AS REAL) AS score
-                 FROM head_search_fts WHERE 0 AND ?4 IS NULL"
-            };
-            let sql = format!(
-                "WITH matched AS MATERIALIZED ({matched}),
-                 candidates AS (
-                   SELECT vid,syntax_id,score FROM matched
-                   UNION ALL
-                   SELECT c.vid,c.syntax_id,NULL FROM native_version_search_cards c
-                   JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
-                   JOIN native_version_declarations d ON d.vid=c.vid AND d.syntax_id=c.syntax_id
-                   WHERE d.name=?2 COLLATE BINARY AND NOT EXISTS
-                     (SELECT 1 FROM matched f WHERE f.vid=c.vid AND f.syntax_id=c.syntax_id)
-                 )
-                 SELECT f.vid,f.syntax_id,f.score,d.role
-                 FROM candidates f
-                 JOIN native_version_search_cards c ON c.vid=f.vid AND c.syntax_id=f.syntax_id
-                 JOIN revision_documents m ON m.vid=c.vid AND m.revision_id=?1
-                 JOIN native_version_declarations d ON d.vid=f.vid AND d.syntax_id=f.syntax_id
-                 WHERE ?3 IS NULL OR d.role=?3
-                 ORDER BY (d.name=?2 COLLATE BINARY) DESC,
-                          CASE d.role WHEN 'production' THEN 0 ELSE 1 END,
-                          f.score IS NULL,f.score,f.syntax_id
-                 LIMIT ?5"
-            );
+            let sql = search_lexical_sql(expression.is_some());
             let mut statement = self.db.prepare(&sql)?;
             let mut rows = statement.query(params![
                 selected.key,
                 query,
-                search_role_filter(role),
+                search_role_filter(policy.role),
                 expression,
                 CANDIDATE_DEPTH as i64
             ])?;
             let mut lexical = Vec::new();
+            let mut seen = BTreeSet::new();
             while let Some(row) = rows.next()? {
                 check()?;
-                if let Some(score) = row.get::<_, Option<f64>>(2)? {
+                let score = row.get::<_, Option<f64>>(2)?;
+                if let Some(score) = score {
                     ensure!(
                         score.is_finite(),
                         SelectedIntegrity("store_unavailable: invalid lexical score".into())
                     );
                 }
                 let stored_role: String = row.get(3)?;
-                crate::native_evidence::DeclarationRole::from_stored(&stored_role)
+                let role = crate::native_evidence::DeclarationRole::from_stored(&stored_role)
                     .map_err(|error| SelectedIntegrity(error.to_string()))?;
-                lexical.push(SearchCandidateKey {
+                let key = SearchCandidateKey {
                     version_id: row.get(0)?,
                     syntax_id: stored_id_row(row, 1, false)?,
-                });
+                };
+                seen.insert(key.clone());
+                lexical.push((key, role, score));
             }
-            Ok(lexical)
+            // The SQL prefix already uses the final tiers. Adding only missing
+            // exact keys cannot promote an excluded nonexact row into the prefix.
+            for (key, role) in &policy.exact {
+                check()?;
+                if seen.insert(key.clone()) {
+                    lexical.push((key.clone(), *role, None));
+                }
+            }
+            lexical.sort_by(|(a, a_role, a_score), (b, b_role, b_score)| {
+                policy
+                    .exact
+                    .contains_key(b)
+                    .cmp(&policy.exact.contains_key(a))
+                    .then_with(|| {
+                        (*a_role != crate::native_evidence::DeclarationRole::Production)
+                            .cmp(&(*b_role != crate::native_evidence::DeclarationRole::Production))
+                    })
+                    .then_with(|| a_score.is_none().cmp(&b_score.is_none()))
+                    .then_with(|| match (a_score, b_score) {
+                        (Some(a), Some(b)) => a.total_cmp(b),
+                        _ => std::cmp::Ordering::Equal,
+                    })
+                    .then_with(|| a.syntax_id.cmp(&b.syntax_id))
+            });
+            lexical.truncate(CANDIDATE_DEPTH);
+            Ok(lexical.into_iter().map(|(key, _, _)| key).collect())
         })
     }
 
@@ -716,11 +756,11 @@ impl EvidenceResponse {
         &self,
         query: &str,
         expected: Option<IndexPin>,
-        role: crate::search_rank::SearchRole,
+        policy: &crate::search_rank::SearchPolicy,
         check: &mut impl FnMut() -> Result<()>,
     ) -> Result<McpSearchCandidates> {
         let (pin, cards) = self.mcp_search_head(expected, check)?;
-        let lexical = self.mcp_search_lexical(query, pin, cards.len(), role, check)?;
+        let lexical = self.mcp_search_lexical(query, pin, cards.len(), policy, check)?;
         Ok(McpSearchCandidates {
             pin,
             cards: cards.to_vec(),
