@@ -23,7 +23,7 @@ function fixture(aggregate = "max", role = "production") {
   if (role === "all") for (const row of files) { row.declarationCount += row.roleCounts.test; if (row.declarationCount) row.metrics.cognitive = 7; }
   return {...pin, aggregate, role, workbench:true,metricsVersion:"metrics:v1", scope:"revision", files, directories:[]};
 }
-function harness() {
+function harness(globals = {}) {
   const elements = new Map(), calls = [], renders = [], reads = [], conflicts = [];
   let context = {rootKey:"checkout-one", session:1, pin}, response = async () => ({payload:fixture()});
   function node(tagName) {
@@ -50,7 +50,7 @@ function harness() {
     clearTreemapInspector:() => { get("treemap-inspector").hidden = true; get("treemap-inspector-content").replaceChildren(); },
     showTreemapInspector:() => { get("treemap-inspector").hidden = false; },
   }};
-  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console});
+  vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window, document, URLSearchParams, console, ...globals});
   const controller = window.TrellisTreemap.create({request:(url, current) => { calls.push({url, current}); return response(url); }, context:() => context,
     readSource:(site, revision, current) => reads.push({site, revision, current}), onConflict:error => conflicts.push(error)});
   const button = label => { const result = descendants(get("treemap-inspector-content")).find(item => item.tagName === "button" && item.textContent === label); assert.ok(result, `Missing ${label}`); return result; };
@@ -281,4 +281,35 @@ test("root label is the observed checkout name only when one source set owns eve
   const unknown = harness(); unknown.setResponse(workspaceOnly); await unknown.controller.refresh();
   assert.equal(unknown.renders[0].options.rootLabel("workspace"), "workspace", "no observed checkout root: keep the exact source set");
   assert.equal(unknown.renders[0].options.viewport, undefined, "an unmeasured box keeps the natural square layout");
+});
+
+test("a resize back to the committed size supersedes a pending relayout, so a late stale size cannot repaint (#425)", async () => {
+  const observers = [], timers = [];
+  const h = harness({ResizeObserver:class { constructor(callback) { observers.push(callback); } observe() {} },
+    setTimeout:callback => { timers.push(callback); return timers.length; }, clearTimeout:() => {}, getComputedStyle:() => ({})});
+  h.window.TrellisTreemapPele.layoutSize = (count, viewport) => ({width:Math.floor(viewport.width), height:Math.floor(viewport.height)});
+  const box = h.get("treemap-diagram"), painted = [], held = [];
+  const resize = async width => { box.offsetWidth = width + 16; box.offsetHeight = 616; observers[0](); const run = timers.pop(); timers.length = 0; await run(); };
+  h.setRenderer((container, files, options) => {
+    h.renders.push({files, options});
+    const projection = {width:Math.floor(options.viewport.width), height:Math.floor(options.viewport.height)};
+    // Like Pele: the container changes only if the render is still current when it completes.
+    const finish = () => { if (!options.isCurrent()) return {status:"stale"}; painted.push(projection.width); return {status:"ready", projection}; };
+    if (projection.width !== 2000) return Promise.resolve(finish());
+    const gate = deferred(); held.push(gate); return gate.promise.then(finish);
+  });
+  box.offsetWidth = 1016; box.offsetHeight = 616;
+  await h.controller.refresh();
+  assert.equal(observers.length, 1); assert.deepEqual(painted, [1000], "layout A committed");
+  h.renders[0].options.onSelectFile(h.renders[0].files.find(file => file.path === "src/main.rs"));
+  const b = resize(2000); await Promise.resolve();
+  assert.equal(held.length, 1, "layout B is pending");
+  await resize(1000);
+  assert.equal(h.renders.length, 2, "the committed size A is not rendered again");
+  held[0].resolve(); await b;
+  assert.deepEqual(painted, [1000], "late B cannot replace A");
+  assert.equal(h.get("treemap-state").dataset.state, "ready");
+  assert.equal(h.get("treemap-inspector").hidden, false, "selection survives");
+  await resize(1000); assert.equal(h.renders.length, 2, "A stays the committed size");
+  await resize(1200); assert.deepEqual(painted, [1000, 1200], "a later real change still relayouts");
 });

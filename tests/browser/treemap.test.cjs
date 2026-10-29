@@ -584,5 +584,11 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
   assert.ok(Number.isFinite(value), "src/ has a measured folder number");
   assert.equal(folder.swatch, `metric-swatch heat-${[5, 15, 30].filter(cut => value > cut).length}`, "folder swatch uses the legend's fixed band");
   assert.ok(folder.gap >= 0 && folder.gap < 12, "folder number is right-aligned in its row");
+  assert.equal(await legend.getAttribute("role"), "group"); assert.equal(await page.locator("#treemap-legend").getAttribute("role"), "group");
   await capture(page, "treemap-explorer-legend");
+  // An open file list scrolls inside its own capped box instead of squeezing the diagram.
+  await page.locator(".treemap-file-list > summary").click();
+  const list = await page.locator("#treemap-files").evaluate(node => ({max:parseFloat(getComputedStyle(node).maxHeight), height:node.getBoundingClientRect().height, overflow:getComputedStyle(node).overflowY}));
+  assert.ok(list.max > 0 && list.height <= list.max + 1 && list.overflow === "auto", JSON.stringify(list));
+  assert.ok(fills(await filled(page)), "the diagram still fills its box with the list open");
 }));

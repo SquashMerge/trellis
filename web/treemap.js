@@ -169,11 +169,12 @@
           let laidOut = outcome.projection;
           const area = files.filter(file => file.physicalLines > 0).length;
           relayout = async () => {
+            // Every newer desired size supersedes pending relayouts, even when it is the committed size again.
+            const layout = ++layoutSerial, latest = () => interactive() && layout === layoutSerial;
             const next = interactive() && laidOut ? viewport() : undefined;
             if (!next) return;
             const size = window.TrellisTreemapPele.layoutSize(area, next);
             if (size.width === laidOut.width && size.height === laidOut.height) return;
-            const layout = ++layoutSerial, latest = () => interactive() && layout === layoutSerial;
             const result = await paint(selectedKey, latest);
             if (!latest()) return;
             if (result?.status === "ready") { laidOut = result.projection; markSelection(); return; }
