@@ -527,6 +527,11 @@ test("unsupported source type files collapse into one quiet counted marker per f
   const rendered = text(h.get('file-tree'));
   assert.equal((rendered.match(/Unsupported source type/g) || []).length, 0, 'no per-file unsupported rows');
   assert.match(rendered, /TypeScript indexing not supported yet/, 'other unindexed reasons keep their own rows');
+  h.run(`selectedWorkspaceRoot=treeRoot;filesGitStatus={git:{state:"available"},changes:[{path:"docs/guide.md",status:"modified"},{path:"<img src=x>.lock",status:"added"}]};renderDirectoryTree()`);
+  const grouped = descendants(h.get('file-tree')).filter(n => n.className === 'unsupported-files');
+  const changes = grouped.flatMap(row => descendants(row).filter(n => n.className === 'git-marker'));
+  assert.equal(grouped.length, 2, 'Git decoration keeps the quiet grouping');
+  assert.deepEqual(changes.map(n => [n.attrs['data-path'], n.attrs['data-status']]), [['docs/guide.md', 'modified'], ['<img src=x>.lock', 'added']]);
 });
 
 test("index scope mismatch stays in primary roots and action label, same root adds no warning", async () => {
@@ -1372,4 +1377,96 @@ test("captured declaration Inspect source rejects replaced Inspector and changed
   await h.run(`selectMethod(${JSON.stringify(symbol("next"))})`);
   const count=h.networkUrls.length; await callbacks[2](); assert.equal(h.networkUrls.length,count);
   assert.equal(h.run("selectedMethod.id"),"next");
+});
+
+
+const measuredGit = (count, name = "main") => ({state:"available",head:{kind:"branch",name},upstream:null,workingTree:{state:"available",changedFiles:count}});
+const gitMarkers = h => descendants(h.get("file-tree")).filter(node => node.className === "git-marker");
+const markerStatus = node => node.attrs["data-status"];
+test("live Git markers use exact checkout paths, accessible meanings and no invented deleted rows", async () => {
+  const h=harness();
+  h.run(`selectedWorkspaceRoot="/synthetic";treeRoot="/synthetic";indexedWorkspace="/synthetic";treeMode=true;
+    directories.set("",{open:true,items:[
+      {path:"src",name:"src",kind:"directory"},
+      {path:"other",name:"other",kind:"directory"},
+      {path:"fresh.txt",name:"fresh.txt",kind:"file",indexedPath:null},
+      {path:"renamed.js",name:"renamed.js",kind:"file",indexedPath:"renamed.js",methodCount:0}
+    ]});
+    directories.set("src",{open:true,items:[{path:"src/same.js",name:"same.js",kind:"file",indexedPath:"src/same.js",methodCount:0}]});
+    directories.set("other",{open:true,items:[{path:"other/same.js",name:"same.js",kind:"file",indexedPath:"other/same.js",methodCount:0}]});`);
+  const changes=[{path:"src/same.js",status:"modified"},{path:"fresh.txt",status:"added"},{path:"renamed.js",previousPath:"old/<img>.js",status:"renamed"},{path:"gone.js",status:"deleted"}];
+  h.context.fetch=async route=>{assert.equal(route,"/api/git");return response({git:measuredGit(4),changes});};
+  await h.run("refreshGit()");
+  const markers=gitMarkers(h);
+  assert.deepEqual(markers.map(markerStatus).sort(),["added","modified","renamed"]);
+  for (const marker of markers) {
+    assert.match(marker.title,/uncommitted vs HEAD/);
+    assert.match(marker.attrs["aria-label"],/uncommitted vs HEAD/);
+  }
+  const modified=markers.find(marker=>markerStatus(marker)==="modified");
+  assert.equal(modified.textContent,"M"); assert.match(modified.title,/Modified/);
+  const modifiedRow=descendants(h.get("file-tree")).find(node=>node.tagName==="li" && node.children.some(child=>child.title==="src/same.js"));
+  assert.ok(descendants(modifiedRow).includes(modified));
+  const otherRow=descendants(h.get("file-tree")).find(node=>node.tagName==="li" && node.children.some(child=>child.title==="other/same.js"));
+  assert.ok(!descendants(otherRow).some(node=>node.className==="git-marker"));
+  assert.match(markers.find(marker=>markerStatus(marker)==="renamed").title,/old\/<img>\.js/);
+  assert.doesNotMatch(text(h.get("file-tree")),/gone.js/);
+  assert.ok(descendants(h.get("file-tree")).every(node=>node.tagName!=="img"));
+  h.run('treeRoot="/different";renderFiles()'); assert.equal(gitMarkers(h).length,0,"ambiguous browse roots cannot borrow checkout-relative paths");
+  h.run('treeRoot="/synthetic";renderFiles()'); assert.equal(gitMarkers(h).length,3);
+  h.context.fetch=async()=>response({git:{state:"unavailable",reason:"git_changed"},changes:null});
+  await h.run("refreshGit()"); assert.equal(gitMarkers(h).length,0);
+  assert.doesNotMatch(h.get("workspace-git").textContent,/4 uncommitted|clean|main/);
+});
+
+test("newer selected Git observation protects header and list from older checkout discovery", async () => {
+  const h=harness(), held=deferred();
+  h.run('selectedWorkspaceRoot="/synthetic"');
+  h.context.fetch=()=>held.promise;
+  const pending=h.run("loadCheckouts()");
+  h.context.fetch=async route=>{assert.equal(route,"/api/git");return response({git:measuredGit(5,"new-branch"),changes:[]});};
+  await h.run("refreshGit()");
+  held.resolve(response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",git:measuredGit(1,"old-branch")},{rootKey:"b".repeat(64),workspaceRoot:"/other",state:"available",git:measuredGit(2,"other-branch")}]}));
+  await pending;
+  assert.match(h.get("workspace-git").textContent,/new-branch.*5 uncommitted/);
+  const rows=descendants(h.get("indexed-checkouts")).filter(node=>node.className==="checkout-git");
+  assert.match(rows[0].textContent,/new-branch.*5 uncommitted/);
+  assert.match(rows[1].textContent,/other-branch.*2 uncommitted/);
+  assert.doesNotMatch(text(h.get("indexed-checkouts")),/old-branch|1 uncommitted/);
+  assert.match(h.get("checkout-select").children.find(node=>node.value===ROOT).textContent,/new-branch/);
+});
+
+for (const cold of [false,true]) test(`selection reads Git independently after ${cold ? "cold reset" : "unavailable index status"}`, async () => {
+  const h=harness(), gitRead=deferred();
+  h.run(`checkouts[0].git=${JSON.stringify(measuredGit(2,"listed"))}`);
+  h.context.fetch=async route=>{
+    if(route==="/api/status") return {ok:false,status:409,json:async()=>({error:{code:cold?"index_not_ready":"storage_busy",message:"Index is unavailable",workspaceRoot:"/synthetic"}})};
+    if(route==="/api/git") return gitRead.promise;
+    throw new Error("Unexpected request "+route);
+  };
+  await h.run(`selectCheckout("${ROOT}")`);
+  assert.ok(h.networkUrls.some(url=>url.endsWith("/git")),"cold/unavailable index must still start a Git observation");
+  gitRead.resolve(response({git:measuredGit(6,"measured"),changes:[]}));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(h.get("workspace-git").textContent,/measured.*6 uncommitted/);
+  assert.equal(h.run("selectedGit.workingTree.changedFiles"),6);
+  assert.equal(h.run("status"),null);
+  assert.ok(h.networkUrls.every(url=>!url.includes("/source")&&!url.includes("/index")));
+});
+
+
+test("selected Git starts while index status is still pending", async () => {
+  const h=harness(), statusRead=deferred();
+  h.context.fetch=async route=>{
+    if(route==="/api/status") return statusRead.promise;
+    if(route==="/api/git") return response({git:measuredGit(7,"independent"),changes:[]});
+    throw new Error("Unexpected request "+route);
+  };
+  const selection=h.run(`selectCheckout("${ROOT}")`);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(h.networkUrls.some(url=>url.endsWith("/git")),"slow status must not block the independent Git observation");
+  assert.match(h.get("workspace-git").textContent,/independent.*7 uncommitted/);
+  statusRead.resolve({ok:false,status:409,json:async()=>({error:{code:"storage_busy",message:"Index is unavailable"}})});
+  await selection;
+  assert.match(h.get("workspace-git").textContent,/independent.*7 uncommitted/);
 });

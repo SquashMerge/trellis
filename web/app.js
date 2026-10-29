@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, selectedGit = null, gitSerial = 0, checkoutBusy = false, checkouts = [], sourceSerial = 0;
 const pendingRequests = new Set();
-let status = null, statusUnavailable = false, indexNotReady = false, staleMessage = "";
+let status = null, statusUnavailable = false, jobUnavailable = false, jobObservation = 0, indexNotReady = false, staleMessage = "";
 let statusSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
 let job = null, pollTimer = null, waitingForJob = false;
@@ -379,10 +379,16 @@ function clearSource() {
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
 function showSelectedGit(git) {
   selectedGit = git || null;
+  if (selectedGit?.state !== "available") {
+    filesGitStatus = null; filesDiffSerial++; filesDiff = null;
+    $("files-diff")?.replaceChildren();
+  }
   const row = checkouts.find(row => row.rootKey === selectedRootKey);
   if (row) row.git = selectedGit;
   updateCheckoutOptions();
+  renderCheckoutList();
   updateFilesBasis();
+  if (treeMode || files.length || filesCatalogLoaded) renderFiles();
   window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
   if (!status) window.TrellisShell?.updateWorkspace(null);
 }
@@ -391,9 +397,9 @@ async function refreshGit() {
   filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
   try {
     const data = await api("/api/git");
-    if (serial === gitSerial && session === epoch && root === selectedRootKey) { filesGitStatus = data; showSelectedGit(data?.git); updateFilesBasis(); if (section === "files") renderFiles(); }
+    if (serial === gitSerial && session === epoch && root === selectedRootKey) { filesGitStatus = data; showSelectedGit(data?.git); }
   } catch (error) {
-    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") { filesGitStatus = null; showSelectedGit(null); updateFilesBasis(); }
+    if (serial === gitSerial && session === epoch && root === selectedRootKey && error.name !== "AbortError") { filesGitStatus = null; showSelectedGit(null); }
   }
 }
 async function refreshStatus(followup = false) {
@@ -414,6 +420,7 @@ async function refreshStatus(followup = false) {
       resetCheckout();
       selectedRootKey = root; selectedWorkspaceRoot = listedRoot; indexNotReady = true;
       showSelectedGit(git);
+      void refreshGit();
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
       $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
@@ -532,7 +539,7 @@ function resetCheckout() {
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
   clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
-  status = null; statusUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;
+  status = null; statusUnavailable = false; jobUnavailable = false; indexNotReady = false; staleMessage = ""; job = null; waitingForJob = false;
   resetHeadObservation();
   ["status", "diagnostics", "job"].forEach(id => $(id).textContent = "");
   $("file-filter").value = "";
@@ -587,6 +594,7 @@ function selectedIndexStatus() {
   if (!selectedRootKey) return {state:"unknown", text:"No checkout selected"};
   if (checkoutBusy) return {state:"failed", text:"Checkout busy · retry checkout list"};
   if (statusUnavailable) return {state:"failed", text:"Index status unavailable · retry status"};
+  if (jobUnavailable) return {state:"failed", text:"Index job unavailable · retry status"};
   if (job?.state === "failed") return {state:"failed", text:"Index failed · see Diagnostics"};
   if (job && activeJob(job)) return {state:"catching-up", text:jobText(job)};
   if (indexNotReady) return {state:"unknown", text:"Index not ready · retry status"};
@@ -599,12 +607,17 @@ function selectedIndexStatus() {
   if (staleMessage) return {state:"stale", text:"Stale evidence · see Diagnostics"};
   return base;
 }
+// The visible label follows every poll; the live region speaks only when the leading state words change.
+function stateWord(text) { return String(text).split(" · ")[0]; }
 function renderIndexStatus() {
   const state = selectedIndexStatus();
   $("workspace-index-state")?.setAttribute("data-state", state.state);
   $("workspace-index-label").textContent = state.text;
+  const announce = $("workspace-index-announce");
+  if (announce && stateWord(announce.textContent) !== stateWord(state.text)) announce.textContent = state.text;
   renderCheckoutList();
 }
+function storageWarning() { return tokenSaveFailed ? "Browser storage is unavailable; token was not saved." : ""; }
 function updateCheckoutOptions() {
   for (const option of $("checkout-select").children) {
     const row = checkouts.find(row => row.rootKey === option.value);
@@ -623,7 +636,7 @@ function renderCheckoutList() {
   list.replaceChildren();
   for (const row of checkouts) {
     const li = element("li"), state = row.rootKey === selectedRootKey ? selectedIndexStatus() : checkoutIndexLabel(row);
-    const name = row.workspaceRoot?.split("/").filter(Boolean).at(-1) || row.rootKey;
+    const name = window.TrellisShell?.rootName(row.workspaceRoot) || row.rootKey;
     const pick = button(name, () => selectCheckout(row.rootKey));
     pick.className = "checkout-pick"; pick.disabled = !selectable(row);
     pick.title = row.workspaceRoot || row.rootKey;
@@ -662,6 +675,7 @@ async function loadCheckouts() {
       checkoutBusy = true;
       $("checkout-root").textContent = verifiedRoot;
     }
+    if (sameRoot && gitAtStart !== gitSerial) selected.git = selectedGit;
     checkouts = next;
     renderCheckoutList();
     if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
@@ -675,12 +689,16 @@ async function loadCheckouts() {
       option.disabled = !selectable(row); select.append(option);
     }
     select.value = choice;
-    if (choice && !busy && gitAtStart === gitSerial) { gitSerial++; showSelectedGit(selected.git); }
+    if (choice && !busy && gitAtStart === gitSerial) {
+      gitSerial++; filesGitStatus = null; showSelectedGit(selected.git);
+      if (section === "files" && filesFile && filesBasis === "working") void setFilesBasis("working");
+      else void refreshGit();
+    }
     select.disabled = !checkouts.some(selectable);
     $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
       : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
-      : choice ? "" : "Choose a checkout to inspect. No checkout is selected automatically.";
+      : choice ? storageWarning() : "Choose a checkout to inspect. No checkout is selected automatically.";
     $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
     if (choice && !busy) showCheckoutIndexState(selected);
     if (recovering) await selectCheckout(choice);
@@ -723,18 +741,17 @@ async function selectCheckout(key) {
   $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
   window.TrellisShell?.setConnected(true);
   const session = epoch;
+  void refreshGit();
   try {
     await refreshStatus();
     if (session !== epoch) return;
-    job = await api("/api/jobs/current").catch(error => { if (error.name !== "AbortError") throw error; return null; });
+    const lookup = await lookupCurrentJob();
     if (session !== epoch) return;
-    waitingForJob = !!job && activeJob(job);
-    showJob();
-    if (job) schedulePoll();
-    $("checkout-state").textContent = "";
+    // The browse notice is hidden once a checkout is shown; the storage warning stays in the header status line.
+    $("checkout-state").textContent = lookup.error && jobUnavailable
+      ? `Index job unavailable: ${lookup.error.message} Retry status; your selection is unchanged.` : storageWarning();
     void readNavigationLocation(true);
-    $("notice").textContent = "Browse folders below. Indexed files expand to methods."
-      + (tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "");
+    $("notice").textContent = `Browse folders below. Indexed files expand to methods.${storageWarning() ? ` ${storageWarning()}` : ""}`;
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     const cold = error.code === "index_not_ready";
@@ -752,7 +769,11 @@ $("checkout-retry").addEventListener("click", async () => {
   const [listed] = await Promise.all([loadCheckouts(), loadDaemonStatus()]);
   if (listed && token && $("remember-token").checked) {
     try { localStorage.setItem(tokenStorageKey, token); tokenSaveFailed = false; }
-    catch (_) { tokenSaveFailed = true; $("checkout-state").textContent += " Browser storage is unavailable; token was not saved."; }
+    catch (_) {
+      tokenSaveFailed = true;
+      const line = $("checkout-state");
+      if (!line.textContent.includes(storageWarning())) line.textContent = `${line.textContent} ${storageWarning()}`.trim();
+    }
   }
 });
 form("connect-form", async () => {
@@ -797,9 +818,12 @@ function paintCachedSource(data, range, current, startLine = range?.startLine ||
   $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot`;
   const fragment = document.createDocumentFragment();
   const lastLine = range && range.endLine > range.startLine && range.endColumn === 1 ? range.endLine - 1 : range?.endLine;
-  data.file.text.split("\n").forEach((text, index) => {
+  const lines = data.file.text.split("\n"), syntax = section === "files" ? window.TrellisFiles?.lineClass : null;
+  lines.forEach((text, index) => {
     const number = index + 1, line = element("span", undefined, "source-line");
     if (range && number >= range.startLine && number <= lastLine) line.classList.add("highlight");
+    const kind = syntax?.(data.file.language, text, lines.length);
+    if (kind) line.classList.add(kind);
     line.append(element("span", String(number), "line-number"), document.createTextNode(text)); fragment.append(line);
   });
   $("source").replaceChildren(fragment); $("source").hidden = false;
@@ -848,6 +872,13 @@ async function refreshView() {
   clearSource(); filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
   await refreshGit(); if (session !== epoch || root !== selectedRootKey) return;
   await refreshStatus();
+  if (jobUnavailable) {
+    // Retrying status also retries the job lookup that failed during selection.
+    const lookup = await lookupCurrentJob();
+    if (session !== epoch || root !== selectedRootKey) return;
+    if (lookup.error) throw lookup.error;
+    $("checkout-state").textContent = storageWarning();
+  }
   if (IndexPin.equal(revision, status?.revision)) {
     void viewerMetrics?.refresh(); await refreshTree();
     if (section === "files" && file) {
@@ -878,6 +909,23 @@ function jobText(value) {
   if (value.error) parts.push("see Diagnostics");
   return parts.join(" · ");
 }
+// Every job read from the daemon is an observation; an older lookup never overrides a newer one.
+function observeJob(value) { job = value; jobObservation++; jobUnavailable = false; }
+async function lookupCurrentJob() {
+  const observed = jobObservation, session = epoch;
+  let current, error = null;
+  try { current = await api("/api/jobs/current"); }
+  catch (failure) { if (failure.name === "AbortError") return {error:null}; error = failure; }
+  if (session !== epoch || observed !== jobObservation) return {error:null};
+  if (error) {
+    // The job is unknown: never let the header fall back to Fresh.
+    jobUnavailable = true; $("job").textContent = `Index job unavailable: ${error.message}`; renderIndexStatus();
+    return {error};
+  }
+  observeJob(current); waitingForJob = !!job && activeJob(job); showJob();
+  if (job) schedulePoll();
+  return {error:null};
+}
 function showJob() {
   if (!job) { $("job").textContent = ""; $("cancel").hidden = true; $("index").disabled = false; renderIndexStatus(); return; }
   $("job").textContent = `${jobText(job)}${job.error ? `\n${describe(job.error)}` : ""}`;
@@ -889,7 +937,7 @@ function schedulePoll() {
   clearTimeout(pollTimer);
   if (!waitingForJob || !job || !activeJob(job) || !token) return;
   pollTimer = setTimeout(() => perform(async () => {
-    job = await api(`/api/jobs/${encodeURIComponent(job.id)}`); showJob();
+    observeJob(await api(`/api/jobs/${encodeURIComponent(job.id)}`)); showJob();
     if (activeJob(job)) schedulePoll();
     else { waitingForJob = false; showJob(); await refreshStatus(); }
   }), 700);
@@ -898,7 +946,7 @@ $("index").addEventListener("click", () => perform(async () => {
   clearNavigationHistory();
   window.TrellisClasses?.reset();
   diagramSerial++; viewerMetrics?.clearInspection(); window.TrellisShell?.resetInspector(); clearSource();
-  job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
+  observeJob(await api("/api/index", "POST", {})); waitingForJob = true; showJob(); schedulePoll();
 }, $("index")).then(() => { if (job) showJob(); }));
 $("cancel").addEventListener("click", () => {
   // Stopping this page's polling never cancels a durably accepted request.
@@ -1153,20 +1201,26 @@ async function setFilesBasis(basis) {
   const path = filesFile.path, guard = filesGuard({basis:true}), observation = ++gitSerial;
   const current = () => guard() && serial === filesDiffSerial && observation === gitSerial;
   $("files-diff").append(element("p", "Measuring uncommitted changes against HEAD…"));
+  let statusMeasured = false;
   try {
     const statusData = await api("/api/git", "GET", undefined, current);
     if (!current()) return;
-    filesGitStatus = statusData; showSelectedGit(statusData.git);
+    filesGitStatus = statusData; showSelectedGit(statusData.git); statusMeasured = true;
     if (statusData.git.state !== "available") { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
     if (!statusData.changes?.some(change => change.path === path)) { window.TrellisFiles?.diff($("files-diff"), {git:statusData.git, file:null}); return; }
     const data = await api(`/api/git/diff?path=${encodeURIComponent(path)}`, "GET", undefined, current);
     if (!current()) return;
     if (data.file && data.file.path !== path) throw new Error("Git diff path changed. Refresh to measure again.");
-    filesDiff = data; showSelectedGit(data.git); window.TrellisFiles?.diff($("files-diff"), data); renderFiles();
-  } catch (error) { if (current()) $("files-diff").replaceChildren(); filesFailure(error, "files-diff", current); }
+    filesDiff = data;
+    window.TrellisFiles?.diff($("files-diff"), data); renderFiles();
+  } catch (error) {
+    if (!current()) return;
+    if (!statusMeasured) { filesGitStatus = null; showSelectedGit(null); }
+    filesFailure(error, "files-diff", guard);
+  }
 }
 function appendChangedOnlyPaths(tree, filter) {
-  const indexed = new Set(files.map(file => file.path));
+  const indexed = new Set(files.map(file => file.path)), markers = gitChangesByPath();
   const changes = filesGitStatus?.changes?.filter(change => !indexed.has(change.path) && change.path.toLowerCase().includes(filter)) || [];
   if (!changes.length) return;
   const group = element("li", "Uncommitted paths · not indexed"), list = element("ul"); group.append(list); tree.append(group);
@@ -1179,7 +1233,8 @@ function appendChangedOnlyPaths(tree, filter) {
       $("source-path").textContent = `${change.path} · not in the loaded indexed catalog; no indexed outline or navigation`;
       await setFilesBasis("working");
     });
-    pick.className = "files-change-pick"; pick.setAttribute("data-path", change.path); row.append(pick); list.append(row);
+    pick.className = "files-change-pick"; pick.setAttribute("data-path", change.path);
+    appendGitMarker(pick, change.path, markers); row.append(pick); list.append(row);
   }
 }
 $("files-indexed")?.addEventListener("click", () => setFilesBasis("indexed"));
@@ -1263,6 +1318,28 @@ function hiddenTreeEntry(item) {
   const selection = metricDirectorySelection(item.path);
   return !!selection && viewerMetrics?.indexedDirectory(selection.path) === false;
 }
+function gitChangesByPath() {
+  if (filesGitStatus?.git?.state !== "available" || !Array.isArray(filesGitStatus.changes)) return new Map();
+  const paths = new Map();
+  for (const change of filesGitStatus.changes) paths.set(change.path, change);
+  for (const change of filesGitStatus.changes) {
+    if (change.status === "renamed" && change.previousPath && !paths.has(change.previousPath)) paths.set(change.previousPath, change);
+  }
+  return paths;
+}
+function appendGitMarker(node, path, changes) {
+  const change = changes.get(path);
+  const labels = {modified:["M", "Modified"], added:["A", "Added"], deleted:["D", "Deleted"], renamed:["R", "Renamed"]};
+  const label = labels[change?.status];
+  if (!label) return;
+  const marker = element("span", label[0], "git-marker");
+  const rename = change.status === "renamed" ? path === change.previousPath ? ` · to ${change.path}` : ` · from ${change.previousPath}` : "";
+  marker.title = `${label[1]} · uncommitted vs HEAD${rename}`;
+  marker.setAttribute("aria-label", marker.title);
+  marker.setAttribute("data-status", change.status);
+  marker.setAttribute("data-path", path);
+  node.append(marker);
+}
 function renderFiles() {
   $("show-hidden-files").checked = showHiddenFiles();
   if (section !== "files" && treeMode) { renderDirectoryTree(); return; }
@@ -1270,7 +1347,7 @@ function renderFiles() {
   const tree = $("file-tree"); tree.replaceChildren();
   const filter = $("file-filter").value.toLowerCase();
   const visible = files.filter(f => f.path.toLowerCase().includes(filter) && (showHiddenFiles() || !dotPath(f.path)));
-  const metricRows = [];
+  const changes = gitChangesByPath(), metricRows = [];
   const dirs = new Map([["", tree]]);
   for (const file of visible) {
     const parts = file.path.split("/"); let parent = tree, key = "";
@@ -1296,6 +1373,7 @@ function renderFiles() {
     const selection = {scope:"file", path:file.path};
     const pick = button(`${state?.open ? "▾" : "▸"} ${parts.at(-1)}${section === "files" ? "" : " · " + file.methodCount}`, () => { if (!fileCurrent() || fileSurface !== sectionSerial) return; if (section === "files") return selectFilesFile(file); inspectTreeSelection(selection); return toggleFile(file); });
     pick.className = "file-pick"; pick.title = file.path;
+    appendGitMarker(pick, file.path, changes);
     if (section !== "files") attachClassMenu(pick, {path:file.path});
     pick.setAttribute("aria-expanded", String(section === "files" ? !!state?.outlineOpen : !!state?.open));
     if (section !== "files") metricRows.push(viewerMetrics?.decorate(pick, selection)); li.append(pick);
@@ -1637,11 +1715,14 @@ const unsupportedSourceReason = "Unsupported source type";
 function unsupportedTreeFile(item) {
   return item.kind === "file" && item.indexedPath == null && item.unindexedReason === unsupportedSourceReason;
 }
-function unsupportedFilesMarker(names) {
+function unsupportedFilesMarker(items, changes) {
   const row = element("li", undefined, "unsupported-files"), details = element("details");
-  details.append(element("summary", `${names.length} ${names.length === 1 ? "file" : "files"} · unsupported source type · not indexed`));
+  details.append(element("summary", `${items.length} ${items.length === 1 ? "file" : "files"} · unsupported source type · not indexed`));
   const list = element("ul");
-  for (const name of names) list.append(element("li", name, "unindexed-file"));
+  for (const item of items) {
+    const name = element("li", item.name, "unindexed-file");
+    appendGitMarker(name, item.path, changes); list.append(name);
+  }
   details.append(list); row.append(details);
   return row;
 }
@@ -1667,6 +1748,7 @@ function renderDirectoryTree() {
   }
   let count = 0, hidden = 0;
   const metricRows = [], showHidden = showHiddenFiles();
+  const changes = treeRoot === selectedWorkspaceRoot ? gitChangesByPath() : new Map();
   function rows(path, list, anchorPath = path) {
     const state = directories.get(path);
     if (!state) return;
@@ -1674,7 +1756,7 @@ function renderDirectoryTree() {
     for (const item of (state.items || []).filter(matches)) {
       if (!showHidden && hiddenTreeEntry(item)) { hidden++; continue; }
       count++;
-      if (unsupportedTreeFile(item)) { unsupported.push(item.name); continue; }
+      if (unsupportedTreeFile(item)) { unsupported.push(item); continue; }
       const row = element("li");
       if (item.kind === "directory") {
         const compact = compactDirectory(item), child = directories.get(item.path);
@@ -1696,17 +1778,20 @@ function renderDirectoryTree() {
         const selection = {scope:"file", path:item.indexedPath};
         const pick = button(`${open ? "▾" : "▸"} ${item.name} · ${item.methodCount ?? 0}`, () => { inspectTreeSelection(selection); return toggleFile(file); });
         pick.className = "file-pick"; pick.title = item.path;
+        appendGitMarker(pick, item.path, changes);
         attachClassMenu(pick, {path:file.path});
         pick.setAttribute("aria-expanded", String(open));
         metricRows.push(viewerMetrics?.decorate(pick, selection));
         row.append(pick); appendMethods(row, file);
       } else {
-        row.append(element("span", item.name, "unindexed-file"), element("span",
+        const name = element("span", item.name, "unindexed-file");
+        if (item.kind === "file") appendGitMarker(name, item.path, changes);
+        row.append(name, element("span",
           item.kind === "symlink" ? "Symbolic link · not followed" : item.kind === "file" ? (item.unindexedReason || "Not indexed in current workspace") : "Special entry · metadata only", "detail"));
       }
       list.append(row);
     }
-    if (unsupported.length) list.append(unsupportedFilesMarker(unsupported));
+    if (unsupported.length) list.append(unsupportedFilesMarker(unsupported, changes));
     if (state.loading) list.append(element("li", "Loading folder…", "detail"));
     if (state.error) {
       const row = element("li", state.error, "warning");

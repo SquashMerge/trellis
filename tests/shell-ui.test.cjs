@@ -326,13 +326,17 @@ test("inspector refuses source callback for malformed ranges or missing paired s
  assert.equal(opened,0);
 });
 
-const branchGit = (upstream = null) => ({state:"available",head:{kind:"branch",name:"feature/<script>",commit:"abcdef123456",shortCommit:"abcdef1"},upstream});
-test("Git header shows measured branch, last-fetch counts, detached HEAD and unavailable without inventing a branch",()=>{
+const branchGit = (upstream = null, workingTree = {state:"available",changedFiles:3}) => ({state:"available",head:{kind:"branch",name:"feature/<script>",commit:"abcdef123456",shortCommit:"abcdef1"},upstream,workingTree});
+test("Git header uses measured counts independently of branch, upstream and index freshness",()=>{
   const h=harness();
   for (const [git,expected] of [
-    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · origin/main ↑2 ↓3 · As of last fetch"],
-    [branchGit(),"feature/<script> · No upstream"],
-    [{state:"available",head:{kind:"detached",name:null,commit:"abcdef123456",shortCommit:"abcdef1"},upstream:null},"Detached HEAD abcdef1 · No upstream"],
+    [branchGit({name:"origin/main",ahead:2,behind:3,basis:"last_fetch"}),"feature/<script> · 3 uncommitted · origin/main ↑2 ↓3 · As of last fetch"],
+    [branchGit(),"feature/<script> · No upstream · 3 uncommitted"],
+    [branchGit(null,{state:"available",changedFiles:0}),"feature/<script> · No upstream · clean"],
+    [branchGit(null,{state:"unavailable",reason:"git_changed"}),"feature/<script> · No upstream · Changes unavailable"],
+    [{...branchGit(),workingTree:undefined},"feature/<script> · No upstream · Changes unavailable"],
+    [{state:"available",head:{kind:"detached",name:null,commit:"abcdef123456",shortCommit:"abcdef1"},upstream:null,workingTree:{state:"available",changedFiles:1}},"Detached HEAD abcdef1 · No upstream · 1 uncommitted"],
+    [{state:"available",head:{kind:"detached"},upstream:null,workingTree:{state:"available",changedFiles:0}},"Detached HEAD · No upstream · clean"],
     [{state:"unavailable",reason:"not_repository"},"Git unavailable"],
     [undefined,"Git unavailable"]
   ]) {
@@ -341,6 +345,7 @@ test("Git header shows measured branch, last-fetch counts, detached HEAD and una
     assert.equal(h.get("workspace-git").title,expected);
     assert.equal(h.get("workspace-git").hidden,false);
     assert.equal(all(h.get("workspace-git")).some(n=>n.tagName==="script"),false);
+    if (!git?.upstream) assert.doesNotMatch(expected,/[↑↓]/);
     h.shell.updateWorkspace(null);
     assert.equal(h.get("workspace-git").textContent,expected,"cold index must not erase independent Git");
     assert.equal(h.get("workspace-name").textContent,"repo");
@@ -541,4 +546,87 @@ test("shared status follows retained head observations and completed job details
   assert.match(h.get("job").textContent,/rev 12345678:9/);
   assert.doesNotMatch(h.get("job").textContent,/rev 12345678:1/);
   assert.match(h.get("workspace-index-label").textContent,/Head comparison unavailable/);
+});
+test("detached heads without a short commit say Detached and roots split on either separator", () => {
+  const h = harness();
+  const revision = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:7};
+  const detached = {state:"available",head:{kind:"detached",shortCommit:null}};
+  assert.equal(h.shell.checkoutLabel({workspaceRoot:"/private/long/repo",revision,git:detached}), "repo ⎇ Detached · rev 12345678:7");
+  assert.equal(h.shell.formatGit(detached), "Detached HEAD · No upstream · Changes unavailable");
+  assert.equal(h.shell.checkoutLabel({workspaceRoot:"C:\\work\\repo\\",revision,git:{state:"unavailable"}}), "repo ⎇ Git unavailable · rev 12345678:7");
+  for (const root of ["/a/b/repo", "/a/b/repo/", "C:\\a\\repo", "C:\\a\\repo\\"]) assert.equal(h.shell.rootName(root), "repo");
+  assert.equal(h.shell.rootName(""), "");
+});
+test("the header live region announces state-word changes, not each progress poll", () => {
+  const h = harness(true);
+  const announced = () => h.get("workspace-index-announce").textContent;
+  h.run(`status.catchingUp=false;renderIndexStatus();`);
+  assert.match(announced(), /^Fresh/);
+  h.run(`job={state:"running",progress:{phase:"capture",total:10,completed:1}};waitingForJob=true;showJob();`);
+  assert.equal(announced(), "Indexing · capture · 1/10");
+  h.run(`job={state:"running",progress:{phase:"capture",total:10,completed:7}};showJob();`);
+  assert.equal(h.get("workspace-index-label").textContent, "Indexing · capture · 7/10");
+  assert.equal(announced(), "Indexing · capture · 1/10", "a progress-only change is not re-announced");
+  h.run(`job={state:"failed",error:{code:"index_failed",message:"boom"}};showJob();`);
+  assert.equal(announced(), "Index failed · see Diagnostics");
+});
+const selectedStatus = {revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},workspaceRoot:"/repo",stats:{files:1,changedFiles:[]},catchingUp:false};
+async function selectWith(h, jobs) {
+  h.run(`checkouts[0].catchingUp=false;checkouts[0].revision=status.revision;uniqueSelectableRoot=()=>true;`);
+  h.context.fetch = async path => path === "/api/status" ? response(selectedStatus) : path === "/api/jobs/current" ? jobs() : response({});
+  await h.run(`selectCheckout(selectedRootKey)`);
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+}
+test("a failed job lookup after status succeeds marks the selection unavailable, not stale", async () => {
+  const h = harness(true);
+  let jobs = async () => ({ok:false,status:500,json:async()=>({error:{code:"storage_io",message:"<b>jobs</b> unavailable"}})});
+  await selectWith(h, () => jobs());
+  assert.equal(h.get("workspace-index-state").attrs["data-state"], "failed");
+  assert.equal(h.get("workspace-index-label").textContent, "Index job unavailable · retry status");
+  assert.match(h.get("checkout-state").textContent, /<b>jobs<\/b> unavailable/);
+  // A later status refresh alone does not hide the unknown job behind Fresh.
+  await h.run(`refreshStatus()`);
+  assert.equal(h.get("workspace-index-label").textContent, "Index job unavailable · retry status");
+  jobs = async () => ({ok:true,status:204,json:async()=>null});
+  await h.get("refresh").listeners.click();
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  // Stubbed tree reads lack a pin, so the header may report other stale evidence, but the job is known again.
+  assert.doesNotMatch(h.get("workspace-index-label").textContent, /job unavailable/);
+  assert.notEqual(h.get("workspace-index-state").attrs["data-state"], "failed");
+  assert.equal(h.get("checkout-state").textContent, "");
+});
+test("an older failed job lookup never overrides a newer accepted job after Stop waiting", async () => {
+  const h = harness(true);
+  let failLookup;
+  const held = new Promise(resolve => { failLookup = () => resolve({ok:false,status:500,json:async()=>({error:{code:"storage_io",message:"late lookup failure"}})}); });
+  const running = {id:"accepted",state:"running",progress:{phase:"capture",total:10,completed:2}};
+  const posts = [];
+  h.run(`checkouts[0].catchingUp=false;checkouts[0].revision=status.revision;uniqueSelectableRoot=()=>true;`);
+  h.context.fetch = async (path, options) => {
+    if (path === "/api/status") return response(selectedStatus);
+    if (path === "/api/jobs/current") return held;
+    if (path === "/api/index") { posts.push(options?.method); return {ok:true,status:202,json:async()=>running}; }
+    return response({});
+  };
+  const flush = async () => { for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve)); };
+  const selecting = h.run(`selectCheckout(selectedRootKey)`);
+  await flush();
+  await h.get("index").listeners.click();
+  await flush();
+  assert.deepEqual(posts, ["POST"]);
+  assert.match(h.get("workspace-index-label").textContent, /^Indexing · capture · 2\/10/);
+  h.get("cancel").listeners.click();
+  assert.match(h.get("workspace-index-label").textContent, /no longer waiting here/);
+  failLookup();
+  await selecting; await flush();
+  assert.equal(h.get("workspace-index-state").attrs["data-state"], "catching-up");
+  assert.match(h.get("workspace-index-label").textContent, /^Indexing · capture · 2\/10 · no longer waiting here$/);
+  assert.doesNotMatch(h.get("checkout-state").textContent, /late lookup failure/);
+});
+test("a storage failure stays in the header status line after a checkout is selected", async () => {
+  const h = harness(true);
+  h.run(`tokenSaveFailed=true;`);
+  await selectWith(h, async () => ({ok:true,status:204,json:async()=>null}));
+  assert.equal(h.get("workspace-index-label").textContent.startsWith("Fresh"), true);
+  assert.equal(h.get("checkout-state").textContent, "Browser storage is unavailable; token was not saved.");
 });

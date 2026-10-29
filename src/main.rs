@@ -132,7 +132,7 @@ struct ReferencesArgs {
 struct GitReadArgs {
     #[arg(long)]
     root: PathBuf,
-    #[arg(long, value_parser = ["summary", "status", "diff"])]
+    #[arg(long, value_parser = ["head", "summary", "status", "diff"])]
     mode: String,
     #[arg(long)]
     path: Option<String>,

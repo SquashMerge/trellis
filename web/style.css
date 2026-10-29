@@ -182,7 +182,12 @@ body:not(.daemon-connected) > main {
 .connection-area { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 440px); align-items: center; gap: 48px 64px; grid-column: 1 / -1; }
 .daemon-connected .connection-area { display: none; }
 .connection-brand { display: flex; justify-content: center; align-items: center; min-height: 456px; }
-.connection-logo { display: block; width: 280px; max-width: 100%; height: auto; }
+/* Crop the lockup's built-in margin with CSS (artwork spans 26–572 × 23–755 of
+   the 600×780 asset) so about 280px of artwork shows, and lighten-blend its
+   near-black backdrop into the page background so no darker box appears. */
+/* Blend kept: the asset backdrop is rgb(7,9,10) vs page rgb(11,12,16), so a plain crop or matching frame fill still shows a box. */
+.connection-logo-frame { position: relative; width: 280px; max-width: 100%; aspect-ratio: 547 / 733; overflow: hidden; }
+.connection-logo { position: absolute; left: calc(-100% * 26 / 547); top: calc(-100% * 23 / 733); display: block; width: calc(100% * 600 / 547); max-width: none; height: auto; mix-blend-mode: lighten; }
 .connection-content { display: flex; flex-direction: column; gap: 24px; }
 .connection-intro h1 { font: 700 32px/40px var(--heading); letter-spacing: normal; }
 .connection-intro p { margin: 8px 0 0; color: var(--secondary); font-size: 16px; line-height: 24px; }
@@ -409,8 +414,7 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
 @media (max-width: 940px) {
   body:not(.daemon-connected) > main { grid-template-columns: minmax(0, 440px); padding: 32px 24px; }
   .connection-area { grid-template-columns: minmax(0, 1fr); gap: 32px; }
-  .connection-brand { min-height: 0; padding: 16px; }
-  .connection-logo { width: 220px; }
+  .connection-brand { min-height: 0; padding: 16px 0; }
   body:not(.daemon-connected) #error, body:not(.daemon-connected) #notice { grid-column: 1; }
 }
 @media (max-width: 480px) {
@@ -535,3 +539,5 @@ button:is(.selected, [aria-pressed="true"]) .badge { background: var(--clear); c
 @media (min-width: 901px) and (max-width: 1200px) {
   body:not(.files-section).inspector-idle .workspace-frame, body:not(.files-section).inspector-collapsed .workspace-frame { grid-template-columns: 214px minmax(0, 1fr); }
 }
+
+.git-marker { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1.5 var(--mono); color: var(--ink); }

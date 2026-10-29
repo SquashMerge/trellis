@@ -3782,18 +3782,27 @@ async fn git_answer(root: &std::path::Path, path: Option<&str>) -> Result<Respon
 }
 
 async fn enrich_checkout_git(checkouts: &mut [Value]) {
+    let Ok(executable) = std::env::current_exe() else {
+        for row in checkouts {
+            row["git"] = json!(crate::git_status::GitSummary::Unavailable {
+                reason: crate::git_status::GitReason::Unreadable,
+            });
+        }
+        return;
+    };
+    enrich_checkout_git_with_reader(checkouts, &crate::git_status::GitReader::new(executable))
+        .await;
+}
+
+async fn enrich_checkout_git_with_reader(
+    checkouts: &mut [Value],
+    reader: &crate::git_status::GitReader,
+) {
     use crate::{
         git_status::{GitReason, GitSummary},
         store::topology::WorkspaceIdentity,
     };
-    let deadline = tokio::time::Instant::now() + crate::git_status::READ_DEADLINE;
     for row in checkouts {
-        if tokio::time::Instant::now() >= deadline {
-            row["git"] = json!(GitSummary::Unavailable {
-                reason: GitReason::DeadlineExceeded
-            });
-            continue;
-        }
         let identity = row["workspaceRoot"]
             .as_str()
             .filter(|_| row["state"] != "unavailable")
@@ -3809,17 +3818,13 @@ async fn enrich_checkout_git(checkouts: &mut [Value]) {
                 reason: GitReason::Unreadable,
             },
             Some(identity) => {
-                let result =
-                    tokio::time::timeout_at(deadline, crate::git_status::summary(&identity.root))
-                        .await;
+                let result = reader.summary(&identity.root).await;
                 if identity.verify_readonly().is_err() {
                     GitSummary::Unavailable {
                         reason: GitReason::Unreadable,
                     }
                 } else {
-                    result.unwrap_or(GitSummary::Unavailable {
-                        reason: GitReason::DeadlineExceeded,
-                    })
+                    result
                 }
             }
         };
@@ -5213,6 +5218,9 @@ async fn provisioned_core_answer(
         }
     }
 }
+
+#[cfg(test)]
+mod git_summary_tests;
 
 #[cfg(test)]
 mod browser_core_route_tests {
