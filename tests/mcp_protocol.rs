@@ -3276,145 +3276,204 @@ fn describe_frame(id: Value, workspace: Option<&Path>) -> Vec<u8> {
     serde_json::to_vec(&call(false, id, "trellis_workspace_describe", arguments)).unwrap()
 }
 
-/// #195 review: every final check attempt is bounded by its call's deadline.
-/// A's lookup always outlasts its bound; a recheck released 150 ms before A's
-/// deadline must not run a full 750 ms lookup, so A is `deadline_exceeded`
-/// within its 5 s deadline plus a stated 400 ms tolerance.
-#[test]
-fn a_persistently_unavailable_final_check_is_decided_by_its_deadline() {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    };
-    use std::time::Instant;
-    let temp = tempfile::tempdir().unwrap();
-    let (main, linked) = git_linked_fixture(temp.path());
-    let stalled = temp.path().join("stall-git");
-    let path = stalling_git_path(temp.path(), &stalled, false);
-    let socket = temp.path().join("phase.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let written: Arc<Mutex<Option<Instant>>> = Arc::default();
-    let held = Arc::new(AtomicBool::new(false));
-    let (flag, start, late) = (stalled.clone(), written.clone(), held.clone());
-    serve_pauses(&listener, move |stage| {
-        let start = (*start.lock().unwrap())?;
-        if stage == "selected_final" {
-            fs::write(&flag, b"").unwrap();
-        } else if stage == "final_recheck"
-            && Instant::now() >= start + Duration::from_secs(4)
-            && !late.swap(true, Ordering::AcqRel)
-        {
-            return Some(start + Duration::from_millis(4850));
-        }
-        None
-    });
-    let mut peer = Peer::start_with_phase_env(
-        Some(&main),
-        Some(("selected_final,final_recheck", &socket)),
-        // The relay's own 5 s decision would mask the daemon's: observe the
-        // daemon coordinator's decision directly.
-        &[
-            ("PATH", path.as_os_str()),
-            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
-        ],
-    );
-    // Warm both checkouts so A does not race a cold activation.
-    tool(
-        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
-        None,
-        true,
-    );
-    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
-    tool(&warm, None, true);
-    *written.lock().unwrap() = Some(Instant::now());
-    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
-    let reply = peer.reply();
-    let elapsed = written.lock().unwrap().unwrap().elapsed();
-    let _ = fs::remove_file(&stalled);
-    assert!(
-        held.load(Ordering::Acquire),
-        "no recheck reached A's last second: {reply}"
-    );
-    tool(&reply, Some("deadline_exceeded"), true);
-    assert!(
-        elapsed < Duration::from_millis(5400),
-        "A was decided {elapsed:?} after it was written"
-    );
-    assert!(peer.finish().0.success());
+/// Frozen call clocks and a parked final-check helper for the two deadline
+/// ordering tests below. Every installed read gate is opened before teardown.
+struct FinalRecheckFixture {
+    env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    stalled: PathBuf,
+    linked: PathBuf,
+    listener: std::os::unix::net::UnixListener,
+    launch: std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+    selected: std::sync::Arc<trellis::daemon::registry::CheckoutRuntime>,
+    read_gate: Option<ReadGate>,
+    client: Option<std::os::unix::net::UnixStream>,
+    reader: Option<BufReader<std::os::unix::net::UnixStream>>,
+    session: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
-/// #195 review: no decision waits on a parked recheck. A is parked with a
-/// lookup that always outlasts its bound; B is written while A's recheck is
-/// held and admitted only 4.4 s after acceptance. A recheck that ran before
-/// B's decision, unbounded, would take B past its deadline; B must be
-/// answered with its own result.
-#[test]
-fn a_call_finishing_near_its_deadline_is_not_held_behind_a_recheck() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    };
-    use std::time::Instant;
+impl FinalRecheckFixture {
+    async fn new(temp: &Path) -> Self {
+        use trellis::daemon::registry::CheckoutRegistry;
+        use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+        let (main, linked) = git_linked_fixture(temp);
+        let identity = WorkspaceIdentity::discover(Some(&main), &main)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let topology = TopologyRoots::isolated_for_tests(temp.join("cache"), temp.join("data"));
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(302, &identity).unwrap();
+        let launch = registry.activate(&identity.root_key).unwrap();
+        let selection = registry.select(302, &identity, &linked).unwrap();
+        let selected = registry.activate(&selection.identity.root_key).unwrap();
+        for runtime in [&launch, &selected] {
+            tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+                loop {
+                    if let Ok((response, catching_up)) = runtime.evidence_response()
+                        && response.finish(()).is_ok()
+                        && !catching_up
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("checkout did not settle before the final-recheck fixture");
+        }
+        let origin = std::time::Instant::now() - trellis::mcp::CALL_DEADLINE;
+        launch.freeze_mcp_call_clock_for_tests(origin);
+        selected.freeze_mcp_call_clock_for_tests(origin);
+        let clock = launch.clone();
+        let hooks = trellis::mcp::TransportHooksForTests {
+            paused_clock_for_tests: Some(std::sync::Arc::new(move || {
+                clock.mcp_call_clock_now_for_tests()
+            })),
+            ..Default::default()
+        };
+        let stalled = temp.join("stall-git");
+        let path = stalling_git_path(temp, &stalled, false);
+        let socket = temp.join("phase.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut fixture = Self {
+            env: [
+                "PATH",
+                "TRELLIS_TEST_MCP_PHASE",
+                "TRELLIS_TEST_MCP_PHASE_SOCKET",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+            stalled,
+            linked,
+            listener,
+            launch,
+            selected,
+            read_gate: None,
+            client: None,
+            reader: None,
+            session: None,
+        };
+        unsafe {
+            std::env::set_var("PATH", path);
+            std::env::set_var("TRELLIS_TEST_MCP_PHASE", "selected_final,final_recheck");
+            std::env::set_var("TRELLIS_TEST_MCP_PHASE_SOCKET", socket);
+        }
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        let (client, reader, session) = hooked_session(&identity, &registry, 302, None, hooks);
+        fixture.client = Some(client);
+        fixture.reader = Some(reader);
+        fixture.session = Some(session);
+        fixture
+    }
+
+    fn advance(&self, by: Duration) {
+        self.launch.advance_mcp_clock_for_tests(by);
+        self.selected.advance_mcp_clock_for_tests(by);
+    }
+
+    fn send(&mut self, frame: &Value) {
+        writeln!(self.client.as_mut().unwrap(), "{frame}").unwrap();
+    }
+
+    fn reply(&mut self) -> Value {
+        next_reply(self.reader.as_mut().unwrap())
+    }
+
+    fn start_a(&mut self) {
+        self.send(
+            &serde_json::from_slice(&describe_frame(json!("A"), Some(&self.linked))).unwrap(),
+        );
+        phase_barrier(&self.listener, "selected_final", || {
+            fs::write(&self.stalled, b"").unwrap();
+        });
+    }
+
+    fn expect_a_expired(&mut self) {
+        // Advancing a paused clock does not wake the coordinator by itself.
+        self.send(&modern(json!("wake"), "tools/list", json!({})));
+        let mut replies = [self.reply(), self.reply()];
+        replies.sort_by_key(|reply| reply["id"].as_str().unwrap().to_owned());
+        let [a, wake] = replies;
+        assert_eq!(a["id"], "A", "{a}");
+        tool(&a, Some("deadline_exceeded"), true);
+        assert_eq!(wake["id"], "wake", "{wake}");
+        assert!(wake["result"]["tools"].is_array(), "{wake}");
+    }
+
+    fn finish(&mut self) {
+        self.client
+            .take()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
+        self.session.take().unwrap().join().unwrap().unwrap();
+    }
+}
+
+impl Drop for FinalRecheckFixture {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.read_gate {
+            gate.open();
+        }
+        let _ = fs::remove_file(&self.stalled);
+        if let Some(client) = &self.client {
+            let _ = client.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(session) = self.session.take() {
+            let _ = session.join();
+        }
+        for (key, value) in &self.env {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+/// #195 review: A expires at its own deadline even while its unavailable
+/// final check remains parked. No host-time response-speed bound is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_persistently_unavailable_final_check_is_decided_by_its_deadline() {
     let temp = tempfile::tempdir().unwrap();
-    let (main, linked) = git_linked_fixture(temp.path());
-    let stalled = temp.path().join("stall-git");
-    let path = stalling_git_path(temp.path(), &stalled, false);
-    let socket = temp.path().join("phase.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let armed = Arc::new(AtomicBool::new(false));
-    let (paused, paused_at) = mpsc::channel::<()>();
-    let (release, release_at) = mpsc::channel::<Instant>();
-    let (flag, arm) = (stalled.clone(), armed.clone());
-    let mut first = true;
-    serve_pauses(&listener, move |stage| {
-        if !arm.load(Ordering::Acquire) {
-            return None;
-        }
-        if stage == "selected_final" {
-            fs::write(&flag, b"").unwrap();
-        } else if stage == "final_recheck" && std::mem::take(&mut first) {
-            paused.send(()).unwrap();
-            return Some(release_at.recv().unwrap());
-        }
-        None
+    let mut fixture = FinalRecheckFixture::new(temp.path()).await;
+    fixture.start_a();
+    let listener = fixture.listener.try_clone().unwrap();
+    phase_barrier(&listener, "final_recheck", || {
+        fixture.advance(trellis::mcp::CALL_DEADLINE);
+        fixture.expect_a_expired();
     });
-    let mut peer = Peer::start_with_phase_env(
-        Some(&main),
-        Some(("selected_final,final_recheck", &socket)),
-        // The relay's own 5 s decision would mask the daemon's: observe the
-        // daemon coordinator's decision directly.
-        &[
-            ("PATH", path.as_os_str()),
-            ("TRELLIS_TEST_MCP_RELAY_DEADLINE_MS", "10000".as_ref()),
-        ],
-    );
-    tool(
-        &peer.ask(serde_json::from_slice(&describe_frame(json!(0), None)).unwrap()),
-        None,
-        true,
-    );
-    let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
-    tool(&warm, None, true);
-    armed.store(true, Ordering::Release);
-    peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
-    // A is parked and its first recheck is held: write B now.
-    paused_at
-        .recv_timeout(trellis::testing::HANG_BACKSTOP)
-        .expect("A's final check was never parked");
-    let written_b = Instant::now();
-    peer.send_raw(&describe_frame(json!("B"), None));
-    release
-        .send(written_b + Duration::from_millis(4400))
-        .unwrap();
-    let mut replies = [peer.reply(), peer.reply()];
-    let _ = fs::remove_file(&stalled);
-    replies.sort_by_key(|reply| reply["id"].as_str().unwrap_or_default().to_owned());
-    let [a, b] = replies;
-    assert_eq!((a["id"].as_str(), b["id"].as_str()), (Some("A"), Some("B")));
-    tool(&b, None, true);
-    tool(&a, Some("deadline_exceeded"), true);
-    assert!(peer.finish().0.success());
+    fixture.finish();
+}
+
+/// #195 review: B finishes near its own virtual deadline and is answered
+/// while A's recheck is still parked, then A expires at its earlier deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_finishing_near_its_deadline_is_not_held_behind_a_recheck() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = FinalRecheckFixture::new(temp.path()).await;
+    fixture.start_a();
+    let listener = fixture.listener.try_clone().unwrap();
+    phase_barrier(&listener, "final_recheck", || {
+        fixture.advance(Duration::from_millis(100));
+        let gate = ReadGate::default();
+        fixture.read_gate = Some(gate.clone());
+        fixture.launch.set_mcp_read_gate_for_tests(gate.hook());
+        fixture.send(&serde_json::from_slice(&describe_frame(json!("B"), None)).unwrap());
+        gate.await_held(1);
+        // A expires at +5000 ms; B, accepted at +100 ms, at +5100 ms.
+        fixture.advance(Duration::from_millis(4800));
+        gate.open();
+        let b = fixture.reply();
+        assert_eq!(b["id"], "B", "{b}");
+        tool(&b, None, true);
+        fixture.advance(Duration::from_millis(100));
+        fixture.expect_a_expired();
+    });
+    fixture.finish();
 }
 
 /// #195 re-review: no call's send decision waits on another call's final

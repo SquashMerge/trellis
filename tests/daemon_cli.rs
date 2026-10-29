@@ -1877,18 +1877,13 @@ fn metrics_client_reassembles_complete_chunks_under_original_deadline() {
         payload: serde_json::json!({}),
     };
     let mut socket = Some(left);
-    let now = Instant::now();
-    let reply = client::call_metrics(
-        &request,
-        now + Duration::from_secs(1),
-        now + Duration::from_secs(2),
-        |_| {
-            socket.take().ok_or(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                "retry",
-            ))
-        },
-    )
+    let deadline = Instant::now() + trellis::testing::HANG_BACKSTOP;
+    let reply = client::call_metrics(&request, deadline, deadline, |_| {
+        socket.take().ok_or(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "retry",
+        ))
+    })
     .unwrap();
     assert_eq!(reply.payload["result"]["payload"]["scope"], "revision");
     server.join().unwrap();
