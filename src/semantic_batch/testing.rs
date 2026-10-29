@@ -29,6 +29,54 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+thread_local! {
+    static NATIVE_DOCUMENT_LOADS: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn reset_native_document_loads() {
+    NATIVE_DOCUMENT_LOADS.with(|loads| loads.set(0));
+}
+
+pub fn native_document_loads() -> u64 {
+    NATIVE_DOCUMENT_LOADS.with(Cell::get)
+}
+
+pub(crate) fn note_native_document_load() {
+    NATIVE_DOCUMENT_LOADS.with(|loads| loads.set(loads.get() + 1));
+}
+
+type DocumentCommonHook =
+    Box<dyn FnMut(u8, &native::DocumentKey, &crate::semantic_import::JoinedFacts, &Connection)>;
+
+thread_local! {
+    static DOCUMENT_COMMON: std::cell::RefCell<Option<DocumentCommonHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observes document-local Common results before legacy settlement can revise their targets.
+pub fn observe_document_common(
+    hook: impl FnMut(u8, &native::DocumentKey, &crate::semantic_import::JoinedFacts, &Connection)
+    + 'static,
+) {
+    DOCUMENT_COMMON.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub fn clear_document_common_observer() {
+    DOCUMENT_COMMON.with(|slot| *slot.borrow_mut() = None);
+}
+
+pub(crate) fn run_document_common_observer(
+    side: u8,
+    document: &native::DocumentKey,
+    facts: &crate::semantic_import::JoinedFacts,
+    conn: &Connection,
+) {
+    DOCUMENT_COMMON.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(side, document, facts, conn);
+        }
+    });
+}
+
 type ClosureHook = Box<dyn FnOnce(&Connection)>;
 
 type RowHook = Box<dyn FnMut(&str, &mut serde_json::Value)>;

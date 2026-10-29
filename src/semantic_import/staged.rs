@@ -3,18 +3,18 @@
 //! LRU of document groups. The binding, ambiguity and rejoin rules are the ones the in-memory
 //! backend runs (`join_inventory_indexed`); this module only supplies the storage.
 use super::{
-    CoordinateMap, DestinationMutations, MeasuredFacts, RoleSites, ScopedKey, compose_join,
-    document_coordinates, join_inventory_indexed,
+    CoordinateMap, DestinationMutations, MeasuredFacts, Position, RoleSites, ScopedKey,
+    compose_join, document_coordinates,
     join_store::{
-        BasisFor, Bytes, JoinFacts, JoinIndex, JoinSink, JoinStore, OccurrenceRow, ProofIdentities,
-        ProofRef, RelationshipRow,
+        BasisFor, Bytes, DocumentJoinState, GlobalJoinReads, JoinFacts, JoinSink, JoinStore,
+        MethodSummary, OccurrenceRow, ProofIdentities, ProofRef, RelationshipRow,
     },
-    mapped_range, occurrence_endpoints, rejoin_provenance_id, source_role_sites,
+    mapped_range, occurrence_endpoints, range_endpoints, rejoin_provenance_id, source_role_sites,
 };
 use crate::{
     model::{CancelFlag, IndexPin},
     native_evidence as native,
-    scip_raw::{CapturedClaim, CapturedScipInventory, ScipCaptureError},
+    scip_raw::{CapturedClaim, ScipCaptureError},
     semantic_batch::{
         AdmittedBatch, BatchCounters, BatchLimits, JoinedBatch, LookupBudget,
         descriptor::{Descriptor, SourceManifestHasher, basis_artifact_ordinal},
@@ -23,7 +23,7 @@ use crate::{
     semantic_evidence::{self as semantic, EmissionHeader, EmissionValidator, RawClaimDocument},
     store::{NativeHeader, NativeReader, Store},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -34,12 +34,17 @@ use std::{
     sync::atomic::Ordering,
 };
 
-const CLAIM_PAGE: usize = 128;
+mod claim_size;
+pub(super) mod group_size;
+mod live;
+pub(super) mod sizes;
+mod streaming;
+pub(super) mod target_size;
+use live::{LiveBudget, Reservation};
+
 const DOCUMENT_SQL: &str =
     "SELECT ord, language, path FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 128";
-const DECLARATIONS_SQL: &str = "SELECT owner_language, owner_path, syntax_id FROM ix_declarations \
-     WHERE side=?1 AND symbol=?2 AND local_language=?3 AND local_path=?4 \
-     ORDER BY owner_language, owner_path, syntax_id";
+
 const PROVENANCE_SQL: &str = "SELECT raw_id, kind FROM w_prov ORDER BY raw_id, kind";
 const REFERENCES_SQL: &str = "SELECT ref_id, body FROM w_refrows ORDER BY ref_id";
 const RESOLVE_CALLS_SQL: &str = "SELECT raw_id, body FROM w_calls ORDER BY ord";
@@ -55,10 +60,9 @@ const BINDINGS_SQL: &str = "SELECT body FROM f_bindings WHERE side=1 ORDER BY or
 #[cfg(feature = "test-support")]
 pub(crate) fn cursor_sql() -> Vec<String> {
     let mut queries = vec![
-        claim_page_sql(false),
-        claim_page_sql(true),
+        document_claim_sql(false),
+        document_claim_sql(true),
         DOCUMENT_SQL.to_owned(),
-        DECLARATIONS_SQL.to_owned(),
         PROVENANCE_SQL.to_owned(),
         REFERENCES_SQL.to_owned(),
         RESOLVE_CALLS_SQL.to_owned(),
@@ -68,17 +72,13 @@ pub(crate) fn cursor_sql() -> Vec<String> {
         SYMBOLS_SQL.to_owned(),
         BINDINGS_SQL.to_owned(),
     ];
-    queries.push(
-        "SELECT body FROM ix_relationships WHERE side=?1 AND language=?2 AND path=?3 ORDER BY ord"
-            .into(),
-    );
+    queries.extend(streaming::cursor_sql().into_iter().map(str::to_owned));
     queries
 }
 
-fn claim_page_sql(filtered: bool) -> String {
+fn document_claim_sql(filtered: bool) -> String {
     format!(
-        "{} WHERE (c.source_ord, c.canonical_bytes, c.claim_id) > (?1, ?2, ?3) \
-         ORDER BY c.source_ord, c.canonical_bytes, c.claim_id LIMIT {CLAIM_PAGE}",
+        "{} WHERE s.language=?1 AND s.path=?2 ORDER BY c.canonical_bytes,c.claim_id",
         claim_select(filtered)
     )
 }
@@ -101,6 +101,7 @@ pub(super) struct JoinCtx<'a> {
     conn: &'a Connection,
     limits: BatchLimits,
     budget: RefCell<LookupBudget>,
+    live: Rc<LiveBudget>,
     counters: RefCell<BatchCounters>,
     cache: RefCell<DocCache>,
     rows: Cell<u64>,
@@ -111,6 +112,22 @@ pub(super) struct JoinCtx<'a> {
 }
 
 impl JoinCtx<'_> {
+    /// Cached groups also retain their unit reservation. On pressure, discard cache ownership;
+    /// live callers keep the group and its charge until their last Rc drops.
+    fn reserve_native(&self, bytes: u64) -> Result<Reservation> {
+        match self.live.reserve(bytes) {
+            Ok(reservation) => Ok(reservation),
+            Err(_) => {
+                let mut cache = self.cache.borrow_mut();
+                cache.active = None;
+                cache.lru.clear();
+                cache.bytes = 0;
+                cache.evicted.retain(|held| held.strong_count() > 0);
+                self.live.reserve(bytes)
+            }
+        }
+    }
+
     /// Accounts lookup work before it is done.
     fn charge(&self, units: usize) -> Result<()> {
         self.budget.borrow_mut().charge(units as u64)?;
@@ -124,14 +141,35 @@ impl JoinCtx<'_> {
         Ok(())
     }
 
-    /// Accounts one staged join row.
-    fn row(&self) -> Result<()> {
-        let rows = self.rows.get() + 1;
+    /// Accounts real insertion attempts, including ignored duplicates and replacements.
+    /// The return value reports crossing a physical-output check boundary.
+    fn reserve_rows(&self, count: u64) -> Result<bool> {
+        let previous = self.rows.get();
+        let rows = previous
+            .checked_add(count)
+            .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
         self.rows.set(rows);
         if rows > self.limits.staged_rows {
             return Err(ScipCaptureError::LimitExceeded("staged rows".into()).into());
         }
-        if rows.is_multiple_of(OUTPUT_CHECK_ROWS) {
+        Ok(previous / OUTPUT_CHECK_ROWS != rows / OUTPUT_CHECK_ROWS)
+    }
+
+    fn row(&self) -> Result<()> {
+        if self.reserve_rows(1)? {
+            self.check_output()?;
+        }
+        Ok(())
+    }
+
+    /// Both statements run on this private stage owner, with no intervening mutation.
+    fn insert_select(&self, count_sql: &str, insert_sql: &str) -> Result<()> {
+        let count = self
+            .conn
+            .query_row(count_sql, [], |row| row.get::<_, i64>(0))?;
+        let crossed = self.reserve_rows(u64::try_from(count)?)?;
+        self.conn.execute(insert_sql, [])?;
+        if crossed {
             self.check_output()?;
         }
         Ok(())
@@ -214,7 +252,6 @@ impl DocCache {
 /// The measured native facts of one document, with the join's per-record indexes.
 struct DocGroup {
     document: native::Document,
-    source_ord: Option<i64>,
     text: Rc<str>,
     native: native::Artifact,
     declaration_ids: BTreeMap<String, Vec<usize>>,
@@ -225,17 +262,18 @@ struct DocGroup {
     candidates: BTreeMap<(usize, usize, semantic::JoinKind), BTreeSet<String>>,
     support: BTreeMap<semantic::JoinKind, native::MeasurementSupport>,
     bytes: u64,
-    coordinates: RefCell<Option<BTreeMap<u8, CoordinateMap>>>,
-    symbol_kinds: RefCell<Option<BTreeMap<String, Option<i64>>>>,
+    _native_reservation: Reservation,
 }
 
 impl DocGroup {
     fn build(
         header: &NativeHeader,
         document: native::Document,
-        source_ord: Option<i64>,
         rows: crate::store::NativeDocumentRows,
+        mut native_reservation: Reservation,
+        live: &Rc<LiveBudget>,
     ) -> Result<Self> {
+        native_reservation.grow(group_size::group_build(header, &document, &rows, live)?)?;
         let key = document.key.clone();
         let sources = BTreeMap::from([(key.clone(), rows.source)]);
         let mini = native::Artifact {
@@ -292,7 +330,6 @@ impl DocGroup {
             + 1024;
         Ok(Self {
             document,
-            source_ord,
             text,
             native: mini,
             declaration_ids,
@@ -303,17 +340,31 @@ impl DocGroup {
             candidates,
             support,
             bytes,
-            coordinates: RefCell::new(None),
-            symbol_kinds: RefCell::new(None),
+            _native_reservation: native_reservation,
         })
     }
 
-    fn pick<T: Clone>(rows: &[T], indexes: Option<&Vec<usize>>) -> Vec<Cow<'static, T>> {
-        indexes
-            .into_iter()
-            .flatten()
-            .map(|index| Cow::Owned(rows[*index].clone()))
-            .collect()
+    fn pick<'s, T: Clone>(
+        rows: &'s [T],
+        indexes: Option<&Vec<usize>>,
+        operation: &mut Reservation,
+    ) -> Result<Vec<Cow<'s, T>>> {
+        let count = indexes.map_or(0, Vec::len);
+        let bytes = (count as u64)
+            .checked_mul(std::mem::size_of::<Cow<'s, T>>() as u64)
+            .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
+        operation.grow(sizes::sum(&[
+            std::mem::size_of::<Vec<Cow<'s, T>>>() as u64,
+            bytes,
+        ])?)?;
+        let mut result = Vec::with_capacity(count);
+        result.extend(
+            indexes
+                .into_iter()
+                .flatten()
+                .map(|&index| Cow::Borrowed(&rows[index])),
+        );
+        Ok(result)
     }
 }
 
@@ -347,53 +398,6 @@ type ClaimParts = (Vec<u8>, String, String, String, String);
 fn build_claim(parts: ClaimParts) -> Result<CapturedClaim> {
     let (canonical, digest, proof, artifact_hash, language) = parts;
     claim_from_stage(canonical, digest, proof, language, artifact_hash)
-}
-
-/// The claims in canonical order, read a page at a time.
-struct ClaimCursor<'a> {
-    conn: &'a Connection,
-    filtered: bool,
-    last: Option<(i64, Vec<u8>, i64)>,
-    page: VecDeque<Result<CapturedClaim>>,
-    done: bool,
-}
-
-impl<'c> Iterator for ClaimCursor<'c> {
-    type Item = Result<Cow<'c, CapturedClaim>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(item) = self.page.pop_front() {
-                return Some(item.map(Cow::Owned));
-            }
-            if self.done {
-                return None;
-            }
-            if let Err(error) = self.fill() {
-                self.done = true;
-                return Some(Err(error));
-            }
-        }
-    }
-}
-
-impl ClaimCursor<'_> {
-    fn fill(&mut self) -> Result<()> {
-        let sql = claim_page_sql(self.filtered);
-        let (ord, bytes, id) = self.last.clone().unwrap_or((-1, vec![], -1));
-        let mut statement = self.conn.prepare_cached(&sql)?;
-        let rows = statement
-            .query_map(params![ord, bytes, id], claim_of_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if rows.len() < CLAIM_PAGE {
-            self.done = true;
-        }
-        for (claim_id, source_ord, parts) in rows {
-            self.last = Some((source_ord, parts.0.clone(), claim_id));
-            self.page.push_back(build_claim(parts));
-        }
-        Ok(())
-    }
 }
 
 /// The documents of one native revision in stored order, read a page at a time.
@@ -448,6 +452,126 @@ impl Iterator for DocumentCursor<'_> {
     }
 }
 
+fn decode_reserved_claim(
+    row: &rusqlite::Row<'_>,
+    live: &Rc<LiveBudget>,
+    reservation: &mut Reservation,
+) -> Result<CapturedClaim> {
+    let canonical = row.get_ref(2)?.as_blob()?;
+    let metadata = sizes::sum(&[
+        row.get_ref(3)?.as_str()?.len() as u64,
+        row.get_ref(4)?.as_str()?.len() as u64,
+        row.get_ref(5)?.as_str()?.len() as u64,
+        row.get_ref(6)?.as_str()?.len() as u64,
+    ])?;
+    let size = claim_size::measure(canonical, metadata)?;
+    reservation.grow(size.retained)?;
+    let _scratch = live.reserve(size.scratch)?;
+    build_claim(claim_of_row(row)?.2)
+}
+
+/// Parsed claims belong to one document/pass, not to the native cache or a cursor page.
+struct DocumentClaims {
+    claims: Vec<CapturedClaim>,
+    coordinates: RefCell<Option<BTreeMap<u8, CoordinateMap>>>,
+    symbol_kinds: BTreeMap<String, Option<i64>>,
+    by_proof: BTreeMap<String, usize>,
+    reservation: RefCell<Reservation>,
+}
+
+impl DocumentClaims {
+    fn coordinate_bytes(&self, admitted_encoding: u8) -> Result<u64> {
+        let mut counts = [0usize; 3];
+        for claim in &self.claims {
+            if claim.envelope.record_kind != "occurrence" {
+                continue;
+            }
+            for enclosing in [false, true] {
+                let raw = &claim.envelope.raw[if enclosing { "enclosingRange" } else { "range" }];
+                if enclosing && raw.is_null() {
+                    continue;
+                }
+                let (encoding, _) =
+                    range_endpoints(raw, claim.envelope.position_encoding, admitted_encoding)?;
+                counts[encoding as usize - 1] = counts[encoding as usize - 1]
+                    .checked_add(2)
+                    .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
+            }
+        }
+        counts.into_iter().try_fold(0, |total, count| {
+            if count == 0 {
+                return Ok(total);
+            }
+            // Positions Vec push growth, all unique output entries, and their overlap.
+            let slots = count
+                .checked_mul(2)
+                .map(|n| n.max(4))
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
+            sizes::sum(&[
+                total,
+                sizes::map_entries::<u8, Vec<Position>>(1)?,
+                sizes::map_entries::<u8, CoordinateMap>(1)?,
+                sizes::map_entries::<Position, usize>(count)?,
+                (slots as u64)
+                    .checked_mul(std::mem::size_of::<Position>() as u64)
+                    .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+                std::mem::size_of::<std::sync::atomic::AtomicBool>() as u64
+                    + 2 * std::mem::size_of::<usize>() as u64,
+            ])
+        })
+    }
+    fn load(side: &StagedSide<'_>, document: &native::DocumentKey) -> Result<Self> {
+        let mut reservation = side.ctx.live.reserve(sizes::sum(&[
+            std::mem::size_of::<Self>() as u64,
+            2 * std::mem::size_of::<usize>() as u64,
+        ])?)?;
+        let sql = document_claim_sql(side.filtered);
+        side.ctx.charge(1)?;
+        let mut statement = side.ctx.conn.prepare_cached(&sql)?;
+        let mut rows = statement.query(params![document.language, document.path])?;
+        let mut claims = Vec::new();
+        let mut symbol_kinds = BTreeMap::new();
+        let mut by_proof = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            side.ctx.charge(1)?;
+            let claim = decode_reserved_claim(row, &side.ctx.live, &mut reservation)?;
+            if claim.envelope.record_kind == "symbolInformation"
+                && let Some(symbol) = claim.envelope.raw["symbol"].as_str()
+                && !symbol_kinds.contains_key(symbol)
+            {
+                reservation.grow(sizes::sum(&[
+                    symbol.len() as u64,
+                    sizes::map_entries::<String, Option<i64>>(1)?,
+                ])?)?;
+                symbol_kinds.insert(symbol.to_owned(), claim.envelope.raw["kind"].as_i64());
+            }
+            reservation.grow(sizes::sum(&[
+                claim.captured_proof_id.len() as u64,
+                sizes::map_entries::<String, usize>(1)?,
+            ])?)?;
+            by_proof
+                .entry(claim.captured_proof_id.clone())
+                .or_insert(claims.len());
+            if claims.len() == claims.capacity() {
+                // New slots are covered by retained claim roots; old slots overlap the move.
+                let overlap = (claims.capacity() as u64)
+                    .checked_mul(std::mem::size_of::<CapturedClaim>() as u64)
+                    .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
+                let _old_buffer = side.ctx.live.reserve(overlap)?;
+                claims.reserve_exact(1);
+            }
+            claims.push(claim);
+        }
+        Ok(Self {
+            claims,
+            coordinates: RefCell::new(None),
+            symbol_kinds,
+            by_proof,
+            reservation: RefCell::new(reservation),
+        })
+    }
+}
+
 /// One revision's side of the join: the retained native revision, the claims (all of them, or
 /// those of eligible documents), and the fact and index tables of its side.
 pub(super) struct StagedSide<'a> {
@@ -457,6 +581,9 @@ pub(super) struct StagedSide<'a> {
     rev: u8,
     side: u8,
     filtered: bool,
+    document: Option<native::DocumentKey>,
+    local_claims: Option<Rc<DocumentClaims>>,
+    local_group: Option<Rc<DocGroup>>,
 }
 
 impl<'a> StagedSide<'a> {
@@ -485,7 +612,59 @@ impl<'a> StagedSide<'a> {
     }
 
     /// The group of `document`, loaded on first use. `None` when the revision lacks it.
+    fn mapped_claim_range(
+        &self,
+        claim: &CapturedClaim,
+        admitted_encoding: u8,
+        encoding: u8,
+        endpoints: super::Endpoints,
+    ) -> Result<native::Range> {
+        let document = native::DocumentKey {
+            source_set_id: self.header.source_set.id.clone(),
+            language: claim.language.clone(),
+            path: claim.envelope.relative_path.clone(),
+        };
+        let group = self.require_group(&document)?;
+        let local = self
+            .local_claims
+            .as_ref()
+            .context("document claim owner required")?;
+        if local.coordinates.borrow().is_none() {
+            local
+                .reservation
+                .borrow_mut()
+                .grow(local.coordinate_bytes(admitted_encoding)?)?;
+            let maps = document_coordinates(&local.claims, &group.text, admitted_encoding)?;
+            *local.coordinates.borrow_mut() = Some(maps);
+        }
+        let coordinates = local.coordinates.borrow();
+        let offsets = coordinates
+            .as_ref()
+            .and_then(|maps| maps.get(&encoding))
+            .context("missing SCIP coordinate map")?;
+        mapped_range(claim, endpoints, offsets)
+    }
+
+    fn borrowed_group(&self, document: &native::DocumentKey) -> Result<Option<&DocGroup>> {
+        anyhow::ensure!(
+            self.document.as_ref() == Some(document),
+            "native document view required"
+        );
+        Ok(self.local_group.as_deref())
+    }
+
     fn group(&self, document: &native::DocumentKey) -> Result<Option<Rc<DocGroup>>> {
+        if self.document.is_some() {
+            return Ok(self
+                .borrowed_group(document)?
+                .map(|_| self.local_group.as_ref().unwrap().clone()));
+        }
+        anyhow::ensure!(
+            self.document
+                .as_ref()
+                .is_none_or(|current| current == document),
+            "foreign document in local join"
+        );
         let Some((ord, row)) = self.doc_row(document)? else {
             return Ok(None);
         };
@@ -499,19 +678,24 @@ impl<'a> StagedSide<'a> {
         }
         self.ctx.charge(1)?;
         self.ctx.check_cancel()?;
-        let mut rows = self.reader.document(&row)?;
+        let native_bytes = self.reader.document_reservation_bytes(&row)?;
+        let mut reservation = self.ctx.reserve_native(native_bytes)?;
+        // Rc<str> construction overlaps the source Vec returned by the reader.
+        reservation.grow(row.byte_length as u64)?;
+        let mut rows = self.reader.join_document(&row)?;
         if self.rev == 1 {
+            reservation.grow(sizes::mutation(&rows, self.ctx.mutations)?)?;
             self.ctx
                 .mutations
                 .apply(&mut rows.declarations, &mut rows.references);
         }
-        let source_ord: Option<i64> = self
-            .ctx
-            .conn
-            .prepare_cached("SELECT ord FROM sources WHERE language=?1 AND path=?2")?
-            .query_row(params![document.language, document.path], |r| r.get(0))
-            .optional()?;
-        let group = Rc::new(DocGroup::build(self.header, row, source_ord, rows)?);
+        let group = Rc::new(DocGroup::build(
+            self.header,
+            row,
+            rows,
+            reservation,
+            &self.ctx.live,
+        )?);
         let mut cache = self.ctx.cache.borrow_mut();
         let mut counters = self.ctx.counters.borrow_mut();
         cache.activate(key, group.clone(), &mut counters);
@@ -522,31 +706,70 @@ impl<'a> StagedSide<'a> {
         self.group(document)?.context("foreign anchor document")
     }
 
-    fn document_claims(&self, group: &DocGroup) -> Result<Vec<CapturedClaim>> {
-        self.ctx.charge(1)?;
-        let Some(ord) = group.source_ord else {
-            return Ok(vec![]);
-        };
-        let sql = format!(
-            "{} WHERE c.source_ord=?1 ORDER BY c.canonical_bytes, c.claim_id",
-            claim_select(false)
-        );
-        let mut statement = self.ctx.conn.prepare_cached(&sql)?;
-        let rows = statement
-            .query_map([ord], claim_of_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        self.ctx.charge(rows.len())?;
-        rows.into_iter()
-            .map(|(_, _, parts)| build_claim(parts))
-            .collect()
-    }
-
     fn proof_filter(&self) -> &'static str {
         if self.filtered { ELIGIBLE_JOIN } else { "" }
     }
 }
 
 impl JoinFacts for StagedSide<'_> {
+    type Operation = Reservation;
+    fn operation(&self) -> Result<Reservation> {
+        self.ctx.live.reserve(0)
+    }
+    fn reserve_operation(&self, operation: &mut Reservation, bytes: u64) -> Result<()> {
+        operation.grow(bytes)
+    }
+    fn join_reserved(
+        &self,
+        document: &native::DocumentKey,
+        range: native::Range,
+        kind: semantic::JoinKind,
+        operation: &mut Reservation,
+    ) -> Result<semantic::Join> {
+        let group = self.require_group(document)?;
+        let ids = group.candidates.get(&(range.start, range.end, kind));
+        let count = ids.map_or(0, BTreeSet::len);
+        let id_bytes = ids
+            .into_iter()
+            .flatten()
+            .try_fold(0, |total, id| sizes::sum(&[total, id.len() as u64]))?;
+        let diagnostic = if count > 1 {
+            "ambiguous_measured_anchor".len() as u64
+        } else if count == 1 {
+            0
+        } else {
+            group
+                .support
+                .get(&kind)
+                .map_or(0, |support| {
+                    support
+                        .diagnostic
+                        .as_ref()
+                        .map_or(0, |s| s.len() as u64)
+                        .max(
+                            support
+                                .gaps
+                                .iter()
+                                .map(|gap| gap.diagnostic.len() as u64)
+                                .max()
+                                .unwrap_or(0),
+                        )
+                })
+                .max("unmatched_measured_anchor".len() as u64)
+        };
+        operation.grow(sizes::sum(&[
+            std::mem::size_of::<semantic::Join>() as u64,
+            sizes::document(&group.document.key)?,
+            self.header.revision.id.len() as u64,
+            group.document.content_hash.len() as u64,
+            id_bytes,
+            (count as u64)
+                .checked_mul(std::mem::size_of::<String>() as u64)
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+            diagnostic,
+        ])?)?;
+        self.join(document, range, kind)
+    }
     fn revision_id(&self) -> &str {
         &self.header.revision.id
     }
@@ -562,13 +785,9 @@ impl JoinFacts for StagedSide<'_> {
         kind: semantic::JoinKind,
     ) -> Result<semantic::Join> {
         let group = self.require_group(document)?;
-        let ids: Vec<String> = group
-            .candidates
-            .get(&(range.start, range.end, kind))
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect();
+        let candidates = group.candidates.get(&(range.start, range.end, kind));
+        let mut ids = Vec::with_capacity(candidates.map_or(0, BTreeSet::len));
+        ids.extend(candidates.into_iter().flatten().cloned());
         {
             let mut counters = self.ctx.counters.borrow_mut();
             counters.candidate_group_high_water =
@@ -587,11 +806,14 @@ impl JoinFacts for StagedSide<'_> {
 
     fn bytes_of(&self, document: &native::DocumentKey) -> Result<Option<Bytes<'_>>> {
         Ok(self
-            .group(document)?
-            .map(|group| Bytes::Shared(group.text.clone())))
+            .borrowed_group(document)?
+            .map(|group| Bytes::Borrowed(group.text.as_bytes())))
     }
 
     fn documents(&self) -> Box<dyn Iterator<Item = Result<native::DocumentKey>> + '_> {
+        if let Some(document) = &self.document {
+            return Box::new(std::iter::once(Ok(document.clone())));
+        }
         Box::new(DocumentCursor {
             conn: self.ctx.conn,
             rev: self.rev,
@@ -605,17 +827,21 @@ impl JoinFacts for StagedSide<'_> {
     fn document_declarations(
         &self,
         document: &native::DocumentKey,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
-        Ok(match self.group(document)? {
-            Some(group) => group
-                .native
-                .declarations
-                .iter()
-                .cloned()
-                .map(Cow::Owned)
-                .collect(),
-            None => vec![],
-        })
+        let Some(group) = self.borrowed_group(document)? else {
+            return Ok(vec![]);
+        };
+        let count = group.native.declarations.len();
+        operation.grow(sizes::sum(&[
+            std::mem::size_of::<Vec<Cow<'_, native::Declaration>>>() as u64,
+            (count as u64)
+                .checked_mul(std::mem::size_of::<Cow<'_, native::Declaration>>() as u64)
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+        ])?)?;
+        let mut result = Vec::with_capacity(count);
+        result.extend(group.native.declarations.iter().map(Cow::Borrowed));
+        Ok(result)
     }
 
     fn declaration_of(
@@ -623,18 +849,27 @@ impl JoinFacts for StagedSide<'_> {
         document: &native::DocumentKey,
         id: &str,
     ) -> Result<Option<Cow<'_, native::Declaration>>> {
-        Ok(self.declarations_with_id(document, id)?.into_iter().next())
+        Ok(self.borrowed_group(document)?.and_then(|group| {
+            group
+                .declaration_ids
+                .get(id)
+                .and_then(|ids| ids.first())
+                .map(|&index| Cow::Borrowed(&group.native.declarations[index]))
+        }))
     }
 
     fn declarations_with_id(
         &self,
         document: &native::DocumentKey,
         id: &str,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
-        Ok(match self.group(document)? {
-            Some(group) => {
-                DocGroup::pick(&group.native.declarations, group.declaration_ids.get(id))
-            }
+        Ok(match self.borrowed_group(document)? {
+            Some(group) => DocGroup::pick(
+                &group.native.declarations,
+                group.declaration_ids.get(id),
+                operation,
+            )?,
             None => vec![],
         })
     }
@@ -643,11 +878,14 @@ impl JoinFacts for StagedSide<'_> {
         &self,
         document: &native::DocumentKey,
         key: &[u8],
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
-        Ok(match self.group(document)? {
-            Some(group) => {
-                DocGroup::pick(&group.native.declarations, group.declaration_keys.get(key))
-            }
+        Ok(match self.borrowed_group(document)? {
+            Some(group) => DocGroup::pick(
+                &group.native.declarations,
+                group.declaration_keys.get(key),
+                operation,
+            )?,
             None => vec![],
         })
     }
@@ -659,7 +897,7 @@ impl JoinFacts for StagedSide<'_> {
         end: usize,
         spelling: &str,
     ) -> Result<bool> {
-        Ok(match self.group(document)? {
+        Ok(match self.borrowed_group(document)? {
             Some(group) => group
                 .declaration_names
                 .contains(&(start, end, spelling.to_owned())),
@@ -672,16 +910,23 @@ impl JoinFacts for StagedSide<'_> {
         document: &native::DocumentKey,
         id: &str,
     ) -> Result<Option<Cow<'_, native::Call>>> {
-        Ok(self.calls_with_id(document, id)?.into_iter().next())
+        Ok(self.borrowed_group(document)?.and_then(|group| {
+            group
+                .call_ids
+                .get(id)
+                .and_then(|ids| ids.first())
+                .map(|&index| Cow::Borrowed(&group.native.calls[index]))
+        }))
     }
 
     fn calls_with_id(
         &self,
         document: &native::DocumentKey,
         id: &str,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Call>>> {
-        Ok(match self.group(document)? {
-            Some(group) => DocGroup::pick(&group.native.calls, group.call_ids.get(id)),
+        Ok(match self.borrowed_group(document)? {
+            Some(group) => DocGroup::pick(&group.native.calls, group.call_ids.get(id), operation)?,
             None => vec![],
         })
     }
@@ -691,16 +936,27 @@ impl JoinFacts for StagedSide<'_> {
         document: &native::DocumentKey,
         id: &str,
     ) -> Result<Option<Cow<'_, native::Reference>>> {
-        Ok(self.references_with_id(document, id)?.into_iter().next())
+        Ok(self.borrowed_group(document)?.and_then(|group| {
+            group
+                .reference_ids
+                .get(id)
+                .and_then(|ids| ids.first())
+                .map(|&index| Cow::Borrowed(&group.native.references[index]))
+        }))
     }
 
     fn references_with_id(
         &self,
         document: &native::DocumentKey,
         id: &str,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Reference>>> {
-        Ok(match self.group(document)? {
-            Some(group) => DocGroup::pick(&group.native.references, group.reference_ids.get(id)),
+        Ok(match self.borrowed_group(document)? {
+            Some(group) => DocGroup::pick(
+                &group.native.references,
+                group.reference_ids.get(id),
+                operation,
+            )?,
             None => vec![],
         })
     }
@@ -708,12 +964,25 @@ impl JoinFacts for StagedSide<'_> {
 
 impl ProofIdentities for StagedSide<'_> {
     fn proof(&self, proof_id: &str) -> Result<Option<ProofRef>> {
+        if let Some(local) = &self.local_claims {
+            self.ctx.charge(1)?;
+            return Ok(local.by_proof.get(proof_id).map(|&index| {
+                let claim = &local.claims[index];
+                ProofRef {
+                    language: claim.language.clone(),
+                    path: claim.envelope.relative_path.clone(),
+                    record_kind: claim.envelope.record_kind.clone(),
+                    fact_digest: claim.fact_digest.clone(),
+                    artifact_hash: claim.artifact_hash.clone(),
+                }
+            }));
+        }
         let sql = format!(
             "SELECT s.language, s.path, c.record_kind, c.fact_digest, a.sha256 FROM claims c \
              JOIN sources s ON s.ord=c.source_ord JOIN artifacts a ON a.ordinal=c.artifact {} WHERE c.proof_id=?1",
             self.proof_filter()
         );
-        Ok(self
+        let proof = self
             .ctx
             .conn
             .prepare_cached(&sql)?
@@ -726,58 +995,37 @@ impl ProofIdentities for StagedSide<'_> {
                     artifact_hash: row.get(4)?,
                 })
             })
-            .optional()?)
+            .optional()?;
+        Ok(proof.filter(|proof| {
+            self.document.as_ref().is_none_or(|document| {
+                document.language == proof.language && document.path == proof.path
+            })
+        }))
     }
 
     fn check_proof(&self, proof_id: &str, kind: &str, digest: &str) -> Result<()> {
-        let sql = format!(
-            "SELECT 1 FROM claims c {} WHERE c.proof_id=?1 AND c.record_kind=?2 AND c.fact_digest=?3",
-            self.proof_filter()
-        );
-        let found = self
-            .ctx
-            .conn
-            .prepare_cached(&sql)?
-            .query_row(params![proof_id, kind, digest], |_| Ok(()))
-            .optional()?;
-        found.ok_or_else(|| ScipCaptureError::MissingProof.into())
+        if self.local_claims.is_some() {
+            self.claim(proof_id, kind, digest)?;
+            return Ok(());
+        }
+        let proof = self
+            .proof(proof_id)?
+            .ok_or(ScipCaptureError::MissingProof)?;
+        if proof.record_kind != kind || proof.fact_digest != digest {
+            return Err(ScipCaptureError::MissingProof.into());
+        }
+        Ok(())
     }
 }
 
 impl<'a> JoinStore for StagedSide<'a> {
-    type Restricted<'i>
-        = StagedSide<'i>
-    where
-        Self: 'i;
-    type Index = StagedIndex<'a>;
-
-    fn restrict<'i>(&'i self, _claims: &'i CapturedScipInventory) -> Result<StagedSide<'i>> {
-        Err(anyhow!(
-            "a staged store is restricted by document eligibility"
-        ))
-    }
-
-    fn new_index(&self) -> StagedIndex<'a> {
-        StagedIndex {
-            ctx: self.ctx,
-            side: self.side,
-            source_set_id: self.header.source_set.id.clone(),
-            occurrences: 0,
-            relationships: 0,
-            endpoints: 0,
-            reference_claims: 0,
-            methods: 0,
-        }
-    }
-
     fn claims(&self) -> Box<dyn Iterator<Item = Result<Cow<'_, CapturedClaim>>> + '_> {
-        Box::new(ClaimCursor {
-            conn: self.ctx.conn,
-            filtered: self.filtered,
-            last: None,
-            page: VecDeque::new(),
-            done: false,
-        })
+        match &self.local_claims {
+            Some(local) => Box::new(local.claims.iter().map(|claim| Ok(Cow::Borrowed(claim)))),
+            None => Box::new(std::iter::once(Err(anyhow::anyhow!(
+                "document claim owner required"
+            )))),
+        }
     }
 
     fn lookup_proof(&self, proof: &str, kind: &str, digest: &str) -> Result<()> {
@@ -785,47 +1033,36 @@ impl<'a> JoinStore for StagedSide<'a> {
     }
 
     fn claim(&self, proof: &str, kind: &str, digest: &str) -> Result<Cow<'_, CapturedClaim>> {
-        let sql = format!(
-            "{} WHERE c.proof_id=?1 AND c.record_kind=?2 AND c.fact_digest=?3",
-            claim_select(self.filtered)
-        );
-        let parts = self
-            .ctx
-            .conn
-            .prepare_cached(&sql)?
-            .query_row(params![proof, kind, digest], claim_of_row)
-            .optional()?
-            .ok_or(ScipCaptureError::MissingProof)?
-            .2;
-        Ok(Cow::Owned(build_claim(parts)?))
+        let local = self
+            .local_claims
+            .as_ref()
+            .context("document claim owner required")?;
+        self.ctx.charge(1)?;
+        let claim = local
+            .by_proof
+            .get(proof)
+            .map(|&index| &local.claims[index])
+            .ok_or(ScipCaptureError::MissingProof)?;
+        if claim.envelope.record_kind != kind || claim.fact_digest != digest {
+            return Err(ScipCaptureError::MissingProof.into());
+        }
+        Ok(Cow::Borrowed(claim))
     }
 
     fn symbol_kind(&self, language: &str, path: &str, symbol: &str) -> Result<Option<i64>> {
-        let document = native::DocumentKey {
-            source_set_id: self.header.source_set.id.clone(),
-            language: language.to_owned(),
-            path: path.to_owned(),
-        };
-        let group = self.require_group(&document)?;
-        if group.symbol_kinds.borrow().is_none() {
-            let mut kinds = BTreeMap::new();
-            for claim in self.document_claims(&group)? {
-                if claim.envelope.record_kind == "symbolInformation"
-                    && let Some(name) = claim.envelope.raw["symbol"].as_str()
-                {
-                    kinds
-                        .entry(name.to_owned())
-                        .or_insert_with(|| claim.envelope.raw["kind"].as_i64());
-                }
-            }
-            *group.symbol_kinds.borrow_mut() = Some(kinds);
-        }
-        Ok(group
-            .symbol_kinds
-            .borrow()
+        let document = self
+            .document
             .as_ref()
-            .and_then(|kinds| kinds.get(symbol).copied())
-            .flatten())
+            .context("document claim owner required")?;
+        anyhow::ensure!(
+            document.language == language && document.path == path,
+            "foreign symbol-kind document"
+        );
+        let local = self
+            .local_claims
+            .as_ref()
+            .context("document claim owner required")?;
+        Ok(local.symbol_kinds.get(symbol).copied().flatten())
     }
 
     fn occurrence_range(
@@ -834,23 +1071,19 @@ impl<'a> JoinStore for StagedSide<'a> {
         admitted_encoding: u8,
     ) -> Result<native::Range> {
         let (encoding, endpoints) = occurrence_endpoints(claim, admitted_encoding)?;
-        let document = native::DocumentKey {
-            source_set_id: self.header.source_set.id.clone(),
-            language: claim.language.clone(),
-            path: claim.envelope.relative_path.clone(),
-        };
-        let group = self.require_group(&document)?;
-        if group.coordinates.borrow().is_none() {
-            let claims = self.document_claims(&group)?;
-            let maps = document_coordinates(&claims, &group.text, admitted_encoding)?;
-            *group.coordinates.borrow_mut() = Some(maps);
-        }
-        let coordinates = group.coordinates.borrow();
-        let offsets = coordinates
-            .as_ref()
-            .and_then(|maps| maps.get(&encoding))
-            .context("missing SCIP coordinate map")?;
-        mapped_range(claim, endpoints, offsets)
+        self.mapped_claim_range(claim, admitted_encoding, encoding, endpoints)
+    }
+    fn enclosing_occurrence_range(
+        &self,
+        claim: &CapturedClaim,
+        admitted_encoding: u8,
+    ) -> Result<native::Range> {
+        let (encoding, endpoints) = range_endpoints(
+            &claim.envelope.raw["enclosingRange"],
+            claim.envelope.position_encoding,
+            admitted_encoding,
+        )?;
+        self.mapped_claim_range(claim, admitted_encoding, encoding, endpoints)
     }
 
     fn role_sites(&self, document: &native::DocumentKey) -> Result<RoleSites> {
@@ -858,6 +1091,21 @@ impl<'a> JoinStore for StagedSide<'a> {
         super::note_parsed_role_site_document(document);
         let group = self.require_group(document)?;
         source_role_sites(document.language.as_str(), group.text.as_bytes())
+    }
+
+    fn role_sites_reserved(
+        &self,
+        document: &native::DocumentKey,
+        operation: &mut Self::Operation,
+    ) -> Result<RoleSites> {
+        #[cfg(feature = "test-support")]
+        super::note_parsed_role_site_document(document);
+        let group = self.require_group(document)?;
+        super::source_role_sites_reserved(
+            document.language.as_str(),
+            group.text.as_bytes(),
+            &mut |bytes| operation.grow(bytes),
+        )
     }
 
     fn charge(&self, units: usize) -> Result<()> {
@@ -870,373 +1118,6 @@ fn local_columns(key: &ScopedKey) -> (&str, &str) {
     match &key.1 {
         Some(document) => (&document.language, &document.path),
         None => ("", ""),
-    }
-}
-
-/// The global join indexes of one side, as tables keyed on the lookup key.
-pub(super) struct StagedIndex<'a> {
-    ctx: &'a JoinCtx<'a>,
-    side: u8,
-    source_set_id: String,
-    occurrences: usize,
-    relationships: i64,
-    endpoints: i64,
-    reference_claims: i64,
-    methods: i64,
-}
-
-impl StagedIndex<'_> {
-    fn insert(&self, sql: &str, values: &[&dyn rusqlite::ToSql]) -> Result<()> {
-        self.ctx.row()?;
-        self.ctx.conn.prepare_cached(sql)?.execute(values)?;
-        Ok(())
-    }
-
-    fn rows<T>(
-        &self,
-        sql: &str,
-        values: &[&dyn rusqlite::ToSql],
-        map: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> Result<Vec<T>> {
-        self.ctx.charge(1)?;
-        let mut statement = self.ctx.conn.prepare_cached(sql)?;
-        let mut rows = statement.query(values)?;
-        let mut items = vec![];
-        while let Some(row) = rows.next()? {
-            self.ctx.charge(1)?;
-            items.push(map(row)?);
-        }
-        Ok(items)
-    }
-}
-
-impl JoinIndex for StagedIndex<'_> {
-    fn put_declaration(
-        &mut self,
-        key: ScopedKey,
-        document: native::DocumentKey,
-        syntax_id: String,
-    ) -> Result<()> {
-        let (local_language, local_path) = local_columns(&key);
-        self.insert(
-            "INSERT OR IGNORE INTO ix_declarations VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            &[
-                &self.side,
-                &key.0,
-                &local_language,
-                &local_path,
-                &document.language,
-                &document.path,
-                &syntax_id,
-            ],
-        )
-    }
-
-    fn declarations(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>> {
-        let (local_language, local_path) = local_columns(key);
-        let set = &self.source_set_id;
-        self.rows(
-            DECLARATIONS_SQL,
-            &[&self.side, &key.0, &local_language, &local_path],
-            |row| {
-                Ok((
-                    native::DocumentKey {
-                        source_set_id: set.clone(),
-                        language: row.get(0)?,
-                        path: row.get(1)?,
-                    },
-                    row.get(2)?,
-                ))
-            },
-        )
-    }
-
-    fn put_type_use(
-        &mut self,
-        document: &native::DocumentKey,
-        start: usize,
-        end: usize,
-        symbol: &str,
-    ) -> Result<()> {
-        self.insert(
-            "INSERT OR IGNORE INTO ix_type_uses VALUES(?1,?2,?3,?4,?5,?6)",
-            &[
-                &self.side,
-                &document.language,
-                &document.path,
-                &(start as i64),
-                &(end as i64),
-                &symbol,
-            ],
-        )
-    }
-
-    fn type_uses(
-        &self,
-        document: &native::DocumentKey,
-        start: usize,
-        end: usize,
-    ) -> Result<BTreeSet<String>> {
-        Ok(self
-            .rows(
-                "SELECT symbol FROM ix_type_uses WHERE side=?1 AND language=?2 AND path=?3 AND start=?4 AND end=?5",
-                &[
-                    &self.side,
-                    &document.language,
-                    &document.path,
-                    &(start as i64),
-                    &(end as i64),
-                ],
-                |row| row.get::<_, String>(0),
-            )?
-            .into_iter()
-            .collect())
-    }
-
-    fn put_occurrence(&mut self, row: OccurrenceRow) -> Result<()> {
-        let body = to_json(&row)?;
-        self.insert(
-            "INSERT INTO ix_occurrences VALUES(?1,?2,?3)",
-            &[&self.side, &(self.occurrences as i64), &body],
-        )?;
-        self.occurrences += 1;
-        Ok(())
-    }
-
-    fn occurrence_count(&self) -> usize {
-        self.occurrences
-    }
-
-    fn occurrence(&self, ordinal: usize) -> Result<OccurrenceRow> {
-        let body: String = self
-            .ctx
-            .conn
-            .prepare_cached("SELECT body FROM ix_occurrences WHERE side=?1 AND ord=?2")?
-            .query_row(params![self.side, ordinal as i64], |row| row.get(0))
-            .context("missing occurrence row")?;
-        from_json(&body)
-    }
-
-    fn put_relationship(&mut self, language: &str, path: &str, row: RelationshipRow) -> Result<()> {
-        let body = to_json(&row)?;
-        self.insert(
-            "INSERT INTO ix_relationships VALUES(?1,?2,?3,?4,?5)",
-            &[&self.side, &language, &path, &self.relationships, &body],
-        )?;
-        self.relationships += 1;
-        Ok(())
-    }
-
-    fn relationships(&self, language: &str, path: &str) -> Result<Vec<RelationshipRow>> {
-        self.rows(
-            "SELECT body FROM ix_relationships WHERE side=?1 AND language=?2 AND path=?3 ORDER BY ord",
-            &[&self.side, &language, &path],
-            |row| row.get::<_, String>(0),
-        )?
-        .iter()
-        .map(|body| from_json(body))
-        .collect()
-    }
-
-    fn put_relationship_endpoint(
-        &mut self,
-        language: &str,
-        path: &str,
-        source: &str,
-        target: &str,
-        row: RelationshipRow,
-    ) -> Result<()> {
-        let body = to_json(&row)?;
-        self.insert(
-            "INSERT INTO ix_relationship_endpoints VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            &[
-                &self.side,
-                &language,
-                &path,
-                &source,
-                &target,
-                &self.endpoints,
-                &body,
-            ],
-        )?;
-        self.endpoints += 1;
-        Ok(())
-    }
-
-    fn relationship_endpoints(
-        &self,
-        language: &str,
-        path: &str,
-        source: &str,
-        target: &str,
-    ) -> Result<Vec<RelationshipRow>> {
-        self.rows(
-            "SELECT body FROM ix_relationship_endpoints WHERE side=?1 AND language=?2 AND path=?3 \
-             AND source=?4 AND target=?5 ORDER BY ord",
-            &[&self.side, &language, &path, &source, &target],
-            |row| row.get::<_, String>(0),
-        )?
-        .iter()
-        .map(|body| from_json(body))
-        .collect()
-    }
-
-    fn put_reference_claim(
-        &mut self,
-        reference_id: &str,
-        proof_id: &str,
-        target: semantic::Target,
-    ) -> Result<()> {
-        let target = to_json(&target)?;
-        self.insert(
-            "INSERT INTO ix_reference_claims VALUES(?1,?2,?3,?4,?5)",
-            &[
-                &self.side,
-                &reference_id,
-                &self.reference_claims,
-                &proof_id,
-                &target,
-            ],
-        )?;
-        self.reference_claims += 1;
-        Ok(())
-    }
-
-    fn take_reference_claims(
-        &mut self,
-        reference_id: &str,
-    ) -> Result<Vec<(String, semantic::Target)>> {
-        let rows = self.rows(
-            "SELECT proof_id, target FROM ix_reference_claims WHERE side=?1 AND reference_id=?2 ORDER BY ord",
-            &[&self.side, &reference_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?;
-        self.ctx
-            .conn
-            .prepare_cached("DELETE FROM ix_reference_claims WHERE side=?1 AND reference_id=?2")?
-            .execute(params![self.side, reference_id])?;
-        rows.into_iter()
-            .map(|(proof, target)| Ok((proof, from_json(&target)?)))
-            .collect()
-    }
-
-    fn put_call_reference(&mut self, proof_id: &str, reference_id: &str) -> Result<()> {
-        self.insert(
-            "INSERT OR REPLACE INTO ix_call_references VALUES(?1,?2,?3)",
-            &[&self.side, &proof_id, &reference_id],
-        )
-    }
-
-    fn call_reference(&self, proof_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .ctx
-            .conn
-            .prepare_cached(
-                "SELECT reference_id FROM ix_call_references WHERE side=?1 AND proof_id=?2",
-            )?
-            .query_row(params![self.side, proof_id], |row| row.get(0))
-            .optional()?)
-    }
-
-    fn put_symbol(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
-        self.insert(
-            "INSERT INTO ix_symbols VALUES(?1,?2,?3,?4) ON CONFLICT(side, symbol) DO UPDATE SET \
-             declared=declared|excluded.declared, information=information|excluded.information",
-            &[&self.side, &symbol, &declared, &information],
-        )
-    }
-
-    fn is_declared_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self
-            .ctx
-            .conn
-            .prepare_cached("SELECT declared FROM ix_symbols WHERE side=?1 AND symbol=?2")?
-            .query_row(params![self.side, symbol], |row| row.get::<_, bool>(0))
-            .optional()?
-            .unwrap_or(false))
-    }
-
-    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self
-            .ctx
-            .conn
-            .prepare_cached("SELECT information FROM ix_symbols WHERE side=?1 AND symbol=?2")?
-            .query_row(params![self.side, symbol], |row| row.get::<_, bool>(0))
-            .optional()?
-            .unwrap_or(false))
-    }
-
-    fn put_method(
-        &mut self,
-        document: &native::DocumentKey,
-        symbol: &str,
-        method: &native::Declaration,
-    ) -> Result<()> {
-        let body = to_json(method)?;
-        self.insert(
-            "INSERT INTO ix_methods VALUES(?1,0,?2,?3,?4,?5,?6)",
-            &[
-                &self.side,
-                &symbol,
-                &document.language,
-                &document.path,
-                &self.methods,
-                &body,
-            ],
-        )?;
-        let key = (
-            symbol.to_owned(),
-            symbol.starts_with("local ").then(|| document.clone()),
-        );
-        let (local_language, local_path) = local_columns(&key);
-        self.insert(
-            "INSERT INTO ix_methods VALUES(?1,1,?2,?3,?4,?5,?6)",
-            &[
-                &self.side,
-                &symbol,
-                &local_language,
-                &local_path,
-                &self.methods,
-                &body,
-            ],
-        )?;
-        self.methods += 1;
-        Ok(())
-    }
-
-    fn source_methods(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<Vec<native::Declaration>> {
-        self.rows(
-            "SELECT body FROM ix_methods WHERE side=?1 AND kind=0 AND key_a=?2 AND key_b=?3 AND key_c=?4 ORDER BY ord",
-            &[&self.side, &symbol, &document.language, &document.path],
-            |row| row.get::<_, String>(0),
-        )?
-        .iter()
-        .map(|body| from_json(body))
-        .collect()
-    }
-
-    fn target_methods(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<Vec<native::Declaration>> {
-        let key = (
-            symbol.to_owned(),
-            symbol.starts_with("local ").then(|| document.clone()),
-        );
-        let (local_language, local_path) = local_columns(&key);
-        self.rows(
-            "SELECT body FROM ix_methods WHERE side=?1 AND kind=1 AND key_a=?2 AND key_b=?3 AND key_c=?4 ORDER BY ord",
-            &[&self.side, &symbol, &local_language, &local_path],
-            |row| row.get::<_, String>(0),
-        )?
-        .iter()
-        .map(|body| from_json(body))
-        .collect()
     }
 }
 
@@ -1306,7 +1187,7 @@ impl JoinSink for StagedFactSink<'_> {
         Ok(())
     }
 
-    fn join(&mut self, _proof_id: &str, _join: semantic::Join) -> Result<()> {
+    fn join(&mut self, _proof_id: &str, _join: &semantic::Join) -> Result<()> {
         Ok(())
     }
 
@@ -1518,8 +1399,11 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
                     document.content_hash,
                     document.byte_length as i64
                 ])?;
-            let mut rows = reader.document(&document)?;
+            let mut reservation =
+                ctx.reserve_native(reader.document_reservation_bytes(&document)?)?;
+            let mut rows = reader.join_document(&document)?;
             if mutate {
+                reservation.grow(sizes::mutation(&rows, ctx.mutations)?)?;
                 ctx.mutations
                     .apply(&mut rows.declarations, &mut rows.references);
             }
@@ -1590,13 +1474,16 @@ static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// The native rows an earlier attempt left in the stage. They count against `staged_rows`
 /// together with the rows this attempt writes.
 fn retained_rows(conn: &Connection) -> Result<u64> {
-    let mut total = 0i64;
+    let mut total = 0u64;
     for table in ["nat_docs", "nat_declarations"] {
-        total += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        let count = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get::<_, i64>(0)
         })?;
+        total = total
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
     }
-    Ok(total as u64)
+    Ok(total)
 }
 
 /// One staged join: the sides, the captured basis and the emission validator.
@@ -1737,7 +1624,10 @@ impl StagedJoin<'_> {
     fn eligibility(&self) -> Result<()> {
         let conn = self.conn();
         let enc = self.admitted_encoding;
-        conn.execute("INSERT INTO w_docs(source_ord) SELECT ord FROM sources", [])?;
+        self.ctx.insert_select(
+            "SELECT COUNT(*) FROM sources",
+            "INSERT INTO w_docs(source_ord) SELECT ord FROM sources",
+        )?;
         for document in self.captured.documents() {
             let document = document?;
             if !self
@@ -1763,108 +1653,130 @@ impl StagedJoin<'_> {
                 self.mark("failed", &document.language, &document.path)?;
             }
         }
-        for claim in self.captured.claims() {
-            let claim = claim?;
-            self.captured.charge(1)?;
-            self.captured.lookup_proof(
-                &claim.captured_proof_id,
-                &claim.envelope.record_kind,
-                &claim.fact_digest,
-            )?;
-            let doc = self.key(&claim.language, &claim.envelope.relative_path);
-            self.mark("requested", &doc.language, &doc.path)?;
-            self.captured
-                .doc_row(&doc)?
-                .context("captured claim outside source manifest")?;
-            self.captured
-                .bytes_of(&doc)?
-                .context("missing captured claim source")?;
-            if !self.unchanged(&doc)? {
-                self.mark("failed", &doc.language, &doc.path)?;
-                continue;
-            }
-            if claim.envelope.record_kind != "occurrence" {
-                self.mark("eligible", &doc.language, &doc.path)?;
-                continue;
-            }
-            let range = self.captured.occurrence_range(&claim, enc)?;
-            if range.start == range.end {
-                self.mark("eligible", &doc.language, &doc.path)?;
-                continue;
-            }
-            let roles = claim.envelope.raw["symbolRoles"]
-                .as_u64()
-                .context("invalid raw roles")?;
-            let proof = claim.captured_proof_id.as_str();
-            let captured_declaration = self.captured_has(
-                "SELECT 1 FROM f_bindings WHERE side=0 AND provenance_id=?1 AND syntax_id IS NOT NULL",
-                proof,
-            )?;
-            let captured_reference = self.captured_reference(proof)?.is_some();
-            let required = if captured_declaration || (!captured_reference && roles & 1 != 0) {
-                semantic::JoinKind::DeclarationName
-            } else {
-                semantic::JoinKind::Reference
-            };
-            let first = self.captured.join(&doc, range.clone(), required)?;
-            let second = self.destination.join(&doc, range, required)?;
-            let authored = self.captured_association(proof)?;
-            if !authored
-                && first.status == semantic::JoinStatus::Unsupported
-                && second.status == semantic::JoinStatus::Unsupported
-            {
-                conn.prepare_cached("INSERT OR IGNORE INTO w_unsupported_claims VALUES(?1)")?
-                    .execute([proof])?;
-                self.mark("unsupported", &doc.language, &doc.path)?;
-                self.mark("eligible", &doc.language, &doc.path)?;
-                continue;
-            }
-            if !authored
-                && first.status == semantic::JoinStatus::Unmatched
-                && second.status == semantic::JoinStatus::Unmatched
-            {
-                self.mark("eligible", &doc.language, &doc.path)?;
-                continue;
-            }
-            let mut exact = first.status == semantic::JoinStatus::Exact
-                && second.status == semantic::JoinStatus::Exact;
-            if captured_reference && required != semantic::JoinKind::Reference {
-                let first_reference = self.captured.join(
-                    &doc,
-                    first.anchor.range.clone(),
-                    semantic::JoinKind::Reference,
+        for document in self.captured.documents() {
+            let local = streaming::document_side(&self.captured, document?)?;
+            let mut destination = None;
+            for claim in local.claims() {
+                let claim = claim?;
+                local.charge(1)?;
+                local.lookup_proof(
+                    &claim.captured_proof_id,
+                    &claim.envelope.record_kind,
+                    &claim.fact_digest,
                 )?;
-                let second_reference = self.destination.join(
-                    &doc,
-                    first.anchor.range.clone(),
-                    semantic::JoinKind::Reference,
+                let doc = self.key(&claim.language, &claim.envelope.relative_path);
+                self.mark("requested", &doc.language, &doc.path)?;
+                local
+                    .doc_row(&doc)?
+                    .context("captured claim outside source manifest")?;
+                local
+                    .bytes_of(&doc)?
+                    .context("missing captured claim source")?;
+                if !self.unchanged(&doc)? {
+                    self.mark("failed", &doc.language, &doc.path)?;
+                    continue;
+                }
+                if claim.envelope.record_kind != "occurrence" {
+                    self.mark("eligible", &doc.language, &doc.path)?;
+                    continue;
+                }
+                let range = local.occurrence_range(&claim, enc)?;
+                if range.start == range.end {
+                    self.mark("eligible", &doc.language, &doc.path)?;
+                    continue;
+                }
+                let roles = claim.envelope.raw["symbolRoles"]
+                    .as_u64()
+                    .context("invalid raw roles")?;
+                let proof = claim.captured_proof_id.as_str();
+                let captured_declaration = self.captured_has(
+                    "SELECT 1 FROM f_bindings WHERE side=0 AND provenance_id=?1 AND syntax_id IS NOT NULL",
+                    proof,
                 )?;
-                exact &= first_reference.status == semantic::JoinStatus::Exact
-                    && second_reference.status == semantic::JoinStatus::Exact;
-            }
-            if let Some(binding) = self.captured_call(proof)? {
-                let call = self.destination.join(
-                    &doc,
-                    binding.join.anchor.range.clone(),
-                    binding.join.anchor.kind,
-                )?;
-                let first_call = self.captured.join(
-                    &doc,
-                    binding.join.anchor.range.clone(),
-                    binding.join.anchor.kind,
-                )?;
-                exact &= call.status == semantic::JoinStatus::Exact
-                    && first_call.status == semantic::JoinStatus::Exact
-                    && first_call.candidate_ids == binding.join.candidate_ids;
-                let mut same_call = false;
-                if let Some(id) = second.candidate_ids.first() {
-                    let calls = match call.candidate_ids.first() {
-                        Some(call_id) => self.destination.calls_with_id(&doc, call_id)?,
-                        None => vec![],
-                    };
-                    same_call =
-                        self.destination
-                            .references_with_id(&doc, id)?
+                let captured_reference = self.captured_reference(proof)?.is_some();
+                let required = if captured_declaration || (!captured_reference && roles & 1 != 0) {
+                    semantic::JoinKind::DeclarationName
+                } else {
+                    semantic::JoinKind::Reference
+                };
+                if destination.is_none() {
+                    destination = Some(streaming::native_document_side(
+                        &self.destination,
+                        doc.clone(),
+                    )?);
+                }
+                let destination = destination.as_ref().expect("destination native view");
+                let mut captured_operation = local.operation()?;
+                let mut destination_operation = destination.operation()?;
+                let first =
+                    local.join_reserved(&doc, range.clone(), required, &mut captured_operation)?;
+                let second =
+                    destination.join_reserved(&doc, range, required, &mut destination_operation)?;
+                let authored = self.captured_association(proof)?;
+                if !authored
+                    && first.status == semantic::JoinStatus::Unsupported
+                    && second.status == semantic::JoinStatus::Unsupported
+                {
+                    self.ctx.row()?;
+                    conn.prepare_cached("INSERT OR IGNORE INTO w_unsupported_claims VALUES(?1)")?
+                        .execute([proof])?;
+                    self.mark("unsupported", &doc.language, &doc.path)?;
+                    self.mark("eligible", &doc.language, &doc.path)?;
+                    continue;
+                }
+                if !authored
+                    && first.status == semantic::JoinStatus::Unmatched
+                    && second.status == semantic::JoinStatus::Unmatched
+                {
+                    self.mark("eligible", &doc.language, &doc.path)?;
+                    continue;
+                }
+                let mut exact = first.status == semantic::JoinStatus::Exact
+                    && second.status == semantic::JoinStatus::Exact;
+                if captured_reference && required != semantic::JoinKind::Reference {
+                    let first_reference = local.join_reserved(
+                        &doc,
+                        first.anchor.range.clone(),
+                        semantic::JoinKind::Reference,
+                        &mut captured_operation,
+                    )?;
+                    let second_reference = destination.join_reserved(
+                        &doc,
+                        first.anchor.range.clone(),
+                        semantic::JoinKind::Reference,
+                        &mut destination_operation,
+                    )?;
+                    exact &= first_reference.status == semantic::JoinStatus::Exact
+                        && second_reference.status == semantic::JoinStatus::Exact;
+                }
+                if let Some(binding) = self.captured_call(proof)? {
+                    let call = destination.join_reserved(
+                        &doc,
+                        binding.join.anchor.range.clone(),
+                        binding.join.anchor.kind,
+                        &mut destination_operation,
+                    )?;
+                    let first_call = local.join_reserved(
+                        &doc,
+                        binding.join.anchor.range.clone(),
+                        binding.join.anchor.kind,
+                        &mut captured_operation,
+                    )?;
+                    exact &= call.status == semantic::JoinStatus::Exact
+                        && first_call.status == semantic::JoinStatus::Exact
+                        && first_call.candidate_ids == binding.join.candidate_ids;
+                    let mut same_call = false;
+                    if let Some(id) = second.candidate_ids.first() {
+                        let calls = match call.candidate_ids.first() {
+                            Some(call_id) => destination.calls_with_id(
+                                &doc,
+                                call_id,
+                                &mut destination_operation,
+                            )?,
+                            None => vec![],
+                        };
+                        same_call = destination
+                            .references_with_id(&doc, id, &mut destination_operation)?
                             .iter()
                             .any(|reference| {
                                 &reference.id == id
@@ -1880,14 +1792,15 @@ impl StagedJoin<'_> {
                                                 .is_none_or(|callee| callee == &reference.range)
                                     })
                             });
+                    }
+                    exact &= same_call;
                 }
-                exact &= same_call;
+                self.mark(
+                    if exact { "eligible" } else { "failed" },
+                    &doc.language,
+                    &doc.path,
+                )?;
             }
-            self.mark(
-                if exact { "eligible" } else { "failed" },
-                &doc.language,
-                &doc.path,
-            )?;
         }
         Ok(())
     }
@@ -2068,6 +1981,7 @@ impl StagedJoin<'_> {
     }
 
     fn observe(&self, document: &native::DocumentKey, role: semantic::Role) -> Result<()> {
+        self.ctx.row()?;
         self.conn()
             .prepare_cached("INSERT OR IGNORE INTO w_observed VALUES(?1,?2,?3)")?
             .execute(params![
@@ -2079,6 +1993,7 @@ impl StagedJoin<'_> {
     }
 
     fn outcome(&self, raw: &str, outcome: i64) -> Result<()> {
+        self.ctx.row()?;
         self.conn()
             .prepare_cached("INSERT OR REPLACE INTO w_outcomes VALUES(?1,?2)")?
             .execute(params![raw, outcome])?;
@@ -2283,8 +2198,10 @@ impl StagedJoin<'_> {
                     .execute(params![reference.id, target_ord, to_json(target)?])?;
                 target_ord += 1;
             }
+            self.ctx.row()?;
             conn.prepare_cached("INSERT OR IGNORE INTO w_refproofs VALUES(?1,?2)")?
                 .execute(params![reference.id, raw])?;
+            self.ctx.row()?;
             conn.prepare_cached("INSERT OR REPLACE INTO w_accepted VALUES(?1,?2)")?
                 .execute(params![raw, reference.id])?;
             self.source(&raw, semantic::EvidenceKind::SemanticReference)?;
@@ -3033,14 +2950,14 @@ impl StagedJoin<'_> {
     fn run(&self) -> Result<serde_json::Value> {
         let conn = self.conn();
         let mut sink = StagedFactSink::new(self.ctx, 0);
-        join_inventory_indexed(self.admitted_encoding, &self.captured, &mut sink)?;
+        streaming::join_side(&self.captured, self.admitted_encoding, &mut sink)?;
         self.eligibility()?;
         let mut sink = StagedFactSink::new(self.ctx, 1);
-        join_inventory_indexed(self.admitted_encoding, &self.filtered, &mut sink)?;
+        streaming::join_side(&self.filtered, self.admitted_encoding, &mut sink)?;
         self.fill_captured_targets()?;
-        conn.execute(
+        self.ctx.insert_select(
+            "SELECT COUNT(*) FROM claims WHERE record_kind<>'symbolInformation'",
             "INSERT INTO w_outcomes SELECT proof_id, 2 FROM claims WHERE record_kind<>'symbolInformation'",
-            [],
         )?;
         conn.execute(
             "UPDATE w_outcomes SET outcome=4 WHERE proof_id IN (SELECT proof_id FROM w_unsupported_claims)",
@@ -3085,6 +3002,7 @@ pub fn join_staged(
         conn: parts.conn,
         limits: limits.clone(),
         budget: RefCell::new(budget.clone()),
+        live: LiveBudget::new(limits.unit_expansion_bytes),
         counters: RefCell::new(BatchCounters::default()),
         cache: RefCell::new(DocCache {
             budget: limits.document_cache_bytes,
@@ -3117,6 +3035,9 @@ pub fn join_staged(
                 rev,
                 side,
                 filtered,
+                document: None,
+                local_claims: None,
+                local_group: None,
             };
             let join = StagedJoin {
                 ctx: &ctx,
@@ -3172,7 +3093,8 @@ pub fn join_staged(
             ))
         };
     let result = reset_for_destination(ctx.conn, destination).and_then(|attempt| {
-        ctx.rows.set(retained_rows(ctx.conn)?);
+        ctx.reserve_rows(retained_rows(ctx.conn)?)?;
+        ctx.check_output()?;
         if shared {
             store.with_native_reader(captured_pin, |reader| body(attempt, reader, reader))
         } else {
@@ -3182,6 +3104,7 @@ pub fn join_staged(
         }
     });
     *budget = ctx.budget.into_inner();
+    ctx.counters.borrow_mut().join_reservation_high_water_bytes = ctx.live.high_water();
     counters.absorb_join(&ctx.counters.borrow());
     result
 }

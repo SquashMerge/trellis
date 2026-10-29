@@ -58,6 +58,14 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "post-native semantic relationships from authenticated source",
     ),
     (
+        "src/semantic_import/staged/group_size.rs",
+        "post-native semantic normalization scratch accounting",
+    ),
+    (
+        "src/semantic_import_complexity_tests.rs",
+        "post-native semantic parser reservation tests",
+    ),
+    (
         "src/files_view.rs",
         "read-time Files outline and syntax matches",
     ),

@@ -3,6 +3,7 @@ pub mod anchors;
 mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
+mod native_join_budget;
 mod published_admission;
 pub mod requests;
 mod search;
@@ -970,6 +971,23 @@ impl NativeReader<'_> {
     ) -> Result<NativeDocumentRows> {
         self.store
             .read_native_document(self.db, self.selected, document)
+    }
+
+    /// Native rows for staged joins, retaining the general reader's integrity checks.
+    pub(crate) fn join_document(
+        &self,
+        document: &crate::native_evidence::Document,
+    ) -> Result<NativeDocumentRows> {
+        self.store
+            .read_native_document(self.db, self.selected, document)
+    }
+
+    /// Logical peak estimate for native document loading, before owning its row bodies.
+    pub(crate) fn document_reservation_bytes(
+        &self,
+        document: &crate::native_evidence::Document,
+    ) -> Result<u64> {
+        native_join_budget::document_bytes(self.db, self.selected, document)
     }
 
     /// Streams the stored source inventory through SQLite incremental blob I/O and a 1 MiB
@@ -20346,6 +20364,8 @@ impl Store {
         use crate::native_evidence as n;
         #[cfg(feature = "test-support")]
         crate::semantic_import::note_selected_original_native_row(&document.key);
+        #[cfg(feature = "test-support")]
+        crate::semantic_batch::testing::note_native_document_load();
         let scope = v8_native_scope_for(db, &document.key, selected)?.context(
             SelectedIntegrity("incompatible_index: retained native document absent".into()),
         )?;

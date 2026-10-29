@@ -1432,6 +1432,22 @@ fn cross_artifact_reference_resolves_internal_in_any_artifact_order() {
     let mut targets = vec![];
     for swap in [false, true] {
         let descriptor = split_definitions(&world, swap);
+        let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let observed = seen.clone();
+        testing::observe_document_common(move |side, document, facts, _conn| {
+            if document.path == "src/A.js" {
+                let reference = facts
+                    .references
+                    .iter()
+                    .find(|row| row.spelling == "target")
+                    .unwrap();
+                assert_eq!(reference.resolution, Resolution::Resolved);
+                assert!(
+                    matches!(&reference.declared_target, Some(trellis::semantic_evidence::Target::Internal { document, .. }) if document.path == "src/B.js")
+                );
+                observed.lock().unwrap().insert(side);
+            }
+        });
         let (mut admitted, _, _) = world
             .join_with(
                 &descriptor,
@@ -1439,6 +1455,11 @@ fn cross_artifact_reference_resolves_internal_in_any_artifact_order() {
                 DestinationMutations::default(),
             )
             .unwrap();
+        testing::clear_document_common_observer();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            std::collections::BTreeSet::from([0, 1])
+        );
         let publication = testing::staged_publication(&mut admitted).unwrap();
         let reference = target_reference(&publication);
         assert_eq!(
@@ -1453,6 +1474,146 @@ fn cross_artifact_reference_resolves_internal_in_any_artifact_order() {
         targets[0],
         Some(trellis::semantic_evidence::Target::Internal { .. })
     ));
+}
+
+#[test]
+fn native_join_reservation_rejects_before_document_loading() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let mut admitted = world.admit(&descriptor).unwrap();
+    let mut limits = BatchLimits::PRODUCTION;
+    limits.unit_expansion_bytes = 1;
+    let mut budget = LookupBudget::new(&limits);
+    let mut counters = BatchCounters::default();
+    testing::reset_native_document_loads();
+    let error = join_staged(
+        &mut admitted,
+        &world.store,
+        world.store.index_baseline().unwrap(),
+        &limits,
+        &mut budget,
+        &mut counters,
+        DestinationMutations::default(),
+        &world.cancel,
+    )
+    .unwrap_err();
+    assert!(matches!(error.downcast_ref::<ScipCaptureError>(),
+        Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"));
+    assert_eq!(testing::native_document_loads(), 0);
+    let mut budget = LookupBudget::new(&BatchLimits::PRODUCTION);
+    join_staged(
+        &mut admitted,
+        &world.store,
+        world.store.index_baseline().unwrap(),
+        &BatchLimits::PRODUCTION,
+        &mut budget,
+        &mut counters,
+        DestinationMutations::default(),
+        &world.cancel,
+    )
+    .unwrap();
+    assert!(testing::native_document_loads() > 0);
+    assert!(counters.join_reservation_high_water_bytes > 0);
+    assert!(
+        counters.join_reservation_high_water_bytes <= BatchLimits::PRODUCTION.unit_expansion_bytes
+    );
+}
+
+#[test]
+fn streaming_common_uses_only_final_eligible_presence() {
+    for definitions in [false, true] {
+        let world = definitions_world();
+        let (a, _) = definitions_docs();
+        let b = if definitions {
+            DocSpec::new("src/B.js").occurrence(&[0, 9, 15], &[], "pkg target.", 1)
+        } else {
+            DocSpec::new("src/B.js").symbol("pkg target.", 17, &[])
+        };
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+        write_files(
+            &world.root,
+            &[("src/B.js", "function target(){ return 1; }\n")],
+        );
+        world.republish();
+        let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let observed = seen.clone();
+        testing::observe_document_common(move |side, document, facts, conn| {
+            if document.path != "src/A.js" {
+                return;
+            }
+            let presence: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM g_presence WHERE side=?1 AND symbol='pkg target.'",
+                    [side],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(presence, if side == 0 { 1 } else { 0 });
+            let reference = facts
+                .references
+                .iter()
+                .find(|row| row.spelling == "target")
+                .unwrap();
+            assert_eq!(
+                reference.resolution,
+                if side == 0 {
+                    Resolution::Unresolved
+                } else {
+                    Resolution::External
+                }
+            );
+            observed.lock().unwrap().insert(side);
+        });
+        world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        testing::clear_document_common_observer();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            std::collections::BTreeSet::from([0, 1])
+        );
+    }
+}
+
+#[test]
+fn streaming_exact_definition_authority_survives_incompatible_common_kind() {
+    let world = world(|root| write_files(root, &[("J.java", "class A {}\n")]));
+    let doc = DocSpec::new("J.java")
+        .occurrence(&[0, 6, 7], &[], "pkg A#", 1)
+        .symbol("pkg A#", 26, &[]);
+    let descriptor = one_artifact_per_language(&world, vec![("java", vec![doc])]);
+    let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let observed = seen.clone();
+    testing::observe_document_common(move |side, document, facts, conn| {
+        if document.path != "J.java" {
+            return;
+        }
+        let exact: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM g_definitions WHERE side=?1 AND symbol='pkg A#' AND common_compatible=0",
+            [side], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(exact, 1);
+        assert_eq!(facts.declaration_bindings.len(), 1);
+        assert!(facts.declaration_bindings[0].syntax_id.is_some());
+        assert!(facts.symbols.iter().all(|row| row.declarations.is_empty()));
+        observed.lock().unwrap().insert(side);
+    });
+    world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    testing::clear_document_common_observer();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        std::collections::BTreeSet::from([0, 1])
+    );
 }
 
 #[test]
