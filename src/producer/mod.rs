@@ -9,6 +9,7 @@ pub mod detect;
 pub mod exec;
 pub mod import;
 pub mod pickup;
+pub mod pickup_watch;
 pub mod plan;
 pub mod process_info;
 pub mod profiles;
@@ -22,6 +23,8 @@ mod batch_tests;
 mod detect_tests;
 #[cfg(test)]
 mod pickup_tests;
+#[cfg(test)]
+mod pickup_watch_tests;
 #[cfg(test)]
 mod plan_tests;
 #[cfg(test)]

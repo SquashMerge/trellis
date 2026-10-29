@@ -661,6 +661,9 @@ impl CheckoutRegistry {
         if let Some(search_fill) = &self.search_fill {
             scheduler.set_search_fill(search_fill.register(&scheduler));
         }
+        runtime
+            .pickup
+            .start_watch(&runtime.resources()?.store, &scheduler);
         scheduler.begin_startup_reconciliation();
         Ok(runtime)
     }
@@ -749,6 +752,7 @@ impl CheckoutRegistry {
                     .root_lost
                     .store(true, std::sync::atomic::Ordering::Release);
             }
+            runtime.pickup.shutdown();
             runtime.resources.lock().unwrap().take();
         }
     }

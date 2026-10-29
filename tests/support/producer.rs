@@ -236,3 +236,52 @@ pub fn stop_daemon(home: &Path) {
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
     });
 }
+
+/// Every accepted request of `checkout` as `(id, state, error_code)`, oldest first.
+pub fn request_rows(checkout: &Checkout) -> Vec<(String, String, Option<String>)> {
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let roots =
+        TopologyRoots::isolated_for_tests(cache_dir(&checkout.home), data_dir(&checkout.home));
+    let identity = WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root).unwrap();
+    let Ok(db) = rusqlite::Connection::open_with_flags(
+        roots.requests_db(&identity),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut query) = db.prepare("SELECT id,state,error_code FROM requests ORDER BY seq") else {
+        return Vec::new();
+    };
+    query
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// `trellis producer status` of `checkout`, parsed.
+pub fn producer_status(checkout: &Checkout) -> Value {
+    let output = checkout
+        .cli()
+        .args(["producer", "status", "--workspace"])
+        .arg(&checkout.root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// The `pickup` object of `producer` in the status reply (`null` when none is configured).
+pub fn pickup_entry(checkout: &Checkout, producer: &str) -> Value {
+    producer_status(checkout)["producers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == producer)
+        .unwrap()["pickup"]
+        .clone()
+}

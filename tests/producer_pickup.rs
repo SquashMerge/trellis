@@ -1,0 +1,388 @@
+//! Automatic pickup (D6): a regenerated artifact is re-imported on a watch event, the
+//! activation check or the stat check, without running a producer, following the decision
+//! table. Small trigger intervals come from `TRELLIS_TEST_PICKUP_INTERVALS`; negative
+//! assertions wait several of those intervals, and every one is paired with a positive
+//! control showing the watch was alive.
+#![cfg(feature = "test-support")]
+use serde_json::{Value, json};
+use std::{
+    fs,
+    io::Read,
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    time::Duration,
+};
+use tempfile::Builder;
+
+#[path = "support/producer.rs"]
+mod support;
+use support::{
+    Checkout, cache_dir, data_dir, pickup_entry, request_rows, start_checkout, stop_daemon,
+    tripwire_dir,
+};
+
+#[path = "support/semantic_batch.rs"]
+mod semantic_batch_support;
+use semantic_batch_support::{BatchFixture, edit_scip, sha256, uniform_workspace};
+
+const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
+/// Many multiples of the 100 ms and 200 ms intervals the tests configure.
+const SETTLE: Duration = Duration::from_millis(1500);
+
+fn workspace(root: &Path) {
+    uniform_workspace(root, &LANGUAGES, 2);
+}
+
+fn intervals(value: Value) -> Vec<(String, String)> {
+    vec![("TRELLIS_TEST_PICKUP_INTERVALS".into(), value.to_string())]
+}
+
+fn fast() -> Vec<(String, String)> {
+    intervals(json!({"debounceMs": 100, "stableMs": 100}))
+}
+
+fn index_db(checkout: &Checkout) -> PathBuf {
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
+    let roots =
+        TopologyRoots::isolated_for_tests(cache_dir(&checkout.home), data_dir(&checkout.home));
+    let identity = WorkspaceIdentity::discover(Some(&checkout.root), &checkout.root).unwrap();
+    roots.index_db(&identity)
+}
+
+/// A valid `scip-java` artifact over the first `documents` java documents of the checkout
+/// (all of them without a limit). Different counts give different valid bytes.
+fn java_bytes(checkout: &Checkout, documents: Option<usize>) -> Vec<u8> {
+    let fixture =
+        BatchFixture::from_published(&index_db(checkout), &checkout.root).reference("scip-java");
+    let docs = fixture.paths("java");
+    let take = documents.unwrap_or(docs.len());
+    fixture.scip_bytes("java", &docs[..take])
+}
+
+fn set_command(checkout: &Checkout, tripwire: &Path, artifact: &Path) -> Command {
+    let mut command = checkout.cli();
+    command
+        .env("PATH", format!("{}:/usr/bin:/bin", tripwire.display()))
+        .args(["producer", "pickup", "--workspace"])
+        .arg(&checkout.root)
+        .args(["--producer", "scip-java", "--artifact"])
+        .arg(artifact);
+    command
+}
+
+fn set(checkout: &Checkout, tripwire: &Path, artifact: &Path) -> Output {
+    set_command(checkout, tripwire, artifact).output().unwrap()
+}
+
+fn clear(checkout: &Checkout) -> Output {
+    checkout
+        .cli()
+        .args(["producer", "pickup", "--workspace"])
+        .arg(&checkout.root)
+        .args(["--producer", "scip-java", "--clear"])
+        .output()
+        .unwrap()
+}
+
+fn entry(checkout: &Checkout) -> Value {
+    pickup_entry(checkout, "scip-java")
+}
+
+fn last(checkout: &Checkout) -> Value {
+    entry(checkout)["lastImported"].clone()
+}
+
+/// Wait until the entry's last outcome satisfies `ready`, returning it.
+fn wait_last(checkout: &Checkout, what: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    let mut seen = Value::Null;
+    trellis::testing::wait_until(what, || {
+        seen = last(checkout);
+        ready(&seen)
+    });
+    seen
+}
+
+/// An artifact written under the checkout's temporary directory and imported once by `set`.
+struct Configured {
+    checkout: Checkout,
+    tripwire: PathBuf,
+    marker: PathBuf,
+    artifact: PathBuf,
+    first: Value,
+}
+
+fn configured(daemon_env: &[(String, String)]) -> Configured {
+    let checkout = start_checkout(workspace, daemon_env);
+    let (tripwire, marker) = tripwire_dir(checkout.temp.path());
+    let artifact = checkout.temp.path().join("index.scip");
+    fs::write(&artifact, java_bytes(&checkout, None)).unwrap();
+    let output = set(&checkout, &tripwire, &artifact);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first = last(&checkout);
+    assert_eq!(first["state"], "done");
+    Configured {
+        checkout,
+        tripwire,
+        marker,
+        artifact,
+        first,
+    }
+}
+
+#[test]
+fn pickup_reimports_on_watch_event() {
+    let world = configured(&fast());
+    let Configured {
+        checkout,
+        marker,
+        artifact,
+        first,
+        ..
+    } = &world;
+    assert_eq!(entry(checkout)["watch"], "active");
+    let rows = request_rows(checkout).len();
+
+    let regenerated = java_bytes(checkout, Some(1));
+    let digest = sha256(&regenerated);
+    assert_ne!(digest, first["sha256"].as_str().unwrap());
+    fs::write(artifact, &regenerated).unwrap();
+
+    let imported = wait_last(checkout, "the regenerated artifact to import", |last| {
+        last["sha256"] == digest.as_str() && last["state"] == "done"
+    });
+    assert_ne!(imported["requestId"], first["requestId"]);
+    assert_eq!(request_rows(checkout).len(), rows + 1);
+    assert!(!marker.exists(), "a pickup watch event ran a producer");
+}
+
+#[test]
+fn pickup_skips_unchanged_artifact_after_done() {
+    let world = configured(&fast());
+    let Configured {
+        checkout,
+        artifact,
+        first,
+        ..
+    } = &world;
+    let rows = request_rows(checkout).len();
+
+    // The same bytes with a new mtime: the watch sees a change, the decision table skips it.
+    let same = fs::read(artifact).unwrap();
+    fs::write(artifact, &same).unwrap();
+    std::thread::sleep(SETTLE);
+    assert_eq!(
+        request_rows(checkout).len(),
+        rows,
+        "unchanged bytes imported"
+    );
+    assert_eq!(last(checkout), *first);
+
+    // Positive control: the watch is alive and imports different bytes.
+    let regenerated = java_bytes(checkout, Some(1));
+    let digest = sha256(&regenerated);
+    fs::write(artifact, &regenerated).unwrap();
+    wait_last(checkout, "the regenerated artifact to import", |last| {
+        last["sha256"] == digest.as_str() && last["state"] == "done"
+    });
+    assert_eq!(request_rows(checkout).len(), rows + 1);
+}
+
+#[test]
+fn pickup_retries_after_stale_basis() {
+    let sockets = Builder::new()
+        .prefix("pickup-stale-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let staging = sockets.path().join("stage.sock");
+    let mut env = intervals(json!({
+        "debounceMs": 100, "stableMs": 100, "checkMs": 200, "retryMs": 200
+    }));
+    env.push((
+        "TRELLIS_TEST_SEMANTIC_STAGING_SOCKET".into(),
+        staging.display().to_string(),
+    ));
+    let checkout = start_checkout(workspace, &env);
+    let (tripwire, marker) = tripwire_dir(checkout.temp.path());
+    let artifact = checkout.temp.path().join("index.scip");
+    fs::write(&artifact, java_bytes(&checkout, None)).unwrap();
+
+    // The set import pauses while staged; a source edit moves the head under it.
+    let child = set_command(&checkout, &tripwire, &artifact)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    trellis::testing::wait_until("the import to stage", || {
+        staging.with_extension("ready").exists()
+    });
+    fs::write(
+        checkout.root.join("rust/u00000.rs"),
+        "fn u00000() { moved(); }\n",
+    )
+    .unwrap();
+    // Later imports must not pause: the marker is written before the first is released.
+    fs::write(staging.with_extension("done"), []).unwrap();
+    let mut stream = UnixStream::connect(&staging).unwrap();
+    let _ = stream.read(&mut [0_u8; 1]);
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+
+    // The reply is the stale outcome; polling status could miss it, because the retry
+    // follows within a few hundred milliseconds.
+    let stale: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stale["state"], "failed", "{stale}");
+    assert!(
+        stale["errorCode"]
+            .as_str()
+            .unwrap()
+            .starts_with("stale_basis"),
+        "{stale}"
+    );
+    // With no further event, the stat check re-imports the same bytes once the retry
+    // interval has passed, under a new request.
+    let retried = wait_last(&checkout, "the retry to import", |last| {
+        last["state"] == "done"
+    });
+    assert_eq!(retried["sha256"], stale["sha256"]);
+    assert_ne!(retried["requestId"], stale["requestId"]);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn pickup_does_not_retry_deterministic_failure_until_head_changes() {
+    let env = intervals(json!({
+        "debounceMs": 100, "stableMs": 100, "checkMs": 200, "retryMs": 200
+    }));
+    let checkout = start_checkout(workspace, &env);
+    let (tripwire, _) = tripwire_dir(checkout.temp.path());
+    let bad = checkout.temp.path().join("bad.scip");
+    fs::write(
+        &bad,
+        edit_scip(&java_bytes(&checkout, None), |index| {
+            index
+                .metadata
+                .as_mut()
+                .unwrap()
+                .tool_info
+                .as_mut()
+                .unwrap()
+                .version = "0.0.0-not-the-pin".into();
+        }),
+    )
+    .unwrap();
+    assert!(!set(&checkout, &tripwire, &bad).status.success());
+    let failed = last(&checkout);
+    assert!(
+        failed["errorCode"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid_artifact"),
+        "{failed}"
+    );
+    let rows = request_rows(&checkout).len();
+
+    // Many stat checks later, the same bytes against the same head were not tried again.
+    std::thread::sleep(SETTLE);
+    assert_eq!(request_rows(&checkout).len(), rows);
+    assert_eq!(last(&checkout), failed);
+
+    // A new head makes the failure worth another attempt.
+    fs::write(
+        checkout.root.join("rust/u00000.rs"),
+        "fn u00000() { moved(); }\n",
+    )
+    .unwrap();
+    let again = wait_last(&checkout, "the retry against the new head", |last| {
+        last["sourceRevision"] != failed["sourceRevision"]
+    });
+    assert_eq!(again["sha256"], failed["sha256"]);
+    assert_eq!(again["state"], "failed");
+    assert!(request_rows(&checkout).len() > rows);
+}
+
+#[test]
+fn pickup_activation_check_imports_changed_artifact() {
+    let world = configured(&fast());
+    let Configured {
+        checkout,
+        artifact,
+        first,
+        marker,
+        ..
+    } = &world;
+    stop_daemon(&checkout.home);
+
+    // Changed while no daemon watched: only the activation check can notice.
+    let regenerated = java_bytes(checkout, Some(1));
+    let digest = sha256(&regenerated);
+    fs::write(artifact, &regenerated).unwrap();
+
+    let mut status = checkout.cli();
+    for (key, value) in fast() {
+        status.env(key, value);
+    }
+    let output = status
+        .args(["producer", "status", "--workspace"])
+        .arg(&checkout.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let imported = wait_last(checkout, "the activation check to import", |last| {
+        last["sha256"] == digest.as_str() && last["state"] == "done"
+    });
+    assert_ne!(imported["requestId"], first["requestId"]);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn pickup_clear_stops_watch() {
+    let world = configured(&fast());
+    let Configured {
+        checkout,
+        tripwire,
+        artifact,
+        ..
+    } = &world;
+    assert_eq!(entry(checkout)["watch"], "active");
+    assert!(clear(checkout).status.success());
+    let rows = request_rows(checkout).len();
+
+    let regenerated = java_bytes(checkout, Some(1));
+    fs::write(artifact, &regenerated).unwrap();
+    std::thread::sleep(SETTLE);
+    assert_eq!(
+        request_rows(checkout).len(),
+        rows,
+        "a cleared pickup imported"
+    );
+    assert_eq!(entry(checkout), Value::Null);
+
+    // Positive control: configuring it again imports the new bytes at once and re-arms.
+    assert!(set(checkout, tripwire, artifact).status.success());
+    assert_eq!(request_rows(checkout).len(), rows + 1);
+    assert_eq!(last(checkout)["sha256"], sha256(&regenerated).as_str());
+    assert_eq!(entry(checkout)["watch"], "active");
+}
+
+#[test]
+fn pickup_status_reports_degraded_watch_when_directory_is_missing() {
+    let checkout = start_checkout(workspace, &fast());
+    let (tripwire, _) = tripwire_dir(checkout.temp.path());
+    let directory = checkout.temp.path().join("generated");
+    fs::create_dir(&directory).unwrap();
+    let artifact = directory.join("index.scip");
+    fs::write(&artifact, java_bytes(&checkout, None)).unwrap();
+    assert!(set(&checkout, &tripwire, &artifact).status.success());
+    assert_eq!(entry(&checkout)["watch"], "active");
+
+    stop_daemon(&checkout.home);
+    fs::remove_dir_all(&directory).unwrap();
+    let degraded = entry(&checkout);
+    assert_eq!(degraded["watch"], "degraded", "{degraded}");
+    assert_eq!(degraded["lastImported"]["state"], "done");
+}
