@@ -902,6 +902,95 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
     store: &S,
     out: &mut K,
 ) -> Result<()> {
+    let mut index = build_join_index(admitted_encoding, store)?;
+    emit_join_symbols(store, &index, out)?;
+    join_occurrences(admitted_encoding, store, &mut index, out)?;
+    settle_join_references(&mut index, out)?;
+    join_type_relationships(store, &mut index, out)
+}
+
+fn declaration_targets<S: JoinStore>(
+    store: &S,
+    index: &S::Index,
+    document: &native::DocumentKey,
+    symbol: &str,
+) -> Result<Vec<semantic::Target>> {
+    Ok(index
+        .declarations(&scoped_key(symbol, document))?
+        .into_iter()
+        .map(|(document, syntax_id)| semantic::Target::Internal {
+            syntax_id,
+            document,
+            revision_id: store.revision_id().to_owned(),
+        })
+        .collect())
+}
+
+fn declaration_target<S: JoinStore>(
+    store: &S,
+    index: &S::Index,
+    document: &native::DocumentKey,
+    symbol: &str,
+) -> Result<Option<semantic::Target>> {
+    let items = declaration_targets(store, index, document, symbol)?;
+    Ok((items.len() == 1)
+        .then(|| items.into_iter().next())
+        .flatten())
+}
+
+struct MeasuredOccurrence {
+    row: OccurrenceRow,
+    compatible_syntax_id: Option<String>,
+}
+
+fn measure_occurrence<S: JoinStore>(
+    store: &S,
+    claim: &CapturedClaim,
+    doc: &native::DocumentKey,
+    symbol: &str,
+    roles: u64,
+    range: native::Range,
+) -> Result<Option<MeasuredOccurrence>> {
+    // Valid empty module markers retain their raw proof and declared symbol,
+    // but cannot author a measured name, reference or call association.
+    if range.start == range.end {
+        return Ok(None);
+    }
+    let binding = store.join(doc, range.clone(), semantic::JoinKind::DeclarationName)?;
+    let reference = store.join(doc, range.clone(), semantic::JoinKind::Reference)?;
+    let call = store.join(doc, range.clone(), semantic::JoinKind::Callee)?;
+    let compatible_syntax_id = if roles & 1 != 0 && binding.status == semantic::JoinStatus::Exact {
+        let candidate = store
+            .declaration_of(doc, &binding.candidate_ids[0])?
+            .context("missing exact native declaration")?;
+        let compatible = store
+            .symbol_kind(&doc.language, &doc.path, symbol)?
+            .is_some_and(|kind| match candidate.kind.as_str() {
+                "type" => matches!(kind, 7 | 11 | 21),
+                "method" => kind == 26,
+                _ => true,
+            });
+        compatible.then(|| binding.candidate_ids[0].clone())
+    } else {
+        None
+    };
+    Ok(Some(MeasuredOccurrence {
+        row: OccurrenceRow {
+            proof_id: claim.captured_proof_id.clone(),
+            fact_digest: claim.fact_digest.clone(),
+            document: doc.clone(),
+            symbol: symbol.to_owned(),
+            roles,
+            binding,
+            reference,
+            call,
+        },
+        compatible_syntax_id,
+    }))
+}
+
+fn build_join_index<S: JoinStore>(admitted_encoding: u8, store: &S) -> Result<S::Index> {
+    #[cfg(feature = "test-support")]
     let revision_id = store.revision_id();
     let source_set_id = store.source_set_id();
     let mut index = store.new_index();
@@ -949,69 +1038,27 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             if declaration {
                 index.put_symbol(symbol, true, false)?;
             }
-            // Valid empty module markers retain their raw proof and declared symbol,
-            // but cannot author a measured name, reference or call association.
-            if range.start == range.end {
+            let Some(measured) =
+                measure_occurrence(store, &claim, &doc, symbol, roles, range.clone())?
+            else {
                 continue;
-            }
-            let binding = store.join(&doc, range.clone(), semantic::JoinKind::DeclarationName)?;
-            let reference = store.join(&doc, range.clone(), semantic::JoinKind::Reference)?;
-            let call = store.join(&doc, range.clone(), semantic::JoinKind::Callee)?;
-            if declaration && binding.status == semantic::JoinStatus::Exact {
-                let candidate = store
-                    .declaration_of(&doc, &binding.candidate_ids[0])?
-                    .context("missing exact native declaration")?;
-                let compatible = store
-                    .symbol_kind(&doc.language, &doc.path, symbol)?
-                    .is_some_and(|kind| match candidate.kind.as_str() {
-                        "type" => matches!(kind, 7 | 11 | 21),
-                        "method" => kind == 26,
-                        _ => true,
-                    });
-                if compatible {
-                    index.put_declaration(
-                        scoped_key(symbol, &doc),
-                        doc.clone(),
-                        binding.candidate_ids[0].clone(),
-                    )?;
-                }
+            };
+            if let Some(syntax_id) = &measured.compatible_syntax_id {
+                index.put_declaration(scoped_key(symbol, &doc), doc.clone(), syntax_id.clone())?;
             }
             index.put_type_use(&doc, range.start, range.end, symbol)?;
-            index.put_occurrence(OccurrenceRow {
-                proof_id: claim.captured_proof_id.clone(),
-                fact_digest: claim.fact_digest.clone(),
-                document: doc,
-                symbol: symbol.to_owned(),
-                roles,
-                binding,
-                reference,
-                call,
-            })?;
+            index.put_occurrence(measured.row)?;
         }
     }
-    let targets = |index: &S::Index,
-                   doc: &native::DocumentKey,
-                   symbol: &str|
-     -> Result<Vec<semantic::Target>> {
-        Ok(index
-            .declarations(&scoped_key(symbol, doc))?
-            .into_iter()
-            .map(|(owner, id)| semantic::Target::Internal {
-                syntax_id: id,
-                document: owner,
-                revision_id: revision_id.to_owned(),
-            })
-            .collect())
-    };
-    let target = |index: &S::Index,
-                  doc: &native::DocumentKey,
-                  symbol: &str|
-     -> Result<Option<semantic::Target>> {
-        let items = targets(index, doc, symbol)?;
-        Ok((items.len() == 1)
-            .then(|| items.into_iter().next())
-            .flatten())
-    };
+    Ok(index)
+}
+
+fn emit_join_symbols<S: JoinStore, K: JoinSink>(
+    store: &S,
+    index: &S::Index,
+    out: &mut K,
+) -> Result<()> {
+    let source_set_id = store.source_set_id();
     for claim in store.claims() {
         let claim = claim?;
         if claim.envelope.record_kind != "symbolInformation" {
@@ -1026,7 +1073,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             .as_str()
             .filter(|s| !s.is_empty())
             .context("missing symbol key")?;
-        let declarations = targets(&index, &doc, key)?;
+        let declarations = declaration_targets(store, index, &doc, key)?;
         out.symbol(semantic::Symbol {
             key: symbol_key(key, &doc),
             display_name: claim.envelope.raw["displayName"]
@@ -1037,251 +1084,281 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             provenance_id: claim.captured_proof_id.clone(),
         })?;
     }
-    let mut role_sites: Option<(native::DocumentKey, RoleSites)> = None;
+    Ok(())
+}
+
+fn join_occurrences<S: JoinStore, K: JoinSink>(
+    admitted_encoding: u8,
+    store: &S,
+    index: &mut S::Index,
+    out: &mut K,
+) -> Result<()> {
+    let mut role_sites = None;
     for ordinal in 0..index.occurrence_count() {
-        let OccurrenceRow {
-            proof_id,
-            fact_digest,
-            document: doc,
-            symbol,
-            roles,
-            binding,
-            reference,
-            call,
-        } = index.occurrence(ordinal)?;
-        let claim = store.claim(&proof_id, "occurrence", &fact_digest)?;
-        let key = symbol_key(&symbol, &doc);
-        let mut asserted = targets(&index, &doc, &symbol)?;
-        if asserted.is_empty()
-            && key.scope == semantic::SymbolScope::Global
-            && !index.is_declared_symbol(&symbol)?
-            && !index.is_information_symbol(&symbol)?
-        {
-            asserted.push(semantic::Target::External {
-                symbol: key.clone(),
-            });
-        }
-        asserted.sort_by_key(|t| {
-            native_ids::canonical(&serde_json::to_value(t).expect("serializable target"))
+        let measured = index.occurrence(ordinal)?;
+        join_occurrence(
+            admitted_encoding,
+            store,
+            index,
+            out,
+            measured,
+            &mut role_sites,
+        )?;
+    }
+    Ok(())
+}
+
+fn join_occurrence<S: JoinStore, K: JoinSink>(
+    admitted_encoding: u8,
+    store: &S,
+    index: &mut S::Index,
+    out: &mut K,
+    measured: OccurrenceRow,
+    role_sites: &mut Option<(native::DocumentKey, RoleSites)>,
+) -> Result<()> {
+    let revision_id = store.revision_id();
+    let OccurrenceRow {
+        proof_id,
+        fact_digest,
+        document: doc,
+        symbol,
+        roles,
+        binding,
+        reference,
+        call,
+    } = measured;
+    let claim = store.claim(&proof_id, "occurrence", &fact_digest)?;
+    let key = symbol_key(&symbol, &doc);
+    let mut asserted = declaration_targets(store, index, &doc, &symbol)?;
+    if asserted.is_empty()
+        && key.scope == semantic::SymbolScope::Global
+        && !index.is_declared_symbol(&symbol)?
+        && !index.is_information_symbol(&symbol)?
+    {
+        asserted.push(semantic::Target::External {
+            symbol: key.clone(),
         });
-        asserted.dedup();
-        let (resolution, resolved, candidates) = match asserted.len() {
-            0 => (semantic::Resolution::Unresolved, None, vec![]),
-            1 => {
-                let item = asserted.pop().unwrap();
-                let status = if matches!(item, semantic::Target::Internal { .. }) {
-                    semantic::Resolution::Resolved
-                } else {
-                    semantic::Resolution::External
-                };
-                (status, Some(item), vec![])
-            }
-            _ => (semantic::Resolution::Ambiguous, None, asserted),
-        };
-        if roles & 1 != 0 {
-            out.join(&claim.captured_proof_id, binding.clone())?;
-            out.declaration_binding(semantic::DeclarationBinding {
-                syntax_id: (binding.status == semantic::JoinStatus::Exact)
-                    .then(|| binding.candidate_ids[0].clone()),
-                symbols: if binding.status == semantic::JoinStatus::Exact {
-                    vec![key.clone()]
-                } else {
-                    vec![]
-                },
-                join: binding.clone(),
-                provenance_id: claim.captured_proof_id.clone(),
-            })?;
-        }
-        out.join(&claim.captured_proof_id, reference.clone())?;
-        let invocation = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
-            let mut enclosing_claim: CapturedClaim = (*claim).clone();
-            enclosing_claim.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
-            let span = store.occurrence_range(&enclosing_claim, admitted_encoding)?;
-            Some(store.join(&doc, span, semantic::JoinKind::Invocation)?)
-        } else {
-            None
-        };
-        if reference.status == semantic::JoinStatus::Exact {
-            let r = store
-                .reference_of(&doc, &reference.candidate_ids[0])?
-                .context("missing indexed native reference")?;
-            let declaration_site = roles & 1 != 0
-                && store.has_declaration_name(&doc, r.range.start, r.range.end, &r.spelling)?;
-            let is_call = match &invocation {
-                Some(j) if j.status == semantic::JoinStatus::Exact => store
-                    .calls_with_id(&doc, &j.candidate_ids[0])?
-                    .iter()
-                    .any(|c| {
-                        c.id == j.candidate_ids[0]
-                            && c.document == doc
-                            && c.owner_syntax_id == r.owner_syntax_id
-                            && c.range.start <= r.range.start
-                            && r.range.end <= c.range.end
-                            && c.spelling.as_deref() == Some(&r.spelling)
-                            && c.callee_range
-                                .as_ref()
-                                .is_none_or(|callee| callee == &r.range)
-                            && (call.status != semantic::JoinStatus::Exact
-                                || call.candidate_ids == j.candidate_ids)
-                    }),
-                _ => false,
-            };
-            let mut assigned = BTreeSet::new();
-            if declaration_site {
-                assigned.insert(semantic::Role::Definition);
-            }
-            let site = (r.range.start, r.range.end);
-            if role_sites.as_ref().is_none_or(|(owner, _)| owner != &doc) {
-                role_sites = Some((doc.clone(), store.role_sites(&doc)?));
-            }
-            let sites = &role_sites.as_ref().expect("role sites just cached").1;
-            if roles & 2 != 0 && sites.imports.contains(&site) {
-                assigned.insert(semantic::Role::Import);
-            }
-            if !declaration_site && sites.types.contains(&site) && {
-                let keys = index.type_uses(&doc, site.0, site.1)?;
-                keys.len() == 1 && keys.contains(&symbol)
-            } {
-                assigned.insert(semantic::Role::Type);
-            }
-            if roles & 4 != 0 {
-                assigned.insert(semantic::Role::Write);
-            }
-            if is_call {
-                assigned.insert(semantic::Role::Call);
-            }
-            if !declaration_site
-                && roles & 4 == 0
-                && roles & 2 == 0
-                && (!assigned.contains(&semantic::Role::Type) || doc.language == "javascript")
-            {
-                assigned.insert(semantic::Role::Read);
-            }
-            if declaration_site
-                && roles & 2 != 0
-                && matches!(doc.language.as_str(), "javascript" | "rust")
-                && binding.status == semantic::JoinStatus::Exact
-                && store
-                    .declarations_with_id(&doc, &binding.candidate_ids[0])?
-                    .iter()
-                    .any(|d| {
-                        d.syntax_id == binding.candidate_ids[0]
-                            && d.document == doc
-                            && d.kind == "alias"
-                            && d.name_range.as_ref() == Some(&r.range)
-                    })
-            {
-                assigned.insert(semantic::Role::Alias);
-            }
-            if !assigned.is_empty() {
-                for target in resolved.iter().chain(candidates.iter()) {
-                    index.put_reference_claim(&r.id, &claim.captured_proof_id, target.clone())?;
-                }
-            }
-            if !assigned.is_empty() {
-                let reference = semantic::Reference {
-                    id: r.id.clone(),
-                    owner_syntax_id: r.owner_syntax_id.clone(),
-                    ordinal: r.ordinal,
-                    document: doc.clone(),
-                    revision_id: revision_id.to_owned(),
-                    range: r.range.clone(),
-                    spelling: r.spelling.clone(),
-                    lookup_key: r.lookup_key.clone(),
-                    site: if declaration_site {
-                        semantic::ReferenceSite::Declaration
-                    } else {
-                        semantic::ReferenceSite::Use
-                    },
-                    roles: assigned.iter().copied().collect(),
-                    resolution,
-                    declared_target: resolved.clone(),
-                    candidates: candidates.clone(),
-                    provenance_id: claim.captured_proof_id.clone(),
-                };
-                out.reference_claim(&claim.captured_proof_id, reference.clone())?;
-                #[cfg(test)]
-                complexity_work(|work| work.reference_map_lookups += 1);
-                if let Some(slot) = out.reference_slot(&r.id)? {
-                    let mut prior = out.reference(slot)?;
-                    assigned.extend(prior.roles.iter().copied());
-                    prior.roles = assigned.into_iter().collect();
-                    if prior.roles.contains(&semantic::Role::Definition) {
-                        prior.site = semantic::ReferenceSite::Declaration;
-                    }
-                    out.put_reference(Some(slot), prior)?;
-                } else {
-                    out.put_reference(None, reference)?;
-                }
-            }
-        }
-        if roles & 1 == 0 {
-            let source = store.bytes_of(&doc)?.context("missing occurrence source")?;
-            if let Some(join) = &invocation {
-                out.join(&claim.captured_proof_id, join.clone())?;
-            }
-            let candidate = if call.status == semantic::JoinStatus::Exact {
-                call.clone()
-            } else if invocation
-                .as_ref()
-                .is_some_and(|j| j.status == semantic::JoinStatus::Exact)
-            {
-                invocation.as_ref().expect("exact invocation").clone()
+    }
+    asserted.sort_by_key(|t| {
+        native_ids::canonical(&serde_json::to_value(t).expect("serializable target"))
+    });
+    asserted.dedup();
+    let (resolution, resolved, candidates) = match asserted.len() {
+        0 => (semantic::Resolution::Unresolved, None, vec![]),
+        1 => {
+            let item = asserted.pop().unwrap();
+            let status = if matches!(item, semantic::Target::Internal { .. }) {
+                semantic::Resolution::Resolved
             } else {
-                call.clone()
+                semantic::Resolution::External
             };
-            out.join(&claim.captured_proof_id, call)?;
-            if candidate.status == semantic::JoinStatus::Exact
-                && reference.status == semantic::JoinStatus::Exact
-                && invocation.as_ref().is_some_and(|j| {
-                    j.status == semantic::JoinStatus::Exact
-                        && j.candidate_ids == candidate.candidate_ids
+            (status, Some(item), vec![])
+        }
+        _ => (semantic::Resolution::Ambiguous, None, asserted),
+    };
+    if roles & 1 != 0 {
+        out.join(&claim.captured_proof_id, binding.clone())?;
+        out.declaration_binding(semantic::DeclarationBinding {
+            syntax_id: (binding.status == semantic::JoinStatus::Exact)
+                .then(|| binding.candidate_ids[0].clone()),
+            symbols: if binding.status == semantic::JoinStatus::Exact {
+                vec![key.clone()]
+            } else {
+                vec![]
+            },
+            join: binding.clone(),
+            provenance_id: claim.captured_proof_id.clone(),
+        })?;
+    }
+    out.join(&claim.captured_proof_id, reference.clone())?;
+    let invocation = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
+        let mut enclosing_claim: CapturedClaim = (*claim).clone();
+        enclosing_claim.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
+        let span = store.occurrence_range(&enclosing_claim, admitted_encoding)?;
+        Some(store.join(&doc, span, semantic::JoinKind::Invocation)?)
+    } else {
+        None
+    };
+    if reference.status == semantic::JoinStatus::Exact {
+        let r = store
+            .reference_of(&doc, &reference.candidate_ids[0])?
+            .context("missing indexed native reference")?;
+        let declaration_site = roles & 1 != 0
+            && store.has_declaration_name(&doc, r.range.start, r.range.end, &r.spelling)?;
+        let is_call = match &invocation {
+            Some(j) if j.status == semantic::JoinStatus::Exact => store
+                .calls_with_id(&doc, &j.candidate_ids[0])?
+                .iter()
+                .any(|c| {
+                    c.id == j.candidate_ids[0]
+                        && c.document == doc
+                        && c.owner_syntax_id == r.owner_syntax_id
+                        && c.range.start <= r.range.start
+                        && r.range.end <= c.range.end
+                        && c.spelling.as_deref() == Some(&r.spelling)
+                        && c.callee_range
+                            .as_ref()
+                            .is_none_or(|callee| callee == &r.range)
+                        && (call.status != semantic::JoinStatus::Exact
+                            || call.candidate_ids == j.candidate_ids)
+                }),
+            _ => false,
+        };
+        let mut assigned = BTreeSet::new();
+        if declaration_site {
+            assigned.insert(semantic::Role::Definition);
+        }
+        let site = (r.range.start, r.range.end);
+        if role_sites.as_ref().is_none_or(|(owner, _)| owner != &doc) {
+            *role_sites = Some((doc.clone(), store.role_sites(&doc)?));
+        }
+        let sites = &role_sites.as_ref().expect("role sites just cached").1;
+        if roles & 2 != 0 && sites.imports.contains(&site) {
+            assigned.insert(semantic::Role::Import);
+        }
+        if !declaration_site && sites.types.contains(&site) && {
+            let keys = index.type_uses(&doc, site.0, site.1)?;
+            keys.len() == 1 && keys.contains(&symbol)
+        } {
+            assigned.insert(semantic::Role::Type);
+        }
+        if roles & 4 != 0 {
+            assigned.insert(semantic::Role::Write);
+        }
+        if is_call {
+            assigned.insert(semantic::Role::Call);
+        }
+        if !declaration_site
+            && roles & 4 == 0
+            && roles & 2 == 0
+            && (!assigned.contains(&semantic::Role::Type) || doc.language == "javascript")
+        {
+            assigned.insert(semantic::Role::Read);
+        }
+        if declaration_site
+            && roles & 2 != 0
+            && matches!(doc.language.as_str(), "javascript" | "rust")
+            && binding.status == semantic::JoinStatus::Exact
+            && store
+                .declarations_with_id(&doc, &binding.candidate_ids[0])?
+                .iter()
+                .any(|d| {
+                    d.syntax_id == binding.candidate_ids[0]
+                        && d.document == doc
+                        && d.kind == "alias"
+                        && d.name_range.as_ref() == Some(&r.range)
                 })
-            {
-                let actual = store.call_of(&doc, &candidate.candidate_ids[0])?;
-                let owning_references =
-                    store.references_with_id(&doc, &reference.candidate_ids[0])?;
-                if actual.is_some_and(|c| {
-                    let primary = &reference.anchor.range;
-                    c.document == doc
-                        && c.range.start <= primary.start
-                        && primary.end <= c.range.end
-                        && c.callee_range.as_ref().is_none_or(|r| r == primary)
-                        && c.spelling.as_deref()
-                            == source
-                                .get(primary.start..primary.end)
-                                .and_then(|b| std::str::from_utf8(b).ok())
-                        && owning_references.iter().any(|r| {
-                            r.id == reference.candidate_ids[0]
-                                && r.owner_syntax_id == c.owner_syntax_id
-                                && r.range == *primary
-                        })
-                }) {
-                    index.put_call_reference(
-                        &claim.captured_proof_id,
-                        &reference.candidate_ids[0],
-                    )?;
-                    out.put_call_binding(
-                        None,
-                        semantic::CallBinding {
-                            call_id: Some(candidate.candidate_ids[0].clone()),
-                            join: candidate,
-                            resolution,
-                            stale_target: resolved.as_ref().and_then(|t| {
-                                matches!(t, semantic::Target::Internal { .. }).then_some(false)
-                            }),
-                            declared_target: resolved,
-                            candidates,
-                            dispatch: semantic::Dispatch::Unknown,
-                            possible_dispatch: vec![],
-                            possible_dispatch_complete: false,
-                            provenance_id: claim.captured_proof_id.clone(),
-                        },
-                    )?;
+        {
+            assigned.insert(semantic::Role::Alias);
+        }
+        if !assigned.is_empty() {
+            for target in resolved.iter().chain(candidates.iter()) {
+                index.put_reference_claim(&r.id, &claim.captured_proof_id, target.clone())?;
+            }
+        }
+        if !assigned.is_empty() {
+            let reference = semantic::Reference {
+                id: r.id.clone(),
+                owner_syntax_id: r.owner_syntax_id.clone(),
+                ordinal: r.ordinal,
+                document: doc.clone(),
+                revision_id: revision_id.to_owned(),
+                range: r.range.clone(),
+                spelling: r.spelling.clone(),
+                lookup_key: r.lookup_key.clone(),
+                site: if declaration_site {
+                    semantic::ReferenceSite::Declaration
+                } else {
+                    semantic::ReferenceSite::Use
+                },
+                roles: assigned.iter().copied().collect(),
+                resolution,
+                declared_target: resolved.clone(),
+                candidates: candidates.clone(),
+                provenance_id: claim.captured_proof_id.clone(),
+            };
+            out.reference_claim(&claim.captured_proof_id, reference.clone())?;
+            #[cfg(test)]
+            complexity_work(|work| work.reference_map_lookups += 1);
+            if let Some(slot) = out.reference_slot(&r.id)? {
+                let mut prior = out.reference(slot)?;
+                assigned.extend(prior.roles.iter().copied());
+                prior.roles = assigned.into_iter().collect();
+                if prior.roles.contains(&semantic::Role::Definition) {
+                    prior.site = semantic::ReferenceSite::Declaration;
                 }
+                out.put_reference(Some(slot), prior)?;
+            } else {
+                out.put_reference(None, reference)?;
             }
         }
     }
+    if roles & 1 == 0 {
+        let source = store.bytes_of(&doc)?.context("missing occurrence source")?;
+        if let Some(join) = &invocation {
+            out.join(&claim.captured_proof_id, join.clone())?;
+        }
+        let candidate = if call.status == semantic::JoinStatus::Exact {
+            call.clone()
+        } else if invocation
+            .as_ref()
+            .is_some_and(|j| j.status == semantic::JoinStatus::Exact)
+        {
+            invocation.as_ref().expect("exact invocation").clone()
+        } else {
+            call.clone()
+        };
+        out.join(&claim.captured_proof_id, call)?;
+        if candidate.status == semantic::JoinStatus::Exact
+            && reference.status == semantic::JoinStatus::Exact
+            && invocation.as_ref().is_some_and(|j| {
+                j.status == semantic::JoinStatus::Exact
+                    && j.candidate_ids == candidate.candidate_ids
+            })
+        {
+            let actual = store.call_of(&doc, &candidate.candidate_ids[0])?;
+            let owning_references = store.references_with_id(&doc, &reference.candidate_ids[0])?;
+            if actual.is_some_and(|c| {
+                let primary = &reference.anchor.range;
+                c.document == doc
+                    && c.range.start <= primary.start
+                    && primary.end <= c.range.end
+                    && c.callee_range.as_ref().is_none_or(|r| r == primary)
+                    && c.spelling.as_deref()
+                        == source
+                            .get(primary.start..primary.end)
+                            .and_then(|b| std::str::from_utf8(b).ok())
+                    && owning_references.iter().any(|r| {
+                        r.id == reference.candidate_ids[0]
+                            && r.owner_syntax_id == c.owner_syntax_id
+                            && r.range == *primary
+                    })
+            }) {
+                index.put_call_reference(&claim.captured_proof_id, &reference.candidate_ids[0])?;
+                out.put_call_binding(
+                    None,
+                    semantic::CallBinding {
+                        call_id: Some(candidate.candidate_ids[0].clone()),
+                        join: candidate,
+                        resolution,
+                        stale_target: resolved.as_ref().and_then(|t| {
+                            matches!(t, semantic::Target::Internal { .. }).then_some(false)
+                        }),
+                        declared_target: resolved,
+                        candidates,
+                        dispatch: semantic::Dispatch::Unknown,
+                        possible_dispatch: vec![],
+                        possible_dispatch_complete: false,
+                        provenance_id: claim.captured_proof_id.clone(),
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn settle_join_references<I: JoinIndex, K: JoinSink>(index: &mut I, out: &mut K) -> Result<()> {
     for slot in 0..out.reference_count() {
         let mut reference = out.reference(slot)?;
         let mut claims = index.take_reference_claims(&reference.id)?;
@@ -1331,6 +1408,10 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             out.put_call_binding(Some(slot), binding)?;
         }
     }
+    Ok(())
+}
+
+fn discover_join_methods<S: JoinStore>(store: &S, index: &mut S::Index) -> Result<()> {
     for doc in store.documents() {
         let doc = doc?;
         for declaration in store.document_declarations(&doc)? {
@@ -1347,6 +1428,10 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             }
         }
     }
+    Ok(())
+}
+
+fn discover_relationship_claims<S: JoinStore>(store: &S, index: &mut S::Index) -> Result<()> {
     for claim in store.claims() {
         let claim = claim?;
         if claim.envelope.record_kind != "relationship" {
@@ -1367,6 +1452,25 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             index.put_relationship_endpoint(language, path, source, target, row.clone())?;
         }
     }
+    Ok(())
+}
+
+fn join_type_relationships<S: JoinStore, K: JoinSink>(
+    store: &S,
+    index: &mut S::Index,
+    out: &mut K,
+) -> Result<()> {
+    discover_join_methods(store, index)?;
+    discover_relationship_claims(store, index)?;
+    emit_type_relationships(store, index, out)
+}
+
+fn emit_type_relationships<S: JoinStore, K: JoinSink>(
+    store: &S,
+    index: &S::Index,
+    out: &mut K,
+) -> Result<()> {
+    let revision_id = store.revision_id();
     for doc in store.documents() {
         let doc = &doc?;
         let bytes = store
@@ -1410,10 +1514,10 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
             }
             let (source_symbol, target_symbol) =
                 (owner.iter().next().unwrap(), base.iter().next().unwrap());
-            let Some(source) = target(&index, doc, source_symbol)? else {
+            let Some(source) = declaration_target(store, index, doc, source_symbol)? else {
                 continue;
             };
-            let mut target_candidates = targets(&index, doc, target_symbol)?;
+            let mut target_candidates = declaration_targets(store, index, doc, target_symbol)?;
             if target_candidates.is_empty()
                 && symbol_key(target_symbol, doc).scope == semantic::SymbolScope::Global
                 && index
@@ -1460,12 +1564,15 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                 #[cfg(test)]
                 complexity_work(|work| work.method_lookup_rows += source_methods.len());
                 let [source_method] = source_methods.as_slice() else {
-                    if source_methods.is_empty() && target(&index, doc, source_symbol)?.is_none() {
+                    if source_methods.is_empty()
+                        && declaration_target(store, index, doc, source_symbol)?.is_none()
+                    {
                         out.diagnostic(doc, "unmeasurable_override_endpoint")?;
                     }
                     continue;
                 };
-                let Some(source_target) = target(&index, doc, source_symbol)? else {
+                let Some(source_target) = declaration_target(store, index, doc, source_symbol)?
+                else {
                     continue;
                 };
                 let target_methods = index.target_methods(doc, target_symbol)?;
@@ -1561,11 +1668,12 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                     }
                     continue;
                 }
-                let destination = target(&index, doc, target_symbol)?.or_else(|| {
-                    (target_method.is_none()).then(|| semantic::Target::External {
-                        symbol: symbol_key(target_symbol, doc),
-                    })
-                });
+                let destination =
+                    declaration_target(store, index, doc, target_symbol)?.or_else(|| {
+                        (target_method.is_none()).then(|| semantic::Target::External {
+                            symbol: symbol_key(target_symbol, doc),
+                        })
+                    });
                 if let Some(destination) = destination {
                     out.type_relationship(semantic::TypeRelationship {
                         kind: semantic::RelationshipKind::Overrides,
@@ -1597,7 +1705,7 @@ fn join_inventory_indexed<S: JoinStore, K: JoinSink>(
                     continue;
                 }
                 let source_symbol = keys.iter().next().unwrap();
-                if target(&index, doc, source_symbol)?
+                if declaration_target(store, index, doc, source_symbol)?
                     != Some(semantic::Target::Internal {
                         syntax_id: declaration.syntax_id.clone(),
                         document: doc.clone(),
