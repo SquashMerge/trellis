@@ -10876,21 +10876,178 @@ async fn references_filtered_closure_fits_large_snapshot_and_selected_overflow_i
         "module_002.js"
     );
     assert_eq!(isolated_data["counts"]["scannedDocuments"], 1);
-    let oversized = ask(
-        4,
-        json!({"schemaVersion":1,"expectedBasis":basis,"paths":["module_001.js"],"limit":1}),
+    // #448: one file's 300 unresolved sites exceed the response cap; the scoped
+    // result now pages instead of failing response_too_large.
+    let mut pages = Vec::new();
+    let mut offset = 0;
+    let mut unresolved = Vec::new();
+    loop {
+        let page = ask(
+            4 + pages.len() as i32,
+            json!({"schemaVersion":1,"expectedBasis":basis,"paths":["module_001.js"],"limit":1,"offset":offset}),
+        );
+        tool(&page, None, true);
+        assert_reply_cap(&serde_json::to_vec(&page).unwrap());
+        let data = &page["result"]["structuredContent"]["data"];
+        assert_eq!(data["counts"]["unresolvedSites"], 300, "counts stay whole");
+        assert_eq!(data["page"]["offset"], offset);
+        unresolved.extend(data["unresolved"].as_array().unwrap().iter().cloned());
+        let next = data["page"]["nextOffset"].as_u64();
+        pages.push(page);
+        match next {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert!(pages.len() > 1, "selected evidence spans several pages");
+    assert_eq!(unresolved.len(), 300);
+    let past = ask(
+        90,
+        json!({"schemaVersion":1,"expectedBasis":basis,"paths":["module_001.js"],"offset":10_000}),
     );
-    tool(&oversized, Some("response_too_large"), true);
-    let failed = &oversized["result"]["structuredContent"];
+    tool(&past, Some("range_too_large"), true);
+    let failed = &past["result"]["structuredContent"];
     assert_eq!(failed["error"]["currentBasis"], *basis);
-    assert_eq!(failed["error"]["retryable"], false);
     assert!(failed.get("data").is_none());
-    validate_structured_content(&[
+    let mut structured = vec![
         json!({"name":"trellis_references","structuredContent":envelope}),
         json!({"name":"trellis_references","structuredContent":empty["result"]["structuredContent"]}),
         json!({"name":"trellis_references","structuredContent":isolated["result"]["structuredContent"]}),
         json!({"name":"trellis_references","structuredContent":failed}),
-    ]);
+    ];
+    structured.extend(pages.iter().map(|page| {
+        json!({"name":"trellis_references","structuredContent":page["result"]["structuredContent"]})
+    }));
+    validate_structured_content(&structured);
+    drop(ask);
+    drop(reader);
+    drop(client);
+    session.join().unwrap().unwrap();
+}
+
+/// #448: a rules check scoped to one file with hundreds of unknown sites failed
+/// `response_too_large`; it now samples evidence per instance and pages, while
+/// counts and `referenceCount` stay exact and equal the CLI's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_rules_check_samples_evidence_and_pages_under_the_cap() {
+    use trellis::daemon::registry::CheckoutRegistry;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, String)> = (0..80)
+        .map(|i| {
+            (
+                format!("lib_{i:03}.js"),
+                format!("import './app_main.js';\nimport('external_{i}');\n"),
+            )
+        })
+        .collect();
+    files.push(("app_main.js".into(), "import('external');\n".repeat(300)));
+    let borrowed: Vec<_> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (identity, topology) = published_inactive_checkout(temp.path(), &borrowed);
+    fs::create_dir(identity.root.join(".trellis")).unwrap();
+    fs::write(
+        identity.root.join(".trellis/rules.toml"),
+        "version = 1\n[layers.app]\norder = 1\npaths = [\"app_main.js\"]\n[layers.lib]\norder = 2\npaths = [\"lib_*.js\"]\n",
+    )
+    .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(448, &identity).unwrap();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let (mut client, mut reader, session) = socket_session(&identity, &registry, 448, None);
+    let mut ask = |id: i64, name: &str, arguments: Value| {
+        writeln!(
+            client,
+            "{}",
+            modern(
+                json!(id),
+                "tools/call",
+                json!({"name":name, "arguments":arguments})
+            )
+        )
+        .unwrap();
+        next_reply(&mut reader)
+    };
+    let mut structured = Vec::new();
+    let scoped = ask(
+        1,
+        "trellis_rules_check",
+        json!({"schemaVersion":1,"paths":["app_main.js"]}),
+    );
+    tool(&scoped, None, true);
+    assert_reply_cap(&serde_json::to_vec(&scoped).unwrap());
+    let envelope = scoped["result"]["structuredContent"].clone();
+    let basis = envelope["evidenceBasis"].clone();
+    let data = &envelope["data"];
+    let unknown = data["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["target"]["path"] == "app_main.js" && row["status"] == "unknown")
+        .expect("aggregated unknown instance");
+    assert_eq!(unknown["referenceCount"], 300);
+    assert_eq!(unknown["evidence"].as_array().unwrap().len(), 5);
+    assert_eq!(unknown["omittedEvidence"], 295);
+    assert_eq!(data["page"]["offset"], 0);
+    structured.push(json!({"name":"trellis_rules_check","structuredContent":envelope.clone()}));
+    // The unscoped check pages too; its concatenated instances keep every row.
+    let mut offset = 0;
+    let mut instances = 0;
+    let mut counts: Option<Value> = None;
+    let mut pages = 0;
+    loop {
+        let page = ask(
+            10 + pages,
+            "trellis_rules_check",
+            json!({"schemaVersion":1,"expectedBasis":basis,"limit":50,"offset":offset}),
+        );
+        tool(&page, None, true);
+        assert_reply_cap(&serde_json::to_vec(&page).unwrap());
+        let data = &page["result"]["structuredContent"]["data"];
+        let whole = counts.get_or_insert_with(|| data["counts"].clone());
+        assert_eq!(
+            data["counts"], *whole,
+            "every page carries the whole-result counts"
+        );
+        instances += data["instances"].as_array().unwrap().len();
+        structured.push(json!({"name":"trellis_rules_check",
+            "structuredContent":page["result"]["structuredContent"]}));
+        pages += 1;
+        match data["page"]["nextOffset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert!(pages > 1);
+    assert_eq!(
+        instances as u64,
+        counts.unwrap()["comparable"].as_u64().unwrap()
+    );
+    let explained = ask(
+        2,
+        "trellis_rules_explain",
+        json!({"schemaVersion":1,"expectedBasis":basis,"rule":"$layers","target":unknown["target"],"limit":2}),
+    );
+    tool(&explained, None, true);
+    let row = &explained["result"]["structuredContent"]["data"]["instances"][0];
+    assert_eq!(row["evidence"].as_array().unwrap().len(), 2);
+    assert_eq!(row["omittedEvidence"], 298);
+    structured.push(json!({"name":"trellis_rules_explain",
+        "structuredContent":explained["result"]["structuredContent"]}));
+    let references = ask(
+        3,
+        "trellis_references",
+        json!({"schemaVersion":1,"expectedBasis":basis,"paths":["app_main.js"]}),
+    );
+    tool(&references, None, true);
+    assert_eq!(
+        references["result"]["structuredContent"]["data"]["counts"]["unresolvedSites"],
+        300
+    );
+    structured.push(json!({"name":"trellis_references",
+        "structuredContent":references["result"]["structuredContent"]}));
+    validate_structured_content(&structured);
     drop(ask);
     drop(reader);
     drop(client);

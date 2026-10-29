@@ -1030,7 +1030,16 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     if architecture::is_tool(name) || name == architecture::PROMPT_NAME =>
                 {
                     let kind = architecture::operation(name);
-                    let arguments = serde_json::Value::Object(args.clone());
+                    let arguments = architecture::store_arguments(
+                        name,
+                        &serde_json::Value::Object(args.clone()),
+                    );
+                    // check/explain sample rule evidence per instance (#448).
+                    let evidence_limit = (kind != "references" && kind != "prompt").then(|| {
+                        args.get("limit").map_or(5, |value| {
+                            wire::uint(value).expect("validated evidence limit") as usize
+                        })
+                    });
                     Some(Box::new(move |runtime, response, _sampled, _query| {
                         let mut check = || {
                             if cancel.load(std::sync::atomic::Ordering::Acquire)
@@ -1041,7 +1050,12 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             Ok(())
                         };
                         match response.architecture_response(kind, &arguments, &mut check) {
-                            Ok(payload) => Ok(architecture::envelope(id, payload)),
+                            Ok(mut payload) => {
+                                if let Some(limit) = evidence_limit {
+                                    architecture::sample_evidence(&mut payload, limit);
+                                }
+                                Ok(architecture::envelope(id, payload))
+                            }
                             Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                                 Err(error)
                             }
@@ -1463,7 +1477,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
             tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
-                architecture::capped(id, &name, envelope, modern)
+                // Tools page their arrays into the response cap; the prompt never pages.
+                let offset = architecture::is_tool(&name).then(|| {
+                    arguments
+                        .as_ref()
+                        .and_then(|arguments| arguments.get("offset"))
+                        .and_then(wire::uint)
+                        .unwrap_or(0)
+                });
+                architecture::capped(id, &name, envelope, offset, modern)
             } else {
                 tools::result(&name, envelope, modern)
             };

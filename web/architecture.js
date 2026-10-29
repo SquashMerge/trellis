@@ -52,7 +52,7 @@
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }
   function create({request, context, readSource, openTreemap, onConflict = () => {}, onInspect = () => {}}) {
-    let serial = 0, renderSerial = 0, selectionSerial = 0, view = null, basis = null;
+    let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
@@ -111,17 +111,62 @@
       const unassigned = view.modules.filter(module => module.layer === null);
       paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown.`);
       if (references?.externalPackages?.length) disclosure(target, "External packages and captured evidence", references.externalPackages);
-      const bans = [...(view.rules?.instances || []), ...(view.rules?.testOnly || [])].filter(instance => instance.rule === "$external");
-      if (bans.length) disclosure(target, "External policy results (production and test-only)", bans);
       const choose = (label, action) => { const button = make("button", label); button.type = "button"; button.addEventListener("click", action); target.append(button); };
       const c = basis;
       choose("Inspect same-layer and unassigned references", () => { if (current(c) && usable()) inspect("unknown", null); });
       choose("Inspect unresolved sites", () => { if (current(c) && usable()) inspect("unresolved", null); });
+      if (references?.externalPackages?.length) choose("Inspect external policy results", () => { if (current(c) && usable()) inspect("external", null); });
     }
     function layerOf(identity) {
       if (!external(identity)) return view.modules.find(module => same(module.identity, identity))?.layer;
-      return [...(view.rules?.instances || []), ...(view.rules?.testOnly || [])]
-        .find(instance => instance.rule === "$layers" && instance.destination && same(instance.destination, identity))?.destinationLayer;
+      return view.references?.externalPackages?.find(item => same(item.identity, identity))?.layer ?? null;
+    }
+    // Undrawn detail is read on demand, one bounded page at a time, at the view's exact
+    // pin and rules hash (#448). A changed pin or rules file fails with a typed 409.
+    async function details(params, active, offset = 0) {
+      const c = basis;
+      const query = new URLSearchParams({...params, indexGeneration:c.pin.indexGeneration, indexRevision:String(c.pin.indexRevision),
+        rulesHash:c.rulesHash, offset:String(offset)});
+      const data = await request(`/api/architecture/details?${query}`, active);
+      const page = data?.payload;
+      if (!page || !window.TrellisIndexPin.equal(page, c.pin) || page.rulesFile?.contentHash !== c.rulesHash || page.kind !== params.kind ||
+          page.offset !== offset || !Array.isArray(page.items) || !Number.isSafeInteger(page.total) ||
+          !(page.nextOffset === null || (Number.isSafeInteger(page.nextOffset) && page.nextOffset > offset))) {
+        throw new Error("Invalid Architecture detail response. Nothing displayed.");
+      }
+      return page;
+    }
+    // One paged detail list; "Show more" reads the next page of the same scope.
+    function detailList(target, params, active, renderItems, empty) {
+      const list = make("div", undefined, "architecture-detail-list"), items = make("div"), footer = make("div");
+      list.dataset.detailKind = params.kind; list.append(items, footer); target.append(list);
+      async function load(offset) {
+        footer.replaceChildren(make("p", "Loading details…", "detail"));
+        try {
+          const page = await details(params, active, offset);
+          if (!active()) return;
+          footer.replaceChildren(); renderItems(items, page.items);
+          if (!page.total && empty) paragraph(items, empty);
+          if (page.nextOffset !== null) {
+            const more = make("button", `Show more (${page.total - page.nextOffset} more of ${page.total})`); more.type = "button";
+            more.addEventListener("click", () => { if (active()) return load(page.nextOffset); });
+            footer.append(more);
+          }
+        } catch (error) {
+          if (!active() || error.name === "AbortError") return;
+          footer.replaceChildren(make("p", error.code === "rules_conflict" ? "Rules changed since this diagram was loaded. Refresh Architecture." :
+            error.message || "Details unavailable. Refresh Architecture.", "detail"));
+          if (error.status === 409 && ["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) onConflict();
+        }
+      }
+      void load(0);
+    }
+    const pairItems = active => (list, items) => pairs(list, items.map(item => item.pair), active, false);
+    const instanceItems = active => (list, items) => renderInstances(list, items, active, false);
+    // The exact $layers filter of one summary edge (its verdict and exception group).
+    function edgeFilters(edge) {
+      return {rule:"$layers", role:edge.role, sourceLayer:edge.sourceLayer, destinationLayer:edge.destinationLayer, status:edge.status,
+        excepted:String(!!edge.excepted), ...(edge.exceptionReason ? {exceptionReason:edge.exceptionReason} : {})};
     }
     function layerLabel(layer) {
       const modules = view.modules.filter(module => module.layer === layer.name);
@@ -393,8 +438,9 @@
       const button = make("button", "Read indexed reference source"); button.type = "button";
       button.addEventListener("click", () => { if (active()) return readSource({path:identity.path, range}, basis.pin, active); }); target.append(button);
     }
-    function pairs(target, values, active) {
-      if (!values.length) { paragraph(target, "No mapped pairs in this scope. This does not prove absence."); return; }
+    const NO_PAIRS = "No mapped pairs in this scope. This does not prove absence.";
+    function pairs(target, values, active, emptyNote = true) {
+      if (!values.length) { if (emptyNote) paragraph(target, NO_PAIRS); return; }
       for (const pair of values) {
         const details = make("details"); details.append(make("summary", `${targetLabel(pair.source)} → ${targetLabel(pair.target)} · ${pair.count} reference sites`));
         paragraph(details, `${pair.sites.length} sampled sites · ${pair.omittedSites} omitted sites. Counts remain exact; samples are not exhaustive.`);
@@ -444,49 +490,56 @@
           const button = make("button", "Open in Treemap"); button.type = "button";
           button.addEventListener("click", () => { if (active()) openTreemap(record.identity, c.pin); }); target.append(button);
         }
-        pairs(target, [...references.production, ...references.tests].filter(pair => same(pair.source, record.identity) || same(pair.target, record.identity)), active);
-        disclosure(target, "Owned rule evaluation (including exceptions and test-only outcomes)", payload.rules);
+        paragraph(target, "Reference pairs from or to this file", "detail");
+        detailList(target, {kind:"pairs", path:record.identity.path}, active, pairItems(active), NO_PAIRS);
+        paragraph(target, "Rule evaluation for this file (including exceptions and test-only outcomes)", "detail");
+        detailList(target, {kind:"instances", path:record.identity.path}, active, instanceItems(active), "No rule instances name this file.");
       } else if (kind === "edge") {
         title.textContent = `${record.sourceLayer} → ${record.destinationLayer}`;
         paragraph(target, `${record.count} exact ${record.role} structural reference sites · ${record.status}${record.excepted ? ` · excepted: ${record.exceptionReason}` : " · not excepted"}${record.role === "test" ? " · hypothetical policy only; never a production violation" : ""}.`);
         reviewScope = record; reviewMode = "rules"; get("architecture-review-state").value = "all"; get("architecture-review-panel").hidden = false; renderReview();
-        renderInstances(target, scopedRows(), active);
+        detailList(target, {kind:"instances", ...edgeFilters(record)}, active, instanceItems(active), "No rule instances match this review scope.");
         pairs(target, record.pairs, active);
       } else if (kind === "layer") {
         title.textContent = record.name; paragraph(target, layerLabel(record));
         for (const module of payload.modules.filter(item => item.layer === record.name)) {
           const button = make("button", module.identity.path); button.type = "button"; button.addEventListener("click", () => { if (active()) inspect("module", module); }); target.append(button);
         }
-        const packages = (references.externalPackages || []).filter(item => layerOf(item.identity) === record.name);
+        const packages = (references.externalPackages || []).filter(item => item.layer === record.name);
         if (packages.length) disclosure(target, "External packages (no native source or metrics)", packages);
-        const member = identity => layerOf(identity) === record.name;
-        pairs(target, [...references.production, ...references.tests].filter(pair => member(pair.source) || member(pair.target)), active);
-        disclosure(target, "Owned layer policy and exceptions", payload.rules);
+        paragraph(target, "Reference pairs from or to this layer", "detail");
+        detailList(target, {kind:"pairs", layer:record.name}, active, pairItems(active), NO_PAIRS);
+        paragraph(target, "Layer policy and exceptions", "detail");
+        detailList(target, {kind:"instances", layer:record.name}, active, instanceItems(active), "No rule instances name this layer.");
       } else if (kind === "unresolved") {
         title.textContent = "Unresolved structural references";
-        for (const item of references.unresolved) {
-          const entry = make("details"); entry.append(make("summary", `${item.source.path} · ${item.reason}`), make("pre", JSON.stringify(item, null, 2)));
-          inspectorSource(entry, item.source, item.site, active); target.append(entry);
-        }
+        paragraph(target, `${references.counts?.unresolvedSites ?? 0} unresolved sites.`);
+        detailList(target, {kind:"unresolved"}, active, (list, items) => {
+          for (const item of items) {
+            const entry = make("details"); entry.append(make("summary", `${item.source.path} · ${item.reason}`), make("pre", JSON.stringify(item, null, 2)));
+            inspectorSource(entry, item.source, item.site, active); list.append(entry);
+          }
+        }, "No unresolved sites.");
+      } else if (kind === "external") {
+        title.textContent = "External policy results";
+        paragraph(target, "Production and test-only $external results.", "detail");
+        detailList(target, {kind:"instances", rule:"$external"}, active, instanceItems(active), "No external policy results.");
       } else {
         title.textContent = "Same-layer and unassigned references";
-        pairs(target, [...references.production, ...references.tests].filter(pair => {
-          const source = layerOf(pair.source), destination = layerOf(pair.target);
-          return source == null || destination == null || source === destination;
-        }), active);
+        detailList(target, {kind:"pairs", unlayered:"true"}, active, pairItems(active), NO_PAIRS);
         disclosure(target, "Unassigned native file modules", payload.modules.filter(module => module.layer === null));
-        disclosure(target, "Owned policy evaluation", payload.rules);
       }
       for (const limitation of references.limitations || []) paragraph(target, limitation, "detail");
     }
-    function ruleRows() {
-      return [...(view.rules?.instances || []).map(instance => ({instance, role:"production"})),
-        ...(view.rules?.testOnly || []).map(instance => ({instance, role:"test"}))];
-    }
-    function scopedRows() {
-      return ruleRows().filter(({instance:r, role:rowRole}) => !reviewScope ||
-        rowRole === reviewScope.role && r.sourceLayer === reviewScope.sourceLayer && r.destinationLayer === reviewScope.destinationLayer &&
-        r.status === reviewScope.status && !!r.excepted === !!reviewScope.excepted && (r.exceptionReason || null) === (reviewScope.exceptionReason || null));
+    // Review filters as one exact detail scope; null when the role/verdict selects
+    // contradict the chosen edge, so nothing can match.
+    function reviewFilters(roleFilter, verdict) {
+      const params = {kind:"instances", ...(reviewScope ? edgeFilters(reviewScope) : {})};
+      const set = (key, value) => { if (key in params && params[key] !== value) return false; params[key] = value; return true; };
+      if (roleFilter !== "all" && !set("role", roleFilter)) return null;
+      if (verdict === "excepted" && !set("excepted", "true")) return null;
+      if (!["all", "excepted"].includes(verdict) && !(set("status", verdict) && set("excepted", "false"))) return null;
+      return params;
     }
     function portable(identity) { return {language:identity.language, path:identity.path}; }
     function pairKey(row) { return JSON.stringify([portable(row.target), portable(row.destination)]); }
@@ -498,7 +551,7 @@
       const button = make("button", label); button.type = "button";
       button.addEventListener("click", () => { if (active() && !editBusy) return fn(); }); target.append(button); return button;
     }
-    function renderInstances(target, rows, active) {
+    function renderInstances(target, rows, active, emptyNote = true) {
       for (const row of rows) {
         const r = row.instance, entry = make("div", undefined, "architecture-rule-row");
         entry.dataset.rule = r.rule; entry.dataset.source = r.target?.path || ""; entry.dataset.destination = r.destination?.path || "";
@@ -517,7 +570,7 @@
           "New exceptions require a positively witnessed production $layers deviation between native files; unknown, external and test-only rows cannot be waived.", "detail");
         target.append(entry);
       }
-      if (!rows.length) paragraph(target, "No rule instances match this review scope.");
+      if (!rows.length && emptyNote) paragraph(target, "No rule instances match this review scope.");
     }
     function inspectRule(row) {
       if (!usable()) return;
@@ -529,8 +582,10 @@
       paragraph(target, `${row.role} · ${r.status} · ${r.excepted ? `excepted: ${r.exceptionReason}` : "not excepted"} · ${r.referenceCount ?? 0} exact reference sites.`);
       paragraph(target, `Code ${window.TrellisIndexPin.label(payload)} · rules ${c.rulesHash}. Captured spelling and source-owner identities are syntax evidence, not destination symbol bindings.`);
       disclosure(target, "Captured rule evidence and constraints", r);
-      const refs = row.role === "test" ? payload.references.tests : payload.references.production;
-      pairs(target, refs.filter(pair => same(pair.source, r.target) && r.destination && same(pair.target, r.destination)), active);
+      if (r.destination && r.target?.path) {
+        const params = {kind:"pairs", role:row.role, source:JSON.stringify(r.target), target:JSON.stringify(r.destination)};
+        detailList(target, params, active, pairItems(active), NO_PAIRS);
+      } else paragraph(target, NO_PAIRS);
       if (eligible(row)) action(target, "Add exception for this pair", () => beginDraft({type:"addExceptions", pairs:[{source:portable(r.target), destination:portable(r.destination)}], reason:""}), active);
     }
     function renderReview() {
@@ -539,7 +594,8 @@
       get("architecture-review-scope").textContent = reviewMode === "unassigned" ? "Unassigned files (including files without edges)" :
         reviewMode === "authored" ? "Authored exceptions" : reviewScope ? `${reviewScope.sourceLayer} → ${reviewScope.destinationLayer} · ${reviewScope.role}` : "All rule instances";
       get("architecture-exceptions").hidden = reviewMode !== "authored";
-      const c = basis, active = () => usable() && current(c);
+      const c = basis, ticket = ++reviewSerial, active = () => usable() && current(c);
+      const listed = () => active() && ticket === reviewSerial;
       if (reviewMode === "unassigned" && view.state === "no_layers") {
         paragraph(target, "No layers configured. File assignment inventory is unavailable until layers are configured; authored exceptions remain editable.");
       } else if (reviewMode === "unassigned") {
@@ -555,8 +611,8 @@
         if (!target.children.length) paragraph(target, "All indexed native files have an assignment.");
       } else if (reviewMode === "rules") {
         const roleFilter = get("architecture-review-role").value, verdict = get("architecture-review-state").value;
-        renderInstances(target, scopedRows().filter(({instance:r,role:rowRole}) => (roleFilter === "all" || roleFilter === rowRole) &&
-          (verdict === "all" || verdict === "excepted" ? verdict === "all" || r.excepted : r.status === verdict && !r.excepted)), active);
+        const params = reviewFilters(roleFilter, verdict), empty = "No rule instances match this review scope.";
+        if (params) detailList(target, params, listed, instanceItems(active), empty); else paragraph(target, empty);
       }
       const select = get("architecture-destination-layer"), value = select.value; select.replaceChildren();
       const all = make("option", "All layers"); all.value = ""; select.append(all);
@@ -724,12 +780,27 @@
         }
         return reachable.has(parts.length);
       }
-      selected.clear();
-      for (const row of ruleRows()) if (eligible(row) && matches(row.instance.target.path) && (!layer || row.instance.destinationLayer === layer)) {
-        const r = row.instance; selected.set(pairKey(r), {source:portable(r.target),destination:portable(r.destination)});
-      }
-      get("architecture-review-selection-state").textContent = `${selected.size} finite witnessed pairs selected. No wildcard exception will be written.`;
-      renderReview();
+      // Only unexcepted production $layers deviations are eligible; read exactly those pages.
+      const c = basis, owner = setBusy(true), active = () => usable() && current(c);
+      const state = get("architecture-review-selection-state"); state.textContent = "Reading witnessed deviations…";
+      return (async () => {
+        try {
+          const rows = [];
+          for (let offset = 0; offset !== null;) {
+            const page = await details({kind:"instances", role:"production", rule:"$layers", status:"deviates", excepted:"false", limit:"500"}, active, offset);
+            if (!active()) return;
+            rows.push(...page.items); offset = page.nextOffset;
+          }
+          selected.clear();
+          for (const row of rows) if (eligible(row) && matches(row.instance.target.path) && (!layer || row.instance.destinationLayer === layer)) {
+            const r = row.instance; selected.set(pairKey(r), {source:portable(r.target),destination:portable(r.destination)});
+          }
+          state.textContent = `${selected.size} finite witnessed pairs selected. No wildcard exception will be written.`;
+          renderReview();
+        } catch (error) {
+          if (active() && error.name !== "AbortError") state.textContent = error.message || "Selection failed. Nothing was selected.";
+        } finally { setBusy(false, owner); }
+      })();
     }
     get("architecture-review-role").value = "all"; get("architecture-review-state").value = "deviates";
     get("architecture-review").addEventListener("click", () => { if (usable()) { reviewScope = null; reviewMode = "rules"; get("architecture-review-panel").hidden = false; renderReview(); } });

@@ -24,9 +24,38 @@ function fixture(aggregate = "max", hash = "rules-one", role = "production") {
       {sourceLayer:"Storage",destinationLayer:"UI",role:"test",count:2,status:"deviates",excepted:false,exceptionReason:null,pairs:[]}],
     references:{production:[pair],tests:[],unresolved:[],counts:{mappedSites:9,unresolvedSites:0},limitations:["Structural mapping is not binding."]},rules:{instances:[],testOnly:[]}};
 }
+// The daemon's paged detail route (#448), answered from the last full fixture. The
+// controller receives only the summary (the harness strips the detail arrays).
+const flush = () => new Promise(resolve => setImmediate(resolve));
+function emulateDetails(full, url) {
+  const query = new URL(url, "http://local").searchParams, kind = query.get("kind");
+  const layerOf = id => full.modules.find(module => JSON.stringify(module.identity) === JSON.stringify(id))?.layer ??
+    full.references.externalPackages?.find(item => JSON.stringify(item.identity) === JSON.stringify(id))?.layer ?? null;
+  const is = (value, key) => !query.has(key) || value === query.get(key);
+  let items = [];
+  if (kind === "instances") {
+    items = [["production", full.rules.instances], ["test", full.rules.testOnly]].filter(([role]) => is(role, "role"))
+      .flatMap(([role, rows]) => rows.map(instance => ({role, instance}))).filter(({instance:r}) =>
+        is(r.rule, "rule") && is(r.status, "status") && is(String(!!r.excepted), "excepted") && is(r.exceptionReason, "exceptionReason") &&
+        is(r.sourceLayer, "sourceLayer") && is(r.destinationLayer, "destinationLayer") &&
+        (!query.has("layer") || [r.sourceLayer, r.destinationLayer].includes(query.get("layer"))) &&
+        (!query.has("path") || [r.target?.path, r.destination?.path].includes(query.get("path"))));
+  } else if (kind === "pairs") {
+    items = [["production", full.references.production], ["test", full.references.tests]].filter(([role]) => is(role, "role"))
+      .flatMap(([role, rows]) => rows.map(pair => ({role, sourceLayer:layerOf(pair.source), targetLayer:layerOf(pair.target), pair}))).filter(item =>
+        (!query.has("path") || [item.pair.source.path, item.pair.target.path].includes(query.get("path"))) &&
+        is(JSON.stringify(item.pair.source), "source") && is(JSON.stringify(item.pair.target), "target") &&
+        (!query.has("layer") || [item.sourceLayer, item.targetLayer].includes(query.get("layer"))) &&
+        (!query.has("unlayered") || item.sourceLayer === null || item.targetLayer === null || item.sourceLayer === item.targetLayer));
+  } else items = full.references.unresolved.filter(item => is(item.source.path, "path"));
+  const offset = Number(query.get("offset")), limit = Number(query.get("limit") || 100);
+  return {payload:{indexGeneration:query.get("indexGeneration"), indexRevision:Number(query.get("indexRevision")),
+    rulesFile:{contentHash:query.get("rulesHash")}, kind, offset, total:items.length,
+    nextOffset:offset + limit < items.length ? offset + limit : null, items:items.slice(offset, offset + limit)}};
+}
 function harness() {
-  const elements = new Map(), calls = [], renders = [], reads = [], conflicts = [];
-  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false});
+  const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [];
+  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null;
   const document = {getElementById:id => {if (!elements.has(id)) elements.set(id, node(id)); return elements.get(id);},createElement:tag => node(tag)};
   function node(tagName) {
     return {tagName,textContent:"",children:[],dataset:{},attrs:{},listeners:{},hidden:false,value:"",checked:false,
@@ -42,10 +71,19 @@ function harness() {
     showArchitectureInspector:() => {get("architecture-inspector").hidden=false;},
   }};
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console});
-  const controller = window.TrellisArchitecture.create({request:(url,current,options) => {calls.push({url,current,options});return response(url,options);},context:() => context,
+  const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
+    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); return emulateDetails(full, url); }
+    calls.push({url,current,options}); const data = await response(url,options);
+    if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;
+    // The daemon sends the summary; only the detail emulation sees the full arrays.
+    full = data.payload;
+    const {production, tests, unresolved, modules, ...references} = full.references;
+    const {instances, testOnly, unassigned, externalPackages, ...rules} = full.rules;
+    return {...data, payload:{...full, references, rules}};
+  },context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
-  return {window,controller,calls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;}};
+  return {window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;}};
 }
 
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
@@ -56,7 +94,7 @@ test("init is inert; one owned pin/digest supplies metric values and explicit sa
   const {view,options} = h.renders[0];assert.equal(options.moduleValue(view.modules[0]),3);assert.equal(options.moduleValue(view.modules[1]),null);
   assert.equal(options.layerLabel(view.layers[0]),"1 · UI · 1 file · max cognitive (max) 3");
   assert.deepEqual([...options.layerStats(view.layers[0])].map(stat => [stat.text, stat.tone]),[["↓7","neutral"]],"only non-zero counts become chips");
-  assert.equal(h.reads.length,0);options.onSelectModule(view.modules[0]);
+  assert.equal(h.reads.length,0);assert.equal(h.detailCalls.length,0,"the summary load reads no details");options.onSelectModule(view.modules[0]);await flush();
   assert.match(text(h.get("architecture-inspector-content")),/4 physical file lines · 2 production callables/);
   assert.match(text(h.get("architecture-inspector-content")),/not-measured/);
   assert.match(text(h.get("architecture-inspector-content")),/6 omitted sites/);
@@ -179,7 +217,7 @@ test("Architecture rejects wrong role echo and labels unavailable production pop
 test("external package evidence and deny results display without fabricated native metrics or source", async () => {
   const h = harness(), payload = fixture();
   const external = {kind:"externalPackage",sourceSetId:"workspace",language:"rust",package:"legacy-db",standardLibrary:false};
-  const descriptor = {identity:external,ecosystem:"cargo",evidence:[{
+  const descriptor = {identity:external,ecosystem:"cargo",layer:"External",evidence:[{
     kind:"manifest",sourceSetId:"workspace",nativeRevisionId:"native-revision",dependencyHash:"dependencies-hash",
     path:"Cargo.toml",contentHash:"manifest-hash",importRoot:"legacy_db",section:"dependencies",key:"legacy-db",versionConstraint:"1",
   }]};
@@ -200,11 +238,14 @@ test("external package evidence and deny results display without fabricated nati
   assert.equal(view.modules.length, 2, "package remains a descriptor, never a native measured module");
   assert.equal(view.modules.some(module => module.identity.kind === "externalPackage"), false);
   assert.equal(options.moduleValue(descriptor), undefined, "no metric value is invented for a package");
-  assert.match(text(h.get("architecture-notice-content")), /External policy results.*\$external.*legacy-db.*deviates/s);
   assert.match(text(h.get("architecture-notice-content")), /External packages and captured evidence.*Cargo\.toml.*manifest-hash/s);
+  const notice = label => descendants(h.get("architecture-notice-content")).find(item => item.tagName === "button" && item.textContent === label);
+  await notice("Inspect external policy results").fire("click"); await flush();
+  assert.match(text(h.get("architecture-inspector-content")), /\$external.*legacy-db.*deviates/s);
+  assert.equal(new URL(h.detailCalls.at(-1).url, "http://local").searchParams.get("rule"), "$external");
   const layer = view.layers.find(layer => layer.name === "External");
   assert.match(options.layerLabel(layer), /0 files · 1 external packages/);
-  options.onSelectLayer(layer);
+  options.onSelectLayer(layer); await flush();
   const inspector = text(h.get("architecture-inspector-content"));
   assert.match(inspector, /External packages \(no native source or metrics\)/);
   assert.match(inspector, /src\/a\.rs → legacy-db \(rust package\)/);
@@ -228,9 +269,10 @@ function authoringFixture(hash = "rules-one") {
   payload.edges[0] = {...payload.edges[0],status:"deviates"};
   return payload;
 }
+const ruleRows = h => descendants(h.get("architecture-review-list")).filter(item => item.className === "architecture-rule-row").length;
 const byLabel = (node,label) => descendants(node).find(item => item.attrs["aria-label"] === label);
 async function selectTwo(h) {
-  await h.get("architecture-review").fire("click");
+  await h.get("architecture-review").fire("click");await flush();
   for (const label of ["Select src/a.rs → src/b.rs","Select src/b.rs → src/a.rs"]) {
     const input = byLabel(h.get("architecture-review-list"),label);assert.ok(input);input.checked=true;await input.fire("change");
   }
@@ -242,13 +284,13 @@ function editorResponse(hash = "rules-one") {
 
 test("review filters independent role/state, edge instances and no-edge unassigned assignments", async () => {
   const h=harness(),payload=authoringFixture();h.setResponse(async () => ({payload}));await h.controller.refresh();
-  await h.get("architecture-review").fire("click");
-  assert.equal(h.get("architecture-review-list").children.length,3,"two production deviations plus test-only row");
+  await h.get("architecture-review").fire("click");await flush();
+  assert.equal(ruleRows(h),3,"two production deviations plus test-only row");
   const testCheckbox=descendants(h.get("architecture-review-list")).filter(item=>item.tagName==="input").at(-1);assert.equal(testCheckbox.disabled,true);
-  h.get("architecture-review-role").value="test";await h.get("architecture-review-role").fire("change");assert.equal(h.get("architecture-review-list").children.length,1);
+  h.get("architecture-review-role").value="test";await h.get("architecture-review-role").fire("change");await flush();assert.equal(ruleRows(h),1);
   assert.match(text(h.get("architecture-review-list")),/test-only rows cannot be waived/);assert.equal(h.calls.length,1);
-  h.get("architecture-review-role").value="all";h.get("architecture-review-state").value="unknown";await h.get("architecture-review-state").fire("change");assert.match(text(h.get("architecture-review-list")),/Unknown destination/);
-  h.renders[0].options.onSelectEdge(payload.edges[0]);assert.match(text(h.get("architecture-inspector-content")),/\$layers/);assert.equal(h.get("architecture-review-list").children.length,1);
+  h.get("architecture-review-role").value="all";h.get("architecture-review-state").value="unknown";await h.get("architecture-review-state").fire("change");await flush();assert.match(text(h.get("architecture-review-list")),/Unknown destination/);
+  h.renders[0].options.onSelectEdge(payload.edges[0]);await flush();assert.match(text(h.get("architecture-inspector-content")),/\$layers/);assert.equal(ruleRows(h),1);
   await h.get("architecture-unassigned").fire("click");assert.match(text(h.get("architecture-review-list")),/src\/no-edges.rs/);
   const assign=descendants(h.get("architecture-review-list")).find(item=>item.textContent==="Assign file");await assign.fire("click");
   assert.equal(h.get("architecture-reason").hidden,true);assert.match(h.get("architecture-edit-scope").textContent,/assignFile.*no-edges/s);
@@ -546,4 +588,36 @@ test("unhinted test and fixture layers are hidden until tests and fixtures are i
     assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), true, `an authored ${hint} hint wins over the default test-layer hiding`);
     assert.equal(h.renders.at(-1).options.display.expanded("Fixtures"), hint === "expanded");
   }
+});
+
+test("details load on demand at the view's pin and rules hash, page with Show more and render text only", async () => {
+  const h = harness(), payload = fixture();
+  const hostile = '<img src=x onerror="globalThis.detailExecuted=true">';
+  payload.references.unresolved = Array.from({length:150}, (_, i) => ({source:identity(`src/${i}.rs`),
+    site:{role:"production",relationKind:"rust_path",spelling:hostile,lines:{start:1,end:1},range:{start:0,end:4}},reason:"rust_module_ownership_unproved"}));
+  payload.references.counts.unresolvedSites = 150;
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  assert.equal(h.detailCalls.length, 0, "drawing reads only the summary");
+  const notice = label => descendants(h.get("architecture-notice-content")).find(item => item.tagName === "button" && item.textContent === label);
+  await notice("Inspect unresolved sites").fire("click"); await flush();
+  const query = new URL(h.detailCalls[0].url, "http://local").searchParams;
+  assert.equal(query.get("kind"), "unresolved"); assert.equal(query.get("offset"), "0");
+  assert.equal(query.get("indexGeneration"), pin.indexGeneration); assert.equal(query.get("indexRevision"), "1");
+  assert.equal(query.get("rulesHash"), "rules-one");
+  const entries = () => descendants(h.get("architecture-inspector-content")).filter(item => item.tagName === "details").length;
+  assert.equal(entries(), 100);
+  assert.ok(descendants(h.get("architecture-inspector-content")).some(item => item.tagName === "pre" && item.textContent.includes(JSON.stringify(hostile))),
+    "repository text stays text");
+  await h.button("Show more (50 more of 150)").fire("click"); await flush();
+  assert.equal(entries(), 150);
+  assert.equal(new URL(h.detailCalls[1].url, "http://local").searchParams.get("offset"), "100");
+  assert.equal(descendants(h.get("architecture-inspector-content")).some(item => item.tagName === "button" && item.textContent.startsWith("Show more")), false);
+  // A changed pin or rules file is a typed conflict, never a stale page.
+  h.setResponse(async () => ({payload}));
+  const conflicted = harness(); conflicted.setResponse(async () => ({payload}));
+  await conflicted.controller.refresh();
+  const [view, options] = [conflicted.renders[0].view, conflicted.renders[0].options];
+  conflicted.setContext({rootKey:"checkout-one",session:1,pin:{...pin,indexRevision:2}});
+  options.onSelectModule(view.modules[0]); await flush();
+  assert.equal(conflicted.detailCalls.length, 0, "an outdated view never reads details");
 });
