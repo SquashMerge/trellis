@@ -38,6 +38,18 @@ Version needs section '.gnu.version_r' contains 1 entry:
 """
 
 
+class BuildTests(unittest.TestCase):
+    def test_release_build_features_are_selected_by_target(self):
+        for target in release.TARGETS:
+            with self.subTest(target=target), patch.object(release.subprocess, "check_call") as command:
+                release.build(target)
+            expected = ["cargo", "build", "--locked", "--release", "--no-default-features",
+                        "--bin", "trellis", "--target", target]
+            if target == "aarch64-apple-darwin":
+                expected += ["--features", "metal"]
+            command.assert_called_once_with(expected)
+
+
 class ElfTests(unittest.TestCase):
     def audit(self, header=HEADER, program=PROGRAM, versions=VERSIONS, dynamic=DYNAMIC, target=LINUX):
         return release.parse_elf(header, program, versions, dynamic, target)
