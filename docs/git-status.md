@@ -18,10 +18,13 @@ must not set `LIBGIT2_NO_VENDOR`, which would override the vendored choice.
 A hidden Trellis child performs synchronous library reads. The parent enforces a
 5-second deadline and a 2MiB complete JSON response budget, matching the existing
 live-source response budget. It kills and reaps the child on timeout; dropping a
-request must not leave Git work running. Checkout-list enrichment shares one
-aggregate deadline rather than granting each row another full timeout. The complete
-checkout-list response also has a 2MiB serialization cap; an oversized list fails
-with HTTP 413 rather than dropping rows. Expected Git-read failures in selected
+request must not leave Git work running. Each checkout-list row first reads
+HEAD/upstream in its own bounded child, then measures the working-tree count in a
+separate bounded child. Each child has its own 5-second deadline and 2MiB response
+budget; a slow count cannot discard the measured HEAD/upstream or consume a later
+row's budget. A count is used only if its HEAD/upstream matches the first read.
+The complete checkout-list response also has a 2MiB serialization cap; an oversized
+list fails with HTTP 413 rather than dropping rows. Expected Git-read failures in selected
 status/diff replies use HTTP 200 with tagged unavailable state. No database,
 index writer, persistent cache or polling owner is involved.
 
@@ -50,9 +53,11 @@ ahead/behind. `workingTree` is independently tagged:
   including an explicit zero for a clean checkout.
 - `{ "state": "unavailable", "reason": GitReason }` means the change set could not
   be measured; it never substitutes zero. The checkout-list summary retains the
-  independently measured HEAD/upstream, for example for a conflicted index.
+  independently measured HEAD/upstream, including when the count child times out,
+  exceeds its response budget, or encounters a conflicted index. If HEAD/upstream
+  changes between the two reads, the count is unavailable with `git_changed`.
 
-HEAD/upstream or whole-reader failures use outer `unavailable` with a closed reason
+HEAD/upstream failures use outer `unavailable` with a closed reason
 code, never a guessed branch. Selected status/diff failures remain all-or-nothing:
 outer `git` unavailable and no changes/file. Successful selected status/diff replies
 carry the same complete `workingTree.changedFiles` count, not just the selected
@@ -86,8 +91,9 @@ not add a Files layout, stage/commit/fetch actions, or remote-machine access.
 ## Verification
 
 Tests cover upstream counts, detached HEAD, no upstream, non-Git roots, linked
-worktrees, renames, deleted files, response/deadline failures and configured program
-sentinels. The sentinel fixture defines hooks, fsmonitor, credentials and filters;
+worktrees, renames, deleted files, independent count response/deadline failures,
+changed HEAD/upstream between reads, slow checkout counts among several rows, and
+configured program sentinels. The sentinel fixture defines hooks, fsmonitor, credentials and filters;
 none may execute. Index bytes and metadata must remain unchanged by the read.
 Route tests retain selected-root admission and authentication. UI tests cover cold
 indexes, checkout changes and unavailable state without retaining stale branches.

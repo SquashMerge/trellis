@@ -169,11 +169,26 @@ impl GitReader {
         Self { executable }
     }
     pub async fn summary(&self, root: &Path) -> GitSummary {
-        match self.read(root, "summary", None).await {
-            Ok(WorkerResponse::Summary(value)) => value,
-            Err(reason) => unavailable(reason),
-            _ => unavailable(GitReason::InvalidRepository),
-        }
+        let head = match self.read(root, "head", None).await {
+            Ok(WorkerResponse::Head(Ok(value))) => value,
+            Ok(WorkerResponse::Head(Err(reason))) | Err(reason) => return unavailable(reason),
+            _ => return unavailable(GitReason::InvalidRepository),
+        };
+        let reason = match self.read(root, "summary", None).await {
+            Ok(WorkerResponse::Summary(GitSummary::Available {
+                head: measured_head,
+                upstream,
+                working_tree,
+            })) => {
+                if measured_head == head.head && upstream == head.upstream {
+                    return head.with_working_tree(working_tree);
+                }
+                GitReason::GitChanged
+            }
+            Ok(WorkerResponse::Summary(GitSummary::Unavailable { reason })) | Err(reason) => reason,
+            _ => GitReason::InvalidRepository,
+        };
+        head.with_working_tree(GitWorkingTree::Unavailable { reason })
     }
     pub async fn status(&self, root: &Path) -> GitStatus {
         match self.read(root, "status", None).await {
@@ -302,12 +317,14 @@ pub async fn diff(root: &Path, path: &str) -> Result<GitDiff, GitRequestError> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", content = "result", rename_all = "lowercase")]
 pub enum WorkerResponse {
+    Head(Result<HeadSummary, GitReason>),
     Summary(GitSummary),
     Status(GitStatus),
     Diff(Result<GitDiff, GitRequestError>),
 }
 fn failed(mode: &str, reason: GitReason) -> WorkerResponse {
     match mode {
+        "head" => WorkerResponse::Head(Err(reason)),
         "summary" => WorkerResponse::Summary(unavailable(reason)),
         "diff" => WorkerResponse::Diff(Ok(GitDiff {
             git: unavailable(reason),
@@ -362,8 +379,9 @@ fn git_error(error: git2::Error) -> GitReason {
         _ => GitReason::InvalidRepository,
     }
 }
-#[derive(Clone, PartialEq, Eq)]
-struct HeadSummary {
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadSummary {
     head: GitHead,
     upstream: Option<GitUpstream>,
 }
@@ -467,6 +485,12 @@ fn measure(root: &Path, mode: &str, requested: Option<&str>) -> Result<WorkerRes
         return Err(GitReason::InvalidRepository);
     }
     let head = head_summary(&repo)?;
+    if mode == "head" {
+        if head_summary(&repo)? != head {
+            return Err(GitReason::GitChanged);
+        }
+        return Ok(WorkerResponse::Head(Ok(head)));
+    }
     let response = match measure_changes(&repo, &head, mode, requested) {
         Ok(response) => response,
         Err(reason) if mode == "summary" => WorkerResponse::Summary(

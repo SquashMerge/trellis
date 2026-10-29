@@ -757,3 +757,116 @@ async fn missing_or_noncommit_tracking_object_never_reports_counts() {
     fs::write(&ref_path, format!("{blob}\n")).unwrap();
     assert_eq!(reader().summary(f.root()).await, expected);
 }
+
+#[cfg(unix)]
+fn captured_summary(f: &Fixture) -> serde_json::Value {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_trellis"))
+        .args(["git-read", "--mode", "summary", "--root"])
+        .arg(f.root())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"].clone()
+}
+
+#[cfg(unix)]
+fn head_response(summary: &serde_json::Value) -> String {
+    serde_json::json!({"mode": "head", "result": {"Ok": {
+        "head": summary["head"], "upstream": summary["upstream"]
+    }}})
+    .to_string()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn count_child_timeout_preserves_head_and_reaps_child() {
+    let f = Fixture::new();
+    let expected = captured_summary(&f);
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("reader");
+    let pid_file = dir.path().join("count-pid");
+    script(
+        &exe,
+        &format!(
+            "#!/bin/sh\nif [ \"$5\" = head ]; then printf '%s' '{}'; else printf '%s' $$ > '{}'; exec /bin/sleep 60; fi\n",
+            head_response(&expected),
+            pid_file.display()
+        ),
+    );
+    let result = serde_json::to_value(GitReader::new(exe).summary(f.root()).await).unwrap();
+    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    assert_reaped(pid).await;
+    assert_eq!(result["head"], expected["head"]);
+    assert_eq!(result["upstream"], expected["upstream"]);
+    assert_eq!(
+        result["workingTree"],
+        serde_json::json!({
+            "state": "unavailable", "reason": "deadline_exceeded"
+        })
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oversized_count_response_preserves_head() {
+    let f = Fixture::new();
+    let expected = captured_summary(&f);
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("reader");
+    let payload = dir.path().join("oversized");
+    fs::write(&payload, vec![b'x'; RESPONSE_LIMIT + 1]).unwrap();
+    script(
+        &exe,
+        &format!(
+            "#!/bin/sh\nif [ \"$5\" = head ]; then printf '%s' '{}'; else exec /bin/cat '{}'; fi\n",
+            head_response(&expected),
+            payload.display()
+        ),
+    );
+    let result = serde_json::to_value(GitReader::new(exe).summary(f.root()).await).unwrap();
+    assert_eq!(result["head"], expected["head"]);
+    assert_eq!(
+        result["workingTree"],
+        serde_json::json!({
+            "state": "unavailable", "reason": "response_too_large"
+        })
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn count_from_a_changed_head_or_upstream_is_not_combined_with_first_read() {
+    let f = Fixture::new();
+    let expected = captured_summary(&f);
+    for change in ["head", "upstream"] {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("reader");
+        let mut changed = expected.clone();
+        if change == "head" {
+            changed["head"]["name"] = serde_json::json!("other-branch");
+        } else {
+            changed["upstream"] = serde_json::json!({
+                "name": "origin/main", "ahead": 1, "behind": 0, "basis": "last_fetch"
+            });
+        }
+        changed["workingTree"] = serde_json::json!({"state": "available", "changedFiles": 12});
+        let count_response = serde_json::json!({"mode": "summary", "result": changed});
+        script(
+            &exe,
+            &format!(
+                "#!/bin/sh\nif [ \"$5\" = head ]; then printf '%s' '{}'; else printf '%s' '{}'; fi\n",
+                head_response(&expected),
+                count_response
+            ),
+        );
+        let result = serde_json::to_value(GitReader::new(exe).summary(f.root()).await).unwrap();
+        assert_eq!(result["head"], expected["head"]);
+        assert_eq!(result["upstream"], expected["upstream"]);
+        assert_eq!(
+            result["workingTree"],
+            serde_json::json!({
+                "state": "unavailable", "reason": "git_changed"
+            })
+        );
+    }
+}
