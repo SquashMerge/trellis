@@ -95,60 +95,90 @@ There are two app modes and one shared diagram set:
 
 ## Current UI vs. this design (gap list)
 
-Reviewed in the running app at `localhost:8877` on 2026-10-28, at 1440×900, checkout `trellis` (index revision `937ecdcf:6`). The brand tokens and fonts are already in, along with Architecture, Treemap, color by metric, the indexed-checkouts list and the Files view with its Indexed / Working tree toggle. The items below are what remains. The owner rulings below win where they differ.
+Reviewed in the running app at `localhost:8877` on 2026-10-29 (`6925a2c`, index revision `d192e32e:2`) at 1440×900. Each finding was checked against the daemon's own API responses and the Trellis MCP tools. The owner rulings below win where they differ, except where an item says it proposes changing one.
 
-### Architecture (largest gap)
+**Already fixed since 2026-10-28:**
 
-1. **One chip per module, not per file.**
-   - Today Pele draws every file as a tile: 2191×7676px inside a diagram box about 263px tall, so the layer picture can't be seen.
-   - Default to module chips per layer band (`screens/06-architecture.png`). Expand to files on click. Respect the SPEC §9 size cap.
-2. **Fixtures and tests are hidden by default.**
-   - The `fixture-inputs` layer (order 0, 72 files, all "Unavailable") is the first thing drawn.
-   - Hide test and fixture layers unless "Include tests" is on, or show them as one collapsed band.
-3. **Layer stats as chips, plus arrows between bands.**
-   - Each layer now shows six text lines ("Prod refs down: 0 / up: 0 / Up deviation: 0 / …"), mostly zeros.
-   - Show only non-zero counts as compact chips, with upward deviations in the error color (e.g. storage ↑56, indexing ↑7).
-   - Draw the arrows between bands with those counts.
-4. **Exclude vendored code from metrics.**
-   - The web layer's max cognitive (582) is almost certainly the vendored Pele bundle in `web/vendor/`, which also sets the Sequence legend's top bin to ">181".
-   - Leave vendored files out of metrics, or at least out of the heat scale.
+- one header row with a single status
+- the checkout picker shows `repo ⎇ … · rev`
+- fixed per-metric color bands (#395)
+- fixtures and vendored code excluded from heat
+- Architecture folded to deviations, with ↑ counts
+- the treemap root is named `trellis`
+- one-line symbol rows
+- the Connect logo
 
-### Treemap
+### A. Simplify: the screens carry too much
 
-5. **Root label.** Show the repo name, not `source-set:v1:<uuid>`.
-6. **Heat scale.**
-   - The quartile bins (≤5, 5–16, 16–44, >44) come from every file, including `tools/` and fixtures, so most of the area lands in the top bin.
-   - Compute the bins from the visible files, or default the scope to `src/` and `web/`.
-7. **Fit the panel.** The 1170×1170 square sits in a wide, short scroll box. Lay it out to the panel's actual size.
+The app shows every control and every caveat at once. The rule for the next pass: **one row of controls per view, one status in the header, caveats behind an ⓘ, and every tab has something to show on arrival.**
 
-### Chrome and layout
+1. **Open straight into a diagram.**
+   - After Connect, select a checkout automatically: the only one, or the one last used, or the one matching the agent's cwd.
+   - Land on **Architecture**, not an empty Sequence.
+   - The picker stays in the header for switching.
+2. **Header: picker, status chip, menu.**
+   - The status chip shows "Fresh · rev 2". A failed re-index is a secondary note on the chip, and its menu holds Refresh and Diagnostics.
+   - Show the amber **Index workspace** button only when there's no usable index.
+   - Move Disconnect into the menu.
+3. **Left rail: just the file tree.** Remove:
+   - The **Indexed checkouts** card. It repeats the header picker; bring it back only when there are 2+ checkouts, as the picker's dropdown.
+   - "Agents can use these indexes through trellis mcp", the absolute path, the "Index scope & file access" disclosure and the "Expand folders to browse…" paragraph.
+   - The "Filter loaded entries" label. The tall filter box becomes a one-line filter that searches the whole tree, not just loaded folders. Today, filtering `src/watch.rs` on the Diagrams page finds nothing, because unopened folders aren't searched.
+   - The rail legend. It repeats the diagram legend; show it only as a tooltip on a swatch.
+   - Show hidden/ignored and Display options move into a ⋯ menu.
+4. **View toolbars: one row each.**
+   - Keep Color by and the aggregation select (max / sum / mean).
+   - Move the checkboxes into an **Options** popover: include tests and fixtures, relative, test-only edges, deviations only.
+   - Replace the two or three lines of mono explanation under the toolbar (band names, "20025 callables excluded…", excluded-file counts) with the legend swatches and an ⓘ that holds the detail.
+   - Remove **Color by** from Sequence and Classes, where it has nothing to color ("No measured values").
+5. **Architecture header.**
+   - Turn "Review deviations / Unassigned files / Authored exceptions" into counted chips in the inspector: **23 deviations · 156 unassigned · 0 exceptions**.
+   - Remove "Refresh architecture"; the view refreshes on a new revision.
+   - Cut "503 native file modules · 431 production / 331 test-only…" and "Showing 3 layers and 25 files…" to one line, or move them under ⓘ.
+6. **Only show tabs that can show something.**
+   - **Classes** appears only when the checkout has production Java or Python. Class diagrams only cover those languages, and trellis has Java/Python only in fixtures and tools.
+   - **Sequence** opens from a method: click it in the tree, the source margin or the inspector.
+   - With no method selected, the Sequence tab shows a short list of the most complex methods to start from, instead of "Expand a file and select a method."
+7. **Libraries leaves the tab row.** *This proposes changing the 2026-10-24 ruling, which kept it as a tab.* Today it's a catalog: 376 crates and 50,000 declarations with no link to this code.
+   - Reach it in context instead: "open in library" from a call or reference that lands in an external crate.
+   - Optionally, later: a **Dependencies** view showing which external packages each layer uses. The architecture payload already has 51 of them.
+8. **Explanatory text, once per view.** The "not a runtime trace / targets unverified / candidates do not prove dispatch" sentences currently repeat in the toolbar, canvas, inspector and footer. Keep one ⓘ "About this view" per view, plus the footer's Privacy & evidence limits.
 
-8. **Collapse the stacked rows.**
-   - Five rows sit above the content: header, revision strip, "Browse folders…" notice, Workspace toolbar, and the index-job line.
-   - They leave the diagram about 30% of the height. Fold them into the header plus one status line.
-9. **One readable status.**
-   - The header says "Fresh · revision 937ecdcf:6" while the line below shows `Index failed · 0/0 · { "code": "index_failed", … }` as raw JSON.
-   - Show a single status (word plus shape), with the details under Diagnostics.
-10. **Checkout picker.**
-    - It shows the absolute path plus "available", then repeats the path on the line below.
-    - Show `repo ⎇ branch · rev`, per `screens/03-viewer.png`.
-11. **Explorer.**
-    - Replace the per-file "Unsupported source type" rows (`.env`, `Cargo.toml`, …) with one quiet marker.
-    - Folder numbers (docs 43, web 582) have no label. Add the metric swatch and a legend.
-12. **Sizes.**
-    - Body text and buttons are still 12–13px. Workspace buttons are 28px tall with a 4px radius, while header buttons use 8px.
-    - Use 14px for labels and an 8px radius on all controls. Keep the 44px height for primary actions only.
+### B. Fixes found with live data
 
-### Files
+9. **The status says "Index failed" while the index is fine.**
+   - `/status` and MCP `workspace_describe` both report revision 2 as ready and fresh.
+   - What failed was the latest re-index job (`/jobs/current`), whose only error is the generic `"Index job failed"`.
+   - Show it as a note with the real cause (see item 2).
+10. **Architecture downloads 35 MB.**
+    - Drawing needs `edges` and `modules`, about 0.7 MB.
+    - The rest is undrawn detail: `references.unresolved` (32,472 sites, 15 MB), `rules.testOnly` (11.6 MB) and `rules.instances` (6 MB).
+    - The same payload makes MCP `rules_check` and `references` fail with `response_too_large`, even when limited to one file.
+    - Fix: return summary data by default, with details per edge or file on demand, and apply MCP `paths` before the size check.
+11. **The entry layer vanishes.**
+    - It has 36 modules and 172 production references, all downward and allowed.
+    - With "Deviations only" it's neither drawn nor listed under "quiet layers", which names tooling and web.
+    - Fix: draw the full stack (web, entry, query, indexing, storage, with Shared beside it). Dim the allowed arrows and highlight the deviations, rather than dropping layers.
+12. **Architecture leaves most of the panel empty.** The stack is a ~430px column inside a 1196px panel. Use the width, and put module chips colored by metric where it now says "N files folded".
+13. **Show coverage next to the arrows.**
+    - Only 3,034 of 35,506 reference sites mapped to a module (about 9%). The rest are mostly `rust_module_ownership_unproved` (16,104) and `rust_export_name_set_unknown` (13,700).
+    - 563 of 897 rule instances are unknown.
+    - So ↑ counts are lower bounds: storage → indexing shows ↑102, while #163's scan found 183. Say "≥102 · 9% of sites mapped".
+14. **Arrow legend.** Four lines of prose become a compact symbol key.
+15. **Treemap fits its panel.** The controls take about 325px of height, leaving the map 400px of the 712px panel, and it's 69px too wide, so it scrolls sideways.
+16. **"Open full" opens the wrong tab.** In Files → Inspector, "Open full" sets `#sequence?…` but shows the last-used diagram tab (Treemap).
+17. **The inspector mini-sequence is clipped.** Pele draws it at 720×374 in a 251px-wide box. Scale it to fit.
+18. **The selected method is a heavy purple slab.** Use a raised background with a lavender left bar for the selected source range.
+19. **References in the inspector.** The design lists "References to WatcherWitness · 4", and the data exists; the live inspector doesn't show it.
+20. **IDs in accessible labels.** The source-margin buttons are labelled "Sequence for witness · syntax · sid:v1:…". Drop the ID.
 
-13. **Symbol rows on one line.** Today each is a two-line row, e.g. "variable · MAX_DIRTY_PATHS · L19". Use icon plus name, with kind and line right-aligned (`screens/04-files.png`).
-14. **Optional:** subtle syntax coloring, e.g. gold for attributes as in the design.
+### C. Data limits that shape the design
 
-### Connect
-
-15. **Logo.**
-    - The lockup shows a visibly darker box and is about 210px wide in an 800px viewport, below the roughly 260px brand minimum.
-    - Crop it with CSS (as in `reference/Connect.dc.html`). Stack the logo above the form on narrow viewports.
+- **No calls are resolved.** The index resolves 0 of 199,075 calls. MCP `outgoing_calls` for `Store::navigation_at` returns one unresolved call with a same-file candidate, `navigation_in`.
+  - That's why the `witness` sequence is a single lifeline with two "call load · target unverified" boxes.
+  - The Sequence and Class mockups, which draw resolved participants, overstate what's available.
+  - Until resolution lands (#40/#68), draw **native candidates** as dashed participants, labelled as candidates.
+- **Rust coverage is partial.** 260 of 274 Rust files are partial, because macro and attribute bodies aren't measured. This belongs in the ⓘ for every view, not in each one's body.
 
 ## Suggested slices (each its own issue)
 
@@ -166,32 +196,29 @@ Item numbers in brackets refer to the gap list above.
 
 ### Next
 
-1. **Metrics hygiene** [4, 2, 6].
-   - Exclude vendored code from metrics and heat scales.
-   - Hide test and fixture files and layers unless "Include tests" is on.
-   - Use **fixed per-metric thresholds** for heat colors (owner ruling 2026-10-28, #395), not quartiles of the visible set; an optional, clearly labelled "Relative" toggle may show visible-set quartiles.
-   - Small change, and it makes every colored view readable.
-2. **Architecture at module level** [1, 3].
-   - One chip per module in each band; files on click.
-   - Non-zero reference counts as chips.
-   - Arrows between bands, with upward deviations in the error color.
-   - Respect the SPEC §9 size cap.
-3. **Page chrome and status** [8, 9, 10, 12].
-   - Fold the five stacked rows into the header plus one status line.
-   - One readable index status, with raw errors under Diagnostics.
-   - Checkout picker as `repo ⎇ branch · rev`.
-   - Control sizes and radii per `brand/tokens.css`.
-4. **Treemap and explorer polish** [5, 7, 11].
-   - Repo name as the treemap root; fill the panel.
-   - Collapse the "Unsupported source type" rows into one marker.
-   - Explorer metric swatches with a legend.
-5. **Files and Connect polish** [13, 14, 15].
-   - One-line symbol rows.
-   - Optional syntax coloring.
-   - Crop and size the Connect lockup, stacking it on narrow screens.
-6. **Git state** (owner ruling).
-   - New read-only daemon capability: branch, ahead/behind and modified files, measured from Git.
-   - Feeds the header, the checkout list and the explorer markers.
+1. **Simplify the shell** [1–4, 8, 9].
+   - Auto-select the checkout and land on Architecture.
+   - Header: picker, status chip and menu.
+   - Left rail: the file tree with a whole-tree filter.
+   - View toolbars: one row each, with an Options popover and an ⓘ for caveats.
+2. **Architecture payload** [10].
+   - Summary by default, details on demand.
+   - MCP `paths` applied before the size check.
+   - Unblocks the MCP architecture tools.
+3. **Architecture drawing** [5, 11–14].
+   - The full layer stack with Shared beside it, and allowed arrows dimmed.
+   - Module chips colored by metric, using the full width.
+   - Coverage shown next to the arrows, and a compact legend.
+   - Counted chips for deviations, unassigned files and exceptions.
+4. **Tabs that earn their place** [6, 7].
+   - Classes only for production Java/Python.
+   - Sequence opens from a method, with a "most complex methods" starting list.
+   - Libraries reached in context (needs an owner decision: it reverses the 10-24 ruling).
+5. **Files and Inspector** [15–20].
+   - Treemap fits its panel; "Open full" opens Sequence.
+   - Mini-sequence scaled to fit; lighter selection.
+   - References list in the inspector; IDs out of accessible labels.
+6. **Candidate participants in Sequence and Class** [C]. Draw native candidates as dashed participants until call resolution lands.
 7. **Remaining diagram views.** C4, and Pele parity for Sequence and Class. No ERD.
 
 ### Gated (don't build until the prerequisite lands)
@@ -206,6 +233,8 @@ Item numbers in brackets refer to the gap list above.
 - ~~Should the metric color ramp be quartiles of the visible set (as drawn) or fixed thresholds?~~ Settled 2026-10-28: fixed per-metric thresholds (#395). The mockup's quartile coloring is superseded.
 - ~~In Without-Herdr mode, what does "Design a change" produce?~~ Settled 2026-10-29: **copy to clipboard**. The copied text carries the context (checkout, revision, the diagram and selection it came from) and a **structured change request** (the typed change from the structural comparison, per the design-handoff ruling), not a Mermaid text diff. It is not saved as a request for `trellis mcp`.
 - ~~How does "Follow active tab" behave when the tab's cwd isn't an indexed checkout?~~ Settled 2026-10-29: tabs whose cwd has **no Trellis index are shown greyed out and can't be clicked through to**. Following such a tab doesn't switch the view.
+
+- **Libraries tab:** keep it as a tab (2026-10-24 ruling), or reach it from external calls and references only (gap item 7)?
 
 ## Owner rulings on the packet (2026-10-24)
 
