@@ -2619,7 +2619,20 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         .join("tests/fixtures/semantic-import/issue444-javascript-calls");
     let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
     let (lib, main) = (read("src/lib.js"), read("src/main.js"));
-    let world = world(|root| write_files(root, &[("src/lib.js", &lib), ("src/main.js", &main)]));
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/lib.js", &lib),
+                ("src/main.js", &main),
+                // The fixture's package root names its module markers (#443).
+                (
+                    "package.json",
+                    r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+                ),
+            ],
+        )
+    });
     let mut fixture = world.fixture().reference("scip-typescript");
     let ordinal = fixture.artifact(
         "javascript",
