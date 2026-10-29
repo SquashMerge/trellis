@@ -54,7 +54,8 @@ test("init is inert; one owned pin/digest supplies metric values and explicit sa
   assert.equal(query.get("workbench"),"true");assert.equal(query.get("role"),"production");assert.equal(h.get("architecture-metric-tests").checked,false);
   assert.equal(query.get("aggregate"),"max");assert.equal(query.get("indexGeneration"),pin.indexGeneration);assert.equal(query.get("indexRevision"),"1");
   const {view,options} = h.renders[0];assert.equal(options.moduleValue(view.modules[0]),3);assert.equal(options.moduleValue(view.modules[1]),null);
-  assert.match(options.layerLabel(view.layers[0]),/^1 · UI · 1 files · max cognitive \(max\) 3\nUp deviation: 0 · /);
+  assert.equal(options.layerLabel(view.layers[0]),"1 · UI · 1 file · max cognitive (max) 3");
+  assert.deepEqual([...options.layerStats(view.layers[0])].map(stat => [stat.text, stat.tone]),[["↓7","neutral"]],"only non-zero counts become chips");
   assert.equal(h.reads.length,0);options.onSelectModule(view.modules[0]);
   assert.match(text(h.get("architecture-inspector-content")),/4 physical file lines · 2 production callables/);
   assert.match(text(h.get("architecture-inspector-content")),/not-measured/);
@@ -421,4 +422,80 @@ test("Relative uses admitted display modules, collapsed representation is stable
   assert.match(text(h.get("architecture-legend")), /relative totals/);
   h.get("architecture-relative").checked = true; await h.get("architecture-relative").fire("change");
   assert.equal(h.renders.at(-1).options.moduleBand(h.renders.at(-1).view.modules[0]), 0); assert.equal(h.calls.length, 2);
+});
+
+const edge = (sourceLayer, destinationLayer, count, status = "conforms", extra = {}) =>
+  ({sourceLayer,destinationLayer,role:"production",count,status,excepted:false,exceptionReason:null,pairs:[],...extra});
+test("layer stats chip only non-zero production counts by verdict, with deviations in the error tone", async () => {
+  const h = harness(), dto = fixture();
+  dto.layers.push({name:"Peer",order:2,shared:false},{name:"Shared",order:null,shared:true});
+  dto.edges = [edge("UI","Storage",7), edge("Storage","UI",56,"deviates"), edge("Storage","UI",4,"deviates",{excepted:true,exceptionReason:"Reviewed"}),
+    edge("Storage","Peer",3,"deviates"), edge("Storage","Shared",9), edge("Shared","UI",2,"deviates"),
+    {...edge("Storage","UI",11,"deviates"),role:"test"}];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const {options} = h.renders[0], stats = name => JSON.parse(JSON.stringify(options.layerStats(dto.layers.find(layer => layer.name === name)).map(stat => [stat.text, stat.tone])));
+  assert.deepEqual(stats("Storage"), [["↑56","error"],["⇄3","error"],["→shared 9","neutral"],["excepted 4","neutral"]], "test-only sites never count; excepted sites are not deviations");
+  assert.deepEqual(stats("UI"), [["↓7","neutral"]]);
+  assert.deepEqual(stats("Shared"), [["⇄2","error"]], "shared outbound is a deviation, not upward");
+  assert.deepEqual(stats("Peer"), [], "a layer without outgoing references has no chips");
+  assert.match(options.layerStats(dto.layers[1])[0].label, /^56 outgoing production reference sites · upward deviation$/);
+});
+
+test("one chip per module: a file and its same-named directory form one module that opens to files", async () => {
+  const {commonDirectory, groupModules} = harness().window.TrellisArchitecture;
+  assert.equal(commonDirectory(["src/store.rs", "src/store/a.rs", "src/model.rs"]), "src/");
+  assert.equal(commonDirectory(["web/app.js"]), "web/");
+  assert.equal(commonDirectory(["build.rs", "tools/x.py"]), "");
+  const modules = paths => paths.map(path => ({identity:identity(path)}));
+  assert.deepEqual(JSON.parse(JSON.stringify(groupModules(modules(["src/store.rs", "src/store/a.rs", "src/model.rs", "src/a.b.rs"]), "src/").map(([name, files]) => [name, files.length]))),
+    [["a.b", 1], ["model", 1], ["store", 2]]);
+  const h = harness(), dto = fixture();
+  const base = dto.modules[0];
+  dto.modules = ["src/store.rs", "src/store/a.rs", "src/store/deep/b.rs", "src/model.rs"].map((path, i) => ({...base, identity:identity(path), metrics:{cognitive:i}}));
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const display = () => h.renders.at(-1).options.display;
+  assert.equal(display().expanded("UI"), true, "bands open on module chips by default");
+  const top = display().entries("UI", dto.modules);
+  const plain = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(plain(top.map(entry => [entry.type, entry.name ?? entry.shown])), [["module","model"],["directory","store\n2 · 3 files"]]);
+  assert.match(top[1].label, /^store\n3 files · max 2\nsrc\/store$/);
+  await h.renders.at(-1).options.onToggleDirectory(top[1]);
+  const opened = display().entries("UI", dto.modules)[1];
+  assert.equal(opened.open, true);
+  assert.deepEqual(plain(opened.entries.map(entry => [entry.type, entry.name ?? entry.shown])), [["module","store.rs"],["module","a"],["module","deep"]],
+    "the root file comes first, then nested modules one level down");
+});
+
+test("module chips respect the diagram size cap with a visible note per truncated list", async () => {
+  const h = harness(), dto = fixture(), base = dto.modules[0];
+  dto.modules = Array.from({length:200}, (_, i) => ({...base, identity:identity(`src/m${String(i).padStart(3, "0")}.rs`)}));
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const display = h.renders.at(-1).options.display;
+  const first = display.entries("UI", dto.modules);
+  assert.equal(first.length, 40); assert.equal(first.filter(entry => entry.type === "module").length, 39);
+  assert.equal(first.at(-1).type, "note"); assert.match(first.at(-1).label, /^161 files not drawn · diagram size cap\nselect to list this layer's files$/);
+  let drawn = 40;
+  for (let i = 0; i < 5; i++) drawn += display.entries("UI", dto.modules).length;
+  assert.ok(drawn <= 150 + 5, `one render draws at most the cap plus its truncation notes (${drawn})`);
+  assert.equal(display.entries("UI", dto.modules).filter(entry => entry.type !== "note").length, 0, "the shared budget is exhausted");
+});
+
+test("test and fixture layers are hidden until tests and fixtures are included in metrics", async () => {
+  const h = harness();
+  const payload = role => {
+    const dto = fixture("max", "rules-one", role), base = dto.modules[0]; dto.modules[1].roleCounts = {production:1,test:2};
+    dto.layers.push({name:"Fixtures",order:0,shared:false,display:null});
+    dto.modules.push({...base, identity:identity("tests/fixtures/a.rs"), layer:"Fixtures", roleCounts:{production:3,test:0}, ...(role === "production" ? {excludedReason:"fixture"} : {})},
+      {...base, identity:identity("tests/b.rs"), layer:"Fixtures", roleCounts:{production:0,test:2}});
+    dto.edges.push(edge("Fixtures","UI",1));
+    return dto;
+  };
+  h.setResponse(async url => ({payload:payload(new URL(url, "http://local").searchParams.get("role"))})); await h.controller.refresh();
+  assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), false);
+  assert.equal(h.get("architecture-hidden").hidden, false);
+  assert.match(h.get("architecture-hidden-toggle").textContent, /1 hidden layer · 2 files · 1 production edge/);
+  assert.equal(h.get("architecture-hidden-names").textContent, "Fixtures (tests/fixtures; include them to show)");
+  h.get("architecture-metric-tests").checked = true; await h.get("architecture-metric-tests").fire("change");
+  assert.equal(h.renders.at(-1).options.display.layers.has("Fixtures"), true, "Include tests and fixtures draws the layer");
+  assert.equal(h.get("architecture-hidden").hidden, true);
 });

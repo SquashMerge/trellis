@@ -172,11 +172,11 @@
             <div class="architecture-status"><p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p>
             <p id="architecture-focus-state" class="architecture-display-note" role="status" aria-live="polite"></p></div>
             <div id="architecture-legend" class="metric-legend" aria-label="Architecture metric heat legend"></div>
-            <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Select a layer band or directory to expand it; select a module or edge for evidence."></div>
+            <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Select a layer band to fold it or a module chip to open its files; select a file or edge for evidence."></div>
             <div class="architecture-display-footers">
             <div id="architecture-quiet" class="architecture-display-footer" hidden><button id="architecture-quiet-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-quiet-names" class="detail"></span></div>
             <div id="architecture-hidden" class="architecture-display-footer" hidden><button id="architecture-hidden-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-hidden-names" class="detail"></span></div></div>
-            <p class="architecture-edge-legend">Solid: production · Dashed: test-only (never production violations) · Down: allowed · Up / peer / shared outbound: policy verdict shown · Exceptions and unknowns remain explicit.</p>
+            <p class="architecture-edge-legend">Arrows and band chips count reference sites · ↓ downward (allowed) · ↑ upward · ↔ between peers · → into shared · ← shared outbound · ⇄ peer or shared deviation (band chip) · error colour: unexcepted deviation · Solid: production · Dashed: test-only (never production violations) · Exceptions and unknowns remain explicit.</p>
             <details id="architecture-notices" class="warning-disclosure"><summary>Architecture coverage &amp; notices</summary><p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent.</p><div id="architecture-notice-content"></div></details>
           </section>
           <section id="treemap-panel" class="view-panel" role="tabpanel" aria-labelledby="view-treemap" hidden>
