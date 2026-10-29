@@ -89,6 +89,7 @@ impl Builder<'_> {
             call_id: None,
             target: None,
             resolution: None,
+            call_evidence: None,
             children: vec![],
             alternate: vec![],
             hidden: false,
@@ -447,6 +448,7 @@ impl Builder<'_> {
                 .any(|p| p.id == participant.id)
         {
             participant = Participant {
+                declaration: None,
                 id: "java:unresolved-overflow".into(),
                 label: "Unresolved calls".into(),
                 kind: "boundary".into(),
@@ -495,7 +497,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
     } else {
         ("unresolvedCallee", "unknown")
     };
-    Participant { id: format!("java:source:{kind}:{:x}", Sha256::digest(expression.as_bytes())), label: bounded(expression), kind: kind.into(),
+    Participant { declaration: None, id: format!("java:source:{kind}:{:x}", Sha256::digest(expression.as_bytes())), label: bounded(expression), kind: kind.into(),
         identification: "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.".into() }
 }
 pub(crate) fn build(
@@ -553,8 +555,8 @@ pub(crate) fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, count: 0, visits: 0, view: SequenceView {
-        revision, seed: seed.clone(), participants: vec![Participant { id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+    let mut b = Builder { file, seed, calls, count: 0, visits: 0, view: SequenceView { semantic_warnings: vec![],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Java types, overloads, virtual dispatch, annotations/Lombok, reflection, generated methods and implicit initialization are not resolved. Calls/operations may throw; implicit exception paths are not expanded.".into()], hidden_steps: 0, truncated: false,
     }};
     let f = if remaining == 0 {

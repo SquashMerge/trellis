@@ -293,3 +293,76 @@ async fn cached_sequence_and_source_are_independent_of_workspace() {
     assert_eq!(sequence_before.1["revision"], json!(pin));
     assert_eq!(sequence_before.1["seed"]["id"], *seed);
 }
+
+#[path = "common/graph_fixtures.rs"]
+mod graph_fixtures;
+
+#[tokio::test]
+async fn published_sequence_api_pairs_every_call_and_target_with_exact_pin() {
+    use graph_fixtures::{Publisher, Spec, bind, syntax_id};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut publisher = Publisher::open(&dir.path().join("state"), &workspace);
+    let mut spec = Spec::new(&[
+        ("a.rs", "fn a() { decoy(); decoy(); }\nfn decoy() {}\n"),
+        ("target.rs", "fn actual_target() {}\n"),
+    ]);
+    spec.bindings = (0..2)
+        .map(|nth| graph_fixtures::Bind {
+            provenance: "shared".into(),
+            ..bind("a", nth, "actual_target")
+        })
+        .collect();
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let target = syntax_id(publisher.native(), "actual_target");
+    let calls: Vec<_> = graph_fixtures::calls_of(publisher.native(), "a")
+        .iter()
+        .map(|call| call.id.clone())
+        .collect();
+    let store = publisher.store.clone();
+    let state = http::new(
+        store.clone(),
+        IndexOptions::new(workspace.clone()),
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = http::router(state);
+    let (status, view) = call(
+        &app,
+        "POST",
+        "/api/sequence",
+        json!({"seed":seed,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["revision"], json!(pin));
+    let steps = view["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2);
+    for (step, call_id) in steps.iter().zip(calls) {
+        assert_eq!(step["callId"], call_id);
+        assert_eq!(step["target"], target);
+        assert_eq!(step["callEvidence"]["boundaryReason"], "none");
+    }
+    let participant = view["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|participant| participant["id"] == target)
+        .unwrap();
+    assert_eq!(participant["declaration"]["path"], "target.rs");
+    std::fs::remove_file(workspace.join("target.rs")).unwrap();
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/sequence",
+            json!({"seed":seed,"expectedRevision":pin})
+        )
+        .await
+        .1,
+        view
+    );
+}

@@ -459,7 +459,9 @@ test("sequence actions recheck matched snapshot at click time",()=>{
 // Pele projection tests use the real adapter, not a reconstructed prototype DTO.
 function peleProjector() {
   const window = {};
-  vm.runInNewContext(fs.readFileSync("web/sequence-pele.js", "utf8"), {window, TextEncoder});
+  const context = vm.createContext({window, TextEncoder});
+  vm.runInContext(fs.readFileSync("web/sequence.js", "utf8"), context);
+  vm.runInContext(fs.readFileSync("web/sequence-pele.js", "utf8"), context);
   return window.TrellisPeleSequence;
 }
 function peleFixture(language) {
@@ -495,7 +497,7 @@ test("Pele projection rejects duplicates and encodes malicious repository text",
   assert.throws(() => adapter.project(view), /Duplicate sequence identity/);
 });
 
-test("Pele projection keeps human labels separate from encoded Mermaid and refuses all witnessed targets", () => {
+test("Pele projection keeps human labels separate from encoded Mermaid and refuses unsupported target evidence", () => {
   const adapter = peleProjector(), view = peleFixture("rust");
   view.steps[0].label = 'if check() Vec<T> & "quoted" / café 🔒';
   const result = adapter.project(view,new Set(),{showDetails:true});
@@ -514,7 +516,7 @@ test("Pele projection keeps human labels separate from encoded Mermaid and refus
   for (const change of cases) {
     const candidate=peleFixture("rust");candidate.steps=[structuredClone(candidate.steps[0])];
     change(candidate.steps[0]);
-    assert.throws(()=>adapter.project(candidate),/Witnessed call target/);
+    assert.throws(()=>adapter.project(candidate),/Invalid resolved target evidence/);
   }
 });
 
@@ -539,7 +541,9 @@ test("negative control: original step identity check detects altered projector",
   const fixture = peleFixture("rust");
   const evaluate = text => {
     const window = {};
-    vm.runInNewContext(text, {window, TextEncoder});
+    const context = vm.createContext({window, TextEncoder});
+    vm.runInContext(fs.readFileSync("web/sequence.js", "utf8"), context);
+    vm.runInContext(text, context);
     const row = window.TrellisPeleSequence.project(fixture).rows[0];
     assert.equal(row.id, row.step.id, "Pele map must retain original measured identity");
   };
@@ -581,6 +585,7 @@ test("Pele rejects changed inline style and oversized SVG before DOMParser", asy
   let parses = 0;
   const sandbox = {window:{pele:{render:() => ({svg:frozen.replace("max-width:100%", "max-width:200%")})}},
     TextEncoder, DOMParser:class { parseFromString() { parses++; throw Error("should not parse"); } }};
+  vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), sandbox);
   vm.runInNewContext(source, sandbox);
   const container = {replaceChildren() { throw Error("partial DOM installed"); }};
   const changed = await sandbox.window.TrellisPeleSequence.render(container, view);
@@ -612,11 +617,11 @@ test("real Chromium validates pinned SVG and source note identity under unchange
     page.on("pageerror", error => errors.push(error.message));
     await page.route("http://127.0.0.1:43987/**", route => {
       const path = new URL(route.request().url()).pathname;
-      const assets = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence-pele.js":"web/sequence-pele.js"};
+      const assets = {"/vendor/pele-1.10.0-trellis.2.js":"web/vendor/pele-1.10.0-trellis.2.js", "/sequence.js":"web/sequence.js", "/sequence-pele.js":"web/sequence-pele.js"};
       if (assets[path]) return route.fulfill({status:200, contentType:"text/javascript; charset=utf-8", body:fs.readFileSync(assets[path])});
       if (path === "/test.css") return route.fulfill({status:200, contentType:"text/css", body:"#diagram { width:240px; height:110px; overflow:auto }"});
       return route.fulfill({status:200, contentType:"text/html; charset=utf-8", body:
-        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.10.0-trellis.2.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
+        `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'"><script src="/vendor/pele-1.10.0-trellis.2.js"></script><script src="/sequence.js"></script><script src="/sequence-pele.js"></script><link rel="stylesheet" href="/test.css"><div id="diagram"></div>`});
     });
     await page.goto("http://127.0.0.1:43987/");
     await page.evaluate(() => document.addEventListener("securitypolicyviolation", event =>
@@ -793,4 +798,111 @@ test("Pele projector enforces 24 visible levels and the exact 512 KiB UTF-8 Merm
  const limit="x".repeat(512*1024-fixed+4);
  assert.equal(sourceSize(limit),512*1024);
  assert.throws(()=>adapter.project({...view,steps:[{...view.steps[0],label:limit+"x"}]},new Set(),{showDetails:true}),/Mermaid source too large/);
+});
+
+function resolvedSequence() {
+  const view = peleFixture("rust"), range = {startLine:2,endLine:4};
+  const target = {id:"actual-declaration", name:"actual_target", kind:"function", path:"target.rs", range};
+  view.participants.push({id:target.id, label:target.name, kind:"internal", declaration:target});
+  const call = {...view.steps[0], id:"original-call", callId:"original-occurrence", label:"lexical_decoy()", target:target.id,
+    hidden:false, children:[], alternate:[], callEvidence:{boundaryReason:"none",resolution:"resolved",dispatch:"direct",freshness:"fresh",provenanceId:"proof"}};
+  view.steps = [call];
+  return {view, call, target};
+}
+test("resolved projection maps original occurrences and participants, not call spelling or statement offsets", () => {
+  const adapter = peleProjector(), {view, call, target} = resolvedSequence();
+  const repeat = {...call,id:"repeat",callId:"second-occurrence"};
+  const branch = {...call,id:"guard",kind:"branch",callId:null,target:null,callEvidence:null,label:"condition",children:[call],alternate:[repeat]};
+  view.steps = [branch];
+  const result = adapter.project(view);
+  assert.equal(result.lanes.length,2);
+  assert.equal(result.lanes[1].participant.declaration,target);
+  assert.match(result.source,/participant P1 as actual_target/);
+  assert.equal(result.rows[1].step,call);
+  assert.equal(result.rows[2].step,repeat);
+  assert.equal(result.rows[1].statementId,"i3");
+  assert.equal(result.rows[2].statementId,"i5");
+  assert.equal(result.messageIds.join("|"),"i3|i5");
+  assert.equal(result.noteIds.join("|"),"i0|i2");
+  assert.equal(result.closeFrames.join("|"),"alt");
+  assert.equal(result.rows[1].target.declaration.id,target.id);
+});
+test("collapsed sequence uses only first entry target and expands exact targets without ghost lanes", () => {
+  const adapter = peleProjector(), {view,call,target} = resolvedSequence();
+  const other = {...target,id:"other-declaration",name:"other"};
+  view.participants.push({id:other.id,label:other.name,kind:"internal",declaration:other});
+  const second = {...call,id:"second",callId:"second-occurrence",target:other.id};
+  const hidden = {...second,id:"hidden",callId:"hidden-occurrence",hidden:true};
+  const group = {...call,id:"chain",kind:"group",callId:null,target:null,callEvidence:null,children:[call,second]};
+  view.steps = [group,hidden];
+  const folded = adapter.project(view);
+  assert.equal(folded.lanes.map(l=>l.id).join("|"),`${view.seed.id}|${target.id}`);
+  assert.equal(folded.rows[0].preview,call);
+  assert.equal(folded.rows[0].target.declaration,target);
+  const open = adapter.project(view,new Set([group.id]));
+  assert.equal(open.lanes.length,3);
+  assert.equal(open.rows.filter(row=>row.type==="message").length,2);
+});
+test("nonresolved engine boundaries keep honest labels and never gain target lanes", () => {
+  const adapter = peleProjector(), {view,call} = resolvedSequence();
+  for (const boundaryReason of ["unresolved","ambiguous","stale","dispatch","external","missingEvidence","nodeLimit"]) {
+    view.steps = [{...call,target:null,callEvidence:{boundaryReason}}];
+    const result = adapter.project(view);
+    assert.equal(result.lanes.length,1);
+    assert.equal(result.rows[0].type,"note");
+    assert.match(result.rows[0].display,/Unresolved|Ambiguous|Stale|Dispatch|External|Unbound|participant limit/);
+  }
+});
+test("legacy resolved lanes and arrows preserve exact target navigation and stale callbacks", () => {
+  const {view,call,target} = resolvedSequence(), opened = [];
+  let current = true;
+  const d = diagram(view,{isCurrent:()=>current,onOpenTarget:(symbol,step)=>opened.push({symbol,step})});
+  assert.equal(d.nodes().filter(n=>n.attrs.class==="sequence-participant-label").length,2);
+  assert.ok(d.nodes().some(n=>n.attrs.class==="sequence-arrow" && n.attrs["data-trellis-call-id"]===call.callId));
+  const lane = d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button");
+  lane.listeners.click(); lane.listeners.keydown({key:"Enter",preventDefault(){}}); lane.listeners.keydown({key:" ",preventDefault(){}});
+  assert.equal(opened.length,3); assert.equal(opened[0].symbol,target); assert.equal(opened[0].step,call);
+  current=false; lane.listeners.click(); assert.equal(opened.length,3);
+});
+
+test("detached legacy lane actions cannot navigate after same-container redraw", () => {
+  const {view,target} = resolvedSequence(), opened = [];
+  const d = diagram(view,{onOpenTarget:symbol=>opened.push(symbol)});
+  const old = d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button");
+  d.render(); old.listeners.click(); old.listeners.keydown({key:"Enter",preventDefault(){}});
+  assert.equal(opened.length,0);
+  d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button").listeners.click();
+  assert.equal(opened[0],target);
+});
+
+test("long repository call labels cannot hide nonresolved state words", () => {
+  const adapter = peleProjector(), {view,call} = resolvedSequence();
+  for (const boundaryReason of ["unresolved","ambiguous","stale"]) {
+    const step = {...call,label:"long_expression_".repeat(80),target:null,callEvidence:{boundaryReason}};
+    view.steps = [step];
+    const label = boundaryReason[0].toUpperCase()+boundaryReason.slice(1);
+    assert.match(adapter.project(view).rows[0].display,new RegExp(label));
+    assert.ok(visibleText(diagram(view).nodes()).some(text=>text.includes(label)));
+  }
+});
+
+test("measured boundary calls retain their control-flow context and exact engine target", () => {
+  const {view,call,target} = resolvedSequence();
+  const boundary = {...call,kind:"boundary",label:"Optional-chain call: conditional argument evaluation"};
+  view.steps = [boundary];
+  const row = peleProjector().project(view).rows[0];
+  assert.equal(row.step,boundary); assert.equal(row.target.declaration,target); assert.equal(row.type,"note");
+  assert.match(row.display,/boundary Resolved declaration - Optional-chain/);
+  const nodes = diagram(view,{onOpenTarget:()=>{}}).nodes();
+  assert.ok(nodes.some(n=>n.attrs["data-trellis-target-id"]===target.id));
+  assert.equal(nodes.filter(n=>n.attrs.class === "sequence-arrow").length,0);
+});
+
+test("resolved noncallable declaration keeps lane and source action, not a callee-sequence label", () => {
+  const {view,target} = resolvedSequence(); target.kind = "class";
+  const opened = [], d = diagram(view,{onOpenTarget:symbol=>opened.push(symbol)});
+  const lane = d.nodes().find(n=>n.attrs["data-trellis-target-id"]===target.id && n.attrs.role==="button");
+  assert.equal(lane.attrs["aria-label"],"Read declaration source: actual_target");
+  lane.listeners.click(); assert.equal(opened[0],target);
+  assert.equal(peleProjector().project(view).lanes.length,2);
 });

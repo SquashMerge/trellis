@@ -327,6 +327,8 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .sequence-scroll [data-presentation=quiet-note] .sequence-source:hover .sequence-label { fill: var(--link); }
 .sequence-scroll [data-presentation=quiet-note] .sequence-source[aria-pressed=true] .sequence-label { fill: var(--on-selected); }
 .sequence-row-hit { fill: var(--clear); stroke: var(--clear); }
+.sequence-participant-label[role="button"], .trellis-pele .pele-actor[role="button"] { cursor: pointer; }
+.sequence-participant-label[role="button"]:focus, .trellis-pele .pele-actor[role="button"]:focus { outline: 2px solid var(--focus); outline-offset: 3px; }
 .sequence-source { cursor: pointer; }
 .sequence-source:hover .sequence-row-hit { fill: var(--node); stroke: var(--line-strong); }
 .sequence-source[aria-pressed=true] .sequence-row-hit { fill: var(--selected); stroke: var(--selected); }
@@ -499,6 +501,11 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
   font-family: var(--pele-font);
 }
 .sequence-scroll .trellis-pele .pele-note[role="button"] { cursor: pointer; }
+.sequence-scroll .trellis-pele .pele-edge-label[role="button"] { cursor: pointer; }
+.sequence-scroll .trellis-pele .pele-edge-label[role="button"]:hover text { fill: var(--link); }
+.sequence-scroll .trellis-pele .pele-edge-label[role="button"][aria-pressed="true"] text { fill: var(--link); text-decoration: underline; }
+.sequence-scroll .trellis-pele .pele-edge-label[role="button"]:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.sequence-scroll .trellis-pele .pele-actor[role="button"]:hover rect { stroke: var(--link); stroke-width: 2; }
 .sequence-scroll .trellis-pele .pele-note[role="button"]:hover rect { stroke: var(--link); stroke-width: 2; }
 .sequence-scroll .trellis-pele .pele-note[role="button"][aria-pressed="true"] rect { fill: var(--selected); stroke: var(--selected); stroke-width: 2; }
 .sequence-scroll .trellis-pele .pele-note[role="button"][aria-pressed="true"] text { fill: var(--on-selected); }

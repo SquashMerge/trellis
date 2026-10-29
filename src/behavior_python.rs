@@ -165,6 +165,7 @@ impl Builder<'_> {
             call_id: None,
             target: None,
             resolution: None,
+            call_evidence: None,
             children: vec![],
             alternate: vec![],
             hidden: false,
@@ -692,6 +693,7 @@ fn call_label<'a>(n: Node<'_>, file: &'a SourceFile) -> &'a str {
 }
 fn unresolved_boundary() -> Participant {
     Participant {
+        declaration: None,
         id: "boundary:python-unknown".into(),
         label: "Unresolved calls".into(),
         kind: "boundary".into(),
@@ -712,7 +714,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
         ("unresolvedCallee", function)
     };
     let text = &file.text[hint.byte_range()];
-    Participant { id: format!("python:source:{kind}:{:x}", Sha256::digest(text.as_bytes())), label: bounded(text), kind: kind.into(),
+    Participant { declaration: None, id: format!("python:source:{kind}:{:x}", Sha256::digest(text.as_bytes())), label: bounded(text), kind: kind.into(),
         identification: "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.".into() }
 }
 pub fn build(
@@ -731,8 +733,8 @@ pub fn build(
         seed.range.start_byte < seed.range.end_byte && seed.range.end_byte <= file.text.len(),
         "invalid symbol source range"
     );
-    let mut b = Builder { file, seed, calls, count: 0, visits: 0, future_annotations: false, view: SequenceView {
-        revision, seed: seed.clone(), participants: vec![Participant { id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+    let mut b = Builder { file, seed, calls, count: 0, visits: 0, future_annotations: false, view: SequenceView { semantic_warnings: vec![],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Python types, imports, dispatch, descriptors, operator/truthiness protocols and implicit exceptions are not resolved. Async/generator bodies show possible execution on await/iteration, not call-time execution. Unsupported definition-time effects remain opaque; function bodies are deferred.".into()], hidden_steps: 0, truncated: false,
     }};
     let mut parser = tree_sitter::Parser::new();
@@ -766,6 +768,7 @@ pub fn build(
             call_id: None,
             target: None,
             resolution: None,
+            call_evidence: None,
             children: vec![],
             alternate: vec![],
             hidden: false,

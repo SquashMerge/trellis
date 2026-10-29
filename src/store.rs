@@ -21522,7 +21522,9 @@ impl Store {
         let mut calls = document.graph_calls;
         calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let file = document.file;
-        crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all).map(Some)
+        let mut view = crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all)?;
+        graph_read::sequence_calls(self, tx, &selected_revision, &mut view)?;
+        Ok(Some(view))
     }
 
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {

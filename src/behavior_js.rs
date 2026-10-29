@@ -121,6 +121,7 @@ impl Builder<'_> {
             call_id: None,
             target: None,
             resolution: None,
+            call_evidence: None,
             children: vec![],
             alternate: vec![],
             hidden: false,
@@ -421,6 +422,7 @@ impl Builder<'_> {
             .bindings
             .identify(n, &self.file.text, &self.file.path)
             .unwrap_or_else(|| Participant {
+                declaration: None,
                 id: "boundary:unknown".into(),
                 label: "Unknown/external operations (visual group, not object identity)".into(),
                 kind: "boundary".into(),
@@ -613,8 +615,8 @@ pub fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, show_all, view: SequenceView {
-        revision, seed: seed.clone(), participants: vec![Participant { id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
+    let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, show_all, view: SequenceView { semantic_warnings: vec![],
+        revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded.".into()],
         hidden_steps: 0, truncated: false,
     }};

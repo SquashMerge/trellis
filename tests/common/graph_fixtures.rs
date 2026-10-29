@@ -155,6 +155,10 @@ fn native_components(
 pub fn language_of(path: &str) -> s::Language {
     if path.ends_with(".js") {
         s::Language::Javascript
+    } else if path.ends_with(".py") {
+        s::Language::Python
+    } else if path.ends_with(".java") {
+        s::Language::Java
     } else {
         s::Language::Rust
     }
