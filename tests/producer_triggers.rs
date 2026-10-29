@@ -204,9 +204,45 @@ fn fixture() -> Fixture {
     fixture
 }
 
+/// Run `read` until it stops failing with the typed `storage_busy` that the daemon's own writes
+/// cause; any other error fails at once, and a wait that never ends is a hang.
+fn retry_busy<T>(what: &str, mut read: impl FnMut() -> anyhow::Result<T>) -> T {
+    let mut value = None;
+    trellis::testing::wait_until(what, || match read() {
+        Ok(read) => {
+            value = Some(read);
+            true
+        }
+        Err(error) if format!("{error:#}").contains("storage_busy") => false,
+        Err(error) => panic!("{what} failed: {error:#}"),
+    });
+    value.unwrap()
+}
+
 fn head(checkout: &Checkout) -> u64 {
-    let store = Store::open(roots(checkout), identity(checkout)).unwrap();
-    store.index_baseline().unwrap().index_revision
+    retry_busy("the index head read", || {
+        let store = Store::open(roots(checkout), identity(checkout))?;
+        Ok(store.index_baseline()?.index_revision)
+    })
+}
+
+#[test]
+fn head_reads_retry_storage_busy_until_the_writer_lets_go() {
+    let mut busy = 3;
+    let value = retry_busy("the retried read", || {
+        if busy == 0 {
+            return Ok(7);
+        }
+        busy -= 1;
+        Err(anyhow::anyhow!("storage_busy: SQLite lock contention"))
+    });
+    assert_eq!((value, busy), (7, 0));
+}
+
+#[test]
+#[should_panic(expected = "the failing read failed")]
+fn head_reads_do_not_retry_other_errors() {
+    retry_busy::<u64>("the failing read", || Err(anyhow::anyhow!("corrupt")));
 }
 
 /// A raw JSON-RPC session with `trellis mcp` over stdio.
