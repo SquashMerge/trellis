@@ -2145,6 +2145,9 @@ fn sweep_abandoned_semantic_stages(store: &Store) {
     if let Ok(index_dir) = store.semantic_stage_parent() {
         crate::semantic_batch::staging::remove_abandoned_semantic_stages(&index_dir);
     }
+    // Producer runs and pickup directories a crashed daemon left, except those a queued or
+    // running generated import still names (D2). Nothing is importing yet at this point.
+    crate::producer::run::sweep_state(store, false);
 }
 
 #[cfg(test)]

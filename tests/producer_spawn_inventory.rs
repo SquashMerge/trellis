@@ -522,3 +522,31 @@ fn mcp_http_watch_never_reference_producer() {
         );
     }
 }
+
+#[test]
+fn producer_spawn_reachable_only_from_run() {
+    let files = production(|_| true, false);
+    assert!(files.len() > 50);
+    let mut spawn = Vec::new();
+    let mut start = Vec::new();
+    for (file, text) in &files {
+        if whole_words(text, "spawn_producer") > 0 {
+            spawn.push(file.clone());
+        }
+        if whole_words(text, "start_run") > 0 {
+            start.push(file.clone());
+        }
+    }
+    spawn.sort();
+    start.sort();
+    assert_eq!(
+        spawn,
+        ["src/producer/exec.rs", "src/producer/run.rs"],
+        "spawn_producer is reachable from exec.rs (definition) and run.rs only"
+    );
+    assert_eq!(
+        start,
+        ["src/daemon/registry.rs", "src/producer/run.rs"],
+        "start_run is called from the run owner and the registry's run handler only"
+    );
+}

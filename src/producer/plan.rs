@@ -299,7 +299,8 @@ fn canonical_prefix(path: &Path) -> PathBuf {
     }
 }
 
-fn run_dir_template(store: &Store) -> String {
+/// `<state dir>/runs/{runId}` with the state directory as it will exist once created.
+pub fn run_dir_template(store: &Store) -> String {
     let (roots, identity) = store.state_topology();
     let state = canonical_prefix(&roots.producer_state_dir(identity));
     format!("{}/runs/{{runId}}", state.to_string_lossy())
@@ -320,9 +321,36 @@ fn resolve_for(
     Ok((pin, resolution))
 }
 
-/// The plan for `request`, with `planSha256`. Refusals and unavailable
-/// producers are typed errors; nothing is created or executed.
-pub fn plan(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Result<Value> {
+/// A plan's inputs, resolved and read but not yet rendered.
+pub struct Prepared {
+    pub row: Row,
+    pub pin: PinnedProducer,
+    pub resolution: Resolution,
+    pub declared: Declared,
+    pub basis: Basis,
+    pub limits: LimitsRequest,
+}
+
+impl Prepared {
+    /// The plan without its hash, with `run_dir` standing for the run directory.
+    pub fn build(&self, store: &Store, stub: Option<&Stub>, run_dir: &str) -> Value {
+        build(&Parts {
+            workspace: store.workspace_root(),
+            row: self.row,
+            pin: &self.pin,
+            resolution: &self.resolution,
+            declared: &self.declared,
+            stub,
+            basis: &self.basis,
+            limits: self.limits,
+            run_dir,
+        })
+    }
+}
+
+/// Resolve and verify the producer and read the retained revision a plan binds to.
+/// Refusals and unavailable producers are typed errors; nothing is created or executed.
+pub fn prepare(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Result<Prepared> {
     let target = Target::parse(&request.producer, stub.is_some())
         .ok_or_else(|| anyhow::anyhow!("invalid_request: unknown producer"))?;
     let row = profiles::row(target, request.trust_profile)?;
@@ -332,19 +360,21 @@ pub fn plan(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Result
     let baseline = store.index_baseline()?;
     let basis =
         store.with_native_reader(baseline, |reader| read_basis(reader, target.language()))?;
-    let run_dir = run_dir_template(store);
-    let plan = build(&Parts {
-        workspace: store.workspace_root(),
+    Ok(Prepared {
         row,
-        pin: &pin,
-        resolution: &resolution,
-        declared: &declared,
-        stub,
-        basis: &basis,
+        pin,
+        resolution,
+        declared,
+        basis,
         limits: request.limits,
-        run_dir: &run_dir,
-    });
-    Ok(with_hash(plan))
+    })
+}
+
+/// The plan for `request`, with `planSha256`.
+pub fn plan(store: &Store, request: &PlanRequest, stub: Option<&Stub>) -> Result<Value> {
+    let prepared = prepare(store, request, stub)?;
+    let run_dir = run_dir_template(store);
+    Ok(with_hash(prepared.build(store, stub, &run_dir)))
 }
 
 fn availability(result: &Result<Resolution, detect::Unavailable>) -> Value {
@@ -380,7 +410,8 @@ fn mode(last: Option<&RunRecord>) -> Value {
 }
 
 /// The status reply: detection, trust-profile availability and mode per
-/// producer. `activeRun` and `pickup` are filled by the slices that own them.
+/// producer, and one run's record when `runId` is given. `activeRun` and `pickup` are
+/// filled by their owners.
 pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Result<Value> {
     let declared = Declared::new(&request.environment)?;
     let head = match store.index_baseline() {
@@ -438,10 +469,19 @@ pub fn status(store: &Store, request: &StatusRequest, stub: Option<&Stub>) -> Re
             })
         })
         .collect();
-    Ok(json!({
+    let mut reply = json!({
         "workspace": store.workspace_root(),
         "head": head,
         "activeRun": null,
         "producers": producers,
-    }))
+    });
+    if let Some(run_id) = &request.run_id {
+        let record = match StateDir::existing(roots, identity)? {
+            Some(state) => state.read_run_record(run_id)?,
+            None => None,
+        };
+        let record = record.ok_or_else(|| anyhow::anyhow!("{}: run", super::NOT_FOUND))?;
+        reply["run"] = serde_json::to_value(record)?;
+    }
+    Ok(reply)
 }
