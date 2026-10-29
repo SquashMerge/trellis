@@ -214,8 +214,11 @@ ratio and peak ratio apply to medium and large only.
 A criterion is `notMeasured` for a smoke report, off the reference host, with a
 missing repetition or instrumentation value, or while its flag is false (the
 steady ratio needs `denominatorRatified`, the peak ratio needs
-`sqlitePeakMethodReviewed`). Status precedence is `unqualified` > `failed` >
-`notMeasured` > `passed`; `passed` is unreachable with the constant flags. The
+`sqlitePeakMethodReviewed`). Both flags are true since the owner ruling of
+2026-10-28 (https://github.com/SquashMerge/trellis/pull/405#issuecomment-6484495019),
+so `passed` is reachable, but only for a full report from the reference host with
+every repetition, denominator and peak value present. Status precedence is
+`unqualified` > `failed` > `notMeasured` > `passed`. The
 output always carries `authoritativeAcceptance: false` and `issue11: "open"`.
 
 The report must contain `small`, `medium` and `large` exactly once. A missing size

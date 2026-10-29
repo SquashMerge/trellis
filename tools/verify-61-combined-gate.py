@@ -89,8 +89,10 @@ INCLUSION = {
 }
 WORKER_RSS_METHOD = ("os.wait4 ru_maxrss of the daemon process; lifetime high-water including "
                      "setup and post-run validation")
-DENOMINATOR_REASON = ("combined canonical serialized-evidence container unratified "
-                      "(#61 open item 2)")
+DENOMINATOR_REASON = ("ratified denominator is the raw SCIP artifact bytes plus the native evidence "
+                      "serialization, but the native evidence serialization has no byte-exact "
+                      "definition or export outside the test-support native-capture fixture "
+                      "exporter; owner clarification needed (PR #405)")
 
 
 class GateFault(RuntimeError):

@@ -205,7 +205,7 @@ class Campaign(unittest.TestCase):
             self.assertEqual(steady["shm"], 0)
             self.assertEqual(steady["total"], steady["db"])
 
-    def test_storage_ratio_is_not_measured_until_denominator_ratified(self):
+    def test_storage_ratio_is_not_measured_until_native_serialization_is_defined(self):
         block = GATE.storage_block({"total": 10}, {"total": 15}, 0, {})
         self.assertIsNone(block["ratios"]["steady"])
         self.assertEqual(block["denominator"]["status"], "notMeasured")
@@ -214,9 +214,11 @@ class Campaign(unittest.TestCase):
         result = self.qualified_report(self.sizes({s: (1, 1, 1) for s in GATE.SIZES}))
         medium = result["sizes"][1]["evaluations"]
         self.assertEqual(medium["steadyRatio"]["status"], "notMeasured")
-        self.assertEqual(medium["peakRatio"]["status"], "notMeasured")
+        self.assertEqual(medium["peakRatio"]["status"], "passed")
+        self.assertEqual(result["status"], "notMeasured")
         self.assertEqual(medium["steadyAbsolute"]["status"], "passed")
-        self.assertFalse(result["qualification"]["denominatorRatified"])
+        self.assertTrue(result["qualification"]["denominatorRatified"])
+        self.assertIn("native evidence serialization", block["denominator"]["reason"])
 
     def test_statements_define_cold_and_synthetic_scope(self):
         self.assertIn("virgin Trellis state", GATE.STATEMENTS["cold"])

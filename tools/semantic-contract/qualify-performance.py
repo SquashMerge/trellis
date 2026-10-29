@@ -3,8 +3,11 @@
 
 Thresholds are read from the pinned policy and cohort files and are never
 changed here. The result is never authoritative acceptance and leaves #11 open.
-Status precedence is unqualified > failed > notMeasured > passed; `passed` is
-unreachable with the constant qualification flags below. The report must hold
+Status precedence is unqualified > failed > notMeasured > passed. The owner ratified
+the combined-evidence denominator and the SQLite-peak method on 2026-10-28
+(https://github.com/SquashMerge/trellis/pull/405#issuecomment-6484495019), so every
+qualification flag below is true and `passed` is reachable, but only for a full report
+from the reference host with every repetition and every measured value present. The report must hold
 small, medium and large exactly once: a duplicate is `unqualified`, a missing
 size is `notMeasured`, each with a reason naming the size. The runner's `policy`
 object is preserved; derived limits go under `qualification.limits`. Preflight
@@ -24,7 +27,7 @@ REPETITIONS = 3
 CRITERIA = ("wall", "rss", "steadyAbsolute", "steadyRatio", "peakRatio")
 STORAGE_SIZES = ("medium", "large")
 FLAGS = {"methodRatified": True, "workerRssMethodApproved": True,
-         "sqlitePeakMethodReviewed": False, "denominatorRatified": False}
+         "sqlitePeakMethodReviewed": True, "denominatorRatified": True}
 NEEDS = {"wall": "methodRatified", "rss": "workerRssMethodApproved",
          "steadyAbsolute": "methodRatified", "steadyRatio": "denominatorRatified",
          "peakRatio": "sqlitePeakMethodReviewed"}

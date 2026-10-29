@@ -68,12 +68,19 @@ no warmup, replacement or extra sample. Every original attempt is retained.
   post-run validation, a conservative upper bound. CLI RSS is recorded separately.
 - SQLite peak: a sampler stats `index.db`, `-wal`, `-shm` and stage directories
   every 50 ms from before the index command to after the import, plus a final stat.
-  The method is not yet reviewed (`sqlitePeakMethodReviewed: false`), so the peak
-  criterion is `notMeasured`.
-- Steady storage is read after a clean daemon stop. The canonical serialized
-  evidence denominator is unratified (#61 open item 2): `denominator.status` is
-  `notMeasured`, `ratios.steady` is null and the steady ratio criterion is
-  `notMeasured`. The absolute steady limit is evaluated.
+  The peak total is the database, WAL and SHM bytes (`publicationPeakIncludes`);
+  stage directory bytes are recorded separately as `stagingPeakBytes`. The owner
+  ratified this method on 2026-10-28
+  (https://github.com/SquashMerge/trellis/pull/405#issuecomment-6484495019), so
+  `sqlitePeakMethodReviewed` is true.
+- Steady storage is read after a clean daemon stop. The owner ratified the combined
+  canonical-evidence denominator on the same date (`denominatorRatified: true`): the
+  raw SCIP artifact bytes plus the native evidence serialization. The runner cannot
+  yet measure it: the repository defines no byte-exact native evidence serialization
+  outside the test-support `native-capture` fixture exporter, so
+  `denominator.status` stays `notMeasured`, `ratios.steady` is null and the steady
+  ratio criterion is `notMeasured` until the owner defines that serialization. The
+  absolute steady limit is evaluated.
 
 ## Qualification
 
@@ -82,8 +89,9 @@ A criterion is `notMeasured` in smoke, off the reference host, with a missing
 repetition or with its instrumentation flag false. Wall uses the median of the
 three raw samples; RSS requires every sample within the limit; the steady ratio and
 peak rows apply to medium and large only. Status precedence is `unqualified` >
-`failed` > `notMeasured` > `passed`; `passed` is unreachable while
-`sqlitePeakMethodReviewed` and `denominatorRatified` are false. Runner stop reasons
+`failed` > `notMeasured` > `passed`; `passed` needs a full qualified report from the
+reference host with every repetition, denominator and peak value present
+(`sqlitePeakMethodReviewed` and `denominatorRatified` are true). Runner stop reasons
 are prefixed `preflight` or `fault`; only `preflight` reasons are read as
 unqualified input by the qualifier, and a repetition with status `fault` also
 makes the report unqualified.

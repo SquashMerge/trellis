@@ -51,18 +51,48 @@ class QualificationTests(unittest.TestCase):
         self.assertFalse(result["qualification"]["referenceHost"])
         self.assertEqual(evaluation(result, "medium", "wall")["status"], "notMeasured")
 
-    def test_storage_not_measured_without_denominator(self):
+    def test_constant_flags_are_ratified(self):
+        self.assertEqual(Q.FLAGS, ALL_FLAGS)
+
+    def test_storage_not_measured_without_denominator_or_peak(self):
         result = qualify(report())
-        self.assertEqual(result["status"], "notMeasured")
-        self.assertEqual(evaluation(result, "medium", "steadyRatio")["status"], "notMeasured")
-        self.assertEqual(evaluation(result, "medium", "peakRatio")["status"], "notMeasured")
-        self.assertEqual(evaluation(result, "medium", "steadyAbsolute")["status"], "passed")
+        self.assertEqual(result["status"], "passed")
+        for criterion in ("steadyRatio", "peakRatio", "steadyAbsolute"):
+            self.assertEqual(evaluation(result, "medium", criterion)["status"], "passed")
         missing = report()
         for entry in missing["sizes"]:
             for rep in entry["repetitions"]:
                 rep["storage"]["denominator"] = {"status": "notMeasured", "bytes": None}
-        flags = {"denominatorRatified": True, "sqlitePeakMethodReviewed": True}
-        self.assertEqual(evaluation(qualify(missing, flags), "large", "steadyRatio")["status"], "notMeasured")
+        result = qualify(missing)
+        self.assertEqual(result["status"], "notMeasured")
+        self.assertEqual(evaluation(result, "large", "steadyRatio")["status"], "notMeasured")
+        self.assertEqual(evaluation(result, "large", "peakRatio")["status"], "passed")
+        no_peak = report()
+        no_peak["sizes"][2]["repetitions"][0]["storage"]["peak"] = {"total": None}
+        result = qualify(no_peak)
+        self.assertEqual(result["status"], "notMeasured")
+        self.assertEqual(evaluation(result, "large", "peakRatio")["status"], "notMeasured")
+        self.assertEqual(evaluation(result, "large", "steadyRatio")["status"], "passed")
+
+    def test_unratified_flags_keep_ratio_criteria_not_measured(self):
+        flags = dict(ALL_FLAGS, denominatorRatified=False, sqlitePeakMethodReviewed=False)
+        result = qualify(report(), flags)
+        self.assertEqual(result["status"], "notMeasured")
+        self.assertEqual(evaluation(result, "medium", "steadyRatio")["reason"], "denominatorRatified is false")
+        self.assertEqual(evaluation(result, "medium", "peakRatio")["reason"], "sqlitePeakMethodReviewed is false")
+
+    def test_ratio_thresholds_are_unchanged_and_enforced(self):
+        steady_limit = POLICY["performance"]["storage"]["steadyToCanonicalSerializedEvidenceMaxMultiplier"]
+        peak_limit = POLICY["performance"]["storage"]["publicationPeakToSteadyMaxMultiplier"]
+        self.assertEqual((steady_limit, peak_limit), (3, 2))
+        over_steady = qualify(report(steady=steady_limit * 50 + 1))
+        self.assertEqual(evaluation(over_steady, "medium", "steadyRatio")["status"], "failed")
+        self.assertEqual(over_steady["status"], "failed")
+        over_peak = qualify(report(steady=100, peak=peak_limit * 100 + 1))
+        self.assertEqual(evaluation(over_peak, "medium", "peakRatio")["status"], "failed")
+        at_limit = qualify(report(steady=steady_limit * 50, peak=peak_limit * steady_limit * 50))
+        self.assertEqual(evaluation(at_limit, "medium", "steadyRatio")["status"], "passed")
+        self.assertEqual(evaluation(at_limit, "medium", "peakRatio")["status"], "passed")
 
     def test_never_authoritative(self):
         for rep, flags in ((report(), None), (report(), ALL_FLAGS), (report(wall=10**6), ALL_FLAGS),
@@ -71,16 +101,19 @@ class QualificationTests(unittest.TestCase):
             self.assertIs(result["authoritativeAcceptance"], False)
             self.assertEqual(result["issue11"], "open")
 
-    def test_passed_is_unreachable_with_constant_flags(self):
-        self.assertNotEqual(qualify(report())["status"], "passed")
+    def test_passed_needs_a_full_reference_host_report(self):
+        self.assertEqual(qualify(report())["status"], "passed")
         self.assertEqual(qualify(report(), ALL_FLAGS)["status"], "passed")
-        forced = dict(ALL_FLAGS)
         for sizes in (("small",), ("large",), ("small", "medium")):
-            for flags in (None, forced):
-                result = qualify(report(sizes=sizes), flags)
-                self.assertNotEqual(result["status"], "passed")
-        self.assertEqual(qualify(report(sizes=("small",)), forced)["status"], "notMeasured")
-        self.assertIn("missing size medium", qualify(report(sizes=("small",)), forced)["statusReasons"])
+            for flags in (None, ALL_FLAGS):
+                self.assertNotEqual(qualify(report(sizes=sizes), flags)["status"], "passed")
+        self.assertEqual(qualify(report(sizes=("small",)))["status"], "notMeasured")
+        self.assertIn("missing size medium", qualify(report(sizes=("small",)))["statusReasons"])
+        self.assertNotEqual(qualify(report(reference=False))["status"], "passed")
+        self.assertNotEqual(qualify(report(smoke=True))["status"], "passed")
+        incomplete = report()
+        incomplete["sizes"][1]["repetitions"][2] = {"ordinal": 3, "status": "notAttempted"}
+        self.assertEqual(qualify(incomplete)["status"], "notMeasured")
 
     def test_duplicate_size_is_unqualified(self):
         for flags in (None, ALL_FLAGS):
@@ -195,7 +228,7 @@ class QualificationTests(unittest.TestCase):
     def test_failed_outranks_not_measured(self):
         result = qualify(report(wall=10**6))
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["qualification"]["denominatorRatified"], False)
+        self.assertEqual(result["qualification"]["denominatorRatified"], True)
 
     def test_input_is_not_mutated_and_output_is_deterministic(self):
         rep = report()
@@ -211,7 +244,7 @@ class QualificationTests(unittest.TestCase):
             done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--report", str(path)],
                                   capture_output=True, text=True)
             self.assertEqual(done.returncode, 0, done.stderr)
-            self.assertEqual(json.loads(done.stdout)["status"], "notMeasured")
+            self.assertEqual(json.loads(done.stdout)["status"], "passed")
             path.write_text("[]")
             done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--report", str(path)],
                                   capture_output=True, text=True)
