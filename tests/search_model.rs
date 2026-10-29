@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use trellis::search_embed::{Backend, EmbedError, EmbeddingControl};
 use trellis::search_model::{
     BackendPreference, LexicalState, SearchConfig, SearchIndexState, SearchModel,
+    SearchUnavailableReason,
 };
 
 #[test]
@@ -10,6 +11,8 @@ fn configuration_defaults_and_overrides_are_closed() {
     let default = SearchConfig::from_values(None, None).unwrap();
     assert_eq!(default.backend_preference(), BackendPreference::Auto);
     assert!(default.model_path().is_none());
+    let empty = SearchConfig::from_values(Some("".into()), None).unwrap();
+    assert_eq!(empty, default);
     for (name, preference) in [
         ("auto", BackendPreference::Auto),
         ("cpu", BackendPreference::Cpu),
@@ -35,11 +38,13 @@ fn missing_or_unverified_model_is_lexical_only_with_selected_backend() {
     let missing = tempfile::tempdir().unwrap();
     for path in [
         None,
+        Some("".into()),
         Some(missing.path().join("missing")),
         Some(missing.path().to_owned()),
     ] {
-        let mut owner =
-            SearchModel::new(SearchConfig::from_values(path, Some("cpu")).unwrap()).unwrap();
+        let config = SearchConfig::from_values(path, Some("cpu")).unwrap();
+        let configured = config.model_path().is_some();
+        let mut owner = SearchModel::new(config).unwrap();
         assert_eq!(owner.backend(), Backend::Cpu);
         let status = owner.status_handle();
         let initial = status.snapshot("test-card-format.v1", 4, 3, LexicalState::Complete, false);
@@ -56,8 +61,25 @@ fn missing_or_unverified_model_is_lexical_only_with_selected_backend() {
             });
         assert!(matches!(result, Err(EmbedError::ModelUnavailable(_))));
         assert_eq!(
-            status.snapshot("test-card-format.v1", 4, 3, LexicalState::Complete, false),
-            initial
+            initial.unavailable_reason,
+            (!configured).then_some(SearchUnavailableReason::ModelNotConfigured)
+        );
+        let failed = status.snapshot("test-card-format.v1", 4, 3, LexicalState::Complete, false);
+        assert_eq!(
+            failed.unavailable_reason,
+            Some(if configured {
+                SearchUnavailableReason::ModelLoadFailed
+            } else {
+                SearchUnavailableReason::ModelNotConfigured
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(failed).unwrap()["unavailableReason"],
+            if configured {
+                "model_load_failed"
+            } else {
+                "model_not_configured"
+            }
         );
     }
 }

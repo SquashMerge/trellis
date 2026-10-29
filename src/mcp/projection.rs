@@ -73,6 +73,7 @@ pub fn describe(
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
       "watcherDegraded":degraded,"languages":languages,"toolVersion":2,"schemaVersion":1,
+      "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
         "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
         "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":4}},

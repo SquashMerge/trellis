@@ -445,9 +445,7 @@ fn evidence_read(
                         && let Some(head) = &search_head
                         && !head.resident()?
                     {
-                        return Ok(crate::daemon::search::SearchQuery::unavailable(Some(
-                            search.status_handle().backend(),
-                        )));
+                        return Ok(search.unavailable_query());
                     }
                     match search.query_embedding(query, cancel, deadline, Some(budget.clone())) {
                         Ok(prepared) => Ok(prepared),
@@ -954,7 +952,11 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     &cancel,
                     &publish,
                 ) {
-                    Ok((read, degraded)) => {
+                    Ok(DescribeResult {
+                        read,
+                        degraded,
+                        search_availability,
+                    }) => {
                         match read {
                             Ok(DescribedSnapshot {
                                 data: Some((status, counts)),
@@ -1000,6 +1002,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         match degraded {
                             Ok(degraded) if envelope.get("data").is_some() => {
                                 envelope["data"]["watcherDegraded"] = serde_json::json!(degraded);
+                                envelope["data"]["searchIndex"] =
+                                    serde_json::to_value(search_availability)?;
                             }
                             Err(error) => envelope = tools::failure(&id, mcp_read_error(&error)),
                             _ => {}
@@ -1535,6 +1539,12 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
 
 /// Activation, the selected read and published watcher health for one
 /// describe call, on the call's own worker.
+struct DescribeResult {
+    read: anyhow::Result<DescribedSnapshot>,
+    degraded: anyhow::Result<bool>,
+    search_availability: crate::search_model::SearchAvailability,
+}
+
 fn describe(
     registry: &std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
     key: &str,
@@ -1543,7 +1553,7 @@ fn describe(
     deadline: std::time::Instant,
     cancel: &std::sync::atomic::AtomicBool,
     admitted: &dyn Fn(bool),
-) -> anyhow::Result<(anyhow::Result<DescribedSnapshot>, anyhow::Result<bool>)> {
+) -> anyhow::Result<DescribeResult> {
     let existing = registry.blocking_lock().runtime(key);
     let runtime = match existing {
         Some(runtime) => runtime,
@@ -1553,7 +1563,11 @@ fn describe(
         },
     };
     let read = read_describe(&runtime, selected, deadline, cancel, admitted);
-    Ok((read, runtime.mcp_watcher_degraded()))
+    Ok(DescribeResult {
+        read,
+        degraded: runtime.mcp_watcher_degraded(),
+        search_availability: runtime.search_availability(),
+    })
 }
 
 /// Outstanding non-call requests per connection; more are refused at once

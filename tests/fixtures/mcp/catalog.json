@@ -590,6 +590,30 @@
               "type": "integer"
             }
           ]
+        },
+        "SearchAvailability": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "backend": {
+              "enum": [
+                "cpu",
+                "metal",
+                null
+              ]
+            },
+            "unavailableReason": {
+              "enum": [
+                null,
+                "model_not_configured",
+                "model_load_failed"
+              ]
+            }
+          },
+          "required": [
+            "backend",
+            "unavailableReason"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -658,6 +682,9 @@
                 },
                 "workspaceLabel": {
                   "$ref": "#/$defs/Text"
+                },
+                "searchIndex": {
+                  "$ref": "#/$defs/SearchAvailability"
                 }
               },
               "required": [
@@ -668,7 +695,8 @@
                 "languages",
                 "toolVersion",
                 "schemaVersion",
-                "limits"
+                "limits",
+                "searchIndex"
               ],
               "type": "object"
             },
@@ -3134,7 +3162,9 @@
             "unavailableReason": {
               "enum": [
                 null,
-                "vector_budget_exceeded"
+                "vector_budget_exceeded",
+                "model_not_configured",
+                "model_load_failed"
               ]
             }
           },

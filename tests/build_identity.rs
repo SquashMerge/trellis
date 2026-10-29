@@ -79,6 +79,10 @@ async fn daemon_cli_status_adds_binary_identity_without_changing_snapshot_status
     );
     assert!(!status["revision"].is_null());
     assert_eq!(
+        status["searchIndex"],
+        serde_json::json!({"backend":null,"unavailableReason":null})
+    );
+    assert_eq!(
         status["workspaceRoot"],
         fs::canonicalize(checkout)
             .unwrap()
