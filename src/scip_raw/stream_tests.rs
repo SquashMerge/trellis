@@ -62,6 +62,7 @@ fn emit(
     claims: &mut Vec<CapturedClaim>,
     input: &AuthenticatedScipInput<'_>,
     d: &types::Document,
+    language: &str,
     kind: &str,
     raw: Value,
 ) {
@@ -77,7 +78,7 @@ fn emit(
         project_root_uri: &input.project_root_uri,
         assigned_documents: 0,
     };
-    claims.push(make_claim(&artifact, d, kind, raw));
+    claims.push(make_claim(&artifact, d, language, kind, raw));
 }
 pub(super) fn decode_whole_index_oracle(
     input: &AuthenticatedScipInput<'_>,
@@ -164,9 +165,9 @@ pub(super) fn decode_whole_index_oracle(
         let source = admitted
             .get(d.relative_path.as_str())
             .ok_or_else(|| invalid("unlisted document"))?;
-        if source.language != d.language
-            || d.text.as_bytes() != source.source_bytes && !d.text.is_empty()
-        {
+        let language =
+            bind_document_language(&d.language, &source.language, &input.profile_languages)?;
+        if d.text.as_bytes() != source.source_bytes && !d.text.is_empty() {
             return Err(invalid("document source binding"));
         }
         let raw = known(d.position_encoding)?;
@@ -191,6 +192,7 @@ pub(super) fn decode_whole_index_oracle(
                 &mut claims,
                 input,
                 d,
+                language,
                 "occurrence",
                 occurrence(o, &mut positions)?,
             );
@@ -207,13 +209,13 @@ pub(super) fn decode_whole_index_oracle(
             if count + rels.len() > 100000 {
                 return Err(limit("candidate facts"));
             }
-            emit(&mut claims, input, d, "symbolInformation", info);
+            emit(&mut claims, input, d, language, "symbolInformation", info);
             for r in rels {
                 count += 1;
                 if count.is_multiple_of(1024) {
                     cancelled(flag)?;
                 }
-                emit(&mut claims, input, d, "relationship", r);
+                emit(&mut claims, input, d, language, "relationship", r);
             }
         }
     }
@@ -439,6 +441,7 @@ fn decode_uniform(
     };
     let mut resolve = |_: &str, _: &str| {
         Ok(DocumentSource {
+            language: "javascript".into(),
             bytes: Cow::Borrowed(SOURCE),
             content_hash: sha(SOURCE),
         })
@@ -586,6 +589,7 @@ fn candidate_budget_is_shared_across_artifacts() {
             &artifact,
             &mut |_: &str, _: &str| {
                 Ok(DocumentSource {
+                    language: "javascript".into(),
                     bytes: Cow::Borrowed(SOURCE),
                     content_hash: sha(SOURCE),
                 })

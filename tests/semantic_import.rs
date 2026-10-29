@@ -2037,7 +2037,7 @@ mod batch_admission {
     use trellis::{
         scip_raw::{
             AuthenticatedArtifact, CapturedClaim, DocumentSource, ScipCaptureError, VecSink,
-            decode_streaming,
+            bind_document_language, decode_streaming,
         },
         semantic_batch::{BatchCounters, BatchLimits, descriptor::Descriptor},
     };
@@ -2052,6 +2052,10 @@ mod batch_admission {
 
     /// Three JavaScript documents covered by one artifact.
     fn world() -> World {
+        world_with_language("javascript")
+    }
+
+    fn world_with_language(language: &str) -> World {
         use protobuf::{EnumOrUnknown, Message};
         let root = tempfile::tempdir().unwrap();
         let physical = fs::canonicalize(root.path()).unwrap();
@@ -2060,7 +2064,7 @@ mod batch_admission {
         for (path, name) in [("src/A.js", "a"), ("src/B.js", "b"), ("src/C.js", "c")] {
             fs::write(physical.join(path), format!("function {name}(){{}}\n")).unwrap();
             let mut document = scip::types::Document::new();
-            document.language = "javascript".into();
+            document.language = language.into();
             document.relative_path = path.into();
             document.position_encoding = EnumOrUnknown::from_i32(2);
             let mut occurrence = scip::types::Occurrence::new();
@@ -2152,59 +2156,92 @@ mod batch_admission {
     }
 
     #[test]
-    fn admission_equals_the_streaming_decoder_on_the_same_artifact() {
-        let world = world();
-        let inventories = admit_batch(&world, batch(&world), &[&world.artifact]).unwrap();
-        assert_eq!(inventories.len(), 1);
-        let admitted = &inventories[0];
-        let hash = sha(&world.artifact);
-        let uri = format!("file://{}", world.physical.display());
-        let mut sink = VecSink::default();
-        let mut resolve = |path: &str, _language: &str| {
-            let file = world.capture.files.iter().find(|f| f.path == path).unwrap();
-            Ok(DocumentSource {
-                bytes: std::borrow::Cow::Owned(file.text.as_bytes().to_vec()),
-                content_hash: file.hash.clone(),
-            })
-        };
-        decode_streaming(
-            world.artifact.as_slice(),
-            world.artifact.len() as u64,
-            &AuthenticatedArtifact {
-                artifact_hash: &hash,
-                producer_id: "scip-typescript",
-                producer_version: &admitted_version(),
-                source_set_id: &admitted_source_set(&world),
-                source_revision: &admitted_revision(&world),
-                position_encoding: 2,
-                protocol_version: 0,
-                text_document_encoding: 1,
-                project_root_uri: &uri,
-                assigned_documents: 3,
-            },
-            &mut resolve,
-            &mut BatchCounters::default(),
-            &BatchLimits::PRODUCTION,
-            &mut sink,
-            &world.cancel,
-        )
-        .unwrap();
-        let direct: Vec<CapturedClaim> = sink.finish().unwrap();
-        assert_eq!(admitted.claims.len(), direct.len());
-        let key = |claim: &CapturedClaim| {
-            (
-                claim.envelope.relative_path.clone(),
-                claim.canonical_bytes.clone(),
+    fn single_artifact_streaming_decoder_matches_batch_admission_for_document_languages() {
+        for language in ["javascript", "", "python"] {
+            let world = world_with_language(language);
+            let (descriptor, pages) = testing::single_artifact_batch(
+                &world.capture,
+                "scip-typescript",
+                "javascript",
+                &world.artifact,
             )
-        };
-        let mut left: Vec<_> = admitted.claims.iter().collect();
-        let mut right: Vec<_> = direct.iter().collect();
-        left.sort_by_key(|claim| key(claim));
-        right.sort_by_key(|claim| key(claim));
-        for (a, b) in left.into_iter().zip(right) {
-            assert_eq!(a, b);
+            .unwrap();
+            let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+            let admitted = testing::admit_in_memory_from_capture(
+                &world.capture,
+                &descriptor,
+                &pages,
+                &[&world.artifact],
+                &world.cancel,
+            );
+            let pinned = trellis::scip_admission::pinned_producer_by_id("scip-typescript").unwrap();
+            let hash = sha(&world.artifact);
+            let uri = format!("file://{}", world.physical.display());
+            let mut sink = VecSink::default();
+            let mut resolve = |path: &str, raw_language: &str| {
+                let file = world.capture.files.iter().find(|f| f.path == path).unwrap();
+                let language =
+                    bind_document_language(raw_language, &file.language, &pinned.languages)?;
+                Ok(DocumentSource {
+                    language: language.to_owned(),
+                    bytes: std::borrow::Cow::Owned(file.text.as_bytes().to_vec()),
+                    content_hash: file.hash.clone(),
+                })
+            };
+            let decoded = decode_streaming(
+                world.artifact.as_slice(),
+                world.artifact.len() as u64,
+                &AuthenticatedArtifact {
+                    artifact_hash: &hash,
+                    producer_id: "scip-typescript",
+                    producer_version: &admitted_version(),
+                    source_set_id: &admitted_source_set(&world),
+                    source_revision: &admitted_revision(&world),
+                    position_encoding: 2,
+                    protocol_version: 0,
+                    text_document_encoding: 1,
+                    project_root_uri: &uri,
+                    assigned_documents: 3,
+                },
+                &mut resolve,
+                &mut BatchCounters::default(),
+                &BatchLimits::PRODUCTION,
+                &mut sink,
+                &world.cancel,
+            )
+            .and_then(|_| sink.finish());
+            if language == "python" {
+                for error in [admitted.unwrap_err(), decoded.unwrap_err()] {
+                    assert!(
+                        matches!(error, ScipCaptureError::InvalidArtifact(ref detail)
+                            if detail == "document source binding"),
+                        "{language}: {error:?}"
+                    );
+                }
+                continue;
+            }
+            let inventories = admitted.unwrap();
+            assert_eq!(inventories.len(), 1);
+            let admitted = &inventories[0];
+            let direct: Vec<CapturedClaim> = decoded.unwrap();
+            assert_eq!(admitted.claims.len(), direct.len());
+            assert!(!direct.is_empty());
+            assert!(direct.iter().all(|claim| claim.language == "javascript"));
+            let key = |claim: &CapturedClaim| {
+                (
+                    claim.envelope.relative_path.clone(),
+                    claim.canonical_bytes.clone(),
+                )
+            };
+            let mut left: Vec<_> = admitted.claims.iter().collect();
+            let mut right: Vec<_> = direct.iter().collect();
+            left.sort_by_key(|claim| key(claim));
+            right.sort_by_key(|claim| key(claim));
+            for (a, b) in left.into_iter().zip(right) {
+                assert_eq!(a, b, "raw language {language:?}");
+            }
+            assert_eq!(admitted.artifact_hashes, vec![hash]);
         }
-        assert_eq!(admitted.artifact_hashes, vec![hash]);
     }
 
     fn header(world: &World) -> trellis::native_evidence::Artifact {

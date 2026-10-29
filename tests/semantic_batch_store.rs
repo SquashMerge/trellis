@@ -2,6 +2,7 @@
 #[path = "support/semantic_batch.rs"]
 mod semantic_batch_support;
 
+use protobuf::Message;
 use semantic_batch_support::{
     BatchFixture, DocSpec, edit_descriptor, edit_page, long_path_workspace, uniform_workspace,
 };
@@ -2091,6 +2092,128 @@ fn identical_envelopes_are_deduplicated_per_authenticated_tuple() {
             .collect()
     };
     assert_eq!(digests(&world), digests(&other));
+}
+
+#[test]
+fn empty_document_languages_bind_through_batch_publication_and_stored_rejoin() {
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/A.js", DEFINITIONS_A),
+                ("src/B.js", DEFINITIONS_B),
+                ("src/C.py", "def f():\n    f()\n"),
+            ],
+        )
+    });
+    let (a, b) = definitions_docs();
+    let python = DocSpec::new("src/C.py")
+        .occurrence(&[0, 4, 5], &[], "pkg f().", 1)
+        .occurrence(&[1, 4, 5], &[1, 4, 7], "pkg f().", 0);
+    let mut fixture = world.fixture();
+    let mut originals = Vec::new();
+    for (language, docs) in [("javascript", vec![a, b]), ("python", vec![python])] {
+        let ordinal = fixture.artifact(language, docs.clone());
+        let mut index =
+            scip::types::Index::parse_from_bytes(&fixture.scip_bytes(language, &docs)).unwrap();
+        for document in &mut index.documents {
+            document.language.clear();
+        }
+        let bytes = index.write_to_bytes().unwrap();
+        fixture.override_artifact_raw(ordinal, bytes.clone());
+        originals.push(bytes);
+    }
+    let descriptor = world.write(&fixture);
+    let parsed = Descriptor::parse(&fs::read(&descriptor.0).unwrap()).unwrap();
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    let assert_bound = |snapshot: &trellis::semantic_evidence::SemanticSnapshot| {
+        use trellis::semantic_evidence::Language;
+        assert!(!snapshot.provenance.is_empty());
+        for proof in &snapshot.provenance {
+            let expected = if proof.document.path.ends_with(".py") {
+                ("python", Language::Python)
+            } else {
+                ("javascript", Language::Javascript)
+            };
+            assert_eq!(proof.document.language, expected.0);
+            assert_eq!(proof.basis.as_ref().unwrap().language, expected.1);
+        }
+    };
+    assert_bound(&published);
+    let proofs = stored_proofs(&world);
+    assert_eq!(proofs.len(), 7);
+    for (_, _, _, language, path) in &proofs {
+        assert_eq!(
+            language,
+            if path.ends_with(".py") {
+                "python"
+            } else {
+                "javascript"
+            }
+        );
+    }
+    let db = world.db();
+    for (artifact, original) in parsed.artifacts.iter().zip(&originals) {
+        let (stored_hash, stored): (String, Vec<u8>) = db
+            .query_row(
+                "SELECT artifact_hash,binary_bytes FROM semantic_raw_captures WHERE ordinal=?1",
+                [artifact.ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, *original);
+        assert_eq!(stored_hash, artifact.sha256);
+        assert_eq!(stored_hash, semantic_batch_support::sha256(original));
+        let index = scip::types::Index::parse_from_bytes(&stored).unwrap();
+        assert!(
+            index
+                .documents
+                .iter()
+                .all(|document| document.language.is_empty())
+        );
+    }
+    drop(db);
+    let imported = world.basis_artifacts();
+    assert_eq!(imported.len(), 3);
+    // Native recovery authenticates the stored originals again, not the admitted stage.
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(world.basis_artifacts(), imported);
+    assert_eq!(stored_proofs(&world), proofs);
+    assert_bound(
+        &world
+            .store
+            .semantic_at(world.store.index_baseline().unwrap())
+            .unwrap(),
+    );
+}
+
+#[test]
+fn nonempty_document_language_mismatch_still_fails_typed_in_batch_admission() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let docs = vec![a, b];
+    let mut fixture = world.fixture();
+    let ordinal = fixture.artifact("javascript", docs.clone());
+    let mut index =
+        scip::types::Index::parse_from_bytes(&fixture.scip_bytes("javascript", &docs)).unwrap();
+    index.documents[0].language = "python".into();
+    fixture.override_artifact_raw(ordinal, index.write_to_bytes().unwrap());
+    let error = expect_err(world.admit(&world.write(&fixture)));
+    assert_eq!(
+        error.downcast_ref::<ScipCaptureError>(),
+        Some(&ScipCaptureError::InvalidArtifact(
+            "document source binding".into()
+        ))
+    );
+    assert!(world.stage_dirs().is_empty());
 }
 
 #[test]
