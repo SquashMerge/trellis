@@ -27,15 +27,12 @@ CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
 CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
 CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id TEXT NOT NULL, name_start INTEGER, name_end INTEGER, name_ok INTEGER NOT NULL);
 CREATE INDEX nat_declarations_id ON nat_declarations(rev, doc_ord, syntax_id);
-CREATE TABLE ix_declarations(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_language TEXT NOT NULL, local_path TEXT NOT NULL, owner_language TEXT NOT NULL, owner_path TEXT NOT NULL, syntax_id TEXT NOT NULL, PRIMARY KEY(side, symbol, local_language, local_path, owner_language, owner_path, syntax_id)) WITHOUT ROWID;
-CREATE TABLE ix_type_uses(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(side, language, path, start, end, symbol)) WITHOUT ROWID;
-CREATE TABLE ix_occurrences(side INTEGER NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE TABLE ix_relationships(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, language, path, ord)) WITHOUT ROWID;
-CREATE TABLE ix_relationship_endpoints(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, language, path, source, target, ord)) WITHOUT ROWID;
-CREATE TABLE ix_reference_claims(side INTEGER NOT NULL, reference_id TEXT NOT NULL, ord INTEGER NOT NULL, proof_id TEXT NOT NULL, target TEXT NOT NULL, PRIMARY KEY(side, reference_id, ord)) WITHOUT ROWID;
-CREATE TABLE ix_call_references(side INTEGER NOT NULL, proof_id TEXT NOT NULL, reference_id TEXT NOT NULL, PRIMARY KEY(side, proof_id)) WITHOUT ROWID;
-CREATE TABLE ix_symbols(side INTEGER NOT NULL, symbol TEXT NOT NULL, declared INTEGER NOT NULL, information INTEGER NOT NULL, PRIMARY KEY(side, symbol)) WITHOUT ROWID;
-CREATE TABLE ix_methods(side INTEGER NOT NULL, kind INTEGER NOT NULL, key_a TEXT NOT NULL, key_b TEXT NOT NULL, key_c TEXT NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, kind, key_a, key_b, key_c, ord)) WITHOUT ROWID;
+CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_language TEXT NOT NULL, local_path TEXT NOT NULL, owner_language TEXT NOT NULL, owner_path TEXT NOT NULL, syntax_id TEXT NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_language,local_path,owner_language,owner_path,syntax_id)) WITHOUT ROWID;
+CREATE INDEX g_definitions_owner ON g_definitions(side,owner_language,owner_path,symbol,syntax_id);
+CREATE TABLE g_presence(side INTEGER NOT NULL, symbol TEXT NOT NULL, declared INTEGER NOT NULL, information INTEGER NOT NULL, PRIMARY KEY(side,symbol)) WITHOUT ROWID;
+CREATE TABLE g_methods(side INTEGER NOT NULL, ord INTEGER NOT NULL, symbol TEXT NOT NULL, local_language TEXT NOT NULL, local_path TEXT NOT NULL, owner_language TEXT NOT NULL, owner_path TEXT NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL, PRIMARY KEY(side,ord)) WITHOUT ROWID;
+CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_language,owner_path,ord);
+CREATE INDEX g_methods_target ON g_methods(side,symbol,local_language,local_path,ord);
 CREATE TABLE f_symbols(side INTEGER NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
 CREATE TABLE f_bindings(side INTEGER NOT NULL, ord INTEGER NOT NULL, provenance_id TEXT NOT NULL, syntax_id TEXT, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
 CREATE INDEX f_bindings_provenance ON f_bindings(side, provenance_id);
@@ -79,15 +76,9 @@ CREATE INDEX out_type_relationships_provenance ON out_type_relationships(provena
 
 /// Tables a join fills that depend on the destination revision. A new destination clears them all.
 pub const JOIN_TABLES: &[&str] = &[
-    "ix_declarations",
-    "ix_type_uses",
-    "ix_occurrences",
-    "ix_relationships",
-    "ix_relationship_endpoints",
-    "ix_reference_claims",
-    "ix_call_references",
-    "ix_symbols",
-    "ix_methods",
+    "g_definitions",
+    "g_presence",
+    "g_methods",
     "f_symbols",
     "f_bindings",
     "f_refclaims",
@@ -330,7 +321,7 @@ pub(crate) fn claim_from_stage(
     language: String,
     artifact_hash: String,
 ) -> Result<CapturedClaim> {
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         serde_json::from_slice(&canonical_bytes).context("staged claim")?;
     let text = |name: &str| {
         value[name]
@@ -338,13 +329,17 @@ pub(crate) fn claim_from_stage(
             .map(str::to_owned)
             .context("staged claim")
     };
+    let record_kind = text("recordKind")?;
+    let relative_path = text("relativePath")?;
+    let position_encoding = u8::try_from(value["positionEncoding"].as_u64().unwrap_or(0))?;
+    let raw = value["raw"].take();
     Ok(CapturedClaim {
         envelope: crate::scip_raw::CapturedScipFactV1 {
             format_version: 1,
-            record_kind: text("recordKind")?,
-            relative_path: text("relativePath")?,
-            position_encoding: u8::try_from(value["positionEncoding"].as_u64().unwrap_or(0))?,
-            raw: value["raw"].clone(),
+            record_kind,
+            relative_path,
+            position_encoding,
+            raw,
         },
         canonical_bytes,
         fact_digest,

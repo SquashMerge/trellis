@@ -2,8 +2,9 @@
 use super::{
     CoordinateMaps, InventoryIndex, JoinedFacts, MeasuredFacts, RoleSites, ScopedKey,
     join_store::{
-        BasisFor, Bytes, JoinFacts, JoinIndex, JoinSink, JoinStore, NativeFacts, OccurrenceRow,
-        ProofIdentities, ProofRef, PublicationSink, RelationshipRow,
+        BasisFor, Bytes, DocumentJoinState, GlobalJoinReads, IndexedJoinStore, JoinFacts,
+        JoinIndex, JoinSink, JoinStore, MethodSummary, NativeFacts, OccurrenceRow, ProofIdentities,
+        ProofRef, PublicationSink, RelationshipRow,
     },
     source_role_sites,
 };
@@ -101,6 +102,13 @@ impl NativeFacts for MemoryJoinStore<'_> {
 }
 
 impl JoinFacts for MemoryJoinStore<'_> {
+    type Operation = ();
+    fn operation(&self) -> Result<()> {
+        Ok(())
+    }
+    fn reserve_operation(&self, _operation: &mut (), _bytes: u64) -> Result<()> {
+        Ok(())
+    }
     fn revision_id(&self) -> &str {
         &self.measured.native.revision.id
     }
@@ -132,6 +140,7 @@ impl JoinFacts for MemoryJoinStore<'_> {
     fn document_declarations(
         &self,
         document: &native::DocumentKey,
+        _operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
         Ok(self
             .measured
@@ -155,6 +164,7 @@ impl JoinFacts for MemoryJoinStore<'_> {
         &self,
         _document: &native::DocumentKey,
         id: &str,
+        _operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
         Ok(self
             .measured
@@ -170,6 +180,7 @@ impl JoinFacts for MemoryJoinStore<'_> {
         &self,
         document: &native::DocumentKey,
         key: &[u8],
+        _operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>> {
         Ok(self
             .measured
@@ -208,6 +219,7 @@ impl JoinFacts for MemoryJoinStore<'_> {
         &self,
         _document: &native::DocumentKey,
         id: &str,
+        _operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Call>>> {
         Ok(self
             .measured
@@ -231,6 +243,7 @@ impl JoinFacts for MemoryJoinStore<'_> {
         &self,
         _document: &native::DocumentKey,
         id: &str,
+        _operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Reference>>> {
         Ok(self
             .measured
@@ -260,25 +273,6 @@ impl ProofIdentities for MemoryJoinStore<'_> {
 }
 
 impl<'a> JoinStore for MemoryJoinStore<'a> {
-    type Restricted<'i>
-        = MemoryJoinStore<'i>
-    where
-        Self: 'i;
-    type Index = MemoryJoinIndex;
-
-    fn restrict<'i>(&'i self, claims: &'i CapturedScipInventory) -> Result<MemoryJoinStore<'i>> {
-        Ok(MemoryJoinStore {
-            raw: RawIndex::Owned(InventoryIndex::new(claims)?),
-            coordinates: self.coordinates,
-            measured: self.measured,
-            sources: self.sources,
-        })
-    }
-
-    fn new_index(&self) -> MemoryJoinIndex {
-        MemoryJoinIndex::default()
-    }
-
     fn claims(&self) -> Box<dyn Iterator<Item = Result<Cow<'_, CapturedClaim>>> + '_> {
         Box::new(self.raw.claims.iter().map(|claim| Ok(Cow::Borrowed(claim))))
     }
@@ -322,6 +316,27 @@ impl<'a> JoinStore for MemoryJoinStore<'a> {
     }
 }
 
+impl<'a> IndexedJoinStore for MemoryJoinStore<'a> {
+    type Restricted<'i>
+        = MemoryJoinStore<'i>
+    where
+        Self: 'i;
+    fn restrict<'i>(&'i self, claims: &'i CapturedScipInventory) -> Result<MemoryJoinStore<'i>> {
+        Ok(MemoryJoinStore {
+            raw: RawIndex::Owned(InventoryIndex::new(claims)?),
+            coordinates: self.coordinates,
+            measured: self.measured,
+            sources: self.sources,
+        })
+    }
+
+    type Index = MemoryJoinIndex;
+
+    fn new_index(&self) -> MemoryJoinIndex {
+        MemoryJoinIndex::default()
+    }
+}
+
 /// Global join indexes held fully in memory.
 #[derive(Default)]
 pub(super) struct MemoryJoinIndex {
@@ -334,24 +349,11 @@ pub(super) struct MemoryJoinIndex {
     call_references: BTreeMap<String, String>,
     declared_symbols: BTreeSet<String>,
     information_symbols: BTreeSet<String>,
-    source_methods: BTreeMap<(native::DocumentKey, String), Vec<native::Declaration>>,
-    target_methods: BTreeMap<(String, ScopedKey), Vec<native::Declaration>>,
+    source_methods: BTreeMap<(native::DocumentKey, String), Vec<MethodSummary>>,
+    target_methods: BTreeMap<(String, ScopedKey), Vec<MethodSummary>>,
 }
 
-impl JoinIndex for MemoryJoinIndex {
-    fn put_declaration(
-        &mut self,
-        key: ScopedKey,
-        document: native::DocumentKey,
-        syntax_id: String,
-    ) -> Result<()> {
-        self.declarations
-            .entry(key)
-            .or_default()
-            .insert((document, syntax_id));
-        Ok(())
-    }
-
+impl GlobalJoinReads for MemoryJoinIndex {
     fn declarations(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>> {
         Ok(self
             .declarations
@@ -362,6 +364,44 @@ impl JoinIndex for MemoryJoinIndex {
             .collect())
     }
 
+    fn is_declared_symbol(&self, symbol: &str) -> Result<bool> {
+        Ok(self.declared_symbols.contains(symbol))
+    }
+
+    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
+        Ok(self.information_symbols.contains(symbol))
+    }
+
+    fn source_methods(
+        &self,
+        document: &native::DocumentKey,
+        symbol: &str,
+    ) -> Result<Vec<MethodSummary>> {
+        Ok(self
+            .source_methods
+            .get(&(document.clone(), symbol.to_owned()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn target_methods(
+        &self,
+        document: &native::DocumentKey,
+        symbol: &str,
+    ) -> Result<Vec<MethodSummary>> {
+        Ok(self
+            .target_methods
+            .get(&(
+                document.source_set_id.clone(),
+                super::scoped_key(symbol, document),
+            ))
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+impl DocumentJoinState for MemoryJoinIndex {
+    type ClaimReservation = ();
     fn put_type_use(
         &mut self,
         document: &native::DocumentKey,
@@ -427,7 +467,7 @@ impl JoinIndex for MemoryJoinIndex {
         path: &str,
         source: &str,
         target: &str,
-        row: RelationshipRow,
+        row: &RelationshipRow,
     ) -> Result<()> {
         self.relationship_endpoints
             .entry((
@@ -437,7 +477,7 @@ impl JoinIndex for MemoryJoinIndex {
                 target.to_owned(),
             ))
             .or_default()
-            .push(row);
+            .push(row.clone());
         Ok(())
     }
 
@@ -476,11 +516,13 @@ impl JoinIndex for MemoryJoinIndex {
     fn take_reference_claims(
         &mut self,
         reference_id: &str,
-    ) -> Result<Vec<(String, semantic::Target)>> {
-        Ok(self
-            .reference_claims
-            .remove(reference_id)
-            .unwrap_or_default())
+    ) -> Result<(Vec<(String, semantic::Target)>, ())> {
+        Ok((
+            self.reference_claims
+                .remove(reference_id)
+                .unwrap_or_default(),
+            (),
+        ))
     }
 
     fn put_call_reference(&mut self, proof_id: &str, reference_id: &str) -> Result<()> {
@@ -491,6 +533,21 @@ impl JoinIndex for MemoryJoinIndex {
 
     fn call_reference(&self, proof_id: &str) -> Result<Option<String>> {
         Ok(self.call_references.get(proof_id).cloned())
+    }
+}
+
+impl JoinIndex for MemoryJoinIndex {
+    fn put_declaration(
+        &mut self,
+        key: ScopedKey,
+        document: native::DocumentKey,
+        syntax_id: String,
+    ) -> Result<()> {
+        self.declarations
+            .entry(key)
+            .or_default()
+            .insert((document, syntax_id));
+        Ok(())
     }
 
     fn put_symbol(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
@@ -503,19 +560,11 @@ impl JoinIndex for MemoryJoinIndex {
         Ok(())
     }
 
-    fn is_declared_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self.declared_symbols.contains(symbol))
-    }
-
-    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self.information_symbols.contains(symbol))
-    }
-
     fn put_method(
         &mut self,
         document: &native::DocumentKey,
         symbol: &str,
-        method: &native::Declaration,
+        method: &MethodSummary,
     ) -> Result<()> {
         self.source_methods
             .entry((document.clone(), symbol.to_owned()))
@@ -530,35 +579,7 @@ impl JoinIndex for MemoryJoinIndex {
             .push(method.clone());
         Ok(())
     }
-
-    fn source_methods(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<Vec<native::Declaration>> {
-        Ok(self
-            .source_methods
-            .get(&(document.clone(), symbol.to_owned()))
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    fn target_methods(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<Vec<native::Declaration>> {
-        Ok(self
-            .target_methods
-            .get(&(
-                document.source_set_id.clone(),
-                super::scoped_key(symbol, document),
-            ))
-            .cloned()
-            .unwrap_or_default())
-    }
 }
-
 /// `JoinedFacts` as the in-memory join sink.
 #[derive(Default)]
 pub(super) struct MemoryJoinSink {
@@ -583,8 +604,8 @@ impl JoinSink for MemoryJoinSink {
         Ok(())
     }
 
-    fn join(&mut self, proof_id: &str, join: semantic::Join) -> Result<()> {
-        self.facts.joins.push((proof_id.to_owned(), join));
+    fn join(&mut self, proof_id: &str, join: &semantic::Join) -> Result<()> {
+        self.facts.joins.push((proof_id.to_owned(), join.clone()));
         Ok(())
     }
 

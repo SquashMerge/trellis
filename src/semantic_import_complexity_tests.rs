@@ -653,3 +653,210 @@ fn java_relationship_indexes_visit_each_snapshot_once_and_preserve_method_multip
         );
     }
 }
+
+#[test]
+fn java_override_uses_global_method_owner_from_another_language() {
+    let root = tempfile::tempdir().unwrap();
+    let physical = fs::canonicalize(root.path()).unwrap();
+    let child = "class Child extends Base { void f() {} }";
+    let base = "class Base { f() {} }";
+    fs::write(physical.join("A.java"), child).unwrap();
+    fs::write(physical.join("B.js"), base).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let capture = Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
+    let identity =
+        crate::store::topology::WorkspaceIdentity::discover(Some(&physical), &physical).unwrap();
+    let native = native::from_capture(&capture, &physical, &identity.record_id, &cancel).unwrap();
+    let sources: BTreeMap<_, _> = capture
+        .files
+        .iter()
+        .map(|file| {
+            (
+                native::DocumentKey {
+                    source_set_id: native.revision.source_set_id.clone(),
+                    language: file.language.clone(),
+                    path: file.path.clone(),
+                },
+                file.text.as_bytes().to_vec(),
+            )
+        })
+        .collect();
+    let mut claims = Vec::new();
+    let mut push = |document: &native::DocumentKey, kind: &str, raw: serde_json::Value| {
+        let envelope = crate::scip_raw::CapturedScipFactV1 {
+            format_version: 1,
+            record_kind: kind.into(),
+            relative_path: document.path.clone(),
+            position_encoding: 1,
+            raw,
+        };
+        let canonical_bytes = native_ids::canonical(&json!({
+            "formatVersion": 1, "recordKind": kind, "relativePath": document.path,
+            "positionEncoding": 1, "raw": envelope.raw,
+        }));
+        claims.push(CapturedClaim {
+            fact_digest: native_ids::digest(b"trellis.semantic-fact.v1\0", &canonical_bytes),
+            captured_proof_id: native_ids::digest(b"foreign-method-owner", &canonical_bytes),
+            canonical_bytes,
+            envelope,
+            language: document.language.clone(),
+            artifact_hash: "0".repeat(64),
+        });
+    };
+    for declaration in native
+        .declarations
+        .iter()
+        .filter(|d| matches!(d.kind.as_str(), "type" | "method"))
+    {
+        let range = declaration.name_range.as_ref().unwrap();
+        let owner = if declaration.document.path == "A.java" {
+            "Child"
+        } else {
+            "Base"
+        };
+        let (symbol, kind) = if declaration.kind == "type" {
+            (format!("scip-java pkg {owner}#"), 7)
+        } else {
+            (format!("scip-java pkg {owner}#f()."), 26)
+        };
+        push(
+            &declaration.document,
+            "occurrence",
+            json!({
+                "range": {"encoding": "legacy", "values": [0, range.start, range.end]},
+                "enclosingRange": null, "symbol": symbol, "symbolRoles": 1, "syntaxKind": 0,
+            }),
+        );
+        push(
+            &declaration.document,
+            "symbolInformation",
+            json!({"symbol": symbol, "kind": kind}),
+        );
+    }
+    let document = sources.keys().find(|d| d.path == "A.java").unwrap();
+    let start = child.find("Base").unwrap();
+    push(
+        document,
+        "occurrence",
+        json!({
+            "range": {"encoding": "legacy", "values": [0, start, start + 4]},
+            "enclosingRange": null, "symbol": "scip-java pkg Base#", "symbolRoles": 8, "syntaxKind": 0,
+        }),
+    );
+    push(
+        document,
+        "relationship",
+        json!({
+            "sourceSymbol": "scip-java pkg Child#f().", "targetSymbol": "scip-java pkg Base#f().",
+        }),
+    );
+    let inventory = CapturedScipInventory {
+        artifact_hashes: vec!["0".repeat(64)],
+        decoder_version: crate::scip_raw::DECODER_VERSION.into(),
+        source_manifest_hash: manifest_hash(&native.revision),
+        completion: crate::scip_raw::Completion::Complete,
+        exclusions: vec![],
+        claims,
+    };
+    let facts = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    let overrides: Vec<_> = facts
+        .type_relationships
+        .iter()
+        .filter(|r| r.kind == semantic::RelationshipKind::Overrides)
+        .collect();
+    assert_eq!(
+        overrides.len(),
+        1,
+        "foreign-language method must retain its owner predicate"
+    );
+    assert!(
+        matches!(&overrides[0].target, semantic::Target::Internal { document, .. } if document.path == "B.js" && document.language == "javascript")
+    );
+}
+
+#[test]
+fn direct_base_rows_preserve_order_and_admit_output_before_build() {
+    let source = b"interface I extends First, pkg.Second<T> {} class A extends pkg.Base<T> implements X, Y {}";
+    let mut bytes = 0;
+    let rows = direct_java_types(source, &mut |amount| {
+        bytes += amount;
+        Ok(())
+    })
+    .unwrap();
+    let names: Vec<_> = rows
+        .iter()
+        .map(|(_, range, _)| std::str::from_utf8(&source[range.start..range.end]).unwrap())
+        .collect();
+    assert_eq!(names, ["Base", "Y", "X", "Second", "First"]);
+    assert_eq!(
+        bytes,
+        std::mem::size_of::<Vec<DirectBase>>() as u64
+            + (rows.len() * std::mem::size_of::<DirectBase>()) as u64
+    );
+    let mut passes = 0;
+    let denied = collect_direct_bases(
+        &mut |_| {
+            Err(crate::scip_raw::ScipCaptureError::LimitExceeded("unit expansion".into()).into())
+        },
+        |emit| {
+            passes += 1;
+            emit((
+                native::Range { start: 0, end: 1 },
+                native::Range { start: 2, end: 3 },
+                semantic::RelationshipKind::Extends,
+            ))
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(denied.downcast_ref::<crate::scip_raw::ScipCaptureError>(),Some(crate::scip_raw::ScipCaptureError::LimitExceeded(name)) if name=="unit expansion")
+    );
+    assert_eq!(
+        passes, 1,
+        "denied capacity must not reach output-building pass"
+    );
+    let script = b"class A(pkg.Base, Other): pass";
+    let rows = direct_script_types(
+        script,
+        tree_sitter_python::LANGUAGE.into(),
+        "class_definition",
+        "argument_list",
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    let names: Vec<_> = rows
+        .iter()
+        .map(|(_, range, _)| std::str::from_utf8(&script[range.start..range.end]).unwrap())
+        .collect();
+    assert_eq!(names, ["Base", "Other"]);
+}
+
+#[test]
+fn reserved_canonical_key_matches_existing_encoding() {
+    use super::join_store::JoinFacts;
+    let (_root, native, sources, inventory) = case(2, false, 1);
+    let raw = InventoryIndex::new(&inventory).unwrap();
+    let coordinates = CoordinateMaps::new(&inventory, &native, &sources, 1).unwrap();
+    let measured = MeasuredFacts::new(&native, &sources).unwrap();
+    let store = MemoryJoinStore::new(&raw, &coordinates, &measured, &sources);
+    store.operation().unwrap();
+    for number in [0, usize::MAX] {
+        for parameter_types in [vec![], vec!["é\n\\\"🙂".into()]] {
+            let key = native::Key {
+                kind: "function".into(),
+                name: Some("name\t".into()),
+                signature: Some(native::Signature {
+                    parameter_types,
+                    type_parameter_count: number,
+                    variadic: false,
+                }),
+                ordinal: number,
+            };
+            let bytes = reserved_key_bytes(&store, &key, &mut ()).unwrap();
+            assert_eq!(
+                bytes,
+                native_ids::canonical(&serde_json::to_value(&key).unwrap())
+            );
+        }
+    }
+}

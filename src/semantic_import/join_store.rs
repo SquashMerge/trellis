@@ -12,12 +12,11 @@ use crate::{
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::BTreeSet, ops::Deref, rc::Rc};
+use std::{borrow::Cow, collections::BTreeSet, ops::Deref};
 
-/// The source bytes of one document: borrowed from an in-memory map, or shared with a cache.
+/// Source bytes borrowed from the store's document owner.
 pub(super) enum Bytes<'a> {
     Borrowed(&'a [u8]),
-    Shared(Rc<str>),
 }
 
 impl Deref for Bytes<'_> {
@@ -25,7 +24,6 @@ impl Deref for Bytes<'_> {
     fn deref(&self) -> &[u8] {
         match self {
             Bytes::Borrowed(bytes) => bytes,
-            Bytes::Shared(text) => text.as_bytes(),
         }
     }
 }
@@ -44,6 +42,18 @@ pub(super) trait NativeFacts {
 /// The measured native facts the exact join reads. Every lookup is scoped to one document and
 /// returns owned or `Cow` data, so a backend may serve it from a bounded cache.
 pub(super) trait JoinFacts {
+    type Operation;
+    fn operation(&self) -> Result<Self::Operation>;
+    fn reserve_operation(&self, operation: &mut Self::Operation, bytes: u64) -> Result<()>;
+    fn join_reserved(
+        &self,
+        document: &native::DocumentKey,
+        range: native::Range,
+        kind: semantic::JoinKind,
+        _operation: &mut Self::Operation,
+    ) -> Result<semantic::Join> {
+        self.join(document, range, kind)
+    }
     fn revision_id(&self) -> &str;
     fn source_set_id(&self) -> &str;
     fn join(
@@ -60,6 +70,7 @@ pub(super) trait JoinFacts {
     fn document_declarations(
         &self,
         document: &native::DocumentKey,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>>;
     fn declaration_of(
         &self,
@@ -70,11 +81,13 @@ pub(super) trait JoinFacts {
         &self,
         document: &native::DocumentKey,
         id: &str,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>>;
     fn declarations_with_key(
         &self,
         document: &native::DocumentKey,
         key: &[u8],
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Declaration>>>;
     fn has_declaration_name(
         &self,
@@ -92,6 +105,7 @@ pub(super) trait JoinFacts {
         &self,
         document: &native::DocumentKey,
         id: &str,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Call>>>;
     fn reference_of(
         &self,
@@ -102,6 +116,7 @@ pub(super) trait JoinFacts {
         &self,
         document: &native::DocumentKey,
         id: &str,
+        operation: &mut Self::Operation,
     ) -> Result<Vec<Cow<'_, native::Reference>>>;
 }
 
@@ -147,15 +162,82 @@ pub(super) struct RelationshipRow {
     pub(super) target_symbol: Option<String>,
 }
 
-/// The global indexes built by the first pass and read by the later ones, as put/get pairs.
-pub(super) trait JoinIndex {
-    fn put_declaration(
-        &mut self,
-        key: ScopedKey,
-        document: native::DocumentKey,
-        syntax_id: String,
-    ) -> Result<()>;
+/// A measured method and the exact foreign-owner predicate needed by Java overrides.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct MethodSummary {
+    pub(super) method: native::Declaration,
+    pub(super) target_owner_matches: bool,
+}
+
+impl Deref for MethodSummary {
+    type Target = native::Declaration;
+    fn deref(&self) -> &Self::Target {
+        &self.method
+    }
+}
+
+/// Complete declaration, presence and method lookups for one claim set.
+pub(super) trait GlobalJoinReads {
+    fn declarations_clone_bytes(&self, _key: &ScopedKey) -> Result<u64> {
+        Ok(0)
+    }
+    fn source_methods_clone_bytes(
+        &self,
+        _document: &native::DocumentKey,
+        _symbol: &str,
+    ) -> Result<u64> {
+        Ok(0)
+    }
+    fn target_methods_clone_bytes(
+        &self,
+        _document: &native::DocumentKey,
+        _symbol: &str,
+    ) -> Result<u64> {
+        Ok(0)
+    }
     fn declarations(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>>;
+    fn is_declared_symbol(&self, symbol: &str) -> Result<bool>;
+    fn is_information_symbol(&self, symbol: &str) -> Result<bool>;
+    fn source_methods(
+        &self,
+        document: &native::DocumentKey,
+        symbol: &str,
+    ) -> Result<Vec<MethodSummary>>;
+    fn target_methods(
+        &self,
+        document: &native::DocumentKey,
+        symbol: &str,
+    ) -> Result<Vec<MethodSummary>>;
+}
+
+pub(super) type ReferenceClaims = Vec<(String, semantic::Target)>;
+
+/// Scratch state for occurrence and relationship classification. No global discovery writes.
+pub(super) trait DocumentJoinState: GlobalJoinReads {
+    type ClaimReservation;
+    fn type_uses_clone_bytes(
+        &self,
+        _document: &native::DocumentKey,
+        _start: usize,
+        _end: usize,
+    ) -> Result<u64> {
+        Ok(0)
+    }
+    fn relationships_clone_bytes(&self, _language: &str, _path: &str) -> Result<u64> {
+        Ok(0)
+    }
+    fn relationship_endpoints_clone_bytes(
+        &self,
+        _language: &str,
+        _path: &str,
+        _source: &str,
+        _target: &str,
+    ) -> Result<u64> {
+        Ok(0)
+    }
+    fn call_reference_clone_bytes(&self, _proof_id: &str) -> Result<u64> {
+        Ok(0)
+    }
     fn put_type_use(
         &mut self,
         document: &native::DocumentKey,
@@ -171,6 +253,10 @@ pub(super) trait JoinIndex {
     ) -> Result<BTreeSet<String>>;
     fn put_occurrence(&mut self, row: OccurrenceRow) -> Result<()>;
     fn occurrence_count(&self) -> usize;
+    /// Logical clone bytes. Memory is unmetered; decoded staged rows override this.
+    fn occurrence_clone_bytes(&self, _ordinal: usize) -> Result<u64> {
+        Ok(0)
+    }
     fn occurrence(&self, ordinal: usize) -> Result<OccurrenceRow>;
     fn put_relationship(&mut self, language: &str, path: &str, row: RelationshipRow) -> Result<()>;
     fn relationships(&self, language: &str, path: &str) -> Result<Vec<RelationshipRow>>;
@@ -180,7 +266,7 @@ pub(super) trait JoinIndex {
         path: &str,
         source: &str,
         target: &str,
-        row: RelationshipRow,
+        row: &RelationshipRow,
     ) -> Result<()>;
     fn relationship_endpoints(
         &self,
@@ -198,44 +284,79 @@ pub(super) trait JoinIndex {
     fn take_reference_claims(
         &mut self,
         reference_id: &str,
-    ) -> Result<Vec<(String, semantic::Target)>>;
+    ) -> Result<(ReferenceClaims, Self::ClaimReservation)>;
     fn put_call_reference(&mut self, proof_id: &str, reference_id: &str) -> Result<()>;
     fn call_reference(&self, proof_id: &str) -> Result<Option<String>>;
-    /// Records that `symbol` is declared by an occurrence or described by a symbol information.
+}
+
+/// Whole-claim-set discovery used by the existing indexed driver.
+pub(super) trait JoinIndex: DocumentJoinState {
+    fn put_declaration(
+        &mut self,
+        key: ScopedKey,
+        document: native::DocumentKey,
+        syntax_id: String,
+    ) -> Result<()>;
     fn put_symbol(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()>;
-    fn is_declared_symbol(&self, symbol: &str) -> Result<bool>;
-    fn is_information_symbol(&self, symbol: &str) -> Result<bool>;
-    /// Records a measured method whose name range carries `symbol` in its document.
     fn put_method(
         &mut self,
         document: &native::DocumentKey,
         symbol: &str,
-        method: &native::Declaration,
+        method: &MethodSummary,
     ) -> Result<()>;
-    fn source_methods(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<Vec<native::Declaration>>;
-    fn target_methods(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<Vec<native::Declaration>>;
+}
+
+/// Global information learned from authenticated claims, independent of occurrence storage.
+pub(super) trait GlobalDiscoverySink {
+    fn symbol_presence(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()>;
+    fn exact_definition(
+        &mut self,
+        key: ScopedKey,
+        document: native::DocumentKey,
+        syntax_id: String,
+        common_compatible: bool,
+    ) -> Result<()>;
+}
+
+impl<I: JoinIndex> GlobalDiscoverySink for I {
+    fn symbol_presence(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
+        self.put_symbol(symbol, declared, information)
+    }
+
+    fn exact_definition(
+        &mut self,
+        key: ScopedKey,
+        document: native::DocumentKey,
+        syntax_id: String,
+        common_compatible: bool,
+    ) -> Result<()> {
+        if common_compatible {
+            self.put_declaration(key, document, syntax_id)?;
+        }
+        Ok(())
+    }
 }
 
 /// Rows produced by the exact join. Rows that later passes revise are addressed by slot.
 pub(super) trait JoinSink {
     fn symbol(&mut self, row: semantic::Symbol) -> Result<()>;
     fn declaration_binding(&mut self, row: semantic::DeclarationBinding) -> Result<()>;
-    fn join(&mut self, proof_id: &str, join: semantic::Join) -> Result<()>;
+    fn join(&mut self, proof_id: &str, join: &semantic::Join) -> Result<()>;
     fn reference_claim(&mut self, proof_id: &str, row: semantic::Reference) -> Result<()>;
     fn reference_slot(&self, reference_id: &str) -> Result<Option<usize>>;
     fn reference_count(&self) -> usize;
+    /// The disposable SQL bridge is unmetered here until its slice-3 removal.
+    fn reference_clone_bytes(&self, _slot: usize) -> Result<u64> {
+        Ok(0)
+    }
     fn reference(&self, slot: usize) -> Result<semantic::Reference>;
     /// Replaces the row at `slot`, or appends when `slot` is `None`. Returns the slot.
     fn put_reference(&mut self, slot: Option<usize>, row: semantic::Reference) -> Result<usize>;
     fn call_binding_count(&self) -> usize;
+    /// The disposable SQL bridge is unmetered here until its slice-3 removal.
+    fn call_binding_clone_bytes(&self, _slot: usize) -> Result<u64> {
+        Ok(0)
+    }
     fn call_binding(&self, slot: usize) -> Result<semantic::CallBinding>;
     fn put_call_binding(
         &mut self,
@@ -259,14 +380,6 @@ pub(super) trait PublicationSink {
 
 /// A claim set joined against one revision's measured facts.
 pub(super) trait JoinStore: JoinFacts + ProofIdentities {
-    /// The same coordinates and measured facts, served for a different claim set.
-    type Restricted<'i>: JoinStore
-    where
-        Self: 'i;
-    type Index: JoinIndex;
-
-    fn restrict<'i>(&'i self, claims: &'i CapturedScipInventory) -> Result<Self::Restricted<'i>>;
-    fn new_index(&self) -> Self::Index;
     /// The claim stream in canonical order.
     fn claims(&self) -> Box<dyn Iterator<Item = Result<Cow<'_, CapturedClaim>>> + '_>;
     /// Proof lookup by `(proof_id, kind, digest)`.
@@ -280,8 +393,35 @@ pub(super) trait JoinStore: JoinFacts + ProofIdentities {
         claim: &CapturedClaim,
         admitted_encoding: u8,
     ) -> Result<native::Range>;
+    fn enclosing_occurrence_range(
+        &self,
+        claim: &CapturedClaim,
+        admitted_encoding: u8,
+    ) -> Result<native::Range> {
+        let mut enclosing = claim.clone();
+        enclosing.envelope.raw["range"] = claim.envelope.raw["enclosingRange"].clone();
+        self.occurrence_range(&enclosing, admitted_encoding)
+    }
     /// Role sites of one document, parsed on demand.
     fn role_sites(&self, document: &native::DocumentKey) -> Result<RoleSites>;
+    fn role_sites_reserved(
+        &self,
+        document: &native::DocumentKey,
+        _operation: &mut Self::Operation,
+    ) -> Result<RoleSites> {
+        self.role_sites(document)
+    }
     /// Accounts `units` of lookup work against a backend budget.
     fn charge(&self, units: usize) -> Result<()>;
+}
+
+/// Whole-corpus aggregation retained only by the independent in-memory driver.
+pub(super) trait IndexedJoinStore: JoinStore {
+    /// The same coordinates and measured facts, served for a different claim set.
+    type Restricted<'i>: IndexedJoinStore
+    where
+        Self: 'i;
+    fn restrict<'i>(&'i self, claims: &'i CapturedScipInventory) -> Result<Self::Restricted<'i>>;
+    type Index: JoinIndex;
+    fn new_index(&self) -> Self::Index;
 }

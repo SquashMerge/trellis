@@ -35,6 +35,8 @@ pub struct BatchCounters {
     pub live_unit_buffers: u64,
     pub live_unit_buffers_high_water: u64,
     pub unit_reservation_high_water_bytes: u64,
+    /// Logical join expansion, separate from admission's decode-buffer reservation.
+    pub join_reservation_high_water_bytes: u64,
     pub document_cache_high_water_bytes: u64,
     pub document_cache_high_water_entries: u64,
     pub active_document_groups_high_water: u64,
@@ -56,6 +58,9 @@ impl BatchCounters {
 
     /// Folds a join's high-water marks into the batch counters.
     pub(crate) fn absorb_join(&mut self, join: &BatchCounters) {
+        self.join_reservation_high_water_bytes = self
+            .join_reservation_high_water_bytes
+            .max(join.join_reservation_high_water_bytes);
         self.document_cache_high_water_bytes = self
             .document_cache_high_water_bytes
             .max(join.document_cache_high_water_bytes);
