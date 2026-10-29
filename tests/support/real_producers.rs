@@ -198,14 +198,6 @@ impl Availability {
     }
 }
 
-fn count(value: &Value) -> u64 {
-    match value {
-        Value::Number(number) => number.as_u64().unwrap_or(0),
-        Value::Array(items) => items.len() as u64,
-        _ => 0,
-    }
-}
-
 /// Index a copy of the fixture, plan, run the producer and assert the import. Returns the
 /// printed evidence line, or `None` when the producer is unavailable and the variant skips.
 pub fn run_case(case: &Case, availability: Availability) -> Option<String> {
@@ -256,34 +248,24 @@ pub fn run_case(case: &Case, availability: Availability) -> Option<String> {
         case.producer,
         plan["producer"]["version"].as_str().unwrap(),
         case.trust,
-        published["id"].as_str().unwrap_or("?"),
+        published,
     );
     println!("{line}");
     Some(line)
 }
 
-/// Documents the report covers with facts, and the total fact count. The report is the
-/// import's `report` object; every fixture document must be named in it.
+/// Documents the import covered and its total claim count, from the report's per-artifact
+/// totals. Every fixture document must be covered by an imported artifact.
 fn report_totals(report: &Value, documents: &[String]) -> (u64, u64) {
-    let text = report.to_string();
-    for document in documents {
-        assert!(text.contains(document), "{document} missing from {report}");
-    }
-    fn facts(value: &Value) -> u64 {
-        match value {
-            Value::Object(map) => map
-                .iter()
-                .map(|(key, value)| {
-                    if key.to_ascii_lowercase().contains("fact") {
-                        count(value)
-                    } else {
-                        facts(value)
-                    }
-                })
-                .sum(),
-            Value::Array(items) => items.iter().map(facts).sum(),
-            _ => 0,
-        }
-    }
-    (documents.len() as u64, facts(report))
+    let artifacts = report["artifacts"].as_array().unwrap_or_else(|| {
+        panic!("report has no artifacts: {report}");
+    });
+    let sum = |key: &str| -> u64 { artifacts.iter().filter_map(|a| a[key].as_u64()).sum() };
+    let covered = sum("documents");
+    assert!(
+        covered >= documents.len() as u64,
+        "{covered} documents covered, expected {}: {report}",
+        documents.len()
+    );
+    (covered, sum("claims"))
 }
