@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reproduce #40 bounded-query latency gates over the real MCP stdio path.
 
-Measurement mode (reference host only) times seven kinds against the medium and
+Measurement mode (reference host only) times eight kinds against the medium and
 large synthetic cohorts: syntax-only by default, plus semantic-bound answers
 with --semantic. --smoke --binary PATH is the untimed, host-independent proof
 of the semantic path on a four-file workspace.
@@ -52,13 +52,14 @@ ELECTION_RELEASE_WAIT = 120  # seconds; the daemon may be busy in background fil
 GRAPH_KINDS = ("defaultBoundedQuery", "maximumBoundedQuery",
                "semanticDefaultBoundedQuery", "semanticMaximumBoundedQuery")
 SYNTAX_KINDS = ("defaultBoundedQuery", "maximumBoundedQuery", "symbolSubstringSearch",
-                "status", "sourceByKey")
+                "symbolSubstringSearchSparse", "status", "sourceByKey")
 SEMANTIC_KINDS = ("semanticDefaultBoundedQuery", "semanticMaximumBoundedQuery")
 POLICY_ENTRY = {"defaultBoundedQuery": "defaultBoundedQuery",
                 "maximumBoundedQuery": "maximumBoundedQuery",
                 "semanticDefaultBoundedQuery": "defaultBoundedQuery",
                 "semanticMaximumBoundedQuery": "maximumBoundedQuery",
                 "symbolSubstringSearch": "symbolSubstringSearch",
+                "symbolSubstringSearchSparse": "symbolSubstringSearch",
                 "status": "status", "sourceByKey": "sourceByKey"}
 
 LIMITATION_IDENTICAL = ("defaultBoundedQuery and maximumBoundedQuery do identical work; "
@@ -282,7 +283,7 @@ def floored_samples(db, pin, size, floor, scope, producer=None):
     """Apply the floor to this run's own facts before any sampling."""
     counts = facts_for(db, pin)
     check_floor(counts, size, floor, scope)
-    return counts, collect_samples(db, pin, producer)
+    return counts, collect_samples(db, pin, producer, smoke=size == "smoke")
 
 
 # --- deterministic samples ------------------------------------------------
@@ -311,7 +312,45 @@ def covered_roots(db, pin, producer):
     return [row[2] for row in db.execute(_ROOTS.format(covered=_COVERED), (pin, producer))]
 
 
-def collect_samples(db, pin, producer=None):
+def sparse_substrings(db, pin, smoke=False):
+    """Choose bounded, real-name substring samples before any timing.
+
+    Drop up to three trailing characters to group nearby synthetic class names.
+    Counts cover retained history; active hits must also exceed W2's 21-row
+    lookahead. Only the four-file smoke relaxes that minimum.
+    """
+    minimum, maximum = (1 if smoke else 22), 200
+    names = [row[0] for row in db.execute(
+        """SELECT DISTINCT d.name FROM revision_documents m
+           JOIN native_version_declarations d ON d.vid=m.vid
+           WHERE m.revision_id=? AND length(d.name)>=3 ORDER BY d.name LIMIT 4096""", (pin,))]
+    selected = []
+    queries = {name[:max(3, len(name) - cut)] for name in names for cut in range(4)}
+    for query in sorted(queries):
+        lowered = query.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
+        expression = '"' + lowered.replace('"', '""') + '"'
+        candidates = db.execute(
+            """SELECT count(*) FROM (SELECT rowid FROM native_declaration_trigrams
+               WHERE native_declaration_trigrams MATCH ? LIMIT ?)""",
+            (expression, maximum + 1)).fetchone()[0]
+        if not minimum <= candidates <= maximum:
+            continue
+        active = db.execute(
+            """SELECT count(*) FROM native_declaration_trigrams
+               CROSS JOIN native_version_declarations d ON d.rowid=native_declaration_trigrams.rowid
+               JOIN revision_documents m ON m.vid=d.vid AND m.revision_id=?
+               WHERE native_declaration_trigrams MATCH ? AND instr(lower(d.name),lower(?))>0""",
+            (pin, expression, query)).fetchone()[0]
+        if active >= minimum:
+            selected.append({"query": query, "globalFtsCandidates": candidates, "activeRevisionHits": active})
+    require(selected, f"no sparse real-name substring with {minimum}..{maximum} global FTS candidates and active hits")
+    picked = stride_sample(selected, SAMPLES)
+    return {"globalFtsRange": [minimum, maximum], "activeRevisionMinimum": minimum,
+            "smokeRelaxedMinimum": smoke, "candidateNameLimit": 4096,
+            "candidateNameCount": len(names), "eligibleQueryCount": len(selected), "samples": picked}
+
+
+def collect_samples(db, pin, producer=None, smoke=False):
     roots = covered_roots(db, pin, producer) if producer else callable_roots(db, pin)
     require(roots, "no callable root with calls" + (" covered by the producer" if producer else ""))
     names = [row[0] for row in db.execute(
@@ -322,7 +361,8 @@ def collect_samples(db, pin, producer=None):
     require(names and documents, "no declaration names or documents to sample")
     return {"roots": stride_sample(roots, SAMPLES), "rootCount": len(roots),
             "substrings": [(n[1:4] if len(n) >= 4 else n[0:3]) for n in stride_sample(names, SAMPLES)],
-            "documents": stride_sample(documents, SAMPLES)}
+            "documents": stride_sample(documents, SAMPLES),
+            "sparseSearch": sparse_substrings(db, pin, smoke)}
 
 
 # --- edge counts ----------------------------------------------------------
@@ -448,6 +488,8 @@ def kind_arguments(kind, sample, samples, policy, producer, workspace):
         return "trellis_call_graph", arguments
     if kind == "symbolSubstringSearch":
         return "trellis_find_symbols", {"query": samples["substrings"][sample]}
+    if kind == "symbolSubstringSearchSparse":
+        return "trellis_find_symbols", {"query": samples["sparseSearch"]["samples"][sample]["query"]}
     if kind == "status":
         return "trellis_workspace_describe", {}
     path = samples["documents"][sample]
@@ -525,7 +567,7 @@ def measure_cohort(binary, home, workspace, pin, size, floor, scope, semantic, p
         if mcp is not None:
             mcp.stop()
     return {"facts": facts, "producer": producer, "coveredRoots": samples["rootCount"] if semantic else None,
-            "kinds": results}
+            "kinds": results, "sparseSearch": samples["sparseSearch"]}
 
 
 def pin_of(output):
@@ -567,7 +609,7 @@ def smoke(binary):
         print("SMOKE_40_RESULT=" + json.dumps(
             {"pin": pin, "unexpectedHomeProcesses": False, "producer": cohort["producer"], "facts": cohort["facts"],
              "coveredRoots": cohort["coveredRoots"],
-             "kinds": cohort["kinds"],
+             "kinds": cohort["kinds"], "sparseSearch": cohort["sparseSearch"],
              "edgeCounts": {k: cohort["kinds"][k]["edgeCounts"] for k in GRAPH_KINDS}},
             sort_keys=True), flush=True)
     finally:
@@ -676,6 +718,8 @@ def build_report(host, manifest_sha, semantic, sizes, policy):
             kinds[kind] = result
             passed = passed and result["pass"]
         entry = {"facts": cohort["facts"], "kinds": kinds}
+        if "sparseSearch" in cohort:
+            entry["sparseSearch"] = cohort["sparseSearch"]
         if semantic:
             entry.update(producer=cohort["producer"], anchorPath=cohort["anchorPath"],
                          artifactSha256=cohort["artifactSha256"], coveredRoots=cohort["coveredRoots"])
