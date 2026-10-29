@@ -1747,6 +1747,20 @@ fn cli_index_request(
     }
 }
 
+/// The CLI error for a failed request: its code first, then the recorded reason, if any.
+fn failed_request_error(
+    row: &crate::store::requests::Request,
+    fallback: &str,
+    suffix: &str,
+) -> anyhow::Error {
+    let (code, reason) =
+        crate::store::requests::split_error(row.error_code.as_deref().unwrap_or(fallback));
+    match reason {
+        Some(reason) => anyhow::anyhow!("{code}: request {} failed: {reason}{suffix}", row.id),
+        None => anyhow::anyhow!("{code}: request {} failed{suffix}", row.id),
+    }
+}
+
 impl CheckoutRuntime {
     fn resources(&self) -> anyhow::Result<Arc<ActiveResources>> {
         self.resources
@@ -1891,11 +1905,13 @@ impl CheckoutRuntime {
                         serde_json::json!({"publishedRevision": revision, "status": status}),
                     );
                 }
-                "failed" => anyhow::bail!(
-                    "{}: request {} failed; inspect job status",
-                    row.error_code.as_deref().unwrap_or("store_unavailable"),
-                    accepted.id
-                ),
+                "failed" => {
+                    return Err(failed_request_error(
+                        &row,
+                        "store_unavailable",
+                        "; inspect job status",
+                    ));
+                }
                 "queued" | "running" => {
                     crate::index_coordinator::diagnostic_marker(
                         "-",
@@ -1946,11 +1962,7 @@ impl CheckoutRuntime {
                         serde_json::json!({"requestId":accepted.id,"publishedRevision":pin,"report":report}),
                     );
                 }
-                "failed" => anyhow::bail!(
-                    "{}: request {} failed",
-                    row.error_code.as_deref().unwrap_or("index_failed"),
-                    accepted.id
-                ),
+                "failed" => return Err(failed_request_error(&row, "index_failed", "")),
                 "queued" | "running" => resources.store.wait_terminal_change(seen),
                 _ => anyhow::bail!("store_unavailable: invalid request state"),
             }

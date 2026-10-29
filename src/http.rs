@@ -3168,9 +3168,15 @@ struct IndexRequest {
 }
 impl From<crate::store::requests::Request> for IndexJob {
     fn from(row: crate::store::requests::Request) -> Self {
-        let error = row
-            .error_code
-            .map(|code| json!({"code":code,"message":"Index job failed"}));
+        let error =
+            row.error_code.as_deref().map(|stored| {
+                match crate::store::requests::split_error(stored) {
+                    (code, Some(reason)) => {
+                        json!({"code":code,"reason":reason,"message":"Index job failed"})
+                    }
+                    (code, None) => json!({"code":code,"message":"Index job failed"}),
+                }
+            });
         Self {
             id: row.id,
             state: row.state,
@@ -3181,6 +3187,48 @@ impl From<crate::store::requests::Request> for IndexJob {
             started_at: row.started_at,
             finished_at: row.finished_at,
         }
+    }
+}
+#[cfg(test)]
+mod index_job_error_tests {
+    use super::IndexJob;
+    use crate::store::requests::{Request, RequestKind};
+    use serde_json::json;
+
+    fn failed(error_code: &str) -> Request {
+        Request {
+            seq: 1,
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            request_kind: RequestKind::SemanticImport,
+            state: "failed".into(),
+            root_device: "1".into(),
+            root_inode: "2".into(),
+            options_json: "{}".into(),
+            expected: None,
+            claim_incarnation: Some("claim".into()),
+            revision: None,
+            error_code: Some(error_code.into()),
+            submitted_at: "1".into(),
+            started_at: Some("2".into()),
+            finished_at: Some("3".into()),
+        }
+    }
+
+    #[test]
+    fn job_status_exposes_the_recorded_code_and_reason() {
+        let job = IndexJob::from(failed("invalid_artifact: empty or reversed SCIP range"));
+        assert_eq!(
+            job.error,
+            Some(
+                json!({"code":"invalid_artifact","reason":"empty or reversed SCIP range",
+                "message":"Index job failed"})
+            )
+        );
+        let bare = IndexJob::from(failed("revision_conflict"));
+        assert_eq!(
+            bare.error,
+            Some(json!({"code":"revision_conflict","message":"Index job failed"}))
+        );
     }
 }
 async fn start_index(
