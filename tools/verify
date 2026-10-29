@@ -87,10 +87,12 @@ rust() {
   cargo fmt --all -- --check
   cargo clippy --locked --all-targets -- -D warnings
   cargo clippy --locked --all-targets --features test-support -- -D warnings
+  cargo build --locked --features test-support --bin trellis
+  cp "$target_dir/debug/trellis" "$target_dir/debug/trellis-navigation-fixture"
   cargo build --locked --bin trellis
   python3 tools/verify-40-query-performance.py --smoke --binary "$target_dir/debug/trellis"
   browser_system_deps
-  TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs
+  TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs tests/browser/navigation-resolved.test.cjs
 }
 tests() {
   if ! nextest_version=$(cargo nextest --version 2>/dev/null); then

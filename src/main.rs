@@ -15,6 +15,9 @@ use trellis::{
     store::topology::{TopologyRoots, WorkspaceIdentity},
 };
 
+#[cfg(feature = "test-support")]
+mod native_navigation_fixture;
+
 #[derive(Parser)]
 #[command(
     name = "trellis",
@@ -32,6 +35,9 @@ enum Command {
     /// Export fixture snapshots through the real native extractor (test-support build only).
     #[cfg(feature = "test-support")]
     NativeCapture(NativeCaptureArgs),
+    #[cfg(feature = "test-support")]
+    #[command(hide = true)]
+    NavigationFixture(NavigationFixtureArgs),
     /// Build and atomically publish a complete index. Does not execute repository code.
     Index(IndexArgs),
     /// Explicitly import pinned SCIP evidence into the selected native index.
@@ -73,6 +79,14 @@ struct NativeCaptureArgs {
     source_set: Option<String>,
     #[arg(long)]
     revision: Option<String>,
+}
+#[cfg(feature = "test-support")]
+#[derive(Args)]
+struct NavigationFixtureArgs {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long, value_parser = ["zero", "sole", "multiple", "unresolved"])]
+    mode: String,
 }
 #[derive(Args)]
 struct RulesArgs {
@@ -290,6 +304,13 @@ async fn main() -> Result<()> {
                     args.revision.as_deref(),
                 )?;
             }
+        }
+        #[cfg(feature = "test-support")]
+        Command::NavigationFixture(args) => {
+            print_json(&native_navigation_fixture::publish(
+                &args.workspace,
+                &args.mode,
+            )?)?;
         }
         Command::Daemon | Command::Serve(_) | Command::GitRead(_) => unreachable!(),
         Command::Mcp(args) => {

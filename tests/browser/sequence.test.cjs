@@ -55,6 +55,74 @@ test("published Store sequence renders Pele and selects exact measured source by
  assert.equal(await page.locator("#call-inspector").innerText(),before);
  assert.equal(sourceRequests.length,sourceCount);
 }));
+
+test("method source Sequence uses the clicked declaration, not the left-tree selection, and Back restores source", {timeout:240000}, async () => published(source, async ({page, dto, pin}) => {
+ // The tree remains on measured throughout source selection. The helper's
+ // measured ID comes from its own source annotation, never the current seed.
+ await page.locator("#method-source").click();
+ await page.waitForFunction(() => document.querySelector("#source .source-line"));
+ const action = page.getByRole("button", {name:/^Sequence for first ·/});
+ await action.waitFor();
+ const helperId = await action.getAttribute("data-symbol-id");
+ assert.ok(helperId && helperId !== dto.seed.id);
+ assert.match(await page.locator(".method-pick.selected").textContent(), /measured/);
+ const before = await page.locator("#source").textContent();
+ const highlighted = await page.locator("#source .highlight .line-number").allTextContents();
+ const responsePromise = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === helperId);
+ await action.click();
+ const response = await responsePromise, selected = await response.json();
+ assert.equal(response.status(), 200, JSON.stringify(selected));
+ assert.equal(selected.seed.id, helperId); assert.equal(selected.seed.name, "first"); assert.deepEqual(selected.revision, pin);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), helperId);
+ await page.goBack();
+ await page.waitForFunction(text => document.querySelector("#source")?.textContent === text && !document.querySelector("#workspace-source-panel")?.hidden, before);
+ assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), highlighted);
+ await page.waitForFunction(id => document.activeElement?.dataset.symbolId === id, helperId);
+ assert.match(await page.locator("#source-path").textContent(), /flow\.rs.*cached snapshot/);
+ assert.match(await page.locator(".method-pick.selected").textContent(), /measured/, "Back restores the original diagram selection as well as source");
+}));
+
+const rovingSource = `function measured() { helper_0(); }
+function helper_0() {} function helper_peer() {}
+${Array.from({length:30},(_,i)=>`function helper_${i+1}() {}`).join("\n")}
+`;
+test("published source roves one tabbable declaration action and invokes exact same-line identity by keyboard", {timeout:240000}, async () => published(rovingSource, async ({page, pin}) => {
+ await page.locator("#method-source").click();
+ await page.waitForFunction(() => document.querySelectorAll("#source .source-diagram-action").length === 33);
+ const sourcePane = page.locator("#source");
+ const tabbable = page.locator('#source .source-diagram-action[tabindex="0"]');
+ assert.equal(await tabbable.count(), 1, "many declarations must not add many source tab stops");
+ await sourcePane.focus();await page.keyboard.press("Home");await page.keyboard.press("ArrowDown");
+ assert.equal(await sourcePane.getAttribute("data-navigation-line"), "2");
+ assert.equal(await tabbable.count(), 1);
+ const sameLine = page.locator("#source .source-line.navigation-active-line .source-diagram-action");
+ assert.equal(await sameLine.count(), 2, "both declarations on the line remain reachable");
+ const firstId = await sameLine.nth(0).getAttribute("data-symbol-id"), exactId = await sameLine.nth(1).getAttribute("data-symbol-id");
+ assert.ok(firstId && exactId && firstId !== exactId);
+ await page.keyboard.press("Tab");
+ assert.equal(await page.evaluate(() => document.activeElement?.dataset.symbolId), firstId, "Tab from source enters only its active line action");
+ assert.equal(await tabbable.evaluate(node => getComputedStyle(node).opacity), "1", "active-line action is revealed");
+ await page.keyboard.press("ArrowRight");
+ assert.equal(await page.evaluate(() => document.activeElement?.dataset.symbolId), exactId);
+ assert.equal(await tabbable.count(), 1);
+ assert.equal(await tabbable.evaluate(node => getComputedStyle(node).outlineStyle), "solid");
+ const before = await sourcePane.textContent();
+ const responsePromise = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === exactId);
+ await page.keyboard.press("Enter");
+ const response = await responsePromise, selected = await response.json();
+ assert.equal(response.status(), 200, JSON.stringify(selected));assert.equal(selected.seed.id, exactId);assert.deepEqual(selected.revision, pin);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), exactId);
+ await page.goBack();
+ await page.waitForFunction(({id,text}) => document.activeElement?.dataset.symbolId === id && document.querySelector("#source")?.textContent === text, {id:exactId,text:before});
+ assert.equal(await sourcePane.getAttribute("data-navigation-line"), "2");assert.equal(await tabbable.count(), 1);
+ assert.equal(await tabbable.getAttribute("data-symbol-id"), exactId, "Back restores the exact roving action, not a second tab stop");
+ await page.keyboard.press("ArrowLeft");assert.equal(await page.evaluate(() => document.activeElement?.dataset.symbolId), firstId);
+ await page.keyboard.press("ArrowDown");
+ assert.equal(await sourcePane.evaluate(node => document.activeElement === node), true);
+ assert.equal(await sourcePane.getAttribute("data-navigation-line"), "3");assert.equal(await tabbable.count(), 1);
+ await page.keyboard.press("Tab");assert.equal(await page.evaluate(() => document.activeElement?.matches('.source-line.navigation-active-line .source-diagram-action')), true);
+}, "roving.js"));
+
 module.exports={published};
 
 const jsSource="async function measured(path, value) {\n  console.log(writeDb());\n  if (!valid(path)) throw new Error(\"invalid\");\n  const tmp = tempName(path);\n  try {\n    await fs.writeFile(tmp, encode(value));\n    await fs.rename(tmp, path);\n    return path;\n  } catch (err) {\n    await fs.unlink(tmp);\n    throw err;\n  } finally {\n    release(path);\n  }\n}\n";
@@ -123,6 +191,24 @@ test("published import candidate keeps partial provenance and original source",{
  assert.ok(requests.some(raw=>{const q=new URL(raw).searchParams;return q.get("path")===step.path&&q.get("indexGeneration")===pin.indexGeneration&&q.get("indexRevision")===String(pin.indexRevision);}));
  assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(),[String(step.range.startLine)]);
  assert.match(await page.locator("#source").innerText(),/candidateParse\(input\)/);
+ const sourceBefore = await page.locator("#source").textContent();
+ const line = page.locator("#source .source-line").filter({hasText:"return candidateParse(input)"});
+ const navigationPromise = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/navigation"));
+ await line.click({button:"right"});
+ const navigation = await navigationPromise, targets = await navigation.json();
+ assert.equal(navigation.status(), 200, JSON.stringify(targets)); assert.deepEqual(targets.revision, pin);
+ assert.equal(targets.targets.some(target => target.reason === "call" && target.matchKind === "resolved"), false, "import candidate has no resolved workspace callee");
+ const enclosing = page.getByRole("menuitem", {name:/^Sequence · enclosing · syntax · measured/});
+ await enclosing.waitFor();
+ assert.equal(await page.getByRole("menuitem", {name:/Sequence of callee/}).count(), 0, "never guess a callee from import spelling");
+ assert.equal(await page.getByRole("menuitem", {name:/Call graph/}).isDisabled(), true);
+ assert.equal(await page.locator('[role="tab"]').filter({hasText:/Call graph/}).count(), 0, "#378 has no browser view");
+ await enclosing.click();
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), dto.seed.id);
+ await page.goBack();
+ await page.waitForFunction(text => document.querySelector("#source")?.textContent === text && document.querySelector("#source")?.dataset.navigationLine === "3", sourceBefore);
+ assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(), [String(step.range.startLine)]);
+ assert.equal(await page.locator("#source").evaluate(node => node === document.activeElement), true, "Inspector source menu returns focus to source");
 },"flow.js"));
 
 const truncatedSource=`function measured() {\n${Array.from({length:202},(_,i)=>`  observed_${i}();\n`).join("")}}\n`;

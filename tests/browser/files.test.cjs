@@ -31,8 +31,8 @@ ${Array.from({length:53}, (_, i) => `    watcher.measured(${i + 2});`).join("\n"
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published({git = false, width = 1440} = {}, callback) {
-  const paths = H.fixture(source, "Watcher.java");
+async function published({git = false, width = 1440, sourceText = source} = {}, callback) {
+  const paths = H.fixture(sourceText, "Watcher.java");
   writeFileSync(join(paths.workspace, "Uses.java"), uses);
   writeFileSync(join(paths.workspace, "clean.js"), "const clean = 1;\n");
   writeFileSync(join(paths.workspace, hostileName), "// <script>globalThis.sourceExecuted=true</script>\nconst safe = 'λ';\n");
@@ -199,6 +199,143 @@ test("published Files keeps original all-kind outline, UTF-8 syntax locations an
   await assertNoOverflow(page);
 }));
 
+
+test("mini Full from Working tree explains Back to an unsaved blank route and Forward restores its pinned sequence", {timeout:240000}, async () => published({git:true}, async selected => {
+  const {page, pin, server, requests} = selected;
+  await enterFiles(selected); await openFile(selected, "Watcher.java");
+  const method = (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "measured");
+  assert.ok(method); await selectSymbol(page, method);
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false);
+  await page.locator("#files-working").click();
+  await page.locator("#files-diff .files-diff-hunk").first().waitFor();
+  assert.equal(await page.locator("#source").isVisible(), false, "Working tree has no visible indexed source to capture");
+  assert.equal(await page.evaluate(() => location.hash), "");
+  const sourceCount = sourceReads(requests), sequenceCount = sequenceReads(requests);
+  await page.locator("#files-open-full").click();
+  await page.waitForFunction(() => location.hash.startsWith("#sequence?") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  const hash = await page.evaluate(() => location.hash), historyLength = await page.evaluate(() => history.length);
+  const route = new URLSearchParams(hash.slice("#sequence?".length));
+  assert.equal(route.get("sid"), method.symbol.id); assert.equal(route.get("rootKey"), server.rootKey);
+  assert.equal(route.get("indexGeneration"), pin.indexGeneration); assert.equal(route.get("indexRevision"), String(pin.indexRevision));
+  await page.goBack();
+  await page.waitForFunction(() => location.hash === "" && !document.querySelector("#error")?.hidden && document.querySelector("#error")?.textContent.includes("no saved source view"));
+  assert.equal(await page.locator("#error").isVisible(), true);
+  assert.match(await page.locator("#error").textContent(), /current diagram remains open.*Forward/);
+  assert.equal(await page.locator("#sequence-diagram").isVisible(), true);
+  assert.equal(sourceReads(requests), sourceCount); assert.equal(sequenceReads(requests), sequenceCount);
+  assert.equal(await page.evaluate(() => history.length), historyLength, "Back does not append a replacement route");
+  await page.goForward();
+  await page.waitForFunction(hash => location.hash === hash && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered") && document.querySelector("#error")?.hidden, hash);
+  assert.equal(await page.locator("#sequence-diagram").isVisible(), true);
+  assert.equal(sourceReads(requests), sourceCount); assert.equal(sequenceReads(requests), sequenceCount, "Forward reuses the exact admitted mini sequence");
+  assert.equal(await page.evaluate(() => history.length), historyLength);
+}));
+
+
+const navigationSource = source.replace("  int measured", `${Array.from({length:60}, (_, i) => `  // Context ${i + 1}`).join("\n")}\n  int measured`);
+test("Files declaration Sequence and browser traversal restore the exact pinned source position", {timeout:240000}, async () => published({sourceText:navigationSource}, async selected => {
+  const {page, pin, server, requests} = selected;
+  await enterFiles(selected); await openFile(selected, "Watcher.java");
+  const method = (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "measured");
+  assert.ok(method);
+  await selectSymbol(page, method); await assertSource(page, navigationSource, method.symbol.range);
+  const action = page.locator(`.source-diagram-action[data-symbol-id="${method.symbol.id}"]`);
+  await action.waitFor(); await action.focus();
+  await page.locator("#source").focus(); await page.keyboard.press("Home");
+  for (let line = 1; line < method.symbol.range.startLine; line++) await page.keyboard.press("ArrowDown");
+  await action.scrollIntoViewIfNeeded(); await action.focus();
+  await action.evaluate(button => button.addEventListener("pointerdown", () => {
+    const panel = document.querySelector("#workspace-source-panel");
+    window.filesSequenceOrigin = {scroll:{top:panel.scrollTop, left:panel.scrollLeft},
+      line:document.querySelector("#source").dataset.navigationLine, focusedSymbol:document.activeElement?.dataset.symbolId};
+  }, {once:true}));
+  const sourceCount = sourceReads(requests);
+  const sequenceResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === method.symbol.id);
+  await action.click();
+  const origin = await page.evaluate(() => window.filesSequenceOrigin), scroll = origin.scroll;
+  assert.ok(scroll.top > 0, "native pointer interaction starts at a real source-panel scroll position");
+  assert.equal(origin.line, String(method.symbol.range.startLine)); assert.equal(origin.focusedSymbol, method.symbol.id);
+  const response = await sequenceResponse, dto = await response.json();
+  assert.equal(response.status(), 200, JSON.stringify(dto));
+  assert.equal(dto.seed.id, method.symbol.id); assert.deepEqual(dto.revision, pin);
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered") && location.hash.startsWith("#sequence?"));
+  const route = new URLSearchParams((await page.evaluate(() => location.hash)).slice("#sequence?".length));
+  assert.equal(route.get("sid"), method.symbol.id); assert.equal(route.get("rootKey"), server.rootKey);
+  assert.equal(route.get("indexGeneration"), pin.indexGeneration); assert.equal(route.get("indexRevision"), String(pin.indexRevision));
+  assert.equal(route.has("token"), false);
+  const historyLength = await page.evaluate(() => history.length);
+  async function returned() {
+    await page.waitForFunction(line => document.body.classList.contains("files-section") && document.querySelector("#source")?.dataset.navigationLine === String(line), method.symbol.range.startLine);
+    await assertSource(page, navigationSource, method.symbol.range);
+    assert.equal(await page.locator("#files-indexed").getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator(`.files-symbol-pick[data-symbol-id="${method.symbol.id}"]`).getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator("#files-symbol-title").textContent(), method.symbol.name);
+    await page.waitForFunction(({id, scroll}) => {
+      const panel = document.querySelector("#workspace-source-panel"), focus = document.activeElement;
+      return focus?.dataset.symbolId === id && focus.classList.contains("source-diagram-action") &&
+        Math.abs(panel.scrollTop - scroll.top) <= 1 && panel.scrollLeft === scroll.left;
+    }, {id:method.symbol.id, scroll});
+    assert.equal(sourceReads(requests), sourceCount, "Back reuses the captured source snapshot");
+    assert.equal(await page.evaluate(() => history.length), historyLength, "traversal never appends history");
+  }
+  await page.goBack(); await returned();
+  await page.goForward();
+  await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered") && !document.body.classList.contains("files-section"), method.symbol.id);
+  assert.equal(await page.evaluate(() => history.length), historyLength);
+  await page.goBack(); await returned();
+}));
+
+
+const pagedNavigationSource = `class Watcher {
+${Array.from({length:201}, (_, i) => `  int method${i}() { return ${i}; }`).join("\n")}
+}
+`;
+test("explicit More source actions admits page two and Back restores its action without refetching metadata", {timeout:240000}, async () => published({sourceText:pagedNavigationSource}, async selected => {
+  const {page, pin, requests} = selected;
+  await enterFiles(selected); await openFile(selected, "Watcher.java");
+  const first = await outline(selected, "Watcher.java");
+  assert.equal(first.items.length, 200); assert.ok(first.nextOffset > 0);
+  const query = new URLSearchParams({...pin, path:"Watcher.java", offset:first.nextOffset, limit:200});
+  const second = await read(selected, `symbols?${query}`);
+  const target = second.items.find(item => item.symbol.name === "method200");
+  assert.ok(target, "real metadata producer places the final ordinary callable on page two");
+  assert.ok(!first.items.some(item => item.symbol.id === target.symbol.id));
+  const sourceActions = page.locator(".source-navigation");
+  const more = sourceActions.getByRole("button", {name:"More source actions", exact:true});
+  await more.waitFor();
+  await page.waitForFunction(() => [...document.querySelectorAll(".source-navigation button")].some(button => button.textContent === "More source actions" && !button.disabled && !button.hidden));
+  const metadata = () => requests.filter(row => row.url.pathname.endsWith("/symbols"));
+  const action = page.locator(`.source-diagram-action[data-symbol-id="${target.symbol.id}"]`);
+  assert.equal(await action.count(), 0, "unloaded declarations have no guessed action");
+  assert.equal(metadata().filter(row => Number(row.url.searchParams.get("offset")) > 0).length, 0, "source annotations never traverse remaining metadata automatically");
+  const nextPage = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/symbols") && new URL(response.url()).searchParams.get("offset") === String(first.nextOffset));
+  await more.click();
+  const response = await nextPage, admitted = await response.json();
+  assert.equal(response.status(), 200, JSON.stringify(admitted)); assert.deepEqual(admitted.revision, pin);
+  assert.ok(admitted.items.some(item => item.symbol.id === target.symbol.id));
+  await action.waitFor(); await action.scrollIntoViewIfNeeded(); await action.focus();
+  const scroll = await page.locator("#workspace-source-panel").evaluate(panel => ({top:panel.scrollTop, left:panel.scrollLeft}));
+  assert.ok(scroll.top > 0, "page-two action has a real source-panel position");
+  const metadataCount = metadata().length, sourceCount = sourceReads(requests);
+  const sequence = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === target.symbol.id);
+  await action.click();
+  const selectedResponse = await sequence, dto = await selectedResponse.json();
+  assert.equal(selectedResponse.status(), 200, JSON.stringify(dto));
+  assert.equal(dto.seed.id, target.symbol.id); assert.deepEqual(dto.revision, pin);
+  await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), target.symbol.id);
+  await page.goBack();
+  await page.waitForFunction(({id, line, scroll}) => {
+    const panel = document.querySelector("#workspace-source-panel");
+    return document.body.classList.contains("files-section") && document.querySelector("#source")?.dataset.navigationLine === String(line) &&
+      document.activeElement?.dataset.symbolId === id && document.activeElement?.classList.contains("source-diagram-action") &&
+      Math.abs(panel.scrollTop - scroll.top) <= 1 && panel.scrollLeft === scroll.left;
+  }, {id:target.symbol.id, line:target.symbol.range.startLine, scroll});
+  await assertSource(page, pagedNavigationSource);
+  assert.equal(metadata().length, metadataCount, "Back reuses all explicitly admitted source-action metadata, including page two");
+  assert.equal(sourceReads(requests), sourceCount, "Back reuses the pinned source snapshot");
+  assert.equal(await more.isVisible(), false, "the restored completed metadata page has no More action");
+}));
+
 async function git(paths, ...args) { return H.run("git", args, {cwd:paths.workspace, env:paths.env}); }
 async function prepareGit(paths) {
   await git(paths, "init", "-q");
@@ -245,9 +382,11 @@ test("Files Working tree renders actual net HEAD staged and unstaged hunks witho
   assert.deepEqual(lines, diff.file.hunks.flatMap(hunk => hunk.lines.map(line => ({kind:line.kind, marker:line.kind === "added" ? "+" : line.kind === "deleted" ? "−" : " ", text:line.text}))));
   assert.equal(await page.locator("#files-symbol-title").textContent(), method.symbol.name, "working-tree display does not fabricate a new outline basis");
   assert.equal(sourceReads(requests), reads, "Git basis never substitutes a live source request");
-  const navBefore = requests.filter(row => row.url.pathname.endsWith("/navigation")).length;
+  const navBefore = requests.filter(row => row.url.pathname.endsWith("/navigation")).length, sequenceBefore = sequenceReads(requests);
+  assert.equal(await page.locator("#files-diff .source-diagram-action").count(), 0, "working-tree-only source coordinates have no indexed declaration actions");
   await page.locator("#files-diff .files-diff-line").first().click(); await page.keyboard.press("Shift+F10"); await page.keyboard.press("Escape");
   assert.equal(requests.filter(row => row.url.pathname.endsWith("/navigation")).length, navBefore, "Git coordinates are not indexed navigation coordinates");
+  assert.equal(sequenceReads(requests), sequenceBefore, "working-tree source never seeds a sequence");
   await openFile(selected, "clean.js");
   const diffReads = requests.filter(row => row.url.pathname.endsWith("/git/diff")).length;
   await page.locator("#files-working").click();
@@ -319,7 +458,7 @@ test("390px Files keeps cached noncallable source, safe labels, no-Git reason an
   const navigationResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/navigation"));
   await page.keyboard.press("Shift+F10");
   const request = await navigation;
-  assert.deepEqual(request.postDataJSON(), {expectedRevision:pin, path:"Watcher.java", line:2});
+  assert.deepEqual(request.postDataJSON(), {expectedRevision:pin, path:"Watcher.java", line:2, semanticProducerPolicy:"solePublished"});
   const response = await navigationResponse, navigationDto = await response.json();
   assert.equal(response.status(), 200, JSON.stringify(navigationDto));
   assert.deepEqual(navigationDto.revision, pin);

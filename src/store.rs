@@ -6476,6 +6476,24 @@ fn read_semantic_tuple(
     history_syntax: Option<&str>,
     trusted_admitted_raw: bool,
 ) -> Result<crate::semantic_evidence::SemanticSnapshot> {
+    read_semantic_tuple_for_call(
+        db,
+        key,
+        selected_tuple,
+        history_syntax,
+        trusted_admitted_raw,
+        None,
+    )
+}
+
+fn read_semantic_tuple_for_call(
+    db: &Connection,
+    key: &str,
+    selected_tuple: Option<i64>,
+    history_syntax: Option<&str>,
+    trusted_admitted_raw: bool,
+    call_id: Option<&[u8]>,
+) -> Result<crate::semantic_evidence::SemanticSnapshot> {
     use crate::native_evidence::DocumentKey;
     use crate::semantic_evidence as sem;
     let (source_set, native_id): (String, String) = db.query_row(
@@ -6541,7 +6559,7 @@ fn read_semantic_tuple(
             language: language.clone(),
             path: path.clone(),
         };
-        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path],|r|{
+        let rows=db.prepare("SELECT p.provenance_id,p.content_hash,p.evidence_kind,p.freshness,p.derived_from_provenance_id,b.producer_id,b.producer_version,b.producer_hash,b.artifact_hash,b.language,b.source_set_id,b.captured_native_revision_id,b.source_manifest_hash,b.toolchain_hash,b.config_hash,b.dependency_hash,b.basis_id,p.capture_id,p.derived_from_record_kind,p.derived_from_fact_digest FROM semantic_provenance p JOIN semantic_basis b ON b.tuple_id=p.tuple_id AND b.basis_id=p.basis_id WHERE p.tuple_id=?1 AND (?5 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_call_bindings WHERE tuple_id=?1 AND call_id=?5)) AND (?2 IS NULL OR p.provenance_id IN (SELECT provenance_id FROM semantic_declaration_bindings WHERE tuple_id=?1 AND syntax_id=?2 UNION SELECT s.provenance_id FROM semantic_symbols s JOIN semantic_symbol_targets t ON t.symbol_id=s.symbol_id WHERE s.tuple_id=?1 AND t.kind='internal' AND t.internal_syntax_id=?2 AND t.internal_language=?3 AND t.internal_path=?4 UNION SELECT provenance_id FROM semantic_type_relationships WHERE tuple_id=?1 AND source_kind='internal' AND source_internal_syntax_id=?2 AND source_internal_language=?3 AND source_internal_path=?4)) ORDER BY p.rowid")?.query_map(params![tuple, history_syntax.and_then(id_codec::encode_sid), language, path, call_id],|r|{
             Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?,r.get::<_,String>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,String>(15)?,r.get::<_,i64>(16)?,r.get::<_,Option<i64>>(17)?,r.get::<_,Option<String>>(18)?,r.get::<_,Option<String>>(19)?))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (
@@ -6685,7 +6703,7 @@ fn read_semantic_tuple(
             });
         }
         if history_syntax.is_none() {
-            read_semantic_facts(db, tuple, &document, &native_id, &mut result)?;
+            read_semantic_facts(db, tuple, &document, &native_id, &mut result, call_id)?;
         }
     }
     Ok(result)
@@ -6824,9 +6842,13 @@ fn read_semantic_facts(
     document: &crate::native_evidence::DocumentKey,
     native_id: &str,
     result: &mut crate::semantic_evidence::SemanticSnapshot,
+    selected_call: Option<&[u8]>,
 ) -> Result<()> {
     use crate::semantic_evidence as sem;
     let source_set = &document.source_set_id;
+    if selected_call.is_some() {
+        return read_semantic_call_facts(db, tuple, document, result, selected_call);
+    }
     let symbol_rows=db.prepare("SELECT symbol_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id FROM semantic_symbols WHERE tuple_id=?1 ORDER BY ordinal")?.query_map([tuple],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (
         ordinal,
@@ -7001,9 +7023,66 @@ fn read_semantic_facts(
             provenance_id,
         });
     }
-    let call_rows = db
-        .prepare("SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 ORDER BY ordinal")?
+    read_semantic_call_facts(db, tuple, document, result, None)?;
+    let relationship_rows = db
+        .prepare("SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 ORDER BY ordinal")?
         .query_map([tuple], |r| {
+            let source = semantic_target_read(r, 4, source_set).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(e.to_string())),
+                )
+            })?;
+            let target = semantic_target_read(r, 14, source_set).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(e.to_string())),
+                )
+            })?;
+            Ok((
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                source,
+                target,
+                r.get::<_, String>(24)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (ordinal, (stored, kind, source, target, provenance_id)) in
+        relationship_rows.into_iter().enumerate()
+    {
+        selected_ensure!(
+            ordinal as i64 == stored,
+            "incompatible_index: corrupt semantic relationship ordinal"
+        );
+        result.type_relationships.push(sem::TypeRelationship {
+            kind: semantic_enum(kind)?,
+            source: source.context(SelectedIntegrity(
+                "incompatible_index: missing semantic source".into(),
+            ))?,
+            target: target.context(SelectedIntegrity(
+                "incompatible_index: missing semantic target".into(),
+            ))?,
+            provenance_id,
+        });
+    }
+    Ok(())
+}
+
+fn read_semantic_call_facts(
+    db: &Connection,
+    tuple: i64,
+    document: &crate::native_evidence::DocumentKey,
+    result: &mut crate::semantic_evidence::SemanticSnapshot,
+    selected_call: Option<&[u8]>,
+) -> Result<()> {
+    use crate::semantic_evidence as sem;
+    let source_set = &document.source_set_id;
+    let call_rows = db
+        .prepare("SELECT * FROM semantic_call_bindings WHERE tuple_id=?1 AND (?2 IS NULL OR call_id=?2) ORDER BY ordinal")?
+        .query_map(params![tuple, selected_call], |r| {
             let target = semantic_target_read(r, 14, source_set).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     14,
@@ -7058,7 +7137,7 @@ fn read_semantic_facts(
     ) in call_rows.into_iter().enumerate()
     {
         selected_ensure!(
-            ordinal as i64 == stored,
+            selected_call.is_some() || ordinal as i64 == stored,
             "incompatible_index: corrupt semantic call ordinal"
         );
         result.call_bindings.push(sem::CallBinding {
@@ -7116,50 +7195,6 @@ fn read_semantic_facts(
             )?,
             possible_dispatch_complete,
             stale_target,
-            provenance_id,
-        });
-    }
-    let relationship_rows = db
-        .prepare("SELECT * FROM semantic_type_relationships WHERE tuple_id=?1 ORDER BY ordinal")?
-        .query_map([tuple], |r| {
-            let source = semantic_target_read(r, 4, source_set).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::other(e.to_string())),
-                )
-            })?;
-            let target = semantic_target_read(r, 14, source_set).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    14,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::other(e.to_string())),
-                )
-            })?;
-            Ok((
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                source,
-                target,
-                r.get::<_, String>(24)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (ordinal, (stored, kind, source, target, provenance_id)) in
-        relationship_rows.into_iter().enumerate()
-    {
-        selected_ensure!(
-            ordinal as i64 == stored,
-            "incompatible_index: corrupt semantic relationship ordinal"
-        );
-        result.type_relationships.push(sem::TypeRelationship {
-            kind: semantic_enum(kind)?,
-            source: source.context(SelectedIntegrity(
-                "incompatible_index: missing semantic source".into(),
-            ))?,
-            target: target.context(SelectedIntegrity(
-                "incompatible_index: missing semantic target".into(),
-            ))?,
             provenance_id,
         });
     }
@@ -20413,7 +20448,6 @@ impl Store {
         &self,
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
-        request.validate()?;
         self.with_evidence(|tx| self.navigation_in(tx, request, false))
     }
     fn navigation_in(
@@ -20422,9 +20456,42 @@ impl Store {
         request: &crate::navigation::NavigationRequest,
         pre_startup: bool,
     ) -> Result<crate::navigation::NavigationResult> {
+        request.validate()?;
         let selected =
             self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
         let revision = selected.pin;
+        // Policy selection is local to this exact selected snapshot, never the head.
+        let mut producer_bytes = Vec::new();
+        let mut multiple_producers = false;
+        let effective_request = match request {
+            crate::navigation::NavigationRequest::Source(selector)
+                if selector.semantic_producer_policy.is_some() =>
+            {
+                let producers = tx.prepare(
+                    "SELECT CASE WHEN length(CAST(id AS BLOB))<=?2 THEN id END FROM semantic_revision_producers WHERE revision_id=?1 ORDER BY id LIMIT 2",
+                )?.query_map(params![selected.key, crate::navigation::RECORD_BYTES], |row| row.get::<_, Option<String>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut ids = Vec::new();
+                for producer in producers {
+                    let producer = producer.context(SelectedIntegrity(
+                        "selected semantic producer exceeds navigation budget".into(),
+                    ))?;
+                    selected_ensure!(
+                        crate::graph_query::valid_producer_id(&producer),
+                        "invalid selected semantic producer ID"
+                    );
+                    producer_bytes.push(serde_json::to_vec(&producer)?.len());
+                    ids.push(producer);
+                }
+                multiple_producers = ids.len() > 1;
+                let mut selector = selector.clone();
+                selector.semantic_producer_policy = None;
+                selector.semantic_producer_id = if ids.len() == 1 { ids.pop() } else { None };
+                Some(crate::navigation::NavigationRequest::Source(selector))
+            }
+            _ => None,
+        };
+        let request = effective_request.as_ref().unwrap_or(request);
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
         // consumes a selected document, authenticate it against that source BLOB
@@ -20489,6 +20556,24 @@ impl Store {
             selected_document
                 .as_ref()
                 .map(|document| document.nodes.as_slice()),
+            &mut |reader, selector| {
+                if multiple_producers {
+                    reader.warn("multiple semantic producers; showing syntax");
+                }
+                for bytes in &producer_bytes {
+                    if !reader.charge(*bytes) {
+                        return Ok(());
+                    }
+                }
+                graph_read::navigation_calls(
+                    self,
+                    tx,
+                    &selected,
+                    selected_document.as_ref(),
+                    selector,
+                    reader,
+                )
+            },
         )
     }
 
