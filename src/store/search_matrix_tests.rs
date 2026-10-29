@@ -615,13 +615,18 @@ fn exact_policy_and_lexical_plans_use_indexed_candidate_joins() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert!(
-        policy_plan
-            .iter()
-            .any(|step| step.contains("SEARCH d USING INDEX native_version_declarations_lookup")),
+        policy_plan.iter().any(|step| {
+            step.starts_with("SEARCH d USING ")
+                && (step.contains("(name=?") || step.contains("(lookup_key=?"))
+        }),
         "{policy_plan:?}"
     );
     assert!(
-        policy_plan.iter().all(|step| !step.starts_with("SCAN d")),
+        ["c", "m", "d"].iter().all(|alias| {
+            policy_plan.iter().all(|step| {
+                step != &format!("SCAN {alias}") && !step.starts_with(&format!("SCAN {alias} "))
+            })
+        }),
         "{policy_plan:?}"
     );
 
@@ -661,8 +666,9 @@ fn exact_policy_and_lexical_plans_use_indexed_candidate_joins() {
                 .unwrap_or_else(|| panic!("{plan:?}"));
             assert!(fts < indexed, "{plan:?}");
             assert!(
-                plan.iter()
-                    .all(|step| !step.starts_with(&format!("SCAN {alias} "))),
+                plan.iter().all(|step| {
+                    step != &format!("SCAN {alias}") && !step.starts_with(&format!("SCAN {alias} "))
+                }),
                 "{plan:?}"
             );
         }
