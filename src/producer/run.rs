@@ -92,6 +92,8 @@ enum CancelReason {
 
 struct Control {
     phase: RunState,
+    /// The run's outcome is decided: a cancel now has nothing left to stop.
+    finished: bool,
     reason: Option<CancelReason>,
     request_id: Option<String>,
     process: Option<ProcessIdentity>,
@@ -120,6 +122,9 @@ impl ActiveRun {
     /// cancel can never land between the enqueue and its record.
     fn request_cancel(&self, reason: CancelReason) -> Result<Value> {
         let mut control = self.control();
+        if control.finished {
+            anyhow::bail!("{NOT_CANCELLABLE}: run already finished");
+        }
         if control.phase == RunState::Importing {
             anyhow::bail!(
                 "{NOT_CANCELLABLE}: import accepted as request {}",
@@ -135,7 +140,17 @@ impl ActiveRun {
 /// Owns the checkout's producer runs. Cloning shares the same slot.
 #[derive(Clone, Default)]
 pub struct ProducerOwner {
-    active: Arc<Mutex<Option<Arc<ActiveRun>>>>,
+    slot: Arc<Mutex<Slot>>,
+}
+
+/// The run slot and the owner's closed mark, changed together under one lock so a
+/// shutdown can never fall between a run's admission and its installation.
+#[derive(Default)]
+struct Slot {
+    run: Option<Arc<ActiveRun>>,
+    /// The checkout is closing or lost its root; a runtime is never reopened, so
+    /// the mark is permanent.
+    closed: bool,
 }
 
 /// Clears the owner's slot on every exit, and only its own run's.
@@ -147,8 +162,12 @@ struct SlotGuard<'a> {
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
         let mut slot = self.owner.slot();
-        if slot.as_ref().is_some_and(|run| Arc::ptr_eq(run, &self.run)) {
-            *slot = None;
+        if slot
+            .run
+            .as_ref()
+            .is_some_and(|run| Arc::ptr_eq(run, &self.run))
+        {
+            slot.run = None;
         }
     }
 }
@@ -166,8 +185,16 @@ impl Drop for RunCleanup<'_> {
         if !self.armed {
             return;
         }
-        if let Some(process) = self.run.control().process.take() {
+        let (process, enqueued) = {
+            let mut control = self.run.control();
+            (control.process.take(), control.request_id.is_some())
+        };
+        if let Some(process) = process {
             unsafe { libc::killpg(process.pgid, libc::SIGKILL) };
+        }
+        // The queued import still reads `out/` and `batch/`, and its record says so.
+        if enqueued {
+            return;
         }
         if let Ok(Some(mut record)) = self.state.read_run_record(&self.run.run_id)
             && !record.state.is_terminal()
@@ -227,6 +254,21 @@ fn private_dir(path: &Path) -> Result<()> {
         .mode(0o700)
         .create(path)
         .with_context(|| format!("create {}", path.display()))
+}
+
+/// Test-support fault: fail the step named by `variable` once it is reached.
+#[cfg(all(feature = "test-support", unix))]
+fn test_fault(variable: &str) -> Result<()> {
+    ensure!(
+        std::env::var_os(variable).is_none(),
+        "storage_busy: injected {variable}"
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "test-support", unix)))]
+fn test_fault(_variable: &str) -> Result<()> {
+    Ok(())
 }
 
 /// Test-support hold point: bind the socket, announce it, and wait for the
@@ -329,6 +371,13 @@ impl Run<'_> {
             }
             "limit_exceeded" => Finish::failed("limit_exceeded", line),
             "stale_basis" => Finish::failed("stale_basis", line),
+            ROOT_CHANGED => Finish::failed("root_changed", line),
+            // The typed operation codes of the checkout's own state and queue.
+            "capture_unavailable"
+            | "index_not_ready"
+            | "storage_busy"
+            | "producer_state_corrupt"
+            | "invalid_request" => Finish::failed("producer_failed", line),
             _ => {
                 use std::io::Write;
                 let _ = writeln!(std::io::stderr(), "producer run failed: {error:#}");
@@ -502,12 +551,17 @@ impl Run<'_> {
             control.request_id = Some(id.clone());
             id
         };
-        self.recorder.update(|record| {
-            record.state = RunState::Importing;
-            record.request_id = Some(id.clone());
-        })?;
+        // The request is accepted: from here the run only observes it. A record that
+        // cannot be written leaves `writingBatch` behind, and the final record corrects it.
+        let _ = test_fault("TRELLIS_TEST_PRODUCER_FAIL_IMPORTING_RECORD").and_then(|()| {
+            self.recorder.update(|record| {
+                record.state = RunState::Importing;
+                record.request_id = Some(id.clone());
+            })
+        });
         test_hook("TRELLIS_TEST_PRODUCER_ENQUEUED_SOCKET");
-        let imported = import::wait(store, &options, id)?;
+        test_fault("TRELLIS_TEST_PRODUCER_FAIL_WAIT")?;
+        let imported = import::wait(store, self.ctx.scheduler, &options, id)?;
         let finish = if imported.is_done() {
             Finish {
                 state: RunState::Done,
@@ -541,13 +595,13 @@ fn writeln_stderr(text: &str) -> std::io::Result<()> {
 }
 
 impl ProducerOwner {
-    fn slot(&self) -> MutexGuard<'_, Option<Arc<ActiveRun>>> {
-        self.active.lock().unwrap_or_else(PoisonError::into_inner)
+    fn slot(&self) -> MutexGuard<'_, Slot> {
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `activeRun` of the status reply.
     pub fn status(&self) -> Value {
-        let Some(run) = self.slot().clone() else {
+        let Some(run) = self.slot().run.clone() else {
             return Value::Null;
         };
         let control = run.control();
@@ -566,7 +620,7 @@ impl ProducerOwner {
 
     /// Cancel `run_id` while it can still be stopped.
     pub fn cancel(&self, store: &Store, run_id: &str) -> Result<Value> {
-        let active = self.slot().clone();
+        let active = self.slot().run.clone();
         if let Some(run) = active
             && run.run_id == run_id
         {
@@ -585,12 +639,29 @@ impl ProducerOwner {
 
     /// The checkout is retiring or lost its root: stop the active run, which
     /// then finishes as `root_changed`. A run past its enqueue is left to its
-    /// import request, which the checkout settles itself.
+    /// import request, which the checkout settles itself. The owner is marked
+    /// closed under the slot lock, so a run still preparing to take its slot
+    /// finds the mark when it does and is cancelled too.
     pub fn shutdown(&self) {
-        let active = self.slot().clone();
-        if let Some(run) = active {
+        let mut slot = self.slot();
+        slot.closed = true;
+        if let Some(run) = &slot.run {
             let _ = run.request_cancel(CancelReason::RootChanged);
         }
+    }
+
+    /// Put `active` in the slot. An owner closed before this moment installs it already
+    /// cancelled, so the run ends as `root_changed` without starting anything.
+    fn install(&self, active: &Arc<ActiveRun>) -> Result<()> {
+        let mut slot = self.slot();
+        if let Some(current) = &slot.run {
+            anyhow::bail!("{PRODUCER_BUSY}: run {} is active", current.run_id);
+        }
+        slot.run = Some(active.clone());
+        if slot.closed {
+            let _ = active.request_cancel(CancelReason::RootChanged);
+        }
+        Ok(())
     }
 
     /// Run one producer to a terminal record. Refuses with `plan_changed`
@@ -606,6 +677,7 @@ impl ProducerOwner {
             "{PLAN_CHANGED}: the plan no longer matches the one inspected"
         );
 
+        test_hook("TRELLIS_TEST_PRODUCER_PRESLOT_SOCKET");
         let run_id = Uuid::new_v4().simple().to_string();
         let active = Arc::new(ActiveRun {
             run_id: run_id.clone(),
@@ -617,18 +689,13 @@ impl ProducerOwner {
             cancel: AtomicBool::new(false),
             control: Mutex::new(Control {
                 phase: RunState::Materializing,
+                finished: false,
                 reason: None,
                 request_id: None,
                 process: None,
             }),
         });
-        {
-            let mut slot = self.slot();
-            if let Some(current) = slot.as_ref() {
-                anyhow::bail!("{PRODUCER_BUSY}: run {} is active", current.run_id);
-            }
-            *slot = Some(active.clone());
-        }
+        self.install(&active)?;
         let _slot = SlotGuard {
             owner: self,
             run: active.clone(),
@@ -673,9 +740,18 @@ impl ProducerOwner {
         };
         let finish = match run.execute() {
             Ok(finish) => finish,
+            Err(error) if active.control().request_id.is_some() => {
+                // The import is accepted but its outcome is unknown (the queue stayed busy
+                // or the runtime closed). The request still reads `out/` and `batch/`, and
+                // the record stays `importing`; the sweep recovers it once the request is
+                // terminal.
+                cleanup.armed = false;
+                return Err(error);
+            }
             Err(error) => run.finish_from_error(&error, None),
         };
-        run.recorder.update(|record| {
+        active.control().finished = true;
+        let written = run.recorder.update(|record| {
             record.state = finish.state;
             record.outcome = Some(finish.outcome.to_owned());
             record.error_code = finish.error_code.clone();
@@ -685,11 +761,12 @@ impl ProducerOwner {
             if let Some(imported) = &finish.import {
                 record.request_id = Some(imported.request_id.clone());
             }
-        })?;
+        });
         cleanup.armed = false;
-        // The import request is terminal, so nothing but the record is needed.
+        // The import request is terminal or never existed, so nothing but the record is needed.
         let _ = state.strip_to_record(&run_id);
         let _ = state.prune_runs();
+        written?;
         Ok(json!({
             "runId": run_id,
             "state": finish.state,
@@ -706,5 +783,61 @@ impl ProducerOwner {
             })),
             "diagnostics": finish.diagnostics,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active(run_id: &str) -> Arc<ActiveRun> {
+        Arc::new(ActiveRun {
+            run_id: run_id.to_owned(),
+            producer: "stub".to_owned(),
+            trust_profile: super::super::TrustProfile::Restricted,
+            plan_sha256: "0".repeat(64),
+            source_revision: "revision".to_owned(),
+            created_at: 1,
+            cancel: AtomicBool::new(false),
+            control: Mutex::new(Control {
+                phase: RunState::Materializing,
+                finished: false,
+                reason: None,
+                request_id: None,
+                process: None,
+            }),
+        })
+    }
+
+    /// Shutdown before the run takes its slot is not lost: the run installs cancelled
+    /// with the root-change reason.
+    #[test]
+    fn shutdown_before_install_cancels_the_run_that_installs_after() {
+        let owner = ProducerOwner::default();
+        owner.shutdown();
+        let run = active("a");
+        owner.install(&run).unwrap();
+        assert!(run.cancel.load(Ordering::SeqCst));
+        assert_eq!(run.control().reason, Some(CancelReason::RootChanged));
+    }
+
+    #[test]
+    fn shutdown_after_install_cancels_the_active_run_and_a_second_is_busy() {
+        let owner = ProducerOwner::default();
+        let run = active("a");
+        owner.install(&run).unwrap();
+        assert!(!run.cancel.load(Ordering::SeqCst));
+        assert!(owner.install(&active("b")).is_err());
+        owner.shutdown();
+        assert!(run.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancel_of_a_finished_run_is_refused() {
+        let run = active("a");
+        run.control().finished = true;
+        let error = run.request_cancel(CancelReason::Requested).unwrap_err();
+        assert!(error.to_string().starts_with(NOT_CANCELLABLE));
+        assert!(!run.cancel.load(Ordering::SeqCst));
     }
 }

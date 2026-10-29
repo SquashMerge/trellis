@@ -3,7 +3,7 @@
 
 use super::batch::WrittenBatch;
 use crate::{
-    http::DaemonState,
+    http::{DaemonState, RuntimePhase},
     model::IndexPin,
     semantic_batch::descriptor::GenerationOrigin,
     store::{
@@ -86,13 +86,22 @@ pub fn submit(scheduler: &DaemonState, options: &GeneratedImportOptions) -> Resu
     Ok(scheduler.enqueue_generated_semantic_import(options)?.id)
 }
 
+/// How often a waiting import re-reads its row. The terminal-commit condvar has no timed wait
+/// and the runtime closing signals through another one, so a closing runtime is only
+/// observable by polling; the interval bounds how long a wait outlives its runtime.
+const POLL: Duration = Duration::from_millis(100);
+
 /// Block until request `id`, accepted for `options`, is terminal. A failed import is an
-/// `ImportOutcome` with its typed code; only an error in reading the queue is an `Err`.
-pub fn wait(store: &Store, options: &GeneratedImportOptions, id: String) -> Result<ImportOutcome> {
+/// `ImportOutcome` with its typed code. Transient queue contention is retried for a bounded
+/// time and then reported as `storage_busy`; a runtime that closes before the row settles
+/// ends the wait as `root_changed`, because only a replacement runtime would settle it.
+pub fn wait(
+    store: &Store,
+    scheduler: &DaemonState,
+    options: &GeneratedImportOptions,
+    id: String,
+) -> Result<ImportOutcome> {
     loop {
-        // Recorded before the read: a terminal commit between the read and the wait is never
-        // missed.
-        let seen = store.terminal_generation();
         let row = read_request(store, &id)?
             .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
         match row.state.as_str() {
@@ -124,7 +133,20 @@ pub fn wait(store: &Store, options: &GeneratedImportOptions, id: String) -> Resu
                     error_code: Some(row.error_code.unwrap_or_else(|| "index_failed".into())),
                 });
             }
-            "queued" | "running" => store.wait_terminal_change(seen),
+            "queued" | "running" => {
+                // A running request is the closing worker's to finish; a queued one is
+                // never started by a closing runtime.
+                ensure!(
+                    row.state == "running"
+                        || !matches!(
+                            scheduler.runtime_phase(),
+                            RuntimePhase::Closing | RuntimePhase::Retired
+                        ),
+                    "{}: captured root lost",
+                    super::ROOT_CHANGED
+                );
+                std::thread::sleep(POLL);
+            }
             _ => anyhow::bail!("store_unavailable: invalid request state"),
         }
     }
@@ -138,5 +160,5 @@ pub fn submit_and_wait(
     options: &GeneratedImportOptions,
 ) -> Result<ImportOutcome> {
     let id = submit(scheduler, options)?;
-    wait(store, options, id)
+    wait(store, scheduler, options, id)
 }
