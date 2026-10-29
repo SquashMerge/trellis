@@ -278,7 +278,9 @@ async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
         git(root, &["config", "user.email", "test@example.invalid"]);
         git(root, &["config", "user.name", "Test"]);
         fs::write(root.join("core.js"), "function original() { return 1; }\n").unwrap();
-        git(root, &["add", "core.js"]);
+        fs::write(root.join("old.txt"), "rename without editing\n").unwrap();
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        git(root, &["add", "core.js", "old.txt", ".gitignore"]);
         git(root, &["commit", "-qm", "base"]);
     }
     let indexed = command(&home)
@@ -301,6 +303,9 @@ async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
         .unwrap()
         .root_key;
     fs::write(cold.join("core.js"), "function changed() { return 2; }\n").unwrap();
+    fs::rename(cold.join("old.txt"), cold.join("new.txt")).unwrap();
+    fs::write(cold.join("untracked.txt"), "added\n").unwrap();
+    fs::write(cold.join("ignored.txt"), "not a change\n").unwrap();
     let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let token_file = home.join("token");
     fs::write(&token_file, token).unwrap();
@@ -364,6 +369,13 @@ async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
             .unwrap();
         assert_eq!(row["git"]["state"], "available", "{listing}");
         assert_eq!(row["git"]["head"]["name"], "main");
+        assert_eq!(
+            row["git"]["workingTree"],
+            serde_json::json!({
+                "state": "available", "changedFiles": if key == &cold_key { 3 } else { 0 }
+            })
+        );
+        assert!(!row["git"].as_object().unwrap().contains_key("changes"));
         assert!(!row.as_object().unwrap().contains_key("changes"));
         assert_eq!(row["active"], false);
     }
@@ -385,6 +397,10 @@ async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
         assert!(response.headers().contains_key("content-security-policy"));
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["git"]["state"], "available", "{body}");
+        assert_eq!(
+            body["git"]["workingTree"],
+            serde_json::json!({"state": "available", "changedFiles": 3})
+        );
         if suffix.is_empty() {
             assert!(
                 body["changes"]
@@ -449,6 +465,57 @@ async fn production_git_routes_read_cold_checkout_and_enrich_discovered_rows() {
         assert_eq!(response.status(), expected, "{header}");
         assert_eq!(response.headers()["cache-control"], "no-store");
         assert!(!response.headers().contains_key("x-trellis-workspace"));
+    }
+    // Change-set failure must not erase independently readable branch data on the list.
+    let repo = git2::Repository::open(&cold).unwrap();
+    let mut index = repo.index().unwrap();
+    let mut entry = index.get_path(std::path::Path::new("core.js"), 0).unwrap();
+    index.remove_path(std::path::Path::new("core.js")).unwrap();
+    entry.flags = (entry.flags & !0x3000) | 0x1000;
+    index.add(&entry).unwrap();
+    entry.flags = (entry.flags & !0x3000) | 0x2000;
+    index.add(&entry).unwrap();
+    index.write().unwrap();
+    let listing: Value = client
+        .get(format!("{base}/api/checkouts"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listing["checkouts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rootKey"] == cold_key)
+        .unwrap();
+    assert_eq!(row["git"]["state"], "available");
+    assert_eq!(row["git"]["head"]["name"], "main");
+    assert_eq!(
+        row["git"]["workingTree"],
+        serde_json::json!({"state": "unavailable", "reason": "conflicted"})
+    );
+    for suffix in ["", "/diff?path=core.js"] {
+        let body: Value = client
+            .get(format!("{prefix}{suffix}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["git"],
+            serde_json::json!({"state": "unavailable", "reason": "conflicted"})
+        );
+        assert!(body[if suffix.is_empty() { "changes" } else { "file" }].is_null());
     }
     let state: Value = client
         .get(format!("{base}/api/daemon/status"))

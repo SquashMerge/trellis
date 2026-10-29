@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {writeFileSync, rmSync, renameSync} = require("node:fs");
+const {mkdirSync, writeFileSync, rmSync, renameSync} = require("node:fs");
 const {join} = require("node:path");
 const {chromium} = require("playwright");
 const H = require("./sequence-harness.cjs");
@@ -40,7 +40,30 @@ async function published({git = false, width = 1440, sourceText = source} = {}, 
   writeFileSync(join(paths.workspace, hostileName), "// <script>globalThis.sourceExecuted=true</script>\nconst safe = 'λ';\n");
   let server, browser, context;
   try {
-    if (git) await prepareGit(paths);
+    if (git === "markers") {
+      for (const directory of ["changed", "unchanged"]) {
+        mkdirSync(join(paths.workspace, directory));
+        writeFileSync(join(paths.workspace, directory, "same.js"), "function same() { return 1; }\n");
+      }
+    }
+    if (git) await prepareGit(paths, git !== "markers");
+    if (git === "markers") {
+      // All mutations precede indexing and watcher startup; no cached-source retention is assumed.
+      await dirtyGit(paths);
+      writeFileSync(join(paths.workspace, "changed", "same.js"), "function same() { return 2; }\n");
+      writeFileSync(join(paths.workspace, hostileName), "const safe = 'changed';\n");
+      writeFileSync(join(paths.workspace, "added.js"), "function added() { return 3; }\n");
+      const baseline = (await gitCommand(paths, "rev-parse", "HEAD")).stdout.trim();
+      const tree = (await gitCommand(paths, "rev-parse", "HEAD^{tree}")).stdout.trim();
+      const remote = (await gitCommand(paths, "commit-tree", tree, "-p", baseline, "-m", "Unfetched sibling")).stdout.trim();
+      await gitCommand(paths, "update-ref", "refs/remotes/origin/main", remote);
+      await gitCommand(paths, "config", "remote.origin.url", "https://example.invalid/never-contact");
+      await gitCommand(paths, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+      const branch = (await gitCommand(paths, "branch", "--show-current")).stdout.trim();
+      await gitCommand(paths, "config", `branch.${branch}.remote`, "origin");
+      await gitCommand(paths, "config", `branch.${branch}.merge`, "refs/heads/main");
+      await gitCommand(paths, "commit", "--allow-empty", "-qm", "Local sibling", "--only");
+    }
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
     const pin = JSON.parse(indexed.stdout).status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
@@ -342,15 +365,16 @@ test("Files declaration Sequence and browser traversal restore the exact pinned 
   const historyLength = await page.evaluate(() => history.length);
   async function returned() {
     await page.waitForFunction(line => document.body.classList.contains("files-section") && document.querySelector("#source")?.dataset.navigationLine === String(line), method.symbol.range.startLine);
-    await assertSource(page, navigationSource, method.symbol.range);
-    assert.equal(await page.locator("#files-indexed").getAttribute("aria-pressed"), "true");
-    assert.equal(await page.locator(`.files-symbol-pick[data-symbol-id="${method.symbol.id}"]`).getAttribute("aria-pressed"), "true");
-    assert.equal(await page.locator("#files-symbol-title").textContent(), method.symbol.name);
+    // Source paints before the async mini render; restored focus marks completion.
     await page.waitForFunction(({id, scroll}) => {
       const panel = document.querySelector("#workspace-source-panel"), focus = document.activeElement;
       return focus?.dataset.symbolId === id && focus.classList.contains("source-diagram-action") &&
         Math.abs(panel.scrollTop - scroll.top) <= 1 && panel.scrollLeft === scroll.left;
     }, {id:method.symbol.id, scroll});
+    await assertSource(page, navigationSource, method.symbol.range);
+    assert.equal(await page.locator("#files-indexed").getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator(`.files-symbol-pick[data-symbol-id="${method.symbol.id}"]`).getAttribute("aria-pressed"), "true");
+    assert.equal(await page.locator("#files-symbol-title").textContent(), method.symbol.name);
     assert.equal(sourceReads(requests), sourceCount, "Back reuses the captured source snapshot");
     assert.equal(await page.evaluate(() => history.length), historyLength, "traversal never appends history");
   }
@@ -412,8 +436,9 @@ test("explicit More source actions admits page two and Back restores its action 
   assert.equal(await more.isVisible(), false, "the restored completed metadata page has no More action");
 }));
 
-async function git(paths, ...args) { return H.run("git", args, {cwd:paths.workspace, env:paths.env}); }
-async function prepareGit(paths) {
+async function gitCommand(paths, ...args) { return H.run("git", args, {cwd:paths.workspace, env:paths.env}); }
+const git = gitCommand;
+async function prepareGit(paths, dirty = true) {
   await git(paths, "init", "-q");
   await git(paths, "config", "user.name", "Files acceptance");
   await git(paths, "config", "user.email", "files@example.invalid");
@@ -421,6 +446,9 @@ async function prepareGit(paths) {
   writeFileSync(join(paths.workspace, "deleted.java"), "class Deleted {}\n");
   writeFileSync(join(paths.workspace, "rename-old.js"), "function renamed() { return 17; }\n");
   await git(paths, "add", "."); await git(paths, "commit", "-qm", "Files baseline");
+  if (dirty) await dirtyGit(paths);
+}
+async function dirtyGit(paths) {
   writeFileSync(paths.source, source.replace("count = 1", "count = 10"));
   writeFileSync(join(paths.workspace, "clean.js"), "const clean = 2;\n");
   await git(paths, "add", "Watcher.java", "clean.js");
@@ -565,4 +593,59 @@ test("390px Files keeps cached noncallable source, safe labels, no-Git reason an
   assert.equal(await page.locator(".files-symbol-pick").filter({hasText:"safe"}).count(), 1, "a file with no callables still has a measured variable outline");
   assert.equal(sequenceReads(requests), 0, "types and file selection never invent a callable sequence");
   await assertNoOverflow(page);
+}));
+
+
+test("measured Git counts and exact M/A/D/R markers preserve indexed evidence boundaries", {timeout:240000}, async () => published({git:"markers"}, async selected => {
+  const {page, paths, server, requests} = selected;
+  const status = await read(selected, "git");
+  assert.equal(status.git.state, "available");
+  assert.deepEqual(status.git.workingTree, {state:"available", changedFiles:7});
+  assert.equal(status.changes.length, 7, "a rename counts once and restored staged content is net unchanged");
+  assert.deepEqual([status.git.upstream.ahead, status.git.upstream.behind], [1, 1]);
+  const expected = `${status.git.head.name} · 7 uncommitted · origin/main ↑1 ↓1 · As of last fetch`;
+  await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, expected);
+  assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), expected);
+  const marker = async (path, status, letter) => {
+    const found = await page.locator("#file-tree .git-marker").evaluateAll((nodes, path) => nodes.filter(node => node.dataset.path === path).map(node => ({
+      text:node.textContent, status:node.dataset.status, title:node.title, label:node.getAttribute("aria-label"),
+    })), path);
+    assert.equal(found.length, 1, `one exact marker for ${path}: ${JSON.stringify(await page.locator("#file-tree .file-pick, #file-tree .files-change-pick").evaluateAll(nodes => nodes.map(node => ({path:node.title || node.dataset.path, text:node.textContent}))))}`);
+    assert.equal(found[0].status, status); assert.equal(found[0].text, letter);
+    assert.match(found[0].title, /uncommitted vs HEAD/); assert.equal(found[0].label, found[0].title);
+    return found[0];
+  };
+  await page.locator('.directory-pick[title="changed/"]').click();
+  await page.locator('.directory-pick[title="unchanged/"]').click();
+  await marker("changed/same.js", "modified", "M");
+  assert.equal(await page.locator('.file-pick[title="unchanged/same.js"] .git-marker').count(), 0, "basename matches are not Git matches");
+  await marker("added.js", "added", "A");
+  const liveRename = await marker("rename-new.js", "renamed", "R");
+  assert.ok(liveRename.title.includes("rename-old.js"));
+  assert.equal(await page.locator('.file-pick[title="deleted.java"]').count(), 0, "a deletion does not invent a live file");
+  await enterFiles(selected);
+  await page.waitForFunction(() => /\d+ of \d+ loaded files/.test(document.querySelector("#files-state")?.textContent || ""));
+  await marker("Watcher.java", "modified", "M");
+  await marker("added.js", "added", "A");
+  await marker("deleted.java", "deleted", "D");
+  const rename = await marker("rename-new.js", "renamed", "R");
+  assert.ok(rename.title.includes("rename-old.js"));
+  assert.equal(await page.locator('.file-pick[title="rename-old.js"]').count(), 0, "the catalog does not invent a cached rename source");
+  await marker(hostileName, "modified", "M");
+  assert.equal(await page.locator('#file-tree img, #file-tree svg').count(), 0);
+  assert.equal(await page.evaluate(() => globalThis.filenameExecuted), undefined);
+  await openFile(selected, "Watcher.java");
+  await assertSource(page, (await cached(selected, "Watcher.java")).text);
+  assert.equal(await page.locator("#files-indexed").isEnabled(), true, "Git decoration retains actual indexed source access");
+  const before = sourceReads(requests);
+  await page.locator('.files-change-pick[data-path="deleted.java"]').click();
+  await page.waitForFunction(() => document.querySelector("#files-diff .files-diff-status")?.textContent.includes("deleted.java"));
+  assert.equal(await page.locator("#files-indexed").isEnabled(), false);
+  assert.equal(await page.locator("#files-symbol-header").textContent(), "");
+  assert.equal(sourceReads(requests), before, "changed-only paths do not fetch indexed source");
+  await page.locator("#file-filter").fill("same.js");
+  assert.equal(await page.locator("#workspace-git").textContent(), expected, "filtering never changes the checkout-wide count");
+  assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
+  const listing = await H.api(server.base, paths.token, "GET", "/api/checkouts");
+  assert.deepEqual(listing.data.checkouts.find(row => row.rootKey === server.rootKey).git.workingTree, status.git.workingTree);
 }));

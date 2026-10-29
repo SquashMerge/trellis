@@ -26,7 +26,7 @@ function harness(windowOptions = {}) {
   let network = () => { throw new Error("Unexpected request"); };
   const context = vm.createContext({document, window:{...windowOptions}, console, AbortController, DOMException, TextEncoder, URLSearchParams,
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
-    fetch(url, options){ requests.push({url,options}); assert.ok(url.startsWith(`/api/checkouts/${ROOT}/`)); return network("/api/" + url.slice(`/api/checkouts/${ROOT}/`.length),options); }});
+    fetch(url, options){ requests.push({url,options}); if(url === "/api/checkouts") return network(url,options); assert.ok(url.startsWith(`/api/checkouts/${ROOT}/`)); return network("/api/" + url.slice(`/api/checkouts/${ROOT}/`.length),options); }});
   const run = code => vm.runInContext(code, context); run(source);
   run(`token="synthetic"; selectedRootKey="${ROOT}"; checkouts=[{rootKey:"${ROOT}", workspaceRoot:"/fixture", state:"available"}]; status={revision:${JSON.stringify(pin)}, workspaceRoot:"/fixture"}; selectedGit={state:"unavailable",reason:"not_repository"};`);
   get("workspace").hidden=false; get("error").hidden=true;
@@ -186,17 +186,51 @@ for(const failure of [false,true]) test(`mini replacement and reset ignore delay
   h.run('clearBrowse()'); assert.equal(h.run("filesFile"),null); assert.equal(h.get("files-mini-sequence").children.length,0);
 });
 
-test("Working status and diff failures clear previous hunks and no-Git hides the toggle", async () => {
-  const h=harness(); indexedNetwork(h); await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
-  h.run(`selectedGit=${JSON.stringify(git)}`);
-  h.network(url=>url==="/api/git"?response({git,changes:[{path:"main.java"}]}):response({git,file:fileDiff}));
+for (const failure of ["unavailable", "HTTP error"]) test(`Working whole-status ${failure} clears previous hunks, summary and markers`, async () => {
+  const h=harness(), measured={...git,workingTree:{state:"available",changedFiles:1}};
+  indexedNetwork(h); await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
+  h.context.measured=measured; h.run('selectedWorkspaceRoot="/fixture";selectedGit=measured');
+  h.network(url=>url==="/api/git"?response({git:measured,changes:[{path:"main.java",status:"modified"}]}):response({git:measured,file:fileDiff}));
   await h.run('setFilesBasis("working")'); assert.match(text(h.get("files-diff")),/<old>/);
-  h.network(()=>response({git:{state:"unavailable",reason:"git_changed"},changes:null}));
-  await h.run('setFilesBasis("working")'); assert.doesNotMatch(text(h.get("files-diff")),/<old>/);
-  assert.match(text(h.get("files-diff")),/git_changed/); assert.equal(h.get("files-working").hidden,true);
-  h.run(`selectedGit=${JSON.stringify(git)}`);
-  h.network(url=>url==="/api/git"?response({git,changes:[{path:"main.java"}]}):Promise.reject(new Error("Git changed during diff")));
-  await h.run('setFilesBasis("working")'); assert.doesNotMatch(text(h.get("files-diff")),/<old>/); assert.match(h.get("files-diff").textContent,/Git changed during diff/);
+  assert.equal(all(h.get("file-tree")).filter(node=>node.className==="git-marker").length,1);
+  h.network(()=>failure==="unavailable" ? response({git:{state:"unavailable",reason:"git_changed"},changes:null})
+    : {ok:false,status:500,json:async()=>({error:{code:"git_unavailable",message:"Whole Git status failed"}})});
+  await h.run('setFilesBasis("working")');
+  assert.doesNotMatch(text(h.get("files-diff")),/<old>/);
+  assert.match(text(h.get("files-diff")),failure==="unavailable"?/git_changed/:/Whole Git status failed/);
+  assert.equal(h.run("filesGitStatus"),null);
+  assert.equal(h.get("workspace-git").textContent,"Git unavailable");
+  assert.equal(all(h.get("file-tree")).filter(node=>node.className==="git-marker").length,0);
+  assert.equal(h.get("files-working").hidden,true);
+});
+
+for (const failure of ["HTTP 404", "path mismatch", "unavailable", "rejected request"]) test(`Working per-file ${failure} keeps the whole-status summary and markers`, async () => {
+  const h=harness(), measured={...git,workingTree:{state:"available",changedFiles:1}};
+  const wholeStatus={git:measured,changes:[{path:"main.java",status:"modified"}]};
+  indexedNetwork(h); await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
+  h.context.measured=measured; h.run('selectedWorkspaceRoot="/fixture";selectedGit=measured');
+  h.network(url=>url==="/api/git"?response(wholeStatus):response({git:measured,file:fileDiff}));
+  await h.run('setFilesBasis("working")'); assert.match(text(h.get("files-diff")),/<old>/);
+  const header=h.get("workspace-git").textContent;
+  assert.match(header,/1 uncommitted/);
+  const marker=()=>all(h.get("file-tree")).find(node=>node.className==="git-marker");
+  assert.equal(marker().attrs["data-status"],"modified");
+  h.network(url=>{
+    if(url==="/api/git") return response(wholeStatus);
+    if(failure==="HTTP 404") return {ok:false,status:404,json:async()=>({error:{code:"path_not_found",message:"Selected path no longer exists"}})};
+    if(failure==="path mismatch") return response({git:measured,file:{...fileDiff,path:"other.java"}});
+    if(failure==="unavailable") return response({git:{state:"unavailable",reason:"git_changed"},file:null});
+    return Promise.reject(new Error("Git changed during diff"));
+  });
+  await h.run('setFilesBasis("working")');
+  assert.doesNotMatch(text(h.get("files-diff")),/<old>/);
+  const errors={"HTTP 404":/Selected path no longer exists/,"path mismatch":/Git diff path changed/,unavailable:/git_changed/,"rejected request":/Git changed during diff/};
+  assert.match(text(h.get("files-diff")),errors[failure]);
+  assert.equal(h.get("workspace-git").textContent,header);
+  assert.equal(h.run("filesGitStatus"),wholeStatus);
+  assert.equal(h.run("selectedGit"),measured);
+  assert.equal(marker()?.attrs["data-status"],"modified");
+  assert.equal(h.get("files-working").hidden,false);
 });
 
 
@@ -466,4 +500,66 @@ test("Files syntax colouring classifies whole lines by prefix and leaves large f
   assert.equal(lineClass("python", "// not a comment", 10), "");
   assert.equal(lineClass("go", "// comment", 10), "syntax-comment");
   assert.equal(lineClass("rust", "// comment", SYNTAX_LINE_LIMIT + 1), "", "large files stay plain");
+});
+
+
+test("Files decorates cached deletions and both rename paths without manufacturing indexed evidence", async () => {
+  const h=harness(), item=outline("Holder","class","gone.java"); indexedNetwork(h,item);
+  await h.run('setSection("files")');
+  h.context.measured={...git,workingTree:{state:"available",changedFiles:4}};
+  h.run(`files=[{path:"gone.java",methodCount:0},{path:"old.java",methodCount:0},{path:"new.java",methodCount:0},{path:"other/new.java",methodCount:0}];
+    filesGitStatus={git:measured,changes:[{path:"gone.java",status:"deleted"},{path:"new.java",previousPath:"old.java",status:"renamed"},{path:"untracked/<img>.java",status:"added"},{path:"NEW.java",status:"modified"}]};renderFiles()`);
+  const markers=all(h.get("file-tree")).filter(node=>node.className==="git-marker");
+  assert.equal(markers.length,5);
+  const rowFor=path=>all(h.get("file-tree")).find(node=>node.tagName==="li" && node.children.some(child=>child.title===path || child.attrs?.["data-path"]===path));
+  const markerFor=path=>all(rowFor(path)).find(node=>node.className==="git-marker");
+  assert.equal(markerFor("gone.java").attrs["data-status"],"deleted");
+  assert.equal(markerFor("gone.java").textContent,"D");
+  assert.match(markerFor("old.java").title,/Renamed.*to new.java/);
+  assert.match(markerFor("new.java").title,/Renamed.*from old.java/);
+  assert.equal(markerFor("other/new.java"),undefined);
+  assert.equal(markerFor("untracked/<img>.java").attrs["data-status"],"added");
+  assert.equal(markerFor("NEW.java").attrs["data-status"],"modified");
+  assert.ok(all(h.get("file-tree")).every(node=>node.tagName!=="img"));
+  await rowFor("gone.java").children.find(child=>child.className==="file-pick").listeners.click();
+  assert.match(text(h.get("source")),/int measured/);
+  assert.equal(h.run("filesFile.changeOnly"),undefined,"deleted cached row retains indexed source access");
+  assert.equal(h.run("filesGitStatus.git.workingTree.changedFiles"),4,"rename markers never double the producer's total");
+  h.run('filesGitStatus.changes.push({path:"old.java",status:"added"});filesGitStatus.git.workingTree.changedFiles=5;renderFiles()');
+  assert.equal(markerFor("old.java").attrs["data-status"],"added","a real change at a recreated old path wins over a rename alias");
+  assert.equal(markerFor("new.java").attrs["data-status"],"renamed");
+});
+
+
+test("checkout-list retry restores the selected Working diff without indexed source reads", async () => {
+  const h=harness(); indexedNetwork(h); await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
+  const measured={...git,workingTree:{state:"available",changedFiles:1}};
+  h.context.measured=measured; h.run('selectedWorkspaceRoot="/fixture";selectedGit=measured');
+  const diffRequested=deferred(), nextDiff=deferred(); let holdDiff=false;
+  h.network(url=>{
+    if(url==="/api/checkouts") return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/fixture",state:"available",revision:pin,git:measured}]});
+    if(url==="/api/git") return response({git:measured,changes:[{path:"main.java",status:"modified"}]});
+    assert.equal(url,"/api/git/diff?path=main.java");
+    if(holdDiff) {diffRequested.resolve();return nextDiff.promise;}
+    return response({git:measured,file:fileDiff});
+  });
+  await h.run('setFilesBasis("working")'); assert.match(text(h.get("files-diff")),/<old>/);
+  const sourceReads=h.requests.filter(request=>request.url.includes("/source?")).length;
+  holdDiff=true; await h.run('loadCheckouts()');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(h.requests.filter(request=>request.url.includes("/git/diff?")).length===2,"list retry must request the current Working diff again");
+  await diffRequested.promise;
+  nextDiff.resolve(response({git:measured,file:fileDiff}));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.run("filesBasis"),"working"); assert.equal(h.run("filesFile.path"),"main.java");
+  assert.equal(h.get("files-diff").hidden,false); assert.match(text(h.get("files-diff")),/<old>/);
+  assert.equal(h.requests.filter(request=>request.url.includes("/source?")).length,sourceReads);
+  h.network(url=>{
+    assert.equal(url,"/api/checkouts");
+    return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/fixture",state:"available",revision:pin,git:{state:"unavailable",reason:"git_changed"}}]});
+  });
+  await h.run('loadCheckouts()');
+  assert.doesNotMatch(text(h.get("files-diff")),/<old>/,"an unavailable list summary clears obsolete Working hunks");
+  assert.equal(h.run("filesGitStatus"),null);
+  assert.equal(h.get("files-working").hidden,true);
 });

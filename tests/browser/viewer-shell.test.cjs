@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal, {library = false, rules = null, git = false} = {}) {
+async function published(callback, signal, {library = false, rules = null, git = false, additionalRootKeys = []} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -128,7 +128,7 @@ async function published(callback, signal, {library = false, rules = null, git =
     assert.ok(metricsRequests.length > 0);
     for (const {url, method} of metricsRequests) {
       assert.equal(method, "GET"); assert.equal(url.searchParams.get("workbench"), "true");
-      assert.equal(url.pathname, H.scoped(server.rootKey, "metrics"));
+      assert.ok([server.rootKey, ...additionalRootKeys].some(root => url.pathname === H.scoped(root, "metrics")), "metrics remain scoped to an explicitly selected fixture checkout");
       assert.ok(observedPins.some(value => url.searchParams.get("indexGeneration") === value.indexGeneration &&
         url.searchParams.get("indexRevision") === String(value.indexRevision)), "metrics use a complete displayed pin");
       assert.ok(["production", "all"].includes(url.searchParams.get("role")), "browser explicitly selects its metric population");
@@ -992,10 +992,15 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
   assert.equal(gitResponse.status, 200, JSON.stringify(gitResponse.data));
   assert.equal(gitResponse.data.git.state, "available");
   assert.equal(gitResponse.data.git.head.name, "measured-branch");
+  assert.deepEqual(gitResponse.data.git.workingTree, {state:"available", changedFiles:0});
+  await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent === "measured-branch · No upstream · clean");
+  assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), "measured-branch · No upstream · clean");
   const shortRevision = `rev ${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`;
   assert.equal(await page.locator(`#checkout-select option[value="${server.rootKey}"]`).textContent(), `workspace ⎇ measured-branch · ${shortRevision}`, "the real measured Git branch labels the published checkout");
   const branch = '<svg onload="globalThis.branchExecuted=true">' + "-long-branch".repeat(12);
-  const available = {...gitResponse.data.git, head:{...gitResponse.data.git.head, name:branch}};
+  const upstream = '<img src=x onerror="globalThis.upstreamExecuted=true">';
+  const available = {...gitResponse.data.git, head:{...gitResponse.data.git.head, name:branch},
+    upstream:{name:upstream, ahead:2, behind:3, basis:"last_fetch"}, workingTree:{state:"available", changedFiles:9}};
   const rows = [
     {...observed, git:available},
     {...observed, rootKey:"b".repeat(64), workspaceRoot:join(paths.workspace, "busy"), state:"storage_busy", git:{state:"unavailable", reason:"not_repository"}},
@@ -1022,8 +1027,11 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent === "");
     assert.equal(await page.locator("#checkout-select").getAttribute("title"), observed.workspaceRoot);
     assert.equal(await page.locator("#workspace-name").getAttribute("title"), observed.workspaceRoot);
-    assert.equal(await page.locator(".app-header svg, #indexed-checkouts svg").count(), 0);
-    assert.equal(await page.evaluate(() => globalThis.branchExecuted), undefined);
+    const hostileGit = `${branch} · 9 uncommitted · ${upstream} ↑2 ↓3 · As of last fetch`;
+    await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, hostileGit);
+    assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), hostileGit);
+    assert.equal(await page.locator(".app-header svg, #indexed-checkouts svg, #workspace-git img, #indexed-checkouts img").count(), 0);
+    assert.equal(await page.evaluate(() => globalThis.branchExecuted || globalThis.upstreamExecuted), undefined);
     for (const width of [390, 320]) {
       await page.setViewportSize({width, height:844});
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px long branch does not create document overflow`);
@@ -1035,22 +1043,39 @@ test("checkout picker uses observed branch, detached and unavailable Git labels,
     await page.locator("#workspace-details > summary").click();
     assert.equal(await page.locator("#checkout-root").textContent(), observed.workspaceRoot);
     await page.locator("#workspace-details > summary").click();
-    for (const [git, expected] of [
-      [{...available, head:{...available.head, kind:"detached", name:null}}, `Detached ${available.head.shortCommit}`],
-      [{state:"unavailable", reason:"not_repository"}, "Git unavailable"],
-      [{...available, head:{kind:"detached", name:null, shortCommit:null}}, "Detached"],
+    for (const [git, identity, words] of [
+      [{...available, upstream:null, workingTree:{state:"unavailable", reason:"deadline_exceeded"}}, branch, /No upstream · Changes unavailable/],
+      [{...available, upstream:null, head:{...available.head, kind:"detached", name:null}}, `Detached ${available.head.shortCommit}`, /Detached HEAD .*No upstream.*9 uncommitted/],
+      [{...available, upstream:null, head:{kind:"detached", name:null, shortCommit:null}}, "Detached", /Detached HEAD · No upstream · 9 uncommitted/],
+      [{state:"unavailable", reason:"not_repository"}, "Git unavailable", /^Git unavailable$/],
+      [{state:"unavailable", reason:"conflicted"}, "Git unavailable", /^Git unavailable$/],
+      [{state:"unavailable", reason:"tracking_unavailable"}, "Git unavailable", /^Git unavailable$/],
     ]) {
       rows[0].git = git;
       const refreshed = page.waitForResponse(response => response.url() === pattern);
       await page.locator("#checkout-retry").click();
       assert.equal((await refreshed).status(), 200);
-      await page.waitForFunction(({key, label}) => [...document.querySelector("#checkout-select").options].find(option => option.value === key)?.textContent.includes(label), {key:server.rootKey, label:expected});
-      assert.equal(await option.textContent(), `workspace ⎇ ${expected} · ${shortRevision}`);
+      await page.waitForFunction(({key, label}) => [...document.querySelector("#checkout-select").options].find(option => option.value === key)?.textContent.includes(label), {key:server.rootKey, label:identity});
+      assert.equal(await option.textContent(), `workspace ⎇ ${identity} · ${shortRevision}`);
+      const shown = await page.locator("#workspace-git").textContent();
+      assert.match(shown, words);
+      if (git.head?.kind === "detached") assert.doesNotMatch(shown, /Git unavailable/, "a detached HEAD is still Git");
+      assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), shown, "header and selected list row share the accepted observation");
+      if (git.state === "unavailable") assert.doesNotMatch(shown, /uncommitted|clean|↑|↓/);
       assert.equal(await page.locator("#checkout-select").inputValue(), server.rootKey, "retry retains explicit selection of the same available checkout");
     }
-    const listedGit = page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git');
-    await page.waitForFunction(() => /^Detached HEAD/.test(document.querySelector('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git')?.textContent || ""));
-    assert.doesNotMatch(await listedGit.textContent(), /Git unavailable/, "a detached HEAD without a short commit is still Git");
+    // Git remains independent of a missing semantic index; no fallback zero is invented.
+    rows[0].git = {...available, upstream:null, workingTree:{state:"available", changedFiles:4}};
+    const statusPattern = `${server.base}${H.scoped(server.rootKey, "status")}`;
+    const coldStatus = route => route.fulfill({status:409, contentType:"application/json", body:JSON.stringify({error:{code:"index_not_ready", message:"No validated index", workspaceRoot:observed.workspaceRoot}})});
+    await page.route(statusPattern, coldStatus);
+    try {
+      await page.locator("#checkout-select").selectOption(server.rootKey);
+      await page.waitForFunction(() => document.querySelector("#checkout-state")?.textContent.includes("Index not ready"));
+      await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent.includes("4 uncommitted"));
+      assert.ok((await page.locator("#workspace-git").textContent()).startsWith(branch));
+      assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), `${branch} · No upstream · 4 uncommitted`);
+    } finally { await page.unroute(statusPattern, coldStatus); }
     assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
     await capture(page, "chrome-checkout-git-unavailable");
   } finally {
@@ -1121,3 +1146,103 @@ test("an unsaved token warning stays visible in the header after a checkout is s
   assert.ok(box && box.width > 0 && box.height > 0);
   await capture(page, "chrome-storage-warning");
 }));
+
+test("late Git from an old root and an older checkout list cannot regress selected Git", {timeout:240000}, async () => published(async ({page, paths, server, requests}) => {
+  const discovery = await H.api(server.base, paths.token, "GET", "/api/checkouts");
+  const observed = discovery.data.checkouts.find(row => row.rootKey === server.rootKey);
+  const oldStatus = await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, "git"));
+  const otherKey = "d".repeat(64);
+  const summary = name => ({...oldStatus.data.git, head:{...oldStatus.data.git.head, name}, upstream:null, workingTree:{state:"available", changedFiles:1}});
+  const current = {git:summary("current-root"), changes:[{path:"src/flow.js", status:"modified"}]};
+  const old = {git:summary("obsolete-root"), changes:[{path:maliciousName, status:"added"}]};
+  const rows = [{...observed, git:old.git}, {...observed, rootKey:otherKey, git:current.git},
+    {...observed, rootKey:"e".repeat(64), state:"unavailable", git:{state:"unavailable", reason:"not_repository"}}];
+  const listPattern = `${server.base}/api/checkouts`;
+  const respondList = route => route.fulfill({status:200, contentType:"application/json", body:JSON.stringify({...discovery.data, checkouts:rows})});
+  const rootPattern = `${server.base}${H.scoped(server.rootKey, "git")}`;
+  const respondOld = route => route.fulfill({status:200, contentType:"application/json", body:JSON.stringify(old)});
+  const otherPattern = `${server.base}${H.scoped(otherKey, "")}**`;
+  const respondOther = async route => {
+    const url = route.request().url();
+    if (new URL(url).pathname.endsWith("/git")) return route.fulfill({status:200, contentType:"application/json", body:JSON.stringify(current)});
+    await route.continue({url:url.replace(`/checkouts/${otherKey}/`, `/checkouts/${server.rootKey}/`)});
+  };
+  await page.route(listPattern, respondList);
+  await page.route(rootPattern, respondOld);
+  await page.route(otherPattern, respondOther);
+  await page.evaluate(() => {
+    const original = window.fetch;
+    window.__gitOrdering = {original, held:null, entered:false, consumed:false};
+    window.fetch = async (input, options) => {
+      const state = window.__gitOrdering, path = new URL(input, location.href).pathname;
+      const hold = state.held && path === state.held;
+      // Let the old response reach the existing epoch/serial guards even after abort.
+      const response = await original(input, hold ? {...options, signal:undefined} : options);
+      if (!hold) return response;
+      const json = response.json.bind(response);
+      response.json = async () => {
+        const value = await json(); state.entered = true;
+        await new Promise(resolve => { state.release = resolve; });
+        state.consumed = true; return value;
+      };
+      return response;
+    };
+  });
+  const hold = path => page.evaluate(path => {
+    Object.assign(window.__gitOrdering, {held:path, entered:false, consumed:false});
+  }, path);
+  const release = async () => {
+    await page.evaluate(() => { window.__gitOrdering.held = null; window.__gitOrdering.release(); });
+    await page.waitForFunction(() => window.__gitOrdering.consumed);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  };
+  const assertCurrent = async name => {
+    const expected = `${name} · No upstream · 1 uncommitted`;
+    await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, expected);
+    assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), expected);
+    assert.ok((await page.locator(`#checkout-select option[value="${otherKey}"]`).textContent()).includes(name));
+    assert.equal(await page.locator('.file-pick[title="src/flow.js"] .git-marker[data-status="modified"]').count(), 1);
+    assert.equal(await page.locator("#file-tree .git-marker").evaluateAll((nodes, path) => nodes.filter(node => node.dataset.path === path).length, maliciousName), 0);
+  };
+  try {
+    // Refresh discovery once to admit the second explicit checkout.
+    await page.locator("#logout").click();
+    await page.locator("#token").fill(paths.token);
+    await page.locator("#connect-form button[type=submit]").click();
+    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
+    await hold(H.scoped(server.rootKey, "git"));
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await page.waitForFunction(() => window.__gitOrdering.entered);
+    await page.locator("#checkout-select").selectOption(otherKey);
+    await page.locator('.directory-pick[title="src/"]').click();
+    await page.locator('.file-pick[title="src/flow.js"] .git-marker').waitFor();
+    await assertCurrent("current-root");
+    await release();
+    await assertCurrent("current-root");
+    // The list captures old-root summaries first; a newer selected read then wins.
+    await hold("/api/checkouts");
+    await page.locator("#checkout-retry").click();
+    await page.waitForFunction(() => window.__gitOrdering.entered);
+    current.git = summary("newer-selected");
+    const refreshed = page.waitForResponse(response => new URL(response.url()).pathname === H.scoped(otherKey, "git"));
+    await page.locator("#refresh").click();
+    assert.equal((await refreshed).status(), 200);
+    await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent.startsWith("newer-selected"));
+    await release();
+    await assertCurrent("newer-selected");
+    current.git = {state:"unavailable", reason:"git_changed"}; current.changes = null;
+    await page.locator("#refresh").click();
+    await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent === "Git unavailable");
+    assert.equal(await page.locator("#file-tree .git-marker").count(), 0, "unavailable observation clears previously measured paths");
+    assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), "Git unavailable");
+    await page.waitForFunction(() => !document.querySelector("#refresh").disabled);
+    current.git = {...summary("newer-selected"), workingTree:{state:"available", changedFiles:0}}; current.changes = [];
+    await page.locator("#refresh").click();
+    await page.waitForFunction(() => document.querySelector("#workspace-git")?.textContent === "newer-selected · No upstream · clean");
+    assert.equal(await page.locator("#file-tree .git-marker").count(), 0, "measured clean never retains dirty path markers");
+    assert.equal(requests.some(row => row.method === "POST" && row.url.pathname.endsWith("/index")), false);
+  } finally {
+    await page.evaluate(() => { const state = window.__gitOrdering; state.held = null; state.release?.(); window.fetch = state.original; });
+    await page.unroute(listPattern, respondList); await page.unroute(rootPattern, respondOld); await page.unroute(otherPattern, respondOther);
+  }
+}, undefined, {git:true, additionalRootKeys:["d".repeat(64)]}));

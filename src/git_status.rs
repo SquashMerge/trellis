@@ -36,6 +36,19 @@ pub enum GitSummary {
     Available {
         head: GitHead,
         upstream: Option<GitUpstream>,
+        #[serde(rename = "workingTree")]
+        working_tree: GitWorkingTree,
+    },
+    Unavailable {
+        reason: GitReason,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum GitWorkingTree {
+    Available {
+        #[serde(rename = "changedFiles")]
+        changed_files: usize,
     },
     Unavailable {
         reason: GitReason,
@@ -156,11 +169,26 @@ impl GitReader {
         Self { executable }
     }
     pub async fn summary(&self, root: &Path) -> GitSummary {
-        match self.read(root, "summary", None).await {
-            Ok(WorkerResponse::Summary(value)) => value,
-            Err(reason) => unavailable(reason),
-            _ => unavailable(GitReason::InvalidRepository),
-        }
+        let head = match self.read(root, "head", None).await {
+            Ok(WorkerResponse::Head(Ok(value))) => value,
+            Ok(WorkerResponse::Head(Err(reason))) | Err(reason) => return unavailable(reason),
+            _ => return unavailable(GitReason::InvalidRepository),
+        };
+        let reason = match self.read(root, "summary", None).await {
+            Ok(WorkerResponse::Summary(GitSummary::Available {
+                head: measured_head,
+                upstream,
+                working_tree,
+            })) => {
+                if measured_head == head.head && upstream == head.upstream {
+                    return head.with_working_tree(working_tree);
+                }
+                GitReason::GitChanged
+            }
+            Ok(WorkerResponse::Summary(GitSummary::Unavailable { reason })) | Err(reason) => reason,
+            _ => GitReason::InvalidRepository,
+        };
+        head.with_working_tree(GitWorkingTree::Unavailable { reason })
     }
     pub async fn status(&self, root: &Path) -> GitStatus {
         match self.read(root, "status", None).await {
@@ -289,12 +317,14 @@ pub async fn diff(root: &Path, path: &str) -> Result<GitDiff, GitRequestError> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", content = "result", rename_all = "lowercase")]
 pub enum WorkerResponse {
+    Head(Result<HeadSummary, GitReason>),
     Summary(GitSummary),
     Status(GitStatus),
     Diff(Result<GitDiff, GitRequestError>),
 }
 fn failed(mode: &str, reason: GitReason) -> WorkerResponse {
     match mode {
+        "head" => WorkerResponse::Head(Err(reason)),
         "summary" => WorkerResponse::Summary(unavailable(reason)),
         "diff" => WorkerResponse::Diff(Ok(GitDiff {
             git: unavailable(reason),
@@ -349,7 +379,22 @@ fn git_error(error: git2::Error) -> GitReason {
         _ => GitReason::InvalidRepository,
     }
 }
-fn head_summary(repo: &Repository) -> Result<GitSummary, GitReason> {
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadSummary {
+    head: GitHead,
+    upstream: Option<GitUpstream>,
+}
+impl HeadSummary {
+    fn with_working_tree(self, working_tree: GitWorkingTree) -> GitSummary {
+        GitSummary::Available {
+            head: self.head,
+            upstream: self.upstream,
+            working_tree,
+        }
+    }
+}
+fn head_summary(repo: &Repository) -> Result<HeadSummary, GitReason> {
     let head = repo.head().map_err(git_error)?;
     let oid = head.target().ok_or(GitReason::InvalidRepository)?;
     repo.find_commit(oid)
@@ -410,7 +455,7 @@ fn head_summary(repo: &Repository) -> Result<GitSummary, GitReason> {
     } else {
         None
     };
-    Ok(GitSummary::Available {
+    Ok(HeadSummary {
         head: GitHead {
             kind: if detached {
                 GitHeadKind::Detached
@@ -439,13 +484,32 @@ fn measure(root: &Path, mode: &str, requested: Option<&str>) -> Result<WorkerRes
     if workdir != selected_root {
         return Err(GitReason::InvalidRepository);
     }
-    let git = head_summary(&repo)?;
-    if mode == "summary" {
-        if head_summary(&repo)? != git {
+    let head = head_summary(&repo)?;
+    if mode == "head" {
+        if head_summary(&repo)? != head {
             return Err(GitReason::GitChanged);
         }
-        return Ok(WorkerResponse::Summary(git));
+        return Ok(WorkerResponse::Head(Ok(head)));
     }
+    let response = match measure_changes(&repo, &head, mode, requested) {
+        Ok(response) => response,
+        Err(reason) if mode == "summary" => WorkerResponse::Summary(
+            head.clone()
+                .with_working_tree(GitWorkingTree::Unavailable { reason }),
+        ),
+        Err(reason) => return Err(reason),
+    };
+    if head_summary(&repo)? != head {
+        return Err(GitReason::GitChanged);
+    }
+    Ok(response)
+}
+fn measure_changes(
+    repo: &Repository,
+    head: &HeadSummary,
+    mode: &str,
+    requested: Option<&str>,
+) -> Result<WorkerResponse, GitReason> {
     let index = repo.index().map_err(git_error)?;
     if index.has_conflicts() {
         return Err(GitReason::Conflicted);
@@ -454,10 +518,7 @@ fn measure(root: &Path, mode: &str, requested: Option<&str>) -> Result<WorkerRes
         .path()
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|meta| (meta.len(), meta.modified().ok()));
-    let GitSummary::Available { head, .. } = &git else {
-        return Err(GitReason::InvalidRepository);
-    };
-    let oid = git2::Oid::from_str(&head.commit).map_err(git_error)?;
+    let oid = git2::Oid::from_str(&head.head.commit).map_err(git_error)?;
     let tree = repo
         .find_commit(oid)
         .map_err(git_error)?
@@ -533,7 +594,12 @@ fn measure(root: &Path, mode: &str, requested: Option<&str>) -> Result<WorkerRes
         changes.push(change);
     }
     changes.sort_by(|left, right| left.path.cmp(&right.path));
-    let response = if mode == "diff" {
+    let git = head.clone().with_working_tree(GitWorkingTree::Available {
+        changed_files: changes.len(),
+    });
+    let response = if mode == "summary" {
+        WorkerResponse::Summary(git)
+    } else if mode == "diff" {
         let result = match selected {
             Some((index, change)) => Ok(GitDiff {
                 git: git.clone(),
@@ -552,7 +618,7 @@ fn measure(root: &Path, mode: &str, requested: Option<&str>) -> Result<WorkerRes
         .path()
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|meta| (meta.len(), meta.modified().ok()));
-    if head_summary(&repo)? != git || after_stamp != index_stamp {
+    if after_stamp != index_stamp {
         return Err(GitReason::GitChanged);
     }
     Ok(response)
