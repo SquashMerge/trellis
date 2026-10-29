@@ -225,6 +225,10 @@ pub fn command(
                 "index".into(),
                 "--project-name".into(),
                 "trellis-workspace".into(),
+                // Without it scip-python runs `git`, which is not on the child's PATH, and
+                // then fails on the undefined version.
+                "--project-version".into(),
+                "0".into(),
                 "--output".into(),
                 out,
             ];

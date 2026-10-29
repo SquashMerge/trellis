@@ -102,6 +102,12 @@ fn profile_commands_are_closed_table() {
     );
     let py = spec(&row(ProducerName::ScipPython, TrustProfile::Trusted));
     assert!(!py.argv.contains(&"--environment".to_owned()));
+    let version = py
+        .argv
+        .iter()
+        .position(|a| a == "--project-version")
+        .unwrap();
+    assert_eq!(py.argv[version + 1], "0");
 }
 
 #[test]
