@@ -161,3 +161,32 @@ pub fn start_checkout(setup: impl FnOnce(&Path), daemon_env: &[(String, String)]
     );
     Checkout { temp, home, root }
 }
+
+/// A fake npm global prefix under `dir` holding `package` (for example
+/// `scip-typescript`) at `version`, with `bin/<package>` linked to its entry
+/// point and a `bin/node` that has a native executable magic. Returns `bin/`.
+pub fn fake_npm_install(dir: &Path, package: &str, version: &str) -> PathBuf {
+    let bin = dir.join("bin");
+    let root = dir.join("lib/node_modules/@sourcegraph").join(package);
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        json!({"name": format!("@sourcegraph/{package}"), "version": version}).to_string(),
+    )
+    .unwrap();
+    fs::write(root.join("dist/main.js"), "// entry\n").unwrap();
+    std::os::unix::fs::symlink(root.join("dist/main.js"), bin.join(package)).unwrap();
+    fs::set_permissions(root.join("dist/main.js"), fs::Permissions::from_mode(0o755)).unwrap();
+    let node = bin.join("node");
+    fs::write(&node, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+    fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// The pinned version of a producer, from the checked-in profile.
+pub fn pinned_version(name: &str) -> String {
+    trellis::scip_admission::pinned_producer_by_id(name)
+        .unwrap()
+        .version
+}

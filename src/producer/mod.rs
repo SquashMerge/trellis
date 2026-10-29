@@ -4,14 +4,26 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod detect;
 pub mod exec;
+pub mod plan;
 pub mod process_info;
+pub mod profiles;
 pub mod state;
+pub mod worktree;
 
+#[cfg(test)]
+mod detect_tests;
+#[cfg(test)]
+mod plan_tests;
 #[cfg(test)]
 mod process_info_tests;
 #[cfg(test)]
+mod profiles_tests;
+#[cfg(test)]
 mod state_tests;
+#[cfg(test)]
+mod worktree_tests;
 
 pub const PRODUCER_UNAVAILABLE: &str = "producer_unavailable";
 pub const PROFILE_UNSUPPORTED: &str = "profile_unsupported";

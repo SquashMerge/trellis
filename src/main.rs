@@ -36,6 +36,8 @@ enum Command {
     Index(IndexArgs),
     /// Explicitly import pinned SCIP evidence into the selected native index.
     Semantic(SemanticCommand),
+    /// Plan and inspect headless semantic producers. Planning executes nothing.
+    Producer(ProducerCommand),
     /// Run the elected user-level socket service.
     Daemon,
     /// Serve one read-only MCP connection on line-framed stdin/stdout.
@@ -155,6 +157,45 @@ struct SemanticImportArgs {
     /// Lowercase SHA-256 of the descriptor file.
     #[arg(long = "batch-sha256")]
     batch_sha256: String,
+}
+#[derive(Args)]
+struct ProducerCommand {
+    #[command(subcommand)]
+    action: ProducerAction,
+}
+#[derive(Subcommand)]
+enum ProducerAction {
+    /// Print everything a producer run would do, with its planSha256. Executes nothing.
+    Plan(ProducerPlanArgs),
+    /// Report producer detection, trust-profile availability and run state.
+    Status(ProducerStatusArgs),
+}
+#[derive(Args)]
+struct ProducerPlanArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(trellis::producer::profiles::cli_producer_names()))]
+    producer: String,
+    /// `restricted` runs no repository code; `trusted` allows it.
+    #[arg(long, default_value = "restricted", value_parser = ["restricted", "trusted"])]
+    trust: String,
+    /// Wall-clock bound in seconds, 1..14400.
+    #[arg(long, default_value_t = 1800)]
+    timeout_secs: u64,
+    /// Sampled resident-set bound in MiB, 64..65536.
+    #[arg(long, default_value_t = 8192)]
+    memory_mib: u64,
+    /// Launcher to use instead of resolving one on PATH.
+    #[arg(long)]
+    executable: Option<PathBuf>,
+}
+#[derive(Args)]
+struct ProducerStatusArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    /// Report one run.
+    #[arg(long)]
+    run: Option<String>,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -307,6 +348,7 @@ async fn main() -> Result<()> {
         }
         command @ (Command::Index(_)
         | Command::Semantic(_)
+        | Command::Producer(_)
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
@@ -782,6 +824,55 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 "maxFileBytes": args.max_file_bytes
             }),
             false,
+        ),
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Plan(args),
+        }) => {
+            ensure!(
+                trellis::producer::plan::TIMEOUT_SECS.contains(&args.timeout_secs)
+                    && trellis::producer::plan::MEMORY_MIB.contains(&args.memory_mib),
+                "invalid_request: producer limits"
+            );
+            let executable = args
+                .executable
+                .as_ref()
+                .map(|path| -> Result<String> {
+                    let absolute = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    };
+                    Ok(absolute
+                        .to_str()
+                        .context("invalid_request: non-UTF8 executable path")?
+                        .to_owned())
+                })
+                .transpose()?;
+            (
+                "producer_plan",
+                &args.workspace,
+                serde_json::json!({
+                    "version": 1,
+                    "producer": args.producer,
+                    "trustProfile": args.trust,
+                    "limits": {"timeoutSecs": args.timeout_secs, "memoryMiB": args.memory_mib},
+                    "executable": executable,
+                    "environment": trellis::producer::detect::Environment::from_process()?,
+                }),
+                true,
+            )
+        }
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Status(args),
+        }) => (
+            "producer_status",
+            &args.workspace,
+            serde_json::json!({
+                "version": 1,
+                "runId": args.run,
+                "environment": trellis::producer::detect::Environment::from_process()?,
+            }),
+            true,
         ),
         Command::Semantic(SemanticCommand {
             action: SemanticAction::Import(args),
@@ -1417,7 +1508,14 @@ fn dispatch_connection(
     let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
     let read_scope = matches!(
         request.operation.as_str(),
-        "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
+        "status"
+            | "symbols"
+            | "query"
+            | "metrics"
+            | "rules_check"
+            | "references"
+            | "producer_plan"
+            | "producer_status"
     );
     let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
@@ -1476,6 +1574,8 @@ fn dispatch_connection(
                     | "metrics"
                     | "rules_check"
                     | "references"
+                    | "producer_plan"
+                    | "producer_status"
             ),
             "unknown daemon operation"
         );
@@ -1489,7 +1589,10 @@ fn dispatch_connection(
         } else {
             None
         };
-        let identity = if request.operation == "status" {
+        let identity = if matches!(
+            request.operation.as_str(),
+            "status" | "producer_plan" | "producer_status"
+        ) {
             identity.attach_existing_marker_readonly()?
         } else {
             identity.attach_marker()?
@@ -1525,6 +1628,8 @@ fn dispatch_connection(
             let state_version = checkout.state_version();
             let selected = match request.operation.as_str() {
                 "status" => checkout.cli_status(),
+                "producer_plan" => checkout.cli_producer_plan(args),
+                "producer_status" => checkout.cli_producer_status(args),
                 "symbols" => checkout.cli_symbols(
                     args["search"].as_str().context("missing search")?,
                     args["limit"].as_u64().context("missing limit")? as usize,
