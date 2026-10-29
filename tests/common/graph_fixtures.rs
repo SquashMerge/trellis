@@ -499,7 +499,10 @@ pub fn add_second_producer(
     captured
         .producer_executables
         .insert(id.into(), b"exe".to_vec());
-    captured.artifacts.insert(id.into(), b"artifact".to_vec());
+    captured.artifacts.insert(
+        (id.into(), trellis::native_ids::digest(b"", b"artifact")),
+        b"artifact".to_vec(),
+    );
 }
 
 /// A store that publishes one revision per [`Publisher::publish`] call.
