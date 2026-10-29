@@ -52,6 +52,23 @@ fn valid_path(s: &str) -> bool {
 fn invalid(s: &str) -> ScipCaptureError {
     ScipCaptureError::InvalidArtifact(s.into())
 }
+/// Bind SCIP's optional document language to the admitted source under pinned coverage.
+pub fn bind_document_language<'a>(
+    raw: &str,
+    detected: &'a str,
+    profile_languages: &[String],
+) -> Result<&'a str, ScipCaptureError> {
+    if detected.is_empty()
+        || !profile_languages
+            .iter()
+            .any(|language| language == detected)
+        || !raw.is_empty() && raw != detected
+    {
+        return Err(invalid("document source binding"));
+    }
+    Ok(detected)
+}
+
 fn limit(s: &str) -> ScipCaptureError {
     ScipCaptureError::LimitExceeded(s.into())
 }
@@ -78,6 +95,7 @@ pub(crate) struct AuthenticatedScipInput<'a> {
     pub artifact_hash: String,
     pub producer_id: String,
     pub profile_id: String,
+    pub profile_languages: Vec<String>,
     pub source_set_id: String,
     pub source_revision: String,
     pub source_manifest_hash: String,
@@ -763,6 +781,7 @@ fn symbol(
 fn make_claim(
     artifact: &AuthenticatedArtifact<'_>,
     d: &types::Document,
+    language: &str,
     kind: &str,
     raw: Value,
 ) -> CapturedClaim {
@@ -780,7 +799,7 @@ fn make_claim(
     let proof = digest(
         b"trellis.capture-proof.v1\0",
         &canonical(
-            &json!({"producerId":artifact.producer_id,"artifactHash":artifact.artifact_hash,"sourceSetId":artifact.source_set_id,"sourceRevision":artifact.source_revision,"language":d.language,"relativePath":d.relative_path,"factDigest":fact}),
+            &json!({"producerId":artifact.producer_id,"artifactHash":artifact.artifact_hash,"sourceSetId":artifact.source_set_id,"sourceRevision":artifact.source_revision,"language":language,"relativePath":d.relative_path,"factDigest":fact}),
         ),
     );
     CapturedClaim {
@@ -788,7 +807,7 @@ fn make_claim(
         canonical_bytes: bytes,
         fact_digest: fact,
         captured_proof_id: proof,
-        language: d.language.clone(),
+        language: language.to_owned(),
         artifact_hash: artifact.artifact_hash.to_owned(),
     }
 }
@@ -815,6 +834,7 @@ pub struct UnitDocument<'a> {
 }
 /// One assigned document's authenticated source, returned by the caller's resolver.
 pub struct DocumentSource<'s> {
+    pub language: String,
     pub bytes: Cow<'s, [u8]>,
     pub content_hash: String,
 }
@@ -1040,12 +1060,12 @@ pub fn decode_streaming<'s, R: Read>(
                 if !valid_path(&d.relative_path) {
                     return Err(invalid("unlisted document"));
                 }
+                let source = resolve(&d.relative_path, &d.language)?;
                 sink.begin_document(&UnitDocument {
                     path: &d.relative_path,
-                    language: &d.language,
+                    language: &source.language,
                     wire_digest: &wire_digest,
                 })?;
-                let source = resolve(&d.relative_path, &d.language)?;
                 if !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
                     return Err(invalid("document source binding"));
                 }
@@ -1069,7 +1089,13 @@ pub fn decode_streaming<'s, R: Read>(
                         cancelled(cancel)?;
                     }
                     let raw = occurrence(o, &mut positions)?;
-                    sink.claim(make_claim(artifact, &d, "occurrence", raw))?;
+                    sink.claim(make_claim(
+                        artifact,
+                        &d,
+                        &source.language,
+                        "occurrence",
+                        raw,
+                    ))?;
                 }
                 validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
                 for s in &d.symbols {
@@ -1079,13 +1105,25 @@ pub fn decode_streaming<'s, R: Read>(
                     }
                     let (info, rels) =
                         symbol(s, artifact.position_encoding, cancel, &mut traversed, true)?;
-                    sink.claim(make_claim(artifact, &d, "symbolInformation", info))?;
+                    sink.claim(make_claim(
+                        artifact,
+                        &d,
+                        &source.language,
+                        "symbolInformation",
+                        info,
+                    ))?;
                     for r in rels {
                         traversed += 1;
                         if traversed.is_multiple_of(1024) {
                             cancelled(cancel)?;
                         }
-                        sink.claim(make_claim(artifact, &d, "relationship", r))?;
+                        sink.claim(make_claim(
+                            artifact,
+                            &d,
+                            &source.language,
+                            "relationship",
+                            r,
+                        ))?;
                     }
                 }
                 sink.end_document()?;
@@ -1168,10 +1206,10 @@ pub(crate) fn decode_authenticated(
         let source = admitted
             .get(path)
             .ok_or_else(|| invalid("unlisted document"))?;
-        if source.language != language {
-            return Err(invalid("document source binding"));
-        }
+        let language =
+            bind_document_language(language, &source.language, &input.profile_languages)?;
         Ok(DocumentSource {
+            language: language.to_owned(),
             bytes: Cow::Borrowed(source.source_bytes),
             content_hash: source.content_hash.clone(),
         })
@@ -1251,6 +1289,7 @@ mod tests {
             artifact_bytes: bytes,
             producer_id: "scip-test".into(),
             profile_id: "synthetic-test-profile".into(),
+            profile_languages: vec!["javascript".into()],
             source_set_id: "app".into(),
             source_revision: "r1".into(),
             source_manifest_hash:
@@ -1265,6 +1304,61 @@ mod tests {
             text_document_encoding: 1,
             documents,
         }
+    }
+
+    #[test]
+    fn document_language_binding_requires_covered_source_and_exact_nonempty_language() {
+        let languages = vec!["javascript".to_owned()];
+        assert_eq!(
+            bind_document_language("", "javascript", &languages),
+            Ok("javascript")
+        );
+        assert_eq!(
+            bind_document_language("javascript", "javascript", &languages),
+            Ok("javascript")
+        );
+        for (raw, detected) in [("", "python"), ("python", "javascript"), ("", "")] {
+            assert_eq!(
+                bind_document_language(raw, detected, &languages),
+                Err(invalid("document source binding"))
+            );
+        }
+        let bytes = hex::decode(FULL).unwrap();
+        let mut input = vector_input(&bytes, vector_documents(FULL));
+        input.profile_languages = vec!["python".into()];
+        assert_eq!(
+            decode_authenticated(&input, &Arc::new(AtomicBool::new(false))).unwrap_err(),
+            invalid("document source binding")
+        );
+    }
+    #[test]
+    fn empty_document_language_binds_source_without_rewriting_artifact() {
+        let original = hex::decode(FULL).unwrap();
+        let mut index = types::Index::parse_from_bytes(&original).unwrap();
+        for document in &mut index.documents {
+            document.language.clear();
+        }
+        let bytes = index.write_to_bytes().unwrap();
+        let input = vector_input(&bytes, vector_documents(FULL));
+        let inventory = decode_authenticated(&input, &Arc::new(AtomicBool::new(false)))
+            .expect("empty language binds the admitted JavaScript source");
+        let explicit = decoded(FULL).unwrap();
+        assert_eq!(inventory.artifact_hashes, [sha(&bytes)]);
+        assert!(!inventory.claims.is_empty());
+        for (claim, expected) in inventory.claims.iter().zip(&explicit.claims) {
+            assert_eq!(claim.language, "javascript");
+            assert_eq!(claim.canonical_bytes, expected.canonical_bytes);
+            assert_eq!(claim.fact_digest, expected.fact_digest);
+            assert_ne!(claim.captured_proof_id, expected.captured_proof_id);
+        }
+        assert_eq!(input.artifact_bytes, bytes);
+        assert!(
+            types::Index::parse_from_bytes(&bytes)
+                .unwrap()
+                .documents
+                .iter()
+                .all(|document| document.language.is_empty())
+        );
     }
     fn decoded(wire_hex: &str) -> Result<CapturedScipInventory, ScipCaptureError> {
         let bytes = hex::decode(wire_hex).unwrap();
@@ -1312,6 +1406,7 @@ mod tests {
             artifact_bytes: bytes,
             producer_id: "scip-test".into(),
             profile_id: "synthetic-test-profile".into(),
+            profile_languages: vec![language.into()],
             source_set_id: "app".into(),
             source_revision: "r1".into(),
             source_manifest_hash: "pinned-source".into(),
@@ -1376,6 +1471,7 @@ mod tests {
                     .find(|document| document.relative_path == path)
                     .ok_or_else(|| invalid("unlisted document"))?;
                 Ok(DocumentSource {
+                    language: document.language.clone(),
                     bytes: Cow::Borrowed(document.source_bytes),
                     content_hash: document.content_hash.clone(),
                 })
@@ -1699,7 +1795,7 @@ mod tests {
         );
     }
     #[test]
-    fn scip_duplicate_documents_reject_before_language_binding() {
+    fn scip_duplicate_documents_and_mismatched_languages_reject() {
         let source = b"function f(){g();}\n";
         for (first_language, second_language) in [
             ("javascript", "javascript"),
@@ -1716,11 +1812,14 @@ mod tests {
             custom_document(&first, source, 1, "src/A.js", first_language)
                 .expect("single admitted document baseline");
             let bytes = [first, document(second_language)].concat();
-            assert!(
-                matches!(
-                    custom_document(&bytes, source, 1, "src/A.js", first_language),
-                    Err(ScipCaptureError::InvalidArtifact(reason)) if reason == "duplicate document path"
-                ),
+            let error = custom_document(&bytes, source, 1, "src/A.js", first_language).unwrap_err();
+            assert_eq!(
+                error,
+                invalid(if first_language == second_language {
+                    "duplicate document path"
+                } else {
+                    "document source binding"
+                }),
                 "{first_language}/{second_language}"
             );
         }
@@ -2168,6 +2267,7 @@ mod tests {
             artifact_bytes: &bytes,
             producer_id: "scip-test".into(),
             profile_id: "test".into(),
+            profile_languages: vec!["javascript".into()],
             source_set_id: "app".into(),
             source_revision: "r1".into(),
             source_manifest_hash: "test".into(),

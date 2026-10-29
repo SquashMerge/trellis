@@ -360,11 +360,11 @@ impl Passes<'_> {
                     return Err(ScipCaptureError::InvalidArtifact("stage storage".into()));
                 }
             };
-            if language != entry.language {
-                return Err(ScipCaptureError::InvalidArtifact(
-                    "document source binding".into(),
-                ));
-            }
+            let language = crate::scip_raw::bind_document_language(
+                language,
+                &entry.language,
+                &self.producer.languages,
+            )?;
             let document = native::Document {
                 key: native::DocumentKey {
                     source_set_id: descriptor.source_set.id.clone(),
@@ -377,6 +377,7 @@ impl Passes<'_> {
             };
             match native.source_bytes(&document) {
                 Ok(bytes) => Ok(DocumentSource {
+                    language: language.to_owned(),
                     bytes: Cow::Owned(bytes),
                     content_hash: assigned.content_hash,
                 }),
