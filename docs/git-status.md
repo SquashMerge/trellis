@@ -27,7 +27,8 @@ index writer, persistent cache or polling owner is involved.
 
 ## Browser API
 
-- `GET /api/checkouts` includes a lightweight `git` summary in every row.
+- `GET /api/checkouts` includes a lightweight `git` summary in every row, with
+  a measured changed-file count but no changed-path or hunk arrays.
 - `GET /api/checkouts/{rootKey}/git` returns a summary and changed paths.
 - `GET /api/checkouts/{rootKey}/git/diff?path=...` returns one changed file's hunks.
 
@@ -40,17 +41,32 @@ Malformed paths are caller errors. A diff is not an arbitrary file-read endpoint
 the requested path must belong to the measured changed set.
 
 A summary is tagged `available` or `unavailable`. Available summaries identify a
-branch or detached HEAD, full and short commit, and an optional upstream with
-ahead/behind counts. Counts use only existing remote-tracking refs and are labelled
-**as of last fetch**. No upstream is not zero ahead/behind. Unavailable state carries
-a closed reason code, never a guessed branch or a partial successful result.
+branch or detached HEAD, full and short commit, an optional upstream with
+ahead/behind counts, and `workingTree`. Upstream counts use only existing
+remote-tracking refs and are labelled **as of last fetch**. No upstream is not zero
+ahead/behind. `workingTree` is independently tagged:
+
+- `{ "state": "available", "changedFiles": N }` is the complete measured count,
+  including an explicit zero for a clean checkout.
+- `{ "state": "unavailable", "reason": GitReason }` means the change set could not
+  be measured; it never substitutes zero. The checkout-list summary retains the
+  independently measured HEAD/upstream, for example for a conflicted index.
+
+HEAD/upstream or whole-reader failures use outer `unavailable` with a closed reason
+code, never a guessed branch. Selected status/diff failures remain all-or-nothing:
+outer `git` unavailable and no changes/file. Successful selected status/diff replies
+carry the same complete `workingTree.changedFiles` count, not just the selected
+file's count. Separate requests are fresh observations, so edits between them can
+change the count.
 
 ## Change semantics
 
 Changes are the net difference from HEAD to the working tree, including staged
 and unstaged changes. Ordinary untracked files count as added; ignored files are
-excluded. Paths have modified, added, deleted or renamed status; a rename carries
-its previous path. A submodule is reported as one nontext gitlink change, never as
+excluded. The summary count uses this same complete changed-set classification,
+not staged plus unstaged totals: each changed path counts once, a rename counts
+once, and a staged change undone in the working tree counts zero. Paths have
+modified, added, deleted or renamed status; a rename carries its previous path. A submodule is reported as one nontext gitlink change, never as
 nested changed paths. Libgit2 may inspect its dirtiness to classify that gitlink;
 the same child deadline applies. Conflicts and unsupported or unreadable repository
 state are typed unavailable, not silently clean.

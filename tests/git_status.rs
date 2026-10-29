@@ -67,7 +67,7 @@ fn available(
     Option<trellis::git_status::GitUpstream>,
 ) {
     match summary {
-        GitSummary::Available { head, upstream } => (head, upstream),
+        GitSummary::Available { head, upstream, .. } => (head, upstream),
         other => panic!("{other:?}"),
     }
 }
@@ -197,6 +197,13 @@ async fn status_and_diff_measure_net_head_with_rename_delete_added_and_ignored()
     f.write("added.txt", "staged addition\n");
     f.stage("added.txt");
     let status = reader().status(f.root()).await;
+    let summary = serde_json::to_value(reader().summary(f.root()).await).unwrap();
+    let expected = serde_json::json!({"state": "available", "changedFiles": 5});
+    assert_eq!(summary["workingTree"], expected);
+    assert_eq!(
+        serde_json::to_value(&status.git).unwrap()["workingTree"],
+        expected
+    );
     let changes = status.changes.unwrap();
     assert_eq!(changes.len(), 5, "{changes:?}");
     assert!(changes.iter().any(|c| c.path == "rename-new.txt"
@@ -276,8 +283,67 @@ async fn staged_edit_undone_in_worktree_is_clean_and_binary_is_not_suppressed() 
 }
 
 #[tokio::test]
+async fn summary_count_reuses_complete_net_changes_and_successful_selected_counts() {
+    let f = Fixture::new();
+    let summary = serde_json::to_value(reader().summary(f.root()).await).unwrap();
+    assert_eq!(
+        summary["workingTree"],
+        serde_json::json!({"state": "available", "changedFiles": 0})
+    );
+    f.write("deleted.txt", "delete me\n");
+    f.stage("deleted.txt");
+    f.write("rename-old.txt", "rename me without editing\n");
+    f.stage("rename-old.txt");
+    f.write(".gitignore", "ignored.txt\n");
+    f.stage(".gitignore");
+    f.commit("baseline");
+    f.write("tracked.txt", "staged\n");
+    f.stage("tracked.txt");
+    f.write("tracked.txt", "original\n"); // Staged-only edit undone: not changed.
+    fs::rename(
+        f.root().join("rename-old.txt"),
+        f.root().join("rename-new.txt"),
+    )
+    .unwrap();
+    fs::remove_file(f.root().join("deleted.txt")).unwrap();
+    f.write("untracked.txt", "new\n");
+    f.write("ignored.txt", "hidden\n");
+    let status = reader().status(f.root()).await;
+    let changes = status.changes.unwrap();
+    assert_eq!(changes.len(), 3, "{changes:?}");
+    let expected = serde_json::json!({"state": "available", "changedFiles": 3});
+    let summary = serde_json::to_value(reader().summary(f.root()).await).unwrap();
+    assert_eq!(summary["workingTree"], expected);
+    assert!(summary.get("changes").is_none());
+    assert_eq!(
+        serde_json::to_value(status.git).unwrap()["workingTree"],
+        expected
+    );
+    let diff = reader().diff(f.root(), "rename-new.txt").await.unwrap();
+    assert_eq!(
+        serde_json::to_value(diff.git).unwrap()["workingTree"],
+        expected
+    );
+}
+
+#[tokio::test]
 async fn conflicted_index_is_unavailable_never_clean() {
     let f = Fixture::new();
+    let head = f.repo.head().unwrap().target().unwrap();
+    f.repo
+        .reference("refs/remotes/origin/main", head, true, "test")
+        .unwrap();
+    let mut config = f.repo.config().unwrap();
+    config
+        .set_str("remote.origin.url", "https://example.invalid/never-contact")
+        .unwrap();
+    config
+        .set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+        .unwrap();
+    config.set_str("branch.main.remote", "origin").unwrap();
+    config
+        .set_str("branch.main.merge", "refs/heads/main")
+        .unwrap();
     let mut index = f.repo.index().unwrap();
     let mut entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
     index.remove_path(Path::new("tracked.txt")).unwrap();
@@ -287,6 +353,19 @@ async fn conflicted_index_is_unavailable_never_clean() {
     index.add(&entry).unwrap();
     index.write().unwrap();
     assert!(index.has_conflicts());
+    let summary = serde_json::to_value(reader().summary(f.root()).await).unwrap();
+    assert_eq!(summary["state"], "available");
+    assert_eq!(summary["head"]["name"], "main");
+    assert_eq!(
+        summary["upstream"],
+        serde_json::json!({
+            "name": "origin/main", "ahead": 0, "behind": 0, "basis": "last_fetch"
+        })
+    );
+    assert_eq!(
+        summary["workingTree"],
+        serde_json::json!({"state": "unavailable", "reason": "conflicted"})
+    );
     let status = reader().status(f.root()).await;
     assert_eq!(
         status.git,
