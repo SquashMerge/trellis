@@ -11,25 +11,25 @@ const response = data => ({ok:true,status:200,json:async () => data});
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; }
 const all = node => [node, ...(node.children || []).flatMap(all)];
 const text = node => all(node).map(item => item.textContent).join(" ");
-function harness() {
+function harness(windowOptions = {}) {
   const elements = new Map(), requests = [], timers = new Map(); let timer = 0;
   function node(tagName = "div") {
     const classes = new Set();
-    return {tagName, children:[], attrs:{}, listeners:{}, textContent:"", value:"", hidden:false, disabled:false,
+    return {tagName, dataset:{}, children:[], attrs:{}, listeners:{}, textContent:"", value:"", hidden:false, disabled:false,
       classList:{add(c){classes.add(c);},remove(c){classes.delete(c);},contains(c){return classes.has(c);},toggle(c,force){const on = force ?? !classes.has(c); if(on) classes.add(c); else classes.delete(c); return on;}},
       setAttribute(k,v){this.attrs[k]=String(v);}, getAttribute(k){return this.attrs[k];},
       append(...items){this.children.push(...items);}, replaceChildren(...items){this.children=items;this.textContent="";},
-      addEventListener(type,fn){this.listeners[type]=fn;}, querySelector(){return null;}, focus(){this.focused=true;}, scrollIntoView(){}};
+      addEventListener(type,fn){this.listeners[type]=fn;}, querySelector(){return null;}, focus(){this.focused=true;document.activeElement=this;}, scrollIntoView(){}};
   }
-  const get = id => { if(!elements.has(id)) elements.set(id,node()); return elements.get(id); };
+  const get = id => { if(!elements.has(id)) { const item=node(); item.id=id; elements.set(id,item); } return elements.get(id); };
   const document = {getElementById:get,createElement:node,createElementNS:(_,tag)=>node(tag),createTextNode:value=>({...node("#text"),textContent:value}),createDocumentFragment:()=>node("fragment"),body:node("body"),addEventListener(){}};
   let network = () => { throw new Error("Unexpected request"); };
-  const context = vm.createContext({document, window:{}, console, AbortController, DOMException, TextEncoder, URLSearchParams,
+  const context = vm.createContext({document, window:{...windowOptions}, console, AbortController, DOMException, TextEncoder, URLSearchParams,
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(url, options){ requests.push({url,options}); assert.ok(url.startsWith(`/api/checkouts/${ROOT}/`)); return network("/api/" + url.slice(`/api/checkouts/${ROOT}/`.length),options); }});
   const run = code => vm.runInContext(code, context); run(source);
   run(`token="synthetic"; selectedRootKey="${ROOT}"; checkouts=[{rootKey:"${ROOT}", workspaceRoot:"/fixture", state:"available"}]; status={revision:${JSON.stringify(pin)}, workspaceRoot:"/fixture"}; selectedGit={state:"unavailable",reason:"not_repository"};`);
-  get("workspace").hidden=false;
+  get("workspace").hidden=false; get("error").hidden=true;
   return {get, run, context, requests, network(fn){network=fn;}};
 }
 function symbol(id, kind = "method", file = "main.java") { return {id,name:id,kind,path:file,range:{startByte:0,endByte:18,startLine:1,startColumn:1,endLine:2,endColumn:1}}; }
@@ -290,4 +290,136 @@ test("changed-only catalog action cannot disable Indexed after the full pin capt
   assert.equal(h.requests.length,before);
   assert.equal(h.run('filesFile.changeOnly'),undefined);
   assert.equal(h.get("files-indexed").disabled,false);
+});
+
+
+function historyBrowser() {
+  const location = {hash:""}, entries = [{state:null, hash:""}]; let position = 0;
+  return {location, history:{
+    get state(){return entries[position].state;}, get length(){return entries.length;},
+    replaceState(state, _, hash){entries[position]={state,hash};location.hash=hash;},
+    pushState(state, _, hash){entries.splice(++position);entries.push({state,hash});location.hash=hash;},
+    go(delta){position+=delta;location.hash=entries[position].hash;},
+  }};
+}
+
+test("Files source action Back/Forward restores the same source, range, active line, selected symbol, focus and both scroll owners", async () => {
+  const browser = historyBrowser(), bindings = [];
+  const h = harness({...browser, TrellisNavigation:{init(){},reset(){},attachSource(node,options){
+    bindings.push(options); node.dataset.navigationLine=String(options.startLine); return {ready:Promise.resolve()};
+  }}}), item = outline("measured"); indexedNetwork(h,item);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)');
+  h.get("source").dataset.navigationLine="2"; h.get("source").scrollTop=11; h.get("source").scrollLeft=19;
+  h.get("workspace-source-panel").scrollTop=155; h.get("workspace-source-panel").scrollLeft=27;
+  h.get("source-dock").scrollTop=33; h.get("source").focus();
+  const sourceReads = h.requests.filter(request=>request.url.includes("/source?")).length;
+  await h.run('openFilesFull()');
+  assert.equal(browser.history.length,2); assert.match(browser.location.hash,/^#sequence\?sid=measured&/);
+  assert.deepEqual(Object.keys(browser.history.state),["trellisNavigation"]);
+  assert.equal(h.run('section'),"diagrams");
+  browser.history.go(-1); await h.run('readNavigationLocation()');
+  assert.equal(h.run('section'),"files"); assert.equal(h.run('filesSymbol.symbol.id'),"measured");
+  assert.equal(h.run('filesBasis'),"indexed"); assert.equal(h.get("files-symbol-title").textContent,"measured");
+  assert.equal(h.get("source").dataset.navigationLine,"2"); assert.equal(bindings.at(-1).startLine,2);
+  assert.equal(h.get("source").scrollTop,11); assert.equal(h.get("source").scrollLeft,19);
+  assert.equal(h.get("workspace-source-panel").scrollTop,155); assert.equal(h.get("workspace-source-panel").scrollLeft,27);
+  assert.equal(h.get("source-dock").scrollTop,33); assert.equal(h.context.document.activeElement,h.get("source"));
+  assert.equal(all(h.get("source")).filter(node=>node.classList?.contains("highlight")).length,1);
+  assert.equal(h.requests.filter(request=>request.url.includes("/source?")).length,sourceReads);
+  assert.equal(h.requests.filter(request=>request.url.endsWith("/sequence")).length,1);
+  browser.history.go(1); await h.run('readNavigationLocation()');
+  assert.equal(h.run('selectedMethod.id'),"measured"); assert.equal(h.run('section'),"diagrams");
+  assert.equal(browser.history.length,2);
+  assert.equal(h.requests.filter(request=>request.url.endsWith("/sequence")).length,1);
+});
+
+test("source history from a previous pin is rejected without rereading source or adopting the successor", async () => {
+  const browser=historyBrowser(), h=harness(browser), item=outline("measured"); indexedNetwork(h,item);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)'); await h.run('openFilesFull()');
+  h.run('clearNavigationHistory(); status.revision={...status.revision,indexRevision:2}');
+  const reads=h.requests.length;
+  browser.history.go(-1); await h.run('readNavigationLocation()');
+  assert.equal(h.requests.length,reads); assert.match(h.get("error").textContent,/stale/);
+  assert.equal(h.run('status.revision.indexRevision'),2);
+});
+
+
+test("source to class diagram creates one reversible history action at the same pin", async () => {
+  const browser=historyBrowser(), opened=[];
+  const h=harness({...browser,TrellisClasses:{init(){},reset(){},closeContextMenu(){},open(options){opened.push(options);}}});
+  const item=outline("Holder","class"); indexedNetwork(h,item);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)');
+  await h.run('navigateDiagram(item.symbol,status.revision,"class")');
+  assert.equal(browser.history.length,2); assert.equal(browser.location.hash,"#classes");
+  assert.deepEqual(JSON.parse(JSON.stringify(opened)),[{seed:"Holder"}]);
+  browser.history.go(-1); await h.run('readNavigationLocation()');
+  assert.equal(h.run('section'),"files"); assert.equal(h.run('filesSymbol.symbol.id'),"Holder");
+  assert.equal(h.get("files-symbol-title").textContent,"Holder");
+  browser.history.go(1); await h.run('readNavigationLocation()');
+  assert.equal(opened.length,2); assert.equal(browser.history.length,2);
+  assert.equal(h.requests.filter(request=>request.url.endsWith("/sequence")).length,0);
+});
+
+
+test("Back restores source while a diagram request is held; late success cannot replace it", async () => {
+  const browser=historyBrowser(), h=harness(browser), item=outline("measured"), old=deferred();
+  indexedNetwork(h,item,(url, options)=>url==="/api/sequence" && JSON.parse(options.body).seed==="held" ? old.promise : undefined);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)');
+  const pending=h.run('navigateDiagram({...item.symbol,id:"held",name:"held"},status.revision)');
+  await Promise.resolve(); await Promise.resolve();
+  browser.history.go(-1); await h.run('readNavigationLocation()');
+  old.resolve(response({...view(item),seed:{...item.symbol,id:"held",name:"held"}})); await pending;
+  assert.equal(h.run('section'),"files"); assert.equal(h.run('filesSymbol.symbol.id'),"measured");
+  assert.equal(h.run('diagramSequence'),null); assert.equal(h.get("error").hidden,true,h.get("error").textContent);
+  assert.match(text(h.get("source")),/int measured/); assert.equal(browser.history.length,2);
+});
+
+
+test("Back invalidates a pending class owner before restoring source at the same pin", async () => {
+  const browser=historyBrowser(), held=deferred(), admitted=deferred(); let serial=0, published=false;
+  // classes.js reset contract: reset advances its private request ticket; no caller-current API exists.
+  const classes={init(){},reset(){serial++;},closeContextMenu(){},async open(){const ticket=++serial;admitted.resolve();await held.promise;if(ticket===serial)published=true;}};
+  const h=harness({...browser,TrellisClasses:classes}), item=outline("Holder","class"); indexedNetwork(h,item);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)');
+  const pending=h.run('navigateDiagram(item.symbol,status.revision,"class")'); await admitted.promise;
+  browser.history.go(-1); await h.run('readNavigationLocation()');
+  held.resolve(); await pending;
+  assert.equal(published,false); assert.equal(h.run('section'),"files");
+  assert.equal(h.run('filesSymbol.symbol.id'),"Holder"); assert.match(text(h.get("source")),/int measured/);
+});
+
+
+test("source return does not wait for pending action metadata or later move the restored position", async () => {
+  const browser=historyBrowser(), metadata=deferred(), bindings=[];
+  const h=harness({...browser,TrellisNavigation:{init(){},reset(){},attachSource(node,options){
+    bindings.push(options);node.dataset.navigationLine=String(options.startLine);
+    return {ready:metadata.promise,snapshot(){return undefined;}};
+  }}}), item=outline("measured"); indexedNetwork(h,item);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])'); h.context.item=item;
+  await h.run('selectFilesSymbol(item)'); h.get("source").dataset.navigationLine="2";
+  h.get("workspace-source-panel").scrollTop=87; h.get("source").focus();
+  await h.run('openFilesFull()'); browser.history.go(-1);
+  await h.run('readNavigationLocation()');
+  assert.equal(h.get("workspace-source-panel").scrollTop,87);assert.equal(h.get("source").dataset.navigationLine,"2");
+  h.get("workspace-source-panel").scrollTop=150;h.get("source").dataset.navigationLine="1";
+  metadata.resolve();await Promise.resolve();
+  assert.equal(h.get("workspace-source-panel").scrollTop,150);assert.equal(h.get("source").dataset.navigationLine,"1");
+});
+
+test("source history passes all already-admitted action metadata back to the normal renderer", async () => {
+  const browser=historyBrowser(), admitted={items:[{id:"first-page"},{id:"page-two-action"}],nextOffset:400}, received=[];
+  const h=harness({...browser,TrellisNavigation:{init(){},reset(){},attachSource(node,options){
+    received.push(options.metadataSnapshot);node.dataset.navigationLine=String(options.startLine);
+    return {ready:Promise.resolve(),snapshot(){return admitted;}};
+  }}}), item=outline("measured"); indexedNetwork(h,item);
+  await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');h.context.item=item;
+  await h.run('selectFilesSymbol(item)');await h.run('openFilesFull()');
+  browser.history.go(-1);await h.run('readNavigationLocation()');
+  assert.equal(received.at(-1),admitted);
+  assert.equal(h.run('workspaceSource.navigation.snapshot()'),admitted);
 });

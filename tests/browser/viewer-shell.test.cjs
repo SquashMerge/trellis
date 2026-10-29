@@ -58,7 +58,7 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(callback, signal) {
+async function published(callback, signal, {library = false} = {}) {
   const paths = H.fixture("function anchor() { return 0; }\n", "anchor.js");
   mkdirSync(join(paths.workspace, "src", "nested"), {recursive:true});
   writeFileSync(join(paths.workspace, "src", "flow.js"), flowSource);
@@ -72,6 +72,13 @@ async function published(callback, signal) {
   writeFileSync(join(paths.workspace, ".tool-cache", "state.txt"), "cache\n");
   mkdirSync(join(paths.workspace, "assets"));
   writeFileSync(join(paths.workspace, "assets", "notes.txt"), "not source\n");
+  if (library) {
+    mkdirSync(join(paths.workspace, "vendor", "local-library", "src"), {recursive:true});
+    writeFileSync(join(paths.workspace, "Cargo.toml"), "[package]\nname='browser-app'\nversion='0.1.0'\n[dependencies]\nlocal-library={path='vendor/local-library'}\n");
+    writeFileSync(join(paths.workspace, "Cargo.lock"), "version=4\n[[package]]\nname='browser-app'\nversion='0.1.0'\ndependencies=['local-library']\n[[package]]\nname='local-library'\nversion='0.1.0'\n");
+    writeFileSync(join(paths.workspace, "vendor", "local-library", "Cargo.toml"), "[package]\nname='local-library'\nversion='0.1.0'\n");
+    writeFileSync(join(paths.workspace, "vendor", "local-library", "src", "lib.rs"), "// <img src=x onerror='globalThis.libraryExecuted=true'>\npub fn candidate_only() { unknown_external(); }\n");
+  }
   let server, browser, context;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
@@ -82,9 +89,10 @@ async function published(callback, signal) {
     signal?.addEventListener("abort", () => { void context.close().catch(() => {}); }, {once:true});
     const page = await context.newPage(), requests = [], errors = [];
     page.on("pageerror", error => errors.push(error.message));
+    page.on("console", message => { if (message.type() === "error" && /Content Security Policy|CSP/i.test(message.text())) errors.push(message.text()); });
     page.on("request", request => {
       const url = new URL(request.url());
-      if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method()});
+      if (url.pathname.startsWith("/api/")) requests.push({url, method:request.method(), body:request.method() === "POST" ? request.postDataJSON() : null});
     });
     await page.goto(`${server.base}/`, {waitUntil:"networkidle"});
     assert.deepEqual(requests, [], "opening the viewer does not authenticate or select a checkout");
@@ -465,6 +473,125 @@ test("390px drawers and explicit Files section retain selected evidence without 
   await noOverflow(page, 390);
 }));
 
+
+
+test("Sequence URLs wait for authentication and checkout, use the returned seed, and refuse invalid context", {timeout:240000}, async () => published(async ({page, paths, server, pin, requests}) => {
+  const seed = await H.seedId(server, paths.token, "transform");
+  const sequenceRequests = () => requests.filter(row => row.url.pathname.endsWith("/sequence"));
+  const pinned = new URLSearchParams({sid:seed, rootKey:server.rootKey, ...pin});
+  async function authenticateRoute(query, {valid = false, backend = false} = {}) {
+    await page.goto("about:blank");
+    const before = sequenceRequests().length;
+    await page.goto(`${server.base}/#sequence?${query}`, {waitUntil:"domcontentloaded"});
+    assert.equal(sequenceRequests().length, before, "a URL never reads evidence before Connect");
+    await page.locator("#token").fill(paths.token);
+    await page.locator("#connect-form button[type=submit]").click();
+    await page.waitForFunction(() => !document.querySelector("#checkout-select").disabled);
+    assert.equal(await page.locator("#checkout-select").inputValue(), "");
+    assert.equal(sequenceRequests().length, before, "authentication alone does not choose a checkout for the route");
+    const responsePromise = valid || backend ? page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence")) : null;
+    await page.locator("#checkout-select").selectOption(server.rootKey);
+    await page.locator("#workspace").waitFor({state:"visible"});
+    if (valid) {
+      const response = await responsePromise, dto = await response.json();
+      assert.equal(response.status(), 200, JSON.stringify(dto));
+      assert.equal(response.request().postDataJSON().seed, seed); assert.deepEqual(response.request().postDataJSON().expectedRevision, pin);
+      assert.equal(dto.seed.id, seed); assert.equal(dto.seed.name, "transform"); assert.deepEqual(dto.revision, pin);
+      await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+      assert.equal(await page.locator("#method-source").isEnabled(), true);
+      await page.locator("#method-source").click();
+      await assertExactSource(page, flowSource);
+      assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), [String(dto.seed.range.startLine)]);
+    } else {
+      if (responsePromise) assert.notEqual((await responsePromise).status(), 200);
+      await page.waitForFunction(() => !document.querySelector("#error").hidden && document.querySelector("#sequence-state")?.textContent.length > 0);
+      assert.match(await page.locator("#sequence-state").textContent(), /invalid|unavailable|not found|select|snapshot|revision|match|stale|unknown|requires|symbol|seed/i);
+      assert.equal(await page.locator("#sequence-diagram [data-trellis-step-id]").count(), 0, "refusal never displays a guessed successor sequence");
+      assert.equal(await page.locator("#method-source").isEnabled(), false);
+      assert.equal(sequenceRequests().length, before + (backend ? 1 : 0));
+    }
+  }
+  await authenticateRoute(new URLSearchParams({sid:seed}), {valid:true});
+  await authenticateRoute(pinned, {valid:true});
+  for (const patch of [{rootKey:"f".repeat(64)}, {indexGeneration:"00000000-0000-4000-8000-000000000000"}, {indexRevision:String(pin.indexRevision + 1)}]) {
+    const query = new URLSearchParams(pinned);
+    for (const [key, value] of Object.entries(patch)) query.set(key, value);
+    await authenticateRoute(query);
+  }
+  await authenticateRoute(new URLSearchParams({sid:"missing-explicit-callable"}), {backend:true});
+  await authenticateRoute(new URLSearchParams());
+}));
+
+test("Libraries candidate source never sends candidate IDs to workspace sequence or navigation", {timeout:240000}, async () => published(async ({page, paths, server, requests}) => {
+  await expandSources(page); await page.locator('.file-pick[title="src/flow.js"]').click();
+  await page.locator(".method-pick").filter({hasText:"measured"}).click();
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  const selection = await page.locator(".method-pick.selected").textContent();
+  const diagram = await page.locator("#sequence-diagram").textContent();
+  await page.locator("#view-libraries").click();
+  // Explicit fixture setup: serve registration can leave the automatic catalog
+  // loading without a worker (tracked separately from #392 source actions).
+  const started = await H.api(server.base, paths.token, "POST", H.scoped(server.rootKey, "dependencies/refresh"), {});
+  assert.equal(started.status, 202, JSON.stringify(started.data));
+  // Wait for that requested producer, then bind the browser status refresh to
+  // its own new request rather than an older in-flight response.
+  const readyCatalog = await page.evaluate(async ({rootKey, token}) => {
+    const deadline = Date.now() + 30000;
+    for (;;) {
+      const response = await fetch(`/api/checkouts/${rootKey}/dependencies`, {cache:"no-store", headers:{Authorization:`Bearer ${token}`}});
+      const data = await response.json();
+      if (!response.ok || ["failed", "disabled"].includes(data.state)) throw new Error(`Catalog unavailable: ${JSON.stringify(data)}`);
+      if (data.state === "ready") return data;
+      if (Date.now() >= deadline) throw new Error(`Catalog readiness timed out: ${JSON.stringify(data)}`);
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }, {rootKey:server.rootKey, token:paths.token});
+  assert.equal(readyCatalog.state, "ready", JSON.stringify(readyCatalog));
+  const catalogRequest = page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/dependencies"));
+  await page.locator("#dependency-refresh").click();
+  const refreshRequest = await catalogRequest;
+  assert.equal(refreshRequest.method(), "GET");
+  const catalogReply = await refreshRequest.response();
+  assert.ok(catalogReply, "the explicit catalog refresh must return a response");
+  const catalog = await catalogReply.json();
+  assert.equal(catalogReply.status(), 200, JSON.stringify(catalog));
+  assert.equal(catalog.state, "ready", JSON.stringify(catalog));
+  const localPackage = catalog.packages.find(pkg => pkg.name === "local-library");
+  const libraryPresentation = async () => page.evaluate(() => ({state:document.querySelector("#dependency-state")?.textContent,
+    warnings:document.querySelector("#dependency-warnings")?.textContent,
+    buttons:[...document.querySelectorAll("#dependency-packages button")].map(button => ({text:button.textContent, disabled:button.disabled}))}));
+  assert.ok(localPackage, `Missing local path dependency: catalog=${JSON.stringify(catalog)}; UI=${JSON.stringify(await libraryPresentation())}`);
+  assert.equal(localPackage.version, "0.1.0", JSON.stringify(localPackage));
+  assert.equal(localPackage.sourceState, "present", JSON.stringify(localPackage));
+  const pkg = page.locator("#dependency-packages button").filter({hasText:`${localPackage.name} ${localPackage.version}`});
+  try { await pkg.waitFor(); }
+  catch (error) { assert.fail(`Native package not displayed: package=${JSON.stringify(localPackage)}; catalog=${JSON.stringify(catalog)}; UI=${JSON.stringify(await libraryPresentation())}; ${error.message}`); }
+  await pkg.click();
+  const symbolResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/dependencies/source"));
+  await page.locator("#dependency-symbols button").filter({hasText:"candidate_only"}).click();
+  const response = await symbolResponse, snapshot = await response.json();
+  assert.equal(response.status(), 200, JSON.stringify(snapshot));
+  assert.ok(snapshot.id && snapshot.hash && snapshot.rootId);
+  assert.equal(new URL(response.url()).searchParams.get("sourceRef"), snapshot.id);
+  assert.ok(snapshot.definitions.some(item => item.name === "candidate_only"));
+  await page.waitForFunction(hash => document.querySelector("#external-source-path")?.textContent.includes(hash), snapshot.hash);
+  assert.match(await page.locator("#external-source-path").textContent(), /immutable candidate snapshot.*terminal library boundary/);
+  assert.equal(await page.locator("#external-source").isVisible(), true);
+  assert.equal(await page.locator("#external-source .source-diagram-action").count(), 0);
+  assert.equal(await page.locator("#external-source img").count(), 0);
+  assert.equal(await page.evaluate(() => globalThis.libraryExecuted), undefined);
+  const before = requests.filter(row => /\/(sequence|navigation)$/.test(row.url.pathname)).length;
+  await page.locator("#external-source .source-line").filter({hasText:"pub fn candidate_only"}).click();
+  await page.locator("#external-source").focus(); await page.keyboard.press("Shift+F10");
+  assert.equal(await page.locator(".classes-context-menu").count(), 0, "external source has no workspace action menu");
+  await page.keyboard.press("Escape");
+  assert.equal(requests.filter(row => /\/(sequence|navigation)$/.test(row.url.pathname)).length, before);
+  const ids = new Set(snapshot.definitions.map(item => item.id).filter(Boolean));
+  assert.ok(!requests.some(row => row.body && ids.has(row.body.seed)), "candidate IDs are never workspace sequence seeds");
+  assert.equal(await page.locator(".method-pick.selected").textContent(), selection);
+  await page.locator("#view-sequence").click();
+  assert.equal(await page.locator("#sequence-diagram").textContent(), diagram);
+}, undefined, {library:true}));
 
 async function assertExactSource(page, text) {
   await page.waitForFunction(expected => [...document.querySelectorAll("#source .source-line")].map(line =>

@@ -104,6 +104,36 @@ race the watcher. Deterministic cached-vs-live divergence belongs to the offline
 regressions, not timing-based browser edits. Git diff coordinates never become indexed
 navigation targets. No-Git and repository text remain explicit and safe.
 
+## Source navigation and browser history (#392)
+
+The real-daemon suites use ordinary Java, Rust and JavaScript fixtures:
+
+- `files.test.cjs`: a measured declaration's one-click Sequence uses its exact ID and
+  complete pin. Back/Forward restores Files selection, indexed basis, source highlight,
+  active line, actual source-panel scroll and focused action without another source read
+  or extra browser-history entries. Working-tree diff lines have no indexed actions.
+- `sequence.test.cjs`: Read method source opens a different callable than the left-tree
+  selection, then Back restores the same source and original selection. Inspector source
+  on an unresolved import offers the explicitly labelled enclosing callable, not a guessed
+  callee. Call graph stays disabled; no #378 browser view is implied.
+- `viewer-shell.test.cjs`: bare and generated pinned `#sequence?sid=…` links wait for
+  authentication and explicit checkout selection. The exact returned seed supplies the
+  method and source. Missing/unknown IDs and mismatched checkout/generation/revision are
+  refused rather than replaced with a successor. Generated links contain checkout and full
+  pin, never credentials.
+- Libraries uses a local Cargo path dependency, authored before daemon startup. Its real
+  immutable candidate source has no workspace Sequence/navigation action, preserves the
+  selected workspace diagram, and renders hostile text safely under the real CSP. The
+  fixture explicitly requests `POST /dependencies/refresh` before awaiting native catalog
+  readiness: a separately investigated startup/serve-registration defect can leave the
+  automatic catalog loading without a worker. This setup does not fix or test automatic
+  catalog startup. No dependency download, Cargo project execution or positive external
+  navigation is claimed.
+
+These are functional assertions, not benchmarks. They observe events or conditions rather
+than fixed sleeps. Resolved-callee producer acceptance belongs to the approved backend
+projection fixture; this source-navigation coverage does not manufacture resolved targets.
+
 The suite runs in the canonical `./tools/verify` browser lane. For a focused run after normal
 setup and build, set `TRELLIS_SUITE_BINARY` to the absolute built binary and run
 `node --test --test-concurrency=1 tests/browser/files.test.cjs` with the same external

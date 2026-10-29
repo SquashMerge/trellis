@@ -14,10 +14,11 @@ const response = (targets=[target()], extras={}) => ({revision:{indexGeneration:
 const descendants = node => [node,...node.children.flatMap(descendants)];
 function harness({openSource = false} = {}) {
   let revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}, session="one", request=async()=>response(), activeMenu=null;
-  const calls=[],menus=[],selected=[],classes=[],openedSources=[],stale=[];
+  const calls=[],metadataCalls=[],menus=[],selected=[],classes=[],openedSources=[],inspected=[],callbackPins=[],stale=[];
+  let symbolsRequest=async()=>({revision,path:"src/A.java",items:[],nextOffset:null,truncated:false,warnings:[]});
   const document={activeElement:null,listeners:{},addEventListener(type,fn){(this.listeners[type] ||= []).push(fn);}};
   function element(tagName) {
-    const node={tagName,children:[],parentNode:null,attrs:{},className:"",textContent:"",listeners:{},scrollTop:27,scrollLeft:0,
+    const node={tagName,children:[],parentNode:null,attrs:{},dataset:{},className:"",textContent:"",listeners:{},scrollTop:27,scrollLeft:0,
       setAttribute(k,v){this.attrs[k]=String(v);},getAttribute(k){return this.attrs[k]??null;},removeAttribute(k){delete this.attrs[k];},
       append(...nodes){for(const n of nodes){n.remove();n.parentNode=this;this.children.push(n);}},
       before(n){n.remove();n.parentNode=this.parentNode;this.parentNode.children.splice(this.parentNode.children.indexOf(this),0,n);},
@@ -58,8 +59,8 @@ function harness({openSource = false} = {}) {
     activeMenu=record;menus.push(record);
     return {close:()=>record.close()};
   }
-  nav.init({request:(url,options)=>{calls.push({url,options});return request(url,options);},currentRevision:()=>revision,currentSession:()=>session,
-    selectMethod:s=>selected.push(s),openClass:s=>classes.push(s),showMenu,onStale:message=>stale.push(message),
+  nav.init({request:(url,options)=>{if(url.startsWith("/api/symbols?")){metadataCalls.push({url,options});return symbolsRequest(url,options);}calls.push({url,options});return request(url,options);},currentRevision:()=>revision,currentSession:()=>session,
+    selectMethod:(s,pin)=>{callbackPins.push(pin);return selected.push(s);},openClass:(s,pin)=>{callbackPins.push(pin);return classes.push(s);},inspectSymbol:(s,pin)=>{callbackPins.push(pin);return inspected.push(s);},showMenu,onStale:message=>stale.push(message),
     ...(openSource ? {openSource:(symbol,revision)=>openedSources.push({symbol,revision})} : {})});
   const anchor=element("button");document.body.append(anchor);anchor.focus();
   function event(details={}){return {type:"contextmenu",target:anchor,currentTarget:anchor,clientX:120,clientY:80,preventDefault(){this.prevented=true;},stopPropagation(){this.stopped=true;},...details};}
@@ -71,8 +72,8 @@ function harness({openSource = false} = {}) {
     const toolbar=pre.parentNode.children[pre.parentNode.children.indexOf(pre)-1];
     return {pre,rows,binding,toolbar,button:toolbar.children[0],status:toolbar.children[1]};
   }
-  return {nav,document,window,element,anchor,event,pane,calls,menus,selected,classes,openedSources,stale,showMenu,
-    set request(fn){request=fn;},set revision(n){revision=n;},set session(s){session=s;},get latest(){return menus.at(-1);}};
+  return {nav,document,window,element,anchor,event,pane,calls,metadataCalls,menus,selected,classes,openedSources,inspected,callbackPins,stale,showMenu,
+    set symbolsRequest(fn){symbolsRequest=fn;},set request(fn){request=fn;},set revision(n){revision=n;},set session(s){session=s;},get latest(){return menus.at(-1);}};
 }
 const selector={path:"src/A.java",line:1};
 
@@ -503,4 +504,194 @@ test("source declaration action rechecks session revision scope and retry before
  assert.equal(h.openedSources.length,1);
  h.request=async()=>{throw new Error("offline");};await h.nav.open(h.event(),selection);
  const retry=h.latest.actions[1];h.nav.reset();await retry.run();assert.equal(h.calls.length,2);
+});
+
+const declaration = (id="A.run",kind="method",line=4) => ({...symbol(id),kind,range:{...symbol(id).range,startLine:line,endLine:line+3}});
+const outline = (items=[],extras={}) => ({revision:response().revision,path:"src/A.java",items:items.map(symbol=>({symbol})),nextOffset:null,truncated:false,warnings:[],...extras});
+const inlineActions = p => p.pre.querySelectorAll(".source-diagram-action");
+
+test("pinned metadata adds one-click callable declarations without changing source text or reading source",async()=>{
+  const h=harness(),method=declaration("exact#λ", "method",5),noncallable=declaration("A.field","field",4);
+  h.symbolsRequest=async()=>outline([noncallable,method]);
+  const p=h.pane([4,5,6]);const original=p.rows.map(row=>row.children[1].textContent);
+  await p.binding.ready;
+  assert.equal(h.metadataCalls.length,1);assert.equal(h.calls.length,0);
+  const url=new URL(h.metadataCalls[0].url,"http://localhost");
+  assert.equal(url.pathname,"/api/symbols");assert.equal(url.searchParams.get("path"),"src/A.java");
+  assert.equal(url.searchParams.get("limit"),"200");assert.equal(url.searchParams.get("offset"),"0");
+  assert.equal(url.searchParams.get("indexGeneration"),response().revision.indexGeneration);
+  const actions=inlineActions(p);assert.equal(actions.length,1);
+  assert.equal(actions[0].parentNode,p.rows[1]);assert.equal(actions[0].getAttribute("data-symbol-id"),method.id);
+  assert.equal(actions[0].getAttribute("data-source-action"),"sequence");
+  assert.equal(actions[0].textContent,"");assert.match(actions[0].getAttribute("aria-label"),/exact#λ/);
+  assert.deepEqual(p.rows.map(row=>row.children[1].textContent),original);
+  assert.equal(h.selected.length,0);await actions[0].fire("click").done;
+  assert.equal(h.selected[0],method);assert.equal(h.callbackPins[0].indexRevision,1);assert.equal(p.pre.dataset.navigationLine,"5");assert.equal(h.calls.length,0);
+});
+
+test("source action coverage is finite and continues only with explicit More",async()=>{
+  const h=harness(),first=Array.from({length:200},(_,i)=>declaration(`A.${i}`,"field",4));
+  const second=declaration("last","method",6);
+  h.symbolsRequest=async url=>new URL(url,"http://localhost").searchParams.get("offset")==="0" ?
+    outline(first,{nextOffset:200,truncated:true}) : outline([second]);
+  const p=h.pane([4,5,6]);await p.binding.ready;
+  assert.equal(h.metadataCalls.length,1);assert.equal(inlineActions(p).length,0);
+  const more=p.toolbar.children[2],coverage=p.toolbar.children[3];
+  assert.equal(more.hidden,false);assert.match(coverage.textContent,/200 declarations/);assert.match(coverage.textContent,/more available/);
+  await more.fire("click").done;
+  assert.equal(h.metadataCalls.length,2);assert.equal(inlineActions(p).length,1);
+  assert.equal(more.hidden,true);assert.equal(coverage.textContent,"");
+  await p.pre.fire("keydown",{key:"ContextMenu"}).done;
+  assert.equal(h.calls[0].url,"/api/navigation");
+});
+
+test("invalid, cross-path and stale metadata produce no inline actions",async()=>{
+  const method=declaration();
+  for(const bad of [outline([method],{path:"src/Other.java"}),outline([{...method,path:"src/Other.java"}]),
+    outline([{...method,range:{startLine:4,endLine:3}}]),outline([method],{nextOffset:0}),
+    outline([method],{revision:{...response().revision,indexRevision:2}})]) {
+    const h=harness();h.symbolsRequest=async()=>bad;
+    const p=h.pane([4,5]);await p.binding.ready;
+    assert.equal(inlineActions(p).length,0);assert.match(p.toolbar.children[3].textContent,/unavailable|stale/);
+    assert.equal(h.selected.length,0);assert.equal(h.calls.length,0);
+  }
+});
+
+test("metadata callbacks and late replies respect reset, disposal, session, pin and source fences",async()=>{
+  const invalidations=[(h,p)=>p.binding.dispose(),h=>h.nav.reset(),
+    h=>{h.session="two";},h=>{h.revision={...response().revision,indexRevision:2};},(_h,_p,scope)=>{scope.current=false;}];
+  for(const invalidate of invalidations) for(const pending of [true,false]) {
+    const h=harness(),gate=deferred(),scope={current:true};h.symbolsRequest=()=>gate.promise;
+    const method=declaration(),p=h.pane([4,5],{isCurrent:()=>scope.current});
+    let action;
+    if(!pending){gate.resolve(outline([method]));await p.binding.ready;action=inlineActions(p)[0];}
+    invalidate(h,p,scope);
+    if(pending){gate.resolve(outline([method]));await p.binding.ready;assert.equal(inlineActions(p).length,0);}
+    if(action)await action.fire("click").done;
+    assert.equal(h.selected.length,0);
+  }
+});
+
+test("metadata failure offers explicit retry while line navigation remains available",async()=>{
+  const h=harness();h.symbolsRequest=async()=>{throw Error("offline");};const p=h.pane([4]);await p.binding.ready;
+  assert.match(p.toolbar.children[3].textContent,/offline/);
+  h.symbolsRequest=async()=>outline([declaration()]);await p.toolbar.children[2].fire("click").done;
+  assert.equal(inlineActions(p).length,1);assert.equal(p.toolbar.children[2].hidden,true);
+  await p.button.fire("click").done;assert.equal(h.calls[0].url,"/api/navigation");
+});
+
+test("declaration menus expose exact Sequence, Inspect and source actions without automatic transitions",async()=>{
+  const h=harness({openSource:true}),method=declaration();
+  h.request=async()=>response([{symbol:method,reason:"declaration",matchKind:"measured",action:"sequence"}]);
+  await h.nav.open(h.event(),{path:method.path,line:4});
+  assert.equal(h.selected.length+h.inspected.length+h.openedSources.length,0);
+  const sequence=h.latest.actions.find(a=>a.label.startsWith("Sequence ·"));assert.ok(sequence);
+  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Inspect ·")));
+  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Read declaration source")));
+  assert.equal(h.latest.actions.find(a=>a.label.startsWith("Call graph")).disabled,true);
+  sequence.run();assert.equal(h.selected[0],method);
+});
+
+test("enclosing callable and supported class actions use measured identity, not lexical guesses",async()=>{
+  const h=harness(),method=declaration(),cls=declaration("A","class");
+  h.request=async()=>response([{symbol:method,reason:"enclosing",matchKind:"measured",action:"sequence"}]);
+  await h.nav.open(h.event(),{path:method.path,line:5});
+  const enclosing=h.latest.actions.find(a=>a.label.startsWith("Sequence · enclosing"));assert.ok(enclosing);
+  enclosing.run();assert.equal(h.selected[0],method);
+  h.request=async()=>response([{symbol:cls,reason:"declaration",matchKind:"measured",action:"class"}]);
+  await h.nav.open(h.event(),{path:cls.path,line:4});
+  const diagram=h.latest.actions.find(a=>a.label.startsWith("Class diagram"));assert.ok(diagram);
+  diagram.run();assert.equal(h.classes[0],cls);
+  h.request=async()=>response([{symbol:{...cls,path:"src/A.rs"},reason:"declaration",matchKind:"measured",action:"class"}]);
+  await h.nav.open(h.event(),{path:"src/A.rs",line:4});
+  assert.equal(h.latest.actions.some(a=>a.label.startsWith("Class diagram")),false);
+});
+
+test("only explicit call/resolved targets get resolved-callee sequence actions",async()=>{
+  const h=harness(),method=declaration("real"),candidate=declaration("guess");
+  h.request=async()=>response([
+    {symbol:candidate,reason:"call",matchKind:"measured",action:"sequence"},
+    {symbol:candidate,reason:"call",matchKind:"syntaxCandidate",action:"sequence"},
+    {symbol:candidate,reason:"type",matchKind:"resolved",action:"sequence"},
+    {symbol:method,reason:"call",matchKind:"resolved",action:"sequence"}]);
+  await h.nav.open(h.event(),{path:"src/A.java",line:20});
+  const actions=h.latest.actions.filter(a=>a.label.startsWith("Sequence"));assert.equal(actions.length,1);
+  assert.match(actions[0].label,/Sequence of callee/);actions[0].run();assert.equal(h.selected[0],method);
+});
+
+test("new diagram and inspector callbacks recheck all menu scope boundaries",async()=>{
+  for(const invalidation of [h=>h.nav.reset(),h=>{h.session="two";},h=>{h.revision={...response().revision,indexRevision:2};},
+    h=>h.latest.close("dismiss"),h=>h.showMenu(h.event(),[{label:"Other",run(){}}]),(_h,scope)=>{scope.current=false;}]) {
+    for(const prefix of ["Sequence","Inspect"]){
+      const h=harness(),scope={current:true};h.request=async()=>response([{symbol:declaration(),reason:"declaration",matchKind:"measured",action:"sequence"}]);
+      await h.nav.open(h.event(),{path:"src/A.java",line:4},{isCurrent:()=>scope.current});
+      const action=h.latest.actions.find(a=>a.label.startsWith(prefix));assert.ok(action);
+      invalidation(h,scope);action.run();assert.equal(h.selected.length+h.inspected.length,0);
+    }
+  }
+});
+
+test("binding menu reset preserves valid source declaration actions and continuation",async()=>{
+  const h=harness(),method=declaration();
+  h.symbolsRequest=async url=>new URL(url,"http://localhost").searchParams.get("offset")==="0" ?
+    outline([method],{nextOffset:1,truncated:true}) : outline([declaration("later","method",5)]);
+  const p=h.pane([4,5]);await p.binding.ready;
+  const action=inlineActions(p)[0];p.binding.reset();
+  assert.equal(inlineActions(p)[0],action);
+  await p.toolbar.children[2].fire("click").done;
+  assert.equal(inlineActions(p).length,2);await action.fire("click").done;
+  assert.equal(h.selected[0],method);
+});
+
+test("source metadata snapshots hydrate admitted pages synchronously with exact identities and no fetch",async()=>{
+  const h=harness(),first=declaration("first","method",4),second=declaration("second","method",5),third=declaration("third","method",6);
+  h.symbolsRequest=async url=>{
+    const offset=Number(new URL(url,"http://localhost").searchParams.get("offset"));
+    return offset===0 ? outline([first],{nextOffset:1,truncated:true}) :
+      offset===1 ? outline([second],{nextOffset:2,truncated:true,warnings:["Partial input"]}) : outline([third]);
+  };
+  const p=h.pane([4,5,6]);await p.binding.ready;
+  const pageOne=p.binding.snapshot();assert.equal(pageOne.items.length,1);assert.equal(pageOne.items[0],first);
+  await p.toolbar.children[2].fire("click").done;
+  const saved=p.binding.snapshot();assert.equal(saved.items.length,2);assert.equal(saved.items[1],second);
+  assert.equal(saved.nextOffset,2);assert.equal(saved.metadataCount,2);assert.equal(saved.metadataPartial,true);
+  p.binding.dispose();assert.equal(p.binding.snapshot().items[1],second);const before=h.metadataCalls.length;
+  const restored=h.pane([4,5,6],{metadataSnapshot:saved,startLine:5});
+  const actions=inlineActions(restored);assert.equal(actions.length,2);assert.equal(h.metadataCalls.length,before);
+  assert.equal(actions[1].getAttribute("data-symbol-id"),second.id);
+  assert.equal(restored.pre.dataset.navigationLine,"5");assert.match(restored.toolbar.children[3].textContent,/2 declarations/);
+  await actions[1].fire("click").done;assert.equal(h.selected[0],second);
+  await restored.toolbar.children[2].fire("click").done;
+  assert.equal(h.metadataCalls.length,before+1);assert.match(h.metadataCalls.at(-1).url,/offset=2&limit=200/);
+  assert.equal(inlineActions(restored).length,3);
+});
+
+test("pending initial metadata has no snapshot, while admitted empty metadata restores without fetching",async()=>{
+  const h=harness(),gate=deferred();h.symbolsRequest=()=>gate.promise;
+  const p=h.pane([4]);assert.equal(p.binding.snapshot(),undefined);
+  gate.resolve(outline());await p.binding.ready;
+  const saved=p.binding.snapshot();assert.equal(saved.items.length,0);assert.equal(saved.nextOffset,null);
+  p.binding.dispose();const before=h.metadataCalls.length;
+  const restored=h.pane([4],{metadataSnapshot:saved});
+  assert.equal(h.metadataCalls.length,before);assert.equal(inlineActions(restored).length,0);
+  assert.equal(restored.toolbar.children[2].hidden,true);assert.equal(restored.binding.snapshot().metadataCount,0);
+});
+
+test("resolved choices distinguish native callsite ranges and retain exact same-callee symbols",async()=>{
+  const h=harness(),first=declaration("callee"),second={...first};
+  const targets=[
+    {symbol:first,reason:"call",matchKind:"resolved",action:"sequence",callId:"call-1",range:{start:100,end:110}},
+    {symbol:second,reason:"call",matchKind:"resolved",action:"sequence",callId:"call-2",range:{start:120,end:130}}];
+  h.request=async()=>response(targets);
+  for(const index of [0,1]) {
+    await h.nav.open(h.event(),{path:"src/A.java",line:20});
+    const actions=h.latest.actions.filter(a=>a.label.startsWith("Sequence of callee"));
+    assert.equal(actions.length,2);assert.notEqual(actions[0].label,actions[1].label);
+    assert.match(actions[0].label,/call bytes 100–110/);assert.match(actions[1].label,/call bytes 120–130/);
+    actions[index].run();assert.equal(h.selected[index],targets[index].symbol);
+  }
+  targets[1].range=targets[0].range;
+  await h.nav.open(h.event(),{path:"src/A.java",line:20});
+  const duplicate=h.latest.actions.filter(a=>a.label.startsWith("Sequence of callee"));
+  assert.match(duplicate[0].label,/call call-1/);assert.match(duplicate[1].label,/call call-2/);
 });

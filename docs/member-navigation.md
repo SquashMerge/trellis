@@ -8,19 +8,31 @@ library source, call a provider, or resolve a type by globally matching its name
 - Right-click a source line, or use **Navigate line N**.
 - With the source pane focused, Up/Down or Home/End chooses a line. Shift+F10 opens its menu.
   Shift-arrow selection and normal copy remain available.
-- Menus can offer declarations on that line, the nearest enclosing method/class, recorded declared
-  type candidates, and measured internal call targets when available.
-- Choose a class to open its class diagram. Methods/functions offer separate **Go to source** and
-  **Open sequence** choices. Source-only navigation highlights the measured declaration without
-  changing the selected sequence.
+- Indexed callable declarations offer **Sequence** on hover or keyboard focus. Choose it to open
+  that exact declaration in Diagrams › Sequence. Source text and normal copy remain unchanged.
+- Source action metadata is read at the source pane's full index pin, in pages of 200 declarations.
+  Large files offer **More source actions**; line menus remain available independently of those pages.
+- Menus offer measured declarations on that line and the nearest enclosing method/class. Choose
+  **Class diagram** for a supported type, **Inspect** for its declaration details, or
+  **Read declaration source** to stay in source. Call graph is unavailable until its view ships.
+- Browser Back returns to the same source position and selection in the current checkout session.
+  Forward reopens the selected diagram. Logout, checkout changes and adopting another index pin
+  invalidate old source-return actions rather than applying them to a different snapshot.
 
 This is **line-based navigation**, not compiler go-to-definition for any word under the pointer.
-Unresolved calls are not globally name-matched. For Java bare-name and plain `this` calls, exact
-cached syntax can offer methods declared in the same measured class. These are labelled
-**same class candidate**, not compiler-resolved calls. All matching overloads remain explicit choices;
-arbitrary receivers and inheritance lookup are not guessed. This first slice supports calls in
-ordinary method declarations, not constructor bodies, initializers, lambdas, or local/anonymous classes.
-External/library source stays a separate read-only surface; this navigation uses workspace snapshots.
+Unresolved calls are not globally name-matched. Syntax candidates, same-class names, type hints and
+sequence participant labels are not resolved callees. The enclosing measured method remains a
+sequence choice when no eligible callee binding exists.
+
+External/library source stays a separate read-only surface. Its catalog and source-hash identities
+are not workspace syntax IDs, so it has no workspace Sequence or Class diagram action. Matching a
+path or name does not change that boundary. Working-tree-only text likewise has no indexed actions.
+
+Sequence URLs use `#sequence?sid=…`. A bare syntax ID resolves only after authentication and explicit
+checkout selection, against that checkout's admitted snapshot. Generated links also carry the
+checkout key and full index pin. A mismatched checkout or pin is a visible refusal, not an automatic
+switch to another snapshot. Source return state is local to the current browser session; it is not
+saved source text and cannot survive logout or a reload.
 
 ## Class members
 
@@ -34,8 +46,9 @@ bounded cached Java syntax tree and existing recorded type evidence, not neighbo
 
 ## Continuity and limits
 
-Lookups are explicit. Opening source, selecting a line or expanding members does not fetch navigation
-or another source file. Menus are invalidated by scope/session/revision changes or dismissal. Opening a
+Opening pinned source reads declaration metadata for its inline actions, never another source file.
+Selecting a line does not fetch navigation; its menu lookup remains explicit. Expanding members does
+not fetch source. Menus are invalidated by scope/session/revision changes or dismissal. Opening a
 new diagram clears stale source actions. Existing authentication, source guards and provider allowances
 remain unchanged.
 

@@ -108,6 +108,71 @@ test("inspector uses safe original evidence, never claims candidate confidence",
   assert.equal(all(h.get("inspector-detail")).some(n=>n.tagName==="script"),false);
   h.get("inspector-open-source").listeners.click();assert.equal(opened,1);assert.equal(JSON.stringify(step),original);
 });
+test("declaration Inspect uses measured symbol text and pinned revision without reading source",()=>{
+  const h=harness(),symbol={id:"declaration",name:"<script>declaration</script>",kind:"method",path:"src/<tag>.rs",range,provenance:{kind:"syntax"}},revision=view().revision;
+  let opened=0;const original=JSON.stringify(symbol);
+  h.context.window.matchMedia=()=>({matches:true});
+  h.get("explorer-toggle").listeners.click();
+  h.shell.inspectSymbol(symbol,revision,()=>++opened);
+  assert.equal(opened,0);
+  assert.equal(h.get("inspector-title").textContent,symbol.name);
+  assert.equal(h.get("inspector-title").title,symbol.name);
+  assert.equal(h.get("inspector-kind").textContent,"method");
+  assert.equal(h.get("inspector-location").textContent,"src/<tag>.rs:3:2–9:7 · revision 12345678:1");
+  assert.equal(h.get("inspector-target").textContent,"Declaration only · no call target or verified dispatch");
+  assert.match(h.get("inspector-evidence").textContent,/Measured declaration syntax/);
+  assert.equal(h.get("inspector-content").hidden,false);
+  assert.equal(h.get("inspector-clear").disabled,false);
+  assert.equal(h.document.body.classList.contains("explorer-open"),false);
+  assert.equal(h.document.body.classList.contains("inspector-open"),true);
+  assert.equal(h.get("inspector-open-source").textContent,"Read declaration source");
+  assert.equal(h.get("inspector-open-source").disabled,false);
+  assert.equal(h.get("inspector-detail").children[0].tagName,"details");
+  assert.notEqual(h.get("inspector-detail").children[0].open,true);
+  assert.match(text(h.get("inspector-detail")),/<script>declaration<\/script>/);
+  assert.equal(all(h.get("inspector-detail")).some(n=>n.tagName==="script"),false);
+  assert.equal(h.get("inspector-open-source").listeners.click(),1);
+  assert.equal(JSON.stringify(symbol),original);
+  assert.deepEqual(h.requests,[]);
+});
+test("declaration source callbacks are replaced and erased by existing inspector resets",()=>{
+  const h=harness(),symbol={id:"declaration",name:"declared",kind:"function",path:"main.rs",range};let first=0,second=0,step=0;
+  h.shell.inspectSymbol(symbol,view().revision,()=>first++);
+  h.shell.inspectSymbol({...symbol,name:"next"},view().revision,()=>second++);
+  h.get("inspector-open-source").listeners.click();
+  assert.equal(first,0);assert.equal(second,1);
+  h.shell.selectStep(call(),view(),()=>step++);
+  assert.equal(h.get("inspector-open-source").textContent,"Open call site");
+  h.get("inspector-open-source").listeners.click();assert.equal(step,1);assert.equal(second,1);
+  for(const reset of [()=>h.shell.resetInspector(),()=>h.shell.setConnected(false),()=>h.get("inspector-clear").listeners.click()]){
+    h.shell.inspectSymbol(symbol,view().revision,()=>second++);reset();
+    h.get("inspector-open-source").listeners.click();
+    assert.equal(second,1);
+    assert.equal(h.get("inspector-content").hidden,true);
+    assert.equal(h.get("inspector-open-source").disabled,true);
+    assert.equal(h.get("inspector-detail").children.length,0);
+  }
+  assert.deepEqual(h.requests,[]);
+});
+test("declaration Inspect requires source witness, paired revision and explicit callback",()=>{
+  const h=harness(),symbol={id:"declaration",name:"declared",kind:"class",path:"main.rs",range};let opened=0;
+  for(const [item,revision,callback] of [
+    [{...symbol,path:""},view().revision,()=>opened++],
+    [{...symbol,range:{startLine:4,endLine:2}},view().revision,()=>opened++],
+    [symbol,null,()=>opened++],
+    [symbol,{indexGeneration:"",indexRevision:1},()=>opened++],
+    [symbol,{indexGeneration:view().revision.indexGeneration,indexRevision:1.5},()=>opened++],
+    [symbol,view().revision,null]
+  ]){
+    h.shell.inspectSymbol(item,revision,callback);
+    assert.equal(h.get("inspector-open-source").disabled,true);
+    h.get("inspector-open-source").listeners.click();
+  }
+  h.shell.inspectSymbol(null,view().revision,()=>opened++);
+  assert.equal(h.get("inspector-content").hidden,true);
+  assert.equal(opened,0);
+  assert.deepEqual(h.requests,[]);
+});
 test("group keeps first-entry target limitation, full source callback and all guard/alternate children",()=>{
   const h=harness(),group={id:"chain",kind:"group",label:"Original full chain",path:"main.rs",range,children:[call(),call("finish","other")],alternate:[]};let selected;
   h.shell.selectStep(group,view([group]),()=>{selected=group;});

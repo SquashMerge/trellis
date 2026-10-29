@@ -94,6 +94,185 @@ let filesFile = null, filesSymbol = null, filesBasis = "indexed", filesMini = nu
 let filesGitStatus = null, filesDiff = null, filesCatalogLoaded = false;
 let diagramSequence = null;
 
+// History owns only opaque keys. Validated source/diagram evidence stays in this session.
+const navigationEntries = new Map();
+const navigationScope = String(Math.random()).slice(2);
+let navigationKey = 0, navigationSerial = 0, navigationLocation = null;
+let sourceInspector = null;
+let routeViewChange = false;
+function showNavigationView(name) {
+  routeViewChange = true;
+  try { window.TrellisShell?.showView(name); } finally { routeViewChange = false; }
+}
+function clearNavigationHistory() {
+  navigationSerial++; navigationEntries.clear(); navigationLocation = null; sourceInspector = null;
+}
+function navigationContext() {
+  const session = epoch, root = selectedRootKey, revision = status?.revision && IndexPin.copy(status.revision);
+  return {session, root, revision};
+}
+function navigationCurrent(context) {
+  return !!token && context.session === epoch && context.root === selectedRootKey && IndexPin.equal(context.revision, status?.revision);
+}
+function navigationError(message) {
+  $("sequence-state").textContent = message;
+  $("error").textContent = message; $("error").hidden = false;
+}
+function rememberNavigation(entry, replace, hash) {
+  if (!window.history?.pushState || !window.history?.replaceState) return;
+  const key = `${navigationScope}:${++navigationKey}`;
+  navigationEntries.set(key, {...entry, hash, ...navigationContext()});
+  window.history[replace ? "replaceState" : "pushState"]({trellisNavigation:key}, "", hash);
+  navigationLocation = navigationSignature();
+}
+function navigationSignature() {
+  return `${window.location?.hash || ""}:${window.history?.state?.trellisNavigation || ""}`;
+}
+function captureSourceEntry() {
+  if (!workspaceSource || !IndexPin.equal(workspaceSource.data.revision, status?.revision) ||
+      $("source-dock")?.hidden || $("workspace-source-panel")?.hidden || (section === "files" && filesBasis !== "indexed")) return null;
+  const focus = document.activeElement;
+  const action = focus?.closest?.(".source-diagram-action");
+  const offsets = id => ({top:$(id)?.scrollTop || 0, left:$(id)?.scrollLeft || 0});
+  return {kind:"source", source:workspaceSource, sourceNavigation:workspaceSource.navigation?.snapshot?.(), section, method:selectedMethod, diagram:diagramSequence,
+    view:["sequence", "classes", "architecture", "treemap", "libraries"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence",
+    showAll:!!$("all-steps").checked, inspector:sourceInspector,
+    file:filesFile, symbol:filesSymbol, basis:filesBasis, mini:filesMini, matches:filesMatches,
+    line:Number($("source").dataset?.navigationLine) || workspaceSource.range?.startLine || 1,
+    focus:action ? {symbol:action.dataset.symbolId} : {id:focus?.id || "source"},
+    scroll:{source:offsets("source"), panel:offsets("workspace-source-panel"), dock:offsets("source-dock"),
+      x:window.scrollX || 0, y:window.scrollY || 0}};
+}
+function sequenceHash(id, revision) {
+  const query = new URLSearchParams({sid:id, rootKey:selectedRootKey, indexGeneration:revision.indexGeneration, indexRevision:String(revision.indexRevision)});
+  return `#sequence?${query}`;
+}
+async function navigateDiagram(symbol, revision, kind = "sequence", admitted = null) {
+  IndexPin.copy(revision);
+  if (!IndexPin.equal(revision, status?.revision) || !token || !selectedRootKey) throw new Error("Source navigation is stale. Refresh the indexed view.");
+  const context = navigationContext(), ticket = ++navigationSerial;
+  const current = () => ticket === navigationSerial && navigationCurrent(context);
+  diagramSerial++;
+  const source = captureSourceEntry();
+  if (source) rememberNavigation(source, true, "#source");
+  rememberNavigation({kind, symbol, admitted, showAll:false}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
+  window.TrellisClasses?.reset();
+  clearSource(); diagramSequence = null;
+  await setSection("diagrams");
+  if (!current()) return;
+  $("all-steps").checked = false;
+  if (kind === "class") return openClasses({seed:symbol.id});
+  return selectMethod(symbol, admitted, current);
+}
+async function restoreSourceEntry(entry, current) {
+  // Restore the existing owners before normal section/source rendering rebinds them.
+  filesSerial++; filesDiffSerial++; clearFilesInspector();
+  filesFile = entry.file; filesSymbol = entry.symbol; filesBasis = entry.basis;
+  filesMini = entry.mini; filesMatches = entry.matches; filesDiff = null;
+  selectedMethod = entry.method; diagramSequence = null; $("all-steps").checked = entry.showAll;
+  $("method-source").disabled = !selectedMethod;
+  if ($("method-class")) $("method-class").disabled = !selectedMethod || !classLanguage(selectedMethod.path);
+  workspaceSource = entry.source;
+  await setSection(entry.section);
+  if (!current()) return;
+  diagramSequence = entry.diagram;
+  if (entry.section === "diagrams" && entry.view === "sequence" && entry.diagram && entry.method) {
+    await loadSequence(entry.diagram, true, current);
+    if (!current()) return;
+  }
+  if (entry.section === "diagrams") showNavigationView(entry.view);
+  updateFilesBasis(); renderFiles();
+  if (entry.section === "files" && filesSymbol) {
+    renderFilesSymbolHeader(filesSymbol);
+    if (filesMatches) renderFilesMatches();
+    if (filesMini) await renderFilesMini(filesGuard({symbol:true}));
+    if (!current()) return;
+  }
+  const serial = ++sourceSerial;
+  const sourceCurrent = () => current() && sourceSerial === serial && !(section === "files" && filesBasis !== "indexed");
+  paintCachedSource(entry.source.data, entry.source.range, sourceCurrent, entry.line, entry.sourceNavigation);
+  sourceInspector = entry.inspector;
+  if (entry.inspector) {
+    const inspector = entry.inspector;
+    const readSource = () => {
+      if (navigationCurrent(entry) && sourceInspector === inspector && sourceSerial === serial)
+        return perform(() => showSource(inspector.symbol, entry.revision));
+    };
+    if (inspector.sequence) window.TrellisShell?.selectStep(inspector.symbol, inspector.sequence, readSource);
+    else window.TrellisShell?.inspectSymbol?.(inspector.symbol, entry.revision, readSource);
+  }
+  if (!sourceCurrent()) return;
+  // Rendering and highlight reveal finish before exact focus/scroll restoration.
+  await new Promise(resolve => window.requestAnimationFrame ? window.requestAnimationFrame(resolve) : resolve());
+  if (!sourceCurrent()) return;
+  const actions = $("source").querySelectorAll?.(".source-diagram-action") || [];
+  const focus = entry.focus.symbol ? Array.from(actions).find(node => node.dataset.symbolId === entry.focus.symbol) : $(entry.focus.id);
+  (focus || $("source")).focus({preventScroll:true});
+  for (const [id, offset] of [["source", entry.scroll.source], ["workspace-source-panel", entry.scroll.panel], ["source-dock", entry.scroll.dock]]) {
+    if ($(id)) { $(id).scrollTop = offset.top; $(id).scrollLeft = offset.left; }
+  }
+  window.scrollTo?.(entry.scroll.x, entry.scroll.y);
+}
+async function readNavigationLocation(force = false) {
+  const signature = navigationSignature();
+  if (!force && signature === navigationLocation) return;
+  navigationLocation = signature;
+  const ticket = ++navigationSerial; diagramSerial++; sourceSerial++;
+  window.TrellisClasses?.reset();
+  // A URL never authenticates or chooses a checkout. Explicit selection retries it.
+  if (!token || !selectedRootKey || !status?.revision) return;
+  const context = navigationContext(), current = () => ticket === navigationSerial && navigationCurrent(context);
+  const candidate = navigationEntries.get(window.history?.state?.trellisNavigation);
+  const entry = candidate?.hash === (window.location?.hash || "") ? candidate : null;
+  try {
+    if (entry) {
+      if (!navigationCurrent(entry)) throw new Error("This history entry is stale. Select source from the current snapshot.");
+      if (entry.kind === "source") return await restoreSourceEntry(entry, current);
+      clearSource(); diagramSequence = null;
+      await setSection("diagrams");
+      if (!current()) return;
+      if (entry.kind === "class") return await openClasses({seed:entry.symbol.id});
+      $("all-steps").checked = entry.showAll;
+      return await selectMethod(entry.symbol, entry.admitted, current);
+    }
+    const hash = window.location?.hash || "";
+    const oldKey = window.history?.state?.trellisNavigation;
+    if (typeof oldKey === "string" && oldKey.startsWith(`${navigationScope}:`)) throw new Error("This history entry is stale. Open source from the current snapshot.");
+    if (!hash) return;
+    if (!hash.startsWith("#sequence")) {
+      if (hash === "#source" || hash === "#classes" || window.history?.state?.trellisNavigation) throw new Error("This source history is no longer available. Open source from the current snapshot.");
+      return;
+    }
+    if (!hash.startsWith("#sequence?")) throw new Error("Sequence link requires a symbol ID (sid).");
+    const query = new URLSearchParams(hash.slice("#sequence?".length)), id = query.get("sid");
+    if (!id || !id.trim() || query.getAll("sid").length !== 1) throw new Error("Sequence link requires one valid symbol ID (sid).");
+    if (query.has("rootKey") && query.get("rootKey") !== selectedRootKey) throw new Error("Sequence link belongs to a different checkout. Select its checkout first.");
+    const revision = context.revision;
+    if (query.has("indexGeneration") || query.has("indexRevision")) {
+      const value = query.get("indexRevision");
+      if (!/^(0|[1-9][0-9]*)$/.test(value || "")) throw new Error("Sequence link has an invalid index snapshot.");
+      const requested = IndexPin.copy({indexGeneration:query.get("indexGeneration"), indexRevision:Number(value)});
+      if (!IndexPin.equal(requested, revision)) throw new Error("Sequence link is stale for the selected index snapshot. Reload or select a current link.");
+    }
+    clearSource(); diagramSequence = null;
+    await setSection("diagrams");
+    if (!current()) return;
+    window.TrellisShell?.showView("sequence");
+    $("sequence-state").textContent = "Loading sequence link…";
+    const data = await api("/api/sequence", "POST", {seed:id, expectedRevision:revision, showAll:false}, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data?.revision, revision) || data?.seed?.id !== id) throw new Error("Sequence link provenance mismatch. Nothing displayed.");
+    $("all-steps").checked = false;
+    // A resolved route stores only a key in browser history; seed/DTO remain in memory.
+    rememberNavigation({kind:"sequence", symbol:data.seed, admitted:data, showAll:false}, true, hash);
+    await selectMethod(data.seed, data, current);
+  } catch (error) {
+    if (current() && error.name !== "AbortError") navigationError(`Cannot open sequence: ${error.message}`);
+  }
+}
+window.addEventListener?.("popstate", () => { void readNavigationLocation(); });
+window.addEventListener?.("hashchange", () => { void readNavigationLocation(); });
+
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -187,7 +366,7 @@ function form(id, action) {
 }
 function stale(message) { $("stale").textContent = message; $("stale").hidden = false; }
 function clearSource() {
-  sourceSerial++; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
+  sourceSerial++; sourceInspector = null; workspaceSource = null; window.TrellisNavigation?.reset(); $("source").replaceChildren();
   $("source-path").textContent = "Choose a call to read its cached source snapshot.";
   if (!$("source-dock")?.hidden) window.TrellisShell?.closeSource?.();
 }
@@ -238,7 +417,7 @@ async function refreshStatus(followup = false) {
   const workspaceChanged = status && status.workspaceRoot !== data.workspaceRoot;
   const nextPin = data.revision == null ? null : IndexPin.copy(data.revision);
   const browseChanged = !status || workspaceChanged || !IndexPin.equal(status.revision, nextPin);
-  if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); clearSource(); }
+  if (status && browseChanged) { clearNavigationHistory(); clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); clearSource(); }
   if (browseChanged) clearDependencyCatalog();
   resetHeadObservation();
   status = {...data, revision:nextPin};
@@ -279,7 +458,7 @@ async function refreshStatus(followup = false) {
   }
 }
 function unexpectedPair(message = "Index snapshot changed. Refresh status.", receivedPair) {
-  clearBrowse(message); clearSource(); sourceCache.clear(); clearDependencyCatalog();
+  clearNavigationHistory(); clearBrowse(message); clearSource(); sourceCache.clear(); clearDependencyCatalog();
   $("files-state").textContent = message;
   $("dependency-state").textContent = message;
   $("dependency-symbol-state").textContent = message;
@@ -331,7 +510,7 @@ const validRootKey = key => typeof key === "string" && /^[0-9a-f]{64}$/.test(key
 function checkoutOption(label, value) { const option = element("option", label); option.value = value; return option; }
 function resetCheckout() {
   // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
-  epoch++; gitSerial++; section = "diagrams"; sectionSerial++; filesGitStatus = null; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
+  epoch++; clearNavigationHistory(); gitSerial++; section = "diagrams"; sectionSerial++; filesGitStatus = null; selectedRootKey = null; selectedWorkspaceRoot = null; selectedGit = null; checkoutBusy = false;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
@@ -500,6 +679,7 @@ async function selectCheckout(key) {
     waitingForJob = !!job && activeJob(job);
     if (job) { showJob(); schedulePoll(); }
     $("checkout-state").textContent = "Checkout ready.";
+    void readNavigationLocation(true);
     $("notice").textContent = "Browse folders below. Indexed files expand to methods."
       + (tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "");
   } catch (error) {
@@ -558,7 +738,7 @@ async function showSource(item, revision) {
   return showCachedSource(item.path, item.range, revision);
 }
 let workspaceSource = null;
-function paintCachedSource(data, range, current) {
+function paintCachedSource(data, range, current, startLine = range?.startLine || 1, metadata) {
   workspaceSource = {data, range};
   $("source-path").textContent = `${data.file.path} · ${data.file.language} · ${data.file.text.split("\n").length} lines · revision ${IndexPin.label(data.revision)} · cached snapshot`;
   const fragment = document.createDocumentFragment();
@@ -570,13 +750,16 @@ function paintCachedSource(data, range, current) {
   });
   $("source").replaceChildren(fragment); $("source").hidden = false;
   window.TrellisShell?.showSource("workspace");
-  window.TrellisNavigation?.attachSource($("source"), {
-    path:data.file.path, revision:data.revision, startLine:range?.startLine || 1,
+  const binding = window.TrellisNavigation?.attachSource($("source"), {
+    path:data.file.path, revision:data.revision, startLine, metadataSnapshot:metadata,
     isCurrent: () => current() && !!token && IndexPin.equal(status?.revision, data.revision) &&
       !(section === "files" && filesBasis !== "indexed") && !$("source-dock")?.hidden && !$("workspace-source-panel")?.hidden,
   });
+  workspaceSource.navigation = binding;
+  return binding;
 }
 async function showCachedSource(path, range, revision, callerCurrent = () => true) {
+  navigationSerial++;
   IndexPin.copy(revision);
   if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
   const serial = ++sourceSerial, session = epoch, root = selectedRootKey;
@@ -657,6 +840,7 @@ function schedulePoll() {
   }), 700);
 }
 $("index").addEventListener("click", () => perform(async () => {
+  clearNavigationHistory();
   window.TrellisClasses?.reset();
   diagramSerial++; viewerMetrics?.clearInspection(); window.TrellisShell?.resetInspector(); clearSource();
   job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
@@ -718,7 +902,7 @@ async function setSection(name) {
     if (!$("treemap-panel").hidden) await treemap?.refresh();
     else if (!$("architecture-panel").hidden) await architecture?.refresh();
     else if (diagramSequence && selectedMethod?.id === diagramSequence.seed.id) await loadSequence(diagramSequence, true);
-    if (cached && current()) paintCachedSource(cached.data, cached.range, current);
+    if (cached && current()) paintCachedSource(cached.data, cached.range, current, cached.range?.startLine || 1, cached.navigation?.snapshot?.());
     return;
   }
   viewerMetrics?.clearInspection();
@@ -730,7 +914,7 @@ async function setSection(name) {
   }
   if (workspaceSource && filesBasis === "indexed") {
     const source = workspaceSource;
-    paintCachedSource(source.data, source.range, filesGuard({basis:true}));
+    paintCachedSource(source.data, source.range, filesGuard({basis:true}), source.range?.startLine || 1, source.navigation?.snapshot?.());
   }
   if (filesSymbol) {
     const current = filesGuard({symbol:true});
@@ -746,7 +930,7 @@ async function setSection(name) {
   if (!filesCatalogLoaded && status?.revision) await loadFiles(true);
   if (!filesGitStatus) await refreshGit();
 }
-window.TrellisShell?.setSectionCallback?.(name => { void setSection(name); });
+window.TrellisShell?.setSectionCallback?.(name => { navigationSerial++; diagramSerial++; void setSection(name); });
 function appendFilesOutline(li, file) {
   const state = fileStates.get(file.path);
   if (!state?.outlineOpen) return;
@@ -791,6 +975,14 @@ async function selectFilesFile(file) {
     loadFilesOutline(file),
   ]);
 }
+function renderFilesSymbolHeader(item) {
+  const symbol = item.symbol, pin = status.revision;
+  $("files-symbol-title").textContent = symbol.qualifiedName || symbol.name;
+  $("files-symbol-kind").textContent = item.nativeKind;
+  $("files-symbol-location").textContent = `${symbol.path}:${symbol.range.startLine}–${symbol.range.endLine} · indexed revision ${IndexPin.label(pin)}`;
+  $("files-symbol-header").textContent = window.TrellisFiles?.headerText(item.header) || "Measured header unavailable";
+  $("files-symbol-return").textContent = item.header?.resultType ? `Return type · ${item.header.resultType}` : "Return type not recorded";
+}
 async function selectFilesSymbol(item) {
   if (section !== "files") return;
   if (item.symbol.path !== filesFile?.path) {
@@ -799,11 +991,7 @@ async function selectFilesSymbol(item) {
   }
   filesSerial++; filesDiffSerial++; clearFilesInspector(); filesSymbol = item; filesBasis = "indexed"; filesDiff = null;
   const symbol = item.symbol, pin = IndexPin.copy(status.revision), current = filesGuard({symbol:true});
-  $("files-symbol-title").textContent = symbol.qualifiedName || symbol.name;
-  $("files-symbol-kind").textContent = item.nativeKind;
-  $("files-symbol-location").textContent = `${symbol.path}:${symbol.range.startLine}–${symbol.range.endLine} · indexed revision ${IndexPin.label(pin)}`;
-  $("files-symbol-header").textContent = window.TrellisFiles?.headerText(item.header) || "Measured header unavailable";
-  $("files-symbol-return").textContent = item.header?.resultType ? `Return type · ${item.header.resultType}` : "Return type not recorded";
+  renderFilesSymbolHeader(item);
   updateFilesBasis(); renderFiles();
   const callable = ["function", "method"].includes(symbol.kind);
   $("files-mini-state").textContent = callable ? "Loading measured sequence…" : "Sequence not applicable to this noncallable symbol.";
@@ -867,10 +1055,7 @@ async function renderFilesMini(current) {
 }
 async function openFilesFull() {
   if (section !== "files" || !filesMini || !filesSymbol || !IndexPin.equal(filesMini.revision, status?.revision)) return;
-  const data = filesMini, symbol = filesSymbol.symbol;
-  await setSection("diagrams"); selectedMethod = symbol; $("all-steps").checked = false;
-  $("method-source").disabled = false; if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
-  window.TrellisShell?.showView("sequence"); renderFiles(); await loadSequence(data);
+  return navigateDiagram(filesSymbol.symbol, filesMini.revision, "sequence", filesMini);
 }
 function updateFilesBasis() {
   if (!$("files-working")) return;
@@ -890,7 +1075,7 @@ async function setFilesBasis(basis) {
   window.TrellisNavigation?.reset(); filesDiff = null; $("files-diff").replaceChildren(); updateFilesBasis();
   if (basis === "indexed") {
     const current = filesGuard({basis:true});
-    if (workspaceSource?.data.file.path === filesFile.path) paintCachedSource(workspaceSource.data, workspaceSource.range, current);
+    if (workspaceSource?.data.file.path === filesFile.path) paintCachedSource(workspaceSource.data, workspaceSource.range, current, workspaceSource.range?.startLine || 1, workspaceSource.navigation?.snapshot?.());
     else await showCachedSource(filesFile.path, filesSymbol?.symbol.range || null, status.revision, current).catch(error => filesFailure(error, "source-path", current));
     return;
   }
@@ -1073,28 +1258,35 @@ async function toggleFile(file) {
     state.error = error.message;
   } finally { if (current()) { state.loading = false; renderFiles(); } }
 }
-async function selectMethod(symbol) {
+async function selectMethod(symbol, admitted = null, callerCurrent = null) {
+  if (!callerCurrent) {
+    const context = navigationContext(), ticket = ++navigationSerial;
+    callerCurrent = () => ticket === navigationSerial && navigationCurrent(context);
+  }
+  if (!callerCurrent()) return;
+  sourceInspector = null;
   viewerMetrics?.clearInspection();
   window.TrellisShell?.showView("sequence");
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
   selectedMethod = symbol; $("method-source").disabled = false;
   clearSource(); renderFiles();
-  await loadSequence();
-  if (selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
+  await loadSequence(admitted, false, callerCurrent);
+  if (callerCurrent() && selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
-async function loadSequence(admitted = null, preserveSource = false) {
+async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   if (!selectedMethod || !status) return;
   const serial = ++diagramSerial, guard = browseGuard(), symbol = selectedMethod, revision = IndexPin.copy(status.revision);
   const surface = sectionSerial;
-  const current = () => guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
+  let published = false;
+  const current = () => (published || callerCurrent()) && guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
   if (!preserveSource) clearSource();
   $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
   await browseRequest(async () => {
-    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked});
+    const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked}, current);
     if (!current()) return;
     if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); throw new Error("Sequence provenance mismatch. Nothing displayed."); }
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
@@ -1109,7 +1301,7 @@ async function loadSequence(admitted = null, preserveSource = false) {
       $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
-      if (current()) { viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step)); }
+      if (current()) { sourceInspector = {symbol:step, sequence:data}; viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step)); }
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
@@ -1124,6 +1316,7 @@ async function loadSequence(admitted = null, preserveSource = false) {
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
+    published = true;
   }, current, "sequence-state");
 }
 $("file-filter").addEventListener("input", renderFiles);
@@ -1248,13 +1441,17 @@ const architecture = window.TrellisArchitecture?.create({
   onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
 });
 window.TrellisShell?.setViewCallback?.(name => {
+  if (!routeViewChange && name !== "sequence") {
+    navigationSerial++; diagramSerial++;
+    if (navigationEntries.get(window.history?.state?.trellisNavigation)?.kind === "class") window.TrellisClasses?.reset();
+  }
   architecture?.clearInspection(); treemap?.clearInspection();
   if (name === "architecture" && section === "diagrams") void architecture?.refresh();
   else architecture?.reset();
   if (name === "treemap" && section === "diagrams") void treemap?.refresh();
   else treemap?.reset();
 });
-window.TrellisShell?.setInspectorClearCallback?.(() => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); treemap?.clearInspection(); });
+window.TrellisShell?.setInspectorClearCallback?.(() => { sourceInspector = null; viewerMetrics?.clearInspection(); architecture?.clearInspection(); treemap?.clearInspection(); });
 function metricDirectorySelection(path) {
   if (!treeRoot || !indexedWorkspace) return null;
   const absolute = `${treeRoot.replace(/\/$/, "")}${path ? "/" + path : ""}`;
@@ -1595,6 +1792,7 @@ function renderExternalSource(range = externalSelectedRange, windowStart) {
     if (range && number >= range.startLine && number <= range.endLine) line.classList.add("highlight");
     line.append(element("span", String(number), "line-number"), document.createTextNode(content)); fragment.append(line);
   }
+  fragment.append(element("span", "Workspace diagrams are unavailable for this external candidate snapshot.", "source-line warning"));
   $("external-source").replaceChildren(fragment);
   if (range) {
     $("external-source").focus({preventScroll:true});
@@ -1760,7 +1958,7 @@ async function openClasses(options = {}) {
   if (!token || !status || !window.TrellisClasses) return;
   viewerMetrics?.clearInspection();
   clearSource(); window.TrellisShell?.resetInspector();
-  window.TrellisShell?.showView("classes");
+  showNavigationView("classes");
   return window.TrellisClasses.open(options.seed ? {seed:options.seed} : options);
 }
 function attachClassMenu(node, options) {
@@ -1779,13 +1977,23 @@ function attachClassMenu(node, options) {
     if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) show(event);
   });
 }
+function inspectSourceSymbol(symbol, revision) {
+  if (!sourceWitness(symbol) || !IndexPin.equal(revision, status?.revision)) throw new Error("Source inspection is stale. Refresh the indexed view.");
+  const context = navigationContext(), serial = sourceSerial;
+  const inspector = {symbol}; sourceInspector = inspector;
+  const current = () => navigationCurrent(context) && sourceInspector === inspector && sourceSerial === serial;
+  return window.TrellisShell?.inspectSymbol?.(symbol, revision, () => {
+    if (current()) return perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision));
+  });
+}
 window.TrellisNavigation?.init({
   request: (path, options = {}) => api(path, options.method || "GET", options.body),
   onStale: unexpectedPair,
   currentRevision: () => status?.revision,
   currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
-  openClass: symbol => perform(() => openClasses({seed:symbol.id})),
-  selectMethod: symbol => perform(() => selectMethod(symbol)),
+  openClass: (symbol, revision) => perform(() => navigateDiagram(symbol, revision, "class")),
+  selectMethod: (symbol, revision) => perform(() => navigateDiagram(symbol, revision)),
+  inspectSymbol: (symbol, revision) => perform(() => inspectSourceSymbol(symbol, revision)),
   openSource: (symbol, revision) => perform(() => section === "files" ? openFilesLocation(symbol, revision) : showSource(symbol, revision)),
   showMenu: (event, actions, options) => window.TrellisClasses?.showContextMenu(event, actions, options),
 });

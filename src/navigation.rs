@@ -2,6 +2,7 @@
 //! This is line navigation, not token go-to-definition or global name resolution.
 use crate::{
     model::{ClassMember, IndexPin, Symbol, SymbolKind},
+    native_evidence::Range,
     store::id_codec,
 };
 use anyhow::{Result, ensure};
@@ -12,8 +13,8 @@ use std::collections::BTreeSet;
 pub const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 // Evidence records and source parsing have separate input budgets. Source never leaves this reader.
 const INPUT_BYTES: usize = 256 * 1024;
-const RECORD_BYTES: i64 = 32 * 1024;
-const QUERY_ROWS: usize = 128;
+pub(crate) const RECORD_BYTES: i64 = 32 * 1024;
+pub(crate) const QUERY_ROWS: usize = 128;
 const TOTAL_ROWS: usize = 256;
 const TARGETS: usize = 64;
 const WARNINGS: usize = 32;
@@ -44,6 +45,8 @@ pub struct SourceSelector {
     pub expected_revision: IndexPin,
     pub path: String,
     pub line: usize,
+    #[serde(default)]
+    pub semantic_producer_id: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -71,7 +74,10 @@ impl NavigationRequest {
                         .path
                         .split('/')
                         .any(|p| p.is_empty() || p == "." || p == "..")
-                    && (1..=10_000_000).contains(&s.line),
+                    && (1..=10_000_000).contains(&s.line)
+                    && s.semantic_producer_id
+                        .as_deref()
+                        .is_none_or(crate::graph_query::valid_producer_id),
                 InvalidRequest(
                     "Choose a cached workspace-relative path and a 1-based source line."
                 )
@@ -94,6 +100,10 @@ pub struct NavigationTarget {
     pub action: &'static str,
     pub reason: &'static str,
     pub match_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,7 +114,7 @@ pub struct NavigationResult {
     pub truncated: bool,
     pub require_index: bool,
 }
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     db: &'a Connection,
     revision_key: &'a str,
     result: NavigationResult,
@@ -125,13 +135,17 @@ impl Reader<'_> {
             }
         }
     }
-    fn clipped(&mut self) {
+    pub(crate) fn clipped(&mut self) {
         self.result.truncated = true;
         self.warn("Navigation limits reached; some cached evidence or targets were omitted.");
     }
     // Each query narrows by path/owner/id/range in SQL. Oversized records are represented
     // by NULL, never loaded/deserialized. The caller must SELECT a bounded CASE expression.
-    fn records<T: DeserializeOwned>(&mut self, sql: &str, values: impl Params) -> Result<Vec<T>> {
+    pub(crate) fn records<T: DeserializeOwned>(
+        &mut self,
+        sql: &str,
+        values: impl Params,
+    ) -> Result<Vec<T>> {
         let mut stmt = self.db.prepare(sql)?;
         let mut rows = stmt.query(values)?;
         let mut result = vec![];
@@ -159,7 +173,10 @@ impl Reader<'_> {
     }
     // Identical to `records` for derived symbols: one row probe at a time,
     // then per-record and aggregate byte checks in the same SQL order.
-    fn symbol_records(&mut self, symbols: impl IntoIterator<Item = Symbol>) -> Result<Vec<Symbol>> {
+    pub(crate) fn symbol_records(
+        &mut self,
+        symbols: impl IntoIterator<Item = Symbol>,
+    ) -> Result<Vec<Symbol>> {
         let mut result = Vec::new();
         for (index, symbol) in symbols.into_iter().enumerate() {
             self.rows += 1;
@@ -181,12 +198,50 @@ impl Reader<'_> {
         }
         Ok(result)
     }
+    pub(crate) fn charge(&mut self, bytes: usize) -> bool {
+        self.rows += 1;
+        if self.rows > TOTAL_ROWS
+            || bytes > RECORD_BYTES as usize
+            || self.input_bytes + bytes > INPUT_BYTES
+        {
+            self.clipped();
+            return false;
+        }
+        self.input_bytes += bytes;
+        true
+    }
     fn symbol(&mut self, id: &str) -> Result<Option<Symbol>> {
         let symbols = self.symbols.unwrap_or(&[]);
         let symbol = symbols.iter().find(|symbol| symbol.id == id).cloned();
         Ok(self.symbol_records(symbol)?.pop())
     }
     fn add(&mut self, symbol: Symbol, reason: &'static str, certainty: &str) -> Result<()> {
+        self.add_target(symbol, reason, certainty, None, None)
+    }
+    pub(crate) fn add_call(
+        &mut self,
+        symbol: Symbol,
+        call: &crate::native_evidence::Call,
+    ) -> Result<()> {
+        if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+            return Ok(());
+        }
+        self.add_target(
+            symbol,
+            "call",
+            "resolved",
+            Some(call.id.clone()),
+            Some(call.range.clone()),
+        )
+    }
+    fn add_target(
+        &mut self,
+        symbol: Symbol,
+        reason: &'static str,
+        certainty: &str,
+        call_id: Option<String>,
+        range: Option<Range>,
+    ) -> Result<()> {
         let action = match symbol.kind {
             SymbolKind::Function | SymbolKind::Method => "sequence",
             SymbolKind::Class => {
@@ -210,10 +265,11 @@ impl Reader<'_> {
         {
             return Ok(());
         }
-        if !self
-            .seen
-            .insert((symbol.id.clone(), reason, certainty.into()))
-        {
+        if !self.seen.insert((
+            symbol.id.clone(),
+            reason,
+            call_id.clone().unwrap_or_else(|| certainty.into()),
+        )) {
             return Ok(());
         }
         let target = NavigationTarget {
@@ -221,6 +277,8 @@ impl Reader<'_> {
             action,
             reason,
             match_kind: certainty.into(),
+            call_id,
+            range,
         };
         let bytes = serde_json::to_vec(&target)?.len() + 1;
         // Reserve room for warnings and the envelope, including worst-case JSON escaping.
@@ -338,6 +396,7 @@ pub(crate) fn navigate(
     revision: IndexPin,
     revision_key: &str,
     symbols: Option<&[Symbol]>,
+    calls: &mut dyn FnMut(&mut Reader<'_>, &SourceSelector) -> Result<()>,
 ) -> Result<NavigationResult> {
     let metadata: Option<bool> = db
         .query_row(
@@ -369,7 +428,12 @@ pub(crate) fn navigate(
         reader.warn("The cached class projection is incomplete; some declared types or members may be absent.");
     }
     match request {
-        NavigationRequest::Source(s) => reader.source(s)?,
+        NavigationRequest::Source(s) => {
+            reader.source(s)?;
+            if s.semantic_producer_id.is_some() {
+                calls(&mut reader, s)?;
+            }
+        }
         NavigationRequest::Member(s) => reader.member(s)?,
     }
     if reader.result.targets.is_empty() && reader.result.warnings.is_empty() {

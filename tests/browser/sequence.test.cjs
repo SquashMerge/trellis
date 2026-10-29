@@ -55,6 +55,33 @@ test("published Store sequence renders Pele and selects exact measured source by
  assert.equal(await page.locator("#call-inspector").innerText(),before);
  assert.equal(sourceRequests.length,sourceCount);
 }));
+
+test("method source Sequence uses the clicked declaration, not the left-tree selection, and Back restores source", {timeout:240000}, async () => published(source, async ({page, dto, pin}) => {
+ // The tree remains on measured throughout source selection. The helper's
+ // measured ID comes from its own source annotation, never the current seed.
+ await page.locator("#method-source").click();
+ await page.waitForFunction(() => document.querySelector("#source .source-line"));
+ const action = page.getByRole("button", {name:/^Sequence for first ·/});
+ await action.waitFor();
+ const helperId = await action.getAttribute("data-symbol-id");
+ assert.ok(helperId && helperId !== dto.seed.id);
+ assert.match(await page.locator(".method-pick.selected").textContent(), /measured/);
+ const before = await page.locator("#source").textContent();
+ const highlighted = await page.locator("#source .highlight .line-number").allTextContents();
+ const responsePromise = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === helperId);
+ await action.click();
+ const response = await responsePromise, selected = await response.json();
+ assert.equal(response.status(), 200, JSON.stringify(selected));
+ assert.equal(selected.seed.id, helperId); assert.equal(selected.seed.name, "first"); assert.deepEqual(selected.revision, pin);
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), helperId);
+ await page.goBack();
+ await page.waitForFunction(text => document.querySelector("#source")?.textContent === text && !document.querySelector("#workspace-source-panel")?.hidden, before);
+ assert.deepEqual(await page.locator("#source .highlight .line-number").allTextContents(), highlighted);
+ await page.waitForFunction(id => document.activeElement?.dataset.symbolId === id, helperId);
+ assert.match(await page.locator("#source-path").textContent(), /flow\.rs.*cached snapshot/);
+ assert.match(await page.locator(".method-pick.selected").textContent(), /measured/, "Back restores the original diagram selection as well as source");
+}));
+
 module.exports={published};
 
 const jsSource="async function measured(path, value) {\n  console.log(writeDb());\n  if (!valid(path)) throw new Error(\"invalid\");\n  const tmp = tempName(path);\n  try {\n    await fs.writeFile(tmp, encode(value));\n    await fs.rename(tmp, path);\n    return path;\n  } catch (err) {\n    await fs.unlink(tmp);\n    throw err;\n  } finally {\n    release(path);\n  }\n}\n";
@@ -123,6 +150,24 @@ test("published import candidate keeps partial provenance and original source",{
  assert.ok(requests.some(raw=>{const q=new URL(raw).searchParams;return q.get("path")===step.path&&q.get("indexGeneration")===pin.indexGeneration&&q.get("indexRevision")===String(pin.indexRevision);}));
  assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(),[String(step.range.startLine)]);
  assert.match(await page.locator("#source").innerText(),/candidateParse\(input\)/);
+ const sourceBefore = await page.locator("#source").textContent();
+ const line = page.locator("#source .source-line").filter({hasText:"return candidateParse(input)"});
+ const navigationPromise = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/navigation"));
+ await line.click({button:"right"});
+ const navigation = await navigationPromise, targets = await navigation.json();
+ assert.equal(navigation.status(), 200, JSON.stringify(targets)); assert.deepEqual(targets.revision, pin);
+ assert.equal(targets.targets.some(target => target.reason === "call" && target.matchKind === "resolved"), false, "import candidate has no resolved workspace callee");
+ const enclosing = page.getByRole("menuitem", {name:/^Sequence · enclosing · measured/});
+ await enclosing.waitFor();
+ assert.equal(await page.getByRole("menuitem", {name:/Sequence of callee/}).count(), 0, "never guess a callee from import spelling");
+ assert.equal(await page.getByRole("menuitem", {name:/Call graph/}).isDisabled(), true);
+ assert.equal(await page.locator('[role="tab"]').filter({hasText:/Call graph/}).count(), 0, "#378 has no browser view");
+ await enclosing.click();
+ await page.waitForFunction(id => new URLSearchParams(location.hash.slice("#sequence?".length)).get("sid") === id && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"), dto.seed.id);
+ await page.goBack();
+ await page.waitForFunction(text => document.querySelector("#source")?.textContent === text && document.querySelector("#source")?.dataset.navigationLine === "3", sourceBefore);
+ assert.deepEqual(await page.locator("#source .source-line.highlight .line-number").allTextContents(), [String(step.range.startLine)]);
+ assert.equal(await page.locator("#source").evaluate(node => node === document.activeElement), true, "Inspector source menu returns focus to source");
 },"flow.js"));
 
 const truncatedSource=`function measured() {\n${Array.from({length:202},(_,i)=>`  observed_${i}();\n`).join("")}}\n`;

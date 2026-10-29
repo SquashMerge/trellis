@@ -193,6 +193,7 @@
     hide("inspector-empty", document.body.classList.contains("files-section")); hide("inspector-content", true);
     for (const id of ["inspector-title", "inspector-kind", "inspector-target", "inspector-location", "inspector-evidence", "inspector-detail"]) get(id)?.replaceChildren();
     if (get("inspector-open-source")) get("inspector-open-source").disabled = true;
+    text("inspector-open-source", "Open call site");
     if (get("inspector-clear")) get("inspector-clear").disabled = true;
     if (get("inspector-title")) get("inspector-title").title = "";
     syncInspector();
@@ -213,6 +214,27 @@
     if (!sourceWitness(step)) return "Source range unavailable";
     const r = step.range;
     return `${step.path}:${r.startLine}${r.startColumn == null ? "" : ":" + r.startColumn}–${r.endLine}${r.endColumn == null ? "" : ":" + r.endColumn}`;
+  }
+  function inspectSymbol(symbol, revision, readSource) {
+    resetInspector();
+    if (!symbol) return;
+    const paired = typeof revision?.indexGeneration === "string" && !!revision.indexGeneration && Number.isSafeInteger(revision.indexRevision);
+    const title = symbol.name || symbol.id || "Selected declaration";
+    hide("inspector-empty", true); hide("inspector-content", false);
+    if (get("inspector-clear")) get("inspector-clear").disabled = false;
+    text("inspector-title", title);
+    if (get("inspector-title")) get("inspector-title").title = title;
+    text("inspector-kind", symbol.kind || "Declaration");
+    text("inspector-location", `${location(symbol)} · ${paired ? `revision ${revision.indexGeneration.slice(0, 8)}:${revision.indexRevision}` : "snapshot unavailable"}`);
+    text("inspector-target", "Declaration only · no call target or verified dispatch");
+    text("inspector-evidence", "Measured declaration syntax, not a runtime trace or verified dispatch.");
+    const disclosure = make("details");
+    disclosure.append(make("summary", "Measured declaration"), make("pre", JSON.stringify(symbol, null, 2)));
+    get("inspector-detail")?.append(disclosure);
+    openSource = sourceWitness(symbol) && paired && typeof readSource === "function" ? readSource : null;
+    text("inspector-open-source", "Read declaration source");
+    if (get("inspector-open-source")) get("inspector-open-source").disabled = !openSource;
+    drawer("inspector", true);
   }
   function selectStep(step, view, callback) {
     resetInspector();
@@ -306,6 +328,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, selectStep, resetInspector, reset};
+  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();

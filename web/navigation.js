@@ -70,6 +70,7 @@
     return {expectedRevision: revision, classId: selector.classId, memberName: selector.memberName,
       startByte: selector.startByte, endByte: selector.endByte};
   }
+  function callable(symbol) { return ["function", "method"].includes(symbol?.kind); }
   function sourceWitness(item) {
     const r = item?.range;
     return typeof item?.path === "string" && !!item.path.trim() && !!r &&
@@ -87,7 +88,7 @@
     for (let node = anchor.currentTarget, depth = 0; node && depth < 64; node = node.parentNode, depth++) {
       if (typeof node.scrollTop === "number" && typeof node.scrollLeft === "number") menuScroll.set(node, [node.scrollTop, node.scrollLeft]);
     }
-    if (!owner) return;
+    if (!owner?.currentRevision?.()) return;
     const revision = window.TrellisIndexPin.copy(owner.currentRevision()), session = owner.currentSession();
     const current = () => {
       try { return owner === api && ticket === serial && window.TrellisIndexPin.equal(revision, owner.currentRevision()) &&
@@ -129,22 +130,44 @@
       }
       if (!Array.isArray(data.targets)) throw new Error("Invalid navigation response.");
       const actions = [];
-      // Old call/type matches are lexical candidates, even when labelled "measured".
-      // Only a declaration on the selected source line witnesses a source-open action.
-      const declarations = data.targets.slice(0, MAX_TARGETS).filter(target =>
-        target?.reason === "declaration" && target.matchKind === "measured" &&
-        body.path && target.symbol?.path === body.path && target.symbol.range?.startLine === body.line &&
-        sourceWitness(target.symbol) &&
-        typeof owner.openSource === "function");
-      const labels = declarations.map(target => `Read declaration source · ${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}`);
-      for (const [index, target] of declarations.entries()) {
-        const r = target.symbol.range;
+      const candidates = data.targets.slice(0, MAX_TARGETS).filter(target => {
+        if (!sourceWitness(target?.symbol) || typeof target.symbol.id !== "string" || !target.symbol.id) return false;
+        if (target.reason === "call") return target.matchKind === "resolved" && target.action === "sequence" && callable(target.symbol);
+        if (target.matchKind !== "measured" || !["declaration", "enclosing"].includes(target.reason)) return false;
+        if (!body.path) return target.reason === "declaration";
+        if (target.symbol.path !== body.path) return false;
+        const range = target.symbol.range;
+        return target.reason === "declaration" ? range.startLine === body.line :
+          range.startLine <= body.line && (range.endLine > body.line ||
+            (range.endLine === body.line && range.endColumn > 1));
+      });
+      const labels = candidates.map(target => {
+        const range = target.range;
+        const callsite = target.reason === "call" && natural(range?.start) && natural(range?.end) && range.end > range.start
+          ? ` · call bytes ${range.start}–${range.end}` : "";
+        return `${text(target.symbol.name)} · ${text(target.symbol.path)}:${target.symbol.range.startLine}${callsite}`;
+      });
+      for (const [index, target] of candidates.entries()) {
+        const symbol = target.symbol, r = symbol.range;
         const suffix = labels.indexOf(labels[index]) !== labels.lastIndexOf(labels[index])
-          ? ` · bytes ${r.startByte ?? "?"}–${r.endByte ?? "?"} · ${text(target.symbol.id)}` : "";
-        actions.push({label: labels[index] + suffix,
-          run: () => { if (current()) { serial++; return owner.openSource(target.symbol, revision); } }});
+          ? target.reason === "call" && typeof target.callId === "string" && target.callId
+            ? ` · call ${text(target.callId)}`
+            : ` · bytes ${r.startByte ?? "?"}–${r.endByte ?? "?"} · ${text(symbol.id)}` : "";
+        const label = labels[index] + suffix;
+        const run = callback => () => { if (current()) { serial++; return callback(symbol, revision); } };
+        if (target.reason === "declaration" && typeof owner.openSource === "function")
+          actions.push({label: `Read declaration source · ${label}`, run: run(owner.openSource)});
+        if (callable(symbol) && typeof owner.selectMethod === "function") {
+          const prefix = target.reason === "enclosing" ? "Sequence · enclosing" : target.reason === "call" ? "Sequence of callee" : "Sequence";
+          actions.push({label: `${prefix} · ${label}`, run: run(owner.selectMethod)});
+        }
+        if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py)$/i.test(symbol.path) && typeof owner.openClass === "function")
+          actions.push({label: `Class diagram · ${label}`, run: run(owner.openClass)});
+        if (["declaration", "enclosing"].includes(target.reason) && typeof owner.inspectSymbol === "function")
+          actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · ${label}`, run: run(owner.inspectSymbol)});
       }
-      if (!actions.length) actions.push(notice("No measured declaration on this line. Candidate type and call targets cannot be opened as navigation."));
+      if (!actions.length) actions.push(notice("No measured declaration or resolved callee on this line. Candidate type and call targets cannot be opened as navigation."));
+      actions.push(notice("Call graph · not available yet"));
       if (data.requireIndex) actions.push(notice("Index the workspace to populate cached class declarations."));
       for (const warning of (Array.isArray(data.warnings) ? data.warnings : []).slice(0, MAX_NOTICES)) actions.push(notice(warning));
       if (data.truncated || data.targets.length > MAX_TARGETS || data.warnings?.length > MAX_NOTICES) actions.push(notice("Partial index or navigation results; see notices."));
@@ -155,7 +178,7 @@
       if (window.TrellisIndexPin.isConflict(error)) owner.onStale?.("Navigation is stale. Refresh the indexed view and try again.");
     }
   }
-  function attachSource(container, {path, revision, startLine = 1, isCurrent} = {}) {
+  function attachSource(container, {path, revision, startLine = 1, isCurrent, metadataSnapshot} = {}) {
     // Only annotations/listeners are added. Source spans, selection, and highlighting
     // remain owned by the source renderer.
     for (const source of [...sources]) if (source.container === container) source.dispose();
@@ -171,15 +194,86 @@
     button.setAttribute("aria-haspopup", "menu");
     const status = el("span", undefined, "source-navigation-status");
     status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
-    toolbar.append(button, status); container.before(toolbar);
+    const more = el("button", "More source actions", "source-navigation-action"); more.type = "button"; more.hidden = true;
+    const coverage = el("span", undefined, "source-navigation-status"); coverage.setAttribute("role", "status");
+    toolbar.append(button, status, more, coverage); container.before(toolbar);
     const attributes = ["tabindex", "aria-label", "aria-haspopup"];
     const previous = attributes.map(name => container.getAttribute(name));
     container.setAttribute("tabindex", "0"); container.setAttribute("aria-haspopup", "menu");
-    const owner = api, session = owner?.currentSession();
-    const usable = () => !disposed && api === owner && window.TrellisIndexPin.equal(owner?.currentRevision(), revision) &&
-      owner.currentSession() === session && (!isCurrent || isCurrent());
+    const owner = api, session = owner?.currentSession?.();
+    const usable = () => !disposed && api === owner && window.TrellisIndexPin.equal(owner?.currentRevision?.(), revision) &&
+      owner?.currentSession?.() === session && (!isCurrent || isCurrent());
+    const annotations = [], seen = new Set();
+    let nextOffset = 0, metadataLoading = false, metadataCount = 0, metadataPartial = false, admitted = null;
+    function clearAnnotations() {
+      for (const node of annotations) node.remove();
+      annotations.length = 0;
+    }
+    function renderSymbols(symbols) {
+      for (const symbol of symbols) {
+        if (seen.has(symbol.id)) continue;
+        seen.add(symbol.id); metadataCount++; admitted.push(symbol);
+        if (!callable(symbol) || typeof owner.selectMethod !== "function") continue;
+        const row = rows[lines.indexOf(symbol.range.startLine)];
+        if (!row) continue;
+        const action = el("button", undefined, "source-diagram-action"); action.type = "button";
+        action.setAttribute("data-symbol-id", symbol.id);
+        action.setAttribute("data-source-action", "sequence");
+        // A CSS label keeps controls out of source text and native copy/selection.
+        action.setAttribute("data-label", "Sequence");
+        action.setAttribute("aria-label", `Sequence for ${text(symbol.name)} · ${text(symbol.id)}`);
+        action.setAttribute("title", `Sequence · ${text(symbol.name)} · ${text(symbol.id)}`);
+        action.addEventListener("click", event => {
+          event.stopPropagation();
+          if (usable()) { activate(lines.indexOf(symbol.range.startLine)); serial++; return owner.selectMethod(symbol, revision); }
+        });
+        row.append(action); annotations.push(action);
+      }
+    }
+    function updateCoverage() {
+      more.hidden = nextOffset === null; more.textContent = "More source actions";
+      coverage.textContent = nextOffset !== null || metadataPartial ?
+        `Source actions cover ${metadataCount} declarations · ${nextOffset !== null ? "more available" : "partial metadata"}. Line navigation remains available.` : "";
+    }
+    async function loadDeclarations() {
+      if (!usable() || metadataLoading || nextOffset === null || typeof owner.request !== "function") return;
+      const offset = nextOffset;
+      const current = usable;
+      metadataLoading = true; more.disabled = true;
+      try {
+        const data = await owner.request(`/api/symbols?path=${encodeURIComponent(path)}&${window.TrellisIndexPin.query(revision)}&offset=${offset}&limit=200`);
+        if (!current()) return;
+        if (!window.TrellisIndexPin.equal(data?.revision, revision)) {
+          clearAnnotations(); admitted = null; nextOffset = null; more.hidden = true;
+          coverage.textContent = "Source actions are stale. Refresh the indexed view.";
+          owner.onStale?.("Source actions are stale. Refresh the indexed view."); return;
+        }
+        if (data.path !== path || !Array.isArray(data.items) || data.items.length > 200 ||
+            data.items.some(item => item?.symbol?.path !== path || !sourceWitness(item.symbol) ||
+              typeof item.symbol.id !== "string" || !item.symbol.id) ||
+            !(data.nextOffset === null || (natural(data.nextOffset) && data.nextOffset > offset)))
+          throw new Error("Invalid source declaration metadata.");
+        admitted ||= [];
+        renderSymbols(data.items.map(item => item.symbol));
+        nextOffset = data.nextOffset;
+        metadataPartial ||= (data.nextOffset === null && !!data.truncated) || !!data.warnings?.length;
+        updateCoverage();
+      } catch (error) {
+        if (!current()) return;
+        coverage.textContent = `Source actions unavailable: ${text(error?.message || "Request failed.")} Line navigation remains available.`;
+        more.hidden = false; more.textContent = "Retry source actions";
+        if (window.TrellisIndexPin.isConflict(error)) {
+          clearAnnotations(); admitted = null; owner.onStale?.("Source actions are stale. Refresh the indexed view.");
+        }
+      } finally {
+        metadataLoading = false;
+        if (current()) more.disabled = false;
+      }
+    }
     function update() {
       const line = lines[active];
+      if (line) container.dataset.navigationLine = String(line);
+      else delete container.dataset.navigationLine;
       button.disabled = !line;
       button.textContent = line ? `Navigate line ${line}` : "Navigate";
       status.textContent = line ? "Line-based targets · ↑ ↓ to select · Shift F10 to navigate" : "No source lines available for navigation.";
@@ -220,18 +314,31 @@
     container.addEventListener("contextmenu", contextmenu);
     container.addEventListener("keydown", keydown);
     button.addEventListener("click", navigate);
-    const binding = {container, reset() { closeOwnedMenu(); generation++; serial++; }, dispose() {
+    more.addEventListener("click", loadDeclarations);
+    const binding = {container, snapshot() {
+      return admitted !== null ? {items:admitted.slice(), nextOffset, metadataPartial, metadataCount} : undefined;
+    }, reset() { closeOwnedMenu(); generation++; serial++; }, dispose() {
       if (disposed) return;
       closeOwnedMenu(); disposed = true; generation++; serial++;
       container.removeEventListener("click", click);
       container.removeEventListener("contextmenu", contextmenu);
       container.removeEventListener("keydown", keydown);
       button.removeEventListener("click", navigate);
+      more.removeEventListener("click", loadDeclarations); clearAnnotations();
+      delete container.dataset.navigationLine;
       rows[active]?.classList.remove("navigation-active-line"); toolbar.remove();
       attributes.forEach((name, index) => previous[index] == null ? container.removeAttribute(name) : container.setAttribute(name, previous[index]));
       sources.delete(binding);
     }};
-    sources.add(binding); update(); return binding;
+    sources.add(binding); update();
+    if (metadataSnapshot && usable()) {
+      admitted = [];
+      renderSymbols(metadataSnapshot.items);
+      nextOffset = metadataSnapshot.nextOffset; metadataPartial = metadataSnapshot.metadataPartial; metadataCount = metadataSnapshot.metadataCount;
+      updateCoverage();
+      binding.ready = Promise.resolve();
+    } else binding.ready = loadDeclarations();
+    return binding;
   }
   window.TrellisNavigation = Object.freeze({init, open, attachSource, reset, dispose: reset});
 })();

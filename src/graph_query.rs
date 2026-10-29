@@ -151,6 +151,10 @@ fn is_syntax_id(id: &str) -> bool {
     })
 }
 
+pub(crate) fn valid_producer_id(id: &str) -> bool {
+    !id.is_empty()
+}
+
 impl GraphRequest {
     /// Rejects out-of-range input as `invalidRequest` naming the field; nothing is clamped.
     pub fn validate(&self) -> std::result::Result<(), GraphError> {
@@ -175,7 +179,11 @@ impl GraphRequest {
         if !is_syntax_id(&self.root_syntax_id) {
             return invalid("rootSyntaxId", "rootSyntaxId must be a syntax ID");
         }
-        if self.semantic_producer_id.as_deref() == Some("") {
+        if self
+            .semantic_producer_id
+            .as_deref()
+            .is_some_and(|id| !valid_producer_id(id))
+        {
             return invalid("semanticProducerId", "semanticProducerId must not be empty");
         }
         Ok(())
@@ -591,6 +599,29 @@ fn boundary_reason(binding: &CallBinding, proof: &sem::Provenance) -> BoundaryRe
     } else {
         BoundaryReason::None
     }
+}
+
+/// The same pre-grouping eligibility used by rooted expansion, for line navigation.
+pub(crate) fn resolved_call_target<'a>(
+    semantic: Option<&'a SemanticDocument>,
+    call: &native::Call,
+) -> Result<Option<(&'a str, &'a DocumentKey)>> {
+    let Some((binding, proof)) = select_binding(semantic, call)? else {
+        return Ok(None);
+    };
+    if boundary_reason(binding, proof) != BoundaryReason::None
+        || binding.resolution != Resolution::Resolved
+    {
+        return Ok(None);
+    }
+    Ok(match &binding.declared_target {
+        Some(Target::Internal {
+            syntax_id,
+            document,
+            ..
+        }) => Some((syntax_id.as_str(), document)),
+        _ => None,
+    })
 }
 
 /// Evaluates one rooted graph request. The outer error covers read failures, aborts and
