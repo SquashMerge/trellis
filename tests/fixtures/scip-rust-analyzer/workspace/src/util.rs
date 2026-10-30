@@ -6,3 +6,9 @@ pub fn saturating(left: u64, right: u64) -> u64 {
 pub fn double(value: u64) -> u64 {
     saturating(value, value)
 }
+
+/// Calls itself: rust-analyzer gives the recursive reference its own definition's range.
+#[allow(unconditional_recursion)]
+pub fn spin(value: u64) -> u64 {
+    spin(value)
+}

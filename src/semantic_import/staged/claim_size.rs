@@ -2,6 +2,7 @@
 use super::*;
 use std::mem::size_of;
 
+#[derive(Debug)]
 pub(super) struct ClaimSize {
     pub retained: u64,
     pub scratch: u64,
@@ -158,7 +159,7 @@ impl Counter<'_> {
         payload = sizes::sum(&[
             payload,
             keys as u64,
-            sizes::map_entries::<String, serde_json::Value>(entries)?,
+            super::heap::btree::<String, serde_json::Value>(entries),
         ])?;
         Ok(payload)
     }
@@ -219,7 +220,7 @@ impl Counter<'_> {
         sizes::sum(&[
             payload,
             keys as u64,
-            sizes::map_entries::<String, serde_json::Value>(entries)?,
+            super::heap::btree::<String, serde_json::Value>(entries),
         ])
     }
 }
@@ -246,9 +247,9 @@ pub(super) fn measure(canonical: &[u8], metadata_bytes: u64) -> Result<ClaimSize
         counter.offset == canonical.len(),
         "corrupt staged claim trailing bytes"
     );
+    // The claim keeps no copy of the canonical bytes; serde decodes the borrowed row.
     let retained = sizes::sum(&[
         size_of::<CapturedClaim>() as u64,
-        canonical.len() as u64,
         kind,
         path,
         raw,
@@ -257,7 +258,7 @@ pub(super) fn measure(canonical: &[u8], metadata_bytes: u64) -> Result<ClaimSize
     // Current reconstruction parses an envelope Value then moves raw out. Its remaining
     // fields and object entries overlap the final claim; raw itself is not copied.
     let scratch = sizes::sum(&[
-        sizes::map_entries::<String, serde_json::Value>(5)?,
+        super::heap::btree::<String, serde_json::Value>(5),
         "formatVersionpositionEncodingrawrecordKindrelativePath".len() as u64,
         format,
         encoding,
@@ -265,10 +266,7 @@ pub(super) fn measure(canonical: &[u8], metadata_bytes: u64) -> Result<ClaimSize
         path,
         size_of::<serde_json::Value>() as u64,
         size_of::<CapturedClaim>() as u64,
-        size_of::<ClaimParts>() as u64,
-        2 * size_of::<String>() as u64,
-        size_of::<Vec<u8>>() as u64,
-        size_of::<String>() as u64,
+        3 * size_of::<String>() as u64,
         sizes::sum(&[counter.max_string, counter.max_string])?.max(8),
         // Pinned serde_json's arbitrary-precision scanner starts with capacity 16.
         sizes::sum(&[counter.max_number, counter.max_number])?.max(16),
@@ -289,7 +287,7 @@ mod tests {
                     + values.iter().map(payload).sum::<u64>()
             }
             serde_json::Value::Object(values) => {
-                sizes::map_entries::<String, serde_json::Value>(values.len()).unwrap()
+                super::super::heap::btree::<String, serde_json::Value>(values.len())
                     + values
                         .iter()
                         .map(|(key, value)| key.len() as u64 + payload(value))
@@ -322,7 +320,6 @@ mod tests {
             assert_eq!(
                 size.retained,
                 size_of::<CapturedClaim>() as u64
-                    + canonical.len() as u64
                     + 10
                     + "src/é.js".len() as u64
                     + payload(&decoded["raw"])
@@ -387,6 +384,61 @@ mod tests {
         }
         drop(allowed.reserve(limit).unwrap());
     }
+    /// Canonical claims of the shapes rust-analyzer produces, as staging stores them.
+    fn rust_analyzer_claims() -> Vec<Vec<u8>> {
+        let symbol = "rust-analyzer cargo trellis 0.1.0 store/impl#[Store]open_for_tests().";
+        let single = serde_json::json!({"encoding":"singleLine","endCharacter":31,"line":4210,"startCharacter":18});
+        let multi = serde_json::json!({"encoding":"multiLine","endCharacter":5,"endLine":4290,"startCharacter":4,"startLine":4206});
+        let raws = [
+            serde_json::json!({"enclosingRange":null,"range":single,"symbol":symbol,"symbolRoles":0,"syntaxKind":0}),
+            serde_json::json!({"enclosingRange":multi,"range":single,"symbol":symbol,"symbolRoles":1,"syntaxKind":0}),
+            serde_json::json!({"displayName":"open_for_tests","enclosingSymbol":"","kind":17,"symbol":symbol}),
+            serde_json::json!({"isDefinition":false,"isImplementation":true,"isReference":false,"isTypeDefinition":false,"sourceSymbol":symbol,"targetSymbol":"rust-analyzer cargo trellis 0.1.0 store/Reader#"}),
+        ];
+        let kinds = [
+            "occurrence",
+            "occurrence",
+            "symbolInformation",
+            "relationship",
+        ];
+        raws.iter()
+            .zip(kinds)
+            .map(|(raw, kind)| {
+                crate::native_ids::canonical(&serde_json::json!({"formatVersion":1,"positionEncoding":1,"raw":raw,"recordKind":kind,"relativePath":"src/store.rs"}))
+            })
+            .collect()
+    }
+
+    /// The retained estimate is the decoded claim's heap storage exactly, plus its root (a
+    /// slot of the document's claim Vec); retained plus scratch covers the decode's peak,
+    /// including the row's metadata Strings the decode copies.
+    #[test]
+    fn retained_estimate_is_the_decoded_claims_storage() {
+        let (digest, proof, artifact) = ("d".repeat(64), "p".repeat(71), "a".repeat(64));
+        let metadata = (digest.len() + proof.len() + artifact.len() + "rust".len()) as u64;
+        for canonical in rust_analyzer_claims() {
+            let size = measure(&canonical, metadata).unwrap();
+            let (claim, retained, peak) = crate::test_alloc::measure_peak(|| {
+                claim_from_stage(
+                    &canonical,
+                    digest.clone(),
+                    proof.clone(),
+                    "rust".to_owned(),
+                    artifact.clone(),
+                )
+                .unwrap()
+            });
+            let root = size_of::<CapturedClaim>() as u64;
+            assert_eq!(
+                size.retained,
+                retained + root,
+                "{}",
+                claim.envelope.record_kind
+            );
+            assert!(peak <= size.retained + size.scratch, "{peak} vs {size:?}");
+        }
+    }
+
     #[test]
     fn malformed_counter_input_returns_errors() {
         for bytes in [b"".as_slice(), b"{}", b"{\"formatVersion\":"] {

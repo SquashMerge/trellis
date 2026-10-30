@@ -35,6 +35,10 @@ fn definitions_sql(filtered: bool) -> String {
     )
 }
 
+/// The callable kind discovery recorded for one exact definition (#470); absent is `Other`.
+const TARGET_CALLABLE_SQL: &str = "SELECT c.callable FROM g_callables c JOIN sources s \
+    ON s.ord=c.owner_doc WHERE c.side=?1 AND s.language=?2 AND s.path=?3 AND c.syntax_id=?4";
+
 fn methods_sql(target: bool, filtered: bool) -> String {
     let key = if target {
         format!("local_doc={LOCAL_DOC}")
@@ -225,6 +229,28 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
             (&a.0.language, &a.0.path, &a.1).cmp(&(&b.0.language, &b.0.path, &b.1))
         });
         Ok(result)
+    }
+    fn target_callable(
+        &self,
+        document: &native::DocumentKey,
+        syntax_id: &str,
+    ) -> Result<TargetCallable> {
+        self.ctx.charge(1)?;
+        let code: Option<i64> = self
+            .ctx
+            .conn
+            .prepare_cached(TARGET_CALLABLE_SQL)?
+            .query_row(
+                params![
+                    self.side,
+                    document.language,
+                    document.path,
+                    codec::sid(syntax_id)
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        code.map_or(Ok(TargetCallable::Other), TargetCallable::from_code)
     }
     fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
         use crate::semantic_batch::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION};
@@ -458,8 +484,27 @@ impl GlobalDiscoverySink for GlobalWriter<'_> {
         document: native::DocumentKey,
         syntax_id: String,
         common_compatible: bool,
+        callable: TargetCallable,
     ) -> Result<()> {
         let (language, path) = local_columns(&key);
+        if callable != TargetCallable::Other {
+            // A function of the owner document's native declaration: repeats agree.
+            self.global.ctx.row("g_callables")?;
+            self.global
+                .ctx
+                .conn
+                .prepare_cached(
+                    "INSERT INTO g_callables VALUES(?1,(SELECT ord FROM sources WHERE language=?2 \
+                 AND path=?3),?4,?5) ON CONFLICT(side,owner_doc,syntax_id) DO NOTHING",
+                )?
+                .execute(params![
+                    self.global.side,
+                    document.language,
+                    document.path,
+                    codec::sid(&syntax_id),
+                    callable as i64
+                ])?;
+        }
         if !self.targets.contains(&syntax_id) {
             self.targets_reservation.grow(sizes::sum(&[
                 sizes::map_entries::<String, ()>(1)?,
@@ -647,6 +692,19 @@ impl<'g, 'a> DocumentIndex<'g, 'a> {
         );
         Ok(())
     }
+
+    /// Sizes the occurrence buffer for `count` rows at once, admitted first, so filling it
+    /// never doubles the buffer (no growth slack, no old and new buffer live together).
+    fn reserve_occurrences(&mut self, count: usize) -> Result<()> {
+        let additional = count.saturating_sub(self.occurrences.capacity());
+        self.retained.grow(
+            (additional as u64)
+                .checked_mul(std::mem::size_of::<OccurrenceRow>() as u64)
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+        )?;
+        self.occurrences.reserve_exact(additional);
+        Ok(())
+    }
 }
 
 impl GlobalJoinReads for DocumentIndex<'_, '_> {
@@ -686,6 +744,13 @@ impl GlobalJoinReads for DocumentIndex<'_, '_> {
             reads.declarations.insert(key.clone(), rows.clone());
         }
         Ok(rows)
+    }
+    fn target_callable(
+        &self,
+        document: &native::DocumentKey,
+        syntax_id: &str,
+    ) -> Result<TargetCallable> {
+        self.global.target_callable(document, syntax_id)
     }
     fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
         if let Some(found) = self.reads.borrow().presence.get(symbol) {
@@ -1228,6 +1293,7 @@ impl GlobalDiscoverySink for DiscardDiscovery {
         _document: native::DocumentKey,
         _syntax_id: String,
         _compatible: bool,
+        _callable: TargetCallable,
     ) -> Result<()> {
         Ok(())
     }
@@ -1348,6 +1414,18 @@ pub(super) fn join_document(
 ) -> Result<(JoinedFacts, Reservation)> {
     let document = store.document.as_ref().context("document view required")?;
     let mut index = DocumentIndex::new(global, document)?;
+    // Each occurrence claim yields at most one occurrence row.
+    let local = store
+        .local_claims
+        .as_ref()
+        .context("document claim owner required")?;
+    index.reserve_occurrences(
+        local
+            .claims
+            .iter()
+            .filter(|claim| claim.envelope.record_kind == "occurrence")
+            .count(),
+    )?;
     for claim in store.claims() {
         let claim = claim?;
         let mut operation = store.operation()?;
@@ -1366,10 +1444,13 @@ pub(super) fn join_document(
     let mut sink = DocumentSink::new(global)?;
     emit_join_symbols(store, &index, &mut sink)?;
     let mut role_sites = None;
-    for ordinal in 0..index.occurrence_count() {
+    // Each row is read once, in order, so it moves out of the index instead of being copied;
+    // its payload is released once the row is dropped. The buffer keeps its charge until the
+    // loop ends.
+    let occurrences = std::mem::take(&mut index.occurrences);
+    for row in occurrences {
         let mut operation = store.operation()?;
-        store.reserve_operation(&mut operation, || index.occurrence_clone_bytes(ordinal))?;
-        let row = index.occurrence(ordinal)?;
+        let payload = sizes::occurrence(&row)? - std::mem::size_of::<OccurrenceRow>() as u64;
         join_occurrence(
             encoding,
             store,
@@ -1379,6 +1460,7 @@ pub(super) fn join_document(
             &mut role_sites,
             &mut operation,
         )?;
+        index.retained.release(payload)?;
     }
     settle_join_references(store, &mut index, &mut sink)?;
     let related = emit_type_relationships(store, &index, &mut sink);

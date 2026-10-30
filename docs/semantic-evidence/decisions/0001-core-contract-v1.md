@@ -37,6 +37,10 @@ Subject to independent review, we ratify `contract-v1.md` as the complete prospe
 
 This is **prospective ratification**, not a statement that production implements the records or algorithms today. Final issue acceptance still requires the later vectors/checker slice and a distinct integrated reviewer.
 
+### Amendment: dispatch from measured call shape and target kind (owner ruling 2026-10-30, #470)
+
+Resolved semantic calls carried `dispatch=unknown` (#453), so the static-expansion rule in item 5 above never admitted them and every resolved callee was a dead-end boundary. By owner ruling, a call binding's dispatch is now classified from the **measured native call shape plus the exact bound target's native declaration kind**, with no inference: a plain call (JavaScript identifier callee; Rust identifier or path callee such as `foo()` or `crate::m::foo()`) whose resolved internal target is a free function is `direct`; a JavaScript `new X()` whose target is a class or its constructor is `constructor`; member and method-call syntax (`obj.m()`, `a?.b()`, `super.m()`, Rust `x.m()`) stays `unknown` because the receiver type is not measured, and Rust trait dispatch remains #14. Ambiguous, external, unresolved and stale-target bindings never get `direct` or `constructor`. Item 5's eligibility rule is otherwise unchanged; the classification itself is specified in `contract-v1.md` § Dispatch.
+
 ## Rejected alternatives
 
 | Alternative | Reason rejected |
