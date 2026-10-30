@@ -30,6 +30,8 @@ pub(crate) type AnchorParts = (
 );
 
 type AnchorKey = (native::DocumentKey, usize, usize, semantic::JoinKind);
+/// An `AnchorKey` whose document is its rank among the artifact's interned documents.
+type RankedAnchor = (usize, usize, usize, semantic::JoinKind);
 type ScopedKey = (String, Option<native::DocumentKey>);
 
 /// Import-local native indexes. Distinct native identities, not raw-claim counts,
@@ -55,7 +57,9 @@ pub struct MeasuredFacts<'a> {
 struct MeasuredAnchors<'a> {
     sources: BTreeMap<native::DocumentKey, &'a str>,
     documents: BTreeMap<native::DocumentKey, &'a native::Document>,
-    candidates: BTreeMap<AnchorKey, BTreeSet<String>>,
+    /// The interned documents, in key order: `candidates` names a document by its rank here.
+    ranks: Vec<native::DocumentKey>,
+    candidates: BTreeMap<RankedAnchor, BTreeSet<String>>,
     declarations: BTreeMap<String, Vec<&'a native::Declaration>>,
     calls: BTreeMap<String, Vec<&'a native::Call>>,
     references: BTreeMap<String, Vec<&'a native::Reference>>,
@@ -70,12 +74,17 @@ impl<'a> MeasuredFacts<'a> {
         let MeasuredAnchors {
             sources,
             documents,
+            ranks,
             candidates,
             declarations,
             calls,
             references,
             support,
         } = Self::anchors(native, sources)?;
+        let candidates = candidates
+            .into_iter()
+            .map(|((rank, start, end, kind), ids)| ((ranks[rank].clone(), start, end, kind), ids))
+            .collect();
         let mut declaration_names: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut declaration_keys: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut by_document: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
@@ -118,7 +127,13 @@ impl<'a> MeasuredFacts<'a> {
         document: &native::DocumentKey,
     ) -> Result<AnchorParts> {
         let anchors = Self::anchors(native, sources)?;
-        Ok(Self::parts(anchors.candidates, anchors.support, document))
+        let rank = anchors.ranks.binary_search(document).ok();
+        Ok(Self::parts(
+            anchors.candidates,
+            anchors.support,
+            rank,
+            document,
+        ))
     }
 
     fn anchors(
@@ -149,13 +164,40 @@ impl<'a> MeasuredFacts<'a> {
             source_text.entry(doc.key.clone()).or_insert(text);
             documents.entry(doc.key.clone()).or_insert(doc);
         }
+        // Every document a record or the revision names, interned to its rank in key order:
+        // ordering anchors by rank is ordering them by document key, without a key copy or
+        // comparison per record.
+        let mut keys: Vec<&native::DocumentKey> =
+            native.revision.documents.iter().map(|d| &d.key).collect();
+        let named = native
+            .declarations
+            .iter()
+            .map(|d| &d.document)
+            .chain(native.calls.iter().map(|c| &c.document))
+            .chain(native.references.iter().map(|r| &r.document));
+        for document in named {
+            if keys.last() != Some(&document) {
+                keys.push(document);
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let mut last = 0;
+        let mut rank = |document: &native::DocumentKey| -> usize {
+            if keys.get(last) != Some(&document) {
+                last = keys
+                    .binary_search(&document)
+                    .expect("every record document is interned");
+            }
+            last
+        };
         let mut declarations: BTreeMap<String, Vec<&native::Declaration>> = BTreeMap::new();
         let mut calls: BTreeMap<String, Vec<&native::Call>> = BTreeMap::new();
         let mut references: BTreeMap<String, Vec<&native::Reference>> = BTreeMap::new();
-        let mut anchors: BTreeMap<AnchorKey, BTreeSet<String>> = BTreeMap::new();
-        let mut insert = |doc: &native::DocumentKey, range: &native::Range, kind, id: &str| {
+        let mut anchors: BTreeMap<RankedAnchor, BTreeSet<String>> = BTreeMap::new();
+        let mut insert = |doc: usize, range: &native::Range, kind, id: &str| {
             anchors
-                .entry((doc.clone(), range.start, range.end, kind))
+                .entry((doc, range.start, range.end, kind))
                 .or_default()
                 .insert(id.to_owned());
         };
@@ -163,7 +205,7 @@ impl<'a> MeasuredFacts<'a> {
             declarations.entry(d.syntax_id.clone()).or_default().push(d);
             if let Some(range) = &d.name_range {
                 insert(
-                    &d.document,
+                    rank(&d.document),
                     range,
                     semantic::JoinKind::DeclarationName,
                     &d.syntax_id,
@@ -172,70 +214,73 @@ impl<'a> MeasuredFacts<'a> {
         }
         for c in &native.calls {
             calls.entry(c.id.clone()).or_default().push(c);
+            let doc = rank(&c.document);
             if let Some(range) = &c.callee_range {
-                insert(&c.document, range, semantic::JoinKind::Callee, &c.id);
+                insert(doc, range, semantic::JoinKind::Callee, &c.id);
             }
-            insert(&c.document, &c.range, semantic::JoinKind::Invocation, &c.id);
+            insert(doc, &c.range, semantic::JoinKind::Invocation, &c.id);
         }
         for r in &native.references {
             references.entry(r.id.clone()).or_default().push(r);
-            insert(&r.document, &r.range, semantic::JoinKind::Reference, &r.id);
+            insert(
+                rank(&r.document),
+                &r.range,
+                semantic::JoinKind::Reference,
+                &r.id,
+            );
         }
+        let texts: Vec<Option<&str>> = keys
+            .iter()
+            .map(|key| source_text.get(*key).copied())
+            .collect();
         let mut raw_ranges: BTreeMap<_, Vec<(usize, usize)>> = BTreeMap::new();
-        let mut candidates = BTreeMap::new();
-        for ((document, start, end, kind), ids) in &anchors {
+        // Each anchor keeps, in place, the candidates compatible with its spelling.
+        for ((rank, start, end, kind), ids) in anchors.iter_mut() {
+            let document = keys[*rank];
             raw_ranges
-                .entry((document.clone(), *kind))
+                .entry((*rank, *kind))
                 .or_default()
                 .push((*start, *end));
             #[cfg(test)]
             complexity_work(|work| work.native_gap_index_records += 1);
-            let spelling = source_text
-                .get(document)
-                .and_then(|source| source.get(*start..*end));
+            let spelling = texts[*rank].and_then(|source| source.get(*start..*end));
             let lookup = if *kind == semantic::JoinKind::Reference {
                 spelling.and_then(|s| native::lookup(&document.language, s).ok())
             } else {
                 None
             };
-            let compatible = ids
-                .iter()
-                .filter(|id| {
-                    #[cfg(test)]
-                    complexity_work(|work| work.native_candidates += 1);
-                    match kind {
-                        semantic::JoinKind::DeclarationName => {
-                            declarations.get(*id).is_some_and(|rows| {
-                                rows.iter().any(|d| {
-                                    &d.document == document && d.name.as_deref() == spelling
-                                })
-                            })
-                        }
-                        semantic::JoinKind::Callee => calls.get(*id).is_some_and(|rows| {
-                            rows.iter().any(|c| {
-                                &c.document == document && c.spelling.as_deref() == spelling
-                            })
-                        }),
-                        semantic::JoinKind::Invocation => calls.get(*id).is_some_and(|rows| {
-                            rows.iter().any(|c| {
-                                &c.document == document
-                                    && c.range.start == *start
-                                    && c.range.end == *end
-                            })
-                        }),
-                        semantic::JoinKind::Reference => references.get(*id).is_some_and(|rows| {
-                            rows.iter().any(|r| {
-                                &r.document == document
-                                    && spelling == Some(r.spelling.as_str())
-                                    && lookup.as_deref() == Some(r.lookup_key.as_str())
-                            })
-                        }),
+            ids.retain(|id| {
+                #[cfg(test)]
+                complexity_work(|work| work.native_candidates += 1);
+                match kind {
+                    semantic::JoinKind::DeclarationName => {
+                        declarations.get(id).is_some_and(|rows| {
+                            rows.iter()
+                                .any(|d| &d.document == document && d.name.as_deref() == spelling)
+                        })
                     }
-                })
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            candidates.insert((document.clone(), *start, *end, *kind), compatible);
+                    semantic::JoinKind::Callee => calls.get(id).is_some_and(|rows| {
+                        rows.iter()
+                            .any(|c| &c.document == document && c.spelling.as_deref() == spelling)
+                    }),
+                    semantic::JoinKind::Invocation => calls.get(id).is_some_and(|rows| {
+                        rows.iter().any(|c| {
+                            &c.document == document
+                                && c.range.start == *start
+                                && c.range.end == *end
+                        })
+                    }),
+                    semantic::JoinKind::Reference => references.get(id).is_some_and(|rows| {
+                        rows.iter().any(|r| {
+                            &r.document == document
+                                && spelling == Some(r.spelling.as_str())
+                                && lookup.as_deref() == Some(r.lookup_key.as_str())
+                        })
+                    }),
+                }
+            });
         }
+        let candidates = anchors;
         for ranges in raw_ranges.values_mut() {
             ranges.sort_unstable();
             let mut min_end = usize::MAX;
@@ -277,30 +322,33 @@ impl<'a> MeasuredFacts<'a> {
                 );
                 #[cfg(test)]
                 complexity_work(|work| work.native_gap_queries += 1);
-                let contradicts =
-                    raw_ranges
-                        .get(&(document.clone(), *kind))
-                        .is_some_and(|ranges| {
-                            let first = ranges.partition_point(|(start, _)| {
-                                #[cfg(test)]
-                                complexity_work(|work| work.native_gap_query_records += 1);
-                                *start < gap.range.start
-                            });
-                            ranges.get(first).is_some_and(|(_, min_end)| {
-                                #[cfg(test)]
-                                complexity_work(|work| work.native_gap_query_records += 1);
-                                *min_end <= gap.range.end
-                            })
+                let contradicts = keys
+                    .binary_search(&document)
+                    .ok()
+                    .and_then(|rank| raw_ranges.get(&(rank, *kind)))
+                    .is_some_and(|ranges| {
+                        let first = ranges.partition_point(|(start, _)| {
+                            #[cfg(test)]
+                            complexity_work(|work| work.native_gap_query_records += 1);
+                            *start < gap.range.start
                         });
+                        ranges.get(first).is_some_and(|(_, min_end)| {
+                            #[cfg(test)]
+                            complexity_work(|work| work.native_gap_query_records += 1);
+                            *min_end <= gap.range.end
+                        })
+                    });
                 ensure!(
                     !contradicts,
                     "native capability gap contradicts measured candidates"
                 );
             }
         }
+        let documents_by_rank = keys.into_iter().cloned().collect();
         Ok(MeasuredAnchors {
             sources: source_text,
             documents,
+            ranks: documents_by_rank,
             candidates,
             declarations,
             calls,
@@ -365,16 +413,17 @@ impl<'a> MeasuredFacts<'a> {
     /// The anchor candidates and capability families of one document. A document group keeps
     /// these and serves joins from them.
     fn parts(
-        candidates: BTreeMap<AnchorKey, BTreeSet<String>>,
+        candidates: BTreeMap<RankedAnchor, BTreeSet<String>>,
         support: BTreeMap<
             (native::DocumentKey, semantic::JoinKind),
             &'a native::MeasurementSupport,
         >,
+        rank: Option<usize>,
         document: &native::DocumentKey,
     ) -> AnchorParts {
         let candidates = candidates
             .into_iter()
-            .filter(|((owner, ..), _)| owner == document)
+            .filter(|((owner, ..), _)| Some(*owner) == rank)
             .map(|((_, start, end, kind), ids)| ((start, end, kind), ids))
             .collect();
         let support = support
@@ -1397,14 +1446,21 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     out.join(&claim.captured_proof_id, &reference)?;
     let invocation = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
         let span = store.enclosing_occurrence_range(&claim, admitted_encoding)?;
-        Some(store.join_reserved(&doc, span, semantic::JoinKind::Invocation, operation)?)
+        let own = store.occurrence_range(&claim, admitted_encoding)?;
+        // A SCIP enclosing range encloses its own occurrence. rust-analyzer instead gives a
+        // same-document reference its target's definition range (#394), which encloses some
+        // other span and says nothing about a call; that is no invocation witness.
+        (span.start <= own.start && own.end <= span.end)
+            .then(|| store.join_reserved(&doc, span, semantic::JoinKind::Invocation, operation))
+            .transpose()?
     } else {
         None
     };
     // The measured call this use occurrence names (#444). SCIP has no call role, and
     // scip-typescript, scip-java and scip-python never give a reference an enclosing range,
     // so the occurrence's exact span on one measured callee identifies the call by itself.
-    // A producer-supplied enclosing range must still join exactly to that same call.
+    // A producer-supplied enclosing range that encloses the occurrence must still join
+    // exactly to that same call.
     let witness = match &invocation {
         Some(j) => (j.status == semantic::JoinStatus::Exact
             && (call.status != semantic::JoinStatus::Exact
@@ -1882,15 +1938,17 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             note_parsed_type_document(doc);
         }
         let mut relationship_operation = store.operation()?;
+        let parsed = store.take_parsed_tree(doc);
         let mut reserve_bases =
             |bytes: LazyBytes<'_>| store.reserve_operation(&mut relationship_operation, bytes);
         let bases = match doc.language.as_str() {
-            "java" => direct_java_types(bytes, &mut reserve_bases)?,
+            "java" => direct_java_types(bytes, parsed, &mut reserve_bases)?,
             "javascript" => direct_script_types(
                 bytes,
                 tree_sitter_javascript::LANGUAGE.into(),
                 "class_declaration",
                 "class_heritage",
+                parsed,
                 &mut reserve_bases,
             )?,
             "python" => direct_script_types(
@@ -1898,6 +1956,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 tree_sitter_python::LANGUAGE.into(),
                 "class_definition",
                 "argument_list",
+                parsed,
                 &mut reserve_bases,
             )?,
             _ => continue,
@@ -2239,13 +2298,19 @@ fn collect_direct_bases(
 
 fn direct_java_types(
     source: &[u8],
+    parsed: Option<tree_sitter::Tree>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
-    #[cfg(test)]
-    complexity_work(|work| work.java_type_parses += 1);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
-    let tree = parser.parse(source, None).context("Java parser failed")?;
+    let tree = match parsed {
+        Some(tree) => tree,
+        None => {
+            #[cfg(test)]
+            complexity_work(|work| work.java_type_parses += 1);
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
+            parser.parse(source, None).context("Java parser failed")?
+        }
+    };
     collect_direct_bases(reserve, |emit| java_base_rows(tree.root_node(), emit))
 }
 
@@ -2412,13 +2477,24 @@ fn source_role_sites_reserved(
     source: &[u8],
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<RoleSites> {
+    Ok(source_role_sites_parsed(language, source, reserve)?.0)
+}
+
+/// The role sites of `source`, and the syntax tree they were read from (`None` for a language
+/// without role sites). Each supported language's tree is the one its direct type bases are
+/// read from too.
+fn source_role_sites_parsed(
+    language: &str,
+    source: &[u8],
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
+) -> Result<(RoleSites, Option<tree_sitter::Tree>)> {
     reserve(&mut || Ok(std::mem::size_of::<RoleSites>() as u64))?;
     let grammar: tree_sitter::Language = match language {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
-        _ => return Ok(RoleSites::default()),
+        _ => return Ok((RoleSites::default(), None)),
     };
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&grammar)?;
@@ -2552,7 +2628,7 @@ fn source_role_sites_reserved(
         }
         Ok(true)
     })?;
-    Ok(sites)
+    Ok((sites, Some(tree)))
 }
 
 fn js_direct_class_span(
@@ -2600,13 +2676,19 @@ fn direct_script_types(
     language: tree_sitter::Language,
     owner_kind: &str,
     clause_kind: &str,
+    parsed: Option<tree_sitter::Tree>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language)?;
-    let tree = parser
-        .parse(source, None)
-        .context("semantic source parser failed")?;
+    let tree = match parsed {
+        Some(tree) => tree,
+        None => {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language)?;
+            parser
+                .parse(source, None)
+                .context("semantic source parser failed")?
+        }
+    };
     collect_direct_bases(reserve, |emit| {
         walk_named_reverse(tree.root_node(), &mut |node| {
             if node.kind() == owner_kind
@@ -3310,6 +3392,9 @@ pub struct DestinationMutations {
     pub duplicate_b_target: bool,
     pub duplicate_a_reference: bool,
     pub missing_a_reference: bool,
+    /// B's `target` declaration gets another syntax ID: a destination target that is not a
+    /// captured one.
+    pub renamed_b_target: bool,
 }
 
 impl DestinationMutations {
@@ -3327,6 +3412,7 @@ impl DestinationMutations {
                 .is_some(),
             missing_a_reference: std::env::var_os("TRELLIS_TEST_SEMANTIC_MISSING_A_REFERENCE")
                 .is_some(),
+            renamed_b_target: std::env::var_os("TRELLIS_TEST_SEMANTIC_RENAMED_B_TARGET").is_some(),
         }
     }
 
@@ -3354,6 +3440,17 @@ impl DestinationMutations {
             let mut competing = reference;
             competing.id = format!("{}-candidate-only", competing.id);
             references.push(competing);
+        }
+        if self.renamed_b_target
+            && let Some(declaration) = declarations
+                .iter_mut()
+                .find(|d| d.document.path == "src/B.js" && d.name.as_deref() == Some("target"))
+        {
+            // Another canonical syntax ID: flip the last hex digit.
+            let last = declaration.syntax_id.pop().unwrap_or('0');
+            declaration
+                .syntax_id
+                .push(if last == '0' { '1' } else { '0' });
         }
         if self.missing_a_reference {
             references.retain(|r| !(r.document.path == "src/A.js" && r.spelling == "target"));
@@ -3966,8 +4063,12 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         let requested = requested.contains(&doc.key);
         let failed = failed.contains(&doc.key);
         let excluded = exclusions.get(&(doc.key.language.as_str(), doc.key.path.as_str()));
+        let capped = inventory
+            .capped_documents
+            .contains(&(doc.key.language.clone(), doc.key.path.clone()));
         let partial = excluded == Some(&"unsupported")
             || unsupported_documents.contains(&doc.key)
+            || capped
             || omitted.contains(&Some(doc.key.clone()))
             || captured.diagnostics.contains_key(&doc.key);
         let state = if !requested {
@@ -4037,6 +4138,8 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                 Some("excluded_by_producer".into())
             } else if unsupported_documents.contains(&doc.key) {
                 Some("unsupported_native_gap".into())
+            } else if capped {
+                Some(crate::scip_raw::OCCURRENCE_CAP_EXCEEDED.into())
             } else if partial {
                 Some("unmeasurable_internal_target".into())
             } else {

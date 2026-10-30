@@ -1090,7 +1090,9 @@ fn each_batch_limit_fails_limit_exceeded_before_expansion() {
     // (limits override, cause, how the batch is made)
     type Case = (&'static str, &'static str, Fault);
     let ordinary: Fault = |world| world.write_unwatched(&paged_fixture(world));
-    let cases: [Case; 23] = [
+    // `document_occurrences` is not here: over it a document is admitted partially (#394),
+    // which `real_rust_analyzer_capped_document_stays_partial_through_import_and_rejoin` covers.
+    let cases: [Case; 22] = [
         (r#"{"source_documents":4}"#, "source documents", ordinary),
         (r#"{"descriptor_bytes":64}"#, "descriptor bytes", ordinary),
         (r#"{"page_bytes":50}"#, "page bytes", ordinary),
@@ -1107,11 +1109,6 @@ fn each_batch_limit_fails_limit_exceeded_before_expansion() {
         (r#"{"candidates":1}"#, "candidate facts", ordinary),
         (r#"{"wire_fields":3}"#, "wire fields", ordinary),
         (r#"{"unit_expansion_bytes":8}"#, "unit expansion", ordinary),
-        (
-            r#"{"document_occurrences":0}"#,
-            "document entries",
-            ordinary,
-        ),
         (r#"{"document_symbols":0}"#, "document entries", ordinary),
         (r#"{"message_depth":0}"#, "message depth", ordinary),
         (r#"{"staged_rows":1}"#, "staged rows", ordinary),
@@ -1747,4 +1744,99 @@ fn commit_contention_after_in_loop_watcher_publication_requeues_and_completes() 
         !log.contains("leave running for verified recovery"),
         "the busy COMMIT was requeued by the running daemon, not left to a new incarnation: {log}"
     );
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&target).unwrap();
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// `(state, diagnostic)` of `path`'s coverage row at the head.
+fn head_coverage(world: &World, path: &str) -> (String, Option<String>) {
+    let head = world.head();
+    world
+        .store
+        .with_index_sql_for_tests(|db| {
+            Ok(db.query_row(
+                "SELECT state, diagnostic FROM semantic_coverage WHERE revision_id=?1 AND path=?2",
+                [
+                    format!("pin:v1:{}:{}", head.index_generation, head.index_revision),
+                    path.to_owned(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .unwrap()
+}
+
+/// Owner ruling 2026-10-28 (#394, option c) through the CLI, queue and daemon, on real
+/// rust-analyzer 1.98.1 bytes (`tests/fixtures/scip-rust-analyzer`) with the per-document cap
+/// shrunk below src/lib.rs's 36 occurrences. The import succeeds with src/lib.rs partial and its
+/// typed reason, and a native republish rejoins the stored original under the same limits with
+/// the reason kept, whichever rejoin path it takes.
+#[test]
+fn real_rust_analyzer_capped_document_stays_partial_through_import_and_rejoin() {
+    capped_document_through_import_and_rejoin(false);
+}
+
+/// The same, with the rejoin forced onto the FULL path, which re-decodes the stored original.
+#[test]
+fn real_rust_analyzer_capped_document_stays_partial_through_full_rejoin() {
+    capped_document_through_import_and_rejoin(true);
+}
+
+fn capped_document_through_import_and_rejoin(force_full: bool) {
+    use protobuf::Message;
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scip-rust-analyzer");
+    let mut env = vec![(
+        "TRELLIS_TEST_SEMANTIC_LIMITS",
+        Path::new(r#"{"document_occurrences":20}"#),
+    )];
+    if force_full {
+        env.push(("TRELLIS_TEST_FORCE_FULL_REJOIN", Path::new("1")));
+    }
+    let world = World::new(|root| copy_dir(&fixtures.join("workspace"), root), &env);
+    let mut index = scip::types::Index::new();
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "rust-analyzer".into();
+    tool.version = "1.98.1 (48a229ce 2026-09-01)".into();
+    metadata.tool_info = Some(tool).into();
+    index.metadata = Some(metadata).into();
+    let mut artifact = index.write_to_bytes().unwrap();
+    artifact.extend(fs::read(fixtures.join("documents.scip")).unwrap());
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 2);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(ordinal, artifact);
+    let (descriptor, sha) = world.write(&fixture);
+    let imported = succeeded(&world.import(&descriptor, &sha));
+    assert_eq!(imported["report"]["languages"][0]["partial"], json!(1));
+    let capped = (
+        "partial".to_owned(),
+        Some("occurrence_cap_exceeded".to_owned()),
+    );
+    assert_eq!(head_coverage(&world, "src/lib.rs"), capped);
+    let util = head_coverage(&world, "src/util.rs");
+    assert_ne!(util.1.as_deref(), Some("occurrence_cap_exceeded"));
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=1"),
+        1
+    );
+    let before = world.head();
+    fs::write(world.root.join("Unrelated.java"), "class Unrelated {}\n").unwrap();
+    world.settle(before);
+    assert_eq!(head_coverage(&world, "src/lib.rs"), capped);
+    assert_eq!(head_coverage(&world, "src/util.rs"), util);
 }

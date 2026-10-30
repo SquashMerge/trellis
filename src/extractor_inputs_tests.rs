@@ -66,6 +66,14 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
         "post-native semantic normalization scratch accounting",
     ),
     (
+        "src/semantic_import/join_store.rs",
+        "post-native semantic join: hands one role-site syntax tree to type relationships",
+    ),
+    (
+        "src/semantic_import/staged.rs",
+        "post-native semantic join: keeps one role-site syntax tree for type relationships",
+    ),
+    (
         "src/semantic_import_complexity_tests.rs",
         "post-native semantic parser reservation tests",
     ),

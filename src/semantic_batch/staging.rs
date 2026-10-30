@@ -12,6 +12,8 @@ use std::{
 pub const STAGE_PREFIX: &str = "semantic-stage-";
 const STAGE_DB: &str = "stage.db";
 
+/// `documents.capped` is 1 for a document admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
+///
 /// `claims.symbol`/`presence` index each admitted claim's symbol presence: a symbol-information
 /// claim's symbol (`PRESENCE_INFORMATION`) and a definition occurrence's (`PRESENCE_DECLARED`),
 /// `NULL`/0 otherwise. A side's presence context is this index over its claim set.
@@ -20,6 +22,7 @@ const STAGE_DB: &str = "stage.db";
 /// symbol scopes (`-1` for none), `nat_docs.ord` for native declarations, and the document's
 /// `out_coverage.ord` (`doc`) for every output row. Native syntax IDs and 64-hex provenance IDs
 /// are stored as their bytes when canonical, as text otherwise (`staged::codec`).
+/// `nat_docs.reserve` is a document's native load reservation, filled on its first load.
 ///
 /// The join emits `out_*` one document at a time, so every table's `ord` is document-major and
 /// the publisher reads each family with one cursor in `ord` order. Within one document each
@@ -33,16 +36,17 @@ CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT 
 CREATE TABLE coverage(source_ord INTEGER PRIMARY KEY REFERENCES sources(ord), artifact INTEGER, exclusion TEXT, CHECK((artifact IS NULL)<>(exclusion IS NULL)));
 CREATE INDEX coverage_artifact ON coverage(artifact, source_ord);
 CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, language TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, UNIQUE(artifact,path));
+CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, capped INTEGER NOT NULL CHECK(capped IN (0,1)), UNIQUE(artifact,path));
 CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
 CREATE INDEX claims_symbol ON claims(symbol, presence) WHERE symbol IS NOT NULL;
 CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL, attempt INTEGER NOT NULL);
-CREATE TABLE nat_done(rev INTEGER PRIMARY KEY, declarations INTEGER NOT NULL);
-CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
+CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
+CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, reserve INTEGER, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
 CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id BLOB NOT NULL, n INTEGER NOT NULL, named INTEGER NOT NULL, name_ok INTEGER NOT NULL, PRIMARY KEY(rev, doc_ord, syntax_id, n)) WITHOUT ROWID;
 CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID;
+CREATE INDEX g_definitions_owner ON g_definitions(side,owner_doc,syntax_id);
 CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL);
 CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_doc);
 CREATE INDEX g_methods_target ON g_methods(side,symbol,local_doc);
@@ -56,8 +60,10 @@ CREATE TABLE out_call_bindings(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, pr
 CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
 ";
 
-/// Tables a join fills that depend on the destination revision. A new destination clears them all.
+/// Tables one join attempt fills from its claims and destination. Every attempt clears them all;
+/// only `nat_docs` (and `nat_done`) outlive an attempt, as its retained native seed.
 pub const JOIN_TABLES: &[&str] = &[
+    "nat_declarations",
     "g_definitions",
     "g_methods",
     "w_docs",
@@ -454,10 +460,16 @@ impl ClaimSink for StageClaimSink<'_> {
             return Ok(());
         };
         let inserted = self.conn.prepare_cached(
-            "INSERT INTO documents(source_ord, artifact, path, wire_digest) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO documents(source_ord, artifact, path, wire_digest, capped) VALUES(?1,?2,?3,?4,?5)",
         );
         let inserted = inserted.and_then(|mut statement| {
-            statement.execute(params![ord, self.artifact, doc.path, doc.wire_digest])
+            statement.execute(params![
+                ord,
+                self.artifact,
+                doc.path,
+                doc.wire_digest,
+                doc.occurrence_cap_exceeded
+            ])
         });
         match inserted {
             Err(rusqlite::Error::SqliteFailure(error, _))

@@ -256,28 +256,110 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
 
 /// Writes one side's exact definitions and methods. Presence needs no write: the admitted
 /// claims' presence index already holds it (`claim_presence`). `targets` collects the current
-/// document's exact-definition syntax IDs, the only declarations of the captured revision
-/// whose name status settlement ever asks for.
+/// document's exact-definition syntax IDs: every internal target settlement can name is one of
+/// them, so their name status is the only declaration status it ever asks for.
 struct GlobalWriter<'a> {
     global: CompletedGlobal<'a>,
     targets: BTreeSet<String>,
     targets_reservation: Reservation,
 }
 
+/// Which declaration name status (`nat_declarations`) a discovery pass writes from the document
+/// groups it loads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TargetStatus {
+    /// None: an unshared pin's captured side. Its exact definitions are named captured
+    /// declarations by construction (`StagedJoin::retarget`); the captured status of the
+    /// destination's own targets is written by `remaining_target_status`.
+    None,
+    /// The side's own exact-definition targets, in its own revision (a shared pin's captured
+    /// side, which is also the destination).
+    Own,
+    /// The side's own targets and the captured side's targets of the same document, in the
+    /// destination revision (an unshared pin's eligible destination side).
+    OwnAndCaptured,
+}
+
+/// The captured exact-definition syntax IDs owned by one source document.
+const CAPTURED_TARGETS_SQL: &str = "SELECT DISTINCT syntax_id FROM g_definitions \
+    WHERE side=0 AND owner_doc=(SELECT ord FROM sources WHERE language=?1 AND path=?2)";
+
+/// Adds each captured exact-definition syntax ID of `document` to `targets`, admitting every
+/// new entry before it is inserted. One charged lookup, and one per row.
+fn add_captured_targets(
+    ctx: &JoinCtx<'_>,
+    document: &native::DocumentKey,
+    targets: &mut BTreeSet<String>,
+    reservation: &mut Reservation,
+) -> Result<()> {
+    ctx.charge(1)?;
+    let mut statement = ctx.conn.prepare_cached(CAPTURED_TARGETS_SQL)?;
+    let mut rows = statement.query(params![document.language, document.path])?;
+    while let Some(row) = rows.next()? {
+        ctx.charge(1)?;
+        let value = row.get_ref(0)?;
+        reservation.grow(sizes::sum(&[
+            sizes::map_entries::<String, ()>(1)?,
+            codec::sid_len(value)?,
+        ])?)?;
+        targets.insert(codec::sid_text(value)?);
+    }
+    Ok(())
+}
+
+/// Writes the name status (`nat_declarations` in `group`'s revision `rev`, document `ord`) of
+/// every declaration of `group` whose syntax ID is in `targets`.
+fn write_target_status(
+    ctx: &JoinCtx<'_>,
+    rev: u8,
+    ord: i64,
+    group: &DocGroup,
+    targets: &BTreeSet<String>,
+) -> Result<()> {
+    for (n, declaration) in group.native.declarations.iter().enumerate() {
+        if !targets.contains(&declaration.syntax_id) {
+            continue;
+        }
+        ctx.row("nat_declarations")?;
+        let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
+            group.text.get(range.start..range.end) == declaration.name.as_deref()
+        });
+        ctx.conn
+            .prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6)")?
+            .execute(params![
+                rev,
+                ord,
+                codec::sid(&declaration.syntax_id),
+                i64::try_from(n)?,
+                declaration.name_range.is_some(),
+                name_ok
+            ])?;
+    }
+    Ok(())
+}
+
 impl GlobalWriter<'_> {
-    /// Writes the captured name status (`nat_declarations` rev 0) of the current document's
-    /// exact-definition targets, from its loaded native group, and ends the document.
-    fn captured_declarations(
+    /// Writes the name status of the current document's targets (see `TargetStatus`) from its
+    /// loaded native group, and ends the document.
+    fn target_declarations(
         &mut self,
         store: &StagedSide<'_>,
         document: &native::DocumentKey,
+        status: TargetStatus,
     ) -> Result<()> {
-        let targets = std::mem::take(&mut self.targets);
+        let mut targets = std::mem::take(&mut self.targets);
         // The moved set keeps its charge until this function drops it.
-        let _targets_charge = std::mem::replace(
+        let mut targets_charge = std::mem::replace(
             &mut self.targets_reservation,
             self.global.ctx.live.reserve(0)?,
         );
+        match status {
+            TargetStatus::None => return Ok(()),
+            TargetStatus::Own => {}
+            TargetStatus::OwnAndCaptured => {
+                add_captured_targets(self.global.ctx, document, &mut targets, &mut targets_charge)?
+            }
+        }
         if targets.is_empty() {
             return Ok(());
         }
@@ -287,29 +369,81 @@ impl GlobalWriter<'_> {
         let (ord, _) = store
             .doc_row(document)?
             .context("missing native document")?;
-        for (n, declaration) in group.native.declarations.iter().enumerate() {
-            if !targets.contains(&declaration.syntax_id) {
-                continue;
-            }
-            self.global.ctx.row("nat_declarations")?;
-            let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
-                group.text.get(range.start..range.end) == declaration.name.as_deref()
-            });
-            self.global
-                .ctx
-                .conn
-                .prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6)")?
-                .execute(params![
-                    store.rev,
-                    ord,
-                    codec::sid(&declaration.syntax_id),
-                    i64::try_from(n)?,
-                    declaration.name_range.is_some(),
-                    name_ok
-                ])?;
-        }
-        Ok(())
+        write_target_status(self.global.ctx, store.rev, ord, group, &targets)
     }
+}
+
+/// The destination status of captured targets whose document the eligible destination
+/// discovery did not visit (an ineligible or failed document), and the captured status of
+/// destination targets that are not captured targets of the same document. Unshared pins only:
+/// with the two discovery passes it completes the status of every key `g_definitions` holds.
+pub(super) fn remaining_target_status(
+    captured: &StagedSide<'_>,
+    destination: &StagedSide<'_>,
+) -> Result<()> {
+    let ctx = captured.ctx;
+    // (status side, revision view, the documents and syntax IDs it lacks)
+    let passes: [(&StagedSide<'_>, &str); 2] = [
+        (
+            destination,
+            "SELECT s.language, s.path, g.syntax_id FROM g_definitions g JOIN sources s \
+             ON s.ord=g.owner_doc WHERE g.side=0 AND NOT EXISTS (SELECT 1 FROM w_docs w \
+             WHERE w.source_ord=g.owner_doc AND w.eligible=1 AND w.failed=0) \
+             ORDER BY g.owner_doc, g.syntax_id",
+        ),
+        (
+            captured,
+            "SELECT s.language, s.path, g.syntax_id FROM g_definitions g JOIN sources s \
+             ON s.ord=g.owner_doc WHERE g.side=1 AND NOT EXISTS (SELECT 1 FROM g_definitions c \
+             WHERE c.side=0 AND c.owner_doc=g.owner_doc AND c.syntax_id=g.syntax_id) \
+             ORDER BY g.owner_doc, g.syntax_id",
+        ),
+    ];
+    for (side, sql) in passes {
+        ctx.charge(1)?;
+        let mut statement = ctx.conn.prepare_cached(sql)?;
+        let mut rows = statement.query([])?;
+        let mut current: Option<(native::DocumentKey, BTreeSet<String>, Reservation)> = None;
+        let flush = |entry: Option<(native::DocumentKey, BTreeSet<String>, Reservation)>| {
+            let Some((document, targets, _charge)) = entry else {
+                return anyhow::Ok(());
+            };
+            let Some((ord, _)) = side.doc_row(&document)? else {
+                return Ok(());
+            };
+            let group = side.group(&document)?.context("missing native document")?;
+            write_target_status(ctx, side.rev, ord, &group, &targets)
+        };
+        while let Some(row) = rows.next()? {
+            ctx.check_cancel()?;
+            ctx.charge(1)?;
+            let (language, path) = (row.get_ref(0)?.as_str()?, row.get_ref(1)?.as_str()?);
+            let value = row.get_ref(2)?;
+            if current.as_ref().is_none_or(|(document, _, _)| {
+                document.language != language || document.path != path
+            }) {
+                flush(current.take())?;
+                let document = native::DocumentKey {
+                    source_set_id: side.source_set_id().to_owned(),
+                    language: language.to_owned(),
+                    path: path.to_owned(),
+                };
+                let reservation = ctx.live.reserve(sizes::sum(&[
+                    std::mem::size_of::<native::DocumentKey>() as u64,
+                    sizes::document(&document)?,
+                ])?)?;
+                current = Some((document, BTreeSet::new(), reservation));
+            }
+            let (_, targets, reservation) = current.as_mut().expect("current document");
+            reservation.grow(sizes::sum(&[
+                sizes::map_entries::<String, ()>(1)?,
+                codec::sid_len(value)?,
+            ])?)?;
+            targets.insert(codec::sid_text(value)?);
+        }
+        flush(current.take())?;
+    }
+    Ok(())
 }
 
 impl GlobalDiscoverySink for GlobalWriter<'_> {
@@ -1134,7 +1268,7 @@ pub(super) fn claims_side<'a>(
 pub(super) fn discover_side<'a>(
     side: &StagedSide<'a>,
     encoding: u8,
-    target_status: bool,
+    target_status: TargetStatus,
 ) -> Result<CompletedGlobal<'a>> {
     let global = || -> Result<CompletedGlobal<'a>> {
         CompletedGlobal::new(side.ctx, side.side, false, side.source_set_id())
@@ -1200,14 +1334,7 @@ pub(super) fn discover_side<'a>(
                 writer.method(&document, &symbol, summary)?;
             }
         }
-        // A shared pin's captured side records its targets' name status; otherwise both
-        // revisions' status comes from their full native passes.
-        if target_status {
-            writer.captured_declarations(&local_store, &document)?;
-        } else {
-            writer.targets.clear();
-            writer.targets_reservation = side.ctx.live.reserve(0)?;
-        }
+        writer.target_declarations(&local_store, &document, target_status)?;
     }
     Ok(writer.global)
 }
@@ -1254,7 +1381,12 @@ pub(super) fn join_document(
         )?;
     }
     settle_join_references(store, &mut index, &mut sink)?;
-    emit_type_relationships(store, &index, &mut sink)?;
+    let related = emit_type_relationships(store, &index, &mut sink);
+    // A role-site tree the relationships did not take ends with this join.
+    if let Some(local) = &store.local_claims {
+        local.parsed.borrow_mut().take();
+    }
+    related?;
     Ok(sink.into_facts())
 }
 
@@ -1846,7 +1978,7 @@ mod reservation_tests {
     #[test]
     fn crossing_checks_physical_growth_and_seed_is_native_only() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE output(body TEXT); CREATE TABLE nat_docs(id); CREATE TABLE nat_declarations(id); INSERT INTO nat_docs VALUES(1); INSERT INTO nat_declarations VALUES(1),(2); CREATE TABLE claims(id); INSERT INTO claims VALUES(1),(2);").unwrap();
+        conn.execute_batch("CREATE TABLE output(body TEXT); CREATE TABLE nat_docs(id); CREATE TABLE nat_declarations(id); INSERT INTO nat_docs VALUES(1),(2),(3); INSERT INTO nat_declarations VALUES(1),(2); CREATE TABLE claims(id); INSERT INTO claims VALUES(1),(2);").unwrap();
         assert_eq!(retained_rows(&conn).unwrap(), 3);
         let mut limits = BatchLimits::PRODUCTION;
         limits.output_bytes = 0;

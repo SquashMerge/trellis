@@ -76,6 +76,7 @@ fn case(
         source_manifest_hash: manifest_hash(&native.revision),
         completion: crate::scip_raw::Completion::Complete,
         exclusions: vec![],
+        capped_documents: Default::default(),
         claims,
     };
     (root, native, sources, inventory)
@@ -449,6 +450,7 @@ fn java_local_method_in_other_document_does_not_make_override_endpoint_ambiguous
         source_manifest_hash: manifest_hash(&native.revision),
         completion: crate::scip_raw::Completion::Complete,
         exclusions: vec![],
+        capped_documents: Default::default(),
         claims,
     };
     let facts = join_inventory(&inventory, &native, &sources, 1).unwrap();
@@ -599,6 +601,7 @@ fn java_relationship_indexes_visit_each_snapshot_once_and_preserve_method_multip
             source_manifest_hash: manifest_hash(&native.revision),
             completion: crate::scip_raw::Completion::Complete,
             exclusions: vec![],
+            capped_documents: Default::default(),
             claims,
         };
         reset_work();
@@ -762,6 +765,7 @@ fn java_override_uses_global_method_owner_from_another_language() {
         source_manifest_hash: manifest_hash(&native.revision),
         completion: crate::scip_raw::Completion::Complete,
         exclusions: vec![],
+        capped_documents: Default::default(),
         claims,
     };
     let estimates = staged::sizes::estimates();
@@ -790,7 +794,7 @@ fn java_override_uses_global_method_owner_from_another_language() {
 fn direct_base_rows_preserve_order_and_admit_output_before_build() {
     let source = b"interface I extends First, pkg.Second<T> {} class A extends pkg.Base<T> implements X, Y {}";
     let mut bytes = 0;
-    let rows = direct_java_types(source, &mut |amount| {
+    let rows = direct_java_types(source, None, &mut |amount| {
         bytes += amount()?;
         Ok(())
     })
@@ -834,6 +838,7 @@ fn direct_base_rows_preserve_order_and_admit_output_before_build() {
         tree_sitter_python::LANGUAGE.into(),
         "class_definition",
         "argument_list",
+        None,
         &mut |_| Ok(()),
     )
     .unwrap();

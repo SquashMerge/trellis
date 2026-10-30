@@ -14418,6 +14418,62 @@ async fn call_graph_eight_cases_through_mcp() {
     mcp.finish();
 }
 
+/// #466: an ambiguous call published as one row per provenance (sharing `call_id`) is one
+/// ambiguous edge carrying the full candidate union, not `store_unavailable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_graph_ambiguous_rows_sharing_a_call_through_mcp() {
+    use graph_fixtures::{Bind, bind};
+    use trellis::semantic_evidence::Resolution;
+    let spec = with_bindings(
+        &[("a.rs", "fn a() { b(); }\nfn b() {}\nfn c() {}\nfn d() {}\n")],
+        [("amb-3", "d"), ("amb-1", "b"), ("amb-2", "c")]
+            .into_iter()
+            .map(|(provenance, target)| Bind {
+                resolution: Resolution::Ambiguous,
+                provenance: provenance.into(),
+                ..bind("a", 0, target)
+            })
+            .collect(),
+    );
+    let mut mcp = GraphMcp::start(320, &[spec], Default::default()).await;
+    let producer = json!({"semanticProducerId":graph_fixtures::PRODUCER,"includeExternal":true});
+    for _ in 0..2 {
+        let envelope = mcp.case(
+            "a",
+            producer.clone(),
+            &["a:0"],
+            &["b:a>-:boundary:ambiguous"],
+            &[],
+            (false, true),
+        );
+        let binding = &envelope["data"]["result"]["edges"][0]["binding"];
+        assert_eq!(binding["resolution"], "ambiguous");
+        assert_eq!(binding["provenanceId"], "amb-1");
+        let mut internal: Vec<String> = binding["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["syntaxId"].as_str().map(|id| mcp.name(&json!(id))))
+            .collect();
+        internal.sort();
+        assert_eq!(internal, ["b", "c", "d"]);
+        assert_eq!(binding["candidates"].as_array().unwrap().len(), 4);
+        let proofs: Vec<_> = envelope["data"]["result"]["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["producerId"] == graph_fixtures::PRODUCER)
+            .map(|p| p["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(proofs, ["amb-1", "amb-2", "amb-3"]);
+        assert_eq!(
+            GraphMcp::warning_keys(&envelope),
+            keys(&[("bindingAmbiguous", Some("amb-1"))])
+        );
+    }
+    mcp.finish();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn call_graph_five_warning_checks_through_mcp() {
     use graph_fixtures::{Bind, bind};
