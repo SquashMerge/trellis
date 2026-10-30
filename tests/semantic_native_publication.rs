@@ -2579,10 +2579,13 @@ fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
             .or_default() += 1;
     }
     // Each document's references are joined at the captured revision and, unless changed, at
-    // the destination; one join parses a document at most once.
-    assert_eq!(parses.len(), documents.len(), "{parses:?}");
-    assert!(
-        parses.values().all(|&count| count <= 2),
-        "a rejoin re-parsed a document per occurrence: {parses:?}"
+    // the destination; one join parses a document once.
+    let expected: std::collections::BTreeMap<String, usize> = documents
+        .iter()
+        .map(|(path, _)| (path.clone(), if path == "src/C0.js" { 1 } else { 2 }))
+        .collect();
+    assert_eq!(
+        parses, expected,
+        "a rejoin re-parsed a document per occurrence"
     );
 }

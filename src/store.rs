@@ -19071,10 +19071,11 @@ impl Store {
                 let captured_revision_number = captured_revision_number.context(
                     SelectedIntegrity("incompatible_index: selected captured pin missing".into()),
                 )?;
-                // Claims in the decoder's (language, path, canonical bytes) order (`VecSink::finish`),
-                // so a rejoin meets each document's claims together. Its join keeps one
-                // document's role sites at a time; `proof_id` order is a digest order that
-                // interleaves documents and re-parsed a source per occurrence (#494).
+                // Claims in the decoder's (language, path, canonical bytes) order, as
+                // `VecSink::finish` sorts them, so a rejoin meets each document's claims
+                // together. Its join keeps one document's role sites at a time; `proof_id` is a
+                // digest order that interleaves documents and re-parsed a source per occurrence
+                // (#494).
                 let proofs = if metadata_only {
                     Vec::new()
                 } else {
