@@ -80,8 +80,8 @@ for (const mode of ["zero", "sole", "multiple", "unresolved"]) {
         assert.ok(navigation.targets.some(target => target.reason === "enclosing" && target.symbol.id === fixture.caller));
         await page.getByRole("menuitem", {name:/^Sequence · enclosing · syntax · measured/}).waitFor();
         if (mode === "multiple") {
-          assert.ok(navigation.warnings.includes("multiple semantic producers; showing syntax"));
-          assert.match(await page.locator(".classes-context-menu").textContent(), /multiple semantic producers; showing syntax/);
+          assert.ok(navigation.warnings.includes("multiple semantic producers for rust; showing syntax"));
+          assert.match(await page.locator(".classes-context-menu").textContent(), /multiple semantic producers for rust; showing syntax/);
         }
       }
       assert.equal(requests.some(row => row.method() === "POST" && new URL(row.url()).pathname.endsWith("/index")), false);
@@ -198,7 +198,7 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
         assert.equal(await page.getByRole("button", {name:/Open callee sequence:/}).count(), 0);
         if (mode === "zero" || mode === "multiple") {
           assert.ok(calls.every(call => call.callEvidence == null));
-          if (mode === "multiple") assert.ok(dto.warnings.includes("multiple semantic producers; showing syntax"));
+          if (mode === "multiple") assert.ok(dto.warnings.includes("multiple semantic producers for rust; showing syntax"));
         } else {
           const reason = mode === "missing" ? "missingEvidence" : mode;
           assert.ok(calls.every(call => call.callEvidence.boundaryReason === reason), JSON.stringify(calls));

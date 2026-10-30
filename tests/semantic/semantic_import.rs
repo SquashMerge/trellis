@@ -644,9 +644,40 @@ fn issue444_case() -> (
     BTreeMap<native::DocumentKey, Vec<u8>>,
     CapturedScipInventory,
 ) {
+    issue444_case_with_kinds(&[])
+}
+
+/// The #444 fixture with the `SymbolInformation.kind` of each symbol ending in a given suffix
+/// replaced by an explicit SCIP kind (the real bytes state `0`, unspecified, for every symbol).
+fn issue444_case_with_kinds(
+    kinds: &[(&str, i32)],
+) -> (
+    tempfile::TempDir,
+    native::Artifact,
+    BTreeMap<native::DocumentKey, Vec<u8>>,
+    CapturedScipInventory,
+) {
+    use protobuf::{EnumOrUnknown, Message};
     let read = |path: &str| fs::read_to_string(format!("{ISSUE444_FIXTURE}/{path}")).unwrap();
     let (lib, main) = (read("src/lib.js"), read("src/main.js"));
-    let bytes = fs::read(format!("{ISSUE444_FIXTURE}/index.scip")).unwrap();
+    let mut bytes = fs::read(format!("{ISSUE444_FIXTURE}/index.scip")).unwrap();
+    if !kinds.is_empty() {
+        let mut index = scip::types::Index::parse_from_bytes(&bytes).unwrap();
+        let mut replaced = 0;
+        for info in index
+            .documents
+            .iter_mut()
+            .flat_map(|d| d.symbols.iter_mut())
+        {
+            assert_eq!(info.kind.value(), 0, "{}", info.symbol);
+            if let Some((_, kind)) = kinds.iter().find(|(s, _)| info.symbol.ends_with(s)) {
+                info.kind = EnumOrUnknown::from_i32(*kind);
+                replaced += 1;
+            }
+        }
+        assert_eq!(replaced, kinds.len());
+        bytes = index.write_to_bytes().unwrap();
+    }
     admitted_files_case(
         "javascript",
         "scip-typescript",
@@ -719,14 +750,12 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
     // callback, and a plain call after a supplementary-plane character (UTF-16 columns).
     // Owner ruling 2026-10-30 (#470): dispatch follows the measured call shape and the bound
     // declaration's kind. Plain calls of free functions, the imported one included, are
-    // direct. scip-typescript 0.4.0 gives every symbol information kind 0, so its constructor
-    // (`Widget#<constructor>().`) and method (`Widget#run().`) symbols fail the existing
-    // native method-kind compatibility check and bind no target: unresolved, never classified.
-    // `new` of a resolved class is covered by `constructor_call_to_class_is_constructor_dispatch`.
-    let (resolved, unresolved) = (
-        semantic::Resolution::Resolved,
-        semantic::Resolution::Unresolved,
-    );
+    // direct. scip-typescript 0.4.0 gives every symbol information kind 0 (unspecified), which
+    // defers to the measured native kind (#473): its constructor (`Widget#<constructor>().`)
+    // and method (`Widget#run().`) symbols bind their exact native declarations, so
+    // `new Widget(3)` is constructor and the member call `w.run()` resolves with dispatch
+    // unknown.
+    let resolved = semantic::Resolution::Resolved;
     let bound = [
         (
             issue444_span("plain", "();\n  helper", 0),
@@ -738,11 +767,11 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
         ),
         (
             issue444_span("Widget", "(3)", 0),
-            (unresolved, semantic::Dispatch::Unknown),
+            (resolved, semantic::Dispatch::Constructor),
         ),
         (
             issue444_span("run", "()", 0),
-            (unresolved, semantic::Dispatch::Unknown),
+            (resolved, semantic::Dispatch::Unknown),
         ),
         (
             issue444_span("register", "(plain)", 0),
@@ -792,6 +821,24 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
             if *syntax_id == lib_declaration("helper") && document.path == "src/lib.js"
     ));
     assert_eq!(helper.stale_target, Some(false));
+    // The constructor and method calls bind their exact native declarations in `src/lib.js`.
+    for (span, target) in [(&bound[2].0, "constructor"), (&bound[3].0, "run")] {
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| &b.join.anchor.range == span)
+            .unwrap();
+        assert!(
+            matches!(
+                &binding.declared_target,
+                Some(semantic::Target::Internal { syntax_id, document, .. })
+                    if *syntax_id == lib_declaration(target) && document.path == "src/lib.js"
+            ),
+            "{target}: {:?}",
+            binding.declared_target
+        );
+        assert_eq!(binding.stale_target, Some(false));
+    }
     // A callback argument is a measured reference inside the invocation, not its callee.
     let callback = issue444_span("plain", ");\n  const", 0);
     assert_eq!(reference_at(&callback).roles, vec![semantic::Role::Read]);
@@ -815,6 +862,60 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
                 .all(|r| Some(&r.range) != call.callee_range.as_ref())
         );
     }
+}
+
+/// #473: an unspecified SCIP kind (`0`) defers to the measured native declaration kind, but an
+/// explicit producer kind is still checked against it. On the real #444 bytes, stating SCIP
+/// `Method` (26) for the constructor and `run` agrees with their native `method` declarations
+/// and binds exactly as kind 0 does; stating `Function` (17) conflicts, so neither call binds
+/// a target. Plain and imported calls of free functions stay direct either way.
+#[test]
+fn real_scip_typescript_explicit_symbol_kind_is_still_checked() {
+    use semantic::Dispatch::{Constructor, Direct, Unknown};
+    use semantic::Resolution::{Resolved, Unresolved};
+    let calls = |kind: i32| {
+        let (_root, native, sources, inventory) = issue444_case_with_kinds(&[
+            ("Widget#`<constructor>`().", kind),
+            ("Widget#run().", kind),
+        ]);
+        let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        [
+            ("plain", "();\n  helper"),
+            ("helper", "(2)"),
+            ("Widget", "(3)"),
+            ("run", "()"),
+            ("register", "(plain)"),
+        ]
+        .map(|(needle, after)| {
+            let span = issue444_span(needle, after, 0);
+            let binding = output
+                .call_bindings
+                .iter()
+                .find(|b| b.join.anchor.range == span)
+                .unwrap_or_else(|| panic!("binding for {needle}"));
+            (needle, binding.resolution, binding.dispatch)
+        })
+    };
+    assert_eq!(
+        calls(26),
+        [
+            ("plain", Resolved, Direct),
+            ("helper", Resolved, Direct),
+            ("Widget", Resolved, Constructor),
+            ("run", Resolved, Unknown),
+            ("register", Resolved, Direct),
+        ]
+    );
+    assert_eq!(
+        calls(17),
+        [
+            ("plain", Resolved, Direct),
+            ("helper", Resolved, Direct),
+            ("Widget", Unresolved, Unknown),
+            ("run", Unresolved, Unknown),
+            ("register", Resolved, Direct),
+        ]
+    );
 }
 
 /// Owner ruling 2026-10-30 (#470): dispatch is the measured native call shape plus the exact

@@ -155,6 +155,75 @@ pub(crate) fn valid_producer_id(id: &str) -> bool {
     !id.is_empty()
 }
 
+pub const NO_PRODUCER_NOTE: &str = "no semantic producer published; showing syntax";
+pub const LANGUAGE_NOTE: &str = "semantic producer does not cover this language; showing syntax";
+const UNSELECTED_MESSAGE: &str = "No semantic producer was selected; only syntax evidence is used.";
+
+/// The note of a language that two or more published producers cover (#483).
+pub fn multiple_producers_note(language: &str) -> String {
+    format!("multiple semantic producers for {language}; showing syntax")
+}
+
+/// The default producer of each language at one revision (owner ruling 2026-10-30, #483,
+/// amending #392): a document uses the sole published producer whose profile covers its
+/// language. A language that two or more cover shows syntax only. Producers are never merged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultProducers {
+    /// The published producers covering each language, in ID order.
+    pub by_language: BTreeMap<String, Vec<String>>,
+    /// Whether the revision publishes any producer.
+    pub published: bool,
+}
+
+impl DefaultProducers {
+    /// The selection over published `(producer, language)` rows. A producer that declares
+    /// no language still counts as published.
+    pub fn from_published<I>(rows: I) -> Self
+    where
+        I: IntoIterator<Item = (String, Option<String>)>,
+    {
+        let mut selection = Self::default();
+        for (producer, language) in rows {
+            selection.published = true;
+            if let Some(language) = language {
+                let producers = selection.by_language.entry(language).or_default();
+                if !producers.contains(&producer) {
+                    producers.push(producer);
+                    producers.sort();
+                }
+            }
+        }
+        selection
+    }
+
+    /// The language's producer, when exactly one published producer covers it.
+    pub fn producer(&self, language: &str) -> Option<&str> {
+        match self.by_language.get(language).map(Vec::as_slice) {
+            Some([producer]) => Some(producer),
+            _ => None,
+        }
+    }
+
+    /// Why the language shows syntax only, or `None` when it has a producer.
+    pub fn note(&self, language: &str) -> Option<String> {
+        match self.by_language.get(language).map(Vec::len) {
+            Some(1) => None,
+            Some(_) => Some(multiple_producers_note(language)),
+            None if !self.published => Some(NO_PRODUCER_NOTE.to_string()),
+            None => Some(LANGUAGE_NOTE.to_string()),
+        }
+    }
+
+    /// Every language with a selected producer.
+    pub fn languages(&self) -> BTreeSet<String> {
+        self.by_language
+            .iter()
+            .filter(|(_, producers)| producers.len() == 1)
+            .map(|(language, _)| language.clone())
+            .collect()
+    }
+}
+
 impl GraphRequest {
     /// Rejects out-of-range input as `invalidRequest` naming the field; nothing is clamped.
     pub fn validate(&self) -> std::result::Result<(), GraphError> {
@@ -316,6 +385,11 @@ pub trait GraphSource {
     fn snapshot(&self) -> &GraphSnapshot;
     /// `None` means the producer is not published for the revision.
     fn producer_languages(&mut self, producer_id: &str) -> Result<Option<BTreeSet<String>>>;
+    /// The per-language default of a request without a producer (#483). `None`, as for a
+    /// fixture without one, leaves the whole answer syntax only.
+    fn default_producers(&mut self) -> Result<Option<DefaultProducers>> {
+        Ok(None)
+    }
     fn locate(&mut self, syntax_id: &str) -> Result<Option<DocumentKey>>;
     fn document(&mut self, key: &DocumentKey) -> Result<Arc<DocumentFacts>>;
     /// The role of an exactly located declaration, without requiring its whole document.
@@ -349,6 +423,8 @@ pub struct GraphFacts {
     snapshot: GraphSnapshot,
     memo: bool,
     pub producers: BTreeMap<String, BTreeSet<String>>,
+    /// The per-language default selection the query read, if it read one (#483).
+    pub defaults: Option<DefaultProducers>,
     pub locations: BTreeMap<String, Option<DocumentKey>>,
     pub documents: BTreeMap<DocumentKey, Arc<DocumentFacts>>,
     pub history: BTreeMap<(DocumentKey, String), Option<Arc<HistoryFacts>>>,
@@ -360,6 +436,7 @@ impl GraphFacts {
             snapshot,
             memo,
             producers: BTreeMap::new(),
+            defaults: None,
             locations: BTreeMap::new(),
             documents: BTreeMap::new(),
             history: BTreeMap::new(),
@@ -386,6 +463,10 @@ impl GraphSource for &GraphFacts {
             None if self.memo => Err(anyhow!(FACTS_MISS)),
             None => Ok(None),
         }
+    }
+
+    fn default_producers(&mut self) -> Result<Option<DefaultProducers>> {
+        Ok(self.defaults.clone())
     }
 
     fn locate(&mut self, syntax_id: &str) -> Result<Option<DocumentKey>> {
@@ -422,6 +503,9 @@ impl GraphSource for GraphFacts {
     }
     fn producer_languages(&mut self, id: &str) -> Result<Option<BTreeSet<String>>> {
         (&*self).producer_languages(id)
+    }
+    fn default_producers(&mut self) -> Result<Option<DefaultProducers>> {
+        (&*self).default_producers()
     }
     fn locate(&mut self, id: &str) -> Result<Option<DocumentKey>> {
         (&*self).locate(id)
@@ -492,14 +576,18 @@ impl GraphAnswer {
             }
         }
         let mut facts = &self.facts;
-        let languages = match &self.requested.semantic_producer_id {
-            Some(id) => facts.producer_languages(id)?,
-            None => None,
+        let (languages, defaults) = match &self.requested.semantic_producer_id {
+            Some(id) => (facts.producer_languages(id)?, None),
+            None => {
+                let defaults = facts.default_producers()?;
+                (defaults.as_ref().map(DefaultProducers::languages), defaults)
+            }
         };
         finish(
             &self.requested,
             &mut facts,
             languages.as_ref(),
+            defaults.as_ref(),
             nodes,
             edges,
             frontier,
@@ -709,8 +797,12 @@ pub fn evaluate(
             "Call graph root not found in the admitted snapshot",
         )));
     };
+    let mut defaults = None;
     let scope = match &request.semantic_producer_id {
-        None => None,
+        None => {
+            defaults = source.default_producers()?;
+            defaults.as_ref().map(DefaultProducers::languages)
+        }
         Some(producer) => match source.producer_languages(producer)? {
             Some(languages) => Some(languages),
             None => {
@@ -908,6 +1000,7 @@ pub fn evaluate(
         request,
         source,
         scope,
+        defaults.as_ref(),
         nodes,
         edges,
         frontier,
@@ -981,10 +1074,12 @@ fn shortest_depths(nodes: &mut [GraphNode], edges: &[GraphEdge]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     request: &GraphRequest,
     source: &mut dyn GraphSource,
     scope: Option<&BTreeSet<String>>,
+    defaults: Option<&DefaultProducers>,
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     mut frontier: Vec<Frontier>,
@@ -1056,7 +1151,8 @@ fn finish(
         || omitted.filtered > 0
         || selected_incomplete(&coverage)
         || edges.iter().any(|edge| edge.visit == Visit::Boundary);
-    let warnings = warnings_v1(request, &coverage, &provenance, &edges);
+    let syntax_only = syntax_only(request, defaults, &nodes, &edges);
+    let warnings = warnings_with(syntax_only, &coverage, &provenance, &edges);
     Ok(GraphResult {
         request: request.clone(),
         resolved_revision_id: request.revision_id.clone(),
@@ -1212,6 +1308,39 @@ pub(crate) fn occurrence_warnings(
     Ok(warnings_v1(request, &coverage, &provenance, edges))
 }
 
+/// The `syntaxOnly` message of an answer, if any. An explicit producer never warns (D8).
+/// Without one, a source with no default selection warns as before. Under the per-language
+/// default (#483), each returned language without a producer names its reason.
+fn syntax_only(
+    request: &GraphRequest,
+    defaults: Option<&DefaultProducers>,
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+) -> Option<String> {
+    if request.semantic_producer_id.is_some() {
+        return None;
+    }
+    let Some(defaults) = defaults else {
+        return Some(UNSELECTED_MESSAGE.to_string());
+    };
+    let languages: BTreeSet<&str> = nodes
+        .iter()
+        .map(|node| node.declaration.document.language.as_str())
+        .chain(
+            edges
+                .iter()
+                .map(|edge| edge.call.document.language.as_str()),
+        )
+        .collect();
+    let mut notes: Vec<String> = Vec::new();
+    for note in languages.into_iter().filter_map(|l| defaults.note(l)) {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
+}
+
 /// Exactly the warnings-v1 set, unique by `(code, provenanceId)` and in contract order.
 pub fn warnings_v1(
     request: &GraphRequest,
@@ -1219,12 +1348,22 @@ pub fn warnings_v1(
     provenance: &[sem::Provenance],
     edges: &[GraphEdge],
 ) -> Vec<Warning> {
-    let mut keys: BTreeMap<(WarningCode, Option<String>), &'static str> = BTreeMap::new();
-    if request.semantic_producer_id.is_none() {
-        keys.insert(
-            (WarningCode::SyntaxOnly, None),
-            "No semantic producer was selected; only syntax evidence is used.",
-        );
+    let syntax_only = request
+        .semantic_producer_id
+        .is_none()
+        .then(|| UNSELECTED_MESSAGE.to_string());
+    warnings_with(syntax_only, coverage, provenance, edges)
+}
+
+fn warnings_with(
+    syntax_only: Option<String>,
+    coverage: &[sem::Coverage],
+    provenance: &[sem::Provenance],
+    edges: &[GraphEdge],
+) -> Vec<Warning> {
+    let mut keys: BTreeMap<(WarningCode, Option<String>), &str> = BTreeMap::new();
+    if let Some(message) = syntax_only.as_deref() {
+        keys.insert((WarningCode::SyntaxOnly, None), message);
     }
     if selected_incomplete(coverage) {
         keys.insert(

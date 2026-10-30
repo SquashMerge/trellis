@@ -129,10 +129,11 @@ validated cached snapshot; before a valid head is ready, evidence tools return t
 `index_not_ready`, while describe can report not-ready status. Declaration takes a `symbolId` with
 no `limit` or `view`; outgoing calls takes a `symbolId` and optional `limit`, with no `view`.
 Outgoing and incoming calls show each call's published semantic binding (resolution, target,
-ambiguous candidates and freshness) from the sole published producer, or from an explicit
-optional `semanticProducerId`. With none or several published, they stay syntax-only and the
-`syntaxOnly` warning says why. `trellis query` (`--semantic-producer-id`) and `trellis status`
-apply the same producer policy.
+ambiguous candidates and freshness) from the sole published producer whose profile covers
+each call's language, or from an explicit optional `semanticProducerId`. A language that none
+or several producers cover stays syntax-only and the `syntaxOnly` warning says why. The call
+graph, `trellis query` (`--semantic-producer-id`), `trellis symbols`, `trellis status` (per
+language) and the browser apply the same per-language policy (owner ruling 2026-10-30, #483).
 Find, declaration and outgoing results use compact `doc` references into their `documents` table.
 Symbols, declaration data and calls include inclusive 1-based `lines` beside byte ranges when the
 source is selectable; `NativeCandidate` has no `lines`. Use the returned `evidenceBasis` and

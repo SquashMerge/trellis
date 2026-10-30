@@ -284,7 +284,7 @@ fn sole_published_policy_zero_one_multiple_and_retained_cardinality() {
             result
                 .warnings
                 .iter()
-                .any(|warning| warning == "multiple semantic producers; showing syntax"),
+                .any(|warning| *warning == trellis::store::multiple_producers_note("rust")),
             pin == multiple
         );
         assert!(
