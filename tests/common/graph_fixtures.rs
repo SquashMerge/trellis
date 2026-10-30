@@ -406,6 +406,26 @@ fn evidence(
             provenance_id: b.provenance.clone(),
         });
     }
+    // As the importer publishes contradictory evidence at one call site: one ambiguous row per
+    // provenance, each carrying the canonical union of every row's candidates (#466).
+    let mut unions: BTreeMap<Option<String>, Vec<s::Target>> = BTreeMap::new();
+    for b in &semantic.call_bindings {
+        if b.resolution == s::Resolution::Ambiguous {
+            unions
+                .entry(b.call_id.clone())
+                .or_default()
+                .extend(b.candidates.iter().cloned());
+        }
+    }
+    for union in unions.values_mut() {
+        union.sort_by_key(canonical_target);
+        union.dedup();
+    }
+    for b in &mut semantic.call_bindings {
+        if b.resolution == s::Resolution::Ambiguous {
+            b.candidates = unions[&b.call_id].clone();
+        }
+    }
     semantic.provenance.sort_by(|a, b| a.id.cmp(&b.id));
     for document in &native.revision.documents {
         let language = language_of(&document.key.path);

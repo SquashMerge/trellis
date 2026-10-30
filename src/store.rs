@@ -669,11 +669,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 27;
+const DATABASE_SCHEMA_VERSION: u32 = 28;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V27: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=27), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V28: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=28), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -758,7 +758,7 @@ CREATE TABLE semantic_revision_raw_selections(revision_id TEXT NOT NULL REFERENC
 CREATE INDEX semantic_raw_selections_batch ON semantic_revision_raw_selections(batch_id);
 CREATE INDEX semantic_raw_selections_captured_pin ON semantic_revision_raw_selections(captured_pin);
 CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id),proof_id TEXT NOT NULL,record_kind TEXT NOT NULL CHECK(record_kind IN ('occurrence','symbolInformation','relationship')),fact_digest TEXT NOT NULL CHECK(length(fact_digest)=64),language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest));
-CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),PRIMARY KEY(capture_id,language,path));
+CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),capped INTEGER NOT NULL CHECK(capped IN (0,1)),PRIMARY KEY(capture_id,language,path));
 CREATE TABLE semantic_import_reports(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,report_json TEXT NOT NULL CHECK(json_valid(report_json)),PRIMARY KEY(revision_id,producer_id));
 CREATE TABLE semantic_provenance(tuple_id INTEGER NOT NULL,provenance_id TEXT NOT NULL,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),freshness TEXT NOT NULL CHECK(freshness IN ('fresh','possiblyStale','stale')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest TEXT CHECK(length(derived_from_fact_digest)=64),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),PRIMARY KEY(tuple_id,provenance_id),FOREIGN KEY(tuple_id) REFERENCES semantic_coverage(tuple_id),FOREIGN KEY(tuple_id,basis_id) REFERENCES semantic_basis(tuple_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
 CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_id TEXT NOT NULL,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
@@ -973,13 +973,14 @@ impl NativeReader<'_> {
             .read_native_document(self.db, self.selected, document)
     }
 
-    /// Native rows for staged joins, retaining the general reader's integrity checks.
+    /// Native rows for staged joins, retaining the general reader's integrity checks. A join
+    /// never reads control regions or search cards, so they are not loaded (left empty).
     pub(crate) fn join_document(
         &self,
         document: &crate::native_evidence::Document,
     ) -> Result<NativeDocumentRows> {
         self.store
-            .read_native_document(self.db, self.selected, document)
+            .read_native_document_rows(self.db, self.selected, document, false)
     }
 
     /// Logical peak estimate for native document loading, before owning its row bodies.
@@ -3636,7 +3637,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V27)?;
+    expected.execute_batch(CACHE_SCHEMA_V28)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -3660,7 +3661,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V27).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V28).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -5868,7 +5869,10 @@ fn authenticate_stored_batch(
     );
     let uri = crate::scip_admission::file_uri(root).context("raw project root")?;
     let module_roots = scip_raw::ModuleRoots::from_native_config(&captured.native_config);
+    // The limits admission ran under, so a document capped there is capped here.
+    let limits = BatchLimits::effective().map_err(anyhow::Error::msg)?;
     let mut claims = Vec::new();
+    let mut capped = scip_raw::CappedDocuments::new();
     for capture in &raw.captures {
         // The artifact covers every retained document of its language that the batch did not
         // exclude, unless a stored document row assigns it to another artifact.
@@ -5960,12 +5964,13 @@ fn authenticate_stored_batch(
             &artifact,
             &mut resolve,
             &mut BatchCounters::default(),
-            &BatchLimits::PRODUCTION,
+            &limits,
             &mut sink,
             cancel,
         )
         .map_err(anyhow::Error::from)
         .context("raw original binary admission")?;
+        capped.extend(sink.capped_documents().iter().cloned());
         claims.extend(sink.finish().context("raw original binary admission")?);
     }
     claims.sort_by(|a, b| a.captured_proof_id.cmp(&b.captured_proof_id));
@@ -5982,6 +5987,7 @@ fn authenticate_stored_batch(
             && inventory.source_manifest_hash == raw.source_manifest_hash
             && inventory.completion == descriptor.completion
             && inventory.exclusions == raw.exclusions
+            && inventory.capped_documents == capped
             && claims == retained,
         "raw inventory differs from authenticated binary"
     );
@@ -6034,6 +6040,8 @@ pub struct SelectedRawBatch {
     /// In ordinal order.
     pub captures: Vec<SelectedRawCapture>,
     pub exclusions: Vec<crate::scip_raw::Exclusion>,
+    /// Documents admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
+    pub capped_documents: crate::scip_raw::CappedDocuments,
     pub proofs: Vec<(String, StoredRawProof)>,
     /// `(language, path)` to `(source_hash, wire_digest, capture_id)`.
     pub documents: BTreeMap<(String, String), (String, String, i64)>,
@@ -7586,7 +7594,7 @@ fn fill_capture_blob(
 /// Raw rows of a batch. The document and proof statements join the ordinal-to-capture pairs of
 /// `with_capture_ids`; `CROSS JOIN` keeps the staged table as the driver, so every select reads in
 /// the order that table is stored and needs no sorter.
-const RAW_DOCUMENTS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_documents SELECT m.capture_id,s.language,s.path,s.content_hash,d.wire_digest FROM stage.documents d CROSS JOIN stage.sources s ON s.ord=d.source_ord CROSS JOIN capture_ids m ON m.ordinal=d.artifact ORDER BY d.source_ord";
+const RAW_DOCUMENTS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_documents SELECT m.capture_id,s.language,s.path,s.content_hash,d.wire_digest,d.capped FROM stage.documents d CROSS JOIN stage.sources s ON s.ord=d.source_ord CROSS JOIN capture_ids m ON m.ordinal=d.artifact ORDER BY d.source_ord";
 const RAW_EXCLUSIONS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_exclusions SELECT ?1,s.language,s.path,c.exclusion FROM stage.coverage c JOIN stage.sources s ON s.ord=c.source_ord WHERE c.exclusion IS NOT NULL ORDER BY c.source_ord";
 const RAW_PROOFS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_proofs SELECT m.capture_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact ORDER BY c.claim_id";
 
@@ -8626,6 +8634,7 @@ fn decoded_selected_inventory(
         source_manifest_hash: raw.source_manifest_hash.clone(),
         completion: raw.descriptor.completion,
         exclusions: raw.exclusions.clone(),
+        capped_documents: raw.capped_documents.clone(),
         claims: raw
             .proofs
             .iter()
@@ -8900,6 +8909,7 @@ fn selected_native_rejoin_once(
                     .collect(),
                 source_manifest_hash: raw.source_manifest_hash.clone(),
                 exclusions: raw.exclusions.clone(),
+                capped_documents: raw.capped_documents.clone(),
                 claims: input.proof_identities.clone(),
             };
             if input.lightweight {
@@ -10527,7 +10537,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V27 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V28 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -13181,7 +13191,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V27)?;
+                db.execute_batch(CACHE_SCHEMA_V28)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -19045,6 +19055,10 @@ impl Store {
                     "SELECT d.language,d.path,d.source_hash,d.wire_digest,d.capture_id FROM semantic_raw_documents d JOIN semantic_raw_captures c ON c.capture_id=d.capture_id WHERE c.batch_id=?1 ORDER BY d.language,d.path"
                 )?.query_map([batch_id], |r| Ok(((r.get(0)?,r.get(1)?),(r.get(2)?,r.get(3)?,r.get(4)?))))?
                     .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+                let capped_documents = db.prepare(
+                    "SELECT d.language,d.path FROM semantic_raw_documents d JOIN semantic_raw_captures c ON c.capture_id=d.capture_id WHERE c.batch_id=?1 AND d.capped=1"
+                )?.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<crate::scip_raw::CappedDocuments>>()?;
                 let exclusions = db.prepare(
                     "SELECT language,path,reason FROM semantic_raw_exclusions WHERE batch_id=?1 ORDER BY language,path"
                 )?.query_map([batch_id], |r| Ok(crate::scip_raw::Exclusion {language:r.get(0)?,relative_path:r.get(1)?,reason:r.get(2)?}))?
@@ -19061,6 +19075,7 @@ impl Store {
                     decoder_version,
                     captures,
                     exclusions,
+                    capped_documents,
                     proofs,
                     documents,
                     captured_pin: IndexPin {
@@ -20486,6 +20501,18 @@ impl Store {
         selected: &ReadRevision,
         document: &crate::native_evidence::Document,
     ) -> Result<NativeDocumentRows> {
+        self.read_native_document_rows(db, selected, document, true)
+    }
+
+    /// One document's native rows; without `complete`, its control regions and search cards
+    /// are left empty (the staged join reads neither).
+    fn read_native_document_rows(
+        &self,
+        db: &Connection,
+        selected: &ReadRevision,
+        document: &crate::native_evidence::Document,
+        complete: bool,
+    ) -> Result<NativeDocumentRows> {
         use crate::native_evidence as n;
         #[cfg(feature = "test-support")]
         crate::semantic_import::note_selected_original_native_row(&document.key);
@@ -20511,10 +20538,18 @@ impl Store {
             },
             declarations: read_native_declarations_v8(db, &scope, None, true)?,
             calls: read_native_calls_v8(db, &scope, None)?,
-            control_regions: read_native_control_regions_v8(db, &scope, None)?,
+            control_regions: if complete {
+                read_native_control_regions_v8(db, &scope, None)?
+            } else {
+                vec![]
+            },
             references: read_native_references(db, &scope, None)?,
             capability_report: read_native_capability_report(db, &scope)?,
-            search_cards: search::read_cards(db, scope.vid, &document.key.path)?,
+            search_cards: if complete {
+                search::read_cards(db, scope.vid, &document.key.path)?
+            } else {
+                vec![]
+            },
         })
     }
 
@@ -21955,7 +21990,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V27).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V28).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -22091,7 +22126,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V27).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V28).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

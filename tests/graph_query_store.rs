@@ -848,6 +848,151 @@ fn result_of(answer: Result<GraphAnswer>) -> GraphResult {
     result(answer.unwrap())
 }
 
+const CONTRADICTED: &str = "fn a() { b(); }\nfn b() {}\nfn c() {}\nfn d() {}\n";
+
+/// #466: contradictory evidence at one call site, published the way the importer does it: one
+/// ambiguous row per provenance, all sharing `call_id`, each carrying the full candidate union.
+fn publish_contradicted(publisher: &mut Publisher) -> trellis::model::IndexPin {
+    let mut spec = Spec::new(&[("a.rs", CONTRADICTED)]);
+    spec.bindings = [("amb-3", "d"), ("amb-1", "b"), ("amb-2", "c")]
+        .into_iter()
+        .map(|(provenance, target)| Bind {
+            resolution: s::Resolution::Ambiguous,
+            provenance: provenance.into(),
+            ..bind("a", 0, target)
+        })
+        .collect();
+    publisher.publish(&spec)
+}
+
+#[test]
+fn ambiguous_call_rows_answer_graph_sequence_and_navigation_without_recovery() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let pin = publish_contradicted(&mut publisher);
+    let seed = syntax_id(publisher.native(), "a");
+    let names = |ids: &[&str]| -> Vec<String> {
+        ids.iter()
+            .map(|n| syntax_id(publisher.native(), n))
+            .collect()
+    };
+    let expected_internal = names(&["b", "c", "d"]);
+
+    let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
+    assert_eq!(graph.edges.len(), 1);
+    let edge = &graph.edges[0];
+    assert_eq!(edge.visit, Visit::Boundary);
+    assert_eq!(edge.boundary_reason, BoundaryReason::Ambiguous);
+    let binding = edge.binding.as_ref().expect("ambiguous binding");
+    assert_eq!(binding.resolution, s::Resolution::Ambiguous);
+    assert_eq!(binding.provenance_id, "amb-1");
+    assert_eq!(
+        binding.candidates.len(),
+        4,
+        "three internal targets and one external"
+    );
+    let mut internal: Vec<_> = binding
+        .candidates
+        .iter()
+        .filter_map(|t| match t {
+            s::Target::Internal { syntax_id, .. } => Some(syntax_id.clone()),
+            s::Target::External { .. } => None,
+        })
+        .collect();
+    internal.sort();
+    let mut expected = expected_internal.clone();
+    expected.sort();
+    assert_eq!(internal, expected);
+    let proofs: Vec<_> = graph
+        .provenance
+        .iter()
+        .filter(|p| p.producer_id == graph_fixtures::PRODUCER)
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(proofs, vec!["amb-1", "amb-2", "amb-3"]);
+    assert_eq!(
+        warning_keys(&graph),
+        vec![(WarningCode::BindingAmbiguous, Some("amb-1".into()))]
+    );
+
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert_eq!(steps.len(), 1);
+    let evidence = steps[0].call_evidence.as_ref().unwrap();
+    assert!(steps[0].target.is_none());
+    assert_eq!(evidence.boundary_reason, BoundaryReason::Ambiguous);
+    assert_eq!(evidence.resolution, Some(s::Resolution::Ambiguous));
+    assert_eq!(evidence.provenance_id.as_deref(), Some("amb-1"));
+    assert_eq!(view.semantic_warnings, graph.warnings);
+
+    let navigation = publisher
+        .store
+        .navigation_at(
+            &serde_json::from_value(serde_json::json!({"expectedRevision":pin,"path":"a.rs",
+                "line":1,"semanticProducerId":graph_fixtures::PRODUCER}))
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(navigation.targets.iter().all(|t| t.reason != "call"));
+    assert!(!publisher.store.recovery_pending_for_tests());
+}
+
+#[test]
+fn non_ambiguous_multi_match_for_one_call_stays_typed_corruption() {
+    for case in ["ambiguous+unresolved", "duplicate resolved"] {
+        let (state, root) = workspace();
+        let (pin, seed) = {
+            let mut publisher = Publisher::open(state.path(), root.path());
+            let pin = if case == "duplicate resolved" {
+                let mut spec = Spec::new(&[("a.rs", CONTRADICTED)]);
+                spec.bindings = vec![bind("a", 0, "b")];
+                publisher.publish(&spec)
+            } else {
+                publish_contradicted(&mut publisher)
+            };
+            (pin, syntax_id(publisher.native(), "a"))
+        };
+        sql(
+            state.path(),
+            if case == "duplicate resolved" {
+                "CREATE TEMP TABLE copy AS SELECT * FROM semantic_call_bindings; \
+                 UPDATE copy SET binding_id=binding_id+1000, ordinal=ordinal+1; \
+                 INSERT INTO semantic_call_bindings SELECT * FROM copy;"
+            } else {
+                "PRAGMA foreign_keys=OFF; \
+                 DELETE FROM semantic_call_candidates WHERE binding_id IN \
+                   (SELECT binding_id FROM semantic_call_bindings WHERE provenance_id='amb-2'); \
+                 UPDATE semantic_call_bindings SET resolution='unresolved' \
+                   WHERE provenance_id='amb-2';"
+            },
+        );
+        for path in ["graph", "sequence"] {
+            let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+            let error = if path == "sequence" {
+                store.sequence_at(&seed, pin, false).unwrap_err()
+            } else {
+                run(&store, &query(&seed, true)).err().unwrap()
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("multiple call bindings match one call"),
+                "{case} {path}: {error:#}"
+            );
+            // The MCP and HTTP boundaries report a graph read failure; sequence reports itself.
+            assert_eq!(
+                store.recovery_pending_for_tests(),
+                path == "sequence",
+                "{case} {path}"
+            );
+        }
+    }
+}
+
 #[test]
 fn high_fanout_syntax_only_store() {
     let (state, root) = workspace();

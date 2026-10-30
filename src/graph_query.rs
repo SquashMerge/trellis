@@ -571,17 +571,28 @@ fn select_binding<'a>(
     {
         return Ok(None);
     }
-    let mut matches = semantic
+    let matches: Vec<_> = semantic
         .call_bindings
         .iter()
         .filter(|b| b.call_id.as_deref() == Some(call.id.as_str()))
         .filter(|b| b.join.anchor.document == call.document)
-        .filter_map(|b| Some((b, semantic.provenance.get(&b.provenance_id)?)));
-    let selected = matches.next();
-    if matches.next().is_some() {
+        .filter_map(|b| Some((b, semantic.provenance.get(&b.provenance_id)?)))
+        .collect();
+    // Contradictory evidence at one call site is published as one ambiguous row per
+    // provenance, each carrying the full candidate union (contract-v1 "Duplicate
+    // contradictory exact bindings ... both provenances remain"). All rows here belong to
+    // one producer coverage tuple. The lowest provenance ID represents the call; evidence
+    // selection gathers the other ambiguous proofs. Any other multi-match is corrupt.
+    if matches.len() > 1
+        && !matches
+            .iter()
+            .all(|(b, _)| b.resolution == Resolution::Ambiguous)
+    {
         return Err(integrity("multiple call bindings match one call"));
     }
-    Ok(selected)
+    Ok(matches
+        .into_iter()
+        .min_by(|(a, _), (b, _)| a.provenance_id.cmp(&b.provenance_id)))
 }
 
 fn boundary_reason(binding: &CallBinding, proof: &sem::Provenance) -> BoundaryReason {
