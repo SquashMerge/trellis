@@ -461,10 +461,19 @@ impl World {
     }
 
     fn java_artifact(&self, project_root: Option<String>) -> PathBuf {
-        let fixture = BatchFixture::from_published(&self.index_db, &self.checkout.root)
-            .reference("scip-java");
-        let docs = fixture.paths("java");
-        let bytes = fixture.scip_bytes("java", &docs);
+        self.reference_artifact("scip-java", "java", project_root)
+    }
+
+    fn reference_artifact(
+        &self,
+        producer: &str,
+        language: &str,
+        project_root: Option<String>,
+    ) -> PathBuf {
+        let fixture =
+            BatchFixture::from_published(&self.index_db, &self.checkout.root).reference(producer);
+        let docs = fixture.paths(language);
+        let bytes = fixture.scip_bytes(language, &docs);
         let bytes = match project_root {
             Some(root) => edit_scip(&bytes, |index| {
                 index.metadata.as_mut().unwrap().project_root = root;
@@ -481,15 +490,13 @@ impl World {
     }
 
     fn pickup_command(&self, artifact: &Path) -> std::process::Command {
+        self.pickup_command_for("scip-java", artifact)
+    }
+
+    fn pickup_command_for(&self, producer: &str, artifact: &Path) -> std::process::Command {
         let mut command = self.checkout.cli();
         command
-            .args([
-                "producer",
-                "pickup",
-                "--producer",
-                "scip-java",
-                "--workspace",
-            ])
+            .args(["producer", "pickup", "--producer", producer, "--workspace"])
             .arg(&self.checkout.root)
             .arg("--artifact")
             .arg(artifact);
@@ -891,6 +898,53 @@ fn pickup_batch_with_trailing_slash_survives_full_reuse() {
     );
     assert_eq!(
         retained.descriptor.generation.as_ref().unwrap().origin,
+        GenerationOrigin::OwnerPickup
+    );
+}
+
+/// A Rust (rust-analyzer) pickup batch is retained and re-authenticated when an unrelated
+/// publication moves the head and the store reuses the stored batch.
+#[test]
+fn rust_pickup_batch_survives_store_reuse() {
+    let world = world(&[]);
+    let root_uri = file_uri(&world.checkout.root);
+    let artifact = world.reference_artifact("rust-analyzer", "rust", Some(format!("{root_uri}/")));
+    let output = world
+        .pickup_command_for("rust-analyzer", &artifact)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let imported = world.head();
+    assert_eq!(
+        world.store.selected_raw_inputs_at(imported).unwrap().len(),
+        1
+    );
+    let documents = complete_documents(&world.store, imported, "rust-analyzer");
+    assert!(documents > 0);
+
+    fs::write(
+        world.checkout.root.join("java/u00000.java"),
+        "class u00000 { void unrelated() {} }\n",
+    )
+    .unwrap();
+    trellis::testing::wait_until("the watcher to publish the edit", || {
+        world.head().index_revision > imported.index_revision
+    });
+    let head = world.head();
+    let retained = world.store.selected_raw_inputs_at(head).unwrap();
+    assert_eq!(retained.len(), 1, "the Rust batch was dropped on reuse");
+    assert_eq!(
+        complete_documents(&world.store, head, "rust-analyzer"),
+        documents,
+        "reuse failed to re-authenticate the Rust pickup batch"
+    );
+    assert_eq!(
+        retained[0].descriptor.generation.as_ref().unwrap().origin,
         GenerationOrigin::OwnerPickup
     );
 }

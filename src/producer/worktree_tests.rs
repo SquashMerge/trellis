@@ -3,7 +3,7 @@ use super::worktree::{self, RetainedInputs, RetainedSource};
 use super::{ProducerName, TrustProfile};
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::{fs, sync::atomic::AtomicBool};
+use std::{fs, os::unix::fs::PermissionsExt, sync::atomic::AtomicBool};
 
 fn present(path: &str, bytes: &[u8]) -> Value {
     json!({"path": path, "type": "present", "bytes": hex::encode(bytes), "byteLength": bytes.len()})
@@ -159,4 +159,19 @@ fn cancellation_stops_between_files() {
     )
     .unwrap_err();
     assert_eq!(error.to_string(), "cancelled");
+}
+
+#[test]
+fn worktree_dirs_and_files_are_private() {
+    let dir = run(
+        &retained(),
+        ProducerName::ScipTypescript,
+        TrustProfile::Restricted,
+    );
+    let tree = dir.path().join("worktree");
+    let mode = |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&tree.join("src")), 0o700);
+    assert_eq!(mode(&tree.join("pkg")), 0o700);
+    assert_eq!(mode(&tree.join("src/a.js")), 0o600);
+    assert_eq!(mode(&tree.join("package.json")), 0o600);
 }
