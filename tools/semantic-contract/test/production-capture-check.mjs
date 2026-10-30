@@ -1,4 +1,4 @@
-// Integration companion invoked by tests/native_capture.rs with the pinned Rust binary.
+// Integration companion invoked by tests/index/native_capture.rs with the pinned Rust binary.
 import assert from "node:assert/strict";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";

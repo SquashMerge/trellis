@@ -643,9 +643,9 @@ def class_output(db, revision, path):
     return extraction, classes, relations
 
 
-# Port of tests/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
+# Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
 # schema-29 tables, immutable surrogate keys, and current pin normalization.
-# Match tests/cli.rs: check FTS shadow inventory, compare logical corpus cells.
+# Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
 native_source_sets native_source_set_languages native_source_set_dependencies
@@ -785,7 +785,7 @@ def parity_digest(db, revision, physical_root):
     require(output["native_revisions"]["rows"] == 1
             and output["revision_documents"]["rows"] in (1000, 10000),
             "selected native corpus incomplete")
-    # Exact logical corpus equality, including multiplicity, as in tests/cli.rs.
+    # Exact logical corpus equality, including multiplicity, as in tests/daemon/cli.rs.
     # Card keys are unique; equal counts plus both set differences reject missing,
     # extra, duplicate, stale-version, or altered-term FTS rows.
     require(output["head_search_fts"]["rows"] == output["native_version_search_cards"]["rows"],

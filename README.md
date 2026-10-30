@@ -141,7 +141,7 @@ Each tool's `content[0].text` is a deterministic summary of at most 512 UTF-8 by
 schema-valid result is in `structuredContent`. MCP does not execute repository code or trigger
 on-demand indexing, enroll grants, expose an HTTP listener or accept authenticated MCP intake.
 See the [MCP contract](docs/mcp-readonly-pilot-contract.md) for limits and schemas. Run the native
-protocol fixtures with `cargo test --locked --test mcp_protocol`.
+protocol fixtures with `cargo nextest run --locked --features test-support --test mcp -E 'test(/^mcp_protocol::/)'`.
 
 `trellis_call_graph` (#40) answers a rooted, revision-pinned outgoing call graph from one
 `symbolId`: a pinned breadth-first traversal bounded by `depth` (0-5), `maxNodes` (1-150) and

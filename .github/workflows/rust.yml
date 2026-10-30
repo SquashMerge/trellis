@@ -9,12 +9,32 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  # verify's lanes run as separate jobs, so the slowest lane, not their sum on
+  # one runner, sets the wall time. Every lane runs on both platforms; locally,
+  # ./tools/verify with no arguments still runs them all.
+  verify:
+    name: ${{ matrix.job }} (${{ matrix.os }})
     strategy:
-      # One platform's failure must not cancel the other's result.
+      # One job's failure must not cancel the others' results.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        job: [browser, tests, checks]
+        include:
+          # The browser half of the rust lane: debug binaries, the query
+          # performance smoke and the browser suite. Owns `target`.
+          - job: browser
+            lanes: --lane browser
+            workspaces: . -> target
+          # The Rust tests under nextest. Owns `target-test-support`.
+          - job: tests
+            lanes: --lane tests
+            workspaces: . -> target-test-support
+          # The lint half of the rust lane (fmt and both clippy runs, in
+          # `target`) beside the Node and Python lanes.
+          - job: checks
+            lanes: --lane lint --lane semantic --lane cohorts --lane checks
+            workspaces: . -> target
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -27,9 +47,15 @@ jobs:
         with:
           toolchain: 1.99.1
           components: rustfmt, clippy
+      # Linux links with mold, which is much faster than the default linker on
+      # the large test and debug binaries. macOS keeps its default linker.
+      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+        if: runner.os == 'Linux'
+        with:
+          mold-version: 2.42.1
       # The synthetic-cohorts composition helper builds its tree-sitter grammars
-      # in its own target directory under the OS temp dir; cache it with the
-      # main workspace's dependencies.
+      # in its own target directory under the OS temp dir; the checks job
+      # caches it with the workspace's dependencies.
       - name: Locate composition helper target
         run: |
           target=$(node -p 'require("node:path").join(require("node:os").tmpdir(), "trellis-synthetic-composition-cargo-target")')
@@ -37,26 +63,24 @@ jobs:
           echo "TRELLIS_COMPOSITION_TARGET=$target" >> "$GITHUB_ENV"
       # verify runs the Rust tests with nextest (one process per test).
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        if: matrix.job == 'tests'
         with:
           tool: cargo-nextest@0.9.150
-      # verify builds two target directories: the default build (`target`: both
-      # clippy runs and the browser suite's debug binary) and the test-support
-      # build (`target-test-support`: the tests), which is the larger.
+      # Each job caches only the target directory its lanes build, under its
+      # own key, so the jobs never evict each other's caches.
       # Caches are saved only from pushes to the long-lived branches, so a pull
       # request restores its base branch's warm cache and never evicts it
       # (GitHub scopes a PR's cache reads to its own, base and default branch).
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: |
-            . -> target
-            . -> target-test-support
-          cache-directories: ${{ env.COMPOSITION_TARGET }}
+          key: ${{ matrix.job }}
+          workspaces: ${{ matrix.workspaces }}
+          cache-directories: ${{ matrix.job == 'checks' && env.COMPOSITION_TARGET || '' }}
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-')) }}
-      # verify lints the default build and runs the tests once, with test-support hooks.
       # verify provisions the browser packages and the pinned Chromium itself.
-      # On Linux it also installs Chromium's system packages in the background,
-      # since only the browser suite at the end of the rust lane needs them (#244).
-      - run: ./tools/verify
+      # On Linux the browser job also installs Chromium's system packages in the
+      # background, since only the browser suite at its end needs them (#244).
+      - run: ./tools/verify ${{ matrix.lanes }}
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
           TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}

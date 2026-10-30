@@ -10,5 +10,5 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 real-workers = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = '(kind(lib) & test(/^(http::(exceptional_recovery_tests|live_tests)|daemon::registry::selection_tests)::/)) | binary(=mcp_protocol)'
+filter = '(kind(lib) & test(/^(http::(exceptional_recovery_tests|live_tests)|daemon::registry::selection_tests)::/)) | (binary_id(trellis::mcp) & test(/^mcp_protocol::/))'
 test-group = 'real-workers'
