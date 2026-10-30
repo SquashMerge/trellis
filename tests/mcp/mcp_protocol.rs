@@ -14963,7 +14963,7 @@ fn run_hook_child(test: &str) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            test,
+            child_test_name(test).as_str(),
             "--ignored",
             "--test-threads=1",
             "--nocapture",
@@ -15116,4 +15116,10 @@ fn call_graph_cancel_child() {
             tool(&reply, None, true);
             mcp.finish();
         });
+}
+
+/// A child test's libtest name in the grouped test binary, which names this
+/// module's tests `<module>::<test>`.
+fn child_test_name(test: &str) -> String {
+    format!("{}::{test}", module_path!().split_once("::").unwrap().1)
 }

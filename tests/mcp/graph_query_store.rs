@@ -1292,11 +1292,7 @@ fn call_graph_node_hook_fires_once_per_dequeued_node() {
     let socket = dir.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    // The grouped test binary names this test `<module>::<test>`.
-    let child_test = format!(
-        "{}::call_graph_node_hook_child",
-        module_path!().split_once("::").unwrap().1
-    );
+    let child_test = child_test_name("call_graph_node_hook_child");
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -1539,4 +1535,10 @@ fn rejoined_binding_on_edited_workspace_is_a_stale_boundary_with_its_binding() {
     assert_eq!(proof.freshness, s::Freshness::PossiblyStale);
     assert!(warning_keys(&result).contains(&(WarningCode::StaleEvidence, None)));
     assert!(result.partial);
+}
+
+/// A child test's libtest name in the grouped test binary, which names this
+/// module's tests `<module>::<test>`.
+fn child_test_name(test: &str) -> String {
+    format!("{}::{test}", module_path!().split_once("::").unwrap().1)
 }

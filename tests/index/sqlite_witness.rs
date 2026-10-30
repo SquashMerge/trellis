@@ -32,7 +32,7 @@ fn sqlite_writer_child() {
 fn contender(path: &Path) -> i32 {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.arg("--exact")
-        .arg("sqlite_writer_child")
+        .arg(child_test_name("sqlite_writer_child"))
         .env("TRELLIS_WITNESS_LOCK_CHILD", path);
     if path.file_name().is_some_and(|name| name == "requests.db") {
         cmd.env("TRELLIS_WITNESS_QUEUE", "1");
@@ -191,7 +191,7 @@ fn corrupt_index_recreation_child() {
 fn corrupt_index_recreation_preserves_queue_and_replaces_only_index_inode() {
     let outcome = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("corrupt_index_recreation_child")
+        .arg(child_test_name("corrupt_index_recreation_child"))
         .env("TRELLIS_RECREATE_CHILD", "1")
         .output()
         .unwrap();
@@ -285,7 +285,7 @@ fn gc_releases_only_deleted_candidate_witnesses() {
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "gc_releases_only_deleted_candidate_witnesses_child",
+            child_test_name("gc_releases_only_deleted_candidate_witnesses_child").as_str(),
             "--nocapture",
         ])
         .env("TRELLIS_GC_WITNESS_CHILD", "1")
@@ -398,4 +398,10 @@ fn gc_fault_after_parent_sync_reports_error_before_last_lock_removal() {
         roots.index_use_lock(&candidate).exists(),
         "beside-directory use lock is always last"
     );
+}
+
+/// A child test's libtest name in the grouped test binary, which names this
+/// module's tests `<module>::<test>`.
+fn child_test_name(test: &str) -> String {
+    format!("{}::{test}", module_path!().split_once("::").unwrap().1)
 }

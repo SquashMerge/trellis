@@ -45,7 +45,7 @@ fn implicit_home_is_refused_in_isolated_child() {
     let home = fs::canonicalize(root(temp.path())).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("implicit_home_child")
+        .arg(child_test_name("implicit_home_child"))
         .arg("--nocapture")
         .env("HOME", &home)
         .env("TOPOLOGY_IMPLICIT_HOME_CHILD", &home)
@@ -215,7 +215,7 @@ fn marker_race_and_durability() {
         .map(|_| {
             Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("marker_child")
+                .arg(child_test_name("marker_child"))
                 .arg("--nocapture")
                 .env("TOPOLOGY_MARKER_CHILD", &work)
                 .stdout(Stdio::piped())
@@ -562,7 +562,7 @@ fn stale_use_inode_waiters_reopen_before_success() {
     let original = UseGuard::acquire(&path, true, true).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("stale_use_child")
+        .arg(child_test_name("stale_use_child"))
         .arg("--nocapture")
         .env("TOPOLOGY_STALE_USE", &path)
         .stdin(Stdio::piped())
@@ -616,7 +616,7 @@ fn exclusive_deletion_waits_for_shared_process() {
     let path = roots.index_use_lock(&id);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("shared_holder_child")
+        .arg(child_test_name("shared_holder_child"))
         .arg("--nocapture")
         .env("TOPOLOGY_SHARED_HOLDER", &path)
         .stdin(Stdio::piped())
@@ -692,7 +692,7 @@ fn existing_use_lock_replacement_checks_new_inode_and_holder() {
         drop(roots.index_use(&id)?);
         let mut process = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("shared_holder_child")
+            .arg(child_test_name("shared_holder_child"))
             .arg("--nocapture")
             .env("TOPOLOGY_SHARED_HOLDER", &lock)
             .stdin(Stdio::piped())
@@ -1701,4 +1701,10 @@ fn vector_report_is_machine_wide_and_does_not_create_checkout_state() {
     assert_eq!(before, gc_manifest(temp.path()));
     assert!(!roots.cache.join("indexes").exists());
     assert!(!roots.data.exists());
+}
+
+/// A child test's libtest name in the grouped test binary, which names this
+/// module's tests `<module>::<test>`.
+fn child_test_name(test: &str) -> String {
+    format!("{}::{test}", module_path!().split_once("::").unwrap().1)
 }

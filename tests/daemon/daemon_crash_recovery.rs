@@ -63,11 +63,7 @@ fn announce_and_wait_for_kill(line: &str) -> ! {
 /// Run `child_test` in a fresh test-binary process, wait for its hooked
 /// announcement, then SIGKILL it and reap it. Returns the announcement.
 fn run_child_until_hook_then_kill(child_test: &str, state: &Path, root: &Path) -> String {
-    // The grouped test binary names this test `<module>::<test>`.
-    let child_test = format!(
-        "{}::{child_test}",
-        module_path!().split_once("::").unwrap().1
-    );
+    let child_test = child_test_name(child_test);
     let mut child: Child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &child_test, "--nocapture", "--test-threads=1"])
         .env(STATE_ENV, state)
@@ -539,4 +535,10 @@ fn short_cold_journal_does_not_defer_first_activation() {
         let opened = Store::open(roots(&state), identity(&root)).map(|_| ());
         assert!(opened.is_ok(), "{journal_len:?}: {opened:?}");
     }
+}
+
+/// A child test's libtest name in the grouped test binary, which names this
+/// module's tests `<module>::<test>`.
+fn child_test_name(test: &str) -> String {
+    format!("{}::{test}", module_path!().split_once("::").unwrap().1)
 }

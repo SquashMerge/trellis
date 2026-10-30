@@ -1141,7 +1141,7 @@ fn rebuilt_executable_retains_semantic_head_context_without_reusing_evidence() {
     assert_ne!(rebuilt_hash, native.producer.executable_hash);
     let output = std::process::Command::new(&binary)
         .arg("--exact")
-        .arg("semantic_executable_drift_child")
+        .arg(child_test_name("semantic_executable_drift_child"))
         .arg("--nocapture")
         .env("TRELLIS_SEMANTIC_DRIFT_STATE", state.path())
         .env("TRELLIS_SEMANTIC_DRIFT_WORKSPACE", root.path())
@@ -1245,4 +1245,10 @@ fn rebuilt_executable_retains_semantic_head_context_without_reusing_evidence() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(violations.is_empty(), "{violations:?}");
+}
+
+/// A child test's libtest name in the grouped test binary, which names this
+/// module's tests `<module>::<test>`.
+fn child_test_name(test: &str) -> String {
+    format!("{}::{test}", module_path!().split_once("::").unwrap().1)
 }

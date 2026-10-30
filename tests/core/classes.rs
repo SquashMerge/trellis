@@ -13,9 +13,14 @@ use trellis::{
 };
 thread_local! { static GOLDEN_ORDINAL: Cell<usize> = const { Cell::new(0) }; }
 fn golden(catalog: &Catalog) {
+    // libtest names the thread `classes::<test>` in the grouped binary; the
+    // goldens are named by the bare test name.
     let name = std::thread::current()
         .name()
         .unwrap_or("unnamed")
+        .rsplit("::")
+        .next()
+        .unwrap()
         .to_owned();
     let ordinal = GOLDEN_ORDINAL.with(|counter| {
         let n = counter.get();
