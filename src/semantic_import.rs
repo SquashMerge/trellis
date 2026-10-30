@@ -545,16 +545,11 @@ fn module_definition(claim: &CapturedClaim) -> bool {
         descriptor.suffix.enum_value() == Ok(Suffix::Package)
     };
     match (claim.language.as_str(), symbol.scheme.as_str()) {
+        // Admission decoded this claim and rejected any empty marker that does not name its
+        // document under the authenticated package or project root (owner ruling 2026-10-29,
+        // #443), so the marker shape suffices here.
         ("javascript", "scip-typescript") => {
-            !symbol.descriptors.is_empty()
-                && symbol.descriptors.iter().all(package)
-                && symbol
-                    .descriptors
-                    .iter()
-                    .map(|descriptor| descriptor.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("/")
-                    == claim.envelope.relative_path
+            crate::scip_raw::module_roots::typescript_module_path(&symbol).is_some()
         }
         ("python", "scip-python") => {
             symbol
