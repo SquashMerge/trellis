@@ -1039,10 +1039,145 @@ mod search_tests {
     }
 }
 
+/// One call item's binding and evidence fields (#467). Without a selected binding they are
+/// the syntax-only constants: no binding, unresolved, missing evidence, fresh syntax.
+struct CallEvidence {
+    binding: Value,
+    disposition: &'static str,
+    target_id: Value,
+    boundary_reason: Value,
+    evidence_tier: &'static str,
+    semantic_basis: Value,
+    freshness: Value,
+}
+
+fn call_evidence(
+    semantic: Option<&crate::store::CallSemantic>,
+) -> Result<CallEvidence, &'static str> {
+    use crate::graph_query::BoundaryReason;
+    use crate::semantic_evidence::Resolution;
+    let Some(semantic) = semantic else {
+        return Ok(CallEvidence {
+            binding: Value::Null,
+            disposition: "unresolved",
+            target_id: Value::Null,
+            boundary_reason: json!("missingEvidence"),
+            evidence_tier: "syntax",
+            semantic_basis: Value::Null,
+            freshness: json!("fresh"),
+        });
+    };
+    let value = |v: serde_json::Result<Value>| {
+        v.map_err(|_| "store_unavailable: semantic binding projection")
+    };
+    Ok(CallEvidence {
+        binding: value(serde_json::to_value(&semantic.binding))?,
+        disposition: match semantic.boundary_reason {
+            BoundaryReason::Stale => "staleTarget",
+            _ => match semantic.binding.resolution {
+                Resolution::Resolved => "resolved",
+                Resolution::External => "external",
+                Resolution::Ambiguous => "ambiguous",
+                Resolution::Unresolved => "unresolved",
+            },
+        },
+        target_id: json!(semantic.target_id),
+        boundary_reason: value(serde_json::to_value(semantic.boundary_reason))?,
+        evidence_tier: "semantic",
+        semantic_basis: value(serde_json::to_value(&semantic.provenance.basis))?,
+        freshness: value(serde_json::to_value(semantic.provenance.freshness))?,
+    })
+}
+
+/// A semantic coverage or provenance row in the wire's shared `Coverage`/`Provenance` shape.
+fn wire_row<T: serde::Serialize, U: serde::de::DeserializeOwned>(
+    row: &T,
+) -> Result<U, &'static str> {
+    serde_json::to_value(row)
+        .and_then(serde_json::from_value)
+        .map_err(|_| "store_unavailable: semantic evidence projection")
+}
+
+/// Warnings-v1 for the emitted calls (#467): coverage, stale evidence and targets, ambiguous
+/// bindings and, when no producer covers them, `syntaxOnly` carrying the producer note.
+fn call_warnings<'a>(
+    incomplete: bool,
+    semantic: &crate::store::McpSemantic,
+    emitted: impl IntoIterator<Item = &'a crate::store::CallSemantic>,
+) -> Vec<Value> {
+    use crate::semantic_evidence::{Freshness, Resolution};
+    use std::collections::BTreeMap;
+    let mut keys: BTreeMap<(u8, Option<String>), (&str, &str)> = BTreeMap::new();
+    if incomplete {
+        keys.insert(
+            (0, None),
+            (
+                "coverageIncomplete",
+                "Selected syntax coverage is incomplete",
+            ),
+        );
+    }
+    for call in emitted {
+        if call.coverage.selected
+            && matches!(
+                call.coverage.state,
+                crate::semantic_evidence::CoverageState::Failed
+                    | crate::semantic_evidence::CoverageState::Partial
+            )
+        {
+            keys.entry((0, None)).or_insert((
+                "coverageIncomplete",
+                "Selected semantic coverage is incomplete",
+            ));
+        }
+        for proof in &call.proofs {
+            match proof.freshness {
+                Freshness::Stale => {
+                    keys.insert(
+                        (1, Some(proof.id.clone())),
+                        ("staleEvidence", "Returned provenance is stale."),
+                    );
+                }
+                Freshness::PossiblyStale => {
+                    keys.insert(
+                        (1, None),
+                        (
+                            "staleEvidence",
+                            "At least one returned provenance is possibly stale.",
+                        ),
+                    );
+                }
+                Freshness::Fresh => {}
+            }
+        }
+        if call.binding.stale_target == Some(true) {
+            keys.insert(
+                (2, Some(call.binding.provenance_id.clone())),
+                ("staleTarget", "A returned binding has a stale target."),
+            );
+        }
+        if call.binding.resolution == Resolution::Ambiguous {
+            keys.insert(
+                (3, Some(call.binding.provenance_id.clone())),
+                ("bindingAmbiguous", "A returned binding is ambiguous."),
+            );
+        }
+    }
+    if let Some(note) = semantic.note {
+        keys.insert((4, None), ("syntaxOnly", note));
+    }
+    keys.into_iter()
+        .map(|((_, provenance), (code, message))| {
+            json!({"code":code,"message":message,"provenanceId":provenance})
+        })
+        .collect()
+}
+
 /// Calls have priority over optional hints in the complete structured-plus-summary wire budget.
 pub fn outgoing(
     id: &Value,
     result: crate::store::mcp_read::McpOutgoingWithLines,
+    semantic: &crate::store::McpSemantic,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -1087,6 +1222,7 @@ pub fn outgoing(
         // hint clipping is reported per call in `nativeCandidates.omitted`.
         let limited = result.has_more;
         let mut clipped = false;
+        let mut boundary = false;
         for (index, item) in result.calls[..count].iter().enumerate() {
             let text = item.selected.callee_text.as_deref();
             clipped |= item.selected.callee_text_truncated;
@@ -1130,6 +1266,27 @@ pub fn outgoing(
                 Some(text) => format!("{owner_display}@byte:{}:{text}", call.range.start),
                 None => format!("{owner_display}@byte:{}", call.range.start),
             };
+            let bound = semantic.call(index);
+            if let Some(bound) = bound {
+                let c: crate::native_evidence::Coverage = wire_row(&bound.coverage)?;
+                coverage.insert(
+                    (
+                        c.producer_id.clone(),
+                        c.language.clone(),
+                        c.source_set_id.clone(),
+                        c.document_path.clone(),
+                        c.revision_id.clone(),
+                    ),
+                    c,
+                );
+                for proof in &bound.proofs {
+                    provenance.insert(proof.id.clone(), wire_row(proof)?);
+                }
+            }
+            boundary |= bound.is_none_or(|bound| {
+                bound.boundary_reason != crate::graph_query::BoundaryReason::None
+            });
+            let evidence = call_evidence(bound)?;
             calls.push(json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
                 "ordinal":call.ordinal,"doc":document_ref(&refs, &item.source.document).ok_or("store_unavailable: missing call ref")?,
                 "lines":item.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
@@ -1137,9 +1294,10 @@ pub fn outgoing(
                 "calleeText":text,"calleeTextTruncated":item.selected.callee_text_truncated,
                 "displayKey":label,"nativeCandidates":{"items":suggestions,
                     "omitted":item.selected.omitted.map(|unexamined| unexamined + item.selected.candidates.len().saturating_sub(n)),
-                    "complete":false},"binding":null,"disposition":"unresolved",
-                "targetId":null,"boundaryReason":"missingEvidence",
-                "evidenceTier":"syntax","semanticBasis":null,"freshness":"fresh","staleBecause":[]}));
+                    "complete":false},"binding":evidence.binding,"disposition":evidence.disposition,
+                "targetId":evidence.target_id,"boundaryReason":evidence.boundary_reason,
+                "evidenceTier":evidence.evidence_tier,"semanticBasis":evidence.semantic_basis,
+                "freshness":evidence.freshness,"staleBecause":[]}));
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
         let language_order = |language: &str| match language {
@@ -1175,19 +1333,17 @@ pub fn outgoing(
         } else {
             None
         };
-        let mut warnings = vec![];
-        if incomplete {
-            warnings.push(json!({"code":"coverageIncomplete",
-                "message":"Selected syntax coverage is incomplete","provenanceId":null}));
-        }
-        warnings.push(json!({"code":"syntaxOnly",
-            "message":"Only syntax evidence is available","provenanceId":null}));
+        let warnings = call_warnings(
+            incomplete,
+            semantic,
+            (0..count).filter_map(|index| semantic.call(index)),
+        );
         Ok(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,"data":{"symbolId":result.owner.selected.declaration.syntax_id,
                 "displayKey":owner_display,"calls":calls,"documents":documents,"coverage":coverage,
                 "provenance":provenance.into_values().collect::<Vec<_>>()},
-            "warnings":warnings,"partial":incomplete || truncated || count > 0,
+            "warnings":warnings,"partial":incomplete || truncated || boundary,
             "truncated":truncated,"truncationReason":reason}),
         )
     };
@@ -1298,10 +1454,12 @@ fn fit_call_graph(
     Ok(retained)
 }
 
-/// Project a name-matched reverse lookup without implying a semantic binding.
+/// Project a name-matched reverse lookup. Each caller carries its own call's selected
+/// binding, if any; the name match itself establishes no binding.
 pub fn incoming(
     id: &Value,
     result: crate::store::mcp_read::McpIncomingWithLines,
+    semantic: &crate::store::McpSemantic,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -1335,7 +1493,8 @@ pub fn incoming(
             provenance.insert(row.id.clone(), row.clone());
         }
         let mut callers = Vec::new();
-        for item in &result.calls[..count] {
+        let mut boundary = false;
+        for (index, item) in result.calls[..count].iter().enumerate() {
             let call = &item.call;
             let version = &item.source.document;
             if call.document != version.document
@@ -1368,15 +1527,37 @@ pub fn incoming(
                 item.coverage.clone(),
             );
             provenance.insert(item.provenance.id.clone(), item.provenance.clone());
+            let bound = semantic.call(index);
+            if let Some(bound) = bound {
+                let c: crate::native_evidence::Coverage = wire_row(&bound.coverage)?;
+                coverage.insert(
+                    (
+                        c.producer_id.clone(),
+                        c.language.clone(),
+                        c.source_set_id.clone(),
+                        c.document_path.clone(),
+                        c.revision_id.clone(),
+                    ),
+                    c,
+                );
+                for proof in &bound.proofs {
+                    provenance.insert(proof.id.clone(), wire_row(proof)?);
+                }
+            }
+            boundary |= bound.is_none_or(|bound| {
+                bound.boundary_reason != crate::graph_query::BoundaryReason::None
+            });
+            let evidence = call_evidence(bound)?;
             callers.push(
                 json!({"callId":call.id,"ownerSyntaxId":call.owner_syntax_id,
                 "callerDisplayKey":display_key(&item.caller),"callerRole":item.caller.role,
                 "doc":document_ref(&refs, version).ok_or("store_unavailable: missing caller ref")?,
                 "lines":item.source.lines.map(|lines| json!({"start":lines.start,"end":lines.end})),
                 "range":call.range,"calleeRange":callee_range,"calleeText":item.callee_text,
-                "matchedBy":"name","binding":null,"disposition":"unresolved","targetId":null,
-                "boundaryReason":"missingEvidence","evidenceTier":"syntax","semanticBasis":null,
-                "freshness":"fresh","staleBecause":[]}),
+                "matchedBy":"name","binding":evidence.binding,"disposition":evidence.disposition,
+                "targetId":evidence.target_id,"boundaryReason":evidence.boundary_reason,
+                "evidenceTier":evidence.evidence_tier,"semanticBasis":evidence.semantic_basis,
+                "freshness":evidence.freshness,"staleBecause":[]}),
             );
         }
         let mut coverage: Vec<_> = coverage.into_values().collect();
@@ -1410,13 +1591,14 @@ pub fn incoming(
         } else {
             None
         };
-        let mut warnings = Vec::new();
-        if incomplete {
-            warnings.push(json!({"code":"coverageIncomplete",
-                "message":"Selected syntax coverage is incomplete","provenanceId":null}));
-        }
-        warnings.push(json!({"code":"syntaxOnly",
-            "message":"Only syntax evidence is available","provenanceId":null}));
+        let warnings = call_warnings(
+            incomplete,
+            semantic,
+            (0..count).filter_map(|index| semantic.call(index)),
+        );
+        let incomplete = warnings
+            .first()
+            .is_some_and(|warning| warning["code"] == "coverageIncomplete");
         Ok(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
             "evidenceBasis":basis,"data":{
@@ -1427,7 +1609,7 @@ pub fn incoming(
                 "callers":callers,"documents":documents,"coverage":coverage,
                 "scopeCoverage":language_status(&result.scope),
                 "provenance":provenance.into_values().collect::<Vec<_>>()},
-            "warnings":warnings,"partial":incomplete || truncated || count > 0,
+            "warnings":warnings,"partial":incomplete || truncated || boundary,
             "truncated":truncated,"truncationReason":reason}),
         )
     };
@@ -1510,7 +1692,18 @@ mod outgoing_tests {
         catching_up: bool,
         modern: bool,
     ) -> Option<Value> {
-        outgoing(id, with_lines(result), root, catching_up, modern).unwrap()
+        outgoing(
+            id,
+            with_lines(result),
+            &syntax_only(),
+            root,
+            catching_up,
+            modern,
+        )
+        .unwrap()
+    }
+    pub(super) fn syntax_only() -> crate::store::McpSemantic {
+        crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0)
     }
     pub(super) fn owner() -> McpDeclaration {
         let document = DocumentKey {
@@ -1587,7 +1780,7 @@ mod outgoing_tests {
             })
         };
         let root = std::path::Path::new("/workspace");
-        let valid = outgoing(&json!(1), make_result(), root, false, true)
+        let valid = outgoing(&json!(1), make_result(), &syntax_only(), root, false, true)
             .unwrap()
             .unwrap();
         let entry = &valid["data"]["documents"]
@@ -1603,7 +1796,7 @@ mod outgoing_tests {
         // The owner proof is real and present in the response, but it is not
         // the independent target declaration's proof.
         wrong.calls[0].candidate_documents[0].provenance_id = owner().provenance[0].id.clone();
-        let failure = outgoing(&json!(1), wrong, root, false, true).unwrap_err();
+        let failure = outgoing(&json!(1), wrong, &syntax_only(), root, false, true).unwrap_err();
         assert!(failure.starts_with("store_unavailable"));
     }
 
@@ -1956,6 +2149,7 @@ mod incoming_tests {
         incoming(
             &json!(1),
             result,
+            &crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0),
             std::path::Path::new("/workspace"),
             false,
             modern,

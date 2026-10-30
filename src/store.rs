@@ -8,12 +8,17 @@ mod published_admission;
 pub mod requests;
 mod search;
 mod search_startup;
+mod semantic_display;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
     SearchHeadChanged, SearchHeadDelta,
 };
 pub use search_startup::RecentSearchCheckout;
+pub use semantic_display::{
+    CallSemantic, LANGUAGE_NOTE, MULTIPLE_PRODUCERS_NOTE, McpSemantic, NO_PRODUCER_NOTE,
+    ProducerChoice, ProducerNotPublished,
+};
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
@@ -2733,7 +2738,9 @@ impl EvidenceResponse {
         Ok(value)
     }
     pub fn status(&self) -> Result<IndexStatus> {
-        self.store.read_status_for(&self.db, true)
+        let mut status = self.store.read_status_for(&self.db, true)?;
+        semantic_display::status_semantics(&self.db, &mut status)?;
+        Ok(status)
     }
     pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
         self.selected(Some(pin))?;
@@ -14201,6 +14208,8 @@ impl Store {
             evidence_format: (row.0 == i64::from(DATABASE_SCHEMA_VERSION) && row.6 > 0)
                 .then(|| EVIDENCE_FORMAT.to_owned()),
             watcher: None,
+            semantic_producer_id: None,
+            semantic_note: None,
         })
     }
     fn ensure_public_read_ready(&self) -> Result<()> {
@@ -14738,7 +14747,11 @@ impl Store {
             .map_err(|error| self.report_index_failure(error))?;
         before_snapshot(&db)?;
         drop(db);
-        self.with_evidence(|db| self.read_status(db))
+        self.with_evidence(|db| {
+            let mut status = self.read_status(db)?;
+            semantic_display::status_semantics(db, &mut status)?;
+            Ok(status)
+        })
     }
     pub fn publish(
         &self,
@@ -21489,8 +21502,17 @@ impl Store {
         let Some(_projection_id) = projection_id else {
             return Ok(None);
         };
-        let mut symbols = self.selected_graph_document_for(tx, path, &selected)?.nodes;
+        let document = self.selected_graph_document_for(tx, path, &selected)?;
+        let mut symbols = document.nodes;
         symbols.retain(|node| matches!(node.kind, SymbolKind::Method | SymbolKind::Function));
+        // `provenance.semantic` reports the sole published producer's coverage (#467).
+        semantic_display::mark_document_symbols(
+            tx,
+            &selected,
+            &document.file.language,
+            path,
+            &mut symbols,
+        )?;
         symbols.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let mut items = Vec::new();
         for symbol in symbols.into_iter().take(1001) {
@@ -21906,7 +21928,7 @@ impl Store {
             return Ok(None);
         };
         let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
-        let seed = seed_document
+        let mut seed = seed_document
             .nodes
             .iter()
             .find(|symbol| symbol.id == query.seed)
@@ -21953,6 +21975,14 @@ impl Store {
                 regions.insert(id, region);
             }
         }
+        let semantic = semantic_display::view_semantics(
+            tx,
+            &selected,
+            query.semantic_producer_id.as_deref(),
+            &mut seed,
+            &seed_document.file.language,
+            &mut calls,
+        )?;
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
@@ -21966,6 +21996,7 @@ impl Store {
             } else {
                 vec![]
             },
+            semantic,
         }))
     }
 }

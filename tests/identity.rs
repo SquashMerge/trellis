@@ -46,6 +46,7 @@ fn real_syntax_rename_retires_old_identity_and_cached_graph_preserves_call_order
         max_calls: 3,
         include_callbacks: false,
         exclude_paths: vec![],
+        semantic_producer_id: None,
     };
     let view = store.query_view(&query).unwrap().unwrap();
     assert!(view.truncated);
