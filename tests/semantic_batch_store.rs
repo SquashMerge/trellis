@@ -2341,7 +2341,7 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
 #[test]
 fn unshared_target_status_matches_memory_when_destination_declarations_change() {
     type Files = &'static [(&'static str, &'static str)];
-    let edits: [(&str, Files, &[&str]); 5] = [
+    let edits: [(&str, Files, &[&str]); 6] = [
         (
             "target renamed",
             &[("src/B.js", "function other(){ }\n")],
@@ -2363,6 +2363,13 @@ fn unshared_target_status_matches_memory_when_destination_declarations_change() 
             &[("src/C.js", "function target(){ }\n")],
             &[],
         ),
+        // Unchanged sources, but the destination measures B's target under another syntax
+        // ID: a destination-only target whose captured status the remaining pass writes.
+        (
+            "target re-measured",
+            &[("src/C.js", "function other(){ }\n")],
+            &[],
+        ),
     ];
     for (case, writes, removals) in edits {
         let world = definitions_world();
@@ -2373,7 +2380,10 @@ fn unshared_target_status_matches_memory_when_destination_declarations_change() 
             fs::remove_file(world.root.join(path)).unwrap();
         }
         world.republish();
-        let mutations = DestinationMutations::default();
+        let mutations = DestinationMutations {
+            renamed_b_target: case == "target re-measured",
+            ..Default::default()
+        };
         let (mut admitted, sealed, counters) = world
             .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
             .unwrap();
@@ -2409,6 +2419,16 @@ fn unshared_target_status_matches_memory_when_destination_declarations_change() 
             counters.staged_row_attempts["nat_declarations"], status as u64,
             "{case}"
         );
+        let destination_only: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM g_definitions g WHERE side=1 AND NOT EXISTS \
+                 (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
+                 AND c.syntax_id=g.syntax_id)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(destination_only > 0, case == "target re-measured", "{case}");
     }
 }
 

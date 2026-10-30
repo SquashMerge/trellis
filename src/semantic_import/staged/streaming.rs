@@ -1381,7 +1381,12 @@ pub(super) fn join_document(
         )?;
     }
     settle_join_references(store, &mut index, &mut sink)?;
-    emit_type_relationships(store, &index, &mut sink)?;
+    let related = emit_type_relationships(store, &index, &mut sink);
+    // A role-site tree the relationships did not take ends with this join.
+    if let Some(local) = &store.local_claims {
+        local.parsed.borrow_mut().take();
+    }
+    related?;
     Ok(sink.into_facts())
 }
 

@@ -485,10 +485,11 @@ struct DocumentClaims {
     symbol_kinds: BTreeMap<String, Option<i64>>,
     /// Claim index and staged `claim_id`, by proof ID.
     by_proof: BTreeMap<String, (usize, i64)>,
-    /// The syntax tree role sites were last read from, with the group text it parsed, until
-    /// the same join takes it for the document's direct type bases. One tree at a time, as
-    /// when each step parsed its own; tree-sitter memory is outside the live budget.
-    parsed: RefCell<Option<(Rc<str>, tree_sitter::Tree)>>,
+    /// The syntax tree role sites were last read from, and the address and length of the
+    /// group text it parsed, until the same document join takes it for the document's direct
+    /// type bases; `streaming::join_document` drops any it left. One tree at a time, as when
+    /// each step parsed its own (tree-sitter memory is outside the live budget, as before).
+    parsed: RefCell<Option<((usize, usize), tree_sitter::Tree)>>,
     reservation: RefCell<Reservation>,
 }
 
@@ -1187,7 +1188,8 @@ impl<'a> JoinStore for StagedSide<'a> {
             &mut |bytes| operation.grow(bytes()?),
         )?;
         if let Some(local) = &self.local_claims {
-            *local.parsed.borrow_mut() = tree.map(|tree| (group.text.clone(), tree));
+            let text = (group.text.as_ptr() as usize, group.text.len());
+            *local.parsed.borrow_mut() = tree.map(|tree| (text, tree));
         }
         Ok(sites)
     }
@@ -1197,7 +1199,8 @@ impl<'a> JoinStore for StagedSide<'a> {
         let (text, tree) = local.parsed.borrow_mut().take()?;
         // Only the tree of this view's own document group text.
         let group = self.local_group.as_ref()?;
-        (self.document.as_ref() == Some(document) && Rc::ptr_eq(&text, &group.text)).then_some(tree)
+        let current = (group.text.as_ptr() as usize, group.text.len());
+        (self.document.as_ref() == Some(document) && text == current).then_some(tree)
     }
 
     fn charge(&self, units: usize) -> Result<()> {

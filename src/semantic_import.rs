@@ -3385,6 +3385,9 @@ pub struct DestinationMutations {
     pub duplicate_b_target: bool,
     pub duplicate_a_reference: bool,
     pub missing_a_reference: bool,
+    /// B's `target` declaration gets another syntax ID: a destination target that is not a
+    /// captured one.
+    pub renamed_b_target: bool,
 }
 
 impl DestinationMutations {
@@ -3402,6 +3405,7 @@ impl DestinationMutations {
                 .is_some(),
             missing_a_reference: std::env::var_os("TRELLIS_TEST_SEMANTIC_MISSING_A_REFERENCE")
                 .is_some(),
+            renamed_b_target: std::env::var_os("TRELLIS_TEST_SEMANTIC_RENAMED_B_TARGET").is_some(),
         }
     }
 
@@ -3429,6 +3433,17 @@ impl DestinationMutations {
             let mut competing = reference;
             competing.id = format!("{}-candidate-only", competing.id);
             references.push(competing);
+        }
+        if self.renamed_b_target
+            && let Some(declaration) = declarations
+                .iter_mut()
+                .find(|d| d.document.path == "src/B.js" && d.name.as_deref() == Some("target"))
+        {
+            // Another canonical syntax ID: flip the last hex digit.
+            let last = declaration.syntax_id.pop().unwrap_or('0');
+            declaration
+                .syntax_id
+                .push(if last == '0' { '1' } else { '0' });
         }
         if self.missing_a_reference {
             references.retain(|r| !(r.document.path == "src/A.js" && r.spelling == "target"));
