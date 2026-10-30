@@ -23,6 +23,8 @@ const STAGE_DB: &str = "stage.db";
 /// `out_coverage.ord` (`doc`) for every output row. Native syntax IDs and 64-hex provenance IDs
 /// are stored as their bytes when canonical, as text otherwise (`staged::codec`).
 /// `nat_docs.reserve` is a document's native load reservation, filled on its first load.
+/// `g_definitions.callable` is the owner declaration's `TargetCallable` code (#470): a function
+/// of `(side, owner_doc, syntax_id)`, so every row of one definition target carries the same value.
 ///
 /// The join emits `out_*` one document at a time, so every table's `ord` is document-major and
 /// the publisher reads each family with one cursor in `ord` order. Within one document each
@@ -45,9 +47,8 @@ CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), genera
 CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
 CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, reserve INTEGER, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
 CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id BLOB NOT NULL, n INTEGER NOT NULL, named INTEGER NOT NULL, name_ok INTEGER NOT NULL, PRIMARY KEY(rev, doc_ord, syntax_id, n)) WITHOUT ROWID;
-CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID;
+CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, callable INTEGER NOT NULL CHECK(callable IN (0,1,2)), PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID;
 CREATE INDEX g_definitions_owner ON g_definitions(side,owner_doc,syntax_id);
-CREATE TABLE g_callables(side INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, callable INTEGER NOT NULL CHECK(callable IN (1,2)), PRIMARY KEY(side,owner_doc,syntax_id)) WITHOUT ROWID;
 CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL);
 CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_doc);
 CREATE INDEX g_methods_target ON g_methods(side,symbol,local_doc);
@@ -66,7 +67,6 @@ CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, doc INTEGER NOT NUL
 pub const JOIN_TABLES: &[&str] = &[
     "nat_declarations",
     "g_definitions",
-    "g_callables",
     "g_methods",
     "w_docs",
     "out_coverage",

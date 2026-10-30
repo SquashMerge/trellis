@@ -2519,7 +2519,6 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             "nat_docs",
             "nat_declarations",
             "g_definitions",
-            "g_callables",
             "g_methods",
             "w_docs",
             "out_coverage",

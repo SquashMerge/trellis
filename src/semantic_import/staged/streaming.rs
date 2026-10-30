@@ -36,8 +36,9 @@ fn definitions_sql(filtered: bool) -> String {
 }
 
 /// The callable kind discovery recorded for one exact definition (#470); absent is `Other`.
-const TARGET_CALLABLE_SQL: &str = "SELECT c.callable FROM g_callables c JOIN sources s \
-    ON s.ord=c.owner_doc WHERE c.side=?1 AND s.language=?2 AND s.path=?3 AND c.syntax_id=?4";
+/// Every row of one target carries the same kind, so any one answers.
+const TARGET_CALLABLE_SQL: &str = "SELECT g.callable FROM g_definitions g JOIN sources s \
+    ON s.ord=g.owner_doc WHERE g.side=?1 AND s.language=?2 AND s.path=?3 AND g.syntax_id=?4 LIMIT 1";
 
 fn methods_sql(target: bool, filtered: bool) -> String {
     let key = if target {
@@ -487,24 +488,6 @@ impl GlobalDiscoverySink for GlobalWriter<'_> {
         callable: TargetCallable,
     ) -> Result<()> {
         let (language, path) = local_columns(&key);
-        if callable != TargetCallable::Other {
-            // A function of the owner document's native declaration: repeats agree.
-            self.global.ctx.row("g_callables")?;
-            self.global
-                .ctx
-                .conn
-                .prepare_cached(
-                    "INSERT INTO g_callables VALUES(?1,(SELECT ord FROM sources WHERE language=?2 \
-                 AND path=?3),?4,?5) ON CONFLICT(side,owner_doc,syntax_id) DO NOTHING",
-                )?
-                .execute(params![
-                    self.global.side,
-                    document.language,
-                    document.path,
-                    codec::sid(&syntax_id),
-                    callable as i64
-                ])?;
-        }
         if !self.targets.contains(&syntax_id) {
             self.targets_reservation.grow(sizes::sum(&[
                 sizes::map_entries::<String, ()>(1)?,
@@ -514,9 +497,9 @@ impl GlobalDiscoverySink for GlobalWriter<'_> {
         }
         self.global.ctx.row("g_definitions")?;
         self.global.ctx.conn.prepare_cached(&format!(
-            "INSERT INTO g_definitions VALUES(?1,?2,{LOCAL_DOC},(SELECT ord FROM sources WHERE language=?5 AND path=?6),?7,?8) \
+            "INSERT INTO g_definitions VALUES(?1,?2,{LOCAL_DOC},(SELECT ord FROM sources WHERE language=?5 AND path=?6),?7,?8,?9) \
              ON CONFLICT(side,symbol,local_doc,owner_doc,syntax_id) DO UPDATE SET common_compatible=MAX(common_compatible,excluded.common_compatible)",
-        ))?.execute(params![self.global.side,key.0,language,path,document.language,document.path,codec::sid(&syntax_id),common_compatible])?;
+        ))?.execute(params![self.global.side,key.0,language,path,document.language,document.path,codec::sid(&syntax_id),common_compatible,callable as i64])?;
         Ok(())
     }
 }
