@@ -53,6 +53,13 @@ jobs:
         if: runner.os == 'Linux'
         with:
           mold-version: 2.42.1
+      # Rust on x86_64 Linux links with its bundled rust-lld by default, which
+      # bypasses the system `ld` that setup-mold replaces. Turn that off and ask
+      # the C compiler driver for mold explicitly. This is set before
+      # rust-cache, so it is part of the Linux cache keys.
+      - name: Link Rust with mold
+        if: runner.os == 'Linux'
+        run: echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       # The synthetic-cohorts composition helper builds its tree-sitter grammars
       # in its own target directory under the OS temp dir; the checks job
       # caches it with the workspace's dependencies.
@@ -77,6 +84,9 @@ jobs:
           workspaces: ${{ matrix.workspaces }}
           cache-directories: ${{ matrix.job == 'checks' && env.COMPOSITION_TARGET || '' }}
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-')) }}
+      - name: Mark the start of this job's builds
+        if: runner.os == 'Linux'
+        run: touch "$RUNNER_TEMP/build-start"
       # verify provisions the browser packages and the pinned Chromium itself.
       # On Linux the browser job also installs Chromium's system packages in the
       # background, since only the browser suite at its end needs them (#244).
@@ -84,3 +94,25 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
           TRELLIS_BROWSER_SYSTEM_DEPS: ${{ runner.os == 'Linux' && '1' || '' }}
+      # Every ELF executable or shared object this job linked must name mold in
+      # its .comment section (rust-lld would name LLD instead).
+      - name: Confirm mold linked this job's binaries
+        if: runner.os == 'Linux'
+        run: |
+          count=0
+          for file in $(find target target-test-support -type f -perm -u+x -newer "$RUNNER_TEMP/build-start" 2>/dev/null); do
+            readelf -h "$file" >/dev/null 2>&1 || continue
+            comment=$(readelf -p .comment "$file" 2>&1 || true)
+            case $comment in
+              *mold*) ;;
+              *) printf 'not linked by mold: %s\n%s\n' "$file" "$comment" >&2; exit 1 ;;
+            esac
+            count=$((count + 1))
+            example=$file
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "no ELF files were linked in this job"
+          else
+            echo "mold linked all $count ELF files built in this job, e.g. $example:"
+            readelf -p .comment "$example"
+          fi
