@@ -391,7 +391,8 @@ impl StateDir {
     /// recorded leader is still the process that started it. A run directory
     /// whose record fails its closed parse is removed; one that cannot be read
     /// for another reason is left and reported. A pickup
-    /// directory that no request names is removed.
+    /// directory that no request names is removed. The inputs an abandoned run
+    /// kept are stripped by the first sweep after its request settles.
     pub fn sweep(
         &self,
         this_daemon: &DaemonIdentity,
@@ -425,7 +426,15 @@ impl StateDir {
                     continue;
                 }
             };
-            if record.state.is_terminal() || record.daemon == *this_daemon {
+            if record.state.is_terminal() {
+                // An abandoned run kept its import inputs for a pending request; they go
+                // once no request names the directory.
+                if record.outcome.as_deref() == Some("abandoned") && !kept(&dir) {
+                    self.strip_to_record(&run_id)?;
+                }
+                continue;
+            }
+            if record.daemon == *this_daemon {
                 continue;
             }
             if let Some(process) = record.process

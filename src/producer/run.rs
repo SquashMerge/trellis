@@ -743,8 +743,8 @@ impl ProducerOwner {
             Err(error) if active.control().request_id.is_some() => {
                 // The import is accepted but its outcome is unknown (the queue stayed busy
                 // or the runtime closed). The request still reads `out/` and `batch/`, and
-                // the record stays `importing`; the sweep recovers it once the request is
-                // terminal.
+                // the record stays `importing`; the sweep abandons it and strips those
+                // directories once the request is no longer pending.
                 cleanup.armed = false;
                 return Err(error);
             }

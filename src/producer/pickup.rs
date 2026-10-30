@@ -121,6 +121,12 @@ pub fn decide_with_retry(
     }
 }
 
+/// What `reconcile` found for the request behind a failed `lastImported`.
+enum Reconcile {
+    Settled,
+    Pending,
+}
+
 /// The checkout's pickup workflow: the only writer of `pickup.json`.
 #[derive(Clone, Default)]
 pub struct PickupOwner {
@@ -316,16 +322,67 @@ impl PickupOwner {
         let Some(last) = &entry.last_imported else {
             return false;
         };
+        let sha256 = last.sha256.clone();
         let Ok(revision) = head_revision(store) else {
+            return false;
+        };
+        let mut config = config;
+        match self.reconcile(store, &state, &mut config, producer) {
+            Ok(Reconcile::Settled) => {}
+            Ok(Reconcile::Pending) | Err(_) => return false,
+        }
+        let Some(entry) = config.entries.iter().find(|e| e.producer == producer) else {
             return false;
         };
         decide_with_retry(
             entry,
-            &last.sha256,
+            &sha256,
             &revision,
             now_millis(),
             Intervals::current().retry_ms,
         ) == Decision::Import
+    }
+
+    /// Bring a failed `lastImported` that names a request in line with that request's row: a
+    /// lost wait is not a verdict. A done row is recorded as done, a failed one with its typed
+    /// code, and a queued or running one holds back any new import. A vanished row changes
+    /// nothing, and an unreadable one is an error, so no second import starts on a guess.
+    fn reconcile(
+        &self,
+        store: &Store,
+        state: &StateDir,
+        config: &mut PickupConfig,
+        producer: &str,
+    ) -> Result<Reconcile> {
+        let Some(last) = config
+            .entries
+            .iter()
+            .find(|e| e.producer == producer)
+            .and_then(|e| e.last_imported.clone())
+        else {
+            return Ok(Reconcile::Settled);
+        };
+        let Some(id) = last.request_id.clone().filter(|_| last.state == "failed") else {
+            return Ok(Reconcile::Settled);
+        };
+        let Some(row) = import::read_request(store, &id)? else {
+            return Ok(Reconcile::Settled);
+        };
+        let (new_state, code) = match row.state.as_str() {
+            "done" => ("done", None),
+            "failed" => (
+                "failed",
+                Some(row.error_code.unwrap_or_else(|| "index_failed".into())),
+            ),
+            _ => return Ok(Reconcile::Pending),
+        };
+        if last.state != new_state || last.error_code != code {
+            let mut next = last;
+            next.state = new_state.into();
+            next.error_code = code;
+            self.record_last(state, config, producer, next)?;
+        }
+        Ok(Reconcile::Settled)
     }
 
     /// Configure the producer's artifact and import it now, as an explicit owner action.
@@ -393,7 +450,8 @@ impl PickupOwner {
     }
 
     /// Import the configured artifact. `force` skips the decision table, as the set command
-    /// does; an automatic trigger passes `false`. A skipped import replies `state: skipped`.
+    /// does; an automatic trigger passes `false`. A skipped import replies `state: skipped`; an
+    /// import held by a pending request replies `producer_busy` and records nothing.
     pub fn import(
         &self,
         store: &Store,
@@ -418,6 +476,19 @@ impl PickupOwner {
         let mut config = state
             .read_pickup_config()?
             .ok_or_else(|| anyhow::anyhow!("{}: no pickup configured", super::NOT_FOUND))?;
+        if !force
+            && matches!(
+                self.reconcile(store, state, &mut config, producer)?,
+                Reconcile::Pending
+            )
+        {
+            // Not a verdict: the artifact was not judged, so the watcher keeps reading it
+            // until the request settles. Nothing is recorded and no request starts.
+            anyhow::bail!(
+                "{}: an earlier import is still pending",
+                super::PRODUCER_BUSY
+            );
+        }
         let entry = config
             .entries
             .iter()
@@ -429,7 +500,9 @@ impl PickupOwner {
         Self::wait_ready(scheduler)?;
         let generation_id = Uuid::new_v4().simple().to_string();
         let dir = state.create_pickup_dir(&generation_id)?;
-        // The directory goes on every exit, whatever the outcome.
+        // Set once the queue accepts the import: the request then owns the directory's batch.
+        let mut accepted: Option<LastImported> = None;
+        // The directory goes on every exit before acceptance, whatever the outcome.
         let result = (|| -> Result<(Value, Option<LastImported>)> {
             let copied = batch::copy_artifact(Path::new(&entry.artifact), &dir);
             let (sha256, _) = match copied {
@@ -491,7 +564,17 @@ impl PickupOwner {
             };
             let options =
                 import::options_for(&written, GenerationOrigin::OwnerPickup, &generation_id)?;
-            let outcome = import::submit_and_wait(store, scheduler, &options)?;
+            let request_id = import::submit(scheduler, &options)?;
+            accepted = Some(LastImported {
+                sha256: sha256.clone(),
+                source_revision: revision.clone(),
+                request_id: Some(request_id.clone()),
+                state: "failed".into(),
+                error_code: None,
+                attempted_at,
+            });
+            import::test_wait_fault()?;
+            let outcome = import::wait(store, scheduler, &options, request_id)?;
             let last = LastImported {
                 sha256: sha256.clone(),
                 source_revision: revision.clone(),
@@ -513,16 +596,46 @@ impl PickupOwner {
             });
             Ok((reply, Some(last)))
         })();
-        let _ = state.remove_pickup_dir(&generation_id);
+        let result = match (result, accepted) {
+            (Err(error), Some(mut last)) => {
+                // The wait ended before the accepted request settled: the request still
+                // reads the batch, so the directory stays and the sweep reclaims it once
+                // the request is terminal. The unknown outcome is recorded as a failed
+                // attempt naming the request; a later trigger reconciles it with the
+                // request's row and imports again only if that row no longer exists.
+                let message = format!("{error:#}");
+                let class = message.split(':').next().unwrap_or(&message);
+                last.error_code = Some(class.chars().take(120).collect());
+                let _ = self.record_last(state, &mut config, producer, last);
+                return Err(error);
+            }
+            (result, _) => {
+                let _ = state.remove_pickup_dir(&generation_id);
+                result
+            }
+        };
         let (reply, last) = result?;
-        if let Some(last) = last
-            && !self.closed.load(std::sync::atomic::Ordering::Acquire)
+        if let Some(last) = last {
+            self.record_last(state, &mut config, producer, last)?;
+        }
+        Ok(reply)
+    }
+
+    /// Record `last` for `producer` unless this owner is retired.
+    fn record_last(
+        &self,
+        state: &StateDir,
+        config: &mut PickupConfig,
+        producer: &str,
+        last: LastImported,
+    ) -> Result<()> {
+        if !self.closed.load(std::sync::atomic::Ordering::Acquire)
             && let Some(entry) = config.entries.iter_mut().find(|e| e.producer == producer)
         {
             entry.last_imported = Some(last);
-            state.write_pickup_config(&config)?;
+            state.write_pickup_config(config)?;
         }
-        Ok(reply)
+        Ok(())
     }
 }
 

@@ -408,6 +408,14 @@ fn sweep_keeps_dirs_in_keep_set() {
         RunState::Failed
     );
     kill_group(child);
+
+    // Once no request names the directory, the next sweep strips what was kept.
+    let report = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert!(report.abandoned_runs.is_empty());
+    assert!(dir.join("run.json").exists());
+    assert!(!dir.join("out").exists() && !dir.join("batch").exists());
 }
 
 #[test]

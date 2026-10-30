@@ -328,3 +328,49 @@ fn pickup_config_survives_daemon_restart() {
     stop_daemon(&checkout.home);
     assert_eq!(pickup_status(&checkout, "scip-java"), Value::Null);
 }
+
+#[test]
+fn lost_pickup_wait_keeps_the_batch_until_the_request_settles() {
+    let checkout = start_checkout(
+        workspace,
+        &[(
+            "TRELLIS_TEST_PRODUCER_FAIL_WAIT".to_owned(),
+            "unused".to_owned(),
+        )],
+    );
+    let (tripwire, _marker) = tripwire_dir(checkout.temp.path());
+    let artifact = java_artifact(&checkout, "index.scip");
+    let before = status(&checkout)["head"]["indexRevision"].as_u64().unwrap();
+    let output = pickup(
+        &checkout,
+        &tripwire,
+        &[
+            "--producer",
+            "scip-java",
+            "--artifact",
+            artifact.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("storage_busy"), "{stderr}");
+
+    // The accepted request still publishes, and its inputs are still there.
+    trellis::testing::wait_until("import published", || {
+        status(&checkout)["head"]["indexRevision"].as_u64().unwrap() != before
+    });
+    let pickups = state_dir(&checkout).join("pickups");
+    let dirs: Vec<_> = fs::read_dir(&pickups)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    assert!(dirs[0].join("out").exists(), "{dirs:?}");
+    assert!(dirs[0].join("batch").exists(), "{dirs:?}");
+
+    // With the default retry interval nothing has reconciled the lost wait yet.
+    let entry = pickup_status(&checkout, "scip-java");
+    assert_eq!(entry["lastImported"]["state"], "failed");
+    assert_eq!(entry["lastImported"]["errorCode"], "storage_busy");
+    assert!(entry["lastImported"]["requestId"].is_string());
+}
