@@ -1273,10 +1273,9 @@ async fn pele_assets_are_local_and_keep_csp() {
         );
     }
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(include_bytes!("../web/vendor/pele-1.10.0-trellis.2.js"))
-        ),
+        hex::encode(Sha256::digest(include_bytes!(
+            "../web/vendor/pele-1.10.0-trellis.2.js"
+        ))),
         "bb4220ed66550152469e0e9a3afb6c532d5812ad62c45126234ed2ca42a0ccea"
     );
 }

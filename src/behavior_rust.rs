@@ -481,7 +481,7 @@ fn source_hint(kind: &str, expression: &str) -> Participant {
     // The full source spelling, not its shortened label, identifies a visual
     // group. Stable across call sites; deliberately not a binding/object ID.
     Participant { declaration: None,
-        id: format!("rust:source:{kind}:{:x}", Sha256::digest(expression.as_bytes())),
+        id: format!("rust:source:{kind}:{}", hex::encode(Sha256::digest(expression.as_bytes()))),
         label: bounded(expression),
         kind: kind.into(),
         identification: "Source expression only; type and dispatch unresolved. Repeated names are visual groups, not runtime object identity.".into(),

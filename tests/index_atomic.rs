@@ -916,8 +916,7 @@ fn sqlite_snapshot(
             let mut statement = db.prepare(&sql).unwrap();
             let column_names: Vec<String> = statement
                 .column_names()
-                .iter()
-                .map(|name| (*name).to_owned())
+                .map(str::to_owned)
                 .collect();
             let mut rows = statement
                 .query_map([&revision_id], |row| {
@@ -3366,10 +3365,9 @@ fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retai
         String::from_utf8_lossy(&generated.stderr)
     );
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
-        ),
+        hex::encode(Sha256::digest(
+            fs::read(corpus.join("manifest.json")).unwrap()
+        )),
         "ab4a058fac22dd9f324a476990755a3af07ab32f977f32c977d6eeea79627259"
     );
     let workspace = corpus.join("medium");

@@ -714,7 +714,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
         ("unresolvedCallee", function)
     };
     let text = &file.text[hint.byte_range()];
-    Participant { declaration: None, id: format!("python:source:{kind}:{:x}", Sha256::digest(text.as_bytes())), label: bounded(text), kind: kind.into(),
+    Participant { declaration: None, id: format!("python:source:{kind}:{}", hex::encode(Sha256::digest(text.as_bytes()))), label: bounded(text), kind: kind.into(),
         identification: "Source expression only; type, descriptors and dispatch unresolved. Visual group, not object identity or a constructor claim.".into() }
 }
 pub fn build(

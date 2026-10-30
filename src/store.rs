@@ -4048,7 +4048,7 @@ fn open_index_marker_probe(
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let db = protected_sqlite_open(path, flags)?;
+    let mut db = protected_sqlite_open(path, flags)?;
     // Inside a read scope a read-only connection's waits share the scope's one
     // deadline (#142); otherwise each SQLite call waits up to `busy_wait`.
     // A standard read outside a scope uses the same handler with its own 5 s
