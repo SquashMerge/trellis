@@ -3279,6 +3279,142 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
     );
 }
 
+/// Real scip-typescript 0.4.0 bytes for issue #466 (`index` with the fixture's `tsconfig.json`,
+/// producer metadata dropped). `new Set(..)` names four merged lib declarations and `Error(..)`
+/// two, so each call publishes one ambiguous row per occurrence, all sharing its `call_id`.
+/// The call graph, sequence and line navigation read them as one ambiguous call carrying the
+/// whole candidate union, without failing or scheduling recovery.
+#[test]
+fn real_typescript_ambiguous_calls_read_as_one_edge_with_the_union() {
+    use trellis::graph_query::{BoundaryReason, GraphQuery, Visit};
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue466-ambiguous-calls");
+    let main = fs::read_to_string(fixture_dir.join("src/main.js")).unwrap();
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/main.js", &main),
+                (
+                    "package.json",
+                    r#"{"name":"issue466-fixture","version":"1.0.0"}"#,
+                ),
+            ],
+        )
+    });
+    let mut fixture = world.fixture().reference("scip-typescript");
+    let ordinal = fixture.artifact("javascript", vec![DocSpec::new("src/main.js")]);
+    fixture.override_artifact_raw(ordinal, fs::read(fixture_dir.join("index.scip")).unwrap());
+    let descriptor = world.write(&fixture);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let published = world.store.semantic_at(pin).unwrap();
+    let rows_of = |callee: &str| -> Vec<_> {
+        published
+            .call_bindings
+            .iter()
+            .filter(|b| {
+                let range = &b.join.anchor.range;
+                &main[range.start..range.end] == callee
+            })
+            .collect()
+    };
+    for (callee, count) in [("Set", 4), ("Error", 2)] {
+        let rows = rows_of(callee);
+        assert_eq!(rows.len(), count, "{callee} rows");
+        assert!(rows.iter().all(|b| b.resolution == Resolution::Ambiguous
+            && b.call_id == rows[0].call_id
+            && b.candidates.len() == count));
+    }
+    let producer = published.producers[0].id.clone();
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let caller = native
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("caller"))
+        .unwrap()
+        .syntax_id
+        .clone();
+
+    let answer = world
+        .store
+        .evidence_response()
+        .unwrap()
+        .graph_query(
+            &GraphQuery {
+                root_syntax_id: caller.clone(),
+                semantic_producer_id: Some(producer.clone()),
+                depth: 2,
+                max_nodes: 150,
+                max_calls: 500,
+                include_external: true,
+                include_tests: true,
+            },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let graph = answer.outcome.expect("contract success");
+    let ambiguous: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|e| e.boundary_reason == BoundaryReason::Ambiguous)
+        .collect();
+    assert_eq!(ambiguous.len(), 2);
+    for edge in &ambiguous {
+        assert_eq!(edge.visit, Visit::Boundary);
+        let binding = edge.binding.as_ref().unwrap();
+        let callee = &main[binding.join.anchor.range.start..binding.join.anchor.range.end];
+        let rows = rows_of(callee);
+        let lowest = rows.iter().map(|b| &b.provenance_id).min().unwrap();
+        assert_eq!(&binding.provenance_id, lowest, "{callee}");
+        assert_eq!(binding.candidates, rows[0].candidates, "{callee}");
+        for row in &rows {
+            assert!(
+                graph.provenance.iter().any(|p| p.id == row.provenance_id),
+                "{callee} proof"
+            );
+        }
+    }
+
+    let view = world
+        .store
+        .sequence_at(&caller, pin, false)
+        .unwrap()
+        .unwrap();
+    fn ambiguous_steps(steps: &[trellis::behavior::SequenceStep]) -> usize {
+        steps
+            .iter()
+            .map(|step| {
+                usize::from(step.call_evidence.as_ref().is_some_and(|e| {
+                    e.boundary_reason == BoundaryReason::Ambiguous
+                        && e.resolution == Some(Resolution::Ambiguous)
+                })) + ambiguous_steps(&step.children)
+                    + ambiguous_steps(&step.alternate)
+            })
+            .sum()
+    }
+    assert_eq!(ambiguous_steps(&view.steps), 2);
+    assert_eq!(view.semantic_warnings, graph.warnings);
+    for line in 1..=3 {
+        world
+            .store
+            .navigation_at(
+                &serde_json::from_value(json!({"expectedRevision":pin,"path":"src/main.js",
+                    "line":line,"semanticProducerId":producer}))
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    assert!(!world.store.recovery_pending_for_tests());
+}
+
 #[test]
 fn real_python_empty_module_markers_publish_and_rejoin_without_measured_anchors() {
     real_module_marker_batch("python");
