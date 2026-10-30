@@ -8,6 +8,24 @@ use super::codec;
 use super::streaming::{self, CompletedGlobal};
 use super::*;
 
+/// A document's validation index and its live charge, built on the first validated row.
+type ValidationIndex = std::cell::OnceCell<(semantic::NativeIndex, Reservation)>;
+
+/// The document's validation index, built on first use: admitted to the live budget before it
+/// is built (#476 accounting), and held until the cell drops with the document.
+fn validation_index<'i>(
+    cell: &'i ValidationIndex,
+    live: &Rc<LiveBudget>,
+    native: &native::Artifact,
+) -> Result<&'i semantic::NativeIndex> {
+    if let Some((index, _)) = cell.get() {
+        return Ok(index);
+    }
+    let reservation = live.reserve(semantic::NativeIndex::bytes(native))?;
+    let built = semantic::NativeIndex::new(native);
+    Ok(&cell.get_or_init(|| (built, reservation)).0)
+}
+
 /// What one document's settlement leaves for its coverage row and report tally.
 #[derive(Default)]
 pub(super) struct DocumentOutcome {
@@ -210,10 +228,13 @@ impl StagedJoin<'_> {
     /// Runs the emission validator's row-local checks for the row stemming from raw proof
     /// `raw` of `view`'s document, against that document's destination group. `id` is the
     /// row's provenance ID as derived from `raw` (`id_for`), before any test edit of the row.
-    /// `anchor` is the document the row itself names.
+    /// `anchor` is the document the row itself names. `index` holds the group's validation
+    /// index, built and charged on the document's first row and released with the document.
+    #[allow(clippy::too_many_arguments)]
     fn check_row(
         &self,
         view: &StagedSide<'_>,
+        index: &ValidationIndex,
         raw: &str,
         id: &str,
         kind: semantic::EvidenceKind,
@@ -259,11 +280,13 @@ impl StagedJoin<'_> {
                 .declaration_status(self.destination.rev, document, id)?
                 .is_empty())
         };
+        let index = validation_index(index, &self.ctx.live, &group.native)?;
         check(
             &self.validator,
             &proof,
             &semantic::DocumentFacts {
                 native: &group.native,
+                index,
                 sources: &sources,
                 declaration: &declaration,
                 reference: &reference,
@@ -299,6 +322,8 @@ impl StagedJoin<'_> {
             }
         };
         let view = streaming::claims_side(&self.filtered, doc.clone(), claims)?;
+        // The document's validation index, dropped (and its charge released) with the document.
+        let index = ValidationIndex::new();
         // Same claims, native revision and global rows: the destination join would recompute
         // the captured facts, so the destination rows are read from the captured join itself.
         // Settlement reads destination rows by reference and copies one at a time.
@@ -409,7 +434,7 @@ impl StagedJoin<'_> {
                 symbol.provenance_id = id.clone();
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("symbol", &mut symbol)?;
-                self.check_row(&view, &raw, &id, kind, None, |v, p, f| {
+                self.check_row(&view, &index, &raw, &id, kind, None, |v, p, f| {
                     v.symbol(&symbol, p, f)
                 })?;
                 self.emit_fact("out_symbols", SYMBOLS, &mut symbol)?;
@@ -437,6 +462,7 @@ impl StagedJoin<'_> {
             crate::semantic_batch::testing::edit_row("declarationBinding", &mut binding)?;
             self.check_row(
                 &view,
+                &index,
                 &raw,
                 &id,
                 kind,
@@ -595,6 +621,7 @@ impl StagedJoin<'_> {
             crate::semantic_batch::testing::edit_row("reference", &mut reference)?;
             self.check_row(
                 &view,
+                &index,
                 &raw,
                 &proof_id,
                 kind,
@@ -779,6 +806,7 @@ impl StagedJoin<'_> {
             crate::semantic_batch::testing::edit_row("callBinding", &mut call)?;
             self.check_row(
                 &view,
+                &index,
                 &raw,
                 &id,
                 kind,
@@ -805,7 +833,7 @@ impl StagedJoin<'_> {
                 relationship.provenance_id = id.clone();
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("typeRelationship", &mut relationship)?;
-                self.check_row(&view, &raw, &id, kind, None, |v, p, f| {
+                self.check_row(&view, &index, &raw, &id, kind, None, |v, p, f| {
                     v.type_relationship(&relationship, p, f)
                 })?;
                 self.emit_fact("out_type_relationships", RELATIONSHIPS, &mut relationship)?;
@@ -953,6 +981,61 @@ impl StagedJoin<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_index_is_admitted_before_it_is_built_and_released_with_its_document() {
+        let native = native::Artifact {
+            producer: native::Producer {
+                id: "native".into(),
+                version: "1".into(),
+                executable_hash: "e".repeat(64),
+                kind: "native".into(),
+                languages: vec!["rust".into()],
+                position_encoding: "utf8".into(),
+            },
+            source_set: native::SourceSet {
+                id: "set".into(),
+                root_id: "root".into(),
+                languages: vec!["rust".into()],
+                dependencies: vec![],
+            },
+            revision: native::Revision {
+                id: "revision".into(),
+                source_set_id: "set".into(),
+                documents: vec![],
+                toolchain_hash: "t".into(),
+                config_hash: "c".into(),
+                dependency_hash: "d".into(),
+            },
+            coverage: vec![],
+            provenance: vec![],
+            declarations: vec![],
+            calls: vec![],
+            control_regions: vec![],
+            references: vec![],
+            capability_reports: vec![],
+            search_cards: vec![],
+        };
+        let bytes = semantic::NativeIndex::bytes(&native);
+        assert!(bytes > 0);
+        // No room: typed refusal, nothing built.
+        let budget = LiveBudget::new(bytes - 1);
+        let cell = ValidationIndex::new();
+        let error = validation_index(&cell, &budget, &native).err().unwrap();
+        assert!(
+            matches!(error.downcast_ref::<ScipCaptureError>(), Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion")
+        );
+        assert!(cell.get().is_none());
+        // Room: built once and held by the document's cell, then released with it.
+        let budget = LiveBudget::new(bytes);
+        let cell = ValidationIndex::new();
+        validation_index(&cell, &budget, &native).unwrap();
+        validation_index(&cell, &budget, &native).unwrap();
+        assert_eq!(budget.high_water(), bytes);
+        assert!(budget.reserve(1).is_err());
+        drop(cell);
+        budget.reserve(bytes).unwrap();
+    }
 
     #[test]
     fn adopted_targets_are_admitted_from_the_incoming_set_before_any_copy() {

@@ -151,6 +151,9 @@ fn occ(id: &str) -> Result<()> {
     ensure!(id_codec::encode_occ(id).is_some(), "invalid occurrence ID");
     Ok(())
 }
+/// A span decoded with its whole source, as rows did before #477; the oracle of
+/// `DocumentIndex::span`.
+#[cfg(test)]
 fn span<'a>(bytes: &'a [u8], range: &native::Range) -> Result<&'a str> {
     uint(range.start)?;
     uint(range.end)?;
@@ -278,10 +281,340 @@ fn declaration_name_owner<'a>(
     parents.next().is_none().then_some(owner.syntax_id.as_str())
 }
 
+// Validation work counted by the linear-growth test (#477): source bytes decoded and native
+// facts or gaps visited.
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[inline]
+fn count_work(_units: usize) {
+    #[cfg(test)]
+    VALIDATION_WORK.with(|work| work.set(work.get() + _units as u64));
+}
+
+/// What every join and reference row of a document reads from its measured native facts,
+/// prepared once per document (#477): the document's source decoded as UTF-8 once, its
+/// declaration names, callees, invocations and references ordered by range, and each family's
+/// capability support validated once. A row then looks up its own range instead of rescanning
+/// the document, so a document's validation work grows with its rows, not rows times facts.
+/// Every check is still made on the same inputs; only the repetition goes. The index holds
+/// positions into the artifact it was built from, which every lookup passes back.
+pub(crate) struct NativeIndex {
+    documents: BTreeMap<native::DocumentKey, DocumentIndex>,
+}
+
+/// A measured range and the position of the fact that has it.
+type Ranged = ((usize, usize), usize);
+
+/// One document's part of a `NativeIndex`. Each list is ordered by range.
+#[derive(Default)]
+struct DocumentIndex {
+    /// The first revision document with this key.
+    document: Option<usize>,
+    /// Declarations by name range (those with one).
+    names: Vec<Ranged>,
+    /// Calls by callee range (those with one).
+    callees: Vec<Ranged>,
+    /// Spelled calls without a callee range, by spelling.
+    bare_calls: Vec<usize>,
+    /// Calls by invocation range.
+    invocations: Vec<Ranged>,
+    references: Vec<Ranged>,
+    /// Set once the document's whole source has decoded as UTF-8.
+    utf8: std::cell::OnceCell<()>,
+    /// Each family's capability support once validated, by `JoinKind`.
+    support: [std::cell::OnceCell<SupportIndex>; 4],
+}
+
+/// One family's capability support, validated once for its document.
+struct SupportIndex {
+    report: usize,
+    family: usize,
+    /// The running maximum of gap ends when the gaps are ordered by start; otherwise a row
+    /// scans the gaps in order.
+    gap_ends: Option<Vec<usize>>,
+}
+
+fn ranged(range: &native::Range, position: usize) -> Ranged {
+    ((range.start, range.end), position)
+}
+
+/// The items whose indexed range equals `range`.
+fn at<'n, T>(
+    list: &'n [Ranged],
+    items: &'n [T],
+    range: &native::Range,
+) -> impl Iterator<Item = &'n T> + 'n {
+    let target = (range.start, range.end);
+    let first = list.partition_point(|(r, _)| *r < target);
+    list[first..]
+        .iter()
+        .take_while(move |(r, _)| *r == target)
+        .map(|(_, position)| {
+            count_work(1);
+            &items[*position]
+        })
+}
+
+impl NativeIndex {
+    /// An upper bound of the bytes `new` allocates for `native`, admitted before building: the
+    /// map's entries (at least one full B-tree leaf, else twice the entries for node slack) with
+    /// each key's strings, one list slot per declaration and reference and two per call, and
+    /// one end per capability gap; the lists are pushed or collected, so each may hold up to
+    /// twice its length.
+    pub(crate) fn bytes(native: &native::Artifact) -> u64 {
+        let mut documents = BTreeSet::new();
+        let strings = native
+            .revision
+            .documents
+            .iter()
+            .map(|d| &d.key)
+            .chain(native.declarations.iter().map(|d| &d.document))
+            .chain(native.calls.iter().map(|c| &c.document))
+            .chain(native.references.iter().map(|r| &r.document))
+            .filter(|document| documents.insert(*document))
+            .map(|key| key.source_set_id.len() + key.language.len() + key.path.len())
+            .sum::<usize>();
+        let entries = (2 * documents.len()).max(11)
+            * (size_of::<native::DocumentKey>() + size_of::<DocumentIndex>());
+        let gaps = native
+            .capability_reports
+            .iter()
+            .flat_map(|report| &report.families)
+            .map(|family| family.gaps.len())
+            .sum::<usize>();
+        let lists = size_of::<Ranged>()
+            * (native.declarations.len() + 2 * native.calls.len() + native.references.len())
+            + size_of::<usize>() * gaps;
+        (entries + strings + 2 * lists) as u64
+    }
+
+    /// Indexes every document of `native` in one pass over its facts.
+    pub(crate) fn new(native: &native::Artifact) -> Self {
+        fn entry<'m>(
+            documents: &'m mut BTreeMap<native::DocumentKey, DocumentIndex>,
+            key: &native::DocumentKey,
+        ) -> &'m mut DocumentIndex {
+            if !documents.contains_key(key) {
+                documents.insert(key.clone(), DocumentIndex::default());
+            }
+            documents
+                .get_mut(key)
+                .expect("document entry inserted above")
+        }
+        let mut documents = BTreeMap::new();
+        for (position, d) in native.revision.documents.iter().enumerate() {
+            entry(&mut documents, &d.key)
+                .document
+                .get_or_insert(position);
+        }
+        for (position, d) in native.declarations.iter().enumerate() {
+            count_work(1);
+            if let Some(range) = &d.name_range {
+                entry(&mut documents, &d.document)
+                    .names
+                    .push(ranged(range, position));
+            }
+        }
+        for (position, c) in native.calls.iter().enumerate() {
+            count_work(1);
+            let index = entry(&mut documents, &c.document);
+            index.invocations.push(ranged(&c.range, position));
+            match &c.callee_range {
+                Some(range) => index.callees.push(ranged(range, position)),
+                None if c.spelling.is_some() => index.bare_calls.push(position),
+                None => {}
+            }
+        }
+        for (position, r) in native.references.iter().enumerate() {
+            count_work(1);
+            entry(&mut documents, &r.document)
+                .references
+                .push(ranged(&r.range, position));
+        }
+        for index in documents.values_mut() {
+            index.names.sort_unstable();
+            index.callees.sort_unstable();
+            index.invocations.sort_unstable();
+            index.references.sort_unstable();
+            index
+                .bare_calls
+                .sort_unstable_by_key(|position| (&native.calls[*position].spelling, *position));
+        }
+        Self { documents }
+    }
+
+    /// The index of `document`, or `empty` when the artifact has nothing for it.
+    fn document<'i>(
+        &'i self,
+        document: &native::DocumentKey,
+        empty: &'i std::cell::OnceCell<DocumentIndex>,
+    ) -> &'i DocumentIndex {
+        self.documents
+            .get(document)
+            .unwrap_or_else(|| empty.get_or_init(DocumentIndex::default))
+    }
+}
+
+impl DocumentIndex {
+    /// `span` over this document's source, decoding the whole source once: a later span checks
+    /// its bounds and scalar boundaries and decodes only its own bytes.
+    fn span<'s>(&self, bytes: &'s [u8], range: &native::Range) -> Result<&'s str> {
+        uint(range.start)?;
+        uint(range.end)?;
+        if self.utf8.get().is_none() {
+            count_work(bytes.len());
+            std::str::from_utf8(bytes)?;
+            let _ = self.utf8.set(());
+        }
+        ensure!(range.start < range.end, "empty semantic span");
+        // In valid UTF-8, a scalar starts at every byte that is not a continuation byte.
+        let boundary =
+            |i: usize| i == bytes.len() || bytes.get(i).is_some_and(|b| (*b as i8) >= -0x40);
+        bytes
+            .get(range.start..range.end)
+            .filter(|_| boundary(range.start) && boundary(range.end))
+            .and_then(|slice| {
+                count_work(slice.len());
+                std::str::from_utf8(slice).ok()
+            })
+            .context("invalid converted semantic span")
+    }
+
+    fn revision_document<'n>(&self, native: &'n native::Artifact) -> Option<&'n native::Document> {
+        self.document
+            .map(|position| &native.revision.documents[position])
+    }
+
+    /// The measured ranges of an anchor kind's family.
+    fn measured(&self, kind: JoinKind) -> &[Ranged] {
+        match kind {
+            JoinKind::DeclarationName => &self.names,
+            JoinKind::Callee => &self.callees,
+            JoinKind::Invocation => &self.invocations,
+            JoinKind::Reference => &self.references,
+        }
+    }
+
+    /// The capability support of an anchor kind's family in this document, validated on first
+    /// use: its report and family exist, an unavailable family measured nothing, and every gap
+    /// is a valid span with a diagnostic and contains no measured range.
+    fn support<'n>(
+        &self,
+        native: &'n native::Artifact,
+        document: &native::DocumentKey,
+        revision_id: &str,
+        kind: JoinKind,
+        source: &[u8],
+    ) -> Result<(&'n native::MeasurementSupport, &SupportIndex)> {
+        let (measurement, slot) = match kind {
+            JoinKind::DeclarationName => (native::MeasurementKind::DeclarationName, 0),
+            JoinKind::Callee => (native::MeasurementKind::Callee, 1),
+            JoinKind::Invocation => (native::MeasurementKind::Invocation, 2),
+            JoinKind::Reference => (native::MeasurementKind::Reference, 3),
+        };
+        let cell = &self.support[slot];
+        if let Some(index) = cell.get() {
+            let support = &native.capability_reports[index.report].families[index.family];
+            return Ok((support, index));
+        }
+        let report = native
+            .capability_reports
+            .iter()
+            .position(|report| {
+                count_work(1);
+                report.document == *document && report.revision_id == revision_id
+            })
+            .context("missing native capability report")?;
+        let family = native.capability_reports[report]
+            .families
+            .iter()
+            .position(|support| support.kind == measurement)
+            .context("missing native measurement family")?;
+        let support = &native.capability_reports[report].families[family];
+        let measured = self.measured(kind);
+        ensure!(
+            support.available || measured.is_empty(),
+            "unavailable family has measured candidates"
+        );
+        for gap in &support.gaps {
+            self.span(source, &gap.range)?;
+            text(&gap.diagnostic)?;
+            // A measured range inside the gap starts inside it.
+            let first = measured.partition_point(|((start, _), _)| *start < gap.range.start);
+            let contradiction = measured[first..]
+                .iter()
+                .take_while(|((start, _), _)| {
+                    count_work(1);
+                    *start <= gap.range.end
+                })
+                .any(|((_, end), _)| *end <= gap.range.end);
+            ensure!(
+                !contradiction,
+                "measured candidate contradicts native capability gap"
+            );
+        }
+        let gap_ends = SupportIndex::gap_ends(&support.gaps);
+        let index = cell.get_or_init(|| SupportIndex {
+            report,
+            family,
+            gap_ends,
+        });
+        Ok((support, index))
+    }
+}
+
+impl SupportIndex {
+    /// The running maximum of `gaps`' ends, when they are ordered by start.
+    fn gap_ends(gaps: &[native::MeasurementGap]) -> Option<Vec<usize>> {
+        count_work(gaps.len());
+        gaps.windows(2)
+            .all(|pair| pair[0].range.start <= pair[1].range.start)
+            .then(|| {
+                gaps.iter()
+                    .scan(0, |end, gap| {
+                        *end = gap.range.end.max(*end);
+                        Some(*end)
+                    })
+                    .collect()
+            })
+    }
+
+    /// The first gap of `support`, in its order, that contains `range`.
+    fn containing<'n>(
+        &self,
+        support: &'n native::MeasurementSupport,
+        range: &native::Range,
+    ) -> Option<&'n native::MeasurementGap> {
+        let contains = |gap: &native::MeasurementGap| {
+            gap.range.start <= range.start && range.end <= gap.range.end
+        };
+        match &self.gap_ends {
+            // The gaps that start at or before `range` are a prefix, and the first of them to
+            // reach `range.end` is where their running maximum end first does.
+            Some(ends) => {
+                let starts = support
+                    .gaps
+                    .partition_point(|gap| gap.range.start <= range.start);
+                let first = ends[..starts].partition_point(|end| *end < range.end);
+                support.gaps[..starts]
+                    .get(first)
+                    .filter(|gap| contains(gap))
+            }
+            None => support.gaps.iter().find(|gap| {
+                count_work(1);
+                contains(gap)
+            }),
+        }
+    }
+}
+
 fn validate_join(
     join: &Join,
     family: JoinKind,
     native: &native::Artifact,
+    index: &NativeIndex,
     sources: Sources<'_>,
     original: Option<&Join>,
 ) -> Result<()> {
@@ -290,6 +623,8 @@ fn validate_join(
         a.kind == family || (family == JoinKind::Callee && a.kind == JoinKind::Invocation),
         "wrong join family"
     );
+    let empty = std::cell::OnceCell::new();
+    let measured = index.document(&a.document, &empty);
     if let Some(previous) = original {
         ensure!(
             previous.anchor.document == a.document
@@ -313,12 +648,9 @@ fn validate_join(
         }
     } else {
         let source = sources(&a.document).context("missing join source")?;
-        let slice = span(source, &a.range)?;
-        let doc = native
-            .revision
-            .documents
-            .iter()
-            .find(|d| d.key == a.document)
+        let slice = measured.span(source, &a.range)?;
+        let doc = measured
+            .revision_document(native)
             .context("missing join document")?;
         ensure!(
             a.revision_id == native.revision.id && a.content_hash == doc.content_hash,
@@ -327,7 +659,7 @@ fn validate_join(
         let mut candidates = BTreeSet::new();
         match family {
             JoinKind::DeclarationName => {
-                for d in &native.declarations {
+                for d in at(&measured.names, &native.declarations, &a.range) {
                     if d.document == a.document
                         && d.name_range.as_ref() == Some(&a.range)
                         && d.name.as_deref() == Some(slice)
@@ -337,7 +669,12 @@ fn validate_join(
                 }
             }
             JoinKind::Callee => {
-                for call in &native.calls {
+                let calls = if a.kind == JoinKind::Invocation {
+                    &measured.invocations
+                } else {
+                    &measured.callees
+                };
+                for call in at(calls, &native.calls, &a.range) {
                     let r = if a.kind == JoinKind::Invocation {
                         Some(&call.range)
                     } else {
@@ -353,7 +690,7 @@ fn validate_join(
                 }
             }
             JoinKind::Reference => {
-                for reference in &native.references {
+                for reference in at(&measured.references, &native.references, &a.range) {
                     if reference.document == a.document
                         && reference.range == a.range
                         && reference.spelling == slice
@@ -365,64 +702,8 @@ fn validate_join(
             }
             JoinKind::Invocation => anyhow::bail!("invocation is a call anchor, not a fact family"),
         }
-        let kind = match a.kind {
-            JoinKind::DeclarationName => native::MeasurementKind::DeclarationName,
-            JoinKind::Callee => native::MeasurementKind::Callee,
-            JoinKind::Invocation => native::MeasurementKind::Invocation,
-            JoinKind::Reference => native::MeasurementKind::Reference,
-        };
-        let support = native
-            .capability_reports
-            .iter()
-            .find(|report| report.document == a.document && report.revision_id == a.revision_id)
-            .context("missing native capability report")?
-            .families
-            .iter()
-            .find(|support| support.kind == kind)
-            .context("missing native measurement family")?;
-        let contained = |range: &native::Range, within: &native::Range| {
-            within.start <= range.start && range.end <= within.end
-        };
-        let measured_ranges: Vec<_> = match a.kind {
-            JoinKind::DeclarationName => native
-                .declarations
-                .iter()
-                .filter(|d| d.document == a.document)
-                .filter_map(|d| d.name_range.as_ref())
-                .collect(),
-            JoinKind::Callee => native
-                .calls
-                .iter()
-                .filter(|c| c.document == a.document)
-                .filter_map(|c| c.callee_range.as_ref())
-                .collect(),
-            JoinKind::Invocation => native
-                .calls
-                .iter()
-                .filter(|c| c.document == a.document)
-                .map(|c| &c.range)
-                .collect(),
-            JoinKind::Reference => native
-                .references
-                .iter()
-                .filter(|r| r.document == a.document)
-                .map(|r| &r.range)
-                .collect(),
-        };
-        ensure!(
-            support.available || measured_ranges.is_empty(),
-            "unavailable family has measured candidates"
-        );
-        for gap in &support.gaps {
-            span(source, &gap.range)?;
-            text(&gap.diagnostic)?;
-            ensure!(
-                !measured_ranges
-                    .iter()
-                    .any(|range| contained(range, &gap.range)),
-                "measured candidate contradicts native capability gap"
-            );
-        }
+        let (support, gaps) =
+            measured.support(native, &a.document, &a.revision_id, a.kind, source)?;
         let unsupported = if !support.available {
             Some(
                 support
@@ -432,10 +713,7 @@ fn validate_join(
             )
         } else {
             ensure!(support.diagnostic.is_none(), "enabled family diagnostic");
-            support
-                .gaps
-                .iter()
-                .find(|gap| contained(&a.range, &gap.range))
+            gaps.containing(support, &a.range)
                 .map(|gap| gap.diagnostic.as_str())
         };
         let expected: Vec<_> = candidates.into_iter().collect();
@@ -473,11 +751,8 @@ fn validate_join(
             }
         }
     }
-    let doc = native
-        .revision
-        .documents
-        .iter()
-        .find(|d| d.key == a.document)
+    let doc = measured
+        .revision_document(native)
         .context("missing join document")?;
     ensure!(
         a.revision_id == native.revision.id && a.content_hash == doc.content_hash,
@@ -932,10 +1207,11 @@ type Sources<'a> = &'a dyn Fn(&native::DocumentKey) -> Option<&'a [u8]>;
 /// Read-only inputs shared by the per-row association validators. A row needs only its own
 /// document's measured facts: `native` carries the document's declarations, calls, references
 /// and capability report (the whole artifact for the whole-publication validator), and the
-/// lookups answer by syntax or occurrence ID.
+/// lookups answer by syntax or occurrence ID. `index` is `native`'s per-document index.
 #[derive(Clone, Copy)]
 struct RowEnv<'a> {
     native: &'a native::Artifact,
+    index: &'a NativeIndex,
     captured: &'a CapturedComponents,
     revision: &'a native::Revision,
     sources: Sources<'a>,
@@ -956,6 +1232,7 @@ fn validate_declaration_binding_row<'a>(
 ) -> Result<()> {
     let RowEnv {
         native,
+        index,
         captured,
         revision,
         sources,
@@ -979,6 +1256,7 @@ fn validate_declaration_binding_row<'a>(
         &b.join,
         JoinKind::DeclarationName,
         native,
+        index,
         sources,
         admitted,
     )?;
@@ -1039,6 +1317,7 @@ fn validate_reference_row<'a>(
 ) -> Result<()> {
     let RowEnv {
         native,
+        index,
         captured,
         revision,
         sources,
@@ -1047,6 +1326,8 @@ fn validate_reference_row<'a>(
         known,
         witnesses,
     } = *env;
+    let empty = std::cell::OnceCell::new();
+    let measured = index.document(&r.document, &empty);
     ensure!(r.revision_id == revision.id, "foreign reference revision");
     let admitted = witnesses
         .and_then(|items| items.get(&r.document))
@@ -1096,7 +1377,7 @@ fn validate_reference_row<'a>(
     if admitted.is_none() {
         let bytes = sources(&r.document).context("missing reference source")?;
         ensure!(
-            span(bytes, &r.range)? == r.spelling,
+            measured.span(bytes, &r.range)? == r.spelling,
             "reference spelling mismatch"
         );
     }
@@ -1115,8 +1396,8 @@ fn validate_reference_row<'a>(
         "alias without definition"
     );
     if r.roles.contains(&Role::Call) && admitted.is_none() {
-        ensure!(
-            native.calls.iter().any(|call| call.document == r.document
+        let invocation = |call: &native::Call| {
+            call.document == r.document
                 && call.owner_syntax_id == r.owner_syntax_id
                 && call.range.start <= r.range.start
                 && r.range.end <= call.range.end
@@ -1124,7 +1405,22 @@ fn validate_reference_row<'a>(
                     .callee_range
                     .as_ref()
                     .is_none_or(|callee| callee == &r.range)
-                && call.spelling.as_deref() == Some(&r.spelling)),
+                && call.spelling.as_deref() == Some(&r.spelling)
+        };
+        // Such a call has the reference's range as its callee range, or none and the
+        // reference's spelling.
+        let spelling = |position: &usize| native.calls[*position].spelling.as_deref();
+        let bare = &measured.bare_calls;
+        let first = bare.partition_point(|position| spelling(position) < Some(&r.spelling));
+        ensure!(
+            at(&measured.callees, &native.calls, &r.range).any(invocation)
+                || bare[first..]
+                    .iter()
+                    .take_while(|position| spelling(position) == Some(&r.spelling))
+                    .any(|position| {
+                        count_work(1);
+                        invocation(&native.calls[*position])
+                    }),
             "call role without measured invocation"
         );
     }
@@ -1134,7 +1430,7 @@ fn validate_reference_row<'a>(
     );
     if r.site == ReferenceSite::Declaration && admitted.is_none() {
         ensure!(
-            native.declarations.iter().any(|d| {
+            at(&measured.names, &native.declarations, &r.range).any(|d| {
                 d.document == r.document
                     && d.name_range.as_ref() == Some(&r.range)
                     && d.name.as_deref() == Some(&r.spelling)
@@ -1167,6 +1463,7 @@ fn validate_call_binding_row(
 ) -> Result<()> {
     let RowEnv {
         native,
+        index,
         captured,
         revision,
         sources,
@@ -1187,7 +1484,7 @@ fn validate_call_binding_row(
         .and_then(|items| items.get(&proof.document))
         .map(|w| original_join(w, proof, JoinKind::Callee))
         .transpose()?;
-    validate_join(&b.join, JoinKind::Callee, native, sources, admitted)?;
+    validate_join(&b.join, JoinKind::Callee, native, index, sources, admitted)?;
     if let Some(old) = admitted {
         ensure!(
             old.anchor.revision_id == captured.captured_revision.id
@@ -1990,8 +2287,12 @@ fn validate_evidence_inner(
             },
         )
     };
+    // The whole publication's facts are already materialized; the index adds a range-ordered
+    // position per fact, bounded by the artifact the request bounds already admitted.
+    let index = NativeIndex::new(native);
     let env = RowEnv {
         native,
+        index: &index,
         captured,
         revision,
         sources: &|key| sources.get(key).map(Vec::as_slice),
@@ -2222,6 +2523,7 @@ impl<'h> EmissionValidator<'h> {
     ) -> Result<T> {
         check(&RowEnv {
             native: facts.native,
+            index: facts.index,
             captured: &self.captured,
             revision: &self.revision,
             sources: facts.sources,
@@ -2321,6 +2623,8 @@ impl<'h> EmissionValidator<'h> {
 /// One document's measured facts, as the row-local validators read them.
 pub(crate) struct DocumentFacts<'a> {
     pub native: &'a native::Artifact,
+    /// `NativeIndex::new(native)`, built once for the document and shared by its rows.
+    pub index: &'a NativeIndex,
     pub sources: &'a dyn Fn(&native::DocumentKey) -> Option<&'a [u8]>,
     pub declaration: &'a dyn Fn(&str) -> Option<&'a native::Declaration>,
     pub reference: &'a dyn Fn(&str) -> Option<&'a native::Reference>,
@@ -2410,5 +2714,507 @@ mod witness_tests {
                 .to_string()
                 .contains("missing admitted proof")
         );
+    }
+}
+
+#[cfg(test)]
+mod native_index_tests {
+    use super::*;
+
+    const PREFIX: &str = "fn main() {\n";
+
+    fn hex(n: usize) -> String {
+        format!("{n:032x}")
+    }
+
+    fn document() -> native::DocumentKey {
+        native::DocumentKey {
+            source_set_id: "set".into(),
+            language: "rust".into(),
+            path: "src/lib.rs".into(),
+        }
+    }
+
+    fn line(i: usize) -> usize {
+        PREFIX.len() + 5 * i
+    }
+
+    fn range(start: usize, end: usize) -> native::Range {
+        native::Range { start, end }
+    }
+
+    /// A Rust document of `n` lines `f();` inside `main`, each line a measured call with callee
+    /// `f` and a reference `f`; every fourth line's `;\n` is a callee capability gap.
+    fn artifact(n: usize) -> (native::Artifact, Vec<u8>) {
+        let mut text = String::from(PREFIX);
+        for _ in 0..n {
+            text.push_str("f();\n");
+        }
+        text.push_str("}\n");
+        let key = document();
+        let revision = "revision:test".to_string();
+        let owner = format!("sid:v1:{}", hex(0));
+        let declaration = native::Declaration {
+            role: native::DeclarationRole::Production,
+            syntax_id: owner.clone(),
+            document: key.clone(),
+            revision_id: revision.clone(),
+            kind: "function".into(),
+            name: Some("main".into()),
+            lookup_key: Some("main".into()),
+            ancestors: vec![],
+            key: native::Key {
+                kind: "function".into(),
+                name: Some("main".into()),
+                signature: None,
+                ordinal: 0,
+            },
+            range: range(0, text.len()),
+            name_range: Some(range(3, 7)),
+            header: native::Header {
+                kind: "function".into(),
+                name: Some("main".into()),
+                modifiers: vec![],
+                type_parameters: vec![],
+                parameters: vec![],
+                result_type: None,
+                bases: vec![],
+            },
+            provenance_id: "native".into(),
+        };
+        let calls = (0..n)
+            .map(|i| native::Call {
+                id: format!("occ:v2:{}", hex(i)),
+                owner_syntax_id: owner.clone(),
+                ordinal: i,
+                document: key.clone(),
+                revision_id: revision.clone(),
+                range: range(line(i), line(i) + 3),
+                callee_range: Some(range(line(i), line(i) + 1)),
+                spelling: Some("f".into()),
+                region_ids: vec![],
+                provenance_id: "native".into(),
+            })
+            .collect();
+        let references = (0..n)
+            .map(|i| native::Reference {
+                id: format!("occ:v2:{}", hex(n + i)),
+                owner_syntax_id: owner.clone(),
+                ordinal: i,
+                document: key.clone(),
+                revision_id: revision.clone(),
+                range: range(line(i), line(i) + 1),
+                spelling: "f".into(),
+                lookup_key: "f".into(),
+                provenance_id: "native".into(),
+            })
+            .collect();
+        let family = |kind, gaps| native::MeasurementSupport {
+            kind,
+            available: true,
+            diagnostic: None,
+            gaps,
+        };
+        let gaps = (0..n)
+            .step_by(4)
+            .map(|i| native::MeasurementGap {
+                range: range(line(i) + 3, line(i) + 5),
+                diagnostic: format!("gap {i}"),
+            })
+            .collect();
+        let native = native::Artifact {
+            producer: native::Producer {
+                id: "native".into(),
+                version: "1".into(),
+                executable_hash: "e".repeat(64),
+                kind: "native".into(),
+                languages: vec!["rust".into()],
+                position_encoding: "utf8".into(),
+            },
+            source_set: native::SourceSet {
+                id: "set".into(),
+                root_id: "root".into(),
+                languages: vec!["rust".into()],
+                dependencies: vec![],
+            },
+            revision: native::Revision {
+                id: revision.clone(),
+                source_set_id: "set".into(),
+                documents: vec![native::Document {
+                    key: key.clone(),
+                    revision_id: revision.clone(),
+                    content_hash: "c".repeat(64),
+                    byte_length: text.len(),
+                }],
+                toolchain_hash: "t".repeat(64),
+                config_hash: "c".repeat(64),
+                dependency_hash: "d".repeat(64),
+            },
+            coverage: vec![],
+            provenance: vec![],
+            declarations: vec![declaration],
+            calls,
+            control_regions: vec![],
+            references,
+            capability_reports: vec![native::CapabilityReport {
+                document: key,
+                revision_id: revision,
+                families: vec![
+                    family(native::MeasurementKind::DeclarationName, vec![]),
+                    family(native::MeasurementKind::Callee, gaps),
+                    family(native::MeasurementKind::Invocation, vec![]),
+                    family(native::MeasurementKind::Reference, vec![]),
+                ],
+            }],
+            search_cards: vec![],
+        };
+        (native, text.into_bytes())
+    }
+
+    fn join(
+        native: &native::Artifact,
+        kind: JoinKind,
+        range: native::Range,
+        candidates: Vec<String>,
+        diagnostic: Option<String>,
+    ) -> Join {
+        let status = match (candidates.len(), &diagnostic) {
+            (1, _) => JoinStatus::Exact,
+            (0, Some(_)) => JoinStatus::Unsupported,
+            (0, None) => JoinStatus::Unmatched,
+            _ => JoinStatus::Ambiguous,
+        };
+        Join {
+            anchor: MeasuredAnchor {
+                document: document(),
+                revision_id: native.revision.id.clone(),
+                content_hash: native.revision.documents[0].content_hash.clone(),
+                range,
+                kind,
+            },
+            status,
+            candidate_ids: candidates,
+            diagnostic,
+        }
+    }
+
+    fn captured(native: &native::Artifact) -> CapturedComponents {
+        CapturedComponents {
+            producer_executables: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            captured_revision: native.revision.clone(),
+            native_toolchain: serde_json::Value::Null,
+            native_config: vec![],
+            native_dependencies: vec![],
+            requested_producers: vec![],
+            toolchain: vec![],
+            config: vec![],
+            dependency: vec![],
+            native_extraction_components: BTreeMap::new(),
+        }
+    }
+
+    /// Validates every join and reference row of `artifact(n)` against one index and returns
+    /// the validation work, the index build included.
+    fn validate_document(n: usize) -> u64 {
+        let (native, source) = artifact(n);
+        VALIDATION_WORK.with(|work| work.set(0));
+        let index = NativeIndex::new(&native);
+        let sources = |key: &native::DocumentKey| (*key == document()).then_some(&source[..]);
+        for (i, call) in native.calls.iter().enumerate() {
+            let callee = call.callee_range.clone().unwrap();
+            let exact = join(
+                &native,
+                JoinKind::Callee,
+                callee,
+                vec![call.id.clone()],
+                None,
+            );
+            validate_join(&exact, JoinKind::Callee, &native, &index, &sources, None).unwrap();
+            let invocation = join(
+                &native,
+                JoinKind::Invocation,
+                call.range.clone(),
+                vec![call.id.clone()],
+                None,
+            );
+            validate_join(
+                &invocation,
+                JoinKind::Callee,
+                &native,
+                &index,
+                &sources,
+                None,
+            )
+            .unwrap();
+            if i % 4 == 0 {
+                // The line's `;` lies in its gap and measures no callee.
+                let semicolon = range(call.range.end, call.range.end + 1);
+                let unsupported = join(
+                    &native,
+                    JoinKind::Callee,
+                    semicolon,
+                    vec![],
+                    Some(format!("gap {i}")),
+                );
+                validate_join(
+                    &unsupported,
+                    JoinKind::Callee,
+                    &native,
+                    &index,
+                    &sources,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        let captured = captured(&native);
+        let declaration = |id: &str| native.declarations.iter().find(|d| d.syntax_id == id);
+        let ids: BTreeMap<_, _> = native
+            .references
+            .iter()
+            .map(|r| (r.id.as_str(), r))
+            .collect();
+        let reference = |id: &str| ids.get(id).copied();
+        let known = |_: &str, _: &native::DocumentKey| Ok(false);
+        let env = RowEnv {
+            native: &native,
+            index: &index,
+            captured: &captured,
+            revision: &native.revision,
+            sources: &sources,
+            declaration: &declaration,
+            reference: &reference,
+            known: &known,
+            witnesses: None,
+        };
+        let proof = Provenance {
+            id: "proof".into(),
+            producer_id: "producer".into(),
+            document: document(),
+            revision_id: native.revision.id.clone(),
+            content_hash: native.revision.documents[0].content_hash.clone(),
+            evidence_kind: EvidenceKind::SemanticReference,
+            basis: None,
+            freshness: Freshness::Fresh,
+            derived_from: None,
+        };
+        let rows: Vec<_> = native
+            .references
+            .iter()
+            .map(|r| Reference {
+                id: r.id.clone(),
+                owner_syntax_id: r.owner_syntax_id.clone(),
+                ordinal: r.ordinal,
+                document: r.document.clone(),
+                revision_id: r.revision_id.clone(),
+                range: r.range.clone(),
+                spelling: r.spelling.clone(),
+                lookup_key: r.lookup_key.clone(),
+                site: ReferenceSite::Use,
+                roles: vec![Role::Call],
+                resolution: Resolution::Unresolved,
+                declared_target: None,
+                candidates: vec![],
+                provenance_id: "proof".into(),
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        for row in &rows {
+            let exact = join(
+                &native,
+                JoinKind::Reference,
+                row.range.clone(),
+                vec![row.id.clone()],
+                None,
+            );
+            validate_join(&exact, JoinKind::Reference, &native, &index, &sources, None).unwrap();
+            validate_reference_row(row, &proof, &env, &mut seen).unwrap();
+        }
+        VALIDATION_WORK.with(|work| work.get())
+    }
+
+    #[test]
+    fn validation_work_grows_linearly_with_the_document() {
+        let small = validate_document(500);
+        let large = validate_document(2000);
+        // Each row once rescanned its whole document (source bytes, calls, references and
+        // gaps), so four times the lines cost sixteen times the work; now it is about four.
+        assert!(
+            large <= 9 * small / 2,
+            "validation work {small} at 500 lines but {large} at 2000"
+        );
+    }
+
+    #[test]
+    fn indexed_spans_match_whole_source_spans() {
+        let sources: [&[u8]; 4] = [b"ab\xc3\xa9\xe6\x97\xa5x", b"", b"a\xffb", b"\xe6\x97"];
+        let bounds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, usize::MAX];
+        for source in sources {
+            let warm = DocumentIndex::default();
+            for start in bounds {
+                for end in bounds {
+                    let range = range(start, end);
+                    let expected = span(source, &range).map_err(|e| format!("{e:#}"));
+                    for index in [&DocumentIndex::default(), &warm] {
+                        let actual = index.span(source, &range).map_err(|e| format!("{e:#}"));
+                        assert_eq!(actual, expected, "{source:?} {start}..{end}");
+                    }
+                }
+            }
+            if std::str::from_utf8(source).is_err() {
+                let error = DocumentIndex::default()
+                    .span(source, &range(0, 1))
+                    .unwrap_err();
+                assert!(error.downcast_ref::<std::str::Utf8Error>().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn gap_lookup_finds_the_first_containing_gap_in_order() {
+        let gap = |start, end| native::MeasurementGap {
+            range: range(start, end),
+            diagnostic: format!("{start}..{end}"),
+        };
+        let layouts = [
+            vec![gap(0, 3), gap(2, 9), gap(3, 5), gap(4, 6), gap(8, 9)],
+            vec![gap(1, 2), gap(1, 7), gap(5, 6), gap(6, 7)],
+            // Out of start order: rows scan the gaps in order.
+            vec![gap(5, 6), gap(0, 9), gap(2, 4)],
+            vec![],
+        ];
+        for gaps in layouts {
+            let support = native::MeasurementSupport {
+                kind: native::MeasurementKind::Callee,
+                available: true,
+                diagnostic: None,
+                gaps,
+            };
+            let index = SupportIndex {
+                report: 0,
+                family: 0,
+                gap_ends: SupportIndex::gap_ends(&support.gaps),
+            };
+            for start in 0..10 {
+                for end in start + 1..11 {
+                    let linear = support
+                        .gaps
+                        .iter()
+                        .find(|g| g.range.start <= start && end <= g.range.end);
+                    assert_eq!(
+                        index
+                            .containing(&support, &range(start, end))
+                            .map(|g| &g.diagnostic),
+                        linear.map(|g| &g.diagnostic),
+                        "{start}..{end} in {:?}",
+                        support.gaps
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_joins_still_reject_invalid_sources_and_anchors_typed() {
+        let (native, source) = artifact(8);
+        let index = NativeIndex::new(&native);
+        let call = &native.calls[1];
+        let callee = call.callee_range.clone().unwrap();
+        let exact = join(
+            &native,
+            JoinKind::Callee,
+            callee,
+            vec![call.id.clone()],
+            None,
+        );
+        let check = |join: &Join, source: &[u8]| {
+            let sources = |key: &native::DocumentKey| (*key == document()).then_some(source);
+            validate_join(join, JoinKind::Callee, &native, &index, &sources, None)
+                .map_err(|e| format!("{e:#}"))
+        };
+        // Invalid UTF-8 rejects typed before the index has decoded the source.
+        let mut invalid = source.clone();
+        invalid[line(1) + 2] = 0xff;
+        let sources = |key: &native::DocumentKey| (*key == document()).then_some(&invalid[..]);
+        let error =
+            validate_join(&exact, JoinKind::Callee, &native, &index, &sources, None).unwrap_err();
+        assert!(error.downcast_ref::<std::str::Utf8Error>().is_some());
+        // A valid join decodes the source once; bad anchors still reject, every time.
+        check(&exact, &source).unwrap();
+        let with_range = |start, end| {
+            let mut join = exact.clone();
+            join.anchor.range = range(start, end);
+            join
+        };
+        for _ in 0..2 {
+            for (join, message) in [
+                (
+                    with_range(source.len(), source.len() + 1),
+                    "invalid converted semantic span",
+                ),
+                (with_range(3, 3), "empty semantic span"),
+                (
+                    with_range(usize::MAX - 1, usize::MAX),
+                    "semantic UInt overflow",
+                ),
+            ] {
+                assert_eq!(check(&join, &source).unwrap_err(), message);
+            }
+        }
+        // `é` is bytes 4..6 of `fn mén() {`: a span ending inside it is not a scalar span.
+        let text = String::from_utf8(source)
+            .unwrap()
+            .replacen("main", "mén", 1);
+        let multibyte = text.into_bytes();
+        let sources = |key: &native::DocumentKey| (*key == document()).then_some(&multibyte[..]);
+        let index = NativeIndex::new(&native);
+        for (end, message) in [
+            (5, "invalid converted semantic span"),
+            (6, "join differs from measured candidates"),
+        ] {
+            let error = validate_join(
+                &with_range(3, end),
+                JoinKind::Callee,
+                &native,
+                &index,
+                &sources,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(format!("{error:#}"), message);
+        }
+    }
+
+    #[test]
+    fn indexed_joins_reject_a_contradicting_gap_on_every_join() {
+        let (mut native, source) = artifact(8);
+        // A gap over line 1's `f()` contains its measured callee.
+        native.capability_reports[0].families[1].gaps.insert(
+            1,
+            native::MeasurementGap {
+                range: range(line(1), line(1) + 3),
+                diagnostic: "macro".into(),
+            },
+        );
+        let index = NativeIndex::new(&native);
+        let sources = |key: &native::DocumentKey| (*key == document()).then_some(&source[..]);
+        for call in &native.calls {
+            let callee = call.callee_range.clone().unwrap();
+            let exact = join(
+                &native,
+                JoinKind::Callee,
+                callee,
+                vec![call.id.clone()],
+                None,
+            );
+            let error = validate_join(&exact, JoinKind::Callee, &native, &index, &sources, None)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "measured candidate contradicts native capability gap"
+            );
+        }
     }
 }
