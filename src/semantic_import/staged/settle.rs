@@ -605,6 +605,12 @@ impl StagedJoin<'_> {
             call.stale_target = call.declared_target.as_ref().and_then(|target| {
                 matches!(target, semantic::Target::Internal { .. }).then_some(false)
             });
+            // `calls[index]` is still the destination join's row, classified at join time.
+            call.dispatch = super::super::settled_dispatch(
+                calls[index].dispatch,
+                calls[index].declared_target.as_ref(),
+                &call,
+            );
             #[cfg(feature = "test-support")]
             crate::semantic_batch::testing::edit_row("callResolution", &mut call)?;
             calls[kept] = call;
@@ -663,6 +669,7 @@ impl StagedJoin<'_> {
             call.declared_target = None;
             call.candidates = union.clone();
             call.stale_target = None;
+            call.dispatch = semantic::Dispatch::Unknown;
         }
         for mut call in calls {
             // A call's outcome follows its final row, after the per-document reference

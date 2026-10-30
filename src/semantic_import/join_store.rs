@@ -4,7 +4,7 @@
 //! these traits. A backend decides where claims, coordinate maps, measured native facts,
 //! role sites, global indexes and output rows live; the algorithm never touches those
 //! structures directly.
-use super::{RoleSites, ScopedKey};
+use super::{RoleSites, ScopedKey, TargetCallable};
 use crate::{
     native_evidence as native,
     scip_raw::{CapturedClaim, CapturedScipInventory},
@@ -195,6 +195,12 @@ pub(super) trait GlobalJoinReads {
         key: &ScopedKey,
         reserve: RowReserve<'_>,
     ) -> Result<Vec<(native::DocumentKey, String)>>;
+    /// How a target that `declarations` returned can be called (#470); `Other` for any other.
+    fn target_callable(
+        &self,
+        document: &native::DocumentKey,
+        syntax_id: &str,
+    ) -> Result<TargetCallable>;
     /// `(declared, information)` presence of one symbol.
     fn presence(&self, symbol: &str) -> Result<(bool, bool)>;
     fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
@@ -300,6 +306,7 @@ pub(super) trait JoinIndex: DocumentJoinState {
         key: ScopedKey,
         document: native::DocumentKey,
         syntax_id: String,
+        callable: TargetCallable,
     ) -> Result<()>;
     fn put_symbol(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()>;
     fn put_method(
@@ -319,6 +326,7 @@ pub(super) trait GlobalDiscoverySink {
         document: native::DocumentKey,
         syntax_id: String,
         common_compatible: bool,
+        callable: TargetCallable,
     ) -> Result<()>;
 }
 
@@ -333,9 +341,10 @@ impl<I: JoinIndex> GlobalDiscoverySink for I {
         document: native::DocumentKey,
         syntax_id: String,
         common_compatible: bool,
+        callable: TargetCallable,
     ) -> Result<()> {
         if common_compatible {
-            self.put_declaration(key, document, syntax_id)?;
+            self.put_declaration(key, document, syntax_id, callable)?;
         }
         Ok(())
     }
