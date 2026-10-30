@@ -1114,15 +1114,66 @@ fn staged_and_memory_join_stores_produce_identical_publications() {
             }
         }
     }
-    let world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
-    let descriptor = one_artifact_per_language(&world, vec![("java", vec![java_doc()])]);
+    let java_world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
+    let descriptor = one_artifact_per_language(&java_world, vec![("java", vec![java_doc()])]);
     let (staged, _) = check(
-        &world,
+        &java_world,
         &descriptor,
         DestinationMutations::default(),
         "java types",
     );
     assert_eq!(staged.type_relationships.len(), 1);
+    // Dispatch shapes (#470) on both paths: `new` of a class by identifier and by dotted name
+    // is constructor, a plain call of a free function is direct; a class called without `new`
+    // and a member call of the same free function stay unknown.
+    let source =
+        "class W {}\nfunction m(o){ new W(); new o.W(); W(); h(); o.h(); }\nfunction h(){}\n";
+    let world = world(|root| write_files(root, &[("D.js", source)]));
+    let mut doc = DocSpec::new("D.js")
+        .symbol("pkg W#", 7, &[])
+        .symbol("pkg h().", 17, &[]);
+    for (needle, nth, symbol, roles) in [
+        ("W", 0, "pkg W#", 1),
+        ("h", 2, "pkg h().", 1),
+        ("W", 1, "pkg W#", 0),
+        ("W", 2, "pkg W#", 0),
+        ("W", 3, "pkg W#", 0),
+        ("h", 0, "pkg h().", 0),
+        ("h", 1, "pkg h().", 0),
+    ] {
+        doc = occ_at(doc, source, (needle, nth), None, symbol, roles);
+    }
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
+    let (staged, _) = check(
+        &world,
+        &descriptor,
+        DestinationMutations::default(),
+        "dispatch shapes",
+    );
+    let mut dispatches: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|b| {
+            assert_eq!(b.resolution, Resolution::Resolved);
+            let range = &b.join.anchor.range;
+            (range.start, &source[range.start - 2..range.end], b.dispatch)
+        })
+        .collect();
+    dispatches.sort_by_key(|(start, _, _)| *start);
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    assert_eq!(
+        dispatches
+            .into_iter()
+            .map(|(_, text, dispatch)| (text, dispatch))
+            .collect::<Vec<_>>(),
+        [
+            ("w W", Constructor),
+            ("o.W", Constructor),
+            ("; W", Unknown),
+            ("; h", Direct),
+            ("o.h", Unknown),
+        ]
+    );
 }
 
 /// Adds an occurrence of the `nth` `needle` in `source`. `enclosing` is the byte length of the
