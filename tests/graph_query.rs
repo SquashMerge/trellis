@@ -2084,3 +2084,105 @@ fn trimmed_stale_external_bindings_are_still_filtered_as_external() {
         [(WarningCode::StaleEvidence, Some("pv:10".into()))]
     );
 }
+
+/// #466: the importer publishes contradictory evidence at one call site as one ambiguous row per
+/// provenance, all sharing `call_id` and each carrying the full candidate union.
+fn contradictory_call(rows: &[(&str, Bind)]) -> World {
+    let mut w = world(true);
+    for n in [A, B, 90, 91, 92] {
+        w.decl(n, "src/lib.rs");
+    }
+    w.call(A, 10, 10);
+    for (prov, bind) in rows {
+        w.bind(
+            10,
+            Bind {
+                prov: Some((*prov).into()),
+                ..bind.clone()
+            },
+        );
+    }
+    w
+}
+
+fn ambiguous() -> Bind {
+    Bind {
+        target: Tgt::Nothing,
+        resolution: Resolution::Ambiguous,
+        stale_target: None,
+        ..direct(0)
+    }
+}
+
+#[test]
+fn ambiguous_rows_sharing_a_call_are_one_edge_with_the_full_union() {
+    let mut w = contradictory_call(&[
+        ("pC", ambiguous()),
+        ("pA", ambiguous()),
+        ("pB", ambiguous()),
+    ]);
+    let union: Vec<_> = [90, 91, 92]
+        .into_iter()
+        .map(|n| Target::Internal {
+            syntax_id: sid(n),
+            document: dkey("src/lib.rs"),
+            revision_id: REV.into(),
+        })
+        .collect();
+    for binding in &mut w.doc("src/lib.rs").semantic.as_mut().unwrap().call_bindings {
+        binding.candidates = union.clone();
+    }
+    let mut facts = w.build();
+    let req = request(A, true);
+    let r = run(&mut facts, &req);
+    assert_eq!(edges(&r), vec![(10, A, None, Visit::Boundary, Ambiguous)]);
+    let binding = r.edges[0].binding.as_ref().expect("ambiguous binding");
+    assert_eq!(binding.provenance_id, "pA", "lowest provenance represents");
+    assert_eq!(binding.resolution, Resolution::Ambiguous);
+    assert_eq!(binding.candidates, union);
+    let proofs: Vec<_> = r
+        .provenance
+        .iter()
+        .filter(|p| p.producer_id == PRODUCER)
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(proofs, vec!["pA", "pB", "pC"]);
+    assert!(r.partial);
+    assert_keys(&req, &r, &[(WarningCode::BindingAmbiguous, Some("pA"))]);
+}
+
+#[test]
+fn non_ambiguous_multi_match_for_one_call_stays_integrity() {
+    let external = Bind {
+        target: Tgt::External,
+        resolution: Resolution::External,
+        stale_target: None,
+        ..direct(0)
+    };
+    for (case, rows) in [
+        (
+            "duplicate resolved",
+            vec![("pA", direct(B)), ("pB", direct(B))],
+        ),
+        (
+            "ambiguous+resolved",
+            vec![("pA", ambiguous()), ("pB", direct(B))],
+        ),
+        (
+            "ambiguous+external",
+            vec![("pA", ambiguous()), ("pB", external.clone())],
+        ),
+    ] {
+        let mut facts = contradictory_call(&rows).build();
+        let error = evaluate(&request(A, true), &mut facts).unwrap_err();
+        let integrity = error
+            .downcast_ref::<GraphIntegrity>()
+            .unwrap_or_else(|| panic!("{case}: {error:#}"));
+        assert!(
+            integrity
+                .0
+                .contains("multiple call bindings match one call"),
+            "{case}"
+        );
+    }
+}
