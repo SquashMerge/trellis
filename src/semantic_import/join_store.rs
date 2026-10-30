@@ -201,8 +201,8 @@ pub(super) trait GlobalJoinReads {
     fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
         Ok(self.presence(symbol, None)?.1)
     }
-    /// Crate roots of the library targets in which `symbol` is present (#394).
-    fn library_targets(&self, symbol: &str) -> Result<Vec<native::DocumentKey>>;
+    /// The Cargo targets in which `symbol` is present, as `(crate root, is library)` (#394).
+    fn defining_targets(&self, symbol: &str) -> Result<Vec<ClaimTarget>>;
     fn source_methods(
         &self,
         document: &native::DocumentKey,

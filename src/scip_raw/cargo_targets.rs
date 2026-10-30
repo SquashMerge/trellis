@@ -280,7 +280,9 @@ fn reach<'d>(
                 .filter_map(|c| documents.get(c.as_str()).copied())
                 .collect();
             match found[..] {
-                [] => {}
+                // A declared module whose file was not captured may be shared with another
+                // target: never assign around it.
+                [] => complete = false,
                 [child] => {
                     let child_mod_rs = child_mod_rs.unwrap_or_else(|| child.ends_with("/mod.rs"));
                     pending.push((child, child_mod_rs, child_included));
@@ -332,7 +334,8 @@ fn package_targets(
             targets.push(target);
         }
     };
-    // Library: `[lib]` with its path, else `src/lib.rs`.
+    // Library: `[lib]` with its path, else `src/lib.rs` unless `autolib = false`.
+    let autolib = bool_field(package, "autolib").ok()?.unwrap_or(true);
     match manifest.get("lib") {
         Some(lib) => {
             let lib = lib.as_table()?;
@@ -342,12 +345,13 @@ fn package_targets(
             };
             push("lib", path);
         }
-        None => {
+        None if autolib => {
             let path = at("src/lib.rs")?;
             if exists(&path) {
                 push("lib", path);
             }
         }
+        None => {}
     }
     // Build script: `package.build` as a path or a boolean, else `build.rs`.
     match package.get("build") {
@@ -375,10 +379,10 @@ fn package_targets(
                 inferred.insert(name.to_owned(), main);
             }
         }
-        let prefix = at(directory)?;
-        for document in documents.iter() {
-            let Some(rest) = document.strip_prefix(&format!("{prefix}/")) else {
-                continue;
+        let prefix = format!("{}/", at(directory)?);
+        for document in documents.range::<&str, _>(prefix.as_str()..) {
+            let Some(rest) = document.strip_prefix(&prefix) else {
+                break;
             };
             match rest.split('/').collect::<Vec<_>>()[..] {
                 [file] => {
@@ -425,7 +429,7 @@ fn package_targets(
         let discover = match bool_field(package, auto).ok()? {
             Some(value) => value,
             // Edition 2015 turns discovery off for a kind with explicit targets.
-            None => explicit.is_empty() || !edition_2015?,
+            None => manifest.get(section).is_none() || !edition_2015?,
         };
         if discover {
             for (target_name, path) in inferred {
@@ -501,8 +505,9 @@ fn module_refs(source: &[u8]) -> Option<FileModules> {
                         if let Some(path) = include_path(child, &text) {
                             modules.refs.push(ModRef::Include(path));
                         }
-                    } else {
-                        pending.push((child, None));
+                    } else if declares_file_module(child, &text) {
+                        // `mod name;` inside a macro (`cfg_if!`) is invisible to the tree.
+                        modules.uncertain = true;
                     }
                 }
                 _ => pending.push((child, None)),
@@ -510,6 +515,34 @@ fn module_refs(source: &[u8]) -> Option<FileModules> {
         }
     }
     Some(modules)
+}
+
+/// Whether a macro invocation's tokens, string literals aside, hold `mod <name>;`.
+fn declares_file_module<'s>(
+    invocation: tree_sitter::Node<'_>,
+    text: &impl Fn(tree_sitter::Node<'_>) -> Option<&'s str>,
+) -> bool {
+    let mut leaves = Vec::new();
+    let mut pending = vec![invocation];
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node.kind(),
+            "string_literal" | "raw_string_literal" | "char_literal"
+        ) || node.kind().ends_with("comment")
+        {
+            continue;
+        }
+        if node.child_count() == 0 {
+            leaves.push(text(node).unwrap_or_default());
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
+    }
+    leaves
+        .windows(3)
+        .any(|w| w[0] == "mod" && w[2] == ";" && w[1] != ";")
 }
 
 /// The literal of a `#[path = "..."]` attribute on `item`; `Err` for a `path` this module
@@ -733,6 +766,8 @@ mod tests {
             "#[path = \"x\"] mod a { mod b; }",
             "fn f() { #[path = \"a.rs\"] mod a; }",
             "mod both;",
+            "mod missing;",
+            "cfg_if::cfg_if! { if #[cfg(unix)] { mod a; } }",
         ] {
             let found = targets(
                 &[("Cargo.toml", PACKAGE)],
@@ -767,6 +802,17 @@ mod tests {
         );
         assert_eq!(of(&old, "tests/a.rs"), owned("test", "tests/a.rs"));
         assert_eq!(of(&old, "tests/b.rs"), None);
+        // `autolib = false`: src/lib.rs is no target; an empty explicit list still counts.
+        let manifest = "[package]\nname = \"x\"\nautolib = false\n";
+        let no_lib = targets(
+            &[("Cargo.toml", manifest)],
+            &[("src/lib.rs", ""), ("tests/a.rs", "")],
+        );
+        assert_eq!(of(&no_lib, "src/lib.rs"), None);
+        assert_eq!(of(&no_lib, "tests/a.rs"), owned("test", "tests/a.rs"));
+        let manifest = "test = []\n[package]\nname = \"x\"\n";
+        let none = targets(&[("Cargo.toml", manifest)], &[("tests/a.rs", "")]);
+        assert_eq!(of(&none, "tests/a.rs"), None);
     }
 
     #[test]

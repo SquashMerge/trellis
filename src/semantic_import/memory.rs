@@ -356,7 +356,7 @@ pub(super) struct MemoryJoinIndex {
     /// Presence within one Cargo target, keyed by its crate root (#394).
     target_declared: BTreeSet<(String, native::DocumentKey)>,
     target_information: BTreeSet<(String, native::DocumentKey)>,
-    libraries: BTreeMap<String, BTreeSet<native::DocumentKey>>,
+    targets: BTreeMap<String, BTreeSet<super::join_store::ClaimTarget>>,
     source_methods: BTreeMap<(native::DocumentKey, String), Vec<MethodSummary>>,
     target_methods: BTreeMap<(String, ScopedKey), Vec<MethodSummary>>,
 }
@@ -392,9 +392,9 @@ impl GlobalJoinReads for MemoryJoinIndex {
         })
     }
 
-    fn library_targets(&self, symbol: &str) -> Result<Vec<native::DocumentKey>> {
+    fn defining_targets(&self, symbol: &str) -> Result<Vec<super::join_store::ClaimTarget>> {
         Ok(self
-            .libraries
+            .targets
             .get(symbol)
             .into_iter()
             .flatten()
@@ -603,11 +603,11 @@ impl JoinIndex for MemoryJoinIndex {
             if information {
                 self.target_information.insert(key);
             }
-            if *library && (declared || information) {
-                self.libraries
+            if declared || information {
+                self.targets
                     .entry(symbol.to_owned())
                     .or_default()
-                    .insert(root.clone());
+                    .insert((root.clone(), *library));
             }
         }
         Ok(())

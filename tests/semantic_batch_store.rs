@@ -5313,11 +5313,11 @@ fn real_rust_analyzer_keys_repeated_across_cargo_targets_import_per_target() {
         use_resolution(&staged, "examples/demo.rs", "helper"),
         resolved("src/util.rs")
     );
-    // A document without a determined target names the global key, which no target defines:
-    // unresolved, never guessed and never external.
+    // A document without a determined target (in two test crates) takes a library's key only
+    // when that library is the one target defining it.
     assert_eq!(
         use_resolution(&staged, "tests/common/mod.rs", "helper"),
-        (Resolution::Unresolved, None)
+        resolved("src/util.rs")
     );
     // The target is part of each Rust claim's envelope, so of its digest and proof identity.
     let admission = world.memory_admission(&descriptor);

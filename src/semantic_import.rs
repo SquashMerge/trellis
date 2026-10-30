@@ -1020,26 +1020,36 @@ fn defining_key(
     }
 }
 
-/// The identity a use names (#394): a symbol present in the use's own Cargo target is that
-/// target's; otherwise one present in exactly one library target is that library's, which is
-/// the only kind of target another can depend on. A use outside a determined target, or one
-/// neither rule decides, names the global key.
+/// The identity a use names (#394). A symbol present in the use's own Cargo target is that
+/// target's. Otherwise one present in exactly one library target is that library's: a library
+/// is the only kind of target another can depend on, and rust-analyzer's key names its
+/// package. A use in a document without a determined target takes a library's key only when
+/// that library is the one target defining it, since the document may belong to a target that
+/// defines the same key. Every other use names the global key.
 fn using_key<G: GlobalJoinReads>(
     index: &G,
     symbol: &str,
     document: &native::DocumentKey,
     target: Option<&join_store::ClaimTarget>,
 ) -> Result<ScopedKey> {
-    let Some((root, _)) = target.filter(|_| !symbol.starts_with("local ")) else {
+    if symbol.starts_with("local ") {
         return Ok(scoped_key(symbol, document));
-    };
-    if index.presence(symbol, Some(root))? != (false, false) {
+    }
+    if let Some((root, _)) = target
+        && index.presence(symbol, Some(root))? != (false, false)
+    {
         return Ok((symbol.to_owned(), Some(root.clone())));
     }
-    if let [library] = &index.library_targets(symbol)?[..] {
-        return Ok((symbol.to_owned(), Some(library.clone())));
-    }
-    Ok((symbol.to_owned(), None))
+    let defining = index.defining_targets(symbol)?;
+    let library = match (target, &defining[..]) {
+        (None, [(root, true)]) => Some(root),
+        (None, _) => None,
+        (Some(_), _) => match &defining.iter().filter(|(_, lib)| *lib).collect::<Vec<_>>()[..] {
+            [(root, _)] => Some(root),
+            _ => None,
+        },
+    };
+    Ok((symbol.to_owned(), library.cloned()))
 }
 
 #[derive(Clone, Debug, Default)]

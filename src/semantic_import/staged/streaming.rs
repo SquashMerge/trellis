@@ -81,11 +81,12 @@ fn target_presence_sql(filtered: bool) -> String {
     )
 }
 
-/// Crate roots of the library targets whose claims name `?1` as present, one row per claim.
-fn library_targets_sql(filtered: bool) -> String {
+/// Crate roots and library flags of the Cargo targets whose claims name `?1` as present, one
+/// row per claim.
+fn defining_targets_sql(filtered: bool) -> String {
     eligible(
-        "SELECT s.language, s.path FROM claims c JOIN sources s ON s.ord=c.target_root \
-         WHERE c.symbol=?1 AND c.presence>0 AND c.target_lib=1",
+        "SELECT s.language, s.path, c.target_lib FROM claims c \
+         JOIN sources s ON s.ord=c.target_root WHERE c.symbol=?1 AND c.presence>0",
         "c.source_ord",
         filtered,
     )
@@ -103,7 +104,7 @@ pub(super) fn cursor_sql() -> Vec<String> {
         queries.push(methods_sql(false, filtered));
         queries.push(presence_sql(filtered));
         queries.push(target_presence_sql(filtered));
-        queries.push(library_targets_sql(filtered));
+        queries.push(defining_targets_sql(filtered));
     }
     queries
 }
@@ -273,19 +274,22 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
         };
         Ok((probe(PRESENCE_DECLARED)?, probe(PRESENCE_INFORMATION)?))
     }
-    fn library_targets(&self, symbol: &str) -> Result<Vec<native::DocumentKey>> {
+    fn defining_targets(&self, symbol: &str) -> Result<Vec<ClaimTarget>> {
         self.ctx.charge(1)?;
-        let sql = library_targets_sql(self.filtered || self.side == 1);
+        let sql = defining_targets_sql(self.filtered || self.side == 1);
         let mut statement = self.ctx.conn.prepare_cached(&sql)?;
         let mut rows = statement.query(params![symbol])?;
         let mut result = BTreeSet::new();
         while let Some(row) = rows.next()? {
             self.ctx.charge(1)?;
-            result.insert(native::DocumentKey {
-                source_set_id: self.source_set_id.clone(),
-                language: row.get(0)?,
-                path: row.get(1)?,
-            });
+            result.insert((
+                native::DocumentKey {
+                    source_set_id: self.source_set_id.clone(),
+                    language: row.get(0)?,
+                    path: row.get(1)?,
+                },
+                row.get::<_, i64>(2)? == 1,
+            ));
         }
         Ok(result.into_iter().collect())
     }
@@ -667,7 +671,7 @@ struct DocumentIndex<'g, 'a> {
 struct ReadCache {
     declarations: BTreeMap<ScopedKey, Vec<(native::DocumentKey, String)>>,
     presence: BTreeMap<(String, Option<native::DocumentKey>), (bool, bool)>,
-    libraries: BTreeMap<String, Vec<native::DocumentKey>>,
+    targets: BTreeMap<String, Vec<ClaimTarget>>,
     retained: Reservation,
 }
 
@@ -695,7 +699,7 @@ impl<'g, 'a> DocumentIndex<'g, 'a> {
             reads: RefCell::new(ReadCache {
                 declarations: BTreeMap::new(),
                 presence: BTreeMap::new(),
-                libraries: BTreeMap::new(),
+                targets: BTreeMap::new(),
                 retained: global.ctx.live.reserve(0)?,
             }),
         })
@@ -765,26 +769,26 @@ impl GlobalJoinReads for DocumentIndex<'_, '_> {
         }
         Ok(found)
     }
-    fn library_targets(&self, symbol: &str) -> Result<Vec<native::DocumentKey>> {
-        if let Some(found) = self.reads.borrow().libraries.get(symbol) {
+    fn defining_targets(&self, symbol: &str) -> Result<Vec<ClaimTarget>> {
+        if let Some(found) = self.reads.borrow().targets.get(symbol) {
             return Ok(found.clone());
         }
-        let found = self.global.library_targets(symbol)?;
+        let found = self.global.defining_targets(symbol)?;
         let mut reads = self.reads.borrow_mut();
         let mut bytes = sizes::sum(&[
-            sizes::map_entries::<String, Vec<native::DocumentKey>>(1)?,
+            sizes::map_entries::<String, Vec<ClaimTarget>>(1)?,
             symbol.len() as u64,
         ])?;
-        for root in &found {
+        for (root, _) in &found {
             bytes = sizes::sum(&[
                 bytes,
-                std::mem::size_of::<native::DocumentKey>() as u64,
+                std::mem::size_of::<ClaimTarget>() as u64,
                 sizes::document(root)?,
             ])?;
         }
         // Optional like the presence cache: without room the roots are returned uncached.
         if reads.retained.grow(bytes).is_ok() {
-            reads.libraries.insert(symbol.to_owned(), found.clone());
+            reads.targets.insert(symbol.to_owned(), found.clone());
         }
         Ok(found)
     }
