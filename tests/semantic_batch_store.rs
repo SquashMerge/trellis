@@ -2519,7 +2519,6 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             "nat_docs",
             "nat_declarations",
             "g_definitions",
-            "g_callables",
             "g_methods",
             "w_docs",
             "out_coverage",
@@ -2806,6 +2805,24 @@ fn join_cursor_plans_use_no_temp_btree() {
             "{sql}: {plan:?}"
         );
     }
+    // The per-call callable probe (#481) is a keyed search of the covering owner index, never
+    // a scan of a side's definitions.
+    let sql = testing::join_target_callable_sql();
+    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let params = vec![rusqlite::types::Value::Null; statement.parameter_count()];
+    let plan: Vec<String> = statement
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter().any(|step| step.contains(
+            "USING COVERING INDEX g_definitions_owner (side=? AND owner_doc=? AND syntax_id=?)"
+        )),
+        "{sql}: {plan:?}"
+    );
 }
 
 impl World {

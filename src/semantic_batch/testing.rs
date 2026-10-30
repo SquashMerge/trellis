@@ -700,3 +700,8 @@ pub fn staged_publication(batch: &mut AdmittedBatch) -> Result<semantic::Semanti
 pub fn join_cursor_sql() -> Vec<String> {
     crate::semantic_import::staged_cursor_sql()
 }
+
+/// The staged join's per-call target-callable probe (#470), for query-plan tests.
+pub fn join_target_callable_sql() -> &'static str {
+    crate::semantic_import::staged_target_callable_sql()
+}
