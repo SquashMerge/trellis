@@ -5,8 +5,8 @@
 use super::*;
 use crate::{
     graph_query::{
-        DocumentFacts, GraphAnswer, GraphFacts, GraphIntegrity, GraphQuery, GraphRequest,
-        GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument, evaluate,
+        DefaultProducers, DocumentFacts, GraphAnswer, GraphFacts, GraphIntegrity, GraphQuery,
+        GraphRequest, GraphSnapshot, GraphSource, HistoryFacts, SemanticDocument, evaluate,
     },
     native_evidence::DocumentKey,
     semantic_evidence as sem,
@@ -29,6 +29,7 @@ fn native_to_semantic<T: serde::Serialize, U: serde::de::DeserializeOwned>(value
 struct SnapshotGraphSource<'a> {
     db: &'a Connection,
     selected: &'a ReadRevision,
+    /// An explicit producer; `None` selects each language's default producer (#483).
     producer: Option<String>,
     snapshot: GraphSnapshot,
     scopes: BTreeMap<DocumentKey, V8NativeScope>,
@@ -47,6 +48,31 @@ impl SnapshotGraphSource<'_> {
         })?;
         self.scopes.insert(key.clone(), scope.clone());
         Ok(scope)
+    }
+
+    /// The per-language default selection, read once and recorded in the facts (#483).
+    fn defaults(&mut self) -> Result<&DefaultProducers> {
+        if self.facts.defaults.is_none() {
+            self.facts.defaults = Some(semantic_display::default_producers(
+                self.db,
+                &self.selected.key,
+            )?);
+        }
+        Ok(self.facts.defaults.as_ref().expect("defaults read"))
+    }
+
+    /// The producer of a document in `language`: the explicit one when it covers the
+    /// language, else the language's default.
+    fn producer_for(&mut self, language: &str) -> Result<Option<String>> {
+        match &self.producer {
+            Some(producer) => Ok(self
+                .facts
+                .producers
+                .get(producer)
+                .is_some_and(|languages| languages.contains(language))
+                .then(|| producer.clone())),
+            None => Ok(self.defaults()?.producer(language).map(str::to_owned)),
+        }
     }
 
     fn read_document(&mut self, key: &DocumentKey) -> Result<DocumentFacts> {
@@ -79,17 +105,9 @@ impl SnapshotGraphSource<'_> {
             freshness: "fresh".into(),
             derived_from: None,
         })?;
-        let in_scope = match &self.producer {
-            Some(producer) => self
-                .facts
-                .producers
-                .get(producer)
-                .is_some_and(|languages| languages.contains(&key.language)),
-            None => false,
-        };
-        let semantic = match (&self.producer, in_scope) {
-            (Some(producer), true) => self.read_semantic(producer, key)?,
-            _ => None,
+        let semantic = match self.producer_for(&key.language)? {
+            Some(producer) => self.read_semantic(&producer, key)?,
+            None => None,
         };
         Ok(DocumentFacts {
             key: key.clone(),
@@ -160,6 +178,10 @@ impl GraphSource for SnapshotGraphSource<'_> {
         Ok(Some(languages))
     }
 
+    fn default_producers(&mut self) -> Result<Option<DefaultProducers>> {
+        Ok(Some(self.defaults()?.clone()))
+    }
+
     fn locate(&mut self, syntax_id: &str) -> Result<Option<DocumentKey>> {
         if let Some(location) = self.facts.locations.get(syntax_id) {
             return Ok(location.clone());
@@ -220,14 +242,13 @@ impl GraphSource for SnapshotGraphSource<'_> {
             return Ok(history.clone());
         }
         let producer = self
-            .producer
-            .as_deref()
+            .producer_for(&key.language)?
             .ok_or_else(|| anyhow::anyhow!("call graph history requires a producer"))?;
         let history = read_semantic_history(
             self.db,
             &self.selected.key,
             self.selected.pin.index_revision,
-            producer,
+            &producer,
             key,
             syntax_id,
         )?
@@ -461,25 +482,6 @@ pub(super) fn sequence_calls(
     view: &mut crate::behavior::SequenceView,
 ) -> Result<()> {
     use crate::graph_query::{self as engine, BoundaryReason, GraphEdge, GraphNode, Visit};
-    let producers = db
-        .prepare(
-            "SELECT id FROM semantic_revision_producers WHERE revision_id=?1 ORDER BY id LIMIT 2",
-        )?
-        .query_map([&selected.key], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for producer in &producers {
-        if !engine::valid_producer_id(producer) {
-            return Err(SelectedIntegrity("invalid selected semantic producer ID".into()).into());
-        }
-    }
-    if producers.len() != 1 {
-        if producers.len() > 1 {
-            view.warnings
-                .push("multiple semantic producers; showing syntax".into());
-        }
-        return Ok(());
-    }
-    let producer = producers[0].clone();
     let (source_set_id, revision_id): (String, String) = db.query_row(
         "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
         [&selected.key],
@@ -490,20 +492,33 @@ pub(super) fn sequence_calls(
         revision_id: revision_id.clone(),
     };
     let mut check = || Ok(());
+    // Each document uses its language's default producer (#483).
     let mut source = SnapshotGraphSource {
         db,
         selected,
-        producer: Some(producer.clone()),
+        producer: None,
         snapshot: snapshot.clone(),
         scopes: BTreeMap::new(),
         declaration_roles: BTreeMap::new(),
         facts: GraphFacts::memo(snapshot),
         check: &mut check,
     };
-    let languages = source.producer_languages(&producer)?;
     let key = source
         .locate(&view.seed.id)?
         .ok_or_else(|| SelectedIntegrity("selected sequence declaration missing".into()))?;
+    let defaults = source.defaults()?.clone();
+    let Some(producer) = defaults.producer(&key.language).map(str::to_owned) else {
+        if defaults
+            .by_language
+            .get(&key.language)
+            .is_some_and(|producers| producers.len() > 1)
+        {
+            view.warnings
+                .push(engine::multiple_producers_note(&key.language));
+        }
+        return Ok(());
+    };
+    let languages = Some(defaults.languages());
     let document = source.document(&key)?;
     let declaration = document
         .declarations

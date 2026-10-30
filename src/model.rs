@@ -283,12 +283,34 @@ pub struct IndexStatus {
     /// The daemon's watcher-health witness for this checkout, on CLI status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watcher: Option<crate::watch::WatcherWitness>,
-    /// The semantic producer whose selected bindings `stats` counts (#467).
+    /// The one semantic producer whose selected bindings `stats` counts, when every
+    /// selected language shares it (#467, #483).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_producer_id: Option<String>,
-    /// Why `stats` counts syntax only: no published producer, or several.
+    /// Why `stats` counts syntax only, wholly or for a language with several producers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_note: Option<String>,
+    /// Each indexed language's selected producer, state and counts, when any producer is
+    /// published (#483). `stats` is their combined total.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_languages: Vec<LanguageSemantic>,
+}
+/// One language's semantic producer selection and its selected bindings in status (#483).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageSemantic {
+    pub language: String,
+    /// The sole published producer whose profile covers the language.
+    pub semantic_producer_id: Option<String>,
+    /// Why the language shows syntax only, when it does.
+    pub semantic_note: Option<String>,
+    pub semantic_state: SemanticState,
+    /// Measured calls in the language's documents.
+    pub calls: usize,
+    pub internal: usize,
+    pub external: usize,
+    pub ambiguous: usize,
+    pub unresolved: usize,
 }
 /// Bytes allowed in a requested semantic producer ID.
 pub const SEMANTIC_PRODUCER_ID_BYTES: usize = 512;
@@ -310,7 +332,7 @@ pub struct ViewQuery {
     pub include_callbacks: bool,
     #[serde(default)]
     pub exclude_paths: Vec<String>,
-    /// An explicit published semantic producer. Absent selects the sole published one.
+    /// An explicit published semantic producer. Absent selects each language's sole one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_producer_id: Option<String>,
 }

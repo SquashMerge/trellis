@@ -173,6 +173,50 @@ async fn linked_worktree_reads_its_own_head() {
     assert!(reader().status(f.root()).await.changes.unwrap().is_empty());
 }
 
+/// #483: the cleared child environment keeps the user's home, so the Git view honors the
+/// global excludes file (`~/.config/git/ignore`) and `core.excludesFile` as Git does.
+#[tokio::test]
+async fn status_honors_the_users_global_excludes() {
+    let f = Fixture::new();
+    f.write("kept.txt", "new\n");
+    f.write("scratch.log", "global default excludes\n");
+    f.write("notes.tmp", "configured excludes file\n");
+    let paths = |status: trellis::git_status::GitStatus| {
+        let mut paths: Vec<_> = status
+            .changes
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        paths.sort();
+        paths
+    };
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(
+        paths(reader().with_home(empty.path()).status(f.root()).await),
+        ["kept.txt", "notes.tmp", "scratch.log"]
+    );
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".config/git")).unwrap();
+    fs::write(home.path().join(".config/git/ignore"), "*.log\n").unwrap();
+    assert_eq!(
+        paths(reader().with_home(home.path()).status(f.root()).await),
+        ["kept.txt", "notes.tmp"]
+    );
+    let excludes = home.path().join("excludes");
+    fs::write(&excludes, "*.tmp\n").unwrap();
+    fs::write(
+        home.path().join(".gitconfig"),
+        format!("[core]\n\texcludesFile = {}\n", excludes.display()),
+    )
+    .unwrap();
+    // A configured excludes file replaces the default one, as in Git.
+    assert_eq!(
+        paths(reader().with_home(home.path()).status(f.root()).await),
+        ["kept.txt", "scratch.log"]
+    );
+}
+
 #[tokio::test]
 async fn status_and_diff_measure_net_head_with_rename_delete_added_and_ignored() {
     let f = Fixture::new();

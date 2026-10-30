@@ -1163,7 +1163,7 @@ fn call_warnings<'a>(
             );
         }
     }
-    if let Some(note) = semantic.note {
+    if let Some(note) = semantic.note.as_deref() {
         keys.insert((4, None), ("syntaxOnly", note));
     }
     keys.into_iter()

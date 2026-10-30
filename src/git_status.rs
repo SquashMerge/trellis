@@ -3,6 +3,7 @@
 use git2::{BranchType, Delta, DiffFindOptions, DiffOptions, ErrorCode, Repository};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsString,
     io::{self, Write},
     path::{Path, PathBuf},
     process::Stdio,
@@ -163,10 +164,25 @@ fn unavailable(reason: GitReason) -> GitSummary {
 #[derive(Debug, Clone)]
 pub struct GitReader {
     executable: PathBuf,
+    /// The user's `HOME` and `XDG_CONFIG_HOME`, the only variables the cleared child
+    /// environment keeps, so libgit2 finds the global config and excludes file
+    /// (`core.excludesFile`, by default `~/.config/git/ignore`) as Git does (#483).
+    home: Option<OsString>,
+    xdg_config_home: Option<OsString>,
 }
 impl GitReader {
     pub fn new(executable: PathBuf) -> Self {
-        Self { executable }
+        Self {
+            executable,
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+        }
+    }
+    /// The reader with another user home and no `XDG_CONFIG_HOME`, for tests.
+    pub fn with_home(mut self, home: &Path) -> Self {
+        self.home = Some(home.as_os_str().to_owned());
+        self.xdg_config_home = None;
+        self
     }
     pub async fn summary(&self, root: &Path) -> GitSummary {
         let head = match self.read(root, "head", None).await {
@@ -238,6 +254,12 @@ impl GitReader {
             .kill_on_drop(true);
         if let Some(path) = path {
             command.arg("--path").arg(path);
+        }
+        if let Some(home) = &self.home {
+            command.env("HOME", home);
+        }
+        if let Some(config) = &self.xdg_config_home {
+            command.env("XDG_CONFIG_HOME", config);
         }
         let child = command.spawn().map_err(|_| GitReason::Unreadable)?;
         let mut guard = ChildGuard(Some(child));
