@@ -1593,8 +1593,8 @@ fn documents_that_each_fit_join_although_their_sum_exceeds_the_budget() {
     let mut tight = BatchLimits::PRODUCTION;
     tight.unit_expansion_bytes = peak / 2;
     let error = run(1, &tight)
-        .err()
-        .expect("an oversized document is denied");
+        .map(|_| ())
+        .expect_err("an oversized document is denied");
     assert!(matches!(error.downcast_ref::<ScipCaptureError>(),
         Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"));
 }
