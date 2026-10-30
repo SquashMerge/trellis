@@ -2701,6 +2701,7 @@ mod batch_admission {
                     text_document_encoding: 1,
                     project_root_uri: &uri,
                     module_roots: &trellis::scip_raw::ModuleRoots::default(),
+                    cargo_targets: &trellis::scip_raw::CargoTargets::default(),
                     assigned_documents: 3,
                 },
                 &mut resolve,

@@ -162,6 +162,20 @@ impl Counter<'_> {
         ])?;
         Ok(payload)
     }
+    /// A Rust claim's `cargoTarget` object (#394).
+    fn cargo_target(&mut self) -> Result<u64> {
+        self.literal(b"{\"kind\":")?;
+        let kind = self.string()?;
+        self.literal(b",\"root\":")?;
+        let root = self.string()?;
+        self.literal(b"}")?;
+        sizes::sum(&[
+            kind,
+            root,
+            "kindroot".len() as u64,
+            sizes::map_entries::<String, serde_json::Value>(2)?,
+        ])
+    }
     fn raw(&mut self) -> Result<u64> {
         self.literal(b"{")?;
         let (entries, keys, payload) =
@@ -231,7 +245,17 @@ pub(super) fn measure(canonical: &[u8], metadata_bytes: u64) -> Result<ClaimSize
         max_string: 0,
         max_number: 0,
     };
-    counter.literal(b"{\"formatVersion\":")?;
+    // A Rust claim whose Cargo target is determined leads with `cargoTarget` (#394).
+    let target_prefix = b"{\"cargoTarget\":";
+    let target = if canonical.starts_with(target_prefix) {
+        counter.literal(target_prefix)?;
+        let target = counter.cargo_target()?;
+        counter.literal(b",\"formatVersion\":")?;
+        target
+    } else {
+        counter.literal(b"{\"formatVersion\":")?;
+        0
+    };
     let format = counter.integer()?;
     counter.literal(b",\"positionEncoding\":")?;
     let encoding = counter.integer()?;
@@ -252,13 +276,15 @@ pub(super) fn measure(canonical: &[u8], metadata_bytes: u64) -> Result<ClaimSize
         kind,
         path,
         raw,
+        target,
         metadata_bytes,
     ])?;
     // Current reconstruction parses an envelope Value then moves raw out. Its remaining
     // fields and object entries overlap the final claim; raw itself is not copied.
     let scratch = sizes::sum(&[
-        sizes::map_entries::<String, serde_json::Value>(5)?,
-        "formatVersionpositionEncodingrawrecordKindrelativePath".len() as u64,
+        sizes::map_entries::<String, serde_json::Value>(6)?,
+        "cargoTargetformatVersionpositionEncodingrawrecordKindrelativePath".len() as u64,
+        target,
         format,
         encoding,
         kind,

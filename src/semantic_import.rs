@@ -32,6 +32,9 @@ pub(crate) type AnchorParts = (
 type AnchorKey = (native::DocumentKey, usize, usize, semantic::JoinKind);
 /// An `AnchorKey` whose document is its rank among the artifact's interned documents.
 type RankedAnchor = (usize, usize, usize, semantic::JoinKind);
+/// A symbol's join identity: its raw spelling and its scope document, which is the containing
+/// document of a `local ` symbol, the crate root of a Cargo-target-scoped one (#394), and
+/// `None` for a global one.
 type ScopedKey = (String, Option<native::DocumentKey>);
 
 /// Import-local native indexes. Distinct native identities, not raw-claim counts,
@@ -972,17 +975,71 @@ fn scoped_key(
 }
 
 fn symbol_key(symbol: &str, document: &native::DocumentKey) -> semantic::SymbolKey {
-    let local = symbol.starts_with("local ");
+    scoped_symbol_key(&scoped_key(symbol, document))
+}
+
+/// The contract key of a join identity: document scope for a local symbol, target scope for
+/// one scoped to a Cargo target's crate root (owner ruling 2026-10-30, #394), else global.
+fn scoped_symbol_key(key: &ScopedKey) -> semantic::SymbolKey {
     semantic::SymbolKey {
         scheme: semantic::SymbolScheme::Scip,
-        symbol: symbol.into(),
-        scope: if local {
-            semantic::SymbolScope::Document
-        } else {
-            semantic::SymbolScope::Global
+        symbol: key.0.clone(),
+        scope: match &key.1 {
+            None => semantic::SymbolScope::Global,
+            Some(_) if key.0.starts_with("local ") => semantic::SymbolScope::Document,
+            Some(_) => semantic::SymbolScope::Target,
         },
-        document: local.then(|| document.clone()),
+        document: key.1.clone(),
     }
+}
+
+/// The Cargo target of a claim's document, if its target is determined (#394).
+fn claim_target(source_set_id: &str, claim: &CapturedClaim) -> Option<join_store::ClaimTarget> {
+    claim.envelope.cargo_target.as_ref().map(|target| {
+        (
+            native::DocumentKey {
+                source_set_id: source_set_id.to_owned(),
+                language: claim.language.clone(),
+                path: target.root.clone(),
+            },
+            target.is_lib(),
+        )
+    })
+}
+
+/// The identity a definition or symbol information defines: a local symbol in its document,
+/// any other in its document's Cargo target, or globally when that target is not determined.
+fn defining_key(
+    symbol: &str,
+    document: &native::DocumentKey,
+    target: Option<&join_store::ClaimTarget>,
+) -> ScopedKey {
+    match target {
+        Some((root, _)) if !symbol.starts_with("local ") => (symbol.to_owned(), Some(root.clone())),
+        _ => scoped_key(symbol, document),
+    }
+}
+
+/// The identity a use names (#394): a symbol present in the use's own Cargo target is that
+/// target's; otherwise one present in exactly one library target is that library's, which is
+/// the only kind of target another can depend on. A use outside a determined target, or one
+/// neither rule decides, names the global key.
+fn using_key<G: GlobalJoinReads>(
+    index: &G,
+    symbol: &str,
+    document: &native::DocumentKey,
+    target: Option<&join_store::ClaimTarget>,
+) -> Result<ScopedKey> {
+    let Some((root, _)) = target.filter(|_| !symbol.starts_with("local ")) else {
+        return Ok(scoped_key(symbol, document));
+    };
+    if index.presence(symbol, Some(root))? != (false, false) {
+        return Ok((symbol.to_owned(), Some(root.clone())));
+    }
+    if let [library] = &index.library_targets(symbol)?[..] {
+        return Ok((symbol.to_owned(), Some(library.clone())));
+    }
+    Ok((symbol.to_owned(), None))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1037,19 +1094,23 @@ fn declaration_targets<S: JoinStore, G: GlobalJoinReads>(
     symbol: &str,
     operation: &mut S::Operation,
 ) -> Result<Vec<semantic::Target>> {
+    scoped_declaration_targets(store, index, &scoped_key(symbol, document), operation)
+}
+
+fn scoped_declaration_targets<S: JoinStore, G: GlobalJoinReads>(
+    store: &S,
+    index: &G,
+    key: &ScopedKey,
+    operation: &mut S::Operation,
+) -> Result<Vec<semantic::Target>> {
     store.reserve_operation(operation, || {
         staged::sizes::sum(&[
             std::mem::size_of::<ScopedKey>() as u64,
-            symbol.len() as u64,
-            if symbol.starts_with("local ") {
-                staged::sizes::document(document)?
-            } else {
-                0
-            },
+            key.0.len() as u64,
+            key.1.as_ref().map_or(Ok(0), staged::sizes::document)?,
         ])
     })?;
-    let key = scoped_key(symbol, document);
-    let rows = index.declarations(&key, &mut |bytes| {
+    let rows = index.declarations(key, &mut |bytes| {
         store.reserve_operation(operation, || Ok(bytes))
     })?;
     store.reserve_operation(operation, || {
@@ -1190,9 +1251,10 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
     store
         .bytes_of(&doc)?
         .context("missing admitted claim document")?;
+    let target = claim_target(store.source_set_id(), claim);
     if claim.envelope.record_kind == "symbolInformation" {
         if let Some(symbol) = claim.envelope.raw["symbol"].as_str() {
-            global.symbol_presence(symbol, false, true)?;
+            global.symbol_presence(symbol, target.as_ref(), false, true)?;
         }
     } else if claim.envelope.record_kind == "occurrence" {
         let symbol = claim.envelope.raw["symbol"]
@@ -1216,7 +1278,7 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
             .context("invalid syntax kind")?;
         let declaration = roles & 1 != 0;
         if declaration {
-            global.symbol_presence(symbol, true, false)?;
+            global.symbol_presence(symbol, target.as_ref(), true, false)?;
         }
         let Some(measured) =
             measure_occurrence(store, claim, &doc, symbol, roles, range.clone(), operation)?
@@ -1224,15 +1286,12 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
             return Ok(None);
         };
         if roles & 1 != 0 && measured.row.binding.status == semantic::JoinStatus::Exact {
+            let key = defining_key(symbol, &doc, target.as_ref());
             store.reserve_operation(operation, || {
                 staged::sizes::sum(&[
                     std::mem::size_of::<ScopedKey>() as u64,
                     symbol.len() as u64,
-                    if symbol.starts_with("local ") {
-                        staged::sizes::document(&doc)?
-                    } else {
-                        0
-                    },
+                    key.1.as_ref().map_or(Ok(0), staged::sizes::document)?,
                     std::mem::size_of::<native::DocumentKey>() as u64,
                     staged::sizes::document(&doc)?,
                     std::mem::size_of::<String>() as u64,
@@ -1240,7 +1299,7 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
                 ])
             })?;
             global.exact_definition(
-                scoped_key(symbol, &doc),
+                key,
                 doc.clone(),
                 measured.row.binding.candidate_ids[0].clone(),
                 measured.compatible_syntax_id.is_some(),
@@ -1295,7 +1354,8 @@ fn emit_join_symbols<S: JoinStore, G: GlobalJoinReads, K: JoinSink>(
             .as_str()
             .filter(|s| !s.is_empty())
             .context("missing symbol key")?;
-        let declarations = declaration_targets(store, index, &doc, key, &mut operation)?;
+        let scoped = defining_key(key, &doc, claim_target(source_set_id, &claim).as_ref());
+        let declarations = scoped_declaration_targets(store, index, &scoped, &mut operation)?;
         let display_name = claim.envelope.raw["displayName"]
             .as_str()
             .filter(|s| !s.is_empty());
@@ -1303,17 +1363,13 @@ fn emit_join_symbols<S: JoinStore, G: GlobalJoinReads, K: JoinSink>(
             staged::sizes::sum(&[
                 std::mem::size_of::<semantic::Symbol>() as u64,
                 key.len() as u64,
-                if key.starts_with("local ") {
-                    staged::sizes::document(&doc)?
-                } else {
-                    0
-                },
+                scoped.1.as_ref().map_or(Ok(0), staged::sizes::document)?,
                 display_name.map_or(0, |s| s.len() as u64),
                 claim.captured_proof_id.len() as u64,
             ])
         })?;
         out.symbol(semantic::Symbol {
-            key: symbol_key(key, &doc),
+            key: scoped_symbol_key(&scoped),
             display_name: display_name.map(str::to_owned),
             declarations,
             provenance_id: claim.captured_proof_id.clone(),
@@ -1367,22 +1423,24 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         call,
     } = measured;
     let claim = store.claim(&proof_id, "occurrence", &fact_digest)?;
+    let scoped = using_key(
+        index,
+        &symbol,
+        &doc,
+        claim_target(store.source_set_id(), &claim).as_ref(),
+    )?;
     store.reserve_operation(operation, || {
         staged::sizes::sum(&[
             std::mem::size_of::<semantic::SymbolKey>() as u64,
             symbol.len() as u64,
-            if symbol.starts_with("local ") {
-                staged::sizes::document(&doc)?
-            } else {
-                0
-            },
+            scoped.1.as_ref().map_or(Ok(0), staged::sizes::document)?,
         ])
     })?;
-    let key = symbol_key(&symbol, &doc);
-    let mut asserted = declaration_targets(store, index, &doc, &symbol, operation)?;
+    let key = scoped_symbol_key(&scoped);
+    let mut asserted = scoped_declaration_targets(store, index, &scoped, operation)?;
     if asserted.is_empty()
         && key.scope == semantic::SymbolScope::Global
-        && index.presence(&symbol)? == (false, false)
+        && index.presence(&symbol, None)? == (false, false)
     {
         store.reserve_operation(operation, || {
             staged::sizes::sum(&[

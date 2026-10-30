@@ -23,7 +23,7 @@ closed!(CoverageState { NotRequested => "notRequested", Omitted => "omitted", Un
 closed!(Freshness { Fresh => "fresh", PossiblyStale => "possiblyStale", Stale => "stale" });
 closed!(EvidenceKind { MeasuredSyntax => "measuredSyntax", DeclarationBinding => "declarationBinding", SemanticReference => "semanticReference", TypeRelationship => "typeRelationship" });
 closed!(RecordKind { Occurrence => "occurrence", SymbolInformation => "symbolInformation", Relationship => "relationship" });
-closed!(SymbolScope { Global => "global", Document => "document" });
+closed!(SymbolScope { Global => "global", Document => "document", Target => "target" });
 closed!(JoinKind { DeclarationName => "declarationName", Callee => "callee", Invocation => "invocation", Reference => "reference" });
 closed!(JoinStatus { Exact => "exact", Ambiguous => "ambiguous", Unmatched => "unmatched", Unsupported => "unsupported" });
 closed!(Resolution { Resolved => "resolved", External => "external", Ambiguous => "ambiguous", Unresolved => "unresolved" });
@@ -178,6 +178,15 @@ fn symbol_key(key_: &SymbolKey, revision: &native::Revision) -> Result<()> {
     match (&key_.scope, &key_.document) {
         (SymbolScope::Global, None) => {}
         (SymbolScope::Document, Some(d)) => key(d, revision)?,
+        // A Cargo target namespace, named by its Rust crate root (owner ruling 2026-10-30,
+        // #394). A local symbol is document-scoped, never target-scoped.
+        (SymbolScope::Target, Some(d)) => {
+            key(d, revision)?;
+            ensure!(
+                d.language == "rust" && !key_.symbol.starts_with("local "),
+                "symbol scope/document mismatch"
+            );
+        }
         _ => anyhow::bail!("symbol scope/document mismatch"),
     }
     Ok(())
@@ -199,7 +208,14 @@ fn target(t: &Target, revision: &native::Revision, known: KnownTarget<'_>) -> Re
             );
             ensure!(known(syntax_id, document)?, "unmeasured internal target");
         }
-        Target::External { symbol } => symbol_key(symbol, revision)?,
+        Target::External { symbol } => {
+            symbol_key(symbol, revision)?;
+            // A target-scoped key names a namespace inside the artifact (#394).
+            ensure!(
+                symbol.scope != SymbolScope::Target,
+                "target-scoped external symbol"
+            );
+        }
     }
     Ok(())
 }
@@ -1318,8 +1334,15 @@ fn validate_symbol_row(
     if let Some(name) = &s.display_name {
         text(name)?;
     }
-    if let Some(doc) = &s.key.document {
-        ensure!(doc == &p.document, "symbol evidence document mismatch");
+    match (&s.key.scope, &s.key.document) {
+        (SymbolScope::Document, Some(doc)) => {
+            ensure!(doc == &p.document, "symbol evidence document mismatch")
+        }
+        (SymbolScope::Target, Some(_)) => ensure!(
+            p.document.language == "rust",
+            "symbol evidence document mismatch"
+        ),
+        _ => {}
     }
     targets(&s.declarations, revision, known, false)?;
     if let Some(witness) = witnesses.and_then(|items| items.get(&p.document)) {
@@ -1349,17 +1372,44 @@ fn validate_symbol_row(
             "symbol differs from admitted association"
         );
     }
+    let artifact = p
+        .basis
+        .as_ref()
+        .map(|basis| basis.artifact_hash.clone())
+        .unwrap_or_default();
     ensure!(
         symbols.insert((
             p.producer_id.clone(),
-            p.basis
-                .as_ref()
-                .map(|basis| basis.artifact_hash.clone())
-                .unwrap_or_default(),
+            artifact.clone(),
             native_ids::canonical(&serde_json::to_value(&s.key)?)
         )),
         "duplicate semantic symbol key"
     );
+    // A key unique per Cargo target (#394): a global key, from a document whose target is not
+    // determined, still conflicts with the same key in any target. Tagged entries never equal
+    // a canonical key, which starts with `{`.
+    let tagged = |scope: &str| {
+        let mut entry = format!("\0{scope}\0").into_bytes();
+        entry.extend_from_slice(s.key.symbol.as_bytes());
+        (p.producer_id.clone(), artifact.clone(), entry)
+    };
+    match s.key.scope {
+        SymbolScope::Global => {
+            ensure!(
+                !symbols.contains(&tagged("target")),
+                "duplicate semantic symbol key"
+            );
+            symbols.insert(tagged("global"));
+        }
+        SymbolScope::Target => {
+            ensure!(
+                !symbols.contains(&tagged("global")),
+                "duplicate semantic symbol key"
+            );
+            symbols.insert(tagged("target"));
+        }
+        SymbolScope::Document => {}
+    }
     Ok(())
 }
 

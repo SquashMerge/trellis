@@ -353,6 +353,10 @@ pub(super) struct MemoryJoinIndex {
     call_references: BTreeMap<String, String>,
     declared_symbols: BTreeSet<String>,
     information_symbols: BTreeSet<String>,
+    /// Presence within one Cargo target, keyed by its crate root (#394).
+    target_declared: BTreeSet<(String, native::DocumentKey)>,
+    target_information: BTreeSet<(String, native::DocumentKey)>,
+    libraries: BTreeMap<String, BTreeSet<native::DocumentKey>>,
     source_methods: BTreeMap<(native::DocumentKey, String), Vec<MethodSummary>>,
     target_methods: BTreeMap<(String, ScopedKey), Vec<MethodSummary>>,
 }
@@ -372,11 +376,30 @@ impl GlobalJoinReads for MemoryJoinIndex {
             .collect())
     }
 
-    fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
-        Ok((
-            self.declared_symbols.contains(symbol),
-            self.information_symbols.contains(symbol),
-        ))
+    fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)> {
+        Ok(match target {
+            None => (
+                self.declared_symbols.contains(symbol),
+                self.information_symbols.contains(symbol),
+            ),
+            Some(root) => {
+                let key = (symbol.to_owned(), root.clone());
+                (
+                    self.target_declared.contains(&key),
+                    self.target_information.contains(&key),
+                )
+            }
+        })
+    }
+
+    fn library_targets(&self, symbol: &str) -> Result<Vec<native::DocumentKey>> {
+        Ok(self
+            .libraries
+            .get(symbol)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect())
     }
 
     fn source_methods(
@@ -559,12 +582,33 @@ impl JoinIndex for MemoryJoinIndex {
         Ok(())
     }
 
-    fn put_symbol(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
+    fn put_symbol(
+        &mut self,
+        symbol: &str,
+        target: Option<&super::join_store::ClaimTarget>,
+        declared: bool,
+        information: bool,
+    ) -> Result<()> {
         if declared {
             self.declared_symbols.insert(symbol.to_owned());
         }
         if information {
             self.information_symbols.insert(symbol.to_owned());
+        }
+        if let Some((root, library)) = target {
+            let key = (symbol.to_owned(), root.clone());
+            if declared {
+                self.target_declared.insert(key.clone());
+            }
+            if information {
+                self.target_information.insert(key);
+            }
+            if *library && (declared || information) {
+                self.libraries
+                    .entry(symbol.to_owned())
+                    .or_default()
+                    .insert(root.clone());
+            }
         }
         Ok(())
     }
