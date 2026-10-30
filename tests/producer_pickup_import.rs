@@ -374,3 +374,69 @@ fn lost_pickup_wait_keeps_the_batch_until_the_request_settles() {
     assert_eq!(entry["lastImported"]["errorCode"], "storage_busy");
     assert!(entry["lastImported"]["requestId"].is_string());
 }
+
+/// V1: a second identical `--artifact` pickup at an unchanged head is an idempotent success,
+/// and the published evidence's status stays `done`.
+#[test]
+fn duplicate_pickup_at_same_head_is_idempotent() {
+    let checkout = start_checkout(workspace, &[]);
+    let (tripwire, _) = tripwire_dir(checkout.temp.path());
+    let artifact = java_artifact(&checkout, "index.scip");
+    let args = [
+        "--producer",
+        "scip-java",
+        "--artifact",
+        artifact.to_str().unwrap(),
+    ];
+    let first = pickup(&checkout, &tripwire, &args);
+    assert!(first.status.success());
+    let first = json_out(&first);
+    assert_eq!(first["state"], "done");
+    let head = status(&checkout)["head"]["indexRevision"].as_u64().unwrap();
+
+    let second = pickup(&checkout, &tripwire, &args);
+    let reply = json_out(&second);
+    assert!(
+        second.status.success(),
+        "{reply} {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(reply["state"], "done", "{reply}");
+    assert_eq!(reply["unchanged"], true, "{reply}");
+    assert_eq!(reply["sha256"], first["sha256"]);
+    assert_eq!(reply["errorCode"], Value::Null);
+    assert_eq!(reply["requestId"], first["requestId"]);
+    assert!(reply["publishedRevision"].is_object(), "{reply}");
+    assert_eq!(reply["report"], first["report"]);
+    let entry = pickup_status(&checkout, "scip-java");
+    assert_eq!(entry["lastImported"]["state"], "done");
+    assert_eq!(entry["lastImported"]["errorCode"], Value::Null);
+    assert_eq!(
+        status(&checkout)["head"]["indexRevision"].as_u64().unwrap(),
+        head,
+        "an idempotent pickup published a new revision"
+    );
+    assert_eq!(
+        fs::read_dir(state_dir(&checkout).join("pickups"))
+            .map(|dir| dir.count())
+            .unwrap_or(0),
+        0
+    );
+
+    // A real change still imports: different bytes at the same head publish a new revision.
+    let fixture =
+        BatchFixture::from_published(&index_db(&checkout), &checkout.root).reference("scip-java");
+    let docs = fixture.paths("java");
+    fs::write(&artifact, fixture.scip_bytes("java", &docs[..1])).unwrap();
+    let changed = pickup(&checkout, &tripwire, &args);
+    let changed_reply = json_out(&changed);
+    assert!(changed.status.success(), "{changed_reply}");
+    assert_eq!(changed_reply["state"], "done");
+    assert_eq!(changed_reply.get("unchanged"), None, "{changed_reply}");
+    assert_ne!(changed_reply["sha256"], first["sha256"]);
+    assert_ne!(changed_reply["requestId"], first["requestId"]);
+    assert_ne!(
+        status(&checkout)["head"]["indexRevision"].as_u64().unwrap(),
+        head
+    );
+}

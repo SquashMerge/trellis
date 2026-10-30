@@ -514,14 +514,32 @@ impl PickupOwner {
             };
             let head = store.index_baseline()?;
             let retry_ms = Intervals::current().retry_ms;
+            // The batch the head selects for this producer, if it captured these bytes.
+            let selected = store.selected_semantic_capture_at(head, &pin.name, &sha256)?;
             // The decision comes before the batch is written: a skip costs no batch.
-            let (revision, written) = store.with_native_reader(head, |reader| {
+            let (revision, step) = store.with_native_reader(head, |reader| {
                 let revision = reader.header()?.revision.id;
+                // A `done` outcome whose evidence the head no longer selects (an index rebuild
+                // dropped it) is not a reason to skip.
+                let done_but_dropped = selected.is_none()
+                    && entry
+                        .last_imported
+                        .as_ref()
+                        .is_some_and(|last| last.sha256 == sha256 && last.state == "done");
                 if !force
+                    && !done_but_dropped
                     && decide_with_retry(&entry, &sha256, &revision, now_millis(), retry_ms)
                         == Decision::Skip
                 {
-                    return Ok((revision, None));
+                    return Ok((revision, Step::Skip));
+                }
+                // The head already selects these bytes, captured at this revision: an import
+                // would only repeat that publication, so the outcome is `done` as it stands.
+                if let Some((descriptor_sha256, _)) = selected
+                    .as_ref()
+                    .filter(|(_, captured)| *captured == revision)
+                {
+                    return Ok((revision, Step::Unchanged(descriptor_sha256.clone())));
                 }
                 let dir = std::fs::canonicalize(&dir)?;
                 let written = batch::write_batch(
@@ -534,14 +552,28 @@ impl PickupOwner {
                         generation: batch::pickup_generation(&generation_id),
                     },
                 );
-                Ok((revision, Some(written)))
+                Ok((revision, Step::Write(written)))
             })?;
-            let Some(written) = written else {
-                return Ok((
-                    json!({"producer": producer, "artifact": entry.artifact, "state": "skipped",
-                        "sha256": sha256, "sourceRevision": revision}),
-                    None,
-                ));
+            let written = match step {
+                Step::Skip => {
+                    return Ok((
+                        json!({"producer": producer, "artifact": entry.artifact,
+                            "state": "skipped", "sha256": sha256, "sourceRevision": revision}),
+                        None,
+                    ));
+                }
+                Step::Unchanged(descriptor_sha256) => {
+                    return Ok(unchanged(
+                        store,
+                        producer,
+                        &entry,
+                        head,
+                        &descriptor_sha256,
+                        &sha256,
+                        &revision,
+                    )?);
+                }
+                Step::Write(written) => written,
             };
             let attempted_at = now_millis();
             let written = match written {
@@ -637,6 +669,53 @@ impl PickupOwner {
         }
         Ok(())
     }
+}
+
+/// What an import does after reading the head.
+enum Step {
+    Skip,
+    /// The head selects these bytes at this revision; carries the selected descriptor digest.
+    Unchanged(String),
+    Write(Result<batch::WrittenBatch>),
+}
+
+/// The `done` reply for bytes the head already selects at its revision, which submits nothing,
+/// and the outcome to record. An earlier `done` for the same bytes and revision is kept as it
+/// is, request ID included; any other earlier outcome becomes `done` with no request.
+fn unchanged(
+    store: &Store,
+    producer: &str,
+    entry: &PickupEntry,
+    head: crate::model::IndexPin,
+    descriptor_sha256: &str,
+    sha256: &str,
+    revision: &str,
+) -> Result<(Value, Option<LastImported>)> {
+    let prior = entry.last_imported.as_ref().filter(|last| {
+        last.sha256 == sha256 && last.source_revision == revision && last.state == "done"
+    });
+    let request_id = prior.and_then(|last| last.request_id.clone());
+    let last = prior.is_none().then(|| LastImported {
+        sha256: sha256.to_owned(),
+        source_revision: revision.to_owned(),
+        request_id: None,
+        state: "done".into(),
+        error_code: None,
+        attempted_at: now_millis(),
+    });
+    let reply = json!({
+        "producer": producer,
+        "artifact": entry.artifact,
+        "state": "done",
+        "unchanged": true,
+        "errorCode": null,
+        "sha256": sha256,
+        "sourceRevision": revision,
+        "requestId": request_id,
+        "publishedRevision": head,
+        "report": store.semantic_batch_report_at(head, descriptor_sha256)?,
+    });
+    Ok((reply, last))
 }
 
 fn failure(producer: &str, entry: &PickupEntry, bound: Option<(&str, &str)>, code: &str) -> Value {

@@ -263,11 +263,14 @@ The labels here are fixture placeholders, **not #22 identity vectors**. For each
 | Last outcome for the same `sha256` | Action |
 |---|---|
 | none, or a different `sha256` | import |
-| `done` | skip |
+| `done`, and the head still selects a batch of this producer that captured these bytes | skip |
+| `done`, but the head no longer selects such a batch (an index rebuild dropped it) | import |
 | failed with class `invalid_artifact`, `invalid_request`, `limit_exceeded` or `producer_output_invalid` | skip while the head revision equals the recorded `sourceRevision`; import once the head changes |
 | failed with any other class (`stale_basis`, `revision_conflict`, `capture_unavailable`, `root_changed`, `index_failed`, local I/O) | import once 60 s have passed since the attempt |
 
 A transient retry therefore happens at most once per 60 s and a deterministic retry at most once per head change. A skip writes no batch. The explicit `--artifact` command ignores the table.
+
+**Unchanged bytes.** When the head already selects a batch of this producer that captured the same artifact bytes at the head's native revision, an import (explicit or automatic) submits nothing and writes no batch: the reply is `state: done` with `unchanged: true`, the head's `publishedRevision` and the selected batch's report, and `lastImported` records `done` (an earlier `done` for the same bytes and revision is kept, request ID included). A new attempt's `generationId` would otherwise make an otherwise identical descriptor differ, which the store refuses for bytes it already captured.
 
 ## #64 one-capture admission boundary (intermediate, not a rebuild lifecycle)
 

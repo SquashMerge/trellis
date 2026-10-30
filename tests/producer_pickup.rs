@@ -475,3 +475,46 @@ fn pending_request_past_the_retry_interval_starts_no_second_import() {
         "a request failed"
     );
 }
+
+/// V7: a `done` outcome does not outlive the evidence. After a rebuild drops the index, the
+/// activation check re-imports the unchanged artifact instead of skipping it.
+#[test]
+fn pickup_reimports_unchanged_artifact_after_rebuild() {
+    let world = configured(&fast());
+    let Configured {
+        checkout,
+        first,
+        marker,
+        ..
+    } = &world;
+    stop_daemon(&checkout.home);
+
+    // Rebuild: the disposable index goes; the producer state with `pickup.json` stays.
+    let db = index_db(checkout);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", db.display()));
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    let mut status = checkout.cli();
+    for (key, value) in fast() {
+        status.env(key, value);
+    }
+    let output = status
+        .args(["producer", "status", "--workspace"])
+        .arg(&checkout.root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let imported = wait_last(checkout, "the rebuilt index to re-import", |last| {
+        last["requestId"] != first["requestId"] && last["state"] == "done"
+    });
+    assert_eq!(imported["sha256"], first["sha256"]);
+    assert!(!marker.exists());
+}

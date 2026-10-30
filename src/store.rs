@@ -15355,6 +15355,25 @@ impl Store {
         })
     }
 
+    /// The `(descriptor_sha256, captured_revision)` of the batch selected for `producer_id` at
+    /// `pin`, when that batch captured an artifact whose digest is `artifact_hash`.
+    pub fn selected_semantic_capture_at(
+        &self,
+        pin: IndexPin,
+        producer_id: &str,
+        artifact_hash: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.native_at(pin, |db, selected| {
+            Ok(db
+                .query_row(
+                    "SELECT b.descriptor_sha256,b.captured_revision FROM semantic_revision_raw_selections s JOIN semantic_raw_batches b ON b.batch_id=s.batch_id AND b.producer_id=s.producer_id JOIN semantic_raw_captures c ON c.batch_id=b.batch_id WHERE s.revision_id=?1 AND s.producer_id=?2 AND c.artifact_hash=?3 LIMIT 1",
+                    params![selected.key, producer_id, artifact_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?)
+        })
+    }
+
     /// Publish captured semantic evidence with a native revision in the same transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn publish_native_semantic(
