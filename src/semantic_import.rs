@@ -1446,14 +1446,21 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
     out.join(&claim.captured_proof_id, &reference)?;
     let invocation = if roles & 1 == 0 && !claim.envelope.raw["enclosingRange"].is_null() {
         let span = store.enclosing_occurrence_range(&claim, admitted_encoding)?;
-        Some(store.join_reserved(&doc, span, semantic::JoinKind::Invocation, operation)?)
+        let own = store.occurrence_range(&claim, admitted_encoding)?;
+        // A SCIP enclosing range encloses its own occurrence. rust-analyzer instead gives a
+        // same-document reference its target's definition range (#394), which encloses some
+        // other span and says nothing about a call; that is no invocation witness.
+        (span.start <= own.start && own.end <= span.end)
+            .then(|| store.join_reserved(&doc, span, semantic::JoinKind::Invocation, operation))
+            .transpose()?
     } else {
         None
     };
     // The measured call this use occurrence names (#444). SCIP has no call role, and
     // scip-typescript, scip-java and scip-python never give a reference an enclosing range,
     // so the occurrence's exact span on one measured callee identifies the call by itself.
-    // A producer-supplied enclosing range must still join exactly to that same call.
+    // A producer-supplied enclosing range that encloses the occurrence must still join
+    // exactly to that same call.
     let witness = match &invocation {
         Some(j) => (j.status == semantic::JoinStatus::Exact
             && (call.status != semantic::JoinStatus::Exact
@@ -4056,8 +4063,12 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         let requested = requested.contains(&doc.key);
         let failed = failed.contains(&doc.key);
         let excluded = exclusions.get(&(doc.key.language.as_str(), doc.key.path.as_str()));
+        let capped = inventory
+            .capped_documents
+            .contains(&(doc.key.language.clone(), doc.key.path.clone()));
         let partial = excluded == Some(&"unsupported")
             || unsupported_documents.contains(&doc.key)
+            || capped
             || omitted.contains(&Some(doc.key.clone()))
             || captured.diagnostics.contains_key(&doc.key);
         let state = if !requested {
@@ -4127,6 +4138,8 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                 Some("excluded_by_producer".into())
             } else if unsupported_documents.contains(&doc.key) {
                 Some("unsupported_native_gap".into())
+            } else if capped {
+                Some(crate::scip_raw::OCCURRENCE_CAP_EXCEEDED.into())
             } else if partial {
                 Some("unmeasurable_internal_target".into())
             } else {

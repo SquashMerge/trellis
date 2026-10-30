@@ -43,7 +43,7 @@ fn production_limits_match_approved_policy() {
     assert_eq!(candidates, 4_000_000);
     assert_eq!(wire_fields, 64_000_000);
     assert_eq!(unit_expansion_bytes, 128 * MIB);
-    assert_eq!(document_occurrences, 10_000);
+    assert_eq!(document_occurrences, 350_000);
     assert_eq!(document_symbols, 10_000);
     assert_eq!(external_symbols, 10_000);
     assert_eq!(signature_occurrences, 10_000);

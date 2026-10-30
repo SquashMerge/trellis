@@ -253,6 +253,7 @@ pub(super) fn decode_whole_index_oracle(
         source_manifest_hash: input.source_manifest_hash.clone(),
         completion: input.completion,
         exclusions: input.exclusions.clone(),
+        capped_documents: BTreeSet::new(),
         claims,
     })
 }

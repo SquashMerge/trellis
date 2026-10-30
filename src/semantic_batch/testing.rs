@@ -242,11 +242,12 @@ fn admit(
     descriptor_bytes: &[u8],
     pages: &[&[u8]],
     artifacts: &[&[u8]],
+    limits: &BatchLimits,
     cancel: &CancelFlag,
 ) -> std::result::Result<Vec<CapturedScipInventory>, ScipCaptureError> {
     let module_roots = scip_raw::ModuleRoots::from_native_config(native_config);
     let outcome = (|| -> Result<Vec<CapturedScipInventory>> {
-        let limits = BatchLimits::PRODUCTION;
+        let limits = limits.clone();
         let sha = scip_raw::sha(descriptor_bytes);
         let descriptor = Descriptor::parse_admitted(descriptor_bytes, &sha, &limits)?;
         let producer = descriptor.check_producer()?;
@@ -367,12 +368,20 @@ fn read_inventories(
             .filter(|(assigned, _)| *assigned == artifact.ordinal)
             .map(|(_, exclusion)| exclusion.clone())
             .collect();
+        let capped_documents = conn
+            .prepare(
+                "SELECT s.language, s.path FROM documents d JOIN sources s ON s.ord=d.source_ord \
+                 WHERE d.artifact=?1 AND d.capped=1",
+            )?
+            .query_map([artifact.ordinal], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         inventories.push(CapturedScipInventory {
             artifact_hashes: vec![artifact.sha256.clone()],
             decoder_version: descriptor.decoder_version.clone(),
             source_manifest_hash: descriptor.source_manifest_hash.clone(),
             completion: descriptor.completion,
             exclusions,
+            capped_documents,
             claims: captured,
         });
     }
@@ -394,6 +403,32 @@ pub fn admit_in_memory(
     artifacts: &[&[u8]],
     cancel: &CancelFlag,
 ) -> std::result::Result<Vec<CapturedScipInventory>, ScipCaptureError> {
+    admit_in_memory_with_limits(
+        root,
+        native,
+        sources,
+        native_config,
+        descriptor,
+        pages,
+        artifacts,
+        &BatchLimits::PRODUCTION,
+        cancel,
+    )
+}
+
+/// `admit_in_memory` under explicit limits, as the staged path runs under the limits it is given.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_in_memory_with_limits(
+    root: &Path,
+    native: &native::Artifact,
+    sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    native_config: &[serde_json::Value],
+    descriptor: &[u8],
+    pages: &[&[u8]],
+    artifacts: &[&[u8]],
+    limits: &BatchLimits,
+    cancel: &CancelFlag,
+) -> std::result::Result<Vec<CapturedScipInventory>, ScipCaptureError> {
     admit(
         root,
         &native.source_set,
@@ -403,6 +438,7 @@ pub fn admit_in_memory(
         descriptor,
         pages,
         artifacts,
+        limits,
         cancel,
     )
 }
@@ -450,6 +486,7 @@ pub fn admit_in_memory_from_capture(
         descriptor,
         pages,
         artifacts,
+        &BatchLimits::PRODUCTION,
         cancel,
     )
 }

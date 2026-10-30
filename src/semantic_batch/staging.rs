@@ -12,6 +12,8 @@ use std::{
 pub const STAGE_PREFIX: &str = "semantic-stage-";
 const STAGE_DB: &str = "stage.db";
 
+/// `documents.capped` is 1 for a document admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
+///
 /// `claims.symbol`/`presence` index each admitted claim's symbol presence: a symbol-information
 /// claim's symbol (`PRESENCE_INFORMATION`) and a definition occurrence's (`PRESENCE_DECLARED`),
 /// `NULL`/0 otherwise. A side's presence context is this index over its claim set.
@@ -34,7 +36,7 @@ CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT 
 CREATE TABLE coverage(source_ord INTEGER PRIMARY KEY REFERENCES sources(ord), artifact INTEGER, exclusion TEXT, CHECK((artifact IS NULL)<>(exclusion IS NULL)));
 CREATE INDEX coverage_artifact ON coverage(artifact, source_ord);
 CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, language TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, UNIQUE(artifact,path));
+CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, capped INTEGER NOT NULL CHECK(capped IN (0,1)), UNIQUE(artifact,path));
 CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
@@ -458,10 +460,16 @@ impl ClaimSink for StageClaimSink<'_> {
             return Ok(());
         };
         let inserted = self.conn.prepare_cached(
-            "INSERT INTO documents(source_ord, artifact, path, wire_digest) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO documents(source_ord, artifact, path, wire_digest, capped) VALUES(?1,?2,?3,?4,?5)",
         );
         let inserted = inserted.and_then(|mut statement| {
-            statement.execute(params![ord, self.artifact, doc.path, doc.wire_digest])
+            statement.execute(params![
+                ord,
+                self.artifact,
+                doc.path,
+                doc.wire_digest,
+                doc.occurrence_cap_exceeded
+            ])
         });
         match inserted {
             Err(rusqlite::Error::SqliteFailure(error, _))
