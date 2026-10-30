@@ -3715,6 +3715,43 @@ fn cancelled_publication_changes_nothing() {
     assert_nothing_published(&world, joined.destination_pin());
 }
 
+/// A provenance row whose raw claim vanished after the seal is a corrupt stage: publication
+/// fails typed and rolls back, never publishing the document without that row and its facts.
+#[test]
+fn provenance_row_without_its_claim_after_the_seal_rolls_back() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let removed = admitted
+        .stage_mut()
+        .conn()
+        .unwrap()
+        .execute(
+            "DELETE FROM claims WHERE claim_id=(SELECT claim_id FROM out_provenance ORDER BY ord LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(removed, 1);
+    admitted.stage_mut().release_connection();
+    let leader = world.store.publication_for_tests().unwrap();
+    let head = joined.destination_pin();
+    let error = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("staged provenance without claim"),
+        "{error:#}"
+    );
+    assert_nothing_published(&world, head);
+}
+
 #[test]
 fn ambiguous_commit_is_resolved_from_durable_state() {
     use trellis::store::BatchPublishFault;

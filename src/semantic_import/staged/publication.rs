@@ -63,16 +63,17 @@ impl<'s, T> Family<'s, T> {
 
 type RawProvenance = (rusqlite::types::Value, i64, String, String, String);
 
+/// One provenance row with its raw claim's fields. Every row is kept (the claim is joined
+/// outer): a row whose claim is gone is a corrupt stage and fails the publication, never a
+/// row silently dropped with the facts it would own.
 fn provenance_row(row: &rusqlite::Row<'_>) -> Result<(i64, RawProvenance)> {
+    let claim = |index: usize| -> Result<String> {
+        row.get::<_, Option<String>>(index)?
+            .ok_or_else(|| anyhow::anyhow!("staged provenance without claim"))
+    };
     Ok((
         row.get(0)?,
-        (
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-        ),
+        (row.get(1)?, row.get(2)?, claim(3)?, claim(4)?, claim(5)?),
     ))
 }
 
@@ -101,7 +102,7 @@ pub(crate) fn read_documents(
     ))?;
     let mut provenance = conn.prepare(&format!(
         "SELECT p.doc, p.id, p.kind, c.proof_id, c.record_kind, c.fact_digest \
-         FROM {schema}out_provenance p CROSS JOIN {schema}claims c ON c.claim_id=p.claim_id ORDER BY p.ord"
+         FROM {schema}out_provenance p LEFT JOIN {schema}claims c ON c.claim_id=p.claim_id ORDER BY p.ord"
     ))?;
     let mut symbols = facts("out_symbols")?;
     let mut bindings = facts("out_declaration_bindings")?;
@@ -172,7 +173,7 @@ pub(crate) fn statements(schema: &str) -> Vec<String> {
         format!("SELECT ord, body, provenance FROM {schema}out_coverage ORDER BY ord"),
         format!(
             "SELECT p.doc, p.id, p.kind, c.proof_id, c.record_kind, c.fact_digest \
-             FROM {schema}out_provenance p CROSS JOIN {schema}claims c ON c.claim_id=p.claim_id ORDER BY p.ord"
+             FROM {schema}out_provenance p LEFT JOIN {schema}claims c ON c.claim_id=p.claim_id ORDER BY p.ord"
         ),
     ];
     for table in [
