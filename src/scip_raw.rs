@@ -2447,7 +2447,9 @@ mod tests {
         let source = "x".repeat(12_000);
         let mut symbol = types::SymbolInformation::new();
         symbol.symbol = source;
-        symbol.relationships = (0..2000).map(|_| types::Relationship::new()).collect();
+        // Each relationship reserves at least six bytes per byte of the 12,000-byte symbol.
+        let fanout = (BatchLimits::PRODUCTION.unit_expansion_bytes / (6 * 12_000)) as usize + 1;
+        symbol.relationships = (0..fanout).map(|_| types::Relationship::new()).collect();
         let mut doc = types::Document::new();
         doc.relative_path = "src/A.js".into();
         doc.language = "javascript".into();
@@ -2458,6 +2460,37 @@ mod tests {
                 BatchLimits::PRODUCTION.unit_expansion_bytes as usize,
                 &Arc::new(AtomicBool::new(false))
             ),
+            Err(ScipCaptureError::LimitExceeded(reason)) if reason == "unit expansion"
+        ));
+    }
+    /// The decoder's per-document reservation follows the batch live budget (owner ruling
+    /// 2026-10-30, #394): a document of 200,000 rust-analyzer-sized occurrences, over what the
+    /// former 128 MiB budget reserved for, fits the 1 GiB production budget below the
+    /// per-document cap.
+    #[test]
+    fn large_document_reservation_fits_the_production_budget() {
+        let mut doc = types::Document::new();
+        doc.relative_path = "src/store.rs".into();
+        doc.language = "rust".into();
+        let symbol = "rust-analyzer cargo trellis 0.1.0 store/impl#[Store]open_for_tests().";
+        doc.occurrences = (0..200_000)
+            .map(|_| {
+                let mut occurrence = types::Occurrence::new();
+                occurrence.symbol = symbol.into();
+                occurrence
+            })
+            .collect();
+        assert!(doc.occurrences.len() as u64 <= BatchLimits::PRODUCTION.document_occurrences);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reserved = reserve_document(
+            &doc,
+            BatchLimits::PRODUCTION.unit_expansion_bytes as usize,
+            &cancel,
+        )
+        .unwrap();
+        assert!(reserved > 128 * 1024 * 1024);
+        assert!(matches!(
+            reserve_document(&doc, 128 * 1024 * 1024, &cancel),
             Err(ScipCaptureError::LimitExceeded(reason)) if reason == "unit expansion"
         ));
     }

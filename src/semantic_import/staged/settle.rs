@@ -23,6 +23,21 @@ pub(super) struct DocumentOutcome {
     pub(super) provenance: Option<String>,
 }
 
+/// One settled reference row before its emission: the destination claim it starts from, and
+/// the roles and site its claims merged into.
+struct PendingReference<'a> {
+    claim: &'a semantic::Reference,
+    roles: Vec<semantic::Role>,
+    site: Option<semantic::ReferenceSite>,
+}
+
+/// What a call copies from its emitted reference.
+struct EmittedTargets {
+    resolution: semantic::Resolution,
+    declared_target: Option<semantic::Target>,
+    candidates: Vec<semantic::Target>,
+}
+
 /// Retarget decisions already made in this document, by target identity. An optional cache
 /// with its own charge: when the live budget has no room, decisions are simply recomputed.
 struct Retargets {
@@ -41,11 +56,20 @@ fn canonical_targets(live: &Rc<LiveBudget>, targets: &mut Vec<semantic::Target>)
     Ok(())
 }
 
+/// The owned bytes of one row's `declared`/`candidates` pair, as `sizes` counts them.
+fn target_set(declared: Option<&semantic::Target>, candidates: &[semantic::Target]) -> Result<u64> {
+    sizes::sum(&[
+        declared.map_or(Ok(0), sizes::target_payload)?,
+        sizes::targets(candidates)?,
+    ])
+}
+
 /// Replaces `declared`/`candidates` with copies of `from_declared`/`from_candidates`. The
-/// copies are admitted from the borrowed source before anything is cloned; the replaced values
-/// stay charged (overlap). The incoming set can be larger than the one it replaces: a captured
-/// internal target may survive retargeting although destination discovery excluded its
-/// ineligible document.
+/// copies are admitted from the borrowed source before anything is cloned, while the replaced
+/// values are still live (overlap); `owner`, which holds the row's charge, then releases the
+/// replaced values once they are dropped. The incoming set can be larger than the one it
+/// replaces: a captured internal target may survive retargeting although destination
+/// discovery excluded its ineligible document.
 fn adopt_targets(
     owner: &mut Reservation,
     declared: &mut Option<semantic::Target>,
@@ -53,13 +77,23 @@ fn adopt_targets(
     from_declared: Option<&semantic::Target>,
     from_candidates: &[semantic::Target],
 ) -> Result<()> {
-    owner.grow(sizes::sum(&[
-        from_declared.map_or(Ok(0), sizes::target_payload)?,
-        sizes::targets(from_candidates)?,
-    ])?)?;
+    let replaced = target_set(declared.as_ref(), candidates)?;
+    owner.grow(target_set(from_declared, from_candidates)?)?;
     *declared = from_declared.cloned();
     *candidates = from_candidates.to_vec();
-    Ok(())
+    owner.release(replaced)
+}
+
+/// A working copy of one destination row, admitted at its own size before the clone. The guard
+/// follows the copy: bind it first so it is released after the copy drops, or move it to the
+/// owner that keeps the copy.
+fn working_copy<T: Clone>(
+    live: &Rc<LiveBudget>,
+    row: &T,
+    bytes: impl FnOnce(&T) -> Result<u64>,
+) -> Result<(Reservation, T)> {
+    let reservation = live.reserve(bytes(row)?)?;
+    Ok((reservation, row.clone()))
 }
 
 /// Admits one new `BTreeMap` entry whose owned key/value payload is `payload` bytes.
@@ -253,7 +287,7 @@ impl StagedJoin<'_> {
         let _keys = self.view_keys(doc, 2)?;
         // The captured join eligibility already computed for this document, over the same
         // claims and captured context, or a fresh one.
-        let (claims, mut captured, captured_reservation) = match prepared {
+        let (claims, mut captured, _captured_reservation) = match prepared {
             Some(joined) => (joined.claims, joined.facts, joined.reservation),
             None => {
                 let claims = Rc::new(DocumentClaims::load(&self.filtered, doc)?);
@@ -265,21 +299,27 @@ impl StagedJoin<'_> {
             }
         };
         let view = streaming::claims_side(&self.filtered, doc.clone(), claims)?;
-        let (destination, _destination_reservation) = if self.identical_joins.get() {
-            // Same claims, native revision and global rows: the destination join would
-            // recompute the captured facts. Admit the copy at the original's charge first.
-            let reservation = self.ctx.live.reserve(captured_reservation.bytes())?;
-            (captured.clone(), reservation)
+        // Same claims, native revision and global rows: the destination join would recompute
+        // the captured facts, so the destination rows are read from the captured join itself.
+        // Settlement reads destination rows by reference and copies one at a time.
+        let (separate, _destination_reservation) = if self.identical_joins.get() {
+            (None, None)
         } else {
-            streaming::join_document(&view, destination_global, encoding)?
+            let (facts, reservation) =
+                streaming::join_document(&view, destination_global, encoding)?;
+            (Some(facts), Some(reservation))
         };
         #[cfg(feature = "test-support")]
         crate::semantic_batch::testing::run_document_common_observer(
             1,
             doc,
-            &destination,
+            separate.as_ref().unwrap_or(&captured),
             self.conn(),
         );
+        let relationships = std::mem::take(&mut captured.type_relationships);
+        let captured = &captured;
+        let destination = separate.as_ref().unwrap_or(captured);
+        let live = &self.ctx.live;
         let mut owner = self.ctx.live.reserve(0)?;
         let mut memo = Retargets {
             internal: BTreeMap::new(),
@@ -315,7 +355,6 @@ impl StagedJoin<'_> {
             }
             anyhow::Ok(())
         };
-        let relationships = std::mem::take(&mut captured.type_relationships);
 
         // Captured exact definitions of this document, by symbol, and by authoring proof.
         let mut captured_targets = BTreeMap::<&str, Vec<semantic::Target>>::new();
@@ -352,14 +391,17 @@ impl StagedJoin<'_> {
             canonical_targets(&self.ctx.live, targets)?;
         }
 
-        for mut symbol in destination.symbols {
+        for row in &destination.symbols {
             self.ctx.check_cancel()?;
+            let (mut item, mut symbol) = working_copy(live, row, sizes::symbol)?;
             let own = view.proof(&symbol.provenance_id)?.is_some();
             if own && let Some(targets) = captured_targets.get(symbol.key.symbol.as_str()) {
-                owner.grow(sizes::targets(targets)?)?;
+                let replaced = sizes::targets(&symbol.declarations)?;
+                item.grow(sizes::targets(targets)?)?;
                 symbol.declarations = targets.clone();
+                item.release(replaced)?;
             }
-            if self.retarget_all(&mut symbol.declarations, &mut memo, &mut owner)? {
+            if self.retarget_all(&mut symbol.declarations, &mut memo, &mut item)? {
                 let raw = symbol.provenance_id.clone();
                 let kind = semantic::EvidenceKind::DeclarationBinding;
                 source(&mut sources, &mut owner, &raw, kind)?;
@@ -376,15 +418,14 @@ impl StagedJoin<'_> {
             }
         }
 
-        for mut binding in destination.declaration_bindings {
-            let Some(syntax_id) = &binding.syntax_id else {
+        for row in &destination.declaration_bindings {
+            let Some(syntax_id) = &row.syntax_id else {
                 continue;
             };
-            if captured_declarations.get(binding.provenance_id.as_str())
-                != Some(&syntax_id.as_str())
-            {
+            if captured_declarations.get(row.provenance_id.as_str()) != Some(&syntax_id.as_str()) {
                 continue;
             }
+            let (_item, mut binding) = working_copy(live, row, sizes::binding)?;
             let raw = binding.provenance_id.clone();
             let kind = semantic::EvidenceKind::DeclarationBinding;
             source(&mut sources, &mut owner, &raw, kind)?;
@@ -406,26 +447,29 @@ impl StagedJoin<'_> {
         }
 
         // Each destination reference claim takes its captured reference's resolution; claims
-        // of one native reference merge into one row over the union of their targets.
-        let mut rows = BTreeMap::<String, semantic::Reference>::new();
+        // of one native reference merge into one row over the union of their targets. A row is
+        // kept as the destination claim it starts from plus its merged roles and site; the
+        // emitted row is rebuilt from them, and its targets are the union's.
+        let mut rows = BTreeMap::<String, PendingReference<'_>>::new();
         let mut targets = BTreeMap::<String, Vec<semantic::Target>>::new();
         let mut proofs = BTreeMap::<String, Vec<String>>::new();
         let mut accepted = BTreeMap::<String, String>::new();
-        for (raw, mut reference) in destination.reference_claims {
-            let Some(prior) = captured.reference_claims.get(&raw) else {
+        for (raw, row) in &destination.reference_claims {
+            let Some(prior) = captured.reference_claims.get(raw) else {
                 continue;
             };
             anyhow::ensure!(
-                prior.document == reference.document && prior.range == reference.range,
+                prior.document == row.document && prior.range == row.range,
                 "captured reference anchor differs"
             );
-            reference.roles.retain(|role| prior.roles.contains(role));
-            if reference.roles.is_empty() {
+            if !row.roles.iter().any(|role| prior.roles.contains(role)) {
                 continue;
             }
+            let (mut item, mut reference) = working_copy(live, row, sizes::reference)?;
+            reference.roles.retain(|role| prior.roles.contains(role));
             reference.resolution = prior.resolution;
             adopt_targets(
-                &mut owner,
+                &mut item,
                 &mut reference.declared_target,
                 &mut reference.candidates,
                 prior.declared_target.as_ref(),
@@ -437,7 +481,7 @@ impl StagedJoin<'_> {
                     .iter_mut()
                     .chain(reference.candidates.iter_mut()),
                 &mut memo,
-                &mut owner,
+                &mut item,
             )? {
                 outcome.omitted = true;
                 continue;
@@ -471,29 +515,55 @@ impl StagedJoin<'_> {
             source(
                 &mut sources,
                 &mut owner,
-                &raw,
+                raw,
                 semantic::EvidenceKind::SemanticReference,
             )?;
-            if let Some(row) = rows.get_mut(&id) {
-                let roles: BTreeSet<_> =
-                    row.roles.iter().chain(&reference.roles).copied().collect();
+            if let Some(pending) = rows.get_mut(&id) {
+                let roles: BTreeSet<_> = pending
+                    .roles
+                    .iter()
+                    .chain(&reference.roles)
+                    .copied()
+                    .collect();
                 owner.grow((roles.len() * std::mem::size_of::<semantic::Role>()) as u64)?;
-                row.roles = roles.into_iter().collect();
-                if row.roles.contains(&semantic::Role::Definition) {
-                    row.site = semantic::ReferenceSite::Declaration;
+                pending.roles = roles.into_iter().collect();
+                if pending.roles.contains(&semantic::Role::Definition) {
+                    pending.site = Some(semantic::ReferenceSite::Declaration);
                 }
             } else {
-                entry::<String, semantic::Reference>(&mut owner, id.len() as u64)?;
-                rows.insert(id, reference);
+                entry::<String, PendingReference<'_>>(
+                    &mut owner,
+                    sizes::sum(&[
+                        id.len() as u64,
+                        (reference.roles.capacity() * std::mem::size_of::<semantic::Role>()) as u64,
+                    ])?,
+                )?;
+                rows.insert(
+                    id,
+                    PendingReference {
+                        claim: row,
+                        roles: std::mem::take(&mut reference.roles),
+                        site: None,
+                    },
+                );
             }
         }
-        // Final references in reference-ID order; the emitted row is what calls copy.
-        let mut emitted = BTreeMap::<String, semantic::Reference>::new();
-        for (id, mut reference) in rows {
+        // Final references in reference-ID order; the emitted row's targets are what calls copy.
+        let mut emitted = BTreeMap::<String, EmittedTargets>::new();
+        for (id, pending) in rows {
             let mut united = targets.remove(&id).unwrap_or_default();
             canonical_targets(&self.ctx.live, &mut united)?;
+            // The row is its first claim's destination row with the merged roles and site; its
+            // own targets give way to the union (which `owner` already holds).
+            let (mut item, mut reference) = working_copy(live, pending.claim, sizes::reference)?;
+            let replaced = target_set(reference.declared_target.as_ref(), &reference.candidates)?;
             reference.declared_target = None;
-            reference.candidates.clear();
+            reference.candidates = Vec::new();
+            item.release(replaced)?;
+            reference.roles = pending.roles;
+            if let Some(site) = pending.site {
+                reference.site = site;
+            }
             if united.len() > 1 {
                 reference.resolution = semantic::Resolution::Ambiguous;
                 reference.candidates = united;
@@ -543,8 +613,16 @@ impl StagedJoin<'_> {
                     &body,
                 ],
             )?;
-            entry::<String, semantic::Reference>(&mut owner, id.len() as u64)?;
-            emitted.insert(id, reference);
+            // Calls read the emitted targets only; the rest of the row drops with this item.
+            entry::<String, EmittedTargets>(&mut owner, id.len() as u64)?;
+            emitted.insert(
+                id,
+                EmittedTargets {
+                    resolution: reference.resolution,
+                    declared_target: reference.declared_target.take(),
+                    candidates: std::mem::take(&mut reference.candidates),
+                },
+            );
         }
 
         // Calls take the captured reference's targets, then their final reference's.
@@ -558,19 +636,16 @@ impl StagedJoin<'_> {
                 old_targets.insert(binding.provenance_id.as_str(), (reference, binding));
             }
         }
-        let mut calls = destination.call_bindings;
-        let mut kept = 0;
-        for index in 0..calls.len() {
-            let Some(&(old, captured_call)) = old_targets.get(calls[index].provenance_id.as_str())
-            else {
+        let mut calls = Vec::new();
+        for row in &destination.call_bindings {
+            let Some(&(old, captured_call)) = old_targets.get(row.provenance_id.as_str()) else {
                 continue;
             };
             // The working copy, then the captured reference's targets it adopts.
-            owner.grow(sizes::call(&calls[index])?)?;
-            let mut call = calls[index].clone();
+            let (mut item, mut call) = working_copy(live, row, sizes::call)?;
             call.resolution = old.resolution;
             adopt_targets(
-                &mut owner,
+                &mut item,
                 &mut call.declared_target,
                 &mut call.candidates,
                 old.declared_target.as_ref(),
@@ -581,7 +656,7 @@ impl StagedJoin<'_> {
                     .iter_mut()
                     .chain(call.candidates.iter_mut()),
                 &mut memo,
-                &mut owner,
+                &mut item,
             )? {
                 outcome.omitted = true;
                 continue;
@@ -600,7 +675,7 @@ impl StagedJoin<'_> {
             };
             call.resolution = reference.resolution;
             adopt_targets(
-                &mut owner,
+                &mut item,
                 &mut call.declared_target,
                 &mut call.candidates,
                 reference.declared_target.as_ref(),
@@ -609,10 +684,10 @@ impl StagedJoin<'_> {
             call.stale_target = call.declared_target.as_ref().and_then(|target| {
                 matches!(target, semantic::Target::Internal { .. }).then_some(false)
             });
-            // `calls[index]` is still the destination join's row, classified at join time.
+            // `row` is the destination join's row, classified at join time.
             call.dispatch = super::super::rejoined_dispatch(
                 [
-                    Some((calls[index].dispatch, calls[index].declared_target.as_ref())),
+                    Some((row.dispatch, row.declared_target.as_ref())),
                     Some((
                         captured_call.dispatch,
                         captured_call.declared_target.as_ref(),
@@ -622,10 +697,12 @@ impl StagedJoin<'_> {
             );
             #[cfg(feature = "test-support")]
             crate::semantic_batch::testing::edit_row("callResolution", &mut call)?;
-            calls[kept] = call;
-            kept += 1;
+            // The kept copy's payload moves to the owner; its root moves into a slot of
+            // `calls`, which `append_reserved` charges with the buffer.
+            let payload = item.bytes() - std::mem::size_of::<semantic::CallBinding>() as u64;
+            item.transfer_to(&mut owner, payload)?;
+            streaming::append_reserved(&mut calls, call, 0, &mut owner)?;
         }
-        calls.truncate(kept);
         // Every binding of one native call site carries the site's whole distinct target set:
         // contradictory exact evidence becomes ambiguous over that union, never first-wins.
         let mut sites = BTreeMap::<String, BTreeMap<Vec<u8>, semantic::Target>>::new();
@@ -673,12 +750,14 @@ impl StagedJoin<'_> {
             {
                 continue;
             }
+            let replaced = target_set(call.declared_target.as_ref(), &call.candidates)?;
             owner.grow(sizes::targets(union)?)?;
             call.resolution = semantic::Resolution::Ambiguous;
             call.declared_target = None;
             call.candidates = union.clone();
             call.stale_target = None;
             call.dispatch = semantic::Dispatch::Unknown;
+            owner.release(replaced)?;
         }
         for mut call in calls {
             // A call's outcome follows its final row, after the per-document reference
@@ -898,9 +977,10 @@ mod tests {
         let existing = sizes::target_payload(declared.as_ref().unwrap()).unwrap();
         assert!(incoming > existing, "the incoming set is the larger one");
 
-        // Room for a copy of the replaced set, not of the incoming one: denied, nothing copied.
-        let budget = LiveBudget::new(incoming - 1);
-        let mut owner = budget.reserve(0).unwrap();
+        // The owner holds the row's current set. Room for a copy of the replaced set, not of
+        // the incoming one: denied, nothing copied.
+        let budget = LiveBudget::new(existing + incoming - 1);
+        let mut owner = budget.reserve(existing).unwrap();
         let before = declared.clone();
         let error = adopt_targets(
             &mut owner,
@@ -915,10 +995,14 @@ mod tests {
         );
         assert_eq!(declared, before);
         assert!(candidates.is_empty());
-        assert_eq!(budget.high_water(), 0, "nothing was admitted or copied");
+        assert_eq!(
+            budget.high_water(),
+            existing,
+            "nothing was admitted or copied"
+        );
 
-        let budget = LiveBudget::new(incoming);
-        let mut owner = budget.reserve(0).unwrap();
+        let budget = LiveBudget::new(existing + incoming);
+        let mut owner = budget.reserve(existing).unwrap();
         adopt_targets(
             &mut owner,
             &mut declared,
@@ -929,6 +1013,8 @@ mod tests {
         .unwrap();
         assert_eq!(declared.as_ref(), Some(&captured));
         assert_eq!(candidates, others);
-        assert_eq!(budget.high_water(), incoming);
+        // Both sets were live at the swap; afterwards the owner holds the adopted one only.
+        assert_eq!(budget.high_water(), existing + incoming);
+        assert_eq!(owner.bytes(), incoming);
     }
 }

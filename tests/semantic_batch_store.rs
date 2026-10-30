@@ -28,6 +28,64 @@ use trellis::{
     },
 };
 
+/// Counts the bytes each thread requests and frees (layout sizes), so a test can compare the
+/// join's live reservations with the Rust storage it really holds. SQLite and tree-sitter
+/// allocate through the C allocator and are not counted, as the live budget excludes them.
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+
+    thread_local! {
+        static NET: Cell<i64> = const { Cell::new(0) };
+        static PEAK: Cell<i64> = const { Cell::new(0) };
+    }
+
+    fn add(bytes: i64) {
+        let _ = NET.try_with(|net| {
+            let value = net.get() + bytes;
+            net.set(value);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(value)));
+        });
+    }
+
+    // SAFETY: every call forwards to `System` with the caller's arguments unchanged.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            add(layout.size() as i64);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            add(-(layout.size() as i64));
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            add(layout.size() as i64);
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            add(new_size as i64 - layout.size() as i64);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// Runs `f`; returns its result and the most bytes this thread held at once during `f`,
+    /// above what it held before.
+    pub fn peak<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        let before = NET.with(Cell::get);
+        PEAK.with(|peak| peak.set(before));
+        let result = f();
+        (
+            result,
+            u64::try_from(PEAK.with(Cell::get) - before).unwrap_or(0),
+        )
+    }
+}
+
 struct MemoryAdmission {
     pin: IndexPin,
     parsed: Descriptor,
@@ -1690,6 +1748,69 @@ fn documents_that_each_fit_join_although_their_sum_exceeds_the_budget() {
         .expect_err("an oversized document is denied");
     assert!(matches!(error.downcast_ref::<ScipCaptureError>(),
         Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"));
+}
+
+/// One JavaScript document calling a function it declares `calls` times, once from each of
+/// as many small functions, with its batch.
+fn local_calls_world(calls: usize) -> (World, (PathBuf, String)) {
+    let mut source = "function f(){}\n".to_owned();
+    for n in 0..calls {
+        source.push_str(&format!("function g{n}(){{ f(); }}\n"));
+    }
+    let world = world(|root| write_files(root, &[("src/A.js", source.as_str())]));
+    let mut doc = DocSpec::new("src/A.js").occurrence(&[0, 9, 10], &[0, 0, 14], "pkg f.", 1);
+    for (line, column) in positions(&source, "f();") {
+        doc = doc.occurrence(
+            &[line, column, column + 1],
+            &[line, column, column + 3],
+            "pkg f.",
+            0,
+        );
+    }
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
+    (world, descriptor)
+}
+
+/// The join's live reservations track the Rust storage it really holds (owner ruling
+/// 2026-10-30, #394): the most this thread held at once during the join never exceeds the
+/// charged high water by more than a fixed 256 KiB, which covers the join's own Rust working
+/// state outside the budget's owners (SQL text, the row ledger, rusqlite's statement cache);
+/// and the charge is at most 1.25x that real peak. The fixture is one large document, so its
+/// owners dominate.
+#[test]
+fn live_reservations_track_the_joins_real_storage() {
+    for calls in [500, 4_000] {
+        let (world, descriptor) = local_calls_world(calls);
+        let mut admitted = world.admit(&descriptor).unwrap();
+        let limits = BatchLimits::PRODUCTION;
+        let mut budget = LookupBudget::new(&limits);
+        let mut counters = BatchCounters::default();
+        let destination = world.store.index_baseline().unwrap();
+        let (joined, real) = counting::peak(|| {
+            join_staged(
+                &mut admitted,
+                &world.store,
+                destination,
+                &limits,
+                &mut budget,
+                &mut counters,
+                DestinationMutations::default(),
+                &world.cancel,
+            )
+        });
+        joined.unwrap();
+        let publication = testing::staged_publication(&mut admitted).unwrap();
+        assert_eq!(publication.call_bindings.len(), calls);
+        let charged = counters.join_reservation_high_water_bytes;
+        assert!(
+            real <= charged + 256 * 1024,
+            "{calls} calls: real peak {real} above charged {charged}"
+        );
+        assert!(
+            charged * 4 <= real * 5,
+            "{calls} calls: charged {charged} vs real peak {real}"
+        );
+    }
 }
 
 fn split_definitions(world: &World, swap: bool) -> (PathBuf, String) {

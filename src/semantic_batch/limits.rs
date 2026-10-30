@@ -66,7 +66,9 @@ impl BatchLimits {
         total_artifact_bytes: 512 * MIB,
         candidates: 4_000_000,
         wire_fields: 64_000_000,
-        unit_expansion_bytes: 128 * MIB,
+        // Owner ruling 2026-10-30 (#394): one batch's live memory budget, 1 GiB (was 128 MiB,
+        // #410), so real rust-analyzer documents of tens of thousands of occurrences fit.
+        unit_expansion_bytes: GIB,
         document_occurrences: 350_000,
         document_symbols: 10_000,
         external_symbols: 10_000,

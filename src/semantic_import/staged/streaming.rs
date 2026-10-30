@@ -692,6 +692,19 @@ impl<'g, 'a> DocumentIndex<'g, 'a> {
         );
         Ok(())
     }
+
+    /// Sizes the occurrence buffer for `count` rows at once, admitted first, so filling it
+    /// never doubles the buffer (no growth slack, no old and new buffer live together).
+    fn reserve_occurrences(&mut self, count: usize) -> Result<()> {
+        let additional = count.saturating_sub(self.occurrences.capacity());
+        self.retained.grow(
+            (additional as u64)
+                .checked_mul(std::mem::size_of::<OccurrenceRow>() as u64)
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+        )?;
+        self.occurrences.reserve_exact(additional);
+        Ok(())
+    }
 }
 
 impl GlobalJoinReads for DocumentIndex<'_, '_> {
@@ -1401,6 +1414,18 @@ pub(super) fn join_document(
 ) -> Result<(JoinedFacts, Reservation)> {
     let document = store.document.as_ref().context("document view required")?;
     let mut index = DocumentIndex::new(global, document)?;
+    // Each occurrence claim yields at most one occurrence row.
+    let local = store
+        .local_claims
+        .as_ref()
+        .context("document claim owner required")?;
+    index.reserve_occurrences(
+        local
+            .claims
+            .iter()
+            .filter(|claim| claim.envelope.record_kind == "occurrence")
+            .count(),
+    )?;
     for claim in store.claims() {
         let claim = claim?;
         let mut operation = store.operation()?;
@@ -1419,10 +1444,13 @@ pub(super) fn join_document(
     let mut sink = DocumentSink::new(global)?;
     emit_join_symbols(store, &index, &mut sink)?;
     let mut role_sites = None;
-    for ordinal in 0..index.occurrence_count() {
+    // Each row is read once, in order, so it moves out of the index instead of being copied;
+    // its payload is released once the row is dropped. The buffer keeps its charge until the
+    // loop ends.
+    let occurrences = std::mem::take(&mut index.occurrences);
+    for row in occurrences {
         let mut operation = store.operation()?;
-        store.reserve_operation(&mut operation, || index.occurrence_clone_bytes(ordinal))?;
-        let row = index.occurrence(ordinal)?;
+        let payload = sizes::occurrence(&row)? - std::mem::size_of::<OccurrenceRow>() as u64;
         join_occurrence(
             encoding,
             store,
@@ -1432,6 +1460,7 @@ pub(super) fn join_document(
             &mut role_sites,
             &mut operation,
         )?;
+        index.retained.release(payload)?;
     }
     settle_join_references(store, &mut index, &mut sink)?;
     let related = emit_type_relationships(store, &index, &mut sink);

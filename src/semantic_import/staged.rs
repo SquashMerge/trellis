@@ -48,6 +48,7 @@ use std::{
 mod claim_size;
 pub(crate) mod codec;
 pub(super) mod group_size;
+pub(super) mod heap;
 mod live;
 pub(crate) mod publication;
 mod settle;
@@ -267,7 +268,8 @@ struct DocGroup {
     /// The live reservation the group holds, which is what keeping it cached costs: the
     /// document cache's budget bounds the sum of its cached groups' live charges.
     bytes: u64,
-    _native_reservation: Reservation,
+    /// The load and build peak while the group is built, then its retained bytes.
+    native_reservation: Reservation,
 }
 
 impl DocGroup {
@@ -320,9 +322,14 @@ impl DocGroup {
         for (index, r) in references.iter().enumerate() {
             reference_ids.entry(r.id.clone()).or_default().push(index);
         }
-        // A cached group keeps its whole live reservation, so the cache counts exactly that.
-        let bytes = native_reservation.bytes();
-        Ok(Self {
+        // What the group does not keep drops before its charge shrinks to what it keeps.
+        drop((
+            key,
+            rows.provenance,
+            rows.control_regions,
+            rows.search_cards,
+        ));
+        let mut group = Self {
             document,
             text,
             native: mini,
@@ -333,9 +340,21 @@ impl DocGroup {
             reference_ids,
             candidates,
             support,
-            bytes,
-            _native_reservation: native_reservation,
-        })
+            bytes: 0,
+            native_reservation,
+        };
+        // The load and build peak was admitted above; what outlives it is the built group.
+        // Its charge becomes the group's retained bytes, measured from the real capacities.
+        let retained = group_size::retained_group(&group)?;
+        let held = group.native_reservation.bytes();
+        if retained < held {
+            group.native_reservation.release(held - retained)?;
+        } else {
+            group.native_reservation.grow(retained - held)?;
+        }
+        // A cached group keeps its whole live reservation, so the cache counts exactly that.
+        group.bytes = group.native_reservation.bytes();
+        Ok(group)
     }
 
     fn declaration_keys(&self) -> Result<&BTreeMap<Vec<u8>, Vec<usize>>> {
@@ -386,25 +405,16 @@ fn claim_select(filtered: bool) -> String {
 const ELIGIBLE_JOIN: &str =
     "JOIN w_docs w ON w.source_ord=c.source_ord AND w.eligible=1 AND w.failed=0";
 
-fn claim_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, ClaimParts)> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        (
-            row.get::<_, Vec<u8>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-        ),
-    ))
-}
-
-type ClaimParts = (Vec<u8>, String, String, String, String);
-
-fn build_claim(parts: ClaimParts) -> Result<CapturedClaim> {
-    let (canonical, digest, proof, artifact_hash, language) = parts;
-    claim_from_stage(canonical, digest, proof, language, artifact_hash)
+/// The staged join's claim of one `claim_select` row, decoded from its borrowed canonical
+/// bytes.
+fn build_claim(row: &rusqlite::Row<'_>) -> Result<CapturedClaim> {
+    claim_from_stage(
+        row.get_ref(2)?.as_blob()?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(6)?,
+        row.get(5)?,
+    )
 }
 
 /// The documents of one native revision in stored order (or its reverse), a page at a time.
@@ -479,7 +489,7 @@ fn decode_reserved_claim(
     let size = claim_size::measure(canonical, metadata)?;
     reservation.grow(size.retained)?;
     let _scratch = live.reserve(size.scratch)?;
-    build_claim(claim_of_row(row)?.2)
+    build_claim(row)
 }
 
 /// Parsed claims belong to one document/pass, not to the native cache or a cursor page.
@@ -711,6 +721,14 @@ impl<'a> StagedSide<'a> {
         // Rc<str> construction overlaps the source Vec returned by the reader.
         reservation.grow(row.byte_length as u64)?;
         let mut rows = self.reader.join_document(&row)?;
+        // The load's fetch and decode scratch is gone: keep the rows' own storage and the
+        // source overlap, measured from their real capacities.
+        if let Some(loaded) = group_size::retained_rows(&rows) {
+            let loaded = sizes::sum(&[loaded, row.byte_length as u64])?;
+            if loaded < reservation.bytes() {
+                reservation.release(reservation.bytes() - loaded)?;
+            }
+        }
         if self.rev == 1 {
             reservation.grow(sizes::mutation(&rows, self.ctx.mutations)?)?;
             self.ctx
@@ -2410,6 +2428,7 @@ fn emit_ledger_diagnostic(ctx: &JoinCtx<'_>, lookup_steps: u64) {
             serde_json::json!({"pass": pass, "lookupSteps": lookup, "rowAttempts": rows})
         }).collect::<Vec<_>>(),
         "lookupSteps": lookup_steps,
+        "liveHighWaterBytes": ctx.live.high_water(),
         "stageBaseBytes": ctx.stage_base,
         "stageBytes": pages.as_ref().ok().map(|(bytes, _)| *bytes),
         "freelistPages": pages.as_ref().ok().map(|(_, pages)| *pages),
