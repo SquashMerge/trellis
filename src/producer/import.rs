@@ -81,6 +81,22 @@ fn read_request(store: &Store, id: &str) -> Result<Option<Request>> {
     }
 }
 
+/// Test-support fault: fail the wait for an accepted request, as a lost queue read does.
+#[cfg(all(feature = "test-support", unix))]
+pub fn test_wait_fault() -> Result<()> {
+    const VARIABLE: &str = "TRELLIS_TEST_PRODUCER_FAIL_WAIT";
+    ensure!(
+        std::env::var_os(VARIABLE).is_none(),
+        "storage_busy: injected {VARIABLE}"
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "test-support", unix)))]
+pub fn test_wait_fault() -> Result<()> {
+    Ok(())
+}
+
 /// Enqueue `options` and return the accepted request's ID.
 pub fn submit(scheduler: &DaemonState, options: &GeneratedImportOptions) -> Result<String> {
     Ok(scheduler.enqueue_generated_semantic_import(options)?.id)

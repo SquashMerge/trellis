@@ -429,7 +429,9 @@ impl PickupOwner {
         Self::wait_ready(scheduler)?;
         let generation_id = Uuid::new_v4().simple().to_string();
         let dir = state.create_pickup_dir(&generation_id)?;
-        // The directory goes on every exit, whatever the outcome.
+        // Set once the queue accepts the import: the request then owns the directory's batch.
+        let mut accepted: Option<LastImported> = None;
+        // The directory goes on every exit before acceptance, whatever the outcome.
         let result = (|| -> Result<(Value, Option<LastImported>)> {
             let copied = batch::copy_artifact(Path::new(&entry.artifact), &dir);
             let (sha256, _) = match copied {
@@ -491,7 +493,17 @@ impl PickupOwner {
             };
             let options =
                 import::options_for(&written, GenerationOrigin::OwnerPickup, &generation_id)?;
-            let outcome = import::submit_and_wait(store, scheduler, &options)?;
+            let request_id = import::submit(scheduler, &options)?;
+            accepted = Some(LastImported {
+                sha256: sha256.clone(),
+                source_revision: revision.clone(),
+                request_id: Some(request_id.clone()),
+                state: "failed".into(),
+                error_code: None,
+                attempted_at,
+            });
+            import::test_wait_fault()?;
+            let outcome = import::wait(store, scheduler, &options, request_id)?;
             let last = LastImported {
                 sha256: sha256.clone(),
                 source_revision: revision.clone(),
@@ -513,16 +525,44 @@ impl PickupOwner {
             });
             Ok((reply, Some(last)))
         })();
-        let _ = state.remove_pickup_dir(&generation_id);
+        let result = match (result, accepted) {
+            (Err(error), Some(mut last)) => {
+                // The wait ended before the accepted request settled: the request still
+                // reads the batch, so the directory stays and the sweep reclaims it once
+                // the request is terminal. The unknown outcome counts as a transient
+                // failure, so a later trigger retries after the retry interval.
+                let message = format!("{error:#}");
+                last.error_code = Some(message.split(':').next().unwrap_or(&message).to_owned());
+                self.record_last(state, &mut config, producer, last)?;
+                return Err(error);
+            }
+            (result, _) => {
+                let _ = state.remove_pickup_dir(&generation_id);
+                result
+            }
+        };
         let (reply, last) = result?;
-        if let Some(last) = last
-            && !self.closed.load(std::sync::atomic::Ordering::Acquire)
+        if let Some(last) = last {
+            self.record_last(state, &mut config, producer, last)?;
+        }
+        Ok(reply)
+    }
+
+    /// Record `last` for `producer` unless this owner is retired.
+    fn record_last(
+        &self,
+        state: &StateDir,
+        config: &mut PickupConfig,
+        producer: &str,
+        last: LastImported,
+    ) -> Result<()> {
+        if !self.closed.load(std::sync::atomic::Ordering::Acquire)
             && let Some(entry) = config.entries.iter_mut().find(|e| e.producer == producer)
         {
             entry.last_imported = Some(last);
-            state.write_pickup_config(&config)?;
+            state.write_pickup_config(config)?;
         }
-        Ok(reply)
+        Ok(())
     }
 }
 
