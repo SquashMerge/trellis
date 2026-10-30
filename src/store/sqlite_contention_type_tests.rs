@@ -127,7 +127,7 @@ fn an_expired_read_scope_fails_typed_without_waiting() {
     writer
         .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
         .unwrap();
-    let reader = rusqlite::Connection::open(&path).unwrap();
+    let mut reader = rusqlite::Connection::open(&path).unwrap();
     reader.busy_handler(Some(read_deadline_busy)).unwrap();
     writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
     let busy = with_read_deadline(Instant::now() - Duration::from_millis(1), || {

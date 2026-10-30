@@ -303,10 +303,10 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "git", "git/diff", "metrics", "architecture", "architecture/rules", "architecture/rules/preview", "architecture/rules/apply", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  const simple = new Set(["status", "git", "git/diff", "metrics", "architecture", "architecture/details", "architecture/rules", "architecture/rules/preview", "architecture/rules/apply", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
   if (route === "architecture/rules" && method !== "GET" || ["architecture/rules/preview", "architecture/rules/apply"].includes(route) && method !== "POST") throw new Error("Invalid rules request method.");
   if (route === "syntax-matches" && method !== "POST") throw new Error("Syntax match requests must be POST.");
-  if (["git", "git/diff", "metrics", "architecture", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
+  if (["git", "git/diff", "metrics", "architecture", "architecture/details", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
   const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route);
   if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
   if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");

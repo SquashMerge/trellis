@@ -85,6 +85,19 @@ Parse-error files retain recovered syntax with unavailable semantic provenance. 
 `semanticState` reports manifest freshness, not parse completeness or live working-tree
 freshness. There is **no watcher**: the source may have changed since indexing.
 
+**Status of a published import (#467).** `trellis status` and `GET /api/status` read the
+head revision's published semantic producers under the browser's policy (#392/#409). With
+exactly one, `semanticProducerId` names it and `stats` reports its selected bindings:
+`semanticState` is `fresh`, or `stale` when any selected proof is not fresh. It is
+`unavailable` when no selected complete or partial coverage exists. `internal` counts
+calls resolved to an internal declaration, `external` external calls, and `ambiguous`
+ambiguous calls. Each call counts once, even when an ambiguous call publishes one row per
+provenance. `unresolved` counts the remaining measured calls. With no producer, or several,
+`semanticNote` says so (`no semantic producer published; showing syntax` or
+`multiple semantic producers; showing syntax`). `semanticState` is then `unavailable`,
+and the counts stay syntax-only. `GET /api/methods` marks each symbol's
+`provenance.semantic` with the same producer's state for that document.
+
 ## Data and identity contract
 
 Public JSON uses camelCase. `src/model.rs` is the canonical Rust contract.
@@ -125,7 +138,8 @@ The former browser `POST /api/query` route is removed:
   "maxNodes": 40,
   "maxCalls": 200,
   "includeCallbacks": false,
-  "excludePaths": []
+  "excludePaths": [],
+  "semanticProducerId": "optional; `--semantic-producer-id` on the CLI"
 }
 ```
 
@@ -141,8 +155,26 @@ omitted targets, not all unseen reachable nodes. A retained call may point to a 
 outside the displayed node budget; do not invent a connecting box/edge to hide that.
 
 A result includes `revision` as the complete `{indexGeneration,indexRevision}` pair,
-the effective query, `nodes`, `calls`, `regions`, `truncated`, `omittedNodes` and `warnings`.
-The pair and all facts are read in one SQLite transaction. Forward both fields to pinned
+the effective query, `nodes`, `calls`, `regions`, `truncated`, `omittedNodes`, `warnings`
+and `semantic`. The pair and all facts are read in one SQLite transaction.
+
+`semantic` (#467) applies the browser's producer policy (#392/#409) at that revision. An
+explicit `semanticProducerId` (1–512 bytes, no NUL) must be published there: an empty or
+oversized ID fails `invalid_argument`, and an unpublished one fails `producer_unavailable`.
+Without one, the sole published producer is used. None or several leave the view syntax
+only, with `semantic.note` `no semantic producer published; showing syntax` or
+`multiple semantic producers; showing syntax`; producers are never merged. A producer that
+does not cover the seed's language gives `semantic producer does not cover this language;
+showing syntax`. Otherwise `semantic` is `{producerId, note: null, bindings}`. Each
+binding is `{callId, boundaryReason, targetId, freshness, binding}` for a returned call
+that has one. `binding` is the published contract-v1 `CallBinding`: resolution, declared
+target, the whole candidate union of an ambiguous call, dispatch and provenance ID. It is
+selected by the reader that the call graph, sequence and line navigation share. `boundaryReason`
+is that engine's reason, where `none` means the graph would traverse the call. `targetId`
+is a resolved binding's declared internal target, located exactly in this snapshot and not
+stale. With a `dispatch` boundary, `targetId` is the declared target, not a proven callee. Calls
+with a binding, and the seed when its document's selected coverage is complete or
+partial, carry `provenance.semantic` `fresh` or `stale` instead of `unavailable`. Forward both fields to pinned
 shared source/symbol lookups; a stale pair returns a typed conflict. A bare numeric pin is invalid.
 Only the current snapshot is stored server-side; this is not historical time travel.
 

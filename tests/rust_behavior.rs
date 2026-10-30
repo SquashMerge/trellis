@@ -566,8 +566,8 @@ fn target_for<'a>(view: &'a SequenceView, label: &str) -> &'a trellis::behavior:
         "unresolvedReceiver"
     };
     let id = format!(
-        "rust:source:{kind}:{:x}",
-        Sha256::digest(expression.as_bytes())
+        "rust:source:{kind}:{}",
+        hex::encode(Sha256::digest(expression.as_bytes()))
     );
     view.participants
         .iter()

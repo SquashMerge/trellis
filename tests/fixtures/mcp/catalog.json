@@ -4671,6 +4671,11 @@
           "minimum": 1,
           "type": "integer"
         },
+        "semanticProducerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
         "schemaVersion": {
           "const": 1
         },
@@ -4798,24 +4803,26 @@
           "additionalProperties": false,
           "properties": {
             "binding": {
-              "allOf": [
+              "anyOf": [
                 {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/CallBinding"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "$ref": "#/$defs/CallBinding"
                 },
                 {
-                  "const": null
+                  "type": "null"
                 }
               ]
             },
             "boundaryReason": {
-              "const": "missingEvidence"
+              "enum": [
+                "none",
+                "external",
+                "unresolved",
+                "ambiguous",
+                "dispatch",
+                "stale",
+                "nodeLimit",
+                "missingEvidence"
+              ]
             },
             "callId": {
               "$ref": "#/$defs/OccurrenceId"
@@ -4847,13 +4854,30 @@
               "$ref": "#/$defs/Text"
             },
             "disposition": {
-              "const": "unresolved"
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved",
+                "unsupported",
+                "dynamic",
+                "declarationOnly",
+                "staleTarget"
+              ]
             },
             "evidenceTier": {
-              "const": "syntax"
+              "enum": [
+                "syntax",
+                "semantic"
+              ]
             },
             "freshness": {
-              "const": "fresh"
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                "unavailable"
+              ]
             },
             "nativeCandidates": {
               "$ref": "#/$defs/NativeCandidates"
@@ -4868,14 +4892,28 @@
               "$ref": "#/$defs/Range"
             },
             "semanticBasis": {
-              "const": null
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "staleBecause": {
               "maxItems": 0,
               "type": "array"
             },
             "targetId": {
-              "const": null
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SyntaxId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "doc": {
               "$ref": "#/$defs/UInt"
@@ -6110,6 +6148,11 @@
           "minimum": 1,
           "type": "integer"
         },
+        "semanticProducerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
         "schemaVersion": {
           "const": 1
         },
@@ -7029,25 +7072,72 @@
               "const": "name"
             },
             "binding": {
-              "const": null
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CallBinding"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "disposition": {
-              "const": "unresolved"
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved",
+                "unsupported",
+                "dynamic",
+                "declarationOnly",
+                "staleTarget"
+              ]
             },
             "targetId": {
-              "const": null
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SyntaxId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "boundaryReason": {
-              "const": "missingEvidence"
+              "enum": [
+                "none",
+                "external",
+                "unresolved",
+                "ambiguous",
+                "dispatch",
+                "stale",
+                "nodeLimit",
+                "missingEvidence"
+              ]
             },
             "evidenceTier": {
-              "const": "syntax"
+              "enum": [
+                "syntax",
+                "semantic"
+              ]
             },
             "semanticBasis": {
-              "const": null
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SemanticBasis"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "freshness": {
-              "const": "fresh"
+              "enum": [
+                "fresh",
+                "possiblyStale",
+                "stale",
+                "unavailable"
+              ]
             },
             "staleBecause": {
               "type": "array",
@@ -7118,6 +7208,250 @@
             "language",
             "evidenceTier",
             "coverage"
+          ],
+          "type": "object"
+        },
+        "CallBinding": {
+          "additionalProperties": false,
+          "properties": {
+            "callId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OccurrenceId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "candidates": {
+              "items": {
+                "$ref": "#/$defs/Target"
+              },
+              "type": "array"
+            },
+            "declaredTarget": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Target"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "dispatch": {
+              "enum": [
+                "direct",
+                "constructor",
+                "virtual",
+                "interface",
+                "dynamic",
+                "unknown"
+              ]
+            },
+            "join": {
+              "$ref": "#/$defs/Join"
+            },
+            "possibleDispatch": {
+              "items": {
+                "$ref": "#/$defs/Target"
+              },
+              "type": "array"
+            },
+            "possibleDispatchComplete": {
+              "const": false
+            },
+            "provenanceId": {
+              "$ref": "#/$defs/Text"
+            },
+            "resolution": {
+              "enum": [
+                "resolved",
+                "external",
+                "ambiguous",
+                "unresolved"
+              ]
+            },
+            "staleTarget": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "callId",
+            "join",
+            "resolution",
+            "declaredTarget",
+            "candidates",
+            "dispatch",
+            "possibleDispatch",
+            "possibleDispatchComplete",
+            "staleTarget",
+            "provenanceId"
+          ],
+          "type": "object"
+        },
+        "Target": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "document": {
+                  "$ref": "#/$defs/DocumentKey"
+                },
+                "kind": {
+                  "const": "internal"
+                },
+                "revisionId": {
+                  "$ref": "#/$defs/Text"
+                },
+                "syntaxId": {
+                  "$ref": "#/$defs/SyntaxId"
+                }
+              },
+              "required": [
+                "kind",
+                "syntaxId",
+                "document",
+                "revisionId"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "external"
+                },
+                "symbol": {
+                  "$ref": "#/$defs/SymbolKey"
+                }
+              },
+              "required": [
+                "kind",
+                "symbol"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SymbolKey": {
+          "additionalProperties": false,
+          "properties": {
+            "document": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DocumentKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "scheme": {
+              "const": "scip"
+            },
+            "scope": {
+              "enum": [
+                "global",
+                "document"
+              ]
+            },
+            "symbol": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "scheme",
+            "symbol",
+            "scope",
+            "document"
+          ],
+          "type": "object"
+        },
+        "Join": {
+          "additionalProperties": false,
+          "properties": {
+            "anchor": {
+              "$ref": "#/$defs/MeasuredAnchor"
+            },
+            "candidateIds": {
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/SyntaxId"
+                  },
+                  {
+                    "$ref": "#/$defs/OccurrenceId"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "diagnostic": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "enum": [
+                "exact",
+                "ambiguous",
+                "unmatched",
+                "unsupported"
+              ]
+            }
+          },
+          "required": [
+            "anchor",
+            "status",
+            "candidateIds",
+            "diagnostic"
+          ],
+          "type": "object"
+        },
+        "MeasuredAnchor": {
+          "additionalProperties": false,
+          "properties": {
+            "contentHash": {
+              "$ref": "#/$defs/Hash"
+            },
+            "document": {
+              "$ref": "#/$defs/DocumentKey"
+            },
+            "kind": {
+              "enum": [
+                "declarationName",
+                "callee",
+                "invocation",
+                "reference"
+              ]
+            },
+            "range": {
+              "$ref": "#/$defs/Range"
+            },
+            "revisionId": {
+              "$ref": "#/$defs/Text"
+            }
+          },
+          "required": [
+            "document",
+            "revisionId",
+            "contentHash",
+            "range",
+            "kind"
           ],
           "type": "object"
         }
@@ -9867,6 +10201,12 @@
           "minimum": 1,
           "maximum": 50,
           "default": 5
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
         }
       },
       "required": [
@@ -11673,6 +12013,33 @@
                   "items": {
                     "$ref": "#/$defs/ExternalPackage"
                   }
+                },
+                "page": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "offset": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "nextOffset": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "total": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "offset",
+                    "nextOffset",
+                    "total"
+                  ]
                 }
               },
               "required": [
@@ -11687,7 +12054,8 @@
                 "unresolved",
                 "counts",
                 "limitations",
-                "externalPackages"
+                "externalPackages",
+                "page"
               ]
             },
             "evidenceBasis": {
@@ -11801,6 +12169,18 @@
             "minLength": 1,
             "maxLength": 4096
           }
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 5
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
         }
       },
       "required": [
@@ -12751,6 +13131,9 @@
             },
             "referenceCount": {
               "$ref": "#/$defs/UInt"
+            },
+            "omittedEvidence": {
+              "$ref": "#/$defs/UInt"
             }
           },
           "required": [
@@ -12765,7 +13148,8 @@
             "constraints",
             "evidence",
             "unresolved",
-            "referenceCount"
+            "referenceCount",
+            "omittedEvidence"
           ]
         },
         "RuleCounts": {
@@ -13655,6 +14039,33 @@
                   "items": {
                     "$ref": "#/$defs/ExternalPackage"
                   }
+                },
+                "page": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "offset": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "nextOffset": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "total": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "offset",
+                    "nextOffset",
+                    "total"
+                  ]
                 }
               },
               "required": [
@@ -13668,7 +14079,8 @@
                 "testCounts",
                 "unassigned",
                 "limitations",
-                "externalPackages"
+                "externalPackages",
+                "page"
               ]
             },
             "evidenceBasis": {
@@ -13788,6 +14200,18 @@
         },
         "destination": {
           "$ref": "#/$defs/Destination"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 5
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
         }
       },
       "required": [
@@ -15003,6 +15427,9 @@
             },
             "referenceCount": {
               "$ref": "#/$defs/UInt"
+            },
+            "omittedEvidence": {
+              "$ref": "#/$defs/UInt"
             }
           },
           "required": [
@@ -15017,7 +15444,8 @@
             "constraints",
             "evidence",
             "unresolved",
-            "referenceCount"
+            "referenceCount",
+            "omittedEvidence"
           ]
         },
         "RuleCounts": {
@@ -15907,6 +16335,33 @@
                   "items": {
                     "$ref": "#/$defs/ExternalPackage"
                   }
+                },
+                "page": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "offset": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "nextOffset": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "total": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "offset",
+                    "nextOffset",
+                    "total"
+                  ]
                 }
               },
               "required": [
@@ -15920,7 +16375,8 @@
                 "testCounts",
                 "unassigned",
                 "limitations",
-                "externalPackages"
+                "externalPackages",
+                "page"
               ]
             },
             "evidenceBasis": {

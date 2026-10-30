@@ -163,8 +163,13 @@ impl World {
         assert_eq!(state, "failed");
         let code = code.unwrap();
         assert!(code.starts_with(expected), "row code {code}");
+        let (class, reason) = code.split_once(": ").unwrap_or((code.as_str(), ""));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(&code), "{stderr}");
+        assert!(
+            stderr.contains(&format!("{class}: request "))
+                && stderr.contains(&format!(" failed: {reason}")),
+            "{stderr}"
+        );
         code
     }
 

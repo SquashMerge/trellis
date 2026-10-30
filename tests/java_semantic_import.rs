@@ -16,6 +16,7 @@ fn java_converted_type_use_must_obey_exact_admitted_encoding() {
             relative_path: "Child.java".into(),
             position_encoding: 2,
             raw: json!({"range":{"encoding":"legacy","values":[0,base,base+4]},"symbol":"pkg/Base#","symbolRoles":0,"syntaxKind":0}),
+            cargo_target: None,
         },
         canonical_bytes: vec![],
         fact_digest: "raw".into(),

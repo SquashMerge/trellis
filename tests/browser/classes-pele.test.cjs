@@ -151,13 +151,15 @@ test("validation fails closed and the view falls back visibly to cards", async (
       dropped: attempt(raw.replace(/<text class="pele-member pele-method"[^>]*>helper\(\)<\/text>/, "")),
       script: attempt(raw.replace("</svg>", "<script>1</script></svg>")),
       attribute: attempt(raw.replace('data-id="C0"', 'data-id="C0" onclick="x"')),
+      note: attempt(raw.replace("</svg>", '<g class="pele-note"><rect x="0" y="0" width="1" height="1"/></g></svg>')),
+      noteEdge: attempt(raw.replace("</svg>", '<path class="pele-note-edge" d="M0 0L1 1"/></svg>')),
       tooMany: P.render(many, {}).reason,
       bigSource: P.render([{...dto.nodes[0], class: {...dto.nodes[0].class, fields: Array.from({length: 200}, (_, i) => ({name: `f${i}<>`.repeat(8), typeHint: "<>".repeat(20), path: "a", range: dto.nodes[0].class.symbol.range}))}}], {membersOpen: new Set(["A"])}).reason,
       badWitness: P.render([{...dto.nodes[0], class: {...dto.nodes[0].class, symbol: {...dto.nodes[0].class.symbol, range: {startLine: 0, endLine: 1}}}}], {}).reason,
     };
   }, dto);
   assert.equal(reasons.exact, "ok");
-  for (const key of ["renamed", "reordered", "member", "dropped", "script", "attribute"]) assert.notEqual(reasons[key], "ok", key);
+  for (const key of ["renamed", "reordered", "member", "dropped", "script", "attribute", "note", "noteEdge"]) assert.notEqual(reasons[key], "ok", key);
   assert.equal(reasons.tooMany, "Too many classes for Pele");
   assert.equal(reasons.bigSource, "Class Mermaid source too large");
   assert.equal(reasons.badWitness, "Unsupported class declaration");
@@ -177,13 +179,18 @@ test("validation fails closed and the view falls back visibly to cards", async (
   assert.equal(await page.evaluate(() => document.activeElement?.dataset.trellisClassId), "W");
 });
 
-test("member bounds and partial declarations are disclosed beside the Pele diagram", async () => {
-  const many = Array.from({length: 203}, (_, i) => ({name: `m${i}`, symbolId: `P#m${i}`, typeHint: null, path: "src/P.java", range}));
-  await open(diagram([node("P", "Partial", {methods: many, truncated: true})]));
+for (const [fields, methods, shown, omitted] of [
+  [1, 203, "first 200 methods", 3],
+  [203, 2, "first 200 fields", 3],
+  [201, 202, "first 200 fields and first 200 methods", 3],
+]) test(`member bounds disclose only overflowing lists: ${fields} fields and ${methods} methods`, async () => {
+  const members = (count, kind) => Array.from({length: count}, (_, i) => ({name: `${kind}${i}`, typeHint: null, path: "src/P.java", range}));
+  await open(diagram([node("P", "Partial", {fields: members(fields, "f"), methods: members(methods, "m"), truncated: true})]));
   await classMenu("P"); await page.getByRole("menuitem", {name: /Show members/}).click();
   assert.match(await state(), /Pele rendered/);
-  assert.equal(await page.locator(".pele-member.pele-method").count(), 200);
+  assert.equal(await page.locator(".pele-member.pele-attribute").count(), Math.min(fields, 200));
+  assert.equal(await page.locator(".pele-member.pele-method").count(), Math.min(methods, 200));
   assert.deepEqual(await page.locator(".classes-pele-notices li").allTextContents(), [
-    "sample.Partial: first 200 fields and first 200 methods shown; 3 more omitted. Read class source for more.",
+    `sample.Partial: ${shown} shown; ${omitted} more omitted. Read class source for more.`,
     "sample.Partial: partial declaration · read source for details."]);
 });

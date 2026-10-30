@@ -67,6 +67,16 @@ fn fixture(manifest: &str) -> (tempfile::TempDir, tempfile::TempDir, Store, Inde
     drop(leader);
     (state, root, store, pin)
 }
+/// The Architecture summary adds each package's display `layer` (#448); the
+/// descriptor itself is the public one.
+fn without_layer(packages: &Value) -> Value {
+    let mut packages = packages.clone();
+    for package in packages.as_array_mut().unwrap() {
+        let layer = package.as_object_mut().unwrap().remove("layer").unwrap();
+        assert!(layer.is_null() || layer.is_string());
+    }
+    packages
+}
 fn read(store: &Store, kind: &str, pin: IndexPin) -> Value {
     let response = store.evidence_response().unwrap();
     let value = response
@@ -231,7 +241,7 @@ fn external_rules_explain_closure_and_native_metrics_do_not_create_package_modul
         assert_eq!(module["metrics"], metric.metrics);
     }
     assert_eq!(
-        view["references"]["externalPackages"],
+        without_layer(&view["references"]["externalPackages"]),
         refs["externalPackages"]
     );
     assert!(
@@ -457,7 +467,7 @@ fn java_external_rules_explain_and_browser_keep_package_and_native_closure_separ
         assert_eq!(module["metrics"], metric.metrics);
     }
     assert_eq!(
-        view["references"]["externalPackages"],
+        without_layer(&view["references"]["externalPackages"]),
         refs["externalPackages"]
     );
     assert!(refs["modules"].as_array().unwrap().iter().all(|module| {
@@ -859,7 +869,7 @@ fn python_external_rules_explain_and_browser_keep_native_metrics_separate() {
         assert_eq!(module["metrics"], metric.metrics);
     }
     assert_eq!(
-        view["references"]["externalPackages"],
+        without_layer(&view["references"]["externalPackages"]),
         refs["externalPackages"]
     );
     response.finish(()).unwrap();
@@ -1088,7 +1098,7 @@ fn javascript_external_policy_layers_explain_and_metrics_retain_only_native_modu
         assert_eq!(module["metrics"], metric.metrics);
     }
     assert_eq!(
-        view["references"]["externalPackages"],
+        without_layer(&view["references"]["externalPackages"]),
         refs["externalPackages"]
     );
     response.finish(()).unwrap();

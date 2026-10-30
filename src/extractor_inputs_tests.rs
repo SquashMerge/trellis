@@ -11,12 +11,32 @@ use std::{collections::BTreeSet, path::Path};
 /// stored fact for an unchanged capture.
 const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
     (
+        "graph_query::BoundaryReason",
+        "a field of the read-only query view's semantic bindings (#467), never extracted",
+    ),
+    (
+        "semantic_evidence::CallBinding",
+        "a field of the read-only query view's semantic bindings (#467), never extracted",
+    ),
+    (
+        "semantic_evidence::Freshness",
+        "a field of the read-only query view's semantic bindings (#467), never extracted",
+    ),
+    (
         "capture::Capture",
         "the admitted inputs; source bytes enter facts only through per-document content hashes",
     ),
     (
         "capture::ROOT_INPUTS",
         "revision-header config inputs, captured and compared per revision",
+    ),
+    (
+        "capture::nested_package_manifest",
+        "selects nested package.json config inputs (#443), captured and compared per revision",
+    ),
+    (
+        "capture::nested_cargo_manifest",
+        "selects nested Cargo.toml config inputs (#394), captured and compared per revision",
     ),
     (
         "capture::CaptureInputObservation",
@@ -56,6 +76,26 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
     (
         "src/semantic_import.rs",
         "post-native semantic relationships from authenticated source",
+    ),
+    (
+        "src/scip_raw/cargo_targets.rs",
+        "post-native semantic admission: module declarations naming each Rust document's Cargo target (#394)",
+    ),
+    (
+        "src/semantic_import/staged/group_size.rs",
+        "post-native semantic normalization scratch accounting",
+    ),
+    (
+        "src/semantic_import/join_store.rs",
+        "post-native semantic join: hands one role-site syntax tree to type relationships",
+    ),
+    (
+        "src/semantic_import/staged.rs",
+        "post-native semantic join: keeps one role-site syntax tree for type relationships",
+    ),
+    (
+        "src/semantic_import_complexity_tests.rs",
+        "post-native semantic parser reservation tests",
     ),
     (
         "src/files_view.rs",

@@ -8,33 +8,43 @@ fn code(kind: RequestKind, message: &str) -> String {
 }
 
 #[test]
-fn classifies_closed_classes() {
+fn semantic_import_keeps_its_closed_codes_and_listed_reasons() {
     for (message, expected) in [
         (
             "invalid_request: role outside root",
             "invalid_request: role outside root",
         ),
         (
-            "invalid_artifact: bad coordinate",
-            "invalid_artifact: bad coordinate",
+            "invalid_request: generation directory",
+            "invalid_request: generation directory",
         ),
         (
-            "limit_exceeded: descriptor too large",
-            "limit_exceeded: descriptor too large",
+            "stale_basis: head revision changed",
+            "stale_basis: head revision changed",
         ),
         ("capture_unavailable", "capture_unavailable"),
-        ("stale_basis: source changed", "stale_basis: source changed"),
         ("root_changed", "root_changed"),
-        ("index_failed", "index_failed"),
-        ("something unclassified", "index_failed"),
-        ("invalid_requestx: nope", "index_failed"),
+        ("index_failed", "index_failed: internal error"),
+        ("something unclassified", "index_failed: internal error"),
+        ("invalid_requestx: nope", "index_failed: internal error"),
     ] {
-        assert_eq!(semantic_import_code(message), expected, "{message}");
         assert_eq!(
             code(RequestKind::SemanticImport, message),
             expected,
             "{message}"
         );
+    }
+}
+
+#[test]
+fn unlisted_reason_text_never_reaches_the_row() {
+    for message in [
+        "invalid_artifact: /tmp/x\nsecond line",
+        "invalid_artifact: ",
+        "limit_exceeded: Bad Case",
+    ] {
+        let stored = code(RequestKind::SemanticImport, message);
+        assert!(stored.ends_with(": unlisted detail"), "{message}: {stored}");
     }
 }
 
@@ -57,28 +67,9 @@ fn revision_conflict_prefix_wins_over_classifier() {
 }
 
 #[test]
-fn drops_unstable_reason() {
-    for message in [
-        "invalid_artifact: Bad Case",
-        "invalid_artifact: /tmp/x\nsecond line",
-        "invalid_artifact: ",
-        "invalid_artifact: -leading",
-        &format!("invalid_artifact: {}", "a".repeat(65)),
-    ] {
-        assert_eq!(
-            semantic_import_code(message),
-            "invalid_artifact",
-            "{message}"
-        );
-    }
-    let longest = format!("limit_exceeded: {}", "a".repeat(64));
-    assert_eq!(semantic_import_code(&longest), longest);
-}
-
-#[test]
 fn index_kind_keeps_index_failed() {
     assert_eq!(
         code(RequestKind::Index, "invalid_request: role outside root"),
-        "index_failed"
+        "index_failed: internal error"
     );
 }

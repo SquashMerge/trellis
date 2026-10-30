@@ -191,14 +191,186 @@ fn architecture_exact_counts_roles_policy_samples_and_full_identity_metrics() {
         assert!(empty["metrics"]["cyclomatic"].is_null());
     }
     response.finish(()).unwrap();
-    // Public references and rules shapes are not extended by the browser projection.
-    let response = store.evidence_response().unwrap();
-    for (kind, field) in [("references", "references"), ("check", "rules")] {
-        let native = response
-            .architecture_response(kind, &json!({"expectedBasis":pin}), &mut || Ok(()))
-            .unwrap();
-        assert_eq!(native, data[field]);
+    // The summary keeps the public projections' exact counts (#448).
+    let references = native(&store, pin, "references");
+    let checked = native(&store, pin, "check");
+    assert_eq!(data["references"]["counts"], references["counts"]);
+    assert_eq!(data["references"]["limitations"], references["limitations"]);
+    for field in ["counts", "testCounts", "rulesFile", "limitations"] {
+        assert_eq!(data["rules"][field], checked[field], "{field}");
     }
+    assert_eq!(
+        data["rules"]["unassignedCount"],
+        checked["unassigned"].as_array().unwrap().len()
+    );
+}
+
+/// The public `references` or `check` projection, as the CLI prints it.
+fn native(store: &Store, pin: IndexPin, kind: &str) -> Value {
+    let response = store.evidence_response().unwrap();
+    let value = response
+        .architecture_response(kind, &json!({"expectedBasis":pin}), &mut || Ok(()))
+        .unwrap();
+    response.finish(value).unwrap()
+}
+
+/// All detail items of one kind, paged `limit` at a time.
+fn details(
+    store: &Store,
+    data: &Value,
+    kind: &str,
+    filters: &[(&str, &str)],
+    limit: usize,
+) -> Vec<Value> {
+    let response = store.evidence_response().unwrap();
+    let (mut offset, mut items) = (0usize, Vec::new());
+    loop {
+        let mut fields: std::collections::BTreeMap<String, String> = [
+            ("kind", kind.to_owned()),
+            (
+                "indexGeneration",
+                data["indexGeneration"].as_str().unwrap().to_owned(),
+            ),
+            ("indexRevision", data["indexRevision"].to_string()),
+            (
+                "rulesHash",
+                data["rulesFile"]["contentHash"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ),
+            ("offset", offset.to_string()),
+            ("limit", limit.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        fields.extend(
+            filters
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        );
+        let query = trellis::architecture_details::Query::from_fields(fields).unwrap();
+        let page = response
+            .architecture_details(&query, &mut || Ok(()))
+            .unwrap();
+        items.extend(page["items"].as_array().unwrap().iter().cloned());
+        match page["nextOffset"].as_u64() {
+            Some(next) => offset = next as usize,
+            None => {
+                assert_eq!(page["total"], items.len());
+                response.finish(()).unwrap();
+                return items;
+            }
+        }
+    }
+}
+
+/// #448: the default view is bounded by what it draws. Unresolved sites, pairs
+/// and rule instances grow without growing the summary; details page them.
+#[test]
+fn architecture_summary_is_bounded_and_details_page_the_rest() {
+    let (_state, root, store, pin) = fixture();
+    rules(root.path(), RULES);
+    let small = view(&store, pin);
+    let (_state, root, store, pin) = {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        // Same files, each with 400 extra unresolved sites.
+        let noise = "absent::call();".repeat(400);
+        for (path, source) in [
+            (
+                "src/lib.rs",
+                format!(
+                    "mod store; mod peer; mod shared; mod entry; mod other; mod unknown; mod empty; pub fn entry() {{crate::store::run();crate::peer::run();crate::shared::run();crate::entry::run();{noise}}}\n"
+                ),
+            ),
+            (
+                "src/store.rs",
+                format!(
+                    "pub fn run(){{crate::entry::run();crate::other::run();crate::other::run();crate::other::run();crate::other::run();crate::other::run();crate::other::run();crate::other::run();{noise}}}\n#[cfg(test)] mod tests{{fn f(){{crate::entry::run();}}}}\n#[cfg(feature=\"test-support\")] fn seam(){{crate::entry::run();}}\n"
+                ),
+            ),
+            ("src/entry.rs", format!("pub fn run(){{{noise}}}\n")),
+            ("src/other.rs", format!("pub fn run(){{{noise}}}\n")),
+            ("src/peer.rs", format!("pub fn run(){{{noise}}}\n")),
+            (
+                "src/shared.rs",
+                format!("pub fn run(){{crate::entry::run();{noise}}}\n"),
+            ),
+            (
+                "src/unknown.rs",
+                format!("pub fn unknown(){{crate::entry::run();{noise}}}\n"),
+            ),
+            ("src/empty.rs", "// no callable\n".into()),
+        ] {
+            fs::write(root.path().join(path), source).unwrap();
+        }
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let baseline = store.index_baseline().unwrap();
+        let leader = store.publication_for_tests().unwrap();
+        let (graph, native, capture) = index_workspace_bundle(
+            &IndexOptions::new(root.path().to_owned()),
+            store.root_id(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        let pin = store
+            .publish_native(&graph, &capture, &native, &leader, baseline, &cancel)
+            .unwrap();
+        drop(leader);
+        (state, root, store, pin)
+    };
+    rules(root.path(), RULES);
+    let large = view(&store, pin);
+    let references = native(&store, pin, "references");
+    let unresolved = references["unresolved"].as_array().unwrap();
+    assert!(unresolved.len() >= 2400, "{}", unresolved.len());
+    let full = serde_json::to_vec(&references).unwrap().len();
+    let summary = |data: &Value| {
+        let mut data = data.clone();
+        // Per-module metric values and pins legitimately differ between fixtures.
+        for field in ["modules", "indexGeneration", "references", "rules"] {
+            data[field] = Value::Null;
+        }
+        serde_json::to_vec(&data).unwrap().len()
+    };
+    let bytes = serde_json::to_vec(&large).unwrap().len();
+    assert!(
+        bytes * 4 < full,
+        "summary {bytes} bytes vs {full} bytes of references alone"
+    );
+    // Only sampled site offsets gain digits; 2,800 extra sites add no rows.
+    assert!(
+        summary(&small).abs_diff(summary(&large)) < 64,
+        "edges do not grow with sites: {} vs {}",
+        summary(&small),
+        summary(&large)
+    );
+    assert_eq!(
+        serde_json::to_vec(&large["references"]["externalPackages"])
+            .unwrap()
+            .len(),
+        serde_json::to_vec(&small["references"]["externalPackages"])
+            .unwrap()
+            .len()
+    );
+    assert_eq!(
+        large["references"]["counts"]["unresolvedSites"],
+        unresolved.len()
+    );
+    // Paged details return every unresolved site, per file on request.
+    let paged = details(&store, &large, "unresolved", &[], 500);
+    assert_eq!(paged, *unresolved);
+    let file = details(&store, &large, "unresolved", &[("path", "src/peer.rs")], 50);
+    assert_eq!(file.len(), 400);
+    assert!(
+        file.iter()
+            .all(|item| item["source"]["path"] == "src/peer.rs")
+    );
 }
 #[test]
 fn architecture_setup_diagnostics_rules_digest_and_no_live_source_fallback() {
@@ -271,8 +443,8 @@ fn architecture_cancellation_and_expired_pin_fail_atomically() {
 fn architecture_exceptions_preserve_unexcepted_deviations_and_unknown_evidence() {
     let (_state, root, store, pin) = fixture();
     rules(root.path(), RULES);
-    let first = view(&store, pin);
-    let pair = first["references"]["production"]
+    let references = native(&store, pin, "references");
+    let pair = references["production"]
         .as_array()
         .unwrap()
         .iter()
@@ -320,7 +492,7 @@ fn architecture_exceptions_preserve_unexcepted_deviations_and_unknown_evidence()
         7
     );
     assert!(
-        data["references"]["production"]
+        native(&store, pin, "references")["production"]
             .as_array()
             .unwrap()
             .iter()
@@ -334,14 +506,14 @@ fn architecture_exceptions_preserve_unexcepted_deviations_and_unknown_evidence()
             .all(|e| e["sourceLayer"] != e["destinationLayer"])
     );
     assert!(
-        data["rules"]["instances"]
+        native(&store, pin, "check")["instances"]
             .as_array()
             .unwrap()
             .iter()
             .any(|e| e["target"]["path"] == "src/unknown.rs" && e["status"] == "unknown")
     );
     for (field, role) in [("production", "production"), ("tests", "test")] {
-        let assigned: u64 = data["references"][field]
+        let assigned: u64 = native(&store, pin, "references")[field]
             .as_array()
             .unwrap()
             .iter()
@@ -448,7 +620,7 @@ fn architecture_specificity_assignments_match_evaluated_layer_verdicts() {
     assert_eq!(*assignments["src/entry.rs"], "exact");
     assert_eq!(*assignments["src/lib.rs"], "broad");
     for field in ["instances", "testOnly"] {
-        for row in data["rules"][field].as_array().unwrap() {
+        for row in native(&store, pin, "check")[field].as_array().unwrap() {
             assert_eq!(
                 &row["sourceLayer"],
                 assignments[row["target"]["path"].as_str().unwrap()]

@@ -252,6 +252,8 @@ The [#22 advisory-native-candidates rule](semantic-evidence/contract-v1.md#advis
 
 **Owner amendment (2026-10-23, #194 item 3 option (a); native-v9):** Rust may measure the final segment of a `scoped_identifier` callee as the single verified token, using only the parser's `name` field when it is a lone `identifier`. Unwrap a parser-recognized `generic_function` via its `function` field first. Thus `Self::foo()`, `module::foo()`, `Type::foo()`, `Type::<T>::foo()` and `Type::foo::<T>()` can expose exactly `foo` as `Call.spelling` / `calleeRange`. This eligibility applies to outgoing advisory hints and incoming name matching. It is not path resolution and never suffix-splits source text or a compound expression. A final segment not proved to be an identifier yields no verified token. Keep the fixed limitations tuple and all wire shapes unchanged. Tests cover each form and a parser-proved non-identifier negative. This records the existing [owner ruling](https://github.com/SquashMerge/trellis/issues/194#issuecomment-6375543246), not a new ratification request or the unrelated #194 read/publication optimizations.
 
+**Amendment (#467): published semantic bindings.** Both `trellis_outgoing_calls` and `trellis_incoming_calls` also accept an optional `semanticProducerId:string` of 1–512 UTF-8 bytes. An empty, oversized or non-string value, explicit null, or a NUL fails `invalid_request`. A well-formed ID that the admitted revision does not publish fails `not_found` with `Semantic producer not published for the admitted revision`, as `trellis_call_graph` does. Without the field, the browser's policy (#392/#409) applies at the admitted head: the sole published producer is selected. None or several select nothing, and producers are never merged. When the selected producer covers the language of the returned calls, each emitted call item carries its call's binding. The binding is selected by the reader that the call graph, sequence and line navigation share (#466). `binding` is the published `CallBinding`: resolution, declared target, dispatch, and the whole candidate union for an ambiguous call. `disposition` is its resolution, or `staleTarget` for a stale boundary. `boundaryReason` is the call graph's reason (`none` means the graph would traverse the call; `dispatch` means dispatch is not proven direct). `targetId` is a resolved binding's declared internal target when it is located exactly in the admitted snapshot and is not stale. `evidenceTier` is `semantic`, and `semanticBasis` and `freshness` come from the binding's provenance. A call with no binding keeps the syntax-only values above. The data's `coverage` and `provenance` add the producer's coverage tuple and every proof of each emitted binding. Warnings follow warnings-v1: `coverageIncomplete`, `staleEvidence`, `staleTarget`, `bindingAmbiguous` for an emitted ambiguous binding, and no `syntaxOnly`. When nothing is selected, or the producer does not cover the language, every item keeps the syntax-only values. `syntaxOnly` then carries the reason as its message: `no semantic producer published; showing syntax`, `multiple semantic producers; showing syntax` or `semantic producer does not cover this language; showing syntax`. `partial` counts any emitted call whose `boundaryReason` is not `none` as a boundary. Incoming callers are still found by name (`matchedBy:"name"`); the binding annotates each found call and adds no callers.
+
 ### Incoming calls (syntax tier)
 
 [Decision 0012](semantic-evidence/decisions/0012-incoming-calls-syntax-tier.md) adds the standalone sixth tool `trellis_incoming_calls`, **not** an inspect view or a W6 protocol revision. Input exactly `{schemaVersion:1,workspace?:string,symbolId:SyntaxId,limit?:UInt,expectedBasis?:Basis}`. The limit defaults to 20 and accepts integers 1–50; an out-of-range integer fails `range_too_large`. W3's canonical ID syntax and 8192-byte guard, verified workspace selection and optional complete basis pin apply. Invalid syntax, unknown fields, `view`, semantic producer selectors and explicit null optional fields fail `invalid_request`; a well-formed ID absent at the selected head fails `not_found`. An old complete basis conflicts before ID lookup. No selector or typed semantic binding field is reserved here.
@@ -268,7 +270,7 @@ Include test callers and self-recursion. Sort by `(callerRole production before 
 
 The caller list is **required**, not optional hints. After sorting, consider at most limit plus one eligible item for limit detection; emit the longest prefix that fits the complete 65,536-byte JSON-RPC response line including structured content, summary and LF. Recompute emitted-only document refs and mandatory selected-owner-plus-caller coverage/provenance closure for each prefix; never trim proof or scope coverage to make room. More eligible items than `limit` with every limited item fitting sets `truncated:true,truncationReason:"limit"`; dropping any limited required caller to fit sets `truncated:true,truncationReason:"response_bytes"`, which outranks `limit`. Truncation sets `partial:true`, but adds no warning. If the fixed empty-prefix envelope cannot fit, or the first required item with its complete token and proof closure cannot fit, fail `range_too_large`, not a falsely green empty list. The five-second deadline starts at protocol acceptance and includes validation, read admission/materialization and send decision; existing cancellation and typed-error precedence apply. A success summary uses `trellis_incoming_calls: N calls[, truncated: <reason>]; full result in structuredContent.` with singular `call` for one.
 
-When #59's exact semantic tier is implemented it amends **this same tool's** closed input and output with producer selection, typed binding/target, `matchedBy:"binding"` and semantic match basis. None are accepted or reserved in this syntax-only shape. #59's #40/#41/#58 prerequisites remain required for that later tier.
+When #59's exact semantic tier is implemented it amends **this same tool's** closed input and output with `matchedBy:"binding"` and a semantic match basis. #59's #40/#41/#58 prerequisites remain required for that later tier. The #467 amendment above already accepts `semanticProducerId` and fills each name-matched caller's binding fields; the "semantic producer selectors" rejection and fixed `binding:null` values in this section apply only when no producer is selected.
 
 ### `trellis_call_graph` (#40)
 
@@ -299,9 +301,9 @@ meaning, clipping rules and errors unchanged. The three new flat closed inputs a
 
 | Tool | Exact input |
 | --- | --- |
-| `trellis_references` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[],limit?:UInt}` |
-| `trellis_rules_check` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[]}` |
-| `trellis_rules_explain` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,rule:string,target:Target,destination?:Destination}` |
+| `trellis_references` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[],limit?:UInt,offset?:UInt}` |
+| `trellis_rules_check` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[],limit?:UInt,offset?:UInt}` |
+| `trellis_rules_explain` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,rule:string,target:Target,destination?:Destination,limit?:UInt,offset?:UInt}` |
 
 `Target` is exactly `{sourceSetId,language,path,sid}` with native canonical SID,
 full document identity and indexed checkout-relative path. `rule` is nonempty,
@@ -328,11 +330,31 @@ a preserved unassigned catalog after explain filtering.
 A no-match source scope returns complete empty structural arrays and zero counts,
 while `semanticComplete:false` remains invariant. Module revision/hash/provenance
 links and all selected unresolved sites remain intact. Rules' informational
-`unassigned` catalog still uses the full snapshot map. References `limit` defaults
-to 5 and accepts 1–50 **sample sites per edge**, not a cap on edges/counts;
-out-of-range integer fails `range_too_large`. Unrelated modules cannot force
-reference response overflow; genuinely oversized selected evidence still fails
-atomically with `response_too_large`, without raising the cap or clipping proof.
+`unassigned` catalog still uses the full snapshot map. `limit` defaults to 5 and
+accepts 1–50. For references, it is the number of **sample sites per edge**. For
+check/explain, it is the number of **evidence entries per rule instance**: the
+instance keeps exact `referenceCount`, status and constraints, and adds
+`omittedEvidence` (the number of evidence entries not shown). It is never a cap on
+edges, instances or counts. An out-of-range integer fails `range_too_large`. The
+`trellis rules check` CLI keeps every evidence entry.
+
+**Paging (#448).** `paths` selects sources before anything is measured, so unrelated
+modules never consume response bytes. Each tool's arrays form one ordered sequence:
+
+- references: `modules`, `externalPackages`, `production`, `tests`, `unresolved`;
+- check/explain: `instances`, `testOnly`, `unassigned`, `externalPackages`.
+
+A result holds the whole items of that sequence from `offset` (default 0, any safe
+UInt) that fit in the unchanged 65,536-byte response cap. The required
+`page:{offset,nextOffset,total}` continues it: call again with the same arguments,
+`expectedBasis` and `offset:nextOffset`, until `nextOffset` is null. `total` counts
+every item. Every page carries the whole result's `counts`, `testCounts`,
+`limitations`, `rulesFile` and pin. The pages concatenate, in order, to the complete
+selected result, and closures such as module and external-package descriptors hold
+across the sequence, not within each page. An `offset` past `total` fails
+`range_too_large`. Only an item that cannot fit even alone still fails atomically
+with `response_too_large`. The cap is never raised, and no verdict, count or site is
+clipped.
 
 The exact closed payloads, ordering, module/site identity, counts, supported
 structural mapping, grammar and exception semantics are in
@@ -417,8 +439,9 @@ required `diagnostic:{code,kind,path,range,line,column,attribution,message}` as
 [defined for rules](rules.md#work-bounds-and-located-failures). Other failures do
 not acquire this field. No partial instances accompany malformed configuration,
 source parse/work failure or overflow. The full JSON-RPC line, summary and LF must
-fit 65,536 bytes; new results fail atomically with `response_too_large` rather than
-clip verdicts, unresolved sites, proof or TOML. This does not change the original
+fit 65,536 bytes. Larger results page as described above. An item that cannot fit
+alone fails atomically with `response_too_large` rather than clip verdicts,
+unresolved sites, proof or TOML. This does not change the original
 tools' existing prefix/`range_too_large` behavior. Only static `tools/list` retains
 the 262,144-byte catalog cap/headroom requirement.
 

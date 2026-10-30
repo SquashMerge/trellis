@@ -28,14 +28,14 @@ notify = "8"
 protobuf = "3"
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+rusqlite = { version = "0.41", features = ["bundled", "blob"] }
 scip = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 tempfile = "3"
-tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"
 toml_edit = "0.25"
@@ -59,7 +59,7 @@ required-features = ["test-support"]
 
 [build-dependencies]
 # build.rs hashes the native extraction inputs (build/extractor_inputs.rs).
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

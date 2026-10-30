@@ -411,7 +411,7 @@ fn admitted_case_with_calls(
     }
     index.documents.push(document);
     let bytes = index.write_to_bytes().unwrap();
-    admitted_artifact_case(language, producer_name, path, source, &bytes)
+    admitted_artifact_case(language, producer_name, path, source, &bytes, &[])
 }
 
 fn admitted_artifact_case(
@@ -419,6 +419,23 @@ fn admitted_artifact_case(
     producer_name: &str,
     path: &str,
     source: &str,
+    bytes: &[u8],
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    native::Artifact,
+    BTreeMap<native::DocumentKey, Vec<u8>>,
+    CapturedScipInventory,
+) {
+    let mut all = vec![(path, source)];
+    all.extend_from_slice(files);
+    admitted_files_case(language, producer_name, &all, bytes)
+}
+
+fn admitted_files_case(
+    language: &str,
+    producer_name: &str,
+    files: &[(&str, &str)],
     bytes: &[u8],
 ) -> (
     tempfile::TempDir,
@@ -428,8 +445,10 @@ fn admitted_artifact_case(
 ) {
     let root = tempfile::tempdir().unwrap();
     let physical = fs::canonicalize(root.path()).unwrap();
-    fs::create_dir_all(physical.join(path).parent().unwrap()).unwrap();
-    fs::write(physical.join(path), source).unwrap();
+    for (path, source) in files {
+        fs::create_dir_all(physical.join(path).parent().unwrap()).unwrap();
+        fs::write(physical.join(path), source).unwrap();
+    }
     fs::write(physical.join("artifact.scip"), bytes).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(physical.clone());
@@ -516,8 +535,18 @@ fn assert_real_module_marker_joins_without_invented_anchor(language: &str) {
     let mut index = scip::types::Index::new();
     index.documents.push(document);
     let bytes = index.write_to_bytes().unwrap();
+    // The producer fixture's package root names its module marker (#443).
+    let package = [(
+        "package.json",
+        r#"{"name":"trellis-producer-fixture-js","version":"1.0.0","private":true}"#,
+    )];
+    let files: &[(&str, &str)] = if language == "javascript" {
+        &package
+    } else {
+        &[]
+    };
     let (_root, native, sources, inventory) =
-        admitted_artifact_case(language, producer, &path, source, &bytes);
+        admitted_artifact_case(language, producer, &path, source, &bytes, files);
     let raw_marker = inventory
         .claims
         .iter()
@@ -600,6 +629,310 @@ fn real_python_module_marker_joins_without_invented_anchor() {
     assert_real_module_marker_joins_without_invented_anchor("python");
 }
 
+/// Real `@sourcegraph/scip-typescript@0.4.0 index --infer-tsconfig` output for the fixture
+/// (issue #444), with the producer's metadata (its absolute project root) dropped and every
+/// document kept byte for byte. Like every scip-typescript reference occurrence, the call sites
+/// carry no `enclosing_range`.
+const ISSUE444_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/semantic-import/issue444-javascript-calls"
+);
+
+fn issue444_case() -> (
+    tempfile::TempDir,
+    native::Artifact,
+    BTreeMap<native::DocumentKey, Vec<u8>>,
+    CapturedScipInventory,
+) {
+    let read = |path: &str| fs::read_to_string(format!("{ISSUE444_FIXTURE}/{path}")).unwrap();
+    let (lib, main) = (read("src/lib.js"), read("src/main.js"));
+    let bytes = fs::read(format!("{ISSUE444_FIXTURE}/index.scip")).unwrap();
+    admitted_files_case(
+        "javascript",
+        "scip-typescript",
+        &[
+            ("src/lib.js", &lib),
+            ("src/main.js", &main),
+            // The fixture's package root names its module markers (#443).
+            (
+                "package.json",
+                r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+            ),
+        ],
+        &bytes,
+    )
+}
+
+/// The byte range of the `nth` occurrence of `needle` followed by `after` in `src/main.js`.
+fn issue444_span(needle: &str, after: &str, nth: usize) -> native::Range {
+    let main = fs::read_to_string(format!("{ISSUE444_FIXTURE}/src/main.js")).unwrap();
+    let (start, _) = main
+        .match_indices(&format!("{needle}{after}"))
+        .nth(nth)
+        .unwrap();
+    native::Range {
+        start,
+        end: start + needle.len(),
+    }
+}
+
+fn issue444_call<'a>(native: &'a native::Artifact, callee: &native::Range) -> &'a native::Call {
+    let calls: Vec<_> = native
+        .calls
+        .iter()
+        .filter(|c| c.document.path == "src/main.js" && c.callee_range.as_ref() == Some(callee))
+        .collect();
+    assert_eq!(calls.len(), 1, "one measured call at {callee:?}");
+    calls[0]
+}
+
+#[test]
+fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
+    let (_root, native, sources, inventory) = issue444_case();
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert!(
+        inventory
+            .claims
+            .iter()
+            .filter(|c| c.envelope.record_kind == "occurrence"
+                && c.envelope.raw["symbolRoles"].as_u64() == Some(0))
+            .all(|c| c.envelope.raw["enclosingRange"].is_null()),
+        "scip-typescript emits no reference enclosing range"
+    );
+    let reference_at = |range: &native::Range| {
+        output
+            .references
+            .iter()
+            .find(|r| r.document.path == "src/main.js" && &r.range == range)
+            .unwrap_or_else(|| panic!("reference at {range:?}"))
+    };
+    let lib_declaration = |name: &str| {
+        native
+            .declarations
+            .iter()
+            .find(|d| d.document.path == "src/lib.js" && d.name.as_deref() == Some(name))
+            .unwrap()
+            .syntax_id
+            .clone()
+    };
+    // Plain call, imported call, constructor, method call, a call whose argument is a
+    // callback, and a plain call after a supplementary-plane character (UTF-16 columns).
+    // Owner ruling 2026-10-30 (#470): dispatch follows the measured call shape and the bound
+    // declaration's kind. Plain calls of free functions, the imported one included, are
+    // direct. scip-typescript 0.4.0 gives every symbol information kind 0, so its constructor
+    // (`Widget#<constructor>().`) and method (`Widget#run().`) symbols fail the existing
+    // native method-kind compatibility check and bind no target: unresolved, never classified.
+    // `new` of a resolved class is covered by `constructor_call_to_class_is_constructor_dispatch`.
+    let (resolved, unresolved) = (
+        semantic::Resolution::Resolved,
+        semantic::Resolution::Unresolved,
+    );
+    let bound = [
+        (
+            issue444_span("plain", "();\n  helper", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
+        (
+            issue444_span("helper", "(2)", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
+        (
+            issue444_span("Widget", "(3)", 0),
+            (unresolved, semantic::Dispatch::Unknown),
+        ),
+        (
+            issue444_span("run", "()", 0),
+            (unresolved, semantic::Dispatch::Unknown),
+        ),
+        (
+            issue444_span("register", "(plain)", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
+        (
+            issue444_span("plain", "();\n  return", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
+    ];
+    assert_eq!(output.call_bindings.len(), bound.len());
+    for (callee, expected) in &bound {
+        let call = issue444_call(&native, callee);
+        let bindings: Vec<_> = output
+            .call_bindings
+            .iter()
+            .filter(|b| b.call_id.as_ref() == Some(&call.id))
+            .collect();
+        assert_eq!(bindings.len(), 1, "one binding for {:?}", call.spelling);
+        let binding = bindings[0];
+        assert_eq!(binding.join.anchor.kind, semantic::JoinKind::Callee);
+        assert_eq!(binding.join.status, semantic::JoinStatus::Exact);
+        assert_eq!(&binding.join.anchor.range, callee);
+        assert_eq!(binding.join.candidate_ids, vec![call.id.clone()]);
+        assert_eq!(
+            (binding.resolution, binding.dispatch),
+            *expected,
+            "{:?}",
+            call.spelling
+        );
+        let reference = reference_at(callee);
+        assert!(
+            reference.roles.contains(&semantic::Role::Call),
+            "{callee:?}"
+        );
+        assert_eq!(reference.provenance_id, binding.provenance_id);
+    }
+    let helper = output
+        .call_bindings
+        .iter()
+        .find(|b| b.join.anchor.range == bound[1].0)
+        .unwrap();
+    assert_eq!(helper.resolution, semantic::Resolution::Resolved);
+    assert!(matches!(
+        &helper.declared_target,
+        Some(semantic::Target::Internal { syntax_id, document, .. })
+            if *syntax_id == lib_declaration("helper") && document.path == "src/lib.js"
+    ));
+    assert_eq!(helper.stale_target, Some(false));
+    // A callback argument is a measured reference inside the invocation, not its callee.
+    let callback = issue444_span("plain", ");\n  const", 0);
+    assert_eq!(reference_at(&callback).roles, vec![semantic::Role::Read]);
+    // The receiver of a method call is read, not called.
+    let receiver = issue444_span("w", ".run", 0);
+    assert_eq!(reference_at(&receiver).roles, vec![semantic::Role::Read]);
+    // scip-typescript resolves no symbol for members of an untyped parameter, so these
+    // measured calls keep no semantic reference and no binding.
+    for (needle, after) in [("method", "()"), ("b", "()")] {
+        let call = issue444_call(&native, &issue444_span(needle, after, 0));
+        assert!(
+            output
+                .call_bindings
+                .iter()
+                .all(|b| b.call_id.as_ref() != Some(&call.id))
+        );
+        assert!(
+            output
+                .references
+                .iter()
+                .all(|r| Some(&r.range) != call.callee_range.as_ref())
+        );
+    }
+}
+
+/// Owner ruling 2026-10-30 (#470): dispatch is the measured native call shape plus the exact
+/// bound target's declaration kind. `new` of a class (by identifier or dotted name) is
+/// constructor and a plain call of a free function is direct. A class called without `new`,
+/// `new` of a function, and member calls (`o.f()`, `o?.f()`) of the same resolved free
+/// function stay unknown.
+#[test]
+fn constructor_call_to_class_is_constructor_dispatch() {
+    let source = "class W { constructor() {} }\nfunction f() { return 1; }\n\
+        function m(o) { new W(); W(); f(); o.f(); o?.f(); new f(); new o.W(); }\n";
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let (w, f) = ("pkg W#", "pkg f().");
+    let uses = [
+        (at("new W(", 4), w, semantic::Dispatch::Constructor),
+        (at("; W();", 2), w, semantic::Dispatch::Unknown),
+        (at("; f();", 2), f, semantic::Dispatch::Direct),
+        (at("o.f(", 2), f, semantic::Dispatch::Unknown),
+        (at("o?.f(", 3), f, semantic::Dispatch::Unknown),
+        (at("new f(", 4), f, semantic::Dispatch::Unknown),
+        (at("o.W(", 2), w, semantic::Dispatch::Constructor),
+    ];
+    let mut occurrences = vec![
+        (at("class W", 6), at("class W", 7), w, 1),
+        (at("function f", 9), at("function f", 10), f, 1),
+    ];
+    occurrences.extend(
+        uses.iter()
+            .map(|(start, symbol, _)| (*start, start + 1, *symbol, 0)),
+    );
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        occurrences,
+        vec![(w, 7, vec![]), (f, 17, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), uses.len());
+    for (start, _, dispatch) in uses {
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.join.anchor.range.start == start)
+            .unwrap_or_else(|| panic!("binding at {start}"));
+        assert_eq!(binding.join.anchor.kind, semantic::JoinKind::Callee);
+        assert_eq!(
+            binding.resolution,
+            semantic::Resolution::Resolved,
+            "{start}"
+        );
+        assert_eq!(binding.dispatch, dispatch, "{start}");
+    }
+}
+
+/// Owner ruling 2026-10-30 (#470) for Rust: identifier, generic and path calls of a free
+/// function are direct; method-call syntax, and a path call of an associated function, stay
+/// unknown (trait and inherent dispatch are #14).
+#[test]
+fn rust_path_and_plain_calls_of_free_functions_are_direct() {
+    let source = "mod m { pub fn f() {} }\nstruct S;\nimpl S { fn g(&self) {} fn h() {} }\n\
+        fn f2() {}\nfn f3<T>() {}\n\
+        fn k(s: S) { m::f(); f2(); crate::m::f(); s.g(); S::h(); f3::<u8>(); }\n";
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let (f, f2, f3, g, h) = (
+        "rust-analyzer cargo c 0.1.0 m/f().",
+        "rust-analyzer cargo c 0.1.0 f2().",
+        "rust-analyzer cargo c 0.1.0 f3().",
+        "rust-analyzer cargo c 0.1.0 S#g().",
+        "rust-analyzer cargo c 0.1.0 S#h().",
+    );
+    let uses = [
+        (at("{ m::f(", 5), 1, f, semantic::Dispatch::Direct),
+        (at("; f2(", 2), 2, f2, semantic::Dispatch::Direct),
+        (at("crate::m::f(", 10), 1, f, semantic::Dispatch::Direct),
+        (at("s.g(", 2), 1, g, semantic::Dispatch::Unknown),
+        (at("S::h(", 3), 1, h, semantic::Dispatch::Unknown),
+        (at("f3::<", 0), 2, f3, semantic::Dispatch::Direct),
+    ];
+    let mut occurrences = vec![
+        (at("fn f()", 3), at("fn f()", 4), f, 1),
+        (at("fn f2", 3), at("fn f2", 5), f2, 1),
+        (at("fn f3", 3), at("fn f3", 5), f3, 1),
+        (at("fn g", 3), at("fn g", 4), g, 1),
+        (at("fn h", 3), at("fn h", 4), h, 1),
+    ];
+    occurrences.extend(
+        uses.iter()
+            .map(|(start, width, symbol, _)| (*start, start + width, *symbol, 0)),
+    );
+    let (_root, native, sources, inventory) = admitted_case(
+        "rust",
+        source,
+        occurrences,
+        vec![
+            (f, 17, vec![]),
+            (f2, 17, vec![]),
+            (f3, 17, vec![]),
+            (g, 26, vec![]),
+            (h, 26, vec![]),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    assert_eq!(output.call_bindings.len(), uses.len());
+    for (start, _, _, dispatch) in uses {
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.join.anchor.range.start == start)
+            .unwrap_or_else(|| panic!("binding at {start}"));
+        assert_eq!(
+            binding.resolution,
+            semantic::Resolution::Resolved,
+            "{start}"
+        );
+        assert_eq!(binding.dispatch, dispatch, "{start}");
+    }
+}
+
 #[test]
 fn module_marker_exception_rejects_other_empty_occurrences() {
     for (language, symbol, roles, kind) in [
@@ -616,12 +949,6 @@ fn module_marker_exception_rejects_other_empty_occurrences() {
         (
             "python",
             "scip-python python pkg 0 `other.module`/__init__:",
-            1,
-            0,
-        ),
-        (
-            "javascript",
-            "scip-typescript npm pkg 1.0.0 other/`A.js`/",
             1,
             0,
         ),
@@ -645,6 +972,67 @@ fn module_marker_exception_rejects_other_empty_occurrences() {
                 Some(ScipCaptureError::InvalidArtifact(_))
             ),
             "empty non-module-definition occurrence must fail typed: {language} {symbol} roles={roles}: {error:#}"
+        );
+    }
+}
+
+// Owner ruling 2026-10-29 (#443): admission binds an empty scip-typescript module marker to
+// its document under the authenticated package root, so a mismatch rejects the artifact.
+#[test]
+fn typescript_module_marker_without_its_package_root_rejects_at_admission() {
+    use protobuf::Message;
+    let fixture = r#"{"name":"trellis-producer-fixture-js","version":"1.0.0"}"#;
+    for (case, manifest, symbol) in [
+        ("no package root", None, None),
+        (
+            "other package",
+            Some(r#"{"name":"other","version":"1.0.0"}"#),
+            None,
+        ),
+        (
+            "other document",
+            Some(fixture),
+            Some("scip-typescript npm trellis-producer-fixture-js 1.0.0 other/`a.js`/"),
+        ),
+        (
+            "path suffix",
+            Some(fixture),
+            Some("scip-typescript npm trellis-producer-fixture-js 1.0.0 `a.js`/"),
+        ),
+    ] {
+        let (mut document, _, source) = real_module_document("javascript");
+        if let Some(symbol) = symbol {
+            document.occurrences[0].symbol = symbol.into();
+        }
+        let path = document.relative_path.clone();
+        let mut index = scip::types::Index::new();
+        index.documents.push(document);
+        let bytes = index.write_to_bytes().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir_all(physical.join(&path).parent().unwrap()).unwrap();
+        fs::write(physical.join(&path), source).unwrap();
+        if let Some(text) = manifest {
+            fs::write(physical.join("package.json"), text).unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture =
+            Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
+        let (descriptor, pages) =
+            testing::single_artifact_batch(&capture, "scip-typescript", "javascript", &bytes)
+                .unwrap();
+        let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let error = testing::admit_in_memory_from_capture(
+            &capture,
+            &descriptor,
+            &pages,
+            &[&bytes],
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ScipCaptureError::InvalidArtifact(_)),
+            "{case}: {error:?}"
         );
     }
 }
@@ -819,10 +1207,23 @@ fn four_real_admitted_languages_measure_all_anchor_families() {
             semantic::Resolution::External,
             "{language} explicit global target"
         );
+        // SCIP has no call role: a use occurrence whose exact span is one measured callee
+        // names that call (#444), with no enclosing range required.
         assert!(
-            !reference.roles.contains(&semantic::Role::Call),
-            "{language} no raw call assertion"
+            reference.roles.contains(&semantic::Role::Call),
+            "{language} exact callee use is a call"
         );
+        let call = native
+            .calls
+            .iter()
+            .find(|c| c.callee_range.as_ref() == Some(&reference.range))
+            .unwrap();
+        assert_eq!(output.call_bindings.len(), 1, "{language}");
+        let binding = &output.call_bindings[0];
+        assert_eq!(binding.call_id.as_ref(), Some(&call.id), "{language}");
+        assert_eq!(binding.join.anchor.kind, semantic::JoinKind::Callee);
+        assert_eq!(binding.join.status, semantic::JoinStatus::Exact);
+        assert_eq!(binding.resolution, semantic::Resolution::External);
     }
 }
 
@@ -921,8 +1322,30 @@ fn distinct_admitted_proofs_on_one_anchor_preserve_joins_and_ambiguity() {
 }
 
 #[test]
-fn admitted_semantic_call_witness_controls_binding_and_role() {
+fn exact_callee_use_binds_with_or_without_matching_enclosing_range() {
     let source = "function f(){ f(); }";
+    let offset = source.rfind('f').unwrap();
+    // No enclosing range, as scip-typescript, scip-java and scip-python emit (#444), and a
+    // producer enclosing range that joins exactly to the same measured invocation.
+    for enclosing in [&[][..], &[offset][..]] {
+        let (_root, native, sources, inventory) = admitted_case_with_calls(
+            "javascript",
+            source,
+            vec![(offset, offset + 1, "external pkg f.", 0)],
+            vec![],
+            enclosing,
+        );
+        let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+        assert_eq!(output.call_bindings.len(), 1, "{enclosing:?}");
+        let binding = &output.call_bindings[0];
+        assert_eq!(binding.join.anchor.kind, semantic::JoinKind::Callee);
+        assert_eq!(binding.join.status, semantic::JoinStatus::Exact);
+        assert_eq!(binding.call_id, Some(native.calls[0].id.clone()));
+        assert_eq!(binding.resolution, semantic::Resolution::External);
+        assert!(output.references[0].roles.contains(&semantic::Role::Call));
+    }
+    // A use inside the invocation that is not its measured callee is never a call.
+    let source = "function f(){ g(f); }";
     let offset = source.rfind('f').unwrap();
     let (_root, native, sources, inventory) = admitted_case(
         "javascript",
@@ -931,30 +1354,16 @@ fn admitted_semantic_call_witness_controls_binding_and_role() {
         vec![],
     );
     let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
-    assert!(
-        output.call_bindings.is_empty(),
-        "plain reference is not semantic call"
-    );
+    assert!(output.call_bindings.is_empty());
+    assert_eq!(output.references[0].roles, vec![semantic::Role::Read]);
     assert!(
         output
-            .references
+            .joins
             .iter()
-            .all(|r| !r.roles.contains(&semantic::Role::Call))
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Callee
+                && j.status == semantic::JoinStatus::Unmatched)
     );
-    let (_root, native, sources, inventory) = admitted_case_with_calls(
-        "javascript",
-        source,
-        vec![(offset, offset + 1, "external pkg f.", 8)],
-        vec![],
-        &[offset],
-    );
-    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
-    assert_eq!(
-        output.call_bindings.len(),
-        1,
-        "authenticated semantic call should bind exact native callee"
-    );
-    assert!(output.references[0].roles.contains(&semantic::Role::Call));
+    assert!(!native.calls.is_empty());
 }
 
 #[test]
@@ -1642,6 +2051,36 @@ fn admitted_distinct_call_claims_reconcile_ambiguous_targets() {
     );
 }
 
+/// Each claim alone is a plain call of a resolved free function, classified direct at join
+/// time; settlement makes the call ambiguous over both, so neither row stays direct (#470).
+#[test]
+fn settlement_ambiguity_clears_join_time_direct_dispatch() {
+    let source = "function f(){ g(); }\nfunction g(){}\nfunction h(){}\n";
+    let at = source.find("g(); ").unwrap();
+    let (g, h) = (source.find("g(){}").unwrap(), source.find("h(){}").unwrap());
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![
+            (g, g + 1, "pkg g().", 1),
+            (h, h + 1, "pkg h().", 1),
+            (at, at + 1, "pkg g().", 0),
+            (at, at + 1, "pkg h().", 0),
+        ],
+        vec![("pkg g().", 17, vec![]), ("pkg h().", 17, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), 2);
+    assert!(output.call_bindings.iter().all(|b| {
+        b.resolution == semantic::Resolution::Ambiguous
+            && b.candidates.len() == 2
+            && b.dispatch == semantic::Dispatch::Unknown
+    }));
+}
+
+/// Owner ruling 4 (2026-10-30, #394): a producer enclosing range that encloses the use but
+/// joins no invocation exactly is treated as absent, and the exact callee span decides. One
+/// that exactly joins a different invocation than the callee's still binds no call (#453).
 #[test]
 fn call_role_requires_the_same_exact_raw_invocation_as_binding() {
     let source = "function f(){ f(); }";
@@ -1658,7 +2097,39 @@ fn call_role_requires_the_same_exact_raw_invocation_as_binding() {
         .iter_mut()
         .find(|c| c.envelope.record_kind == "occurrence")
         .unwrap();
+    // The callee token alone: it encloses the use and matches no measured invocation.
     raw.envelope.raw["enclosingRange"] = json!({"encoding":"legacy","values":[0,at,at+1]});
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), 1);
+    let binding = &output.call_bindings[0];
+    assert_eq!(binding.join.anchor.kind, semantic::JoinKind::Callee);
+    assert_eq!(binding.call_id, Some(native.calls[0].id.clone()));
+    assert!(output.references[0].roles.contains(&semantic::Role::Call));
+    assert!(
+        output
+            .joins
+            .iter()
+            .all(|(_, j)| j.anchor.kind != semantic::JoinKind::Invocation),
+        "an absent enclosing range authors no invocation join"
+    );
+
+    // `f` is the callee of the inner call; its range names the outer invocation exactly.
+    let source = "function f(){ g(f()); }";
+    let at = source.rfind("f(").unwrap();
+    let outer = source.find("g(").unwrap();
+    let close = source.rfind(')').unwrap() + 1;
+    let (_root, native, sources, mut inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![(at, at + 1, "external pkg f.", 8)],
+        vec![],
+    );
+    let raw = inventory
+        .claims
+        .iter_mut()
+        .find(|c| c.envelope.record_kind == "occurrence")
+        .unwrap();
+    raw.envelope.raw["enclosingRange"] = json!({"encoding":"legacy","values":[0,outer,close]});
     let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
     assert!(output.call_bindings.is_empty());
     assert!(
@@ -1672,7 +2143,7 @@ fn call_role_requires_the_same_exact_raw_invocation_as_binding() {
             .joins
             .iter()
             .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
-                && j.status == semantic::JoinStatus::Unmatched)
+                && j.status == semantic::JoinStatus::Exact)
     );
 }
 
@@ -2039,6 +2510,8 @@ fn type_role_marks_field_type_not_value_with_same_symbol() {
     );
 }
 
+/// Two measured calls share the span: the invocation join is ambiguous, so the enclosing range
+/// is absent (owner ruling 4, 2026-10-30, #394), and the ambiguous callee join binds nothing.
 #[test]
 fn nonexact_invocation_does_not_grant_role_or_binding_even_with_exact_callee() {
     let source = "function f(){ f(); }";
@@ -2064,7 +2537,13 @@ fn nonexact_invocation_does_not_grant_role_or_binding_even_with_exact_callee() {
         output
             .joins
             .iter()
-            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
+            .all(|(_, j)| j.anchor.kind != semantic::JoinKind::Invocation)
+    );
+    assert!(
+        output
+            .joins
+            .iter()
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Callee
                 && j.status == semantic::JoinStatus::Ambiguous)
     );
     assert!(
@@ -2440,6 +2919,8 @@ mod batch_admission {
                     protocol_version: 0,
                     text_document_encoding: 1,
                     project_root_uri: &uri,
+                    module_roots: &trellis::scip_raw::ModuleRoots::default(),
+                    cargo_targets: &trellis::scip_raw::CargoTargets::default(),
                     assigned_documents: 3,
                 },
                 &mut resolve,
@@ -2604,6 +3085,7 @@ mod batch_admission {
                 &world.physical,
                 native,
                 &sources,
+                &testing::captured_native_config(&world.capture).unwrap(),
                 &descriptor,
                 &page_refs,
                 &[&world.artifact],

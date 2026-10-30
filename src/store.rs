@@ -3,16 +3,22 @@ pub mod anchors;
 mod graph_read;
 pub(crate) mod id_codec;
 pub(crate) mod mcp_read;
+mod native_join_budget;
 mod published_admission;
 pub mod requests;
 mod search;
 mod search_startup;
+mod semantic_display;
 pub(crate) use search::SEARCH_CARD_BATCH_SIZE;
 pub use search::{
     HeadSearchCard, HeadSearchCards, McpSearchCandidates, SearchDeltaColdRebuild,
     SearchHeadChanged, SearchHeadDelta,
 };
 pub use search_startup::RecentSearchCheckout;
+pub use semantic_display::{
+    CallSemantic, LANGUAGE_NOTE, MULTIPLE_PRODUCERS_NOTE, McpSemantic, NO_PRODUCER_NOTE,
+    ProducerChoice, ProducerNotPublished,
+};
 pub(crate) mod symbol_trigrams;
 pub mod topology;
 use crate::model::*;
@@ -668,11 +674,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 27;
+const DATABASE_SCHEMA_VERSION: u32 = 29;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V27: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=27), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V29: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=29), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -757,10 +763,10 @@ CREATE TABLE semantic_revision_raw_selections(revision_id TEXT NOT NULL REFERENC
 CREATE INDEX semantic_raw_selections_batch ON semantic_revision_raw_selections(batch_id);
 CREATE INDEX semantic_raw_selections_captured_pin ON semantic_revision_raw_selections(captured_pin);
 CREATE TABLE semantic_raw_proofs(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id),proof_id TEXT NOT NULL,record_kind TEXT NOT NULL CHECK(record_kind IN ('occurrence','symbolInformation','relationship')),fact_digest TEXT NOT NULL CHECK(length(fact_digest)=64),language TEXT NOT NULL,path TEXT NOT NULL,canonical_bytes BLOB NOT NULL,UNIQUE(capture_id,proof_id),UNIQUE(capture_id,language,path,record_kind,fact_digest));
-CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),PRIMARY KEY(capture_id,language,path));
+CREATE TABLE semantic_raw_documents(capture_id INTEGER NOT NULL REFERENCES semantic_raw_captures(capture_id) ON DELETE CASCADE,language TEXT NOT NULL,path TEXT NOT NULL,source_hash TEXT NOT NULL CHECK(length(source_hash)=64),wire_digest TEXT NOT NULL CHECK(length(wire_digest)=64),capped INTEGER NOT NULL CHECK(capped IN (0,1)),PRIMARY KEY(capture_id,language,path));
 CREATE TABLE semantic_import_reports(revision_id TEXT NOT NULL REFERENCES native_revisions(id),producer_id TEXT NOT NULL,report_json TEXT NOT NULL CHECK(json_valid(report_json)),PRIMARY KEY(revision_id,producer_id));
 CREATE TABLE semantic_provenance(tuple_id INTEGER NOT NULL,provenance_id TEXT NOT NULL,content_hash TEXT NOT NULL,evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('measuredSyntax','declarationBinding','semanticReference','typeRelationship')),freshness TEXT NOT NULL CHECK(freshness IN ('fresh','possiblyStale','stale')),basis_id INTEGER NOT NULL,capture_id INTEGER,derived_from_provenance_id TEXT,derived_from_record_kind TEXT CHECK(derived_from_record_kind IN ('occurrence','symbolInformation','relationship')),derived_from_fact_digest TEXT CHECK(length(derived_from_fact_digest)=64),CHECK((capture_id IS NULL AND derived_from_provenance_id IS NULL AND derived_from_record_kind IS NULL AND derived_from_fact_digest IS NULL) OR (capture_id IS NOT NULL AND derived_from_provenance_id IS NOT NULL AND derived_from_record_kind IS NOT NULL AND derived_from_fact_digest IS NOT NULL)),PRIMARY KEY(tuple_id,provenance_id),FOREIGN KEY(tuple_id) REFERENCES semantic_coverage(tuple_id),FOREIGN KEY(tuple_id,basis_id) REFERENCES semantic_basis(tuple_id,basis_id),FOREIGN KEY(capture_id,derived_from_provenance_id) REFERENCES semantic_raw_proofs(capture_id,proof_id));
-CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_id TEXT NOT NULL,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
+CREATE TABLE semantic_symbols(symbol_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL,ordinal INTEGER NOT NULL,key_scheme TEXT NOT NULL,key_symbol TEXT NOT NULL,key_scope TEXT NOT NULL CHECK(key_scope IN ('global','document','target')),key_document_language TEXT,key_document_path TEXT,display_name TEXT,provenance_id TEXT NOT NULL,UNIQUE(tuple_id,ordinal),FOREIGN KEY(tuple_id,provenance_id) REFERENCES semantic_provenance(tuple_id,provenance_id));
 CREATE UNIQUE INDEX semantic_symbols_key ON semantic_symbols(tuple_id,key_scheme,key_symbol,key_scope,COALESCE(key_document_language,''),COALESCE(key_document_path,''));
 CREATE TABLE semantic_symbol_targets(symbol_id INTEGER NOT NULL REFERENCES semantic_symbols(symbol_id),ordinal INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('internal','external')),internal_syntax_id BLOB,internal_language TEXT,internal_path TEXT,internal_native_revision_id TEXT,external_scheme TEXT,external_symbol TEXT,external_scope TEXT,external_language TEXT,external_path TEXT,CHECK((kind='internal' AND length(internal_syntax_id)=16 AND internal_language IS NOT NULL AND internal_path IS NOT NULL AND internal_native_revision_id IS NOT NULL AND external_scheme IS NULL AND external_symbol IS NULL AND external_scope IS NULL AND external_language IS NULL AND external_path IS NULL) OR (kind='external' AND internal_syntax_id IS NULL AND internal_language IS NULL AND internal_path IS NULL AND internal_native_revision_id IS NULL AND external_scheme IS NOT NULL AND external_symbol IS NOT NULL AND external_scope IN ('global','document') AND ((external_scope='global' AND external_language IS NULL AND external_path IS NULL) OR (external_scope='document' AND external_language IS NOT NULL AND external_path IS NOT NULL)))),PRIMARY KEY(symbol_id,ordinal));
 CREATE INDEX semantic_symbol_targets_internal_syntax ON semantic_symbol_targets(internal_syntax_id,internal_language,internal_path,symbol_id) WHERE kind='internal';
@@ -983,6 +989,24 @@ impl NativeReader<'_> {
     ) -> Result<NativeDocumentRows> {
         self.store
             .read_native_document(self.db, self.selected, document)
+    }
+
+    /// Native rows for staged joins, retaining the general reader's integrity checks. A join
+    /// never reads control regions or search cards, so they are not loaded (left empty).
+    pub(crate) fn join_document(
+        &self,
+        document: &crate::native_evidence::Document,
+    ) -> Result<NativeDocumentRows> {
+        self.store
+            .read_native_document_rows(self.db, self.selected, document, false)
+    }
+
+    /// Logical peak estimate for native document loading, before owning its row bodies.
+    pub(crate) fn document_reservation_bytes(
+        &self,
+        document: &crate::native_evidence::Document,
+    ) -> Result<u64> {
+        native_join_budget::document_bytes(self.db, self.selected, document)
     }
 
     /// Streams the stored source inventory through SQLite incremental blob I/O and a 1 MiB
@@ -1635,10 +1659,10 @@ impl EvidenceResponse {
         let snapshot = self
             .architecture_snapshot(Some(selected.pin), check)
             .map_err(|error| self.store.report_index_failure(error))?;
-        let mut references = crate::references::project(&snapshot, &[], 5, check)?;
+        let references = crate::references::project(&snapshot, &[], 5, check)?;
         let evaluated =
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
-        let mut rules = evaluated.data;
+        let rules = evaluated.data;
         let assignments = evaluated.layers;
         let metrics = self.metrics_at_with_config(
             &MetricsOptions {
@@ -1719,7 +1743,6 @@ impl EvidenceResponse {
             }
             modules.push(row);
         }
-        drop(assignments);
         // Keep policy and exception contributions separate even on the same pair.
         type SummaryKey = (String, String, String, String, bool, Option<String>);
         let mut summaries: BTreeMap<SummaryKey, serde_json::Value> = BTreeMap::new();
@@ -1791,16 +1814,55 @@ impl EvidenceResponse {
                     .push(pair.clone());
             }
         }
-        for value in [&mut references.data, &mut rules] {
+        // Undrawn detail (sites, pairs, instances) is served by paged detail reads (#448).
+        let (mut references, mut rules) = crate::architecture_details::summary(
+            &references.data,
+            &rules,
+            &crate::architecture_details::Layers::new(&assignments, &rules),
+        )?;
+        drop(assignments);
+        for value in [&mut references, &mut rules] {
             value["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
             value["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
         }
         payload["modules"] = serde_json::json!(modules);
         payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
-        payload["references"] = references.data;
+        payload["references"] = references;
         payload["rules"] = rules;
         check()?;
         Ok(payload)
+    }
+
+    /// One bounded page of Architecture detail at the summary's pin and rules hash.
+    /// A different rules file fails `rules_conflict`; a stale pin fails like the summary.
+    pub fn architecture_details(
+        &self,
+        query: &crate::architecture_details::Query,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        check()?;
+        let config = crate::rules::load(Path::new(self.store.workspace_root()))?
+            .context("rules_conflict: rules file missing")?;
+        ensure!(
+            config.content_hash == query.rules_hash,
+            "rules_conflict: rules changed since the summary"
+        );
+        let snapshot = self
+            .architecture_snapshot(Some(query.pin), check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let references = crate::references::project(&snapshot, &[], 5, check)?;
+        let evaluated =
+            crate::rules::evaluate_with_layers(&config, &snapshot, &references, &[], check)?;
+        let layers = crate::architecture_details::Layers::new(&evaluated.layers, &evaluated.data);
+        let page = crate::architecture_details::page(
+            query,
+            &references.data,
+            &evaluated.data,
+            &layers,
+            check,
+        )?;
+        check()?;
+        Ok(page)
     }
 
     /// Browser rule authoring validates the entire proposal against one admitted
@@ -2689,7 +2751,9 @@ impl EvidenceResponse {
         Ok(value)
     }
     pub fn status(&self) -> Result<IndexStatus> {
-        self.store.read_status_for(&self.db, true)
+        let mut status = self.store.read_status_for(&self.db, true)?;
+        semantic_display::status_semantics(&self.db, &mut status)?;
+        Ok(status)
     }
     pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
         self.selected(Some(pin))?;
@@ -3593,7 +3657,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V27)?;
+    expected.execute_batch(CACHE_SCHEMA_V29)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -3617,7 +3681,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V27).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V29).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -3997,7 +4061,7 @@ fn open_index_marker_probe(
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let db = protected_sqlite_open(path, flags)?;
+    let mut db = protected_sqlite_open(path, flags)?;
     // Inside a read scope a read-only connection's waits share the scope's one
     // deadline (#142); otherwise each SQLite call waits up to `busy_wait`.
     // A standard read outside a scope uses the same handler with its own 5 s
@@ -4235,9 +4299,8 @@ fn storage_fault(error: &anyhow::Error) -> bool {
     })
 }
 
-/// SQLite reported a full disk (SQLITE_FULL) while writing staged or published rows. Its
-/// message is outside the closed import classes, so an index or semantic import request settles
-/// `index_failed`; the cause stays in the error chain for diagnostics.
+/// SQLite reported a full disk (SQLITE_FULL) while writing staged or published rows. The
+/// request settles `storage_full`; the full cause stays in the error chain for diagnostics.
 #[derive(Debug)]
 pub struct StorageFull(());
 
@@ -5678,6 +5741,26 @@ fn semantic_target_values(
     })
 }
 
+/// `Connection::execute` through the statement cache: the semantic writers run the same few
+/// statements once per row of every publication.
+fn execute_cached(
+    db: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<usize> {
+    db.prepare_cached(sql)?.execute(params)
+}
+
+/// `Connection::query_row` through the statement cache.
+fn query_row_cached<T>(
+    db: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    map: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    db.prepare_cached(sql)?.query_row(params, map)
+}
+
 fn insert_semantic_target(
     db: &Connection,
     table: &str,
@@ -5690,7 +5773,8 @@ fn insert_semantic_target(
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(",");
-    db.execute(
+    execute_cached(
+        db,
         &format!("INSERT INTO {table} VALUES({placeholders})"),
         rusqlite::params_from_iter(values),
     )?;
@@ -5812,7 +5896,28 @@ fn authenticate_stored_batch(
         "raw captured native/source identity differs"
     );
     let uri = descriptor.metadata.project_root.clone();
+    let module_roots = scip_raw::ModuleRoots::from_native_config(&captured.native_config);
+    // Cargo targets read from every captured Rust document, as admission read them (#394).
+    let mut cargo_targets =
+        scip_raw::CargoTargetsBuilder::from_native_config(&captured.native_config);
+    if !cargo_targets.is_empty() && pinned.languages.iter().any(|l| l == "rust") {
+        for doc in r1
+            .revision
+            .documents
+            .iter()
+            .filter(|d| d.key.language == "rust")
+        {
+            let bytes = sources
+                .get(&doc.key)
+                .context("raw retained document missing")?;
+            cargo_targets.add_document(&doc.key.path, bytes);
+        }
+    }
+    let cargo_targets = cargo_targets.finish();
+    // The limits admission ran under, so a document capped there is capped here.
+    let limits = BatchLimits::effective().map_err(anyhow::Error::msg)?;
     let mut claims = Vec::new();
+    let mut capped = scip_raw::CappedDocuments::new();
     for capture in &raw.captures {
         // The artifact covers every retained document of its language that the batch did not
         // exclude, unless a stored document row assigns it to another artifact.
@@ -5874,6 +5979,8 @@ fn authenticate_stored_batch(
             protocol_version: 0,
             text_document_encoding: 1,
             project_root_uri: &uri,
+            module_roots: &module_roots,
+            cargo_targets: &cargo_targets,
             assigned_documents: docs.len() as u64,
         };
         let by_path: BTreeMap<&str, &AuthenticatedScipDocument<'_>> = docs
@@ -5903,12 +6010,13 @@ fn authenticate_stored_batch(
             &artifact,
             &mut resolve,
             &mut BatchCounters::default(),
-            &BatchLimits::PRODUCTION,
+            &limits,
             &mut sink,
             cancel,
         )
         .map_err(anyhow::Error::from)
         .context("raw original binary admission")?;
+        capped.extend(sink.capped_documents().iter().cloned());
         claims.extend(sink.finish().context("raw original binary admission")?);
     }
     claims.sort_by(|a, b| a.captured_proof_id.cmp(&b.captured_proof_id));
@@ -5925,6 +6033,7 @@ fn authenticate_stored_batch(
             && inventory.source_manifest_hash == raw.source_manifest_hash
             && inventory.completion == descriptor.completion
             && inventory.exclusions == raw.exclusions
+            && inventory.capped_documents == capped
             && claims == retained,
         "raw inventory differs from authenticated binary"
     );
@@ -5977,6 +6086,8 @@ pub struct SelectedRawBatch {
     /// In ordinal order.
     pub captures: Vec<SelectedRawCapture>,
     pub exclusions: Vec<crate::scip_raw::Exclusion>,
+    /// Documents admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
+    pub capped_documents: crate::scip_raw::CappedDocuments,
     pub proofs: Vec<(String, StoredRawProof)>,
     /// `(language, path)` to `(source_hash, wire_digest, capture_id)`.
     pub documents: BTreeMap<(String, String), (String, String, i64)>,
@@ -6484,7 +6595,7 @@ fn semantic_symbol_key_read(
     let scope = semantic_enum(scope)?;
     let document = match (scope, language, path) {
         (sem::SymbolScope::Global, None, None) => None,
-        (sem::SymbolScope::Document, Some(language), Some(path)) => {
+        (sem::SymbolScope::Document | sem::SymbolScope::Target, Some(language), Some(path)) => {
             Some(crate::native_evidence::DocumentKey {
                 source_set_id: source_set.into(),
                 language,
@@ -7385,14 +7496,29 @@ fn write_import_coverage(
             .iter()
             .find(|p| p.id == coverage.producer_id)
             .context("missing semantic producer")?;
-        db.execute("INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![key,coverage.producer_id,producer.version,semantic_variant(&coverage.language)?,coverage.document_path,coverage.requested,coverage.selected,semantic_variant(&coverage.state)?,coverage.diagnostic])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                key,
+                coverage.producer_id,
+                producer.version,
+                semantic_variant(&coverage.language)?,
+                coverage.document_path,
+                coverage.requested,
+                coverage.selected,
+                semantic_variant(&coverage.state)?,
+                coverage.diagnostic
+            ],
+        )?;
         let tuple = db.last_insert_rowid();
         for (kind, roles) in [
             ("supported", &coverage.supported_roles),
             ("observed", &coverage.observed_roles),
         ] {
             for (ordinal, role) in roles.iter().enumerate() {
-                db.execute(
+                execute_cached(
+                    db,
                     "INSERT INTO semantic_coverage_roles VALUES(?1,?2,?3,?4)",
                     params![tuple, kind, ordinal as i64, semantic_variant(role)?],
                 )?;
@@ -7514,11 +7640,9 @@ fn fill_capture_blob(
 /// Raw rows of a batch. The document and proof statements join the ordinal-to-capture pairs of
 /// `with_capture_ids`; `CROSS JOIN` keeps the staged table as the driver, so every select reads in
 /// the order that table is stored and needs no sorter.
-const RAW_DOCUMENTS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_documents SELECT m.capture_id,s.language,s.path,s.content_hash,d.wire_digest FROM stage.documents d CROSS JOIN stage.sources s ON s.ord=d.source_ord CROSS JOIN capture_ids m ON m.ordinal=d.artifact ORDER BY d.source_ord";
+const RAW_DOCUMENTS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_documents SELECT m.capture_id,s.language,s.path,s.content_hash,d.wire_digest,d.capped FROM stage.documents d CROSS JOIN stage.sources s ON s.ord=d.source_ord CROSS JOIN capture_ids m ON m.ordinal=d.artifact ORDER BY d.source_ord";
 const RAW_EXCLUSIONS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_exclusions SELECT ?1,s.language,s.path,c.exclusion FROM stage.coverage c JOIN stage.sources s ON s.ord=c.source_ord WHERE c.exclusion IS NOT NULL ORDER BY c.source_ord";
 const RAW_PROOFS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_proofs SELECT m.capture_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact ORDER BY c.claim_id";
-const STAGED_DOCUMENT: &str =
-    "json_extract(body,'$.document.language')=?1 AND json_extract(body,'$.document.path')=?2";
 
 fn with_capture_ids(values: &str, statement: &str) -> String {
     format!("WITH capture_ids(ordinal,capture_id) AS (VALUES {values}) {statement}")
@@ -7532,25 +7656,11 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
         with_capture_ids("(0,1)", RAW_DOCUMENTS_SQL),
         RAW_EXCLUSIONS_SQL.to_owned(),
         with_capture_ids("(0,1)", RAW_PROOFS_SQL),
-        format!("SELECT body FROM stage.out_provenance WHERE {STAGED_DOCUMENT} ORDER BY ord"),
     ];
-    statements.extend(
-        [
-            "out_symbols",
-            "out_declaration_bindings",
-            "out_references",
-            "out_call_bindings",
-            "out_type_relationships",
-        ]
-        .map(staged_owned_rows_sql),
-    );
+    statements.extend(crate::semantic_import::staged_publication_statements(
+        "stage.",
+    ));
     statements
-}
-
-fn staged_owned_rows_sql(table: &str) -> String {
-    format!(
-        "SELECT body FROM stage.{table} WHERE provenance_id IN (SELECT provenance_id FROM stage.out_provenance WHERE {STAGED_DOCUMENT}) ORDER BY ord"
-    )
 }
 
 /// Writes the batch row, one capture per staged artifact, and the document, exclusion and proof
@@ -7625,61 +7735,26 @@ fn write_staged_raw_rows(
     Ok(batch_id)
 }
 
-/// Streams the staged `out_*` rows into the semantic tables one coverage tuple at a time: each
-/// tuple's rows are read through the document and provenance indexes, so memory is bounded by
-/// one document and the rows match what the in-memory writer produces.
+/// Streams the staged `out_*` rows into the semantic tables one coverage tuple at a time:
+/// each family is read by one cursor in emission order, so memory is bounded by one document
+/// and the rows match what the in-memory writer produces.
 fn write_staged_semantic(
     db: &Connection,
     key: &str,
     producer: &crate::semantic_evidence::Producer,
     gate: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
-    fn rows<T: serde::de::DeserializeOwned>(
-        statement: &mut rusqlite::Statement<'_>,
-        params: impl rusqlite::Params,
-    ) -> Result<Vec<T>> {
-        let bodies = statement
-            .query_map(params, |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        bodies
-            .iter()
-            .map(|body| serde_json::from_str(body).context("staged output row"))
-            .collect()
-    }
-    let mut coverage_cursor = db.prepare("SELECT body FROM stage.out_coverage ORDER BY ord")?;
-    let mut provenance_query = db.prepare(&format!(
-        "SELECT body FROM stage.out_provenance WHERE {STAGED_DOCUMENT} ORDER BY ord"
-    ))?;
-    let owned = |table: &str| db.prepare(&staged_owned_rows_sql(table));
-    let mut symbols_query = owned("out_symbols")?;
-    let mut bindings_query = owned("out_declaration_bindings")?;
-    let mut references_query = owned("out_references")?;
-    let mut calls_query = owned("out_call_bindings")?;
-    let mut relationships_query = owned("out_type_relationships")?;
-    let coverage_bodies = coverage_cursor.query_map([], |row| row.get::<_, String>(0))?;
-    for (index, body) in coverage_bodies.enumerate() {
-        let coverage: sem::Coverage = serde_json::from_str(&body?).context("staged output row")?;
-        let key_params = params![
-            semantic_variant(&coverage.language)?,
-            coverage.document_path
-        ];
-        let publication = sem::SemanticPublication {
-            producers: vec![producer.clone()],
-            provenance: rows(&mut provenance_query, key_params)?,
-            symbols: rows(&mut symbols_query, key_params)?,
-            declaration_bindings: rows(&mut bindings_query, key_params)?,
-            references: rows(&mut references_query, key_params)?,
-            call_bindings: rows(&mut calls_query, key_params)?,
-            type_relationships: rows(&mut relationships_query, key_params)?,
-            coverage: vec![coverage],
-        };
+    // The tuple writers' statements, each target table's included, stay prepared.
+    db.set_prepared_statement_cache_capacity(64);
+    let mut index = 0u64;
+    crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {
         write_import_coverage(db, key, &publication)?;
         if index % 1000 == 999 {
             gate()?;
         }
-    }
-    Ok(())
+        index += 1;
+        Ok(())
+    })
 }
 
 /// Witness fast path over a stored batch (R18). `Ok(None)` sends the rejoin to the FULL path.
@@ -8605,6 +8680,7 @@ fn decoded_selected_inventory(
         source_manifest_hash: raw.source_manifest_hash.clone(),
         completion: raw.descriptor.completion,
         exclusions: raw.exclusions.clone(),
+        capped_documents: raw.capped_documents.clone(),
         claims: raw
             .proofs
             .iter()
@@ -8635,6 +8711,9 @@ fn decoded_selected_inventory(
                                     .context("raw position encoding")?,
                             )?,
                             raw: envelope["raw"].clone(),
+                            cargo_target: crate::scip_raw::CapturedScipFactV1::cargo_target_from(
+                                &envelope,
+                            )?,
                         }
                     },
                     canonical_bytes: proof.canonical_bytes.clone(),
@@ -8879,6 +8958,7 @@ fn selected_native_rejoin_once(
                     .collect(),
                 source_manifest_hash: raw.source_manifest_hash.clone(),
                 exclusions: raw.exclusions.clone(),
+                capped_documents: raw.capped_documents.clone(),
                 claims: input.proof_identities.clone(),
             };
             if input.lightweight {
@@ -9464,14 +9544,28 @@ fn write_semantic_tuple(
         let basis_id = if let Some(&id) = basis_ids.get(&encoded) {
             id
         } else {
-            db.execute("INSERT INTO semantic_basis(tuple_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![
-                tuple,basis.producer_id,basis.producer_version,basis.producer_hash,basis.artifact_hash,
-                semantic_variant(&basis.language)?,basis.source_set_id,basis.revision_id,basis.source_manifest_hash,
-                basis.toolchain_hash,basis.config_hash,basis.dependency_hash,
-            ])?;
+            execute_cached(
+                db,
+                "INSERT INTO semantic_basis(tuple_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    tuple,
+                    basis.producer_id,
+                    basis.producer_version,
+                    basis.producer_hash,
+                    basis.artifact_hash,
+                    semantic_variant(&basis.language)?,
+                    basis.source_set_id,
+                    basis.revision_id,
+                    basis.source_manifest_hash,
+                    basis.toolchain_hash,
+                    basis.config_hash,
+                    basis.dependency_hash,
+                ],
+            )?;
             let id = db.last_insert_rowid();
             for (ordinal, lookup) in basis.lookup_dependencies.iter().enumerate() {
-                db.execute(
+                execute_cached(
+                    db,
                     "INSERT INTO semantic_basis_lookup_dependencies VALUES(?1,?2,?3)",
                     params![id, ordinal as i64, lookup],
                 )?;
@@ -9481,14 +9575,38 @@ fn write_semantic_tuple(
         };
         let derived = proof.derived_from.as_ref();
         let capture_id: Option<i64> = if derived.is_some() {
-            Some(db.query_row("SELECT capture_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![proof.producer_id,basis.artifact_hash,basis.source_set_id,basis.revision_id], |row| row.get(0))?)
+            Some(query_row_cached(
+                db,
+                "SELECT capture_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4",
+                params![
+                    proof.producer_id,
+                    basis.artifact_hash,
+                    basis.source_set_id,
+                    basis.revision_id
+                ],
+                |row| row.get(0),
+            )?)
         } else {
             None
         };
-        db.execute("INSERT INTO semantic_provenance(tuple_id,provenance_id,content_hash,evidence_kind,freshness,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![
-            tuple,proof.id,proof.content_hash,semantic_variant(&proof.evidence_kind)?,semantic_variant(&proof.freshness)?,basis_id,
-            capture_id,derived.map(|d| &d.provenance_id),derived.map(|d| semantic_variant(&d.record_kind)).transpose()?,derived.map(|d| &d.fact_digest),
-        ])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_provenance(tuple_id,provenance_id,content_hash,evidence_kind,freshness,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                tuple,
+                proof.id,
+                proof.content_hash,
+                semantic_variant(&proof.evidence_kind)?,
+                semantic_variant(&proof.freshness)?,
+                basis_id,
+                capture_id,
+                derived.map(|d| &d.provenance_id),
+                derived
+                    .map(|d| semantic_variant(&d.record_kind))
+                    .transpose()?,
+                derived.map(|d| &d.fact_digest),
+            ],
+        )?;
         provenance.insert(proof.id.as_str());
     }
     let owns = |proof: &str| provenance.contains(proof);
@@ -9498,11 +9616,21 @@ fn write_semantic_tuple(
         .filter(|s| owns(&s.provenance_id))
         .enumerate()
     {
-        db.execute("INSERT INTO semantic_symbols(tuple_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![
-            tuple,ordinal as i64,semantic_variant(&symbol.key.scheme)?,symbol.key.symbol,semantic_variant(&symbol.key.scope)?,
-            symbol.key.document.as_ref().map(|d| d.language.as_str()),symbol.key.document.as_ref().map(|d| d.path.as_str()),
-            symbol.display_name,symbol.provenance_id,
-        ])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_symbols(tuple_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                tuple,
+                ordinal as i64,
+                semantic_variant(&symbol.key.scheme)?,
+                symbol.key.symbol,
+                semantic_variant(&symbol.key.scope)?,
+                symbol.key.document.as_ref().map(|d| d.language.as_str()),
+                symbol.key.document.as_ref().map(|d| d.path.as_str()),
+                symbol.display_name,
+                symbol.provenance_id,
+            ],
+        )?;
         let id = db.last_insert_rowid();
         for (ordinal, target) in symbol.declarations.iter().enumerate() {
             insert_semantic_target(
@@ -9520,14 +9648,35 @@ fn write_semantic_tuple(
         .enumerate()
     {
         let anchor = &binding.join.anchor;
-        db.execute("INSERT INTO semantic_declaration_bindings(tuple_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![
-            tuple,ordinal as i64,binding.syntax_id.as_ref().map(|id| id_codec::encode_sid(id).context("invalid semantic syntax ID").map(|b| b.to_vec())).transpose()?,binding.provenance_id,
-            anchor.document.language,anchor.document.path,anchor.revision_id,anchor.content_hash,anchor.range.start as i64,anchor.range.end as i64,
-            semantic_variant(&anchor.kind)?,semantic_variant(&binding.join.status)?,binding.join.diagnostic,
-        ])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_declaration_bindings(tuple_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                tuple,
+                ordinal as i64,
+                binding
+                    .syntax_id
+                    .as_ref()
+                    .map(|id| id_codec::encode_sid(id)
+                        .context("invalid semantic syntax ID")
+                        .map(|b| b.to_vec()))
+                    .transpose()?,
+                binding.provenance_id,
+                anchor.document.language,
+                anchor.document.path,
+                anchor.revision_id,
+                anchor.content_hash,
+                anchor.range.start as i64,
+                anchor.range.end as i64,
+                semantic_variant(&anchor.kind)?,
+                semantic_variant(&binding.join.status)?,
+                binding.join.diagnostic,
+            ],
+        )?;
         let id = db.last_insert_rowid();
         for (ordinal, key) in binding.symbols.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_declaration_binding_symbols VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     id,
@@ -9541,7 +9690,8 @@ fn write_semantic_tuple(
             )?;
         }
         for (ordinal, candidate) in binding.join.candidate_ids.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_declaration_join_candidates VALUES(?1,?2,?3)",
                 params![
                     id,
@@ -9582,7 +9732,8 @@ fn write_semantic_tuple(
             vec![rusqlite::types::Value::Null; 10]
         });
         values.push(reference.provenance_id.clone().into());
-        db.execute(
+        execute_cached(
+            db,
             &format!(
                 "INSERT INTO semantic_references VALUES({})",
                 (1..=values.len())
@@ -9593,7 +9744,8 @@ fn write_semantic_tuple(
             rusqlite::params_from_iter(values),
         )?;
         for (ordinal, role) in reference.roles.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_reference_roles VALUES(?1,?2,?3,?4)",
                 params![tuple, id, ordinal as i64, semantic_variant(role)?],
             )?;
@@ -9649,7 +9801,17 @@ fn write_semantic_tuple(
             binding.stale_target.map(|value| value as i64).into(),
             binding.provenance_id.clone().into(),
         ]);
-        db.execute(&format!("INSERT INTO semantic_call_bindings(tuple_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_id) VALUES({})",(1..=values.len()).map(|i|format!("?{i}")).collect::<Vec<_>>().join(",")),rusqlite::params_from_iter(values))?;
+        execute_cached(
+            db,
+            &format!(
+                "INSERT INTO semantic_call_bindings(tuple_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_id) VALUES({})",
+                (1..=values.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            rusqlite::params_from_iter(values),
+        )?;
         let id = db.last_insert_rowid();
         for (table, targets) in [
             ("semantic_call_candidates", &binding.candidates),
@@ -9663,7 +9825,8 @@ fn write_semantic_tuple(
             }
         }
         for (ordinal, candidate) in binding.join.candidate_ids.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_call_join_candidates VALUES(?1,?2,?3)",
                 params![
                     id,
@@ -9689,7 +9852,8 @@ fn write_semantic_tuple(
         values.extend(semantic_target_values(&relationship.source)?);
         values.extend(semantic_target_values(&relationship.target)?);
         values.push(relationship.provenance_id.clone().into());
-        db.execute(
+        execute_cached(
+            db,
             &format!(
                 "INSERT INTO semantic_type_relationships VALUES(NULL,{})",
                 (1..=values.len())
@@ -10422,7 +10586,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V27 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V29 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -11375,6 +11539,21 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             });
         }
         expected.insert(format!("directory:{directory}"));
+    }
+    // Nested package roots of JavaScript sources (#443) and nested Cargo manifests of Rust
+    // sources (#394); a non-regular one is not admitted.
+    for source in &source_paths {
+        let manifest = match Path::new(source).extension().and_then(|x| x.to_str()) {
+            Some("js" | "mjs" | "cjs") => "package.json",
+            Some("rs") => "Cargo.toml",
+            _ => continue,
+        };
+        for dir in Path::new(source).ancestors().skip(1) {
+            let key = format!("config:{}/{manifest}", dir.to_string_lossy());
+            if !dir.as_os_str().is_empty() && actual.contains(&key) {
+                expected.insert(key);
+            }
+        }
     }
     expected.insert(
         executable.ok_or_else(|| {
@@ -12341,6 +12520,8 @@ fn read_native_references(
     }
     let mut references = vec![];
     let mut ordinals = BTreeMap::<String, usize>::new();
+    // One document's references share one proof: digest it once, not per row.
+    let proof = scope.proof_id();
     for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,spelling,COALESCE(lookup_key,spelling) FROM native_version_references WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
         .query_map([scope.vid], |r| Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?,
             r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)))? {
@@ -12354,7 +12535,7 @@ fn read_native_references(
             id, owner_syntax_id: reference_owner, ordinal: ordinal as usize,
             document: scope.key.clone(), revision_id: scope.native_revision_id.clone(),
             range: Range { start: start as usize, end: end as usize }, spelling, lookup_key,
-            provenance_id: scope.proof_id(),
+            provenance_id: proof.clone(),
         });
     }
     if let Some(owner) = owner {
@@ -13060,7 +13241,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V27)?;
+                db.execute_batch(CACHE_SCHEMA_V29)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -14079,6 +14260,8 @@ impl Store {
             evidence_format: (row.0 == i64::from(DATABASE_SCHEMA_VERSION) && row.6 > 0)
                 .then(|| EVIDENCE_FORMAT.to_owned()),
             watcher: None,
+            semantic_producer_id: None,
+            semantic_note: None,
         })
     }
     fn ensure_public_read_ready(&self) -> Result<()> {
@@ -14657,7 +14840,11 @@ impl Store {
             .map_err(|error| self.report_index_failure(error))?;
         before_snapshot(&db)?;
         drop(db);
-        self.with_evidence(|db| self.read_status(db))
+        self.with_evidence(|db| {
+            let mut status = self.read_status(db)?;
+            semantic_display::status_semantics(db, &mut status)?;
+            Ok(status)
+        })
     }
     pub fn publish(
         &self,
@@ -18965,6 +19152,10 @@ impl Store {
                     "SELECT d.language,d.path,d.source_hash,d.wire_digest,d.capture_id FROM semantic_raw_documents d JOIN semantic_raw_captures c ON c.capture_id=d.capture_id WHERE c.batch_id=?1 ORDER BY d.language,d.path"
                 )?.query_map([batch_id], |r| Ok(((r.get(0)?,r.get(1)?),(r.get(2)?,r.get(3)?,r.get(4)?))))?
                     .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+                let capped_documents = db.prepare(
+                    "SELECT d.language,d.path FROM semantic_raw_documents d JOIN semantic_raw_captures c ON c.capture_id=d.capture_id WHERE c.batch_id=?1 AND d.capped=1"
+                )?.query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<crate::scip_raw::CappedDocuments>>()?;
                 let exclusions = db.prepare(
                     "SELECT language,path,reason FROM semantic_raw_exclusions WHERE batch_id=?1 ORDER BY language,path"
                 )?.query_map([batch_id], |r| Ok(crate::scip_raw::Exclusion {language:r.get(0)?,relative_path:r.get(1)?,reason:r.get(2)?}))?
@@ -18981,6 +19172,7 @@ impl Store {
                     decoder_version,
                     captures,
                     exclusions,
+                    capped_documents,
                     proofs,
                     documents,
                     captured_pin: IndexPin {
@@ -20406,9 +20598,23 @@ impl Store {
         selected: &ReadRevision,
         document: &crate::native_evidence::Document,
     ) -> Result<NativeDocumentRows> {
+        self.read_native_document_rows(db, selected, document, true)
+    }
+
+    /// One document's native rows; without `complete`, its control regions and search cards
+    /// are left empty (the staged join reads neither).
+    fn read_native_document_rows(
+        &self,
+        db: &Connection,
+        selected: &ReadRevision,
+        document: &crate::native_evidence::Document,
+        complete: bool,
+    ) -> Result<NativeDocumentRows> {
         use crate::native_evidence as n;
         #[cfg(feature = "test-support")]
         crate::semantic_import::note_selected_original_native_row(&document.key);
+        #[cfg(feature = "test-support")]
+        crate::semantic_batch::testing::note_native_document_load();
         let scope = v8_native_scope_for(db, &document.key, selected)?.context(
             SelectedIntegrity("incompatible_index: retained native document absent".into()),
         )?;
@@ -20429,10 +20635,18 @@ impl Store {
             },
             declarations: read_native_declarations_v8(db, &scope, None, true)?,
             calls: read_native_calls_v8(db, &scope, None)?,
-            control_regions: read_native_control_regions_v8(db, &scope, None)?,
+            control_regions: if complete {
+                read_native_control_regions_v8(db, &scope, None)?
+            } else {
+                vec![]
+            },
             references: read_native_references(db, &scope, None)?,
             capability_report: read_native_capability_report(db, &scope)?,
-            search_cards: search::read_cards(db, scope.vid, &document.key.path)?,
+            search_cards: if complete {
+                search::read_cards(db, scope.vid, &document.key.path)?
+            } else {
+                vec![]
+            },
         })
     }
 
@@ -21386,8 +21600,17 @@ impl Store {
         let Some(_projection_id) = projection_id else {
             return Ok(None);
         };
-        let mut symbols = self.selected_graph_document_for(tx, path, &selected)?.nodes;
+        let document = self.selected_graph_document_for(tx, path, &selected)?;
+        let mut symbols = document.nodes;
         symbols.retain(|node| matches!(node.kind, SymbolKind::Method | SymbolKind::Function));
+        // `provenance.semantic` reports the sole published producer's coverage (#467).
+        semantic_display::mark_document_symbols(
+            tx,
+            &selected,
+            &document.file.language,
+            path,
+            &mut symbols,
+        )?;
         symbols.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let mut items = Vec::new();
         for symbol in symbols.into_iter().take(1001) {
@@ -21803,7 +22026,7 @@ impl Store {
             return Ok(None);
         };
         let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
-        let seed = seed_document
+        let mut seed = seed_document
             .nodes
             .iter()
             .find(|symbol| symbol.id == query.seed)
@@ -21850,6 +22073,14 @@ impl Store {
                 regions.insert(id, region);
             }
         }
+        let semantic = semantic_display::view_semantics(
+            tx,
+            &selected,
+            query.semantic_producer_id.as_deref(),
+            &mut seed,
+            &seed_document.file.language,
+            &mut calls,
+        )?;
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
@@ -21863,6 +22094,7 @@ impl Store {
             } else {
                 vec![]
             },
+            semantic,
         }))
     }
 }
@@ -21873,7 +22105,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V27).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V29).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -22009,7 +22241,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V27).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V29).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

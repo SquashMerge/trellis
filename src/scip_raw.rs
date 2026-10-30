@@ -13,6 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Read};
 use std::sync::atomic::Ordering;
 
+pub mod cargo_targets;
+pub mod module_roots;
+pub use cargo_targets::{CargoTarget, CargoTargets, CargoTargetsBuilder};
+pub use module_roots::ModuleRoots;
+
 pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/2";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +135,45 @@ pub struct CapturedScipFactV1 {
     pub relative_path: String,
     pub position_encoding: u8,
     pub raw: Value,
+    /// The Cargo target of a Rust document whose target is determined (owner ruling
+    /// 2026-10-30, #394). It is part of the envelope, so the fact digest and proof identity
+    /// of the same raw fact differ between targets. Absent for every other document.
+    pub cargo_target: Option<CargoTarget>,
+}
+
+impl CapturedScipFactV1 {
+    /// The envelope's `cargoTarget`, as `make_claim` writes it.
+    pub fn cargo_target_json(target: &CargoTarget) -> Value {
+        json!({"kind": target.kind, "package": target.package, "root": target.root, "version": target.version})
+    }
+
+    /// Reads an envelope's `cargoTarget` back: absent, or exactly a known kind, a package
+    /// name, a root and a version string or null.
+    pub fn cargo_target_from(envelope: &Value) -> Result<Option<CargoTarget>, ScipCaptureError> {
+        let Some(value) = envelope.get("cargoTarget") else {
+            return Ok(None);
+        };
+        let object = value.as_object().filter(|object| object.len() == 4);
+        let text = |key: &str| object.and_then(|o| o.get(key)).and_then(Value::as_str);
+        let version = match object.and_then(|o| o.get("version")) {
+            Some(Value::Null) => Some(None),
+            Some(Value::String(version)) => Some(Some(version.clone())),
+            _ => None,
+        };
+        match (text("kind"), text("package"), text("root"), version) {
+            (Some(kind), Some(package), Some(root), Some(version))
+                if cargo_targets::TARGET_KINDS.contains(&kind) && valid_path(root) =>
+            {
+                Ok(Some(CargoTarget {
+                    kind: kind.to_owned(),
+                    root: root.to_owned(),
+                    package: package.to_owned(),
+                    version,
+                }))
+            }
+            _ => Err(invalid("cargo target")),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedClaim {
@@ -155,6 +199,7 @@ pub(crate) struct ProofInventory {
     pub(crate) artifact_hashes: Vec<String>,
     pub(crate) source_manifest_hash: String,
     pub(crate) exclusions: Vec<Exclusion>,
+    pub(crate) capped_documents: CappedDocuments,
     pub(crate) claims: Vec<RawProofIdentity>,
 }
 
@@ -202,6 +247,8 @@ pub struct CapturedScipInventory {
     pub source_manifest_hash: String,
     pub completion: Completion,
     pub exclusions: Vec<Exclusion>,
+    /// Documents the decoder admitted partially ([`OCCURRENCE_CAP_EXCEEDED`]).
+    pub capped_documents: CappedDocuments,
     pub claims: Vec<CapturedClaim>,
 }
 impl CapturedScipInventory {
@@ -210,6 +257,7 @@ impl CapturedScipInventory {
             artifact_hashes: self.artifact_hashes.clone(),
             source_manifest_hash: self.source_manifest_hash.clone(),
             exclusions: self.exclusions.clone(),
+            capped_documents: self.capped_documents.clone(),
             claims: self
                 .claims
                 .iter()
@@ -291,9 +339,11 @@ fn field(node: Node, n: u64) -> Option<(u8, Wire, usize)> {
         (Symbol, 7) => (2, Message(Signature), 1),
         (Relationship, 1) => (2, Bytes, 1),
         (Relationship, 2..=5) => (0, Scalar, 1),
-        // Signature `relative_path` (scip-java writes it) is presentation-only, like `language`
-        // and `text` (owner ruling 2026-10-29, #439); see `signature_unknown`.
+        // Signature `relative_path` (scip-java writes it) and `position_encoding`
+        // (rust-analyzer writes it) are presentation-only, like `language` and `text` (owner
+        // rulings 2026-10-29, #439, and 2026-10-28, #394); see `signature_unknown`.
         (Signature, 1 | 4 | 5) => (2, Bytes, 1),
+        (Signature, 6) => (0, Scalar, 1),
         (Signature, 2) => (2, Message(Occurrence), 10000),
         (Occurrence, 1 | 7) => (0, Packed, 1000000),
         (Occurrence, 2) => (2, Bytes, 1),
@@ -329,6 +379,9 @@ struct WireBudget<'a> {
     fields: u64,
     relationships: u64,
     candidates: u64,
+    /// Occurrences of the `Document` units walked since the caller last reset it. The walk
+    /// does not cap them: a document over `document_occurrences` is admitted partially.
+    document_occurrences: u64,
     limits: &'a BatchLimits,
 }
 impl<'a> WireBudget<'a> {
@@ -337,6 +390,7 @@ impl<'a> WireBudget<'a> {
             fields: 0,
             relationships: 0,
             candidates: 0,
+            document_occurrences: 0,
             limits,
         }
     }
@@ -372,7 +426,9 @@ fn wire(
         let wt = (tag & 7) as u8;
         let (expected, kind, max) = field(node, n).ok_or_else(|| invalid("unknown field"))?;
         let (max, max_name) = match (node, n) {
-            (Node::Document, 2) => (budget.limits.document_occurrences, "document entries"),
+            // Bounded by the wire-field and unit budgets; over `document_occurrences` the
+            // document is admitted partially (owner ruling 2026-10-28, #394).
+            (Node::Document, 2) => (u64::MAX, "document entries"),
             (Node::Document, 3) => (budget.limits.document_symbols, "document entries"),
             (Node::Signature, 2) => (budget.limits.signature_occurrences, "signature occurrences"),
             _ => (max as u64, "repeated field"),
@@ -403,6 +459,9 @@ fn wire(
                 || matches!(node, Node::Symbol) && n == 4 && depth >= 2
             {
                 budget.candidates += 1;
+            }
+            if matches!(node, Node::Document) && n == 2 {
+                budget.document_occurrences += 1;
             }
             if budget.relationships > budget.limits.relationships_per_artifact {
                 return Err(limit("relationships"));
@@ -460,14 +519,23 @@ fn unknown(f: &protobuf::SpecialFields) -> Result<(), ScipCaptureError> {
     }
 }
 /// The pinned `scip` crate's `Signature` message omits the SCIP `Document.relative_path`
-/// (field 1) that scip-java writes on `signature_documentation`, so it parses as an unknown field.
-/// By owner ruling 2026-10-29 (#439) it is presentation-only: it must be well-formed UTF-8 and is
-/// never read for identity, binding, path or digests. Every other unknown field still rejects.
+/// (field 1) that scip-java writes and the `Document.position_encoding` (field 6) that
+/// rust-analyzer writes on `signature_documentation`, so both parse as unknown fields. Both are
+/// presentation-only (owner rulings 2026-10-29, #439, and 2026-10-28, #394): the path must be
+/// well-formed UTF-8 and the encoding a known `PositionEncoding` value, and neither is ever read
+/// for identity, binding, path, positions or digests. Every other unknown field still rejects.
 fn signature_unknown(f: &protobuf::SpecialFields) -> Result<(), ScipCaptureError> {
+    use protobuf::Enum;
     for (number, value) in f.unknown_fields().iter() {
         match (number, value) {
             (1, protobuf::UnknownValueRef::LengthDelimited(path)) => {
                 std::str::from_utf8(path).map_err(|_| invalid("signature relative path"))?;
+            }
+            (6, protobuf::UnknownValueRef::Varint(encoding)) => {
+                i32::try_from(encoding)
+                    .ok()
+                    .and_then(types::PositionEncoding::from_i32)
+                    .ok_or_else(|| invalid("signature position encoding"))?;
             }
             _ => return Err(invalid("unknown protobuf field")),
         }
@@ -822,10 +890,16 @@ fn make_claim(
         relative_path: d.relative_path.clone(),
         position_encoding: d.position_encoding.value() as u8,
         raw,
+        cargo_target: (language == "rust")
+            .then(|| artifact.cargo_targets.target_of(&d.relative_path))
+            .flatten()
+            .cloned(),
     };
-    let bytes = canonical(
-        &json!({"formatVersion":1,"recordKind":kind,"relativePath":d.relative_path,"positionEncoding":envelope.position_encoding,"raw":envelope.raw}),
-    );
+    let mut value = json!({"formatVersion":1,"recordKind":kind,"relativePath":d.relative_path,"positionEncoding":envelope.position_encoding,"raw":envelope.raw});
+    if let Some(target) = &envelope.cargo_target {
+        value["cargoTarget"] = CapturedScipFactV1::cargo_target_json(target);
+    }
+    let bytes = canonical(&value);
     let fact = digest(b"trellis.semantic-fact.v1\0", &bytes);
     let proof = digest(
         b"trellis.capture-proof.v1\0",
@@ -854,6 +928,10 @@ pub struct AuthenticatedArtifact<'a> {
     pub protocol_version: i32,
     pub text_document_encoding: i32,
     pub project_root_uri: &'a str,
+    /// Package roots that bind scip-typescript module markers (#443).
+    pub module_roots: &'a ModuleRoots,
+    /// The Cargo target of each Rust document, its symbol namespace (#394).
+    pub cargo_targets: &'a CargoTargets,
     /// Source documents assigned to this artifact; every one must appear exactly once.
     pub assigned_documents: u64,
 }
@@ -862,7 +940,20 @@ pub struct UnitDocument<'a> {
     pub path: &'a str,
     pub language: &'a str,
     pub wire_digest: &'a str,
+    /// The document has more occurrences than `document_occurrences`: it is admitted
+    /// partially, with only its definition occurrences ([`OCCURRENCE_CAP_EXCEEDED`]).
+    pub occurrence_cap_exceeded: bool,
 }
+
+/// Coverage diagnostic of a document admitted partially because it has more occurrences than
+/// the per-document cap (owner ruling 2026-10-28, #394). Such a document keeps its symbol
+/// information, relationships and definition occurrences, and drops every other occurrence;
+/// if its definitions alone exceed the cap it keeps no occurrence. Every occurrence is still
+/// fully validated, so a malformed one rejects the artifact as before.
+pub const OCCURRENCE_CAP_EXCEEDED: &str = "occurrence_cap_exceeded";
+
+/// `(language, path)` of the documents admitted under [`OCCURRENCE_CAP_EXCEEDED`].
+pub type CappedDocuments = BTreeSet<(String, String)>;
 /// One assigned document's authenticated source, returned by the caller's resolver.
 pub struct DocumentSource<'s> {
     pub language: String,
@@ -887,8 +978,13 @@ pub trait ClaimSink {
 pub struct VecSink {
     claims: Vec<CapturedClaim>,
     paths: BTreeSet<String>,
+    capped: CappedDocuments,
 }
 impl VecSink {
+    /// The documents admitted under [`OCCURRENCE_CAP_EXCEEDED`] so far.
+    pub fn capped_documents(&self) -> &CappedDocuments {
+        &self.capped
+    }
     pub fn finish(mut self) -> Result<Vec<CapturedClaim>, ScipCaptureError> {
         self.claims.sort_by(|a, b| {
             a.language
@@ -917,11 +1013,14 @@ impl VecSink {
 }
 impl ClaimSink for VecSink {
     fn begin_document(&mut self, doc: &UnitDocument<'_>) -> Result<(), ScipCaptureError> {
-        if self.paths.insert(doc.path.to_string()) {
-            Ok(())
-        } else {
-            Err(invalid("duplicate document path"))
+        if !self.paths.insert(doc.path.to_string()) {
+            return Err(invalid("duplicate document path"));
         }
+        if doc.occurrence_cap_exceeded {
+            self.capped
+                .insert((doc.language.to_owned(), doc.path.to_owned()));
+        }
+        Ok(())
     }
     fn claim(&mut self, claim: CapturedClaim) -> Result<(), ScipCaptureError> {
         self.claims.push(claim);
@@ -986,6 +1085,184 @@ impl Drop for UnitBuffer<'_> {
     fn drop(&mut self) {
         self.counters.live_unit_buffers -= 1;
     }
+}
+
+/// A scip-typescript module-definition marker that does not name this document under its
+/// authenticated package or project root. Only an empty one is invalid; the caller checks.
+fn unresolved_module_marker(
+    artifact: &AuthenticatedArtifact<'_>,
+    language: &str,
+    path: &str,
+    o: &types::Occurrence,
+) -> bool {
+    if language != "javascript" || o.symbol_roles & 1 == 0 {
+        return false;
+    }
+    let Ok(symbol) = scip::symbol::parse_symbol(&o.symbol) else {
+        return false;
+    };
+    module_roots::typescript_module_path(&symbol).is_some()
+        && !artifact.module_roots.names_document(&symbol, path)
+}
+
+type FieldSpan = (u64, std::ops::Range<usize>, std::ops::Range<usize>);
+
+/// The first top-level field of a message already accepted by `wire`: its number, the
+/// field's bytes and its payload (empty for a varint).
+fn next_field(bytes: &[u8], start: usize) -> Result<FieldSpan, ScipCaptureError> {
+    let mut i = start;
+    let tag = varint(bytes, &mut i)?;
+    let payload = if tag & 7 == 0 {
+        varint(bytes, &mut i)?;
+        i..i
+    } else {
+        let len =
+            usize::try_from(varint(bytes, &mut i)?).map_err(|_| invalid("truncated field"))?;
+        let end = i
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| invalid("truncated field"))?;
+        let payload = i..end;
+        i = end;
+        payload
+    };
+    Ok((tag >> 3, start..i, payload))
+}
+
+/// `relative_path` and `language` of a `Document` unit accepted by `wire`, read without
+/// parsing its occurrences.
+fn document_identity(bytes: &[u8]) -> Result<(String, String), ScipCaptureError> {
+    let (mut path, mut language) = (String::new(), String::new());
+    let mut at = 0;
+    while at < bytes.len() {
+        let (number, span, payload) = next_field(bytes, at)?;
+        at = span.end;
+        let target = match number {
+            1 => &mut path,
+            4 => &mut language,
+            _ => continue,
+        };
+        *target = std::str::from_utf8(&bytes[payload])
+            .map_err(|_| invalid("protobuf parse"))?
+            .to_owned();
+    }
+    Ok((path, language))
+}
+
+/// The `symbol_roles` of an `Occurrence` accepted by `wire`; the last value wins, as in a parse.
+fn occurrence_roles(bytes: &[u8]) -> Result<u64, ScipCaptureError> {
+    let mut roles = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let (number, span, _) = next_field(bytes, at)?;
+        if number == 3 {
+            let mut i = span.start;
+            varint(bytes, &mut i)?;
+            roles = varint(bytes, &mut i)?;
+        }
+        at = span.end;
+    }
+    Ok(roles)
+}
+
+/// Positions validated per batch while a capped document's occurrences are checked, so the
+/// pending position list stays bounded however many occurrences the document has.
+const CAPPED_POSITION_BATCH: usize = 1 << 16;
+
+/// Admits an over-cap `Document` unit partially, in place: validates every occurrence exactly
+/// as an admitted one is validated, then keeps every other field and only the definition
+/// occurrences (none if they alone exceed `cap`), in wire order. No occurrence becomes a claim
+/// here; the caller decodes the kept unit as usual.
+#[allow(clippy::too_many_arguments)]
+fn cap_document(
+    bytes: &mut Vec<u8>,
+    artifact: &AuthenticatedArtifact<'_>,
+    language: &str,
+    path: &str,
+    text: &str,
+    cap: u64,
+    traversed: &mut usize,
+    cancel: &CancelFlag,
+) -> Result<(), ScipCaptureError> {
+    let mut definitions = 0u64;
+    let mut at = 0;
+    while at < bytes.len() {
+        let (number, span, payload) = next_field(bytes, at)?;
+        at = span.end;
+        if number == 2 && occurrence_roles(&bytes[payload])? & 1 != 0 {
+            definitions += 1;
+        }
+    }
+    let keep_definitions = definitions <= cap;
+    let mut positions = Vec::new();
+    let mut unresolved_markers = Vec::new();
+    let mut write = 0;
+    let mut read = 0;
+    while read < bytes.len() {
+        let (number, span, payload) = next_field(bytes, read)?;
+        let keep = if number == 2 {
+            *traversed += 1;
+            if traversed.is_multiple_of(1024) {
+                cancelled(cancel)?;
+            }
+            let o = types::Occurrence::parse_from_bytes(&bytes[payload])
+                .map_err(|_| invalid("protobuf parse"))?;
+            let first = positions.len();
+            occurrence(&o, &mut positions)?;
+            if unresolved_module_marker(artifact, language, path, &o) {
+                unresolved_markers.push((positions[first], positions[first + 1]));
+            }
+            if positions.len() >= CAPPED_POSITION_BATCH {
+                validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+                positions.clear();
+            }
+            keep_definitions && o.symbol_roles & 1 != 0
+        } else {
+            true
+        };
+        read = span.end;
+        if keep {
+            let len = span.len();
+            bytes.copy_within(span, write);
+            write += len;
+        }
+    }
+    validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+    check_module_markers(
+        text,
+        artifact.position_encoding,
+        &unresolved_markers,
+        cancel,
+    )?;
+    bytes.truncate(write);
+    Ok(())
+}
+
+/// The start and end positions of an occurrence range.
+type RangeEnds = ((i32, i32), (i32, i32));
+
+/// An unresolved module marker must span source text.
+fn check_module_markers(
+    text: &str,
+    encoding: u8,
+    markers: &[RangeEnds],
+    cancel: &CancelFlag,
+) -> Result<(), ScipCaptureError> {
+    if markers.is_empty() {
+        return Ok(());
+    }
+    let mut ends: Vec<_> = markers
+        .iter()
+        .flat_map(|(start, end)| [*start, *end])
+        .collect();
+    let offsets = source_byte_offsets(text, encoding, &mut ends, cancel)?;
+    if markers
+        .iter()
+        .any(|(start, end)| offsets.get(start) == offsets.get(end))
+    {
+        return Err(invalid("empty or reversed SCIP range"));
+    }
+    Ok(())
 }
 
 /// Decode one authenticated artifact as a stream of top-level units. Each unit is length-checked
@@ -1059,6 +1336,7 @@ pub fn decode_streaming<'s, R: Read>(
             2 => Node::Document,
             _ => Node::Symbol,
         };
+        budget.document_occurrences = 0;
         let walked = wire(&unit.bytes, node, 1, &mut budget, cancel);
         unit.counters.wire_fields = budget.fields;
         unit.counters.candidates = budget.candidates;
@@ -1085,17 +1363,44 @@ pub fn decode_streaming<'s, R: Read>(
             }
             _ => {
                 let wire_digest = sha(&unit.bytes);
-                let d = types::Document::parse_from_bytes(&unit.bytes)
-                    .map_err(|_| invalid("protobuf parse"))?;
-                unknown(&d.special_fields)?;
-                if !valid_path(&d.relative_path) {
-                    return Err(invalid("unlisted document"));
-                }
-                let source = resolve(&d.relative_path, &d.language)?;
+                let capped = budget.document_occurrences > limits.document_occurrences;
+                let (d, source) = if capped {
+                    let (path, language) = document_identity(&unit.bytes)?;
+                    if !valid_path(&path) {
+                        return Err(invalid("unlisted document"));
+                    }
+                    let source = resolve(&path, &language)?;
+                    let text = std::str::from_utf8(&source.bytes)
+                        .map_err(|_| invalid("non-UTF8 source"))?;
+                    cap_document(
+                        &mut unit.bytes,
+                        artifact,
+                        &source.language,
+                        &path,
+                        text,
+                        limits.document_occurrences,
+                        &mut traversed,
+                        cancel,
+                    )?;
+                    let d = types::Document::parse_from_bytes(&unit.bytes)
+                        .map_err(|_| invalid("protobuf parse"))?;
+                    unknown(&d.special_fields)?;
+                    (d, source)
+                } else {
+                    let d = types::Document::parse_from_bytes(&unit.bytes)
+                        .map_err(|_| invalid("protobuf parse"))?;
+                    unknown(&d.special_fields)?;
+                    if !valid_path(&d.relative_path) {
+                        return Err(invalid("unlisted document"));
+                    }
+                    let source = resolve(&d.relative_path, &d.language)?;
+                    (d, source)
+                };
                 sink.begin_document(&UnitDocument {
                     path: &d.relative_path,
                     language: &source.language,
                     wire_digest: &wire_digest,
+                    occurrence_cap_exceeded: capped,
                 })?;
                 if !d.text.is_empty() && d.text.as_bytes() != source.bytes.as_ref() {
                     return Err(invalid("document source binding"));
@@ -1114,12 +1419,17 @@ pub fn decode_streaming<'s, R: Read>(
                 let text =
                     std::str::from_utf8(&source.bytes).map_err(|_| invalid("non-UTF8 source"))?;
                 let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
+                let mut unresolved_markers = Vec::new();
                 for o in &d.occurrences {
                     traversed += 1;
                     if traversed.is_multiple_of(1024) {
                         cancelled(cancel)?;
                     }
+                    let first = positions.len();
                     let raw = occurrence(o, &mut positions)?;
+                    if unresolved_module_marker(artifact, &source.language, &d.relative_path, o) {
+                        unresolved_markers.push((positions[first], positions[first + 1]));
+                    }
                     sink.claim(make_claim(
                         artifact,
                         &d,
@@ -1129,6 +1439,12 @@ pub fn decode_streaming<'s, R: Read>(
                     ))?;
                 }
                 validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+                check_module_markers(
+                    text,
+                    artifact.position_encoding,
+                    &unresolved_markers,
+                    cancel,
+                )?;
                 for s in &d.symbols {
                     traversed += 1;
                     if traversed.is_multiple_of(1024) {
@@ -1195,8 +1511,18 @@ pub(crate) fn decode_authenticated(
     input: &AuthenticatedScipInput<'_>,
     flag: &CancelFlag,
 ) -> Result<CapturedScipInventory, ScipCaptureError> {
+    decode_authenticated_with(input, &BatchLimits::PRODUCTION, flag)
+}
+
+/// `decode_authenticated` under explicit limits.
+#[cfg(test)]
+pub(crate) fn decode_authenticated_with(
+    input: &AuthenticatedScipInput<'_>,
+    limits: &BatchLimits,
+    flag: &CancelFlag,
+) -> Result<CapturedScipInventory, ScipCaptureError> {
     cancelled(flag)?;
-    if input.artifact_bytes.len() as u64 > BatchLimits::PRODUCTION.artifact_bytes {
+    if input.artifact_bytes.len() as u64 > limits.artifact_bytes {
         return Err(limit("artifact bytes"));
     }
     if sha(input.artifact_bytes) != input.artifact_hash {
@@ -1231,6 +1557,8 @@ pub(crate) fn decode_authenticated(
         protocol_version: input.protocol_version,
         text_document_encoding: input.text_document_encoding,
         project_root_uri: &input.project_root_uri,
+        module_roots: &ModuleRoots::default(),
+        cargo_targets: &CargoTargets::default(),
         assigned_documents: admitted.len() as u64,
     };
     let mut resolve = |path: &str, language: &str| {
@@ -1252,7 +1580,7 @@ pub(crate) fn decode_authenticated(
         &artifact,
         &mut resolve,
         &mut BatchCounters::default(),
-        &BatchLimits::PRODUCTION,
+        limits,
         &mut sink,
         flag,
     )?;
@@ -1262,6 +1590,7 @@ pub(crate) fn decode_authenticated(
         source_manifest_hash: input.source_manifest_hash.clone(),
         completion: input.completion,
         exclusions: input.exclusions.clone(),
+        capped_documents: sink.capped_documents().clone(),
         claims: sink.finish()?,
     })
 }
@@ -1494,6 +1823,8 @@ mod tests {
                 protocol_version: 0,
                 text_document_encoding: 1,
                 project_root_uri: "file:///synthetic",
+                module_roots: &ModuleRoots::default(),
+                cargo_targets: &CargoTargets::default(),
                 assigned_documents: documents.len() as u64,
             };
             let mut resolve = |path: &str, _language: &str| {
@@ -1898,9 +2229,16 @@ mod tests {
             ),
             Err(ScipCaptureError::LimitExceeded(_))
         ));
+        // A document's occurrences are not capped by the walk (#394): over the cap the
+        // document is admitted partially, and the walk reports how many it has.
+        let occurrences = std::iter::repeat_n([0x12, 0], 350_001)
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut budget = WireBudget::default();
+        wire(&occurrences, Node::Document, 1, &mut budget, &flag).unwrap();
+        assert_eq!(budget.document_occurrences, 350_001);
         for (node, tag, limit_count) in [
             (Node::Index, 0x12, 1001),
-            (Node::Document, 0x12, 10001),
             (Node::Document, 0x1a, 10001),
             (Node::Symbol, 0x22, 20001),
             (Node::Signature, 0x12, 10001),
@@ -2174,7 +2512,9 @@ mod tests {
         let source = "x".repeat(12_000);
         let mut symbol = types::SymbolInformation::new();
         symbol.symbol = source;
-        symbol.relationships = (0..2000).map(|_| types::Relationship::new()).collect();
+        // Each relationship reserves at least six bytes per byte of the 12,000-byte symbol.
+        let fanout = (BatchLimits::PRODUCTION.unit_expansion_bytes / (6 * 12_000)) as usize + 1;
+        symbol.relationships = (0..fanout).map(|_| types::Relationship::new()).collect();
         let mut doc = types::Document::new();
         doc.relative_path = "src/A.js".into();
         doc.language = "javascript".into();
@@ -2185,6 +2525,37 @@ mod tests {
                 BatchLimits::PRODUCTION.unit_expansion_bytes as usize,
                 &Arc::new(AtomicBool::new(false))
             ),
+            Err(ScipCaptureError::LimitExceeded(reason)) if reason == "unit expansion"
+        ));
+    }
+    /// The decoder's per-document reservation follows the batch live budget (owner ruling
+    /// 2026-10-30, #394): a document of 200,000 rust-analyzer-sized occurrences, over what the
+    /// former 128 MiB budget reserved for, fits the 1 GiB production budget below the
+    /// per-document cap.
+    #[test]
+    fn large_document_reservation_fits_the_production_budget() {
+        let mut doc = types::Document::new();
+        doc.relative_path = "src/store.rs".into();
+        doc.language = "rust".into();
+        let symbol = "rust-analyzer cargo trellis 0.1.0 store/impl#[Store]open_for_tests().";
+        doc.occurrences = (0..200_000)
+            .map(|_| {
+                let mut occurrence = types::Occurrence::new();
+                occurrence.symbol = symbol.into();
+                occurrence
+            })
+            .collect();
+        assert!(doc.occurrences.len() as u64 <= BatchLimits::PRODUCTION.document_occurrences);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reserved = reserve_document(
+            &doc,
+            BatchLimits::PRODUCTION.unit_expansion_bytes as usize,
+            &cancel,
+        )
+        .unwrap();
+        assert!(reserved > 128 * 1024 * 1024);
+        assert!(matches!(
+            reserve_document(&doc, 128 * 1024 * 1024, &cancel),
             Err(ScipCaptureError::LimitExceeded(reason)) if reason == "unit expansion"
         ));
     }
@@ -2470,9 +2841,14 @@ mod tests {
         custom(&accepted, b"function f(){g();}\n", 1).expect("relative_path admits");
         for (name, extra) in [
             ("document symbols", message(3, &message(1, b"A#"))),
-            ("position encoding", vec![0x30, 0x01]),
             ("unknown", vec![0xf8, 0x07, 0x01]),
             ("relative_path wire type", vec![0x08, 0x01]),
+            ("position_encoding wire type", message(6, &[1])),
+            ("position_encoding out of range", vec![0x30, 0x04]),
+            (
+                "position_encoding negative",
+                [&[0x30][..], &[0xff; 9], &[0x01]].concat(),
+            ),
         ] {
             assert!(
                 matches!(
@@ -2492,6 +2868,56 @@ mod tests {
             limit("repeated field"),
             "repeated relative_path"
         );
+        assert_eq!(
+            custom(
+                &sig_with(vec![0x30, 0x01, 0x30, 0x01]),
+                b"function f(){g();}\n",
+                1
+            )
+            .unwrap_err(),
+            limit("repeated field"),
+            "repeated position_encoding"
+        );
+    }
+    /// Owner ruling 2026-10-28 (#394): rust-analyzer writes `position_encoding` (field 6) on
+    /// every `signature_documentation` `Document`. Any known value admits, and the canonical
+    /// bytes and both digests equal those of the same artifact without it.
+    #[test]
+    fn signature_position_encoding_is_presentation_only() {
+        let without = decoded(SIGNATURE).unwrap();
+        for encoding in 0..=3u8 {
+            let mut index =
+                types::Index::parse_from_bytes(&hex::decode(SIGNATURE).unwrap()).unwrap();
+            index.documents[0].symbols[0]
+                .signature_documentation
+                .as_mut()
+                .expect("signature fixture")
+                .special_fields
+                .mut_unknown_fields()
+                .add_varint(6, u64::from(encoding));
+            let bytes = index.write_to_bytes().unwrap();
+            assert_ne!(bytes, hex::decode(SIGNATURE).unwrap());
+            let with = custom(&bytes, b"function f(){g();}\n", 1).expect("position_encoding");
+            assert_eq!(with.claims.len(), without.claims.len());
+            for (claim, expected) in with.claims.iter().zip(&without.claims) {
+                assert_eq!(
+                    claim.canonical_bytes, expected.canonical_bytes,
+                    "{encoding}"
+                );
+                assert_eq!(claim.fact_digest, expected.fact_digest, "{encoding}");
+            }
+        }
+        // An external symbol's signature carries it too.
+        let occ = hex::decode("0a0300090a120241231801").unwrap();
+        let sig = [message(5, b"f()"), vec![0x30, 0x01]].concat();
+        let symbol = [message(1, b"A#"), message(7, &sig)].concat();
+        let document = base_doc(message(2, &occ), 1);
+        custom(
+            &[document, message(3, &symbol)].concat(),
+            b"function f(){g();}\n",
+            1,
+        )
+        .expect("external symbol signature position_encoding");
     }
     #[test]
     fn signature_relative_path_invalid_utf8_rejects() {
@@ -2568,5 +2994,134 @@ mod tests {
                 .map(|c| (&c.canonical_bytes, &c.fact_digest))
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn occ(range: [u8; 3], symbol: &str, roles: u8) -> Vec<u8> {
+        message(
+            2,
+            &[
+                message(1, &range),
+                message(2, symbol.as_bytes()),
+                vec![0x18, roles],
+            ]
+            .concat(),
+        )
+    }
+    /// `function f(){g();}`: definitions of `A#` and `B#` and three references.
+    fn capped_artifact(extra: &[Vec<u8>]) -> Vec<u8> {
+        let info = message(3, &[message(1, b"A#"), vec![0x28, 17]].concat());
+        base_doc(
+            [
+                occ([0, 9, 10], "A#", 1),
+                occ([0, 13, 14], "B#", 0),
+                occ([0, 9, 10], "C#", 8),
+                occ([0, 0, 8], "B#", 1),
+                occ([0, 13, 14], "A#", 0),
+                info,
+            ]
+            .into_iter()
+            .chain(extra.iter().cloned())
+            .collect::<Vec<_>>()
+            .concat(),
+            1,
+        )
+    }
+    fn decode_capped(bytes: &[u8], cap: u64) -> Result<CapturedScipInventory, ScipCaptureError> {
+        let limits = BatchLimits {
+            document_occurrences: cap,
+            ..BatchLimits::PRODUCTION
+        };
+        let documents = vec![AuthenticatedScipDocument {
+            language: "javascript".into(),
+            relative_path: "src/A.js".into(),
+            source_bytes: b"function f(){g();}\n",
+            content_hash: sha(b"function f(){g();}\n"),
+        }];
+        decode_authenticated_with(
+            &vector_input(bytes, documents),
+            &limits,
+            &Arc::new(AtomicBool::new(false)),
+        )
+    }
+    fn kinds(inventory: &CapturedScipInventory) -> Vec<(String, String, u64)> {
+        let mut kinds: Vec<_> = inventory
+            .claims
+            .iter()
+            .map(|claim| {
+                (
+                    claim.envelope.record_kind.clone(),
+                    claim.envelope.raw["symbol"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned(),
+                    claim.envelope.raw["symbolRoles"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        kinds.sort();
+        kinds
+    }
+    /// Owner ruling 2026-10-28 (#394, option c): a document over the per-document occurrence
+    /// cap is admitted partially. It keeps its symbol information and its definition
+    /// occurrences, byte-for-byte as an uncapped decode emits them, and is reported capped.
+    #[test]
+    fn over_cap_document_keeps_definitions_and_is_reported_capped() {
+        let bytes = capped_artifact(&[]);
+        let full = decode_capped(&bytes, 5).unwrap();
+        assert!(
+            full.capped_documents.is_empty(),
+            "at the cap is not over it"
+        );
+        assert_eq!(full.claims.len(), 6);
+        let capped = decode_capped(&bytes, 4).unwrap();
+        assert_eq!(
+            capped.capped_documents,
+            BTreeSet::from([("javascript".to_owned(), "src/A.js".to_owned())])
+        );
+        assert_eq!(
+            kinds(&capped),
+            [
+                ("occurrence".into(), "A#".into(), 1),
+                ("occurrence".into(), "B#".into(), 1),
+                ("symbolInformation".into(), "A#".into(), 0),
+            ]
+        );
+        for claim in &capped.claims {
+            assert!(
+                full.claims.contains(claim),
+                "a kept claim is identical to the uncapped claim"
+            );
+        }
+        // Deterministic: the same bytes keep the same claims.
+        assert_eq!(decode_capped(&bytes, 4).unwrap().claims, capped.claims);
+        // Definitions alone over the cap: no occurrence is kept.
+        let none = decode_capped(&bytes, 1).unwrap();
+        assert_eq!(kinds(&none), [("symbolInformation".into(), "A#".into(), 0)]);
+        assert_eq!(none.capped_documents, capped.capped_documents);
+    }
+    /// A dropped occurrence is still validated: a malformed one rejects the artifact exactly as
+    /// it does under the cap, so admission never depends on which side of the cap it falls.
+    #[test]
+    fn over_cap_document_still_validates_dropped_occurrences() {
+        for (case, bad) in [
+            ("range outside source", occ([3, 0, 1], "D#", 0)),
+            ("split column", occ([0, 30, 31], "D#", 0)),
+            ("symbol roles", occ([0, 9, 10], "D#", 0x80)),
+            (
+                "unknown occurrence field",
+                message(
+                    2,
+                    &[message(1, &[0, 9, 10]), vec![0xf8, 0x07, 0x01]].concat(),
+                ),
+            ),
+        ] {
+            let bytes = capped_artifact(&[bad]);
+            let under = decode_capped(&bytes, 100).unwrap_err();
+            assert!(
+                matches!(under, ScipCaptureError::InvalidArtifact(_)),
+                "{case}: {under:?}"
+            );
+            assert_eq!(decode_capped(&bytes, 4).unwrap_err(), under, "{case}");
+        }
     }
 }

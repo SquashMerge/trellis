@@ -29,6 +29,79 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+thread_local! {
+    static NATIVE_DOCUMENT_LOADS: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn reset_native_document_loads() {
+    NATIVE_DOCUMENT_LOADS.with(|loads| loads.set(0));
+}
+
+pub fn native_document_loads() -> u64 {
+    NATIVE_DOCUMENT_LOADS.with(Cell::get)
+}
+
+pub(crate) fn note_native_document_load() {
+    NATIVE_DOCUMENT_LOADS.with(|loads| loads.set(loads.get() + 1));
+}
+
+type DocumentCommonHook =
+    Box<dyn FnMut(u8, &native::DocumentKey, &crate::semantic_import::JoinedFacts, &Connection)>;
+
+thread_local! {
+    static DOCUMENT_COMMON: std::cell::RefCell<Option<DocumentCommonHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observes document-local Common results before legacy settlement can revise their targets.
+pub fn observe_document_common(
+    hook: impl FnMut(u8, &native::DocumentKey, &crate::semantic_import::JoinedFacts, &Connection)
+    + 'static,
+) {
+    DOCUMENT_COMMON.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub fn clear_document_common_observer() {
+    DOCUMENT_COMMON.with(|slot| *slot.borrow_mut() = None);
+}
+
+pub(crate) fn run_document_common_observer(
+    side: u8,
+    document: &native::DocumentKey,
+    facts: &crate::semantic_import::JoinedFacts,
+    conn: &Connection,
+) {
+    DOCUMENT_COMMON.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(side, document, facts, conn);
+        }
+    });
+}
+
+thread_local! {
+    static FAILED_ELIGIBILITY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static SEPARATE_SETTLEMENT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next staged joins on this thread decide the document at `path` failed, as a
+/// mismatched claim would, whatever its claims say. `None` clears it.
+pub fn fail_eligibility_of(path: Option<&str>) {
+    FAILED_ELIGIBILITY.with(|slot| *slot.borrow_mut() = path.map(str::to_owned));
+}
+
+pub(crate) fn eligibility_forced_failed(document: &native::DocumentKey) -> bool {
+    FAILED_ELIGIBILITY.with(|slot| slot.borrow().as_deref() == Some(document.path.as_str()))
+}
+
+/// Makes the next staged joins on this thread run eligibility and settlement as separate
+/// passes on a shared pin too, instead of the fused walk.
+pub fn separate_settlement(separate: bool) {
+    SEPARATE_SETTLEMENT.with(|slot| slot.set(separate));
+}
+
+pub(crate) fn settlement_separated() -> bool {
+    SEPARATE_SETTLEMENT.with(Cell::get)
+}
+
 type ClosureHook = Box<dyn FnOnce(&Connection)>;
 
 type RowHook = Box<dyn FnMut(&str, &mut serde_json::Value)>;
@@ -165,13 +238,16 @@ fn admit(
     source_set: &native::SourceSet,
     revision: &native::Revision,
     sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    native_config: &[serde_json::Value],
     descriptor_bytes: &[u8],
     pages: &[&[u8]],
     artifacts: &[&[u8]],
+    limits: &BatchLimits,
     cancel: &CancelFlag,
 ) -> std::result::Result<Vec<CapturedScipInventory>, ScipCaptureError> {
+    let module_roots = scip_raw::ModuleRoots::from_native_config(native_config);
     let outcome = (|| -> Result<Vec<CapturedScipInventory>> {
-        let limits = BatchLimits::PRODUCTION;
+        let limits = limits.clone();
         let sha = scip_raw::sha(descriptor_bytes);
         let descriptor = Descriptor::parse_admitted(descriptor_bytes, &sha, &limits)?;
         let producer = descriptor.check_producer()?;
@@ -200,6 +276,8 @@ fn admit(
             limits: &limits,
             cancel,
             budget: stage.budget(&limits),
+            module_roots: &module_roots,
+            native_config,
         };
         let mut inputs = MemoryInputs {
             pages,
@@ -214,12 +292,19 @@ fn admit(
         let dir = stage.dir().to_owned();
         let conn = stage.conn()?;
         passes.begin(conn, descriptor_bytes, &sha)?;
-        passes.source_pass(conn, &mut inputs, &mut native, &mut counters)?;
+        let cargo_targets = passes.source_pass(conn, &mut inputs, &mut native, &mut counters)?;
         if let Some(hook) = BEFORE_COVERAGE.with(|slot| slot.borrow_mut().take()) {
             hook(conn);
         }
         passes.coverage_pass(conn, &mut inputs, &mut counters)?;
-        passes.artifact_pass(&dir, conn, &mut inputs, &mut native, &mut counters)?;
+        passes.artifact_pass(
+            &dir,
+            conn,
+            &mut inputs,
+            &mut native,
+            &cargo_targets,
+            &mut counters,
+        )?;
         read_inventories(conn, &descriptor)
     })();
     outcome.map_err(|error| match error.downcast::<ScipCaptureError>() {
@@ -278,6 +363,7 @@ fn read_inventories(
                         value["positionEncoding"].as_u64().unwrap_or(0),
                     )?,
                     raw: value["raw"].clone(),
+                    cargo_target: CapturedScipFactV1::cargo_target_from(&value)?,
                 },
                 canonical_bytes,
                 fact_digest,
@@ -291,12 +377,20 @@ fn read_inventories(
             .filter(|(assigned, _)| *assigned == artifact.ordinal)
             .map(|(_, exclusion)| exclusion.clone())
             .collect();
+        let capped_documents = conn
+            .prepare(
+                "SELECT s.language, s.path FROM documents d JOIN sources s ON s.ord=d.source_ord \
+                 WHERE d.artifact=?1 AND d.capped=1",
+            )?
+            .query_map([artifact.ordinal], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         inventories.push(CapturedScipInventory {
             artifact_hashes: vec![artifact.sha256.clone()],
             decoder_version: descriptor.decoder_version.clone(),
             source_manifest_hash: descriptor.source_manifest_hash.clone(),
             completion: descriptor.completion,
             exclusions,
+            capped_documents,
             claims: captured,
         });
     }
@@ -305,14 +399,43 @@ fn read_inventories(
 
 /// Runs the full admission over in-memory bytes: one inventory per artifact, in ordinal order.
 /// `pages` follow the descriptor's page order; `artifacts` follow artifact ordinals. Page and
-/// artifact paths are checked syntactically because no file exists to open.
+/// artifact paths are checked syntactically because no file exists to open. `native_config`
+/// is the captured revision's retained native config, the source of package roots.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_in_memory(
     root: &Path,
     native: &native::Artifact,
     sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    native_config: &[serde_json::Value],
     descriptor: &[u8],
     pages: &[&[u8]],
     artifacts: &[&[u8]],
+    cancel: &CancelFlag,
+) -> std::result::Result<Vec<CapturedScipInventory>, ScipCaptureError> {
+    admit_in_memory_with_limits(
+        root,
+        native,
+        sources,
+        native_config,
+        descriptor,
+        pages,
+        artifacts,
+        &BatchLimits::PRODUCTION,
+        cancel,
+    )
+}
+
+/// `admit_in_memory` under explicit limits, as the staged path runs under the limits it is given.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_in_memory_with_limits(
+    root: &Path,
+    native: &native::Artifact,
+    sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    native_config: &[serde_json::Value],
+    descriptor: &[u8],
+    pages: &[&[u8]],
+    artifacts: &[&[u8]],
+    limits: &BatchLimits,
     cancel: &CancelFlag,
 ) -> std::result::Result<Vec<CapturedScipInventory>, ScipCaptureError> {
     admit(
@@ -320,11 +443,18 @@ pub fn admit_in_memory(
         &native.source_set,
         &native.revision,
         sources,
+        native_config,
         descriptor,
         pages,
         artifacts,
+        limits,
         cancel,
     )
+}
+
+/// The retained native config a revision captured from `capture` would hold.
+pub fn captured_native_config(capture: &Capture) -> Result<Vec<serde_json::Value>> {
+    Ok(crate::native_evidence::captured_components(capture, "")?.1)
 }
 
 /// `admit_in_memory` over a fresh `Capture` of the workspace.
@@ -354,14 +484,18 @@ pub fn admit_in_memory_from_capture(
             )
         })
         .collect();
+    let native_config =
+        captured_native_config(capture).map_err(|_| admission("native captured config"))?;
     admit(
         root,
         &source_set,
         &revision,
         &sources,
+        &native_config,
         descriptor,
         pages,
         artifacts,
+        &BatchLimits::PRODUCTION,
         cancel,
     )
 }
@@ -520,30 +654,46 @@ pub fn stage_and_join_admitted(
     Ok((admitted, joined, counters))
 }
 
-/// The staged `out_*` rows, read back as the publication the in-memory join would build.
+/// The staged `out_*` rows, read back as the publication the in-memory join would build:
+/// the publisher's per-document rows, with provenance and references in their global contract
+/// order (raw ID then evidence kind, and reference ID).
 pub fn staged_publication(batch: &mut AdmittedBatch) -> Result<semantic::SemanticPublication> {
     let producer = batch.producer().producer();
     let conn = batch.stage_mut().conn()?;
-    fn rows<T: serde::de::DeserializeOwned>(conn: &Connection, table: &str) -> Result<Vec<T>> {
-        let mut statement = conn.prepare(&format!("SELECT body FROM {table} ORDER BY ord"))?;
-        let bodies = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        bodies
-            .iter()
-            .map(|body| Ok(serde_json::from_str(body)?))
-            .collect()
-    }
-    Ok(semantic::SemanticPublication {
-        producers: vec![producer],
-        coverage: rows(conn, "out_coverage")?,
-        provenance: rows(conn, "out_provenance")?,
-        symbols: rows(conn, "out_symbols")?,
-        declaration_bindings: rows(conn, "out_declaration_bindings")?,
-        references: rows(conn, "out_references")?,
-        call_bindings: rows(conn, "out_call_bindings")?,
-        type_relationships: rows(conn, "out_type_relationships")?,
-    })
+    let mut publication = semantic::SemanticPublication {
+        producers: vec![producer.clone()],
+        coverage: vec![],
+        provenance: vec![],
+        symbols: vec![],
+        declaration_bindings: vec![],
+        references: vec![],
+        call_bindings: vec![],
+        type_relationships: vec![],
+    };
+    crate::semantic_import::read_staged_documents(conn, "", &producer, &mut |document| {
+        publication.coverage.extend(document.coverage);
+        publication.provenance.extend(document.provenance);
+        publication.symbols.extend(document.symbols);
+        publication
+            .declaration_bindings
+            .extend(document.declaration_bindings);
+        publication.references.extend(document.references);
+        publication.call_bindings.extend(document.call_bindings);
+        publication
+            .type_relationships
+            .extend(document.type_relationships);
+        Ok(())
+    })?;
+    publication.provenance.sort_by(|a, b| {
+        let raw = |row: &semantic::Provenance| {
+            row.derived_from
+                .as_ref()
+                .map(|derived| derived.provenance_id.clone())
+        };
+        (raw(a), a.evidence_kind).cmp(&(raw(b), b.evidence_kind))
+    });
+    publication.references.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(publication)
 }
 
 /// The ordered cursor queries of the staged join, for query-plan tests.

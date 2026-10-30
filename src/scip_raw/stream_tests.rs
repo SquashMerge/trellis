@@ -76,6 +76,8 @@ fn emit(
         protocol_version: input.protocol_version,
         text_document_encoding: input.text_document_encoding,
         project_root_uri: &input.project_root_uri,
+        module_roots: &super::ModuleRoots::default(),
+        cargo_targets: &super::CargoTargets::default(),
         assigned_documents: 0,
     };
     claims.push(make_claim(&artifact, d, language, kind, raw));
@@ -252,6 +254,7 @@ pub(super) fn decode_whole_index_oracle(
         source_manifest_hash: input.source_manifest_hash.clone(),
         completion: input.completion,
         exclusions: input.exclusions.clone(),
+        capped_documents: BTreeSet::new(),
         claims,
     })
 }
@@ -437,6 +440,8 @@ fn decode_uniform(
         protocol_version: 0,
         text_document_encoding: 1,
         project_root_uri: "file:///synthetic",
+        module_roots: &super::ModuleRoots::default(),
+        cargo_targets: &super::CargoTargets::default(),
         assigned_documents: documents as u64,
     };
     let mut resolve = |_: &str, _: &str| {
@@ -508,6 +513,8 @@ fn unit_length_beyond_remaining_bytes_is_a_parse_error_before_allocation() {
         protocol_version: 0,
         text_document_encoding: 1,
         project_root_uri: "file:///synthetic",
+        module_roots: &super::ModuleRoots::default(),
+        cargo_targets: &super::CargoTargets::default(),
         assigned_documents: 0,
     };
     let mut counters = BatchCounters::default();
@@ -579,6 +586,8 @@ fn candidate_budget_is_shared_across_artifacts() {
         protocol_version: 0,
         text_document_encoding: 1,
         project_root_uri: "file:///synthetic",
+        module_roots: &super::ModuleRoots::default(),
+        cargo_targets: &super::CargoTargets::default(),
         assigned_documents: 3,
     };
     let mut counters = BatchCounters::default();
@@ -623,6 +632,8 @@ fn external_symbols_over_limit_are_rejected() {
         protocol_version: 0,
         text_document_encoding: 1,
         project_root_uri: "file:///synthetic",
+        module_roots: &super::ModuleRoots::default(),
+        cargo_targets: &super::CargoTargets::default(),
         assigned_documents: 0,
     };
     let result = decode_streaming(

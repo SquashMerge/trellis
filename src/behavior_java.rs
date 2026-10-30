@@ -497,7 +497,7 @@ fn unresolved_participant(n: Node<'_>, file: &SourceFile) -> Participant {
     } else {
         ("unresolvedCallee", "unknown")
     };
-    Participant { declaration: None, id: format!("java:source:{kind}:{:x}", Sha256::digest(expression.as_bytes())), label: bounded(expression), kind: kind.into(),
+    Participant { declaration: None, id: format!("java:source:{kind}:{}", hex::encode(Sha256::digest(expression.as_bytes()))), label: bounded(expression), kind: kind.into(),
         identification: "Source spelling only; types, overloads and virtual dispatch unresolved. Visual group, not runtime object identity or a claimed return type.".into() }
 }
 pub(crate) fn build(

@@ -609,7 +609,8 @@ fn external_import_cannot_claim_generation() {
         assert!(!output.status.success(), "{origin} was accepted");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("invalid_request: generation origin"),
+            stderr.contains("invalid_request: request ")
+                && stderr.contains(" failed: generation origin"),
             "{stderr}"
         );
     }

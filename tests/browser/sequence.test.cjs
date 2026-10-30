@@ -8,7 +8,7 @@ async function published(sourceText,callback,filename="flow.rs") {
  const paths=H.fixture(sourceText,filename);let server,browser,context;
  try {
  const indexed=await H.run(H.binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:120000});
- const pin=JSON.parse(indexed.stdout).status.revision;
+ const pin=indexed.json().status.revision;
  server=await H.startDaemon(paths,pin.indexRevision);
  browser=await chromium.launch();context=await browser.newContext();const page=await context.newPage();
  const errors=[];page.on("pageerror",e=>errors.push(e.message));page.on("console",m=>{if(m.type()==="error")errors.push(m.text());});

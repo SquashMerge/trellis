@@ -1285,7 +1285,11 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
         .output()
         .unwrap();
     assert!(!oversized.status.success());
-    assert!(String::from_utf8_lossy(&oversized.stderr).contains("limit_exceeded"));
+    let stderr = String::from_utf8_lossy(&oversized.stderr);
+    assert!(
+        stderr.contains("limit_exceeded: request ") && stderr.contains(" failed: descriptor bytes"),
+        "{stderr}"
+    );
     let after_rows = queue_rows();
     assert_eq!(
         after_rows.len(),
@@ -1297,13 +1301,9 @@ fn explicit_import_publishes_a_committed_report_through_daemon() {
         .request_by_id(&after_rows.last().unwrap().0)
         .unwrap()
         .unwrap();
-    assert!(
-        failed_row
-            .error_code
-            .as_deref()
-            .is_some_and(|code| code.starts_with("limit_exceeded")),
-        "{:?}",
-        failed_row.error_code
+    assert_eq!(
+        failed_row.error_code.as_deref(),
+        Some("limit_exceeded: descriptor bytes")
     );
     assert!(store.earliest_unfinished_request().unwrap().is_none());
     let baseline = store.index_baseline().unwrap();
@@ -1864,7 +1864,7 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                     );
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     assert!(
-                        stderr.contains("invalid_artifact"),
+                        stderr.contains("invalid_artifact: request "),
                         "{language} case {invalid_case}: {stderr}"
                     );
                     assert!(
@@ -2043,9 +2043,12 @@ fn four_languages_import_through_cli_daemon_and_publish_reports() {
                     if ambiguous_call {
                         2
                     } else {
-                        usize::from(call_witness && !alias_case)
+                        // The use at the exact measured callee is the call, with or
+                        // without an enclosing range (#444); the alias and write sites
+                        // are not callees.
+                        usize::from(!alias_case && !write_case)
                     },
-                    "{language}: authenticated call role controls selected binding"
+                    "{language}: exact measured callee controls selected binding"
                 );
                 if ambiguous_call {
                     assert!(selected.call_bindings.iter().all(|c| c.resolution

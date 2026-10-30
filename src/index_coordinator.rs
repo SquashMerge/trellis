@@ -1782,20 +1782,21 @@ mod semantic_input_tests {
     }
 }
 
-/// Maps a typed admission failure to the `<class>: <reason>` spelling that
-/// `store::requests::semantic_import_code` turns into the terminal error code.
+/// Maps a typed admission failure to its typed failure code. The terminal row records that code
+/// with a reason from a closed set; only the diagnostics show the full cause.
 fn batch_error(error: anyhow::Error) -> anyhow::Error {
     use crate::scip_raw::ScipCaptureError;
+    use crate::store::requests::TypedFailure;
+    let typed = |code: &'static str, detail: &str| {
+        anyhow::Error::from(TypedFailure {
+            code,
+            detail: detail.to_owned(),
+        })
+    };
     match error.downcast_ref::<ScipCaptureError>() {
-        Some(ScipCaptureError::InvalidAdmission(detail)) => {
-            anyhow::anyhow!("invalid_request: {detail}")
-        }
-        Some(ScipCaptureError::InvalidArtifact(detail)) => {
-            anyhow::anyhow!("invalid_artifact: {detail}")
-        }
-        Some(ScipCaptureError::LimitExceeded(detail)) => {
-            anyhow::anyhow!("limit_exceeded: {detail}")
-        }
+        Some(ScipCaptureError::InvalidAdmission(detail)) => typed("invalid_request", detail),
+        Some(ScipCaptureError::InvalidArtifact(detail)) => typed("invalid_artifact", detail),
+        Some(ScipCaptureError::LimitExceeded(detail)) => typed("limit_exceeded", detail),
         Some(ScipCaptureError::Cancelled) => anyhow::anyhow!("index publication cancelled"),
         _ => crate::store::typed_storage_full(error),
     }

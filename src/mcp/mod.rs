@@ -311,6 +311,15 @@ fn call_graph_failure(
     envelope
 }
 
+/// An explicit `semanticProducerId` the admitted revision does not publish (#467), typed
+/// as `trellis_call_graph` types its unpublished producer.
+fn producer_failure(id: &serde_json::Value) -> serde_json::Value {
+    let mut envelope = tools::failure(id, "not_found");
+    envelope["error"]["message"] =
+        serde_json::json!("Semantic producer not published for the admitted revision");
+    envelope
+}
+
 /// A failed evidence read's wire code.
 fn evidence_failure_code(error: &anyhow::Error) -> &'static str {
     let message = error.to_string();
@@ -1030,7 +1039,16 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     if architecture::is_tool(name) || name == architecture::PROMPT_NAME =>
                 {
                     let kind = architecture::operation(name);
-                    let arguments = serde_json::Value::Object(args.clone());
+                    let arguments = architecture::store_arguments(
+                        name,
+                        &serde_json::Value::Object(args.clone()),
+                    );
+                    // check/explain sample rule evidence per instance (#448).
+                    let evidence_limit = (kind != "references" && kind != "prompt").then(|| {
+                        args.get("limit").map_or(5, |value| {
+                            wire::uint(value).expect("validated evidence limit") as usize
+                        })
+                    });
                     Some(Box::new(move |runtime, response, _sampled, _query| {
                         let mut check = || {
                             if cancel.load(std::sync::atomic::Ordering::Acquire)
@@ -1041,7 +1059,12 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             Ok(())
                         };
                         match response.architecture_response(kind, &arguments, &mut check) {
-                            Ok(payload) => Ok(architecture::envelope(id, payload)),
+                            Ok(mut payload) => {
+                                if let Some(limit) = evidence_limit {
+                                    architecture::sample_evidence(&mut payload, limit);
+                                }
+                                Ok(architecture::envelope(id, payload))
+                            }
                             Err(error) if crate::store::cli_read_retryable_contention(&error) => {
                                 Err(error)
                             }
@@ -1310,22 +1333,32 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
+                    let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
                     Some(Box::new(move |runtime, response, sampled, _query| {
+                        let Some(found) = response.mcp_outgoing_with_lines(
+                            symbol_id,
+                            limit,
+                            expected,
+                            &|| runtime.mcp_hint_clock_now(accepted),
+                            deadline,
+                        )?
+                        else {
+                            return Ok(tools::failure(id, "not_found"));
+                        };
+                        let semantic = match response.mcp_call_semantics(
+                            producer,
+                            &found.owner.selected.declaration.document.language,
+                            found.calls.iter().map(|call| &call.selected.call),
+                        ) {
+                            Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
+                                return Ok(producer_failure(id));
+                            }
+                            semantic => semantic?,
+                        };
                         Ok(
-                            match response.mcp_outgoing_with_lines(
-                                symbol_id,
-                                limit,
-                                expected,
-                                &|| runtime.mcp_hint_clock_now(accepted),
-                                deadline,
-                            )? {
-                                Some(found) => {
-                                    projection::outgoing(id, found, root, sampled, modern)
-                                        .map_err(|error| anyhow::anyhow!(error))?
-                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
-                                }
-                                None => tools::failure(id, "not_found"),
-                            },
+                            projection::outgoing(id, found, &semantic, root, sampled, modern)
+                                .map_err(|error| anyhow::anyhow!(error))?
+                                .unwrap_or_else(|| tools::failure(id, "range_too_large")),
                         )
                     }))
                 }
@@ -1335,16 +1368,27 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                         .get("limit")
                         .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
                     let expected = validated_expected_basis(args);
+                    let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
                     Some(Box::new(move |_, response, sampled, _query| {
+                        let Some(found) =
+                            response.mcp_incoming_with_lines(symbol_id, limit, expected)?
+                        else {
+                            return Ok(tools::failure(id, "not_found"));
+                        };
+                        let semantic = match response.mcp_call_semantics(
+                            producer,
+                            &found.selected.selected.declaration.document.language,
+                            found.calls.iter().map(|call| &call.call),
+                        ) {
+                            Err(error) if error.is::<crate::store::ProducerNotPublished>() => {
+                                return Ok(producer_failure(id));
+                            }
+                            semantic => semantic?,
+                        };
                         Ok(
-                            match response.mcp_incoming_with_lines(symbol_id, limit, expected)? {
-                                Some(found) => {
-                                    projection::incoming(id, found, root, sampled, modern)
-                                        .map_err(|error| anyhow::anyhow!(error))?
-                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
-                                }
-                                None => tools::failure(id, "not_found"),
-                            },
+                            projection::incoming(id, found, &semantic, root, sampled, modern)
+                                .map_err(|error| anyhow::anyhow!(error))?
+                                .unwrap_or_else(|| tools::failure(id, "range_too_large")),
                         )
                     }))
                 }
@@ -1463,7 +1507,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
             envelope["workspace"] = serde_json::json!(answering.root());
             envelope["catchingUp"] = serde_json::json!(sampled_catching_up);
             tool.response = if architecture::is_tool(&name) || name == architecture::PROMPT_NAME {
-                architecture::capped(id, &name, envelope, modern)
+                // Tools page their arrays into the response cap; the prompt never pages.
+                let offset = architecture::is_tool(&name).then(|| {
+                    arguments
+                        .as_ref()
+                        .and_then(|arguments| arguments.get("offset"))
+                        .and_then(wire::uint)
+                        .unwrap_or(0)
+                });
+                architecture::capped(id, &name, envelope, offset, modern)
             } else {
                 tools::result(&name, envelope, modern)
             };

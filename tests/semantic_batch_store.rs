@@ -28,6 +28,64 @@ use trellis::{
     },
 };
 
+/// Counts the bytes each thread requests and frees (layout sizes), so a test can compare the
+/// join's live reservations with the Rust storage it really holds. SQLite and tree-sitter
+/// allocate through the C allocator and are not counted, as the live budget excludes them.
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+
+    thread_local! {
+        static NET: Cell<i64> = const { Cell::new(0) };
+        static PEAK: Cell<i64> = const { Cell::new(0) };
+    }
+
+    fn add(bytes: i64) {
+        let _ = NET.try_with(|net| {
+            let value = net.get() + bytes;
+            net.set(value);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(value)));
+        });
+    }
+
+    // SAFETY: every call forwards to `System` with the caller's arguments unchanged.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            add(layout.size() as i64);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            add(-(layout.size() as i64));
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            add(layout.size() as i64);
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            add(new_size as i64 - layout.size() as i64);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// Runs `f`; returns its result and the most bytes this thread held at once during `f`,
+    /// above what it held before.
+    pub fn peak<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        let before = NET.with(Cell::get);
+        PEAK.with(|peak| peak.set(before));
+        let result = f();
+        (
+            result,
+            u64::try_from(PEAK.with(Cell::get) - before).unwrap_or(0),
+        )
+    }
+}
+
 struct MemoryAdmission {
     pin: IndexPin,
     parsed: Descriptor,
@@ -49,11 +107,20 @@ struct World {
 }
 
 fn world(populate: impl FnOnce(&Path)) -> World {
+    world_with(populate, false)
+}
+
+/// `mcp` stages the virgin request queue before the first publication, as a daemon
+/// would, so an MCP session can be served over this index.
+fn world_with(populate: impl FnOnce(&Path), mcp: bool) -> World {
     let state = tempfile::tempdir().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     populate(&root);
     let store = Store::open_for_tests(state.path(), &root).unwrap();
+    if mcp {
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.clone()),
@@ -732,6 +799,21 @@ impl World {
     /// The batch decoded in memory: its descriptor, the captured native revision, the original
     /// artifact bytes and the merged inventory of every artifact.
     fn memory_admission(&self, descriptor: &(PathBuf, String)) -> MemoryAdmission {
+        self.try_memory_admission(descriptor).unwrap()
+    }
+
+    fn try_memory_admission(
+        &self,
+        descriptor: &(PathBuf, String),
+    ) -> Result<MemoryAdmission, ScipCaptureError> {
+        self.try_memory_admission_with(descriptor, &BatchLimits::PRODUCTION)
+    }
+
+    fn try_memory_admission_with(
+        &self,
+        descriptor: &(PathBuf, String),
+        limits: &BatchLimits,
+    ) -> Result<MemoryAdmission, ScipCaptureError> {
         let bytes = fs::read(&descriptor.0).unwrap();
         let parsed = Descriptor::parse(&bytes).unwrap();
         let pin = self
@@ -751,16 +833,17 @@ impl World {
             .collect();
         let page_refs: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
         let artifact_refs: Vec<&[u8]> = artifacts.iter().map(Vec::as_slice).collect();
-        let inventories = testing::admit_in_memory(
+        let inventories = testing::admit_in_memory_with_limits(
             &self.root,
             &r1,
             &r1_sources,
+            &self.store.retained_native_components_at(pin).unwrap().1,
             &bytes,
             &page_refs,
             &artifact_refs,
+            limits,
             &self.cancel,
-        )
-        .unwrap();
+        )?;
         let mut merged = inventories[0].clone();
         merged.claims = inventories
             .iter()
@@ -788,14 +871,18 @@ impl World {
             .flat_map(|inventory| inventory.exclusions.clone())
             .filter(|e| seen.insert((e.language.clone(), e.relative_path.clone())))
             .collect();
-        MemoryAdmission {
+        merged.capped_documents = inventories
+            .iter()
+            .flat_map(|inventory| inventory.capped_documents.clone())
+            .collect();
+        Ok(MemoryAdmission {
             pin,
             parsed,
             r1,
             r1_sources,
             artifacts,
             merged,
-        }
+        })
     }
 
     /// The publication the in-memory join builds from the same batch bytes.
@@ -812,13 +899,31 @@ impl World {
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
     ) -> anyhow::Result<SemanticPublication> {
+        self.memory_rejoin(descriptor, mutations)
+            .map(|result| result.publication)
+    }
+
+    fn memory_rejoin(
+        &self,
+        descriptor: &(PathBuf, String),
+        mutations: DestinationMutations,
+    ) -> anyhow::Result<trellis::semantic_import::RejoinResult> {
+        self.memory_rejoin_with(descriptor, mutations, &BatchLimits::PRODUCTION)
+    }
+
+    fn memory_rejoin_with(
+        &self,
+        descriptor: &(PathBuf, String),
+        mutations: DestinationMutations,
+        limits: &BatchLimits,
+    ) -> anyhow::Result<trellis::semantic_import::RejoinResult> {
         let MemoryAdmission {
             parsed,
             r1,
             r1_sources,
             merged,
             ..
-        } = self.memory_admission(descriptor);
+        } = self.try_memory_admission_with(descriptor, limits)?;
         let head = self.store.index_baseline().unwrap();
         let (mut destination, destination_sources) =
             self.store.retained_native_snapshot_at(head).unwrap();
@@ -870,8 +975,29 @@ impl World {
             &basis,
             parsed.producer.position_encoding,
         )
-        .map(|result| result.publication)
     }
+}
+
+/// The per-language claim tallies of a report, by language name.
+fn report_tallies(report: &Value) -> std::collections::BTreeMap<String, [u64; 5]> {
+    report["languages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let count = |name: &str| row[name].as_u64().unwrap();
+            (
+                row["language"].as_str().unwrap().to_owned(),
+                [
+                    count("requested"),
+                    count("matched"),
+                    count("skipped"),
+                    count("ambiguous"),
+                    count("unsupported"),
+                ],
+            )
+        })
+        .collect()
 }
 
 fn assert_same_publication(staged: &SemanticPublication, memory: &SemanticPublication, case: &str) {
@@ -979,12 +1105,18 @@ fn definitions_world() -> World {
 #[test]
 fn staged_and_memory_join_stores_produce_identical_publications() {
     let check = |world: &World, descriptor: &(PathBuf, String), mutations, case: &str| {
-        let (mut admitted, _, _) = world
+        let (mut admitted, sealed, _) = world
             .join_with(descriptor, &BatchLimits::PRODUCTION, mutations)
             .unwrap();
         let staged = testing::staged_publication(&mut admitted).unwrap();
-        let memory = world.memory_publication(descriptor, mutations);
+        let rejoined = world.memory_rejoin(descriptor, mutations).unwrap();
+        let memory = rejoined.publication;
         assert_same_publication(&staged, &memory, case);
+        assert_eq!(
+            report_tallies(sealed.report()),
+            report_tallies(&rejoined.report),
+            "{case}: report tallies"
+        );
         let full = world.full_validation(descriptor, mutations, &staged);
         let reference = world.full_validation(descriptor, mutations, &memory);
         assert_eq!(
@@ -1035,18 +1167,80 @@ fn staged_and_memory_join_stores_produce_identical_publications() {
                     staged.references.iter().any(|r| r.spelling == "target"),
                     "{case}"
                 );
+                assert!(!staged.call_bindings.is_empty(), "{case}");
+            }
+            // `target()` is a plain call of a free function (#470): direct exactly while it
+            // settles resolved, on both paths (`check` compared them), also under rejoin and
+            // a destination that makes the target ambiguous.
+            for binding in &staged.call_bindings {
+                assert_eq!(
+                    binding.dispatch == trellis::semantic_evidence::Dispatch::Direct,
+                    binding.resolution == Resolution::Resolved,
+                    "{case}: {binding:?}"
+                );
             }
         }
     }
-    let world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
-    let descriptor = one_artifact_per_language(&world, vec![("java", vec![java_doc()])]);
+    let java_world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
+    let descriptor = one_artifact_per_language(&java_world, vec![("java", vec![java_doc()])]);
     let (staged, _) = check(
-        &world,
+        &java_world,
         &descriptor,
         DestinationMutations::default(),
         "java types",
     );
     assert_eq!(staged.type_relationships.len(), 1);
+    // Dispatch shapes (#470) on both paths: `new` of a class by identifier and by dotted name
+    // is constructor, a plain call of a free function is direct; a class called without `new`
+    // and a member call of the same free function stay unknown.
+    let source =
+        "class W {}\nfunction m(o){ new W(); new o.W(); W(); h(); o.h(); }\nfunction h(){}\n";
+    let world = world(|root| write_files(root, &[("D.js", source)]));
+    let mut doc = DocSpec::new("D.js")
+        .symbol("pkg W#", 7, &[])
+        .symbol("pkg h().", 17, &[]);
+    for (needle, nth, symbol, roles) in [
+        ("W", 0, "pkg W#", 1),
+        ("h", 2, "pkg h().", 1),
+        ("W", 1, "pkg W#", 0),
+        ("W", 2, "pkg W#", 0),
+        ("W", 3, "pkg W#", 0),
+        ("h", 0, "pkg h().", 0),
+        ("h", 1, "pkg h().", 0),
+    ] {
+        doc = occ_at(doc, source, (needle, nth), None, symbol, roles);
+    }
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
+    let (staged, _) = check(
+        &world,
+        &descriptor,
+        DestinationMutations::default(),
+        "dispatch shapes",
+    );
+    let mut dispatches: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|b| {
+            assert_eq!(b.resolution, Resolution::Resolved);
+            let range = &b.join.anchor.range;
+            (range.start, &source[range.start - 2..range.end], b.dispatch)
+        })
+        .collect();
+    dispatches.sort_by_key(|(start, _, _)| *start);
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    assert_eq!(
+        dispatches
+            .into_iter()
+            .map(|(_, text, dispatch)| (text, dispatch))
+            .collect::<Vec<_>>(),
+        [
+            ("w W", Constructor),
+            ("o.W", Constructor),
+            ("; W", Unknown),
+            ("; h", Direct),
+            ("o.h", Unknown),
+        ]
+    );
 }
 
 /// Adds an occurrence of the `nth` `needle` in `source`. `enclosing` is the byte length of the
@@ -1147,6 +1341,64 @@ fn complexity_fixtures() -> Vec<Fixture> {
             ("B.java".into(), other.into()),
         ],
         artifacts: vec![("java", vec![local_a, local_b])],
+    });
+
+    // Java overrides whose target method lives in another document: the global method
+    // summary, not the overriding document, supplies the target and its owner predicate.
+    let child = "class Child extends Base { void f() {} }";
+    let child_doc = |base_f: &str| {
+        let doc = DocSpec::new("A.java");
+        let doc = occ_at(doc, child, ("Child", 0), None, "pkg Child#", 1);
+        let doc = occ_at(doc, child, ("Base", 0), None, "pkg Base#", 8);
+        occ_at(doc, child, ("f", 0), None, "pkg Child#f().", 1)
+            .symbol("pkg Child#", 7, &["pkg Base#"])
+            .symbol("pkg Child#f().", 26, &[base_f])
+    };
+    let script_base = "class Base { f() {} }";
+    let script_doc = occ_at(
+        DocSpec::new("B.js"),
+        script_base,
+        ("Base", 0),
+        None,
+        "pkg Base#",
+        1,
+    );
+    let script_doc = occ_at(script_doc, script_base, ("f", 0), None, "pkg Base#f().", 1)
+        .symbol("pkg Base#", 7, &[])
+        .symbol("pkg Base#f().", 26, &[]);
+    fixtures.push(Fixture {
+        name: "java override owner in another language",
+        files: vec![
+            ("A.java".into(), child.into()),
+            ("B.js".into(), script_base.into()),
+        ],
+        artifacts: vec![
+            ("java", vec![child_doc("pkg Base#f().")]),
+            ("javascript", vec![script_doc]),
+        ],
+    });
+    // The foreign method's owner type is named by a different symbol, so its owner predicate
+    // fails and no override may be published. A lookup confined to the overriding document
+    // would miss the method and publish one.
+    let java_base = "class Base { void f() {} }";
+    let mismatched = occ_at(
+        DocSpec::new("B.java"),
+        java_base,
+        ("Base", 0),
+        None,
+        "pkg Other#",
+        1,
+    );
+    let mismatched = occ_at(mismatched, java_base, ("f", 0), None, "pkg Base#f().", 1)
+        .symbol("pkg Other#", 7, &[])
+        .symbol("pkg Base#f().", 26, &[]);
+    fixtures.push(Fixture {
+        name: "foreign java method owner predicate fails",
+        files: vec![
+            ("A.java".into(), child.into()),
+            ("B.java".into(), java_base.into()),
+        ],
+        artifacts: vec![("java", vec![child_doc("pkg Base#f()."), mismatched])],
     });
 
     let mut files = Vec::new();
@@ -1301,19 +1553,27 @@ fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
             let mutations = DestinationMutations::default();
             let codes = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
             let seen = codes.clone();
-            testing::before_join_closure(move |conn| {
-                let mut statement = conn.prepare("SELECT code FROM f_diag").unwrap();
-                let rows = statement
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .unwrap();
-                seen.borrow_mut().extend(rows.map(Result::unwrap));
+            // Captured diagnostics are document-local Common results; nothing persists them.
+            testing::observe_document_common(move |side, _document, facts, _conn| {
+                if side == 0 {
+                    seen.borrow_mut()
+                        .extend(facts.diagnostics.values().flatten().cloned());
+                }
             });
-            let (mut admitted, _, _) = world
-                .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
-                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            let joined = world.join_with(&descriptor, &BatchLimits::PRODUCTION, mutations);
+            testing::clear_document_common_observer();
+            let (mut admitted, sealed, _) =
+                joined.unwrap_or_else(|error| panic!("{case}: {error:#}"));
             let staged = testing::staged_publication(&mut admitted).unwrap();
-            let memory = world.memory_publication(&descriptor, mutations);
+            let rejoined = world.memory_rejoin(&descriptor, mutations).unwrap();
+            let memory = rejoined.publication;
             assert_same_publication(&staged, &memory, &case);
+            // The per-document tallies sum to the whole-corpus oracle's report counts.
+            assert_eq!(
+                report_tallies(sealed.report()),
+                report_tallies(&rejoined.report),
+                "{case}: report tallies"
+            );
             world
                 .full_validation(&descriptor, mutations, &staged)
                 .unwrap_or_else(|error| panic!("{case}: full validation: {error:#}"));
@@ -1351,6 +1611,22 @@ fn staged_and_memory_join_stores_agree_on_every_complexity_fixture() {
                         .any(|r| r.kind == trellis::semantic_evidence::RelationshipKind::Overrides),
                     "{case}"
                 );
+            }
+            let overrides: Vec<_> = staged
+                .type_relationships
+                .iter()
+                .filter(|r| r.kind == trellis::semantic_evidence::RelationshipKind::Overrides)
+                .collect();
+            if fixture.name == "java override owner in another language" {
+                assert_eq!(overrides.len(), 1, "{case}");
+                assert!(
+                    matches!(&overrides[0].target, trellis::semantic_evidence::Target::Internal { document, .. }
+                        if document.path == "B.js" && document.language == "javascript"),
+                    "{case}: {overrides:?}"
+                );
+            }
+            if fixture.name == "foreign java method owner predicate fails" {
+                assert!(overrides.is_empty(), "{case}: {overrides:?}");
             }
         }
     }
@@ -1404,6 +1680,139 @@ fn batch_memory_high_water_is_one_unit_not_the_corpus() {
     );
 }
 
+/// The unit-expansion budget bounds one document's working set plus the document cache, not
+/// the batch: documents that each fit join even when their charges sum past the budget, while
+/// one document that does not fit is still denied, typed.
+#[test]
+fn documents_that_each_fit_join_although_their_sum_exceeds_the_budget() {
+    const DOCUMENTS: usize = 24;
+    let source = calls_source(48, "\n");
+    let path = |n: usize| format!("src/D{n:02}.js");
+    let world = world(|root| {
+        for n in 0..DOCUMENTS {
+            write_files(root, &[(path(n).as_str(), source.as_str())]);
+        }
+    });
+    let docs = |count: usize| {
+        (0..count)
+            .map(|n| {
+                let mut doc = DocSpec::new(&path(n));
+                for (line, column) in positions(&source, "f()") {
+                    doc = doc.occurrence(
+                        &[line, column, column + 1],
+                        &[line, column, column + 3],
+                        "external pkg f.",
+                        0,
+                    );
+                }
+                doc
+            })
+            .collect::<Vec<_>>()
+    };
+    let run = |count: usize, limits: &BatchLimits| {
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", docs(count))]);
+        world
+            .join_with(&descriptor, limits, DestinationMutations::default())
+            .map(|(mut admitted, _, counters)| {
+                (
+                    testing::staged_publication(&mut admitted).unwrap(),
+                    counters,
+                )
+            })
+    };
+    let (_, one) = run(1, &BatchLimits::PRODUCTION).unwrap();
+    let peak = one.join_reservation_high_water_bytes;
+    assert!(peak > 0);
+    let (unbounded, many) = run(DOCUMENTS, &BatchLimits::PRODUCTION).unwrap();
+    assert_eq!(unbounded.call_bindings.len(), 48 * DOCUMENTS);
+    let mut limits = BatchLimits::PRODUCTION;
+    limits.unit_expansion_bytes = 3 * peak;
+    limits.document_cache_bytes = peak;
+    // Under the production cache bound the cache alone kept more live charge than the bounded
+    // budget allows: the bounded run fits only because its cache is held to its own bound.
+    assert!(
+        many.document_cache_high_water_bytes > limits.unit_expansion_bytes,
+        "fixture too small: {} vs {}",
+        many.document_cache_high_water_bytes,
+        limits.unit_expansion_bytes
+    );
+    let (bounded, counters) = run(DOCUMENTS, &limits).unwrap();
+    assert_same_publication(&bounded, &unbounded, "bounded budget");
+    assert!(counters.join_reservation_high_water_bytes <= limits.unit_expansion_bytes);
+    assert!(counters.document_cache_high_water_bytes <= limits.document_cache_bytes);
+    // One document larger than the whole budget is still refused, typed.
+    let mut tight = BatchLimits::PRODUCTION;
+    tight.unit_expansion_bytes = peak / 2;
+    let error = run(1, &tight)
+        .map(|_| ())
+        .expect_err("an oversized document is denied");
+    assert!(matches!(error.downcast_ref::<ScipCaptureError>(),
+        Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"));
+}
+
+/// One JavaScript document calling a function it declares `calls` times, once from each of
+/// as many small functions, with its batch.
+fn local_calls_world(calls: usize) -> (World, (PathBuf, String)) {
+    let mut source = "function f(){}\n".to_owned();
+    for n in 0..calls {
+        source.push_str(&format!("function g{n}(){{ f(); }}\n"));
+    }
+    let world = world(|root| write_files(root, &[("src/A.js", source.as_str())]));
+    let mut doc = DocSpec::new("src/A.js").occurrence(&[0, 9, 10], &[0, 0, 14], "pkg f.", 1);
+    for (line, column) in positions(&source, "f();") {
+        doc = doc.occurrence(
+            &[line, column, column + 1],
+            &[line, column, column + 3],
+            "pkg f.",
+            0,
+        );
+    }
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
+    (world, descriptor)
+}
+
+/// The join's live reservations track the Rust storage it really holds (owner ruling
+/// 2026-10-30, #394): the most this thread held at once during the join never exceeds the
+/// charged high water by more than a fixed 256 KiB, which covers the join's own Rust working
+/// state outside the budget's owners (SQL text, the row ledger, rusqlite's statement cache);
+/// and the charge is at most 1.25x that real peak. The fixture is one large document, so its
+/// owners dominate.
+#[test]
+fn live_reservations_track_the_joins_real_storage() {
+    for calls in [500, 4_000] {
+        let (world, descriptor) = local_calls_world(calls);
+        let mut admitted = world.admit(&descriptor).unwrap();
+        let limits = BatchLimits::PRODUCTION;
+        let mut budget = LookupBudget::new(&limits);
+        let mut counters = BatchCounters::default();
+        let destination = world.store.index_baseline().unwrap();
+        let (joined, real) = counting::peak(|| {
+            join_staged(
+                &mut admitted,
+                &world.store,
+                destination,
+                &limits,
+                &mut budget,
+                &mut counters,
+                DestinationMutations::default(),
+                &world.cancel,
+            )
+        });
+        joined.unwrap();
+        let publication = testing::staged_publication(&mut admitted).unwrap();
+        assert_eq!(publication.call_bindings.len(), calls);
+        let charged = counters.join_reservation_high_water_bytes;
+        assert!(
+            real <= charged + 256 * 1024,
+            "{calls} calls: real peak {real} above charged {charged}"
+        );
+        assert!(
+            charged * 4 <= real * 5,
+            "{calls} calls: charged {charged} vs real peak {real}"
+        );
+    }
+}
+
 fn split_definitions(world: &World, swap: bool) -> (PathBuf, String) {
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture();
@@ -1432,6 +1841,22 @@ fn cross_artifact_reference_resolves_internal_in_any_artifact_order() {
     let mut targets = vec![];
     for swap in [false, true] {
         let descriptor = split_definitions(&world, swap);
+        let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let observed = seen.clone();
+        testing::observe_document_common(move |side, document, facts, _conn| {
+            if document.path == "src/A.js" {
+                let reference = facts
+                    .references
+                    .iter()
+                    .find(|row| row.spelling == "target")
+                    .unwrap();
+                assert_eq!(reference.resolution, Resolution::Resolved);
+                assert!(
+                    matches!(&reference.declared_target, Some(trellis::semantic_evidence::Target::Internal { document, .. }) if document.path == "src/B.js")
+                );
+                observed.lock().unwrap().insert(side);
+            }
+        });
         let (mut admitted, _, _) = world
             .join_with(
                 &descriptor,
@@ -1439,6 +1864,11 @@ fn cross_artifact_reference_resolves_internal_in_any_artifact_order() {
                 DestinationMutations::default(),
             )
             .unwrap();
+        testing::clear_document_common_observer();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            std::collections::BTreeSet::from([0, 1])
+        );
         let publication = testing::staged_publication(&mut admitted).unwrap();
         let reference = target_reference(&publication);
         assert_eq!(
@@ -1453,6 +1883,159 @@ fn cross_artifact_reference_resolves_internal_in_any_artifact_order() {
         targets[0],
         Some(trellis::semantic_evidence::Target::Internal { .. })
     ));
+}
+
+#[test]
+fn native_join_reservation_rejects_before_document_loading() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let mut admitted = world.admit(&descriptor).unwrap();
+    let mut limits = BatchLimits::PRODUCTION;
+    limits.unit_expansion_bytes = 1;
+    let mut budget = LookupBudget::new(&limits);
+    let mut counters = BatchCounters::default();
+    testing::reset_native_document_loads();
+    let error = join_staged(
+        &mut admitted,
+        &world.store,
+        world.store.index_baseline().unwrap(),
+        &limits,
+        &mut budget,
+        &mut counters,
+        DestinationMutations::default(),
+        &world.cancel,
+    )
+    .unwrap_err();
+    assert!(matches!(error.downcast_ref::<ScipCaptureError>(),
+        Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"));
+    assert_eq!(testing::native_document_loads(), 0);
+    let mut budget = LookupBudget::new(&BatchLimits::PRODUCTION);
+    join_staged(
+        &mut admitted,
+        &world.store,
+        world.store.index_baseline().unwrap(),
+        &BatchLimits::PRODUCTION,
+        &mut budget,
+        &mut counters,
+        DestinationMutations::default(),
+        &world.cancel,
+    )
+    .unwrap();
+    assert!(testing::native_document_loads() > 0);
+    assert!(counters.join_reservation_high_water_bytes > 0);
+    assert!(
+        counters.join_reservation_high_water_bytes <= BatchLimits::PRODUCTION.unit_expansion_bytes
+    );
+}
+
+#[test]
+fn streaming_common_uses_only_final_eligible_presence() {
+    for definitions in [false, true] {
+        let world = definitions_world();
+        let (a, _) = definitions_docs();
+        let b = if definitions {
+            DocSpec::new("src/B.js").occurrence(&[0, 9, 15], &[], "pkg target.", 1)
+        } else {
+            DocSpec::new("src/B.js").symbol("pkg target.", 17, &[])
+        };
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+        write_files(
+            &world.root,
+            &[("src/B.js", "function target(){ return 1; }\n")],
+        );
+        world.republish();
+        let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let observed = seen.clone();
+        testing::observe_document_common(move |side, document, facts, conn| {
+            if document.path != "src/A.js" {
+                return;
+            }
+            // Presence is read from the admitted claims: all of them for the captured side,
+            // those of eligible documents for the destination.
+            let presence: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM claims c WHERE symbol='pkg target.' AND (?1=0 OR EXISTS \
+                     (SELECT 1 FROM w_docs w WHERE w.source_ord=c.source_ord AND w.eligible=1 AND w.failed=0))",
+                    [side],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(presence, if side == 0 { 1 } else { 0 });
+            let reference = facts
+                .references
+                .iter()
+                .find(|row| row.spelling == "target")
+                .unwrap();
+            assert_eq!(
+                reference.resolution,
+                if side == 0 {
+                    Resolution::Unresolved
+                } else {
+                    Resolution::External
+                }
+            );
+            observed.lock().unwrap().insert(side);
+        });
+        world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        testing::clear_document_common_observer();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            std::collections::BTreeSet::from([0, 1])
+        );
+    }
+}
+
+#[test]
+fn streaming_exact_definition_authority_survives_incompatible_common_kind() {
+    let world = world(|root| write_files(root, &[("J.java", "class A {}\n")]));
+    let doc = DocSpec::new("J.java")
+        .occurrence(&[0, 6, 7], &[], "pkg A#", 1)
+        .symbol("pkg A#", 26, &[]);
+    let descriptor = one_artifact_per_language(&world, vec![("java", vec![doc])]);
+    let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let observed = seen.clone();
+    testing::observe_document_common(move |side, document, facts, conn| {
+        if document.path != "J.java" {
+            return;
+        }
+        // A shared pin keeps one side of global rows: side 1 reads side 0's eligible rows.
+        let exact: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM g_definitions g WHERE side=0 AND symbol='pkg A#' AND common_compatible=0 \
+             AND (?1=0 OR EXISTS (SELECT 1 FROM w_docs w WHERE w.source_ord=g.owner_doc AND w.eligible=1 AND w.failed=0))",
+            [side], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(exact, 1);
+        let side_one: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM g_definitions WHERE side=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(side_one, 0);
+        assert_eq!(facts.declaration_bindings.len(), 1);
+        assert!(facts.declaration_bindings[0].syntax_id.is_some());
+        assert!(facts.symbols.iter().all(|row| row.declarations.is_empty()));
+        observed.lock().unwrap().insert(side);
+    });
+    world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    testing::clear_document_common_observer();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        std::collections::BTreeSet::from([0, 1])
+    );
 }
 
 #[test]
@@ -1506,8 +2089,13 @@ fn duplicate_symbol_key_within_one_artifact_is_rejected_typed() {
         )
         .map(|_| ())
         .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("duplicate semantic symbol key"),
+    // A producer artifact error, typed (#394: rust-analyzer gives `crate/` and `main().` to
+    // every Cargo target), not an internal one.
+    assert_eq!(
+        error.downcast_ref::<ScipCaptureError>(),
+        Some(&ScipCaptureError::InvalidArtifact(
+            "duplicate semantic symbol key".into()
+        )),
         "{error:#}"
     );
 }
@@ -1517,25 +2105,31 @@ fn forged_derived_from_is_rejected_before_publication() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
-    testing::before_join_closure(|conn| {
-        conn.execute(
-            "UPDATE out_provenance SET derived_digest=?1 WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
-            ["0".repeat(64)],
-        )
-        .unwrap();
-    });
-    let error = world
-        .join_with(
-            &descriptor,
-            &BatchLimits::PRODUCTION,
-            DestinationMutations::default(),
-        )
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("derived provenance without staged claim"),
-        "{error:#}"
-    );
+    // A provenance row names its raw claim by ID: a missing claim, a claim of another
+    // document and an unknown evidence kind are each rejected by the closure.
+    for sql in [
+        "UPDATE out_provenance SET claim_id=-1 WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
+        "UPDATE out_provenance SET claim_id=(SELECT c.claim_id FROM claims c JOIN sources s ON s.ord=c.source_ord \
+         JOIN out_coverage v ON v.ord=out_provenance.doc WHERE s.path<>v.path LIMIT 1) \
+         WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
+        "UPDATE out_provenance SET kind=7 WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
+    ] {
+        testing::before_join_closure(move |conn| {
+            assert_eq!(conn.execute(sql, []).unwrap(), 1, "{sql}");
+        });
+        let error = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("derived provenance without staged claim"),
+            "{sql}: {error:#}"
+        );
+    }
 }
 
 type RowEdit = fn(&mut Value);
@@ -1666,13 +2260,100 @@ fn staged_rows_run_the_row_local_validators() {
 }
 
 #[test]
+fn compact_output_rows_decode_to_the_publication_and_corruption_is_typed() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let decoded = testing::staged_publication(&mut admitted).unwrap();
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&decoded, &memory, "compact rows");
+    {
+        let conn = admitted.stage_mut().conn().unwrap();
+        // IDs are stored as their bytes, a fact body without its provenance ID, and one
+        // provenance template per document.
+        let (blobs, empty, templates, documents): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM out_provenance WHERE typeof(id)='blob' AND length(id)=32), \
+                 (SELECT COUNT(*) FROM out_references WHERE json_extract(body,'$.provenanceId')=''), \
+                 (SELECT COUNT(*) FROM out_coverage WHERE provenance IS NOT NULL), \
+                 (SELECT COUNT(DISTINCT doc) FROM out_provenance)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(blobs as usize, decoded.provenance.len());
+        assert_eq!(empty as usize, decoded.references.len());
+        assert_eq!(templates, documents);
+    }
+    // Each defect is a typed read failure, never a partial publication.
+    for (sql, message) in [
+        (
+            "UPDATE out_symbols SET doc=doc+100",
+            "staged row without coverage",
+        ),
+        (
+            "UPDATE out_references SET doc=-1 WHERE ord=(SELECT MAX(ord) FROM out_references)",
+            "staged output order",
+        ),
+        (
+            "UPDATE out_coverage SET provenance=NULL",
+            "staged provenance without template",
+        ),
+        (
+            "UPDATE out_provenance SET id=x'00' WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_provenance SET kind=9 WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_references SET provenance_id=x'0102' WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_symbols SET body=json_set(body,'$.provenanceId','x') WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_coverage SET provenance=json_set(provenance,'$.id','x') WHERE provenance IS NOT NULL",
+            "staged output row",
+        ),
+    ] {
+        let (mut admitted, _, _) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let changed = admitted
+            .stage_mut()
+            .conn()
+            .unwrap()
+            .execute(sql, [])
+            .unwrap();
+        assert!(changed > 0, "{sql}");
+        let error = testing::staged_publication(&mut admitted).unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{sql}: {error:#}");
+    }
+}
+
+#[test]
 fn staged_closure_rejects_cross_row_defects() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
     let cases: [(&str, &str, &str); 3] = [
         (
-            "INSERT INTO out_declaration_bindings SELECT (SELECT MAX(ord)+1 FROM out_declaration_bindings), provenance_id, body \
+            "INSERT INTO out_declaration_bindings SELECT (SELECT MAX(ord)+1 FROM out_declaration_bindings), doc, provenance_id, body \
              FROM out_declaration_bindings WHERE ord=(SELECT MIN(ord) FROM out_declaration_bindings)",
             "duplicate declaration binding fact",
             "duplicate binding",
@@ -1683,7 +2364,7 @@ fn staged_closure_rejects_cross_row_defects() {
             "proof on failed coverage",
         ),
         (
-            "UPDATE out_provenance SET body=json_set(body,'$.contentHash',?1)",
+            "UPDATE out_coverage SET provenance=json_set(provenance,'$.contentHash',?1) WHERE provenance IS NOT NULL",
             "captured proof document hash mismatch",
             "hash mismatch",
         ),
@@ -1717,16 +2398,28 @@ fn lookup_staged_row_and_output_limits_are_typed() {
             (|l: &mut BatchLimits| l.lookup_steps = 3) as fn(&mut BatchLimits),
         ),
         ("staged rows", |l| l.staged_rows = 5),
-        ("output bytes", |l| l.output_bytes = 10),
     ] {
         let mut limits = BatchLimits::PRODUCTION;
         edit(&mut limits);
         let error = world
             .join_with(&descriptor, &limits, DestinationMutations::default())
             .map(|_| ())
-            .unwrap_err();
+            .expect_err(name);
         assert_eq!(detail(&error), name, "{error:#}");
     }
+    // The compact rows of two small documents fit the pages the stage schema already holds,
+    // so the physical output meter is exercised on a batch whose rows grow the stage file.
+    let mixed = mixed_language_world();
+    let mixed_descriptor = mixed_language_batch(&mixed);
+    let limits = BatchLimits {
+        output_bytes: 10,
+        ..BatchLimits::PRODUCTION
+    };
+    let error = mixed
+        .join_with(&mixed_descriptor, &limits, DestinationMutations::default())
+        .map(|_| ())
+        .expect_err("output bytes");
+    assert_eq!(detail(&error), "output bytes", "{error:#}");
     let mut counters = BatchCounters::default();
     let mut admitted = world
         .stage(&descriptor, &BatchLimits::PRODUCTION, &mut counters)
@@ -1801,6 +2494,288 @@ fn a_new_destination_clears_the_destination_tables() {
     let (coverage_after, provenance_after) = rows(&mut admitted);
     assert_eq!(coverage_after, coverage + 1);
     assert_eq!(provenance_after, provenance);
+}
+
+#[test]
+fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    for changed in [false, true] {
+        if changed {
+            write_files(&world.root, &[("src/C.js", "function other(){ }\n")]);
+            world.republish();
+        }
+        let (mut admitted, _, counters) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let ledger = &counters.staged_row_attempts;
+        let owners = [
+            "seed:retained-native",
+            "nat_docs",
+            "nat_declarations",
+            "g_definitions",
+            "g_callables",
+            "g_methods",
+            "w_docs",
+            "out_coverage",
+            "out_provenance",
+            "out_symbols",
+            "out_declaration_bindings",
+            "out_references",
+            "out_call_bindings",
+            "out_type_relationships",
+        ];
+        assert!(
+            ledger.keys().all(|owner| owners.contains(&owner.as_str())),
+            "changed {changed}: {ledger:?}"
+        );
+        let conn = admitted.stage_mut().conn().unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            tables.iter().all(|t| !t.starts_with("f_")
+                && !t.starts_with("ix_")
+                && (!t.starts_with("w_") || t == "w_docs")),
+            "no whole-corpus mirror table: {tables:?}"
+        );
+        // Each final row is one charged insertion; the decision table holds one row per
+        // captured document.
+        for table in owners
+            .iter()
+            .filter(|o| o.starts_with("out_") || **o == "w_docs")
+        {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                ledger.get(*table).copied().unwrap_or(0),
+                rows as u64,
+                "changed {changed}: {table}"
+            );
+        }
+        let captured_documents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nat_docs WHERE rev=0", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ledger["w_docs"], captured_documents as u64);
+        assert!(ledger["out_references"] > 0 && ledger["out_provenance"] > 0);
+        // A shared pin writes no destination-side global rows: its eligible context is the
+        // eligible view of the captured rows. A changed destination is discovered again.
+        let side_one: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM g_definitions WHERE side=1) + (SELECT COUNT(*) FROM g_methods WHERE side=1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(side_one > 0, changed, "changed {changed}");
+        // Declaration status covers exact-definition targets only (this fixture has no
+        // duplicate syntax IDs), never every native declaration. A shared pin keeps the
+        // captured status of its targets. An unshared pin keeps the destination status of
+        // every captured or destination target, and captured status only for destination
+        // targets that are not captured ones (none here).
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        let captured_status = count("SELECT COUNT(*) FROM nat_declarations WHERE rev=0");
+        let destination_status = count("SELECT COUNT(*) FROM nat_declarations WHERE rev=1");
+        let captured_targets = count(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions WHERE side=0)",
+        );
+        let all_targets =
+            count("SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions)");
+        let other_targets = count(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions g WHERE side=1 \
+             AND NOT EXISTS (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
+             AND c.syntax_id=g.syntax_id))",
+        );
+        assert!(captured_targets > 0);
+        if changed {
+            assert_eq!(
+                (captured_status, destination_status),
+                (other_targets, all_targets),
+                "changed"
+            );
+            assert_eq!(other_targets, 0);
+        } else {
+            assert_eq!((captured_status, destination_status), (captured_targets, 0));
+        }
+        // Native status is rewritten every attempt; only the document inventory is retained.
+        let retained: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nat_docs", [], |row| row.get(0))
+            .unwrap();
+        assert!(retained > 0);
+        assert_eq!(
+            ledger["nat_declarations"],
+            (captured_status + destination_status) as u64,
+            "changed {changed}"
+        );
+    }
+}
+
+/// An unshared pin keeps destination declaration status only for exact-definition targets.
+/// Each case changes the destination's declarations between the pins (a target renamed, moved,
+/// removed, its referrer edited, or a competing declaration added) and the staged publication
+/// must still equal the independent memory join, with the same report and full validation.
+#[test]
+fn unshared_target_status_matches_memory_when_destination_declarations_change() {
+    type Files = &'static [(&'static str, &'static str)];
+    let edits: [(&str, Files, &[&str]); 6] = [
+        (
+            "target renamed",
+            &[("src/B.js", "function other(){ }\n")],
+            &[],
+        ),
+        (
+            "target moved",
+            &[("src/B.js", "\n\nfunction target(){ }\n")],
+            &[],
+        ),
+        ("target removed", &[], &["src/B.js"]),
+        (
+            "referrer edited",
+            &[("src/A.js", "function run(){ target(); }\n// edit\n")],
+            &[],
+        ),
+        (
+            "competing declaration",
+            &[("src/C.js", "function target(){ }\n")],
+            &[],
+        ),
+        // Unchanged sources, but the destination measures B's target under another syntax
+        // ID: a destination-only target whose captured status the remaining pass writes.
+        (
+            "target re-measured",
+            &[("src/C.js", "function other(){ }\n")],
+            &[],
+        ),
+    ];
+    for (case, writes, removals) in edits {
+        let world = definitions_world();
+        let (a, b) = definitions_docs();
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+        write_files(&world.root, writes);
+        for path in removals {
+            fs::remove_file(world.root.join(path)).unwrap();
+        }
+        world.republish();
+        let mutations = DestinationMutations {
+            renamed_b_target: case == "target re-measured",
+            ..Default::default()
+        };
+        let (mut admitted, sealed, counters) = world
+            .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let rejoined = world.memory_rejoin(&descriptor, mutations).unwrap();
+        assert_same_publication(&staged, &rejoined.publication, case);
+        assert_eq!(
+            report_tallies(sealed.report()),
+            report_tallies(&rejoined.report),
+            "{case}: report tallies"
+        );
+        let full = world.full_validation(&descriptor, mutations, &staged);
+        let reference = world.full_validation(&descriptor, mutations, &rejoined.publication);
+        assert_eq!(
+            full.is_ok(),
+            reference.is_ok(),
+            "{case}: {full:?} {reference:?}"
+        );
+        // The status rows are bounded by the targets: each one names a target key.
+        let conn = admitted.stage_mut().conn().unwrap();
+        let (status, keyed): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM g_definitions g \
+                 JOIN sources s ON s.ord=g.owner_doc JOIN nat_docs d ON d.language=s.language \
+                 AND d.path=s.path WHERE d.rev=n.rev AND d.ord=n.doc_ord AND g.syntax_id=n.syntax_id)) \
+                 FROM nat_declarations n",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, keyed, "{case}");
+        assert_eq!(
+            counters.staged_row_attempts["nat_declarations"], status as u64,
+            "{case}"
+        );
+        let destination_only: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM g_definitions g WHERE side=1 AND NOT EXISTS \
+                 (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
+                 AND c.syntax_id=g.syntax_id)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(destination_only > 0, case == "target re-measured", "{case}");
+    }
+}
+
+/// On a shared pin eligibility and settlement run as one walk that assumes every document with
+/// claims is eligible. Whichever document breaks the assumption, the result must equal the
+/// separate passes', and the discarded rows stay charged.
+#[test]
+fn fused_settlement_falls_back_to_the_separate_passes_exactly() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let run = |separate: bool, failed: Option<&str>| {
+        testing::separate_settlement(separate);
+        testing::fail_eligibility_of(failed);
+        let result = world.join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        );
+        testing::separate_settlement(false);
+        testing::fail_eligibility_of(None);
+        let (mut admitted, sealed, counters) = result.unwrap();
+        let publication = testing::staged_publication(&mut admitted).unwrap();
+        let conn = admitted.stage_mut().conn().unwrap();
+        let coverage: i64 = conn
+            .query_row("SELECT COUNT(*) FROM out_coverage", [], |row| row.get(0))
+            .unwrap();
+        (
+            publication,
+            sealed.report().clone(),
+            counters.staged_row_attempts["out_coverage"],
+            coverage as u64,
+        )
+    };
+    for failed in [None, Some("src/A.js"), Some("src/B.js")] {
+        let case = format!("{failed:?}");
+        let (fused, fused_report, fused_attempts, rows) = run(false, failed);
+        let (separate, separate_report, separate_attempts, separate_rows) = run(true, failed);
+        assert_same_publication(&fused, &separate, &case);
+        assert_eq!(fused_report, separate_report, "{case}");
+        assert_eq!((rows, separate_rows), (2, 2), "{case}");
+        assert_eq!(separate_attempts, 2, "{case}");
+        // A.js settles first: when B.js fails, A.js's settled rows were discarded but stay
+        // charged. When A.js fails, nothing was settled before the assumption broke.
+        let discarded = u64::from(failed == Some("src/B.js"));
+        assert_eq!(fused_attempts, 2 + discarded, "{case}");
+        if failed.is_none() {
+            assert!(fused.references.iter().any(|r| r.spelling == "target"));
+        } else {
+            assert!(
+                fused
+                    .coverage
+                    .iter()
+                    .any(|c| c.state == trellis::semantic_evidence::CoverageState::Failed)
+            );
+        }
+    }
 }
 
 #[test]
@@ -2201,6 +3176,11 @@ fn real_module_marker_batch(language: &str) {
     let (files, a, b, marker_symbols) = match language {
         "javascript" => (
             vec![
+                // The producer fixture's package root names its module markers (#443).
+                (
+                    "package.json",
+                    "{\"name\":\"trellis-producer-fixture-js\",\"version\":\"1.0.0\"}\n",
+                ),
                 (
                     "src/a.js",
                     "export function greet(name) {\n  return \"hello \" + name;\n}\n",
@@ -2436,6 +3416,240 @@ fn real_module_marker_batch(language: &str) {
 #[test]
 fn real_typescript_empty_module_markers_publish_and_rejoin_without_measured_anchors() {
     real_module_marker_batch("javascript");
+}
+
+/// Real scip-typescript 0.4.0 bytes for issue #444: its reference occurrences carry no
+/// enclosing range, and calls bind at their exact measured callee spans on both join paths.
+#[test]
+fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue444-javascript-calls");
+    let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
+    let (lib, main) = (read("src/lib.js"), read("src/main.js"));
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/lib.js", &lib),
+                ("src/main.js", &main),
+                // The fixture's package root names its module markers (#443).
+                (
+                    "package.json",
+                    r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+                ),
+            ],
+        )
+    });
+    let mut fixture = world.fixture().reference("scip-typescript");
+    let ordinal = fixture.artifact(
+        "javascript",
+        vec![DocSpec::new("src/lib.js"), DocSpec::new("src/main.js")],
+    );
+    fixture.override_artifact_raw(ordinal, fs::read(fixture_dir.join("index.scip")).unwrap());
+    let descriptor = world.write(&fixture);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&staged, &memory, "real scip-typescript calls");
+    // Callee and dispatch (owner ruling 2026-10-30, #470): plain calls of free functions,
+    // the imported `helper` included, are direct. scip-typescript's constructor and method
+    // symbols bind no target (kind 0 fails the method-kind check), so they stay unknown.
+    let callees = |bindings: &[trellis::semantic_evidence::CallBinding]| {
+        let mut callees: Vec<_> = bindings
+            .iter()
+            .map(|binding| {
+                let range = &binding.join.anchor.range;
+                assert!(binding.call_id.is_some());
+                (&main[range.start..range.end], binding.dispatch)
+            })
+            .collect();
+        callees.sort_by_key(|(callee, _)| *callee);
+        callees
+    };
+    {
+        use trellis::semantic_evidence::Dispatch::{Direct, Unknown};
+        assert_eq!(
+            callees(&staged.call_bindings),
+            [
+                ("Widget", Unknown),
+                ("helper", Direct),
+                ("plain", Direct),
+                ("plain", Direct),
+                ("register", Direct),
+                ("run", Unknown),
+            ]
+        );
+    }
+    let helper = staged
+        .call_bindings
+        .iter()
+        .find(|binding| {
+            let range = &binding.join.anchor.range;
+            &main[range.start..range.end] == "helper"
+        })
+        .unwrap();
+    assert_eq!(helper.resolution, Resolution::Resolved);
+
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    assert_eq!(published.call_bindings.len(), 6);
+    // An unrelated edit rejoins every unchanged call binding at the new revision.
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    let head = world.store.index_baseline().unwrap();
+    assert_eq!(
+        callees(&world.store.semantic_at(head).unwrap().call_bindings),
+        callees(&staged.call_bindings)
+    );
+}
+
+/// Real scip-typescript 0.4.0 bytes for issue #466 (`index` with the fixture's `tsconfig.json`,
+/// producer metadata dropped). `new Set(..)` names four merged lib declarations and `Error(..)`
+/// two, so each call publishes one ambiguous row per occurrence, all sharing its `call_id`.
+/// The call graph, sequence and line navigation read them as one ambiguous call carrying the
+/// whole candidate union, without failing or scheduling recovery.
+#[test]
+fn real_typescript_ambiguous_calls_read_as_one_edge_with_the_union() {
+    use trellis::graph_query::{BoundaryReason, GraphQuery, Visit};
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue466-ambiguous-calls");
+    let main = fs::read_to_string(fixture_dir.join("src/main.js")).unwrap();
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/main.js", &main),
+                (
+                    "package.json",
+                    r#"{"name":"issue466-fixture","version":"1.0.0"}"#,
+                ),
+            ],
+        )
+    });
+    let mut fixture = world.fixture().reference("scip-typescript");
+    let ordinal = fixture.artifact("javascript", vec![DocSpec::new("src/main.js")]);
+    fixture.override_artifact_raw(ordinal, fs::read(fixture_dir.join("index.scip")).unwrap());
+    let descriptor = world.write(&fixture);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let published = world.store.semantic_at(pin).unwrap();
+    let rows_of = |callee: &str| -> Vec<_> {
+        published
+            .call_bindings
+            .iter()
+            .filter(|b| {
+                let range = &b.join.anchor.range;
+                &main[range.start..range.end] == callee
+            })
+            .collect()
+    };
+    for (callee, count) in [("Set", 4), ("Error", 2)] {
+        let rows = rows_of(callee);
+        assert_eq!(rows.len(), count, "{callee} rows");
+        // Plain-call shape, but ambiguous: never direct (#470).
+        assert!(rows.iter().all(|b| b.resolution == Resolution::Ambiguous
+            && b.call_id == rows[0].call_id
+            && b.candidates.len() == count
+            && b.dispatch == trellis::semantic_evidence::Dispatch::Unknown));
+    }
+    let producer = published.producers[0].id.clone();
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let caller = native
+        .declarations
+        .iter()
+        .find(|d| d.name.as_deref() == Some("caller"))
+        .unwrap()
+        .syntax_id
+        .clone();
+
+    let answer = world
+        .store
+        .evidence_response()
+        .unwrap()
+        .graph_query(
+            &GraphQuery {
+                root_syntax_id: caller.clone(),
+                semantic_producer_id: Some(producer.clone()),
+                depth: 2,
+                max_nodes: 150,
+                max_calls: 500,
+                include_external: true,
+                include_tests: true,
+            },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    let graph = answer.outcome.expect("contract success");
+    let ambiguous: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|e| e.boundary_reason == BoundaryReason::Ambiguous)
+        .collect();
+    assert_eq!(ambiguous.len(), 2);
+    for edge in &ambiguous {
+        assert_eq!(edge.visit, Visit::Boundary);
+        let binding = edge.binding.as_ref().unwrap();
+        let callee = &main[binding.join.anchor.range.start..binding.join.anchor.range.end];
+        let rows = rows_of(callee);
+        let lowest = rows.iter().map(|b| &b.provenance_id).min().unwrap();
+        assert_eq!(&binding.provenance_id, lowest, "{callee}");
+        assert_eq!(binding.candidates, rows[0].candidates, "{callee}");
+        for row in &rows {
+            assert!(
+                graph.provenance.iter().any(|p| p.id == row.provenance_id),
+                "{callee} proof"
+            );
+        }
+    }
+
+    let view = world
+        .store
+        .sequence_at(&caller, pin, false)
+        .unwrap()
+        .unwrap();
+    fn ambiguous_steps(steps: &[trellis::behavior::SequenceStep]) -> usize {
+        steps
+            .iter()
+            .map(|step| {
+                usize::from(step.call_evidence.as_ref().is_some_and(|e| {
+                    e.boundary_reason == BoundaryReason::Ambiguous
+                        && e.resolution == Some(Resolution::Ambiguous)
+                })) + ambiguous_steps(&step.children)
+                    + ambiguous_steps(&step.alternate)
+            })
+            .sum()
+    }
+    assert_eq!(ambiguous_steps(&view.steps), 2);
+    assert_eq!(view.semantic_warnings, graph.warnings);
+    for line in 1..=3 {
+        world
+            .store
+            .navigation_at(
+                &serde_json::from_value(json!({"expectedRevision":pin,"path":"src/main.js",
+                    "line":line,"semanticProducerId":producer}))
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    assert!(!world.store.recovery_pending_for_tests());
 }
 
 #[test]
@@ -3117,6 +4331,43 @@ fn cancelled_publication_changes_nothing() {
     assert_nothing_published(&world, joined.destination_pin());
 }
 
+/// A provenance row whose raw claim vanished after the seal is a corrupt stage: publication
+/// fails typed and rolls back, never publishing the document without that row and its facts.
+#[test]
+fn provenance_row_without_its_claim_after_the_seal_rolls_back() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let removed = admitted
+        .stage_mut()
+        .conn()
+        .unwrap()
+        .execute(
+            "DELETE FROM claims WHERE claim_id=(SELECT claim_id FROM out_provenance ORDER BY ord LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(removed, 1);
+    admitted.stage_mut().release_connection();
+    let leader = world.store.publication_for_tests().unwrap();
+    let head = joined.destination_pin();
+    let error = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("staged provenance without claim"),
+        "{error:#}"
+    );
+    assert_nothing_published(&world, head);
+}
+
 #[test]
 fn ambiguous_commit_is_resolved_from_durable_state() {
     use trellis::store::BatchPublishFault;
@@ -3272,9 +4523,10 @@ fn publication_statements_use_the_stage_indexes() {
             .unwrap()
             .map(Result::unwrap)
             .collect();
+        // No statement sorts: raw rows follow their staged table, and every output family is
+        // read by one cursor in `ord` (rowid) order.
         assert!(
-            plan.iter()
-                .all(|step| !step.contains("TEMP B-TREE") || sql.contains("provenance_id IN")),
+            plan.iter().all(|step| !step.contains("TEMP B-TREE")),
             "{sql}: {plan:?}"
         );
         // Joined stage tables are searched by key, never scanned per driving row. The ordinal
@@ -3289,19 +4541,10 @@ fn publication_statements_use_the_stage_indexes() {
             })
             .collect();
         assert!(scans.len() <= 1, "{sql}: {plan:?}");
-        if sql.contains("out_provenance") && !sql.contains("INSERT") {
+        if sql.contains("out_provenance") {
             assert!(
                 plan.iter()
-                    .any(|step| step.contains("out_provenance_document")
-                        || step.contains("out_provenance_provenance_id")
-                        || step.contains("sqlite_autoindex_out_provenance")),
-                "{sql}: {plan:?}"
-            );
-        }
-        if sql.contains("provenance_id IN") {
-            assert!(
-                plan.iter().any(|step| step.contains("_provenance (")
-                    || step.contains("USING INDEX out_")),
+                    .any(|step| step.starts_with("SEARCH c USING INTEGER PRIMARY KEY")),
                 "{sql}: {plan:?}"
             );
         }
@@ -3458,7 +4701,7 @@ fn cross_row_defects_are_rejected_by_whole_publication_validation_on_both_paths(
         ),
         (
             "freshness differs from the independent recomputation",
-            "UPDATE out_provenance SET body=json_set(body,'$.freshness','stale')",
+            "UPDATE out_coverage SET provenance=json_set(provenance,'$.freshness','stale') WHERE provenance IS NOT NULL",
             |publication| {
                 for proof in &mut publication.provenance {
                     proof.freshness = Freshness::Stale;
@@ -3534,4 +4777,1786 @@ fn an_invalid_destination_is_rejected_for_both_outputs_by_whole_publication_vali
             "{error:#}"
         );
     }
+}
+
+// Real scip-typescript 0.4.0 output (`index --infer-tsconfig`) for the workspace in
+// `tests/fixtures/scip-module-roots/workspace`. Only its Metadata unit was dropped, so the
+// document units are the producer's exact bytes; `module_roots_artifact` re-adds metadata for
+// the test workspace. The producer names `src/a.js` relative to the project root
+// (`. . src/`a.js`/`) and `tools/x/lib/c.js` relative to its nearest package root
+// (`@fixture/x 2.0.0 lib/`c.js`/`), per owner ruling 2026-10-29 (#443).
+const MODULE_ROOTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-module-roots"
+);
+const PROJECT_MARKER: &str = "scip-typescript npm . . src/`a.js`/";
+const NESTED_MARKER: &str = "scip-typescript npm @fixture/x 2.0.0 lib/`c.js`/";
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn module_roots_world(edit: impl FnOnce(&Path)) -> World {
+    world(|root| {
+        copy_tree(&Path::new(MODULE_ROOTS).join("workspace"), root);
+        edit(root);
+    })
+}
+
+fn module_roots_artifact(world: &World) -> Vec<u8> {
+    let mut index = scip::types::Index::new();
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "scip-typescript".into();
+    tool.version = "0.4.0".into();
+    metadata.tool_info = Some(tool).into();
+    index.metadata = Some(metadata).into();
+    let mut bytes = index.write_to_bytes().unwrap();
+    bytes.extend(fs::read(Path::new(MODULE_ROOTS).join("documents.scip")).unwrap());
+    bytes
+}
+
+fn module_roots_batch(world: &World, artifact: Vec<u8>) -> (PathBuf, String) {
+    let mut fixture = world.fixture().reference("scip-typescript");
+    let docs = fixture.paths("javascript");
+    assert_eq!(docs.len(), 3);
+    let ordinal = fixture.artifact("javascript", docs);
+    fixture.override_artifact_raw(ordinal, artifact);
+    world.write(&fixture)
+}
+
+fn marker_claims(world: &World, descriptor: &(PathBuf, String)) -> Vec<(String, String, u64)> {
+    let mut markers: Vec<_> = world
+        .memory_admission(descriptor)
+        .merged
+        .claims
+        .iter()
+        .filter(|claim| claim.envelope.record_kind == "occurrence")
+        .filter(|claim| claim.envelope.raw["range"]["values"] == json!([0, 0, 0]))
+        .map(|claim| {
+            (
+                claim.envelope.relative_path.clone(),
+                claim.envelope.raw["symbol"].as_str().unwrap().to_owned(),
+                claim.envelope.raw["symbolRoles"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    markers.sort();
+    markers
+}
+
+#[test]
+fn real_typescript_project_and_package_relative_markers_publish_and_rejoin() {
+    let world = module_roots_world(|_| {});
+    let descriptor = module_roots_batch(&world, module_roots_artifact(&world));
+    assert_eq!(
+        marker_claims(&world, &descriptor),
+        [
+            ("src/a.js".into(), PROJECT_MARKER.into(), 1),
+            (
+                "src/b.js".into(),
+                "scip-typescript npm . . src/`b.js`/".into(),
+                1
+            ),
+            ("tools/x/lib/c.js".into(), NESTED_MARKER.into(), 1),
+        ]
+    );
+    // The in-memory oracle and the staged batch join build the same publication.
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    assert_same_publication(&staged, &memory, "module roots");
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    for marker in [PROJECT_MARKER, NESTED_MARKER] {
+        let symbol = published
+            .symbols
+            .iter()
+            .find(|row| row.key.symbol == marker)
+            .unwrap();
+        assert!(
+            symbol.declarations.is_empty(),
+            "{marker} is not a measured name"
+        );
+    }
+    assert!(
+        published
+            .references
+            .iter()
+            .any(|row| row.spelling == "greet"),
+        "ordinary facts in the same documents still join"
+    );
+    // Stored-original rejoin re-decodes the artifact against the retained package roots.
+    let proofs = stored_proofs(&world);
+    drop(admitted);
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(stored_proofs(&world), proofs);
+}
+
+/// The batch and the in-memory oracle both reject `descriptor` with a typed artifact error
+/// and publish nothing.
+fn assert_module_marker_rejected(world: &World, descriptor: &(PathBuf, String), case: &str) {
+    let head = world.store.index_baseline().unwrap();
+    let memory = world
+        .try_memory_admission(descriptor)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(memory, ScipCaptureError::InvalidArtifact(_)),
+        "{case}: memory {memory:?}"
+    );
+    let error = world.publish(descriptor).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::InvalidArtifact(_))
+        ),
+        "{case}: batch {error:#}"
+    );
+    assert_nothing_published(world, head);
+    assert!(world.stage_dirs().is_empty(), "{case}");
+}
+
+#[test]
+fn real_typescript_markers_reject_without_their_authenticated_package_root() {
+    let nested = "tools/x/package.json";
+    for (case, path, manifest) in [
+        (
+            "other package name",
+            nested,
+            Some(r#"{"name":"@fixture/y","version":"2.0.0"}"#),
+        ),
+        (
+            "other package version",
+            nested,
+            Some(r#"{"name":"@fixture/x","version":"2.0.1"}"#),
+        ),
+        (
+            "missing version is HEAD",
+            nested,
+            Some(r#"{"name":"@fixture/x"}"#),
+        ),
+        ("no package root", nested, None),
+        // With a root package.json the anonymous `src/` markers name the wrong package,
+        // although their paths equal the workspace-relative document paths.
+        (
+            "root package root",
+            "package.json",
+            Some(r#"{"name":"fixture-root","version":"1.0.0"}"#),
+        ),
+    ] {
+        let world = module_roots_world(|root| match manifest {
+            Some(text) => fs::write(root.join(path), text).unwrap(),
+            None => fs::remove_file(root.join(path)).unwrap(),
+        });
+        let descriptor = module_roots_batch(&world, module_roots_artifact(&world));
+        assert_module_marker_rejected(&world, &descriptor, case);
+    }
+}
+
+#[test]
+fn real_typescript_markers_reject_wrong_paths_other_documents_and_reversed_ranges() {
+    let world = module_roots_world(|_| {});
+    let original = module_roots_artifact(&world);
+    let edit_marker = |path: &str, edit: &dyn Fn(&mut scip::types::Occurrence)| {
+        semantic_batch_support::edit_scip(&original, |index| {
+            let document = index
+                .documents
+                .iter_mut()
+                .find(|document| document.relative_path == path)
+                .unwrap();
+            let marker = document
+                .occurrences
+                .iter_mut()
+                .find(|occurrence| occurrence.range == [0, 0, 0])
+                .unwrap();
+            edit(marker);
+        })
+    };
+    for (case, path, edit) in [
+        (
+            "path suffix under the wrong root",
+            "src/a.js",
+            &(|marker: &mut scip::types::Occurrence| {
+                marker.symbol = "scip-typescript npm . . `a.js`/".into()
+            }) as &dyn Fn(&mut scip::types::Occurrence),
+        ),
+        (
+            "workspace path under the package root",
+            "tools/x/lib/c.js",
+            &|marker: &mut scip::types::Occurrence| {
+                marker.symbol = "scip-typescript npm @fixture/x 2.0.0 tools/x/lib/`c.js`/".into()
+            },
+        ),
+        (
+            "marker naming another document",
+            "src/a.js",
+            &|marker: &mut scip::types::Occurrence| {
+                marker.symbol = "scip-typescript npm . . src/`b.js`/".into()
+            },
+        ),
+        (
+            "reversed range",
+            "tools/x/lib/c.js",
+            &|marker: &mut scip::types::Occurrence| marker.range = vec![0, 1, 0],
+        ),
+    ] {
+        let descriptor = module_roots_batch(&world, edit_marker(path, edit));
+        assert_module_marker_rejected(&world, &descriptor, case);
+    }
+}
+
+/// One MCP session over a world's index (#467), served before daemon startup reconciles it.
+struct McpSession {
+    client: std::os::unix::net::UnixStream,
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    session: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    release: std::sync::mpsc::SyncSender<()>,
+    next_id: i64,
+    pairs: Vec<Value>,
+}
+
+impl McpSession {
+    fn start(world: &World, session: u64) -> Self {
+        use std::io::Write;
+        use trellis::daemon::registry::CheckoutRegistry;
+        let identity = WorkspaceIdentity::discover(Some(&world.root), &world.root)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let state = world._state.path();
+        let topology = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(session, &identity).unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        // Hold daemon startup: the session reads the published head as the fixture left it.
+        registry.set_next_startup_hook_for_tests(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+            .unwrap();
+        let workspace = trellis::mcp::OpenedWorkspace::new(identity);
+        let handle = tokio::runtime::Handle::current();
+        let thread = std::thread::spawn(move || {
+            trellis::mcp::run_socket(workspace, server, registry, session, handle)
+        });
+        let reader = std::io::BufReader::new(client.try_clone().unwrap());
+        let mut mcp = Self {
+            client,
+            reader,
+            session: Some(thread),
+            release,
+            next_id: 1,
+            pairs: vec![],
+        };
+        writeln!(
+            mcp.client,
+            "{}",
+            Self::request(1, "trellis_workspace_describe", json!({"schemaVersion":1}))
+        )
+        .unwrap();
+        entered
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        let reply = mcp.reply();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        mcp
+    }
+
+    fn request(id: i64, name: &str, arguments: Value) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,
+            "arguments":arguments,"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}})
+    }
+
+    fn reply(&mut self) -> Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// The structured envelope of one tool call, kept for schema validation.
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        use std::io::Write;
+        self.next_id += 1;
+        writeln!(
+            self.client,
+            "{}",
+            Self::request(self.next_id, name, arguments)
+        )
+        .unwrap();
+        let reply = self.reply();
+        assert_eq!(reply["id"], self.next_id);
+        let envelope = reply["result"]["structuredContent"].clone();
+        self.pairs
+            .push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    }
+
+    /// Validates every envelope against the published catalog schemas, then stops.
+    fn finish(mut self) {
+        use std::io::Write;
+        let script = r#"
+const {createRequire} = require('node:module');
+const {readFileSync} = require('node:fs');
+const requireFromTests = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv2020 = requireFromTests('ajv/dist/2020.js').default;
+const ajv = new Ajv2020({strict: false, allErrors: true});
+const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8'));
+for (const {name, structuredContent} of JSON.parse(readFileSync(0, 'utf8'))) {
+    const validate = ajv.compile(catalog.find(tool => tool.name === name).outputSchema);
+    if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)}`);
+}
+"#;
+        let mut child = std::process::Command::new("node")
+            .args(["-e", script])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&self.pairs).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "structuredContent schema validation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = self.release.send(());
+        let session = self.session.take().unwrap();
+        drop(self.reader);
+        drop(self.client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+/// A world over a real scip-typescript fixture's sources, with an empty `.git` whose
+/// workspace marker exists before indexing, so an MCP session selects this same index.
+fn real_fixture_world(fixture: &str, files: &[&str]) -> (World, Vec<String>) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import")
+        .join(fixture);
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|path| {
+            (
+                path.to_string(),
+                fs::read_to_string(dir.join(path)).unwrap(),
+            )
+        })
+        .collect();
+    // The fixture's package root names its module markers (#443).
+    let package = format!(
+        r#"{{"name":"{}-fixture","version":"1.0.0"}}"#,
+        fixture.split('-').next().unwrap()
+    );
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            let mut all: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str()))
+                .collect();
+            all.push(("package.json", &package));
+            write_files(root, &all);
+        },
+        true,
+    );
+    (world, sources.into_iter().map(|(_, text)| text).collect())
+}
+
+/// Publish the fixture's real `index.scip` as a scip-typescript import.
+fn publish_real_fixture(world: &World, fixture: &str, files: &[&str]) -> (IndexPin, String) {
+    let mut batch = world.fixture().reference("scip-typescript");
+    let ordinal = batch.artifact(
+        "javascript",
+        files.iter().map(|path| DocSpec::new(path)).collect(),
+    );
+    let index = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import")
+        .join(fixture)
+        .join("index.scip");
+    batch.override_artifact_raw(ordinal, fs::read(index).unwrap());
+    let descriptor = world.write(&batch);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    (pin, producer)
+}
+
+fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> {
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    native
+        .declarations
+        .iter()
+        .filter_map(|d| Some((d.name.clone()?, d.syntax_id.clone())))
+        .collect()
+}
+
+/// The query the CLI daemon builds for `trellis query --seed ... [--semantic-producer-id ...]`.
+fn view_query(seed: &str, producer: Option<&str>) -> trellis::model::ViewQuery {
+    let mut query = json!({"seed": seed});
+    if let Some(producer) = producer {
+        query["semanticProducerId"] = json!(producer);
+    }
+    serde_json::from_value(query).unwrap()
+}
+
+/// `[internal, external, ambiguous]` calls among the published bindings, each call once.
+fn expected_counts(published: &trellis::semantic_evidence::SemanticSnapshot) -> [usize; 3] {
+    use trellis::semantic_evidence::Target;
+    let mut calls = std::collections::BTreeMap::new();
+    for binding in &published.call_bindings {
+        let kind = match (&binding.resolution, &binding.declared_target) {
+            (Resolution::Resolved, Some(Target::Internal { .. })) => 0,
+            (Resolution::External, _) | (Resolution::Resolved, Some(Target::External { .. })) => 1,
+            (Resolution::Ambiguous, _) => 2,
+            _ => 3,
+        };
+        calls.insert(binding.call_id.clone().unwrap(), kind);
+    }
+    let mut counts = [0; 3];
+    for kind in calls.values().filter(|kind| **kind < 3) {
+        counts[*kind] += 1;
+    }
+    counts
+}
+
+/// #467: with real scip-typescript 0.4.0 calls published, the CLI query, MCP outgoing and
+/// incoming calls, status and the methods API show the sole producer's selected bindings.
+/// An explicit producer selects the same one; an unpublished or malformed one is typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
+    use trellis::graph_query::BoundaryReason;
+    use trellis::model::SemanticState;
+    let files = ["src/lib.js", "src/main.js"];
+    let (world, sources) = real_fixture_world("issue444-javascript-calls", &files);
+    let main = &sources[1];
+    let (pin, producer) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+    let ids = declaration_ids(&world);
+    let response = world.store.evidence_response().unwrap();
+
+    // CLI query, under the sole-published policy and with the explicit producer.
+    for explicit in [None, Some(producer.as_str())] {
+        let view = response
+            .query_view(&view_query(&ids["caller"], explicit))
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.revision, pin);
+        assert_eq!(
+            view.semantic.producer_id.as_deref(),
+            Some(producer.as_str())
+        );
+        assert_eq!(view.semantic.note, None);
+        assert_eq!(view.nodes[0].provenance.semantic, SemanticState::Fresh);
+        let callee = |call_id: &str| {
+            let call = view.calls.iter().find(|c| c.id == call_id).unwrap();
+            let range = call.callee_range.as_ref().unwrap();
+            main[range.start_byte..range.end_byte].to_owned()
+        };
+        let mut shown: Vec<_> = view
+            .semantic
+            .bindings
+            .iter()
+            .map(|b| {
+                (
+                    callee(&b.call_id),
+                    format!("{:?}", b.binding.resolution),
+                    format!("{:?}", b.binding.dispatch),
+                    b.boundary_reason,
+                    b.target_id.clone(),
+                )
+            })
+            .collect();
+        shown.sort_by(|a, b| a.0.cmp(&b.0));
+        // #470's owner ruling: a resolved plain call to a free function is `Direct`, so the
+        // graph follows it (no boundary). Calls that stay unresolved (`new Widget(3)`,
+        // `w.run()`) keep `Unknown` dispatch and their `unresolved` boundary.
+        let followed = |name: &str, target: &str| {
+            (
+                name.to_owned(),
+                "Resolved".to_owned(),
+                "Direct".to_owned(),
+                BoundaryReason::None,
+                Some(ids[target].clone()),
+            )
+        };
+        let unresolved = |name: &str| {
+            (
+                name.to_owned(),
+                "Unresolved".to_owned(),
+                "Unknown".to_owned(),
+                BoundaryReason::Unresolved,
+                None,
+            )
+        };
+        assert_eq!(
+            shown,
+            [
+                unresolved("Widget"),
+                followed("helper", "helper"),
+                followed("plain", "plain"),
+                followed("plain", "plain"),
+                followed("register", "register"),
+                unresolved("run"),
+            ]
+        );
+        for binding in &view.semantic.bindings {
+            assert_eq!(
+                binding.binding.call_id.as_deref(),
+                Some(binding.call_id.as_str())
+            );
+            assert_eq!(binding.freshness, Freshness::Fresh);
+            let call = view.calls.iter().find(|c| c.id == binding.call_id).unwrap();
+            assert_eq!(call.provenance.semantic, SemanticState::Fresh);
+        }
+        // A call without a binding stays syntax only.
+        assert!(view.calls.iter().any(|call| {
+            call.provenance.semantic == SemanticState::Unavailable
+                && !view.semantic.bindings.iter().any(|b| b.call_id == call.id)
+        }));
+    }
+    let unpublished = response
+        .query_view(&view_query(&ids["caller"], Some("not-published")))
+        .unwrap_err();
+    assert!(
+        unpublished
+            .downcast_ref::<trellis::store::ProducerNotPublished>()
+            .is_some(),
+        "{unpublished:#}"
+    );
+    let malformed = view_query(&ids["caller"], Some(&"p".repeat(513)));
+    assert!(
+        malformed
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .starts_with("invalid_argument:")
+    );
+
+    // Status and the methods API report the same selected producer.
+    let published = world.store.semantic_at(pin).unwrap();
+    let [internal, external, ambiguous] = expected_counts(&published);
+    assert!(internal >= 3, "{internal}");
+    for status in [response.status().unwrap(), world.store.status().unwrap()] {
+        assert_eq!(
+            status.semantic_producer_id.as_deref(),
+            Some(producer.as_str())
+        );
+        assert_eq!(status.semantic_note, None);
+        assert_eq!(status.stats.semantic_state, SemanticState::Fresh);
+        assert_eq!(
+            [
+                status.stats.internal,
+                status.stats.external,
+                status.stats.ambiguous
+            ],
+            [internal, external, ambiguous]
+        );
+        assert_eq!(
+            status.stats.unresolved,
+            status.stats.calls - internal - external - ambiguous
+        );
+    }
+    let methods = response
+        .methods_at("src/main.js", Some(pin))
+        .unwrap()
+        .unwrap();
+    for item in methods["items"].as_array().unwrap() {
+        assert_eq!(item["symbol"]["provenance"]["semantic"], "fresh");
+    }
+    drop(response);
+
+    // MCP outgoing and incoming calls.
+    let mut mcp = McpSession::start(&world, 467);
+    for explicit in [None, Some(&producer)] {
+        let mut arguments = json!({"schemaVersion":1,"symbolId":ids["caller"]});
+        if let Some(producer) = explicit {
+            arguments["semanticProducerId"] = json!(producer);
+        }
+        let outgoing = mcp.call("trellis_outgoing_calls", arguments);
+        let calls = outgoing["data"]["calls"].as_array().unwrap();
+        let helper = calls.iter().find(|c| c["calleeText"] == "helper").unwrap();
+        assert_eq!(helper["disposition"], "resolved");
+        // #470: a resolved plain call is `Direct` and followed, so it has no boundary.
+        assert_eq!(helper["boundaryReason"], "none");
+        assert_eq!(helper["binding"]["dispatch"], "direct");
+        assert_eq!(helper["targetId"], ids["helper"]);
+        assert_eq!(helper["evidenceTier"], "semantic");
+        assert_eq!(helper["freshness"], "fresh");
+        assert_eq!(helper["binding"]["resolution"], "resolved");
+        assert_eq!(
+            helper["binding"]["declaredTarget"]["syntaxId"],
+            ids["helper"]
+        );
+        assert_eq!(helper["semanticBasis"]["producerId"], producer.as_str());
+        // A member call whose target stays unresolved keeps its boundary.
+        let run = calls.iter().find(|c| c["calleeText"] == "run").unwrap();
+        assert_eq!(run["boundaryReason"], "unresolved", "{run}");
+        assert_eq!(run["binding"]["dispatch"], "unknown", "{run}");
+        let unbound = calls.iter().find(|c| c["calleeText"] == "method").unwrap();
+        assert_eq!(unbound["binding"], Value::Null);
+        assert_eq!(unbound["boundaryReason"], "missingEvidence");
+        assert!(
+            outgoing["data"]["provenance"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == helper["binding"]["provenanceId"])
+        );
+        assert!(
+            outgoing["data"]["coverage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["producerId"] == producer.as_str())
+        );
+        assert!(
+            !outgoing["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "syntaxOnly"),
+            "{outgoing}"
+        );
+    }
+    let incoming = mcp.call(
+        "trellis_incoming_calls",
+        json!({"schemaVersion":1,"symbolId":ids["helper"]}),
+    );
+    let callers = incoming["data"]["callers"].as_array().unwrap();
+    assert_eq!(callers.len(), 1, "{incoming}");
+    assert_eq!(callers[0]["ownerSyntaxId"], ids["caller"]);
+    assert_eq!(callers[0]["targetId"], ids["helper"]);
+    assert_eq!(callers[0]["disposition"], "resolved");
+    assert_eq!(callers[0]["evidenceTier"], "semantic");
+    // An explicit producer this revision does not publish, or a malformed one, is typed.
+    for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
+        let failure = mcp.call(
+            name,
+            json!({"schemaVersion":1,"symbolId":ids["caller"],"semanticProducerId":"not-published"}),
+        );
+        assert_eq!(failure["error"]["code"], "not_found", "{failure}");
+        let invalid = mcp.call(
+            name,
+            json!({"schemaVersion":1,"symbolId":ids["caller"],"semanticProducerId":""}),
+        );
+        assert_eq!(invalid["error"]["code"], "invalid_request", "{invalid}");
+    }
+    mcp.finish();
+    assert!(!world.store.recovery_pending_for_tests());
+}
+
+/// #467 with #466's real ambiguous calls: `new Set(..)` and `Error(..)` show as ambiguous
+/// bindings carrying their whole candidate union, and status counts each call once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_typescript_ambiguous_bindings_show_in_query_mcp_and_status() {
+    use trellis::graph_query::BoundaryReason;
+    let files = ["src/main.js"];
+    let (world, _) = real_fixture_world("issue466-ambiguous-calls", &files);
+    let (pin, producer) = publish_real_fixture(&world, "issue466-ambiguous-calls", &files);
+    let ids = declaration_ids(&world);
+    let published = world.store.semantic_at(pin).unwrap();
+    let union = |call_id: &str| {
+        published
+            .call_bindings
+            .iter()
+            .find(|b| b.call_id.as_deref() == Some(call_id))
+            .unwrap()
+            .candidates
+            .clone()
+    };
+    let response = world.store.evidence_response().unwrap();
+    let view = response
+        .query_view(&view_query(&ids["caller"], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view.semantic.producer_id.as_deref(),
+        Some(producer.as_str())
+    );
+    let mut sizes: Vec<_> = view
+        .semantic
+        .bindings
+        .iter()
+        .filter(|b| b.boundary_reason == BoundaryReason::Ambiguous)
+        .map(|b| {
+            assert_eq!(b.binding.resolution, Resolution::Ambiguous);
+            assert_eq!(b.target_id, None);
+            assert_eq!(b.binding.candidates, union(&b.call_id));
+            b.binding.candidates.len()
+        })
+        .collect();
+    sizes.sort();
+    assert_eq!(sizes, [2, 4]);
+    let status = response.status().unwrap();
+    assert_eq!(status.stats.ambiguous, 2);
+    assert_eq!(
+        [
+            status.stats.internal,
+            status.stats.external,
+            status.stats.ambiguous
+        ],
+        expected_counts(&published)
+    );
+    drop(response);
+
+    let mut mcp = McpSession::start(&world, 468);
+    let outgoing = mcp.call(
+        "trellis_outgoing_calls",
+        json!({"schemaVersion":1,"symbolId":ids["caller"]}),
+    );
+    let ambiguous: Vec<_> = outgoing["data"]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["disposition"] == "ambiguous")
+        .collect();
+    assert_eq!(ambiguous.len(), 2, "{outgoing}");
+    for call in &ambiguous {
+        assert_eq!(call["boundaryReason"], "ambiguous");
+        assert_eq!(call["targetId"], Value::Null);
+        assert_eq!(
+            call["binding"]["candidates"],
+            serde_json::to_value(union(call["callId"].as_str().unwrap())).unwrap()
+        );
+        assert!(outgoing["warnings"].as_array().unwrap().iter().any(|w| {
+            w["code"] == "bindingAmbiguous" && w["provenanceId"] == call["binding"]["provenanceId"]
+        }));
+    }
+    assert_eq!(outgoing["partial"], true);
+    mcp.finish();
+    assert!(!world.store.recovery_pending_for_tests());
+}
+
+/// #467: with no published producer, and then with two, every read shows syntax only and
+/// says why, instead of choosing or merging producers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn none_or_multiple_producers_show_syntax_with_a_note() {
+    use trellis::model::SemanticState;
+    let files = ["src/lib.js", "src/main.js"];
+    // One world per case: a served session's released startup may reconcile its index.
+    let check = |world: &World, note: &str, session: u64, producers: usize| {
+        let ids = declaration_ids(world);
+        let head = world.store.index_baseline().unwrap();
+        assert_eq!(
+            world.store.semantic_at(head).unwrap().producers.len(),
+            producers
+        );
+        let response = world.store.evidence_response().unwrap();
+        let view = response
+            .query_view(&view_query(&ids["caller"], None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.semantic.producer_id, None);
+        assert_eq!(view.semantic.note.as_deref(), Some(note));
+        assert!(view.semantic.bindings.is_empty());
+        assert!(
+            view.calls
+                .iter()
+                .all(|c| c.provenance.semantic == SemanticState::Unavailable)
+        );
+        let status = response.status().unwrap();
+        assert_eq!(status.semantic_producer_id, None);
+        assert_eq!(status.semantic_note.as_deref(), Some(note));
+        assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
+        assert_eq!(status.stats.internal + status.stats.ambiguous, 0);
+        drop(response);
+        let mut mcp = McpSession::start(world, session);
+        for (name, symbol, items) in [
+            ("trellis_outgoing_calls", &ids["caller"], "calls"),
+            ("trellis_incoming_calls", &ids["helper"], "callers"),
+        ] {
+            let envelope = mcp.call(name, json!({"schemaVersion":1,"symbolId":symbol}));
+            let items = envelope["data"][items].as_array().unwrap();
+            assert!(!items.is_empty(), "{envelope}");
+            for item in items {
+                assert_eq!(item["binding"], Value::Null);
+                assert_eq!(item["evidenceTier"], "syntax");
+                assert_eq!(item["boundaryReason"], "missingEvidence");
+            }
+            assert_eq!(
+                envelope["warnings"].as_array().unwrap().last().unwrap(),
+                &json!({"code":"syntaxOnly","message":note,"provenanceId":null})
+            );
+        }
+        mcp.finish();
+    };
+    let (none, _) = real_fixture_world("issue444-javascript-calls", &files);
+    check(&none, trellis::store::NO_PRODUCER_NOTE, 469, 0);
+    let (multiple, _) = real_fixture_world("issue444-javascript-calls", &files);
+    publish_real_fixture(&multiple, "issue444-javascript-calls", &files);
+    let mut second = multiple.fixture();
+    let docs = second.paths("javascript");
+    second.artifact("javascript", docs);
+    let descriptor = multiple.write(&second);
+    drop(multiple.publish(&descriptor).unwrap());
+    check(&multiple, trellis::store::MULTIPLE_PRODUCERS_NOTE, 470, 2);
+}
+
+// Real rust-analyzer 1.98.1 output (`rust-analyzer scip`, the profile-pinned binary) for the
+// crate in `tests/fixtures/scip-rust-analyzer/workspace`. Only its Metadata unit (the absolute
+// project root) was dropped; the document units are the producer's exact bytes, and
+// `rust_analyzer_artifact` re-adds metadata for the test workspace. rust-analyzer writes
+// `position_encoding` (field 6) in every signature `Document` and gives same-document references
+// their target definition's range as `enclosing_range` (#394).
+const RUST_ANALYZER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer"
+);
+
+fn rust_analyzer_world() -> World {
+    world(|root| copy_tree(&Path::new(RUST_ANALYZER).join("workspace"), root))
+}
+
+fn rust_analyzer_artifact(world: &World) -> Vec<u8> {
+    let mut index = scip::types::Index::new();
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "rust-analyzer".into();
+    tool.version = "1.98.1 (48a229ce 2026-09-01)".into();
+    metadata.tool_info = Some(tool).into();
+    index.metadata = Some(metadata).into();
+    let mut bytes = index.write_to_bytes().unwrap();
+    bytes.extend(fs::read(Path::new(RUST_ANALYZER).join("documents.scip")).unwrap());
+    bytes
+}
+
+fn rust_analyzer_batch(world: &World) -> (PathBuf, String) {
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 2);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(ordinal, rust_analyzer_artifact(world));
+    world.write(&fixture)
+}
+
+/// The staged publication of `descriptor` under `limits`, checked identical to the in-memory
+/// oracle's under the same limits.
+fn rust_analyzer_publications(
+    world: &World,
+    descriptor: &(PathBuf, String),
+    limits: &BatchLimits,
+    case: &str,
+) -> SemanticPublication {
+    let (mut admitted, _, _) = world
+        .join_with(descriptor, limits, DestinationMutations::default())
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world
+        .memory_rejoin_with(descriptor, DestinationMutations::default(), limits)
+        .unwrap()
+        .publication;
+    assert_same_publication(&staged, &memory, case);
+    staged
+}
+
+/// `(document, callee spelling, resolution, dispatch)` of every call binding, sorted.
+fn rust_calls(
+    world: &World,
+    bindings: &[trellis::semantic_evidence::CallBinding],
+) -> Vec<[String; 4]> {
+    let mut calls: Vec<_> = bindings
+        .iter()
+        .map(|binding| {
+            assert!(binding.call_id.is_some());
+            let anchor = &binding.join.anchor;
+            let source = fs::read_to_string(world.root.join(&anchor.document.path)).unwrap();
+            [
+                anchor.document.path.clone(),
+                source[anchor.range.start..anchor.range.end].to_owned(),
+                format!("{:?}", binding.resolution),
+                format!("{:?}", binding.dispatch),
+            ]
+        })
+        .collect();
+    calls.sort();
+    calls
+}
+
+fn coverage_of<'p>(
+    publication: &'p SemanticPublication,
+    path: &str,
+) -> &'p trellis::semantic_evidence::Coverage {
+    publication
+        .coverage
+        .iter()
+        .find(|row| row.document_path == path)
+        .unwrap()
+}
+
+#[test]
+fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_calls() {
+    let documents = fs::read(Path::new(RUST_ANALYZER).join("documents.scip")).unwrap();
+    let signatures: Vec<_> = scip::types::Index::parse_from_bytes(&documents)
+        .unwrap()
+        .documents
+        .iter()
+        .flat_map(|document| document.symbols.clone())
+        .filter_map(|symbol| symbol.signature_documentation.into_option())
+        .collect();
+    assert!(!signatures.is_empty());
+    assert!(
+        signatures.iter().all(|signature| signature
+            .special_fields
+            .unknown_fields()
+            .iter()
+            .any(|(number, _)| number == 6)),
+        "rust-analyzer writes position_encoding in every signature"
+    );
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let staged =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "real rust");
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    assert!(
+        staged
+            .coverage
+            .iter()
+            .all(|row| row.diagnostic.as_deref() != Some("occurrence_cap_exceeded"))
+    );
+    // `saturating(value, value)` in util.rs, `Counter::new()` and `counter.add(..)` carry an
+    // enclosing range (their target's definition) that does not enclose the reference; they
+    // bind at their exact callee spans like the cross-document calls, which carry none.
+    // Before #394 none of the three bound a call. The recursive `spin(value)` carries its own
+    // definition's range, which encloses the reference but joins no invocation: under owner
+    // ruling 4 (2026-10-30, #394) that range is absent and the exact callee span binds it.
+    // Dispatch (owner ruling 2026-10-30, #470): plain and path calls of free functions are
+    // direct; the method call `counter.add(..)` and unresolved or external calls are unknown.
+    let call = |path: &str, callee: &str, resolution: &str, dispatch: &str| {
+        [path, callee, resolution, dispatch].map(str::to_owned)
+    };
+    assert_eq!(
+        rust_calls(&world, &staged.call_bindings),
+        [
+            call("src/lib.rs", "add", "Resolved", "Unknown"),
+            call("src/lib.rs", "double", "Resolved", "Direct"),
+            // rust-analyzer's associated-function kind does not bind the measured method
+            // declaration, so `Counter::new()` binds its call but resolves no target.
+            call("src/lib.rs", "new", "Unresolved", "Unknown"),
+            call("src/lib.rs", "saturating", "Resolved", "Direct"),
+            call("src/util.rs", "saturating", "Resolved", "Direct"),
+            call("src/util.rs", "saturating_add", "External", "Unknown"),
+            call("src/util.rs", "spin", "Resolved", "Direct"),
+        ]
+    );
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    // An unrelated edit rejoins the stored original, field 6 included, with no failure.
+    let proofs = stored_proofs(&world);
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(stored_proofs(&world), proofs);
+    let head = world.store.index_baseline().unwrap();
+    // The rejoined calls keep their resolution and dispatch (#470).
+    assert_eq!(
+        rust_calls(
+            &world,
+            &world.store.semantic_at(head).unwrap().call_bindings
+        ),
+        rust_calls(&world, &staged.call_bindings)
+    );
+}
+
+/// Owner ruling 2026-10-30 (#470) through the #40 call graph and the sequence view, on the real
+/// rust-analyzer fixture: `run` -> `util::double` -> `saturating` are direct path and plain
+/// calls of free functions, so the graph expands into them under the depth and node bounds,
+/// while `counter.add(..)` stays a dispatch boundary and `Counter::new()` an unresolved one.
+#[test]
+fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
+    use trellis::graph_query::{BoundaryReason, FrontierReason, GraphQuery, Visit};
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let id_of = |name: &str| {
+        let found: Vec<_> = native
+            .declarations
+            .iter()
+            .filter(|d| d.name.as_deref() == Some(name) && d.kind == "function")
+            .collect();
+        assert_eq!(found.len(), 1, "{name}");
+        found[0].syntax_id.clone()
+    };
+    let (run, double, saturating) = (id_of("run"), id_of("double"), id_of("saturating"));
+    let graph = |depth: u64, max_nodes: u64| {
+        world
+            .store
+            .evidence_response()
+            .unwrap()
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: run.clone(),
+                    semantic_producer_id: Some(producer.clone()),
+                    depth,
+                    max_nodes,
+                    max_calls: 500,
+                    include_external: true,
+                    include_tests: true,
+                },
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .outcome
+            .expect("contract success")
+    };
+    let nodes = |result: &trellis::graph_query::GraphResult| {
+        result
+            .nodes
+            .iter()
+            .map(|n| (n.declaration.syntax_id.clone(), n.depth))
+            .collect::<Vec<_>>()
+    };
+    let edge = |result: &trellis::graph_query::GraphResult, callee: &str| {
+        let found: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.call.spelling.as_deref() == Some(callee))
+            .cloned()
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}");
+        found.into_iter().next().unwrap()
+    };
+
+    // Depth 2 follows the direct edge into `double`, then `double`'s into `saturating`.
+    let deep = graph(2, 150);
+    assert_eq!(
+        nodes(&deep),
+        [
+            (run.clone(), 0),
+            (double.clone(), 1),
+            (saturating.clone(), 2)
+        ]
+    );
+    for (callee, from, to) in [
+        ("double", &run, &double),
+        ("saturating", &double, &saturating),
+    ] {
+        let e = edge(&deep, callee);
+        assert_eq!(
+            (e.visit, e.boundary_reason),
+            (Visit::New, BoundaryReason::None)
+        );
+        assert_eq!((&e.from, e.to.as_ref()), (from, Some(to)));
+        let binding = e.binding.unwrap();
+        assert_eq!(
+            binding.dispatch,
+            trellis::semantic_evidence::Dispatch::Direct
+        );
+    }
+    for (callee, reason) in [
+        ("add", BoundaryReason::Dispatch),
+        ("new", BoundaryReason::Unresolved),
+    ] {
+        let e = edge(&deep, callee);
+        assert_eq!(
+            (e.visit, e.boundary_reason),
+            (Visit::Boundary, reason),
+            "{callee}"
+        );
+        assert_eq!(e.to, None);
+    }
+    // The depth bound stops at `saturating`: its own call is depth frontier, not expanded.
+    assert!(
+        deep.frontier
+            .iter()
+            .any(|f| f.reason == FrontierReason::Depth && f.node_id == saturating)
+    );
+    assert!(deep.edges.iter().all(|e| e.from != saturating));
+
+    // Depth 1 admits `double` and leaves its call on the depth frontier.
+    let shallow = graph(1, 150);
+    assert_eq!(nodes(&shallow), [(run.clone(), 0), (double.clone(), 1)]);
+    assert!(
+        shallow
+            .frontier
+            .iter()
+            .any(|f| f.reason == FrontierReason::Depth && f.node_id == double)
+    );
+    assert!(shallow.edges.iter().all(|e| e.from == run));
+
+    // The node bound holds: with room for two nodes the direct call into `saturating` is a
+    // node-limit boundary and the result is partial.
+    let bounded = graph(2, 2);
+    assert_eq!(nodes(&bounded), [(run.clone(), 0), (double.clone(), 1)]);
+    let e = edge(&bounded, "saturating");
+    assert_eq!(
+        (e.visit, e.boundary_reason, e.to),
+        (Visit::Boundary, BoundaryReason::NodeLimit, None)
+    );
+    assert!(bounded.partial);
+
+    // The sequence view takes the same disposition: the direct call names its target.
+    let view = world.store.sequence_at(&run, pin, false).unwrap().unwrap();
+    fn steps(all: &[trellis::behavior::SequenceStep]) -> Vec<&trellis::behavior::SequenceStep> {
+        all.iter()
+            .flat_map(|s| {
+                std::iter::once(s)
+                    .chain(steps(&s.children))
+                    .chain(steps(&s.alternate))
+            })
+            .collect()
+    }
+    let evidence = |label: &str| {
+        let found: Vec<_> = steps(&view.steps)
+            .into_iter()
+            .filter(|s| s.call_evidence.is_some() && s.label.contains(label))
+            .collect();
+        assert_eq!(found.len(), 1, "{label}");
+        (
+            found[0].target.clone(),
+            found[0].call_evidence.as_ref().unwrap().boundary_reason,
+        )
+    };
+    assert_eq!(evidence("double"), (Some(double), BoundaryReason::None));
+    assert_eq!(evidence("add"), (None, BoundaryReason::Dispatch));
+}
+
+/// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
+/// per-document cap shrunk below src/lib.rs's 36 occurrences: the document is admitted partial
+/// with the typed reason, keeps exactly its definitions, and both join paths agree.
+#[test]
+fn real_rust_analyzer_over_cap_document_is_admitted_partial_with_its_reason() {
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let full =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "uncapped");
+    let limits = BatchLimits {
+        document_occurrences: 20,
+        ..BatchLimits::PRODUCTION
+    };
+    let capped = rust_analyzer_publications(&world, &descriptor, &limits, "capped");
+    let lib = coverage_of(&capped, "src/lib.rs");
+    assert_eq!(
+        lib.state,
+        trellis::semantic_evidence::CoverageState::Partial
+    );
+    assert_eq!(lib.diagnostic.as_deref(), Some("occurrence_cap_exceeded"));
+    assert!(lib.selected);
+    // The observed roles are those the kept definition facts author: never `call`.
+    let full_lib = coverage_of(&full, "src/lib.rs");
+    assert!(
+        lib.observed_roles
+            .iter()
+            .all(|role| full_lib.observed_roles.contains(role))
+    );
+    assert!(
+        lib.observed_roles
+            .contains(&trellis::semantic_evidence::Role::Definition)
+    );
+    assert!(
+        !lib.observed_roles
+            .contains(&trellis::semantic_evidence::Role::Call)
+    );
+    assert!(
+        full_lib
+            .observed_roles
+            .contains(&trellis::semantic_evidence::Role::Call)
+    );
+    // util.rs (16 occurrences) is untouched.
+    assert_eq!(
+        coverage_of(&capped, "src/util.rs"),
+        coverage_of(&full, "src/util.rs")
+    );
+    let in_lib = |publication: &SemanticPublication| {
+        publication
+            .declaration_bindings
+            .iter()
+            .filter(|binding| binding.join.anchor.document.path == "src/lib.rs")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(!in_lib(&capped).is_empty());
+    assert_eq!(
+        in_lib(&capped),
+        in_lib(&full),
+        "the kept definitions bind as before"
+    );
+    assert!(
+        capped
+            .call_bindings
+            .iter()
+            .all(|binding| binding.join.anchor.document.path != "src/lib.rs"),
+        "dropped references author no call"
+    );
+    // The admitted claims of the capped document are its definitions and symbols only.
+    let admission = world
+        .try_memory_admission_with(&descriptor, &limits)
+        .unwrap();
+    assert_eq!(
+        admission.merged.capped_documents,
+        std::collections::BTreeSet::from([("rust".to_owned(), "src/lib.rs".to_owned())])
+    );
+    let lib_claims: Vec<_> = admission
+        .merged
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.envelope.relative_path == "src/lib.rs"
+                && claim.envelope.record_kind == "occurrence"
+        })
+        .collect();
+    assert_eq!(lib_claims.len(), 11);
+    assert!(
+        lib_claims
+            .iter()
+            .all(|claim| claim.envelope.raw["symbolRoles"].as_u64().unwrap() & 1 == 1)
+    );
+    // Publication keeps the partial row and records the capped document with the raw capture.
+    let (mut admitted, joined, _) = world
+        .join_with(&descriptor, &limits, DestinationMutations::default())
+        .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &world.cancel,
+        )
+        .unwrap();
+    drop(leader);
+    let published = world.store.semantic_at(pin).unwrap();
+    let stored = published
+        .coverage
+        .iter()
+        .find(|row| row.document_path == "src/lib.rs")
+        .unwrap();
+    assert_eq!(
+        (stored.state, &stored.diagnostic, &stored.observed_roles),
+        (lib.state, &lib.diagnostic, &lib.observed_roles)
+    );
+    assert_eq!(
+        world.count(
+            "SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=1 AND path='src/lib.rs'"
+        ),
+        1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=0"),
+        1
+    );
+}
+
+/// The aggregate candidate cap still fails typed and atomically on both paths (#394, a).
+#[test]
+fn real_rust_analyzer_aggregate_candidate_cap_fails_typed_and_atomically() {
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let head = world.store.index_baseline().unwrap();
+    // 52 occurrences and 20 symbol informations: 72 candidates.
+    let limits = BatchLimits {
+        candidates: 71,
+        ..BatchLimits::PRODUCTION
+    };
+    let error = world
+        .join_with(&descriptor, &limits, DestinationMutations::default())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "candidate facts"
+        ),
+        "{error:#}"
+    );
+    assert_eq!(
+        world
+            .try_memory_admission_with(&descriptor, &limits)
+            .map(|_| ())
+            .unwrap_err(),
+        ScipCaptureError::LimitExceeded("candidate facts".into())
+    );
+    assert_nothing_published(&world, head);
+    assert!(world.stage_dirs().is_empty());
+    let limits = BatchLimits {
+        candidates: 72,
+        ..BatchLimits::PRODUCTION
+    };
+    world
+        .join_with(&descriptor, &limits, DestinationMutations::default())
+        .unwrap();
+}
+
+// Real rust-analyzer 1.98.1 output (`rust-analyzer scip`, the profile-pinned binary) for the
+// multi-target crate in `tests/fixtures/scip-rust-analyzer-targets/workspace`, Metadata unit
+// dropped as for `RUST_ANALYZER`. rust-analyzer repeats `crate/` in all six targets, `main().`
+// in the bin, the build script and the example, and `run().` in the library and the
+// `tests/other.rs` crate. `tests/common/mod.rs` belongs to two test crates (#394).
+const RUST_ANALYZER_TARGETS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer-targets"
+);
+const RA_CRATE: &str = "rust-analyzer cargo fixture 0.1.0 crate/";
+const RA_MAIN: &str = "rust-analyzer cargo fixture 0.1.0 main().";
+const RA_RUN: &str = "rust-analyzer cargo fixture 0.1.0 run().";
+
+fn rust_targets_world() -> World {
+    world(|root| copy_tree(&Path::new(RUST_ANALYZER_TARGETS).join("workspace"), root))
+}
+
+fn rust_targets_documents() -> Vec<u8> {
+    fs::read(Path::new(RUST_ANALYZER_TARGETS).join("documents.scip")).unwrap()
+}
+
+/// A batch of the fixture's document units behind Metadata for the test workspace: the
+/// producer's exact bytes, or, with `edit`, the units decoded, edited and re-encoded.
+fn rust_targets_batch(
+    world: &World,
+    edit: Option<&dyn Fn(&mut scip::types::Document)>,
+) -> (PathBuf, String) {
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "rust-analyzer".into();
+    tool.version = "1.98.1 (48a229ce 2026-09-01)".into();
+    metadata.tool_info = Some(tool).into();
+    let mut header = scip::types::Index::new();
+    header.metadata = Some(metadata).into();
+    let mut artifact = header.write_to_bytes().unwrap();
+    match edit {
+        None => artifact.extend(rust_targets_documents()),
+        Some(edit) => {
+            let mut index =
+                scip::types::Index::parse_from_bytes(&rust_targets_documents()).unwrap();
+            index.documents.iter_mut().for_each(edit);
+            artifact.extend(index.write_to_bytes().unwrap());
+        }
+    }
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 8);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(ordinal, artifact);
+    world.write(&fixture)
+}
+
+/// `(scope, scope document path)` of every symbol with key `symbol`, sorted.
+fn symbol_scopes(publication: &SemanticPublication, symbol: &str) -> Vec<(String, Option<String>)> {
+    let mut scopes: Vec<_> = publication
+        .symbols
+        .iter()
+        .filter(|row| row.key.symbol == symbol)
+        .map(|row| {
+            (
+                format!("{:?}", row.key.scope),
+                row.key.document.as_ref().map(|d| d.path.clone()),
+            )
+        })
+        .collect();
+    scopes.sort();
+    scopes
+}
+
+/// `(resolution, declared internal target document)` of the one use reference spelled
+/// `spelling` in `path`.
+fn use_resolution(
+    publication: &SemanticPublication,
+    path: &str,
+    spelling: &str,
+) -> (Resolution, Option<String>) {
+    let found: Vec<_> = publication
+        .references
+        .iter()
+        .filter(|r| {
+            r.document.path == path
+                && r.spelling == spelling
+                && r.site == trellis::semantic_evidence::ReferenceSite::Use
+        })
+        .collect();
+    let [reference] = found[..] else {
+        panic!("{path} {spelling}: {found:?}");
+    };
+    (
+        reference.resolution,
+        match &reference.declared_target {
+            Some(trellis::semantic_evidence::Target::Internal { document, .. }) => {
+                Some(document.path.clone())
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Owner ruling 2026-10-30 (#394): each Cargo target is its own symbol namespace, derived from
+/// the captured `Cargo.toml` and the target roots. Real rust-analyzer keys repeated across
+/// targets import as distinct target-scoped symbols; a use resolves in its own target first,
+/// then in the library target that defines the key; a document in two test crates keeps
+/// global keys. The batch join, the in-memory oracle and stored-original rejoin agree.
+#[test]
+fn real_rust_analyzer_keys_repeated_across_cargo_targets_import_per_target() {
+    let world = rust_targets_world();
+    let descriptor = rust_targets_batch(&world, None);
+    let staged =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "targets");
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    let target = |root: &str| ("Target".to_owned(), Some(root.to_owned()));
+    assert_eq!(
+        symbol_scopes(&staged, RA_CRATE),
+        [
+            target("build.rs"),
+            target("examples/demo.rs"),
+            target("src/lib.rs"),
+            target("src/main.rs"),
+            target("tests/it.rs"),
+            target("tests/other.rs"),
+        ]
+    );
+    assert_eq!(
+        symbol_scopes(&staged, RA_MAIN),
+        [
+            target("build.rs"),
+            target("examples/demo.rs"),
+            target("src/main.rs")
+        ]
+    );
+    assert_eq!(
+        symbol_scopes(&staged, RA_RUN),
+        [target("src/lib.rs"), target("tests/other.rs")]
+    );
+    // A module file is in the target whose crate root reaches it.
+    assert_eq!(
+        symbol_scopes(&staged, "rust-analyzer cargo fixture 0.1.0 util/helper()."),
+        [target("src/lib.rs")]
+    );
+    // `tests/common/mod.rs` is reached by two test crates: no target, the global key.
+    assert_eq!(
+        symbol_scopes(
+            &staged,
+            "rust-analyzer cargo fixture 0.1.0 common/shared()."
+        ),
+        [("Global".to_owned(), None)]
+    );
+    // Own target first: `run()` in tests/other.rs is that crate's; `fixture::run()` from the
+    // bin and tests/it.rs, which define none, is the library's.
+    let resolved = |path: &str| (Resolution::Resolved, Some(path.to_owned()));
+    assert_eq!(
+        use_resolution(&staged, "tests/other.rs", "run"),
+        resolved("tests/other.rs")
+    );
+    assert_eq!(
+        use_resolution(&staged, "tests/it.rs", "run"),
+        resolved("src/lib.rs")
+    );
+    assert_eq!(
+        use_resolution(&staged, "src/main.rs", "run"),
+        resolved("src/lib.rs")
+    );
+    assert_eq!(
+        use_resolution(&staged, "examples/demo.rs", "helper"),
+        resolved("src/util.rs")
+    );
+    // A document without a determined target (in two test crates) takes a library's key only
+    // when that library is the one target defining it.
+    assert_eq!(
+        use_resolution(&staged, "tests/common/mod.rs", "helper"),
+        resolved("src/util.rs")
+    );
+    // The target is part of each Rust claim's envelope, so of its digest and proof identity.
+    let admission = world.memory_admission(&descriptor);
+    let crate_claims: Vec<_> = admission
+        .merged
+        .claims
+        .iter()
+        .filter(|c| {
+            c.envelope.record_kind == "symbolInformation"
+                && c.envelope.raw["symbol"] == json!(RA_CRATE)
+        })
+        .collect();
+    assert_eq!(crate_claims.len(), 6);
+    assert!(crate_claims.iter().all(|claim| {
+        claim
+            .envelope
+            .cargo_target
+            .as_ref()
+            .map(|t| t.root.as_str())
+            == Some(claim.envelope.relative_path.as_str())
+            && claim
+                .canonical_bytes
+                .starts_with(b"{\"cargoTarget\":{\"kind\":")
+    }));
+    let shared = admission
+        .merged
+        .claims
+        .iter()
+        .find(|c| c.envelope.relative_path == "tests/common/mod.rs")
+        .unwrap();
+    assert!(shared.envelope.cargo_target.is_none());
+    assert!(shared.canonical_bytes.starts_with(b"{\"formatVersion\":"));
+    // Published, then rejoined from the stored original after an unrelated edit.
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    assert_published_matches_staged(&world.store.semantic_at(pin).unwrap(), &staged);
+    let proofs = stored_proofs(&world);
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(stored_proofs(&world), proofs);
+    let head = world
+        .store
+        .semantic_at(world.store.index_baseline().unwrap())
+        .unwrap();
+    let rejoined = SemanticPublication {
+        symbols: head.symbols,
+        references: head.references,
+        ..staged.clone()
+    };
+    assert_eq!(
+        symbol_scopes(&rejoined, RA_CRATE),
+        symbol_scopes(&staged, RA_CRATE)
+    );
+    assert_eq!(
+        use_resolution(&rejoined, "tests/it.rs", "run"),
+        resolved("src/lib.rs")
+    );
+}
+
+/// Asserts the batch join rejects `descriptor` as a duplicate key, typed, that contract
+/// validation rejects the in-memory oracle's rows alike, and that nothing is published.
+fn assert_duplicate_key_rejected(world: &World, descriptor: &(PathBuf, String), case: &str) {
+    let head = world.store.index_baseline().unwrap();
+    let error = world
+        .join_with(
+            descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ScipCaptureError>(),
+        Some(&ScipCaptureError::InvalidArtifact(
+            "duplicate semantic symbol key".into()
+        )),
+        "{case}: {error:#}"
+    );
+    // The in-memory oracle builds the same rows; contract validation rejects them.
+    let memory = world.memory_publication(descriptor, DestinationMutations::default());
+    let invalid = world
+        .full_validation(descriptor, DestinationMutations::default(), &memory)
+        .unwrap_err();
+    assert!(
+        format!("{invalid:#}").contains("duplicate semantic symbol key"),
+        "{case}: {invalid:#}"
+    );
+    assert_nothing_published(world, head);
+}
+
+/// A key is unique per Cargo target (#394): a second document of one target giving the same
+/// key, or a document without a determined target giving a key some target has, still
+/// rejects the artifact typed.
+#[test]
+fn real_rust_analyzer_duplicate_keys_within_a_target_or_against_a_global_key_reject() {
+    let world = rust_targets_world();
+    let index = scip::types::Index::parse_from_bytes(&rust_targets_documents()).unwrap();
+    let library_run = index
+        .documents
+        .iter()
+        .find(|d| d.relative_path == "src/lib.rs")
+        .and_then(|d| d.symbols.iter().find(|s| s.symbol == RA_RUN))
+        .cloned()
+        .unwrap();
+    for (case, path) in [
+        // src/util.rs is in the library target, which already has `run()`.
+        ("same target", "src/util.rs"),
+        // tests/common/mod.rs has no target: its global `run()` meets two targets' keys.
+        ("global against target", "tests/common/mod.rs"),
+    ] {
+        let edit = |document: &mut scip::types::Document| {
+            if document.relative_path == path {
+                document.symbols.push(library_run.clone());
+            }
+        };
+        let descriptor = rust_targets_batch(&world, Some(&edit));
+        assert_duplicate_key_rejected(&world, &descriptor, case);
+    }
+}
+
+// Real rust-analyzer 1.98.1 output for the two-package workspace in
+// `tests/fixtures/scip-rust-analyzer-packages/workspace`, Metadata unit dropped: libraries
+// `alpha 0.1.0` and `beta 0.2.0` each define `run()`, and beta's test crate calls both.
+const RUST_ANALYZER_PACKAGES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer-packages"
+);
+const ALPHA_RUN: &str = "rust-analyzer cargo alpha 0.1.0 run().";
+
+/// A batch of the two-package fixture, each symbol spelling passed through `rename` in the
+/// documents `rename` is given.
+fn rust_packages_batch(world: &World, rename: &dyn Fn(&str, &str) -> String) -> (PathBuf, String) {
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "rust-analyzer".into();
+    tool.version = "1.98.1 (48a229ce 2026-09-01)".into();
+    metadata.tool_info = Some(tool).into();
+    let mut header = scip::types::Index::new();
+    header.metadata = Some(metadata).into();
+    let mut artifact = header.write_to_bytes().unwrap();
+    let documents = fs::read(Path::new(RUST_ANALYZER_PACKAGES).join("documents.scip")).unwrap();
+    let mut index = scip::types::Index::parse_from_bytes(&documents).unwrap();
+    for document in &mut index.documents {
+        let path = document.relative_path.clone();
+        for occurrence in &mut document.occurrences {
+            occurrence.symbol = rename(&path, &occurrence.symbol);
+        }
+        for symbol in &mut document.symbols {
+            symbol.symbol = rename(&path, &symbol.symbol);
+        }
+    }
+    artifact.extend(index.write_to_bytes().unwrap());
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 3);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(ordinal, artifact);
+    world.write(&fixture)
+}
+
+/// Supervisor ruling on #394 ruling 2: the library fallback must also match the package
+/// rust-analyzer's key names against the admitted manifest's `[package]` name and version.
+/// Two workspace libraries defining the same key resolve by package; a key whose package
+/// version is not the manifest's keeps the global key.
+#[test]
+fn real_rust_analyzer_library_fallback_matches_the_keys_package() {
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_PACKAGES).join("workspace"), root));
+    let uses = "crates/beta/tests/uses.rs";
+    let resolved = |path: &str| (Resolution::Resolved, Some(path.to_owned()));
+    let alpha = "crates/alpha/src/lib.rs";
+    // The producer's own keys: each call resolves to its package's library.
+    let descriptor = rust_packages_batch(&world, &|_, symbol| symbol.to_owned());
+    let staged = rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "own");
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    assert_eq!(
+        symbol_scopes(&staged, ALPHA_RUN),
+        [("Target".to_owned(), Some(alpha.to_owned()))]
+    );
+    let calls = |publication: &SemanticPublication| {
+        let mut found: Vec<_> = publication
+            .references
+            .iter()
+            .filter(|r| r.document.path == uses && r.spelling == "run")
+            .map(|r| {
+                (
+                    r.resolution,
+                    match &r.declared_target {
+                        Some(trellis::semantic_evidence::Target::Internal { document, .. }) => {
+                            Some(document.path.clone())
+                        }
+                        _ => None,
+                    },
+                )
+            })
+            .collect();
+        found.sort_by_key(|(_, path)| path.clone());
+        found
+    };
+    assert_eq!(
+        calls(&staged),
+        [resolved(alpha), resolved("crates/beta/src/lib.rs")]
+    );
+    // Both libraries define alpha's key: only alpha's manifest names its package.
+    let same_key = |path: &str, symbol: &str| {
+        if path == "crates/beta/src/lib.rs" {
+            symbol.replace("cargo beta 0.2.0 run().", "cargo alpha 0.1.0 run().")
+        } else {
+            symbol.to_owned()
+        }
+    };
+    let descriptor = rust_packages_batch(&world, &same_key);
+    let staged =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "same key");
+    assert_eq!(
+        symbol_scopes(&staged, ALPHA_RUN),
+        [
+            ("Target".to_owned(), Some(alpha.to_owned())),
+            (
+                "Target".to_owned(),
+                Some("crates/beta/src/lib.rs".to_owned())
+            ),
+        ]
+    );
+    assert!(calls(&staged).contains(&resolved(alpha)));
+    // A key naming a version the manifest does not state matches no library: global key,
+    // which no document defines, so the use stays unresolved.
+    let other_version = |_: &str, symbol: &str| symbol.replace("alpha 0.1.0", "alpha 9.9.9");
+    let descriptor = rust_packages_batch(&world, &other_version);
+    let staged =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "version");
+    assert!(calls(&staged).contains(&(Resolution::Unresolved, None)));
 }

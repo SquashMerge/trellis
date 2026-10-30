@@ -20,6 +20,10 @@ use std::{
 };
 use uuid::Uuid;
 
+mod failure;
+pub(crate) use failure::TypedFailure;
+pub use failure::split_error;
+
 /// A single maintenance unit's existing-only queue admission. Unknown is a
 /// priority signal: never begin (or commit) maintenance on uncertain queue data.
 pub enum QueueProbeAdmission {
@@ -513,51 +517,8 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionOutcome {
     Done(IndexPin),
+    /// The stored terminal error: a bare code, or `<code>: <reason>` from a closed set.
     Failed(String),
-}
-
-const SEMANTIC_IMPORT_CLASSES: [&str; 8] = [
-    "invalid_request",
-    "invalid_artifact",
-    "limit_exceeded",
-    "capture_unavailable",
-    "stale_basis",
-    "revision_conflict",
-    "root_changed",
-    "index_failed",
-];
-
-fn stable_reason(reason: &str) -> bool {
-    let bytes = reason.as_bytes();
-    (1..=64).contains(&bytes.len())
-        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-        && bytes.iter().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b' ' | b'.' | b'_' | b'/' | b'-')
-        })
-}
-
-/// Classifies the top-level message of a failed semantic import as `<class>` or
-/// `<class>: <reason>`. The class comes from a closed list and the reason survives only when it
-/// is a short stable phrase; any other message is `index_failed`.
-pub fn semantic_import_code(message: &str) -> String {
-    for class in SEMANTIC_IMPORT_CLASSES {
-        let Some(rest) = message.strip_prefix(class) else {
-            continue;
-        };
-        if rest.is_empty() {
-            return class.to_owned();
-        }
-        if let Some(reason) = rest.strip_prefix(": ") {
-            return if stable_reason(reason) {
-                format!("{class}: {reason}")
-            } else {
-                class.to_owned()
-            };
-        }
-    }
-    "index_failed".to_owned()
 }
 
 impl CompletionOutcome {
@@ -569,19 +530,19 @@ impl CompletionOutcome {
                 Self::Failed("revision_conflict".to_owned())
             }
             Err(error) => {
-                // A terminal row intentionally retains only a stable error code.
-                // Opt-in diagnostics preserve the cause in either process's log
+                // A terminal row retains only a typed code and a reason from a closed set.
+                // Opt-in diagnostics preserve the full cause in either process's log
                 // without letting a broken stderr change the terminal outcome.
                 if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
                     use std::io::Write;
                     let _ = writeln!(std::io::stderr(), "index-phase request_failure={error:#}");
                 }
-                match kind {
-                    RequestKind::Index => Self::Failed("index_failed".to_owned()),
-                    RequestKind::SemanticImport => {
-                        Self::Failed(semantic_import_code(&error.to_string()))
-                    }
-                }
+                let (code, reason) = failure::classify(kind, &error);
+                Self::Failed(if reason == failure::NO_REASON {
+                    code.to_owned()
+                } else {
+                    format!("{code}: {reason}")
+                })
             }
         })
     }

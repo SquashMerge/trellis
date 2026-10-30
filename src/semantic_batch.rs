@@ -35,10 +35,15 @@ pub struct BatchCounters {
     pub live_unit_buffers: u64,
     pub live_unit_buffers_high_water: u64,
     pub unit_reservation_high_water_bytes: u64,
+    /// Logical join expansion, separate from admission's decode-buffer reservation.
+    pub join_reservation_high_water_bytes: u64,
     pub document_cache_high_water_bytes: u64,
     pub document_cache_high_water_entries: u64,
     pub active_document_groups_high_water: u64,
     pub candidate_group_high_water: u64,
+    /// Charged staged-row attempts of the latest join attempt, by owning table, including the
+    /// retained native seed under `seed:retained-native`. Their sum is the attempt's row meter.
+    pub staged_row_attempts: std::collections::BTreeMap<String, u64>,
 }
 
 impl BatchCounters {
@@ -56,6 +61,9 @@ impl BatchCounters {
 
     /// Folds a join's high-water marks into the batch counters.
     pub(crate) fn absorb_join(&mut self, join: &BatchCounters) {
+        self.join_reservation_high_water_bytes = self
+            .join_reservation_high_water_bytes
+            .max(join.join_reservation_high_water_bytes);
         self.document_cache_high_water_bytes = self
             .document_cache_high_water_bytes
             .max(join.document_cache_high_water_bytes);
@@ -68,6 +76,7 @@ impl BatchCounters {
         self.candidate_group_high_water = self
             .candidate_group_high_water
             .max(join.candidate_group_high_water);
+        self.staged_row_attempts = join.staged_row_attempts.clone();
     }
 }
 

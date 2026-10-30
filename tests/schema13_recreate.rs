@@ -100,14 +100,14 @@ fn schema13_marker_recreates_exclusively_with_spooled_revision() {
         rebuilt
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        27
+        29
     );
     assert_eq!(
         rebuilt
             .query_row("SELECT schema_version FROM index_metadata", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        27
+        29
     );
     assert_eq!(
         rebuilt

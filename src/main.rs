@@ -303,6 +303,9 @@ struct QueryArgs {
     include_callbacks: bool,
     #[arg(long)]
     exclude_path: Vec<String>,
+    /// A published semantic producer for call bindings. Default: the sole published one.
+    #[arg(long)]
+    semantic_producer_id: Option<String>,
 }
 #[derive(Args)]
 struct MetricsArgs {
@@ -823,6 +826,7 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 max_calls: args.max_calls,
                 include_callbacks: args.include_callbacks,
                 exclude_paths: args.exclude_path.clone(),
+                semantic_producer_id: args.semantic_producer_id.clone(),
             }
             .validate()?;
             (
@@ -831,7 +835,8 @@ fn dispatch_cli(command: &Command) -> Result<()> {
                 serde_json::json!({
                     "seed": args.seed, "depth": args.depth, "maxNodes": args.max_nodes,
                     "maxCalls": args.max_calls, "includeCallbacks": args.include_callbacks,
-                    "excludePaths": args.exclude_path
+                    "excludePaths": args.exclude_path,
+                    "semanticProducerId": args.semantic_producer_id
                 }),
                 true,
             )
@@ -1800,6 +1805,10 @@ fn dispatch_connection(
                         .as_bool()
                         .context("missing includeCallbacks")?,
                     exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
+                    semantic_producer_id: serde_json::from_value(
+                        args.get("semanticProducerId").cloned().unwrap_or_default(),
+                    )
+                    .context("invalid_argument: semanticProducerId must be a string")?,
                 }),
                 "rules_check" | "references" => (|| {
                     let (response, catching_up) = checkout.evidence_response()?;

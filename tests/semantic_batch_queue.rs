@@ -480,11 +480,6 @@ fn precommit_sql_fault_leaves_prior_head_and_retry_publishes_once() {
     let before = world.head();
     let failed = world.import(&descriptor, &sha);
     assert!(!failed.status.success());
-    assert!(
-        String::from_utf8_lossy(&failed.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&failed.stderr)
-    );
     assert!(marker.exists());
     assert_eq!(
         world.head(),
@@ -500,9 +495,10 @@ fn precommit_sql_fault_leaves_prior_head_and_retry_publishes_once() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
+    assert_terminal_error(
+        "injected SQL fault",
         world.queue().last().unwrap().2.as_deref(),
-        Some("index_failed")
+        &failed.stderr,
     );
     let retried = succeeded(&world.import(&descriptor, &sha));
     let published: IndexPin = serde_json::from_value(retried["publishedRevision"].clone()).unwrap();
@@ -576,15 +572,15 @@ fn commit_contention_requeues_the_request_instead_of_rejoining_or_failing() {
     let marker = home_marker.path().join("commit-busy.marker");
     // The first COMMIT fails from contention and rolls back; the request is requeued typed
     // `storage_busy` instead of being re-joined (which would charge the lookup budget again).
-    // One join costs 144 lookup steps; a limit of 200 admits one join but not two, so an
-    // in-request re-join after the failed COMMIT would fail with `limit_exceeded`.
+    // This fixture costs 376 lookup steps per join. A limit of 631 admits one join but
+    // not two, so an in-request re-join after the failed COMMIT hits `limit_exceeded`.
     let world = World::new(
         four_language_workspace,
         &[
             ("TRELLIS_TEST_SEMANTIC_COMMIT_BUSY", marker.as_path()),
             (
                 "TRELLIS_TEST_SEMANTIC_LIMITS",
-                Path::new(r#"{"lookup_steps":200}"#),
+                Path::new(r#"{"lookup_steps":631}"#),
             ),
         ],
     );
@@ -697,21 +693,6 @@ impl Drop for LoggedDaemon {
     }
 }
 
-/// Asserts the last queue row failed with the typed code of the logged `cause`: the code starts
-/// with the cause's class, and the CLI's stderr carries the row's code.
-fn assert_typed_failure(world: &World, output: &std::process::Output, cause: &str) {
-    let class = cause.split(':').next().unwrap();
-    let row = world.queue().pop().unwrap();
-    assert_eq!(row.1, "failed", "{cause}");
-    let code = row.2.as_deref().unwrap();
-    assert!(
-        code == class || code.starts_with(&format!("{class}: ")),
-        "{cause}: row code {code}"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(code), "{cause}: {stderr}");
-}
-
 #[test]
 fn claim_time_causes_map_to_stable_terminal_codes() {
     // (cause logged by the diagnostics, daemon env, how the batch is made bad)
@@ -760,7 +741,9 @@ fn claim_time_causes_map_to_stable_terminal_codes() {
         let _daemon = LoggedDaemon::start(&world.home, &log, env);
         let output = world.import(&descriptor, &sha);
         assert!(!output.status.success(), "{cause}");
-        assert_typed_failure(&world, &output, cause);
+        let row = world.queue().pop().unwrap();
+        assert_eq!(row.1, "failed", "{cause}");
+        assert_terminal_error(cause, row.2.as_deref(), &output.stderr);
         assert_eq!(
             world.count("SELECT count(*) FROM semantic_raw_batches"),
             0,
@@ -804,6 +787,7 @@ fn queued_version_one_row_at_startup_settles_invalid_request_and_later_request_c
     assert_eq!(world.head(), published);
     let queue = world.queue();
     let old = queue.iter().find(|row| row.0 == v1.id).unwrap();
+    // The typed `invalid_request` cause records only its closed-list reason, never its text.
     assert_eq!(
         (old.1.as_str(), old.2.as_deref()),
         ("failed", Some("invalid_request: semantic import options"))
@@ -838,8 +822,37 @@ fn four_language_fixture(world: &World) -> BatchFixture {
     fixture
 }
 
-/// Imports the batch on a fresh daemon with `env` and asserts the claim fails typed: terminal
-/// typed code of the diagnostic `cause`, nothing published and no stage left.
+/// Asserts the terminal error a failed import records for its diagnostic `cause` (#445): a
+/// typed cause keeps its code and a listed reason, any other cause is `index_failed: internal
+/// error`, and the CLI error names the same code and reason.
+fn assert_terminal_error(cause: &str, stored: Option<&str>, stderr: &[u8]) {
+    let stored = stored.unwrap_or_else(|| panic!("{cause}: no terminal error"));
+    let typed = [
+        "invalid_request:",
+        "invalid_artifact:",
+        "limit_exceeded:",
+        "capture_unavailable:",
+        "storage_full:",
+    ]
+    .iter()
+    .any(|code| cause.starts_with(code));
+    if typed {
+        assert!(stored.starts_with(cause), "{cause}: {stored}");
+        assert!(!stored.ends_with(": unlisted detail"), "{cause}: {stored}");
+    } else {
+        assert_eq!(stored, "index_failed: internal error", "{cause}");
+    }
+    let (code, reason) = stored.split_once(": ").unwrap();
+    let stderr = String::from_utf8_lossy(stderr);
+    assert!(
+        stderr.contains(&format!("{code}: request "))
+            && stderr.contains(&format!(" failed: {reason}")),
+        "{cause}: {stderr}"
+    );
+}
+
+/// Imports the batch on a fresh daemon with `env` and asserts the claim fails typed: the
+/// terminal error for `cause`, the diagnostic `cause`, nothing published and no stage left.
 fn assert_claim_fails(
     world: &World,
     log: &Path,
@@ -850,7 +863,9 @@ fn assert_claim_fails(
     let daemon = LoggedDaemon::start(&world.home, log, env);
     let output = world.import(&batch.0, &batch.1);
     assert!(!output.status.success(), "{cause}");
-    assert_typed_failure(world, &output, cause);
+    let row = world.queue().pop().unwrap();
+    assert_eq!(row.1, "failed", "{cause}");
+    assert_terminal_error(cause, row.2.as_deref(), &output.stderr);
     assert_eq!(
         world.count("SELECT count(*) FROM semantic_raw_batches"),
         0,
@@ -1035,6 +1050,21 @@ fn malformed_final_artifact_after_valid_artifacts_publishes_nothing() {
     })]);
 }
 
+#[test]
+fn empty_occurrence_range_records_its_typed_cause() {
+    // The live #445 failure: a non-module occurrence with an empty range. The row and the CLI
+    // name `invalid_artifact` and the fixed reason, not only `index_failed`.
+    run_fault_cases(
+        &[("invalid_artifact: empty or reversed SCIP range", |world| {
+            batch_with_artifact_edit(world, "java", |index| {
+                let occurrence = &mut index.documents[0].occurrences[0];
+                let start = occurrence.range[1];
+                occurrence.range = vec![occurrence.range[0], start, start];
+            })
+        })],
+    );
+}
+
 /// A batch whose artifact for `language` is edited after generation, next to ordinary ones.
 fn batch_with_artifact_edit(
     world: &World,
@@ -1061,7 +1091,9 @@ fn each_batch_limit_fails_limit_exceeded_before_expansion() {
     // (limits override, cause, how the batch is made)
     type Case = (&'static str, &'static str, Fault);
     let ordinary: Fault = |world| world.write_unwatched(&paged_fixture(world));
-    let cases: [Case; 23] = [
+    // `document_occurrences` is not here: over it a document is admitted partially (#394),
+    // which `real_rust_analyzer_capped_document_stays_partial_through_import_and_rejoin` covers.
+    let cases: [Case; 22] = [
         (r#"{"source_documents":4}"#, "source documents", ordinary),
         (r#"{"descriptor_bytes":64}"#, "descriptor bytes", ordinary),
         (r#"{"page_bytes":50}"#, "page bytes", ordinary),
@@ -1078,11 +1110,6 @@ fn each_batch_limit_fails_limit_exceeded_before_expansion() {
         (r#"{"candidates":1}"#, "candidate facts", ordinary),
         (r#"{"wire_fields":3}"#, "wire fields", ordinary),
         (r#"{"unit_expansion_bytes":8}"#, "unit expansion", ordinary),
-        (
-            r#"{"document_occurrences":0}"#,
-            "document entries",
-            ordinary,
-        ),
         (r#"{"document_symbols":0}"#, "document entries", ordinary),
         (r#"{"message_depth":0}"#, "message depth", ordinary),
         (r#"{"staged_rows":1}"#, "staged rows", ordinary),
@@ -1159,16 +1186,10 @@ fn full_disk_during_staging_fails_index_failed_with_prior_head() {
     );
     let output = world.import(&batch.0, &batch.1);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed"))
-    );
+    assert_eq!(row.1, "failed");
+    // A file-system ENOSPC is not a typed SQLite full disk.
+    assert_terminal_error("staging write", row.2.as_deref(), &output.stderr);
     assert_eq!(world.head(), prior, "the prior head stays");
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
     assert_eq!(stage_entries(&world), Vec::<String>::new());
@@ -1181,7 +1202,7 @@ fn full_disk_during_staging_fails_index_failed_with_prior_head() {
 }
 
 #[test]
-fn full_disk_at_commit_fails_index_failed_with_prior_head() {
+fn full_disk_at_commit_fails_storage_full_with_prior_head() {
     let marker = Builder::new()
         .prefix("semantic-commit-full-")
         .tempdir_in("/tmp")
@@ -1205,15 +1226,12 @@ fn full_disk_at_commit_fails_index_failed_with_prior_head() {
     let output = world.import(&batch.0, &batch.1);
     assert!(!output.status.success());
     assert!(disk_full.exists(), "the COMMIT failed once");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("index_failed"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let row = world.queue().pop().unwrap();
-    assert_eq!(
-        (row.1.as_str(), row.2.as_deref()),
-        ("failed", Some("index_failed"))
+    assert_eq!(row.1, "failed");
+    assert_terminal_error(
+        "storage_full: database or disk is full",
+        row.2.as_deref(),
+        &output.stderr,
     );
     assert_eq!(world.head(), prior, "the prior head stays");
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
@@ -1622,14 +1640,14 @@ fn lookup_budget_spans_the_rejoin_after_a_cutoff_edit() {
         .tempdir_in("/tmp")
         .unwrap();
     let socket = marker.path().join("cutoff.sock");
-    // One join of this batch costs 144 lookup steps. The limit admits the first join, which
-    // finishes before the cutoff pause, but not the in-request rejoin after the late edit.
+    // This fixture costs 355 lookup steps before the late edit and 326 afterwards. The
+    // limit admits either join alone, but not their cumulative in-request work (681).
     let (world, output, advanced, _, _) = import_with_cutoff_edit(
         &[
             ("TRELLIS_TEST_SEMANTIC_CUTOFF_SOCKET", &socket),
             (
                 "TRELLIS_TEST_SEMANTIC_LIMITS",
-                Path::new(r#"{"lookup_steps":200}"#),
+                Path::new(r#"{"lookup_steps":631}"#),
             ),
         ],
         &socket,
@@ -1642,7 +1660,13 @@ fn lookup_budget_spans_the_rejoin_after_a_cutoff_edit() {
         },
     );
     assert!(!output.status.success());
-    assert_typed_failure(&world, &output, "limit_exceeded");
+    let row = world.queue().pop().unwrap();
+    assert_eq!(row.1, "failed");
+    assert_terminal_error(
+        "limit_exceeded: lookup steps",
+        row.2.as_deref(),
+        &output.stderr,
+    );
     assert_eq!(world.count("SELECT count(*) FROM semantic_raw_batches"), 0);
     // The request can fail on a watcher generation change before the watcher has published the
     // late edit; the watcher publishes it afterwards, and the durable head shows when it has.
@@ -1721,4 +1745,99 @@ fn commit_contention_after_in_loop_watcher_publication_requeues_and_completes() 
         !log.contains("leave running for verified recovery"),
         "the busy COMMIT was requeued by the running daemon, not left to a new incarnation: {log}"
     );
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&target).unwrap();
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// `(state, diagnostic)` of `path`'s coverage row at the head.
+fn head_coverage(world: &World, path: &str) -> (String, Option<String>) {
+    let head = world.head();
+    world
+        .store
+        .with_index_sql_for_tests(|db| {
+            Ok(db.query_row(
+                "SELECT state, diagnostic FROM semantic_coverage WHERE revision_id=?1 AND path=?2",
+                [
+                    format!("pin:v1:{}:{}", head.index_generation, head.index_revision),
+                    path.to_owned(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .unwrap()
+}
+
+/// Owner ruling 2026-10-28 (#394, option c) through the CLI, queue and daemon, on real
+/// rust-analyzer 1.98.1 bytes (`tests/fixtures/scip-rust-analyzer`) with the per-document cap
+/// shrunk below src/lib.rs's 36 occurrences. The import succeeds with src/lib.rs partial and its
+/// typed reason, and a native republish rejoins the stored original under the same limits with
+/// the reason kept, whichever rejoin path it takes.
+#[test]
+fn real_rust_analyzer_capped_document_stays_partial_through_import_and_rejoin() {
+    capped_document_through_import_and_rejoin(false);
+}
+
+/// The same, with the rejoin forced onto the FULL path, which re-decodes the stored original.
+#[test]
+fn real_rust_analyzer_capped_document_stays_partial_through_full_rejoin() {
+    capped_document_through_import_and_rejoin(true);
+}
+
+fn capped_document_through_import_and_rejoin(force_full: bool) {
+    use protobuf::Message;
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scip-rust-analyzer");
+    let mut env = vec![(
+        "TRELLIS_TEST_SEMANTIC_LIMITS",
+        Path::new(r#"{"document_occurrences":20}"#),
+    )];
+    if force_full {
+        env.push(("TRELLIS_TEST_FORCE_FULL_REJOIN", Path::new("1")));
+    }
+    let world = World::new(|root| copy_dir(&fixtures.join("workspace"), root), &env);
+    let mut index = scip::types::Index::new();
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "rust-analyzer".into();
+    tool.version = "1.98.1 (48a229ce 2026-09-01)".into();
+    metadata.tool_info = Some(tool).into();
+    index.metadata = Some(metadata).into();
+    let mut artifact = index.write_to_bytes().unwrap();
+    artifact.extend(fs::read(fixtures.join("documents.scip")).unwrap());
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 2);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(ordinal, artifact);
+    let (descriptor, sha) = world.write(&fixture);
+    let imported = succeeded(&world.import(&descriptor, &sha));
+    assert_eq!(imported["report"]["languages"][0]["partial"], json!(1));
+    let capped = (
+        "partial".to_owned(),
+        Some("occurrence_cap_exceeded".to_owned()),
+    );
+    assert_eq!(head_coverage(&world, "src/lib.rs"), capped);
+    let util = head_coverage(&world, "src/util.rs");
+    assert_ne!(util.1.as_deref(), Some("occurrence_cap_exceeded"));
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=1"),
+        1
+    );
+    let before = world.head();
+    fs::write(world.root.join("Unrelated.java"), "class Unrelated {}\n").unwrap();
+    world.settle(before);
+    assert_eq!(head_coverage(&world, "src/lib.rs"), capped);
+    assert_eq!(head_coverage(&world, "src/util.rs"), util);
 }

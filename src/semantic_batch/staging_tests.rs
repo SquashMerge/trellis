@@ -29,6 +29,7 @@ fn claim(bytes: &[u8], digest: &str, proof: &str) -> CapturedClaim {
             relative_path: "a.java".into(),
             position_encoding: 1,
             raw: serde_json::json!({}),
+            cargo_target: None,
         },
         canonical_bytes: bytes.to_vec(),
         fact_digest: digest.into(),
@@ -43,6 +44,7 @@ fn unit(path: &str) -> UnitDocument<'_> {
         path,
         language: "java",
         wire_digest: "w",
+        occurrence_cap_exceeded: false,
     }
 }
 
@@ -286,4 +288,91 @@ fn coverage_insert_storage_fault_propagates_typed() {
         }
         other => panic!("the storage fault was reported as {other:?}"),
     }
+}
+
+#[test]
+fn admitted_claims_record_the_symbol_presence_discovery_reads() {
+    use super::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION, claim_presence};
+    let with = |kind: &str, raw: serde_json::Value| {
+        let mut row = claim(b"{}", "d", "p");
+        row.envelope.record_kind = kind.into();
+        row.envelope.raw = raw;
+        row
+    };
+    let cases = [
+        (
+            with("symbolInformation", serde_json::json!({"symbol": "pkg A#"})),
+            (Some("pkg A#"), PRESENCE_INFORMATION),
+        ),
+        (with("symbolInformation", serde_json::json!({})), (None, 0)),
+        (
+            with(
+                "occurrence",
+                serde_json::json!({"symbol": "pkg A#", "symbolRoles": 1}),
+            ),
+            (Some("pkg A#"), PRESENCE_DECLARED),
+        ),
+        (
+            with(
+                "occurrence",
+                serde_json::json!({"symbol": "pkg A#", "symbolRoles": 9}),
+            ),
+            (Some("pkg A#"), PRESENCE_DECLARED),
+        ),
+        (
+            with(
+                "occurrence",
+                serde_json::json!({"symbol": "pkg A#", "symbolRoles": 8}),
+            ),
+            (None, 0),
+        ),
+        (
+            with(
+                "occurrence",
+                serde_json::json!({"symbol": "", "symbolRoles": 1}),
+            ),
+            (None, 0),
+        ),
+        (
+            with(
+                "occurrence",
+                serde_json::json!({"symbol": "pkg A#", "symbolRoles": "1"}),
+            ),
+            (None, 0),
+        ),
+        (
+            with("relationship", serde_json::json!({"symbol": "pkg A#"})),
+            (None, 0),
+        ),
+    ];
+    for (row, expected) in &cases {
+        assert_eq!(claim_presence(row), *expected, "{:?}", row.envelope.raw);
+    }
+    // The sink stores it with the claim.
+    let parent = tempfile::tempdir().unwrap();
+    let mut stage = seeded(parent.path(), "presence");
+    let budget = stage.budget(&BatchLimits::PRODUCTION);
+    let conn = stage.conn().unwrap();
+    let mut sink = StageClaimSink::new(conn, &budget, 0, "java");
+    sink.begin_document(&unit("a.java")).unwrap();
+    let mut first = cases[2].0.clone();
+    first.fact_digest = "d1".into();
+    first.captured_proof_id = "p1".into();
+    let mut second = cases[4].0.clone();
+    second.fact_digest = "d2".into();
+    second.captured_proof_id = "p2".into();
+    sink.claim(first).unwrap();
+    sink.claim(second).unwrap();
+    sink.end_document().unwrap();
+    let stored: Vec<(Option<String>, i64)> = conn
+        .prepare("SELECT symbol, presence FROM claims ORDER BY claim_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        stored,
+        [(Some("pkg A#".to_owned()), PRESENCE_DECLARED), (None, 0)]
+    );
 }

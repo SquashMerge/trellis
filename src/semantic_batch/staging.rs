@@ -12,102 +12,66 @@ use std::{
 pub const STAGE_PREFIX: &str = "semantic-stage-";
 const STAGE_DB: &str = "stage.db";
 
+/// `documents.capped` is 1 for a document admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
+///
+/// `claims.symbol`/`presence` index each admitted claim's symbol presence: a symbol-information
+/// claim's symbol (`PRESENCE_INFORMATION`) and a definition occurrence's (`PRESENCE_DECLARED`),
+/// `NULL`/0 otherwise. A side's presence context is this index over its claim set.
+/// `claims.target_root` is the `sources.ord` of the crate root of a Rust claim's Cargo target
+/// (`NULL` without one), `target_lib` is 1 when that target is a library, and
+/// `target_package`/`target_version` are its package's manifest name and version (#394).
+///
+/// Compact join tables. Documents are integers: `sources.ord` for `g_*` owners and local
+/// symbol scopes (`-1` for none), `nat_docs.ord` for native declarations, and the document's
+/// `out_coverage.ord` (`doc`) for every output row. Native syntax IDs and 64-hex provenance IDs
+/// are stored as their bytes when canonical, as text otherwise (`staged::codec`).
+/// `nat_docs.reserve` is a document's native load reservation, filled on its first load.
+///
+/// The join emits `out_*` one document at a time, so every table's `ord` is document-major and
+/// the publisher reads each family with one cursor in `ord` order. Within one document each
+/// family is in contract order. A document's shared provenance fields (document, revision,
+/// content hash, basis, freshness) are stored once, as a template on its coverage row; a
+/// provenance row holds only its raw claim, evidence kind and ID. Fact bodies store an empty
+/// `provenanceId`; the row's `provenance_id` column is authoritative.
 const STAGE_SCHEMA: &str = "
 CREATE TABLE header(singleton INTEGER PRIMARY KEY CHECK(singleton=1), descriptor_sha256 TEXT NOT NULL, descriptor_bytes BLOB NOT NULL);
 CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, UNIQUE(language,path));
 CREATE TABLE coverage(source_ord INTEGER PRIMARY KEY REFERENCES sources(ord), artifact INTEGER, exclusion TEXT, CHECK((artifact IS NULL)<>(exclusion IS NULL)));
 CREATE INDEX coverage_artifact ON coverage(artifact, source_ord);
 CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, language TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, UNIQUE(artifact,path));
-CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, UNIQUE(artifact,fact_digest));
+CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, capped INTEGER NOT NULL CHECK(capped IN (0,1)), UNIQUE(artifact,path));
+CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0, target_package TEXT, target_version TEXT, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
+CREATE INDEX claims_symbol ON claims(symbol, presence, target_root) WHERE symbol IS NOT NULL;
 CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL, attempt INTEGER NOT NULL);
 CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
-CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
-CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id TEXT NOT NULL, name_start INTEGER, name_end INTEGER, name_ok INTEGER NOT NULL);
-CREATE INDEX nat_declarations_id ON nat_declarations(rev, doc_ord, syntax_id);
-CREATE TABLE ix_declarations(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_language TEXT NOT NULL, local_path TEXT NOT NULL, owner_language TEXT NOT NULL, owner_path TEXT NOT NULL, syntax_id TEXT NOT NULL, PRIMARY KEY(side, symbol, local_language, local_path, owner_language, owner_path, syntax_id)) WITHOUT ROWID;
-CREATE TABLE ix_type_uses(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, symbol TEXT NOT NULL, PRIMARY KEY(side, language, path, start, end, symbol)) WITHOUT ROWID;
-CREATE TABLE ix_occurrences(side INTEGER NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE TABLE ix_relationships(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, language, path, ord)) WITHOUT ROWID;
-CREATE TABLE ix_relationship_endpoints(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, language, path, source, target, ord)) WITHOUT ROWID;
-CREATE TABLE ix_reference_claims(side INTEGER NOT NULL, reference_id TEXT NOT NULL, ord INTEGER NOT NULL, proof_id TEXT NOT NULL, target TEXT NOT NULL, PRIMARY KEY(side, reference_id, ord)) WITHOUT ROWID;
-CREATE TABLE ix_call_references(side INTEGER NOT NULL, proof_id TEXT NOT NULL, reference_id TEXT NOT NULL, PRIMARY KEY(side, proof_id)) WITHOUT ROWID;
-CREATE TABLE ix_symbols(side INTEGER NOT NULL, symbol TEXT NOT NULL, declared INTEGER NOT NULL, information INTEGER NOT NULL, PRIMARY KEY(side, symbol)) WITHOUT ROWID;
-CREATE TABLE ix_methods(side INTEGER NOT NULL, kind INTEGER NOT NULL, key_a TEXT NOT NULL, key_b TEXT NOT NULL, key_c TEXT NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, kind, key_a, key_b, key_c, ord)) WITHOUT ROWID;
-CREATE TABLE f_symbols(side INTEGER NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE TABLE f_bindings(side INTEGER NOT NULL, ord INTEGER NOT NULL, provenance_id TEXT NOT NULL, syntax_id TEXT, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE INDEX f_bindings_provenance ON f_bindings(side, provenance_id);
-CREATE TABLE f_refclaims(side INTEGER NOT NULL, proof_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, proof_id)) WITHOUT ROWID;
-CREATE TABLE f_refs(side INTEGER NOT NULL, slot INTEGER NOT NULL, ref_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, slot)) WITHOUT ROWID;
-CREATE UNIQUE INDEX f_refs_id ON f_refs(side, ref_id);
-CREATE TABLE f_calls(side INTEGER NOT NULL, slot INTEGER NOT NULL, provenance_id TEXT NOT NULL, call_id TEXT, body TEXT NOT NULL, PRIMARY KEY(side, slot)) WITHOUT ROWID;
-CREATE INDEX f_calls_provenance ON f_calls(side, provenance_id);
-CREATE TABLE f_rels(side INTEGER NOT NULL, ord INTEGER NOT NULL, provenance_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(side, ord)) WITHOUT ROWID;
-CREATE INDEX f_rels_provenance ON f_rels(side, provenance_id);
-CREATE TABLE f_diag(side INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, code TEXT NOT NULL, PRIMARY KEY(side, language, path, code)) WITHOUT ROWID;
-CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, requested INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, eligible INTEGER NOT NULL DEFAULT 0, unsupported INTEGER NOT NULL DEFAULT 0, omitted INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE w_unsupported_claims(proof_id TEXT PRIMARY KEY) WITHOUT ROWID;
-CREATE TABLE w_cap_targets(language TEXT NOT NULL, path TEXT NOT NULL, symbol TEXT NOT NULL, target BLOB NOT NULL, PRIMARY KEY(language, path, symbol, target)) WITHOUT ROWID;
-CREATE INDEX w_cap_targets_symbol ON w_cap_targets(symbol);
-CREATE TABLE w_prov(raw_id TEXT NOT NULL, kind INTEGER NOT NULL, PRIMARY KEY(raw_id, kind)) WITHOUT ROWID;
-CREATE TABLE w_outcomes(proof_id TEXT PRIMARY KEY, outcome INTEGER NOT NULL) WITHOUT ROWID;
-CREATE TABLE w_refrows(ref_id TEXT PRIMARY KEY, body TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE w_reftargets(ref_id TEXT NOT NULL, ord INTEGER NOT NULL, target TEXT NOT NULL, PRIMARY KEY(ref_id, ord)) WITHOUT ROWID;
-CREATE TABLE w_refproofs(ref_id TEXT NOT NULL, raw_id TEXT NOT NULL, PRIMARY KEY(ref_id, raw_id)) WITHOUT ROWID;
-CREATE TABLE w_accepted(raw_id TEXT PRIMARY KEY, ref_id TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE w_calls(ord INTEGER PRIMARY KEY, raw_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE w_callres(ord INTEGER PRIMARY KEY, raw_id TEXT NOT NULL, call_id TEXT, body TEXT NOT NULL);
-CREATE INDEX w_callres_site ON w_callres(call_id);
-CREATE TABLE w_sitetargets(call_id TEXT NOT NULL, canon BLOB NOT NULL, target TEXT NOT NULL, PRIMARY KEY(call_id, canon)) WITHOUT ROWID;
-CREATE TABLE w_observed(language TEXT NOT NULL, path TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(language, path, role)) WITHOUT ROWID;
-CREATE TABLE out_coverage(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL UNIQUE, artifact INTEGER, derived_from TEXT, derived_kind TEXT, derived_digest TEXT, body TEXT NOT NULL);
-CREATE TABLE out_symbols(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_declaration_bindings(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_references(ord INTEGER PRIMARY KEY, reference_id TEXT NOT NULL UNIQUE, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_call_bindings(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE INDEX out_provenance_document ON out_provenance(json_extract(body,'$.document.language'), json_extract(body,'$.document.path'), ord);
-CREATE INDEX out_symbols_provenance ON out_symbols(provenance_id);
-CREATE INDEX out_declaration_bindings_provenance ON out_declaration_bindings(provenance_id);
-CREATE INDEX out_references_provenance ON out_references(provenance_id);
-CREATE INDEX out_call_bindings_provenance ON out_call_bindings(provenance_id);
-CREATE INDEX out_type_relationships_provenance ON out_type_relationships(provenance_id);
+CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, reserve INTEGER, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
+CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id BLOB NOT NULL, n INTEGER NOT NULL, named INTEGER NOT NULL, name_ok INTEGER NOT NULL, PRIMARY KEY(rev, doc_ord, syntax_id, n)) WITHOUT ROWID;
+CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID;
+CREATE INDEX g_definitions_owner ON g_definitions(side,owner_doc,syntax_id);
+CREATE TABLE g_callables(side INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, callable INTEGER NOT NULL CHECK(callable IN (1,2)), PRIMARY KEY(side,owner_doc,syntax_id)) WITHOUT ROWID;
+CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL);
+CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_doc);
+CREATE INDEX g_methods_target ON g_methods(side,symbol,local_doc);
+CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, requested INTEGER NOT NULL, failed INTEGER NOT NULL, eligible INTEGER NOT NULL, unsupported INTEGER NOT NULL, unsupported_claims INTEGER NOT NULL, claims INTEGER NOT NULL);
+CREATE TABLE out_coverage(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL, provenance TEXT);
+CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, claim_id INTEGER NOT NULL, kind INTEGER NOT NULL, id BLOB NOT NULL UNIQUE);
+CREATE TABLE out_symbols(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_declaration_bindings(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_references(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, reference_id TEXT NOT NULL UNIQUE, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_call_bindings(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
 ";
 
-/// Tables a join fills that depend on the destination revision. A new destination clears them all.
+/// Tables one join attempt fills from its claims and destination. Every attempt clears them all;
+/// only `nat_docs` (and `nat_done`) outlive an attempt, as its retained native seed.
 pub const JOIN_TABLES: &[&str] = &[
-    "ix_declarations",
-    "ix_type_uses",
-    "ix_occurrences",
-    "ix_relationships",
-    "ix_relationship_endpoints",
-    "ix_reference_claims",
-    "ix_call_references",
-    "ix_symbols",
-    "ix_methods",
-    "f_symbols",
-    "f_bindings",
-    "f_refclaims",
-    "f_refs",
-    "f_calls",
-    "f_rels",
-    "f_diag",
+    "nat_declarations",
+    "g_definitions",
+    "g_callables",
+    "g_methods",
     "w_docs",
-    "w_unsupported_claims",
-    "w_cap_targets",
-    "w_prov",
-    "w_outcomes",
-    "w_refrows",
-    "w_reftargets",
-    "w_refproofs",
-    "w_accepted",
-    "w_calls",
-    "w_callres",
-    "w_sitetargets",
-    "w_observed",
     "out_coverage",
     "out_provenance",
     "out_symbols",
@@ -322,31 +286,64 @@ pub fn remove_abandoned_semantic_stages(index_dir: &Path) -> usize {
     removed
 }
 
-/// Rebuilds a claim from its staged row.
+/// `claims.presence` bit of a definition occurrence's symbol.
+pub const PRESENCE_DECLARED: i64 = 1;
+/// `claims.presence` bit of a symbol-information claim's symbol.
+pub const PRESENCE_INFORMATION: i64 = 2;
+
+/// The symbol presence a claim contributes, as the join's discovery records it: the symbol of
+/// a symbol-information claim, and of an occurrence whose roles include the definition bit. A
+/// claim the join would reject (no symbol, invalid roles) contributes none; the join fails it.
+pub fn claim_presence(claim: &CapturedClaim) -> (Option<&str>, i64) {
+    let raw = &claim.envelope.raw;
+    match claim.envelope.record_kind.as_str() {
+        "symbolInformation" => match raw["symbol"].as_str() {
+            Some(symbol) => (Some(symbol), PRESENCE_INFORMATION),
+            None => (None, 0),
+        },
+        "occurrence" => match (raw["symbol"].as_str(), raw["symbolRoles"].as_u64()) {
+            (Some(symbol), Some(roles)) if !symbol.is_empty() && roles & 1 != 0 => {
+                (Some(symbol), PRESENCE_DECLARED)
+            }
+            _ => (None, 0),
+        },
+        _ => (None, 0),
+    }
+}
+
+/// Rebuilds the staged join's view of a claim from its staged row: the parsed envelope and
+/// identity, decoded from the row's borrowed canonical bytes. The join never reads the
+/// canonical bytes again (they stay in the stage), so the claim does not keep a copy.
 pub(crate) fn claim_from_stage(
-    canonical_bytes: Vec<u8>,
+    canonical_bytes: &[u8],
     fact_digest: String,
     proof_id: String,
     language: String,
     artifact_hash: String,
 ) -> Result<CapturedClaim> {
-    let value: serde_json::Value =
-        serde_json::from_slice(&canonical_bytes).context("staged claim")?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(canonical_bytes).context("staged claim")?;
     let text = |name: &str| {
         value[name]
             .as_str()
             .map(str::to_owned)
             .context("staged claim")
     };
+    let record_kind = text("recordKind")?;
+    let relative_path = text("relativePath")?;
+    let position_encoding = u8::try_from(value["positionEncoding"].as_u64().unwrap_or(0))?;
+    let cargo_target = crate::scip_raw::CapturedScipFactV1::cargo_target_from(&value)?;
+    let raw = value["raw"].take();
     Ok(CapturedClaim {
         envelope: crate::scip_raw::CapturedScipFactV1 {
             format_version: 1,
-            record_kind: text("recordKind")?,
-            relative_path: text("relativePath")?,
-            position_encoding: u8::try_from(value["positionEncoding"].as_u64().unwrap_or(0))?,
-            raw: value["raw"].clone(),
+            record_kind,
+            relative_path,
+            position_encoding,
+            raw,
+            cargo_target,
         },
-        canonical_bytes,
+        canonical_bytes: Vec::new(),
         fact_digest,
         captured_proof_id: proof_id,
         language,
@@ -472,10 +469,16 @@ impl ClaimSink for StageClaimSink<'_> {
             return Ok(());
         };
         let inserted = self.conn.prepare_cached(
-            "INSERT INTO documents(source_ord, artifact, path, wire_digest) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO documents(source_ord, artifact, path, wire_digest, capped) VALUES(?1,?2,?3,?4,?5)",
         );
         let inserted = inserted.and_then(|mut statement| {
-            statement.execute(params![ord, self.artifact, doc.path, doc.wire_digest])
+            statement.execute(params![
+                ord,
+                self.artifact,
+                doc.path,
+                doc.wire_digest,
+                doc.occurrence_cap_exceeded
+            ])
         });
         match inserted {
             Err(rusqlite::Error::SqliteFailure(error, _))
@@ -494,9 +497,11 @@ impl ClaimSink for StageClaimSink<'_> {
             return Err(stage_storage());
         };
         let inserted = self.conn.prepare_cached(
-            "INSERT INTO claims(artifact, source_ord, record_kind, fact_digest, proof_id, canonical_bytes) \
-             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING",
+            "INSERT INTO claims(artifact, source_ord, record_kind, fact_digest, proof_id, canonical_bytes, symbol, presence, target_root, target_lib, target_package, target_version) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,CASE WHEN ?9 IS NULL THEN NULL ELSE (SELECT ord FROM sources WHERE language=?10 AND path=?9) END,?11,?12,?13) ON CONFLICT DO NOTHING",
         );
+        let (symbol, presence) = claim_presence(&claim);
+        let target = claim.envelope.cargo_target.as_ref();
         let changed = inserted.and_then(|mut statement| {
             statement.execute(params![
                 self.artifact,
@@ -504,7 +509,14 @@ impl ClaimSink for StageClaimSink<'_> {
                 claim.envelope.record_kind,
                 claim.fact_digest,
                 claim.captured_proof_id,
-                claim.canonical_bytes
+                claim.canonical_bytes,
+                symbol,
+                presence,
+                target.map(|t| t.root.as_str()),
+                claim.language,
+                target.is_some_and(|t| t.is_lib()),
+                target.map(|t| t.package.as_str()),
+                target.and_then(|t| t.version.as_deref())
             ])
         });
         if self.record(changed)? == 0 {

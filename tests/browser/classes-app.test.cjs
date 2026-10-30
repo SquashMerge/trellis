@@ -25,7 +25,7 @@ test("published Java class renders through Pele with exact class, member and met
   let server, browser;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
-    const pin = JSON.parse(indexed.stdout).status.revision;
+    const pin = indexed.json().status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
     const read = async (method, suffix, body) => {
       const response = await H.api(server.base, paths.token, method, H.scoped(server.rootKey, suffix), body);

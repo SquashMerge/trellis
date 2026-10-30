@@ -15,7 +15,7 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
   test("owned sequence fixture", async () => {
     const paths = H.fixture();
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env});
-    const server = await H.startDaemon(paths, JSON.parse(indexed.stdout).status.revision.indexRevision);
+    const server = await H.startDaemon(paths, indexed.json().status.revision.indexRevision);
     const listed = await H.run("ps", ["-axww", "-o", "pid=,args="]);
     const commands = new Set([H.binary, realpathSync(H.binary)].map(path => `${path} daemon`));
     const pids = listed.stdout.split("\n").map(line => line.trim().match(/^(\d+) (.*)$/))
@@ -37,6 +37,16 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
     await H.cleanup();
     if (unrelatedPaths) rmSync(unrelatedPaths.temp, {recursive:true,force:true,maxRetries:10,retryDelay:100});
   });
+  // #475: a child's process exit can be observed before its stdout is read. Here the
+  // shell exits first and its background writer finishes stdout afterwards, so a
+  // result taken at exit misses output the child wrote; run() keeps all of it.
+  test("run returns a child's whole stdout, including output read after its exit", async () => {
+    const result = await H.run("/bin/sh", ["-c", "printf '{\"a\":'; (sleep 0.2; printf '1}') & exit 0"]);
+    assert.equal(result.stdout, '{"a":1}');
+    assert.deepEqual(result.json(), {a:1});
+    const truncated = await H.run("/bin/sh", ["-c", "printf '{\"a\":'; echo 'to stderr' >&2"]);
+    assert.throws(() => truncated.json(), /sh -c .* exited 0 with unparseable stdout \(5 chars: .*\):\nto stderr\n$/s);
+  });
 
   test("CLI index then serve builds the dependency catalog without explicit refresh", {timeout:150000}, async () => {
     const paths = H.fixture("function measured() { return 1; }\n", "anchor.js");
@@ -54,7 +64,7 @@ if (process.env.TRELLIS_SEQUENCE_CLEANUP_CHILD === "1") {
         writeFileSync(destination, text);
       }
       const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env});
-      const pin = JSON.parse(indexed.stdout).status.revision;
+      const pin = indexed.json().status.revision;
       server = await H.startDaemon(paths, pin.indexRevision);
       let catalog;
       const deadline = Date.now() + 120000;

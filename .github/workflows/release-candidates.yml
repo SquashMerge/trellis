@@ -29,7 +29,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         with:
           python-version: '3.12'
@@ -69,12 +69,12 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install repository-pinned Rust toolchain
         run: rustup show active-toolchain
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest@0.9.150
       - name: Confirm native target and read pinned inputs
@@ -148,7 +148,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Recheck tag and full commit before publishing

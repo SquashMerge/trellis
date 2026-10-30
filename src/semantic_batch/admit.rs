@@ -63,6 +63,10 @@ pub(crate) struct Passes<'a> {
     pub limits: &'a BatchLimits,
     pub cancel: &'a CancelFlag,
     pub budget: StageBudget,
+    /// Package roots from the captured revision's retained native config (#443).
+    pub module_roots: &'a scip_raw::ModuleRoots,
+    /// The captured revision's retained native config, the source of Cargo manifests (#394).
+    pub native_config: &'a [serde_json::Value],
 }
 
 fn check_cancel(cancel: &CancelFlag) -> std::result::Result<(), ScipCaptureError> {
@@ -118,15 +122,19 @@ impl Passes<'_> {
     }
 
     /// Source pages: strictly ordered rows, merged one-to-one against the streamed retained
-    /// inventory, hashed against the descriptor and staged.
+    /// inventory, hashed against the descriptor and staged. Returns the Cargo target of each
+    /// Rust document, read from the retained manifests and every authenticated Rust source
+    /// (owner ruling 2026-10-30, #394).
     pub fn source_pass(
         &self,
         conn: &Connection,
         inputs: &mut dyn BatchInputs,
         native: &mut dyn NativeSource,
         counters: &mut BatchCounters,
-    ) -> Result<()> {
+    ) -> Result<scip_raw::CargoTargets> {
         let descriptor = self.descriptor;
+        let mut cargo = scip_raw::CargoTargetsBuilder::from_native_config(self.native_config);
+        let rust = self.producer.languages.iter().any(|l| l == "rust") && !cargo.is_empty();
         let mut rows_order = RowOrder::source();
         let mut hasher = SourceManifestHasher::new(&descriptor.source_set.id);
         let mut ord = 0i64;
@@ -169,6 +177,9 @@ impl Passes<'_> {
                 {
                     return Err(admission("captured source hash").into());
                 }
+                if rust && row.language == "rust" {
+                    cargo.add_document(&row.relative_path, &bytes);
+                }
                 hasher.push(&row.language, &row.relative_path, &row.content_hash);
                 conn.prepare_cached(
                     "INSERT INTO sources(ord, language, path, content_hash, byte_length) VALUES(?1,?2,?3,?4,?5)",
@@ -191,7 +202,7 @@ impl Passes<'_> {
         if hasher.finish() != descriptor.source_manifest_hash {
             return Err(admission("source manifest hash").into());
         }
-        Ok(())
+        Ok(cargo.finish())
     }
 
     /// Coverage pages: strictly ordered rows, each bound to a staged source and either an
@@ -281,6 +292,7 @@ impl Passes<'_> {
         conn: &Connection,
         inputs: &mut dyn BatchInputs,
         native: &mut dyn NativeSource,
+        cargo_targets: &scip_raw::CargoTargets,
         counters: &mut BatchCounters,
     ) -> Result<()> {
         let descriptor = self.descriptor;
@@ -303,7 +315,7 @@ impl Passes<'_> {
             if copied.sha256 != entry.sha256 {
                 return Err(admission("artifact digest").into());
             }
-            self.decode(entry, &dest, conn, native, counters)?;
+            self.decode(entry, &dest, conn, native, cargo_targets, counters)?;
             #[cfg(all(feature = "test-support", unix))]
             if entry.ordinal == 0 {
                 pause_after_first_artifact()?;
@@ -329,6 +341,7 @@ impl Passes<'_> {
         staged: &Path,
         conn: &Connection,
         native: &mut dyn NativeSource,
+        cargo_targets: &scip_raw::CargoTargets,
         counters: &mut BatchCounters,
     ) -> Result<()> {
         let descriptor = self.descriptor;
@@ -347,6 +360,8 @@ impl Passes<'_> {
             protocol_version: descriptor.metadata.protocol_version,
             text_document_encoding: descriptor.metadata.text_document_encoding,
             project_root_uri: &descriptor.metadata.project_root,
+            module_roots: self.module_roots,
+            cargo_targets,
             assigned_documents: assigned as u64,
         };
         let mut sink = StageClaimSink::new(conn, &self.budget, entry.ordinal, &entry.language);
@@ -567,6 +582,8 @@ pub fn stage_batch(
     descriptor.check_pages(limits)?;
     descriptor.check_artifacts(limits)?;
     descriptor.check_paths(root)?;
+    let native_config = store.retained_native_components_at(captured)?.1;
+    let module_roots = scip_raw::ModuleRoots::from_native_config(&native_config);
     let mut stage = Stage::create(
         &store.semantic_stage_parent()?,
         owner.request_id,
@@ -578,10 +595,12 @@ pub fn stage_batch(
         limits,
         cancel,
         budget: stage.budget(limits),
+        module_roots: &module_roots,
+        native_config: &native_config,
     };
     let mut inputs = FileInputs { root };
     passes.begin(stage.conn()?, &bytes, descriptor_sha256)?;
-    store.with_native_reader(captured, |reader| {
+    let cargo_targets = store.with_native_reader(captured, |reader| {
         let mut native = ReaderSource {
             reader,
             stream: Some(reader.inventory()?),
@@ -595,7 +614,14 @@ pub fn stage_batch(
             reader,
             stream: None,
         };
-        passes.artifact_pass(&dir, stage.conn()?, &mut inputs, &mut native, counters)
+        passes.artifact_pass(
+            &dir,
+            stage.conn()?,
+            &mut inputs,
+            &mut native,
+            &cargo_targets,
+            counters,
+        )
     })?;
     Ok(AdmittedBatch::new(
         stage,
