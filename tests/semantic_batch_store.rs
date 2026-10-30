@@ -748,6 +748,14 @@ impl World {
         &self,
         descriptor: &(PathBuf, String),
     ) -> Result<MemoryAdmission, ScipCaptureError> {
+        self.try_memory_admission_with(descriptor, &BatchLimits::PRODUCTION)
+    }
+
+    fn try_memory_admission_with(
+        &self,
+        descriptor: &(PathBuf, String),
+        limits: &BatchLimits,
+    ) -> Result<MemoryAdmission, ScipCaptureError> {
         let bytes = fs::read(&descriptor.0).unwrap();
         let parsed = Descriptor::parse(&bytes).unwrap();
         let pin = self
@@ -767,7 +775,7 @@ impl World {
             .collect();
         let page_refs: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
         let artifact_refs: Vec<&[u8]> = artifacts.iter().map(Vec::as_slice).collect();
-        let inventories = testing::admit_in_memory(
+        let inventories = testing::admit_in_memory_with_limits(
             &self.root,
             &r1,
             &r1_sources,
@@ -775,6 +783,7 @@ impl World {
             &bytes,
             &page_refs,
             &artifact_refs,
+            limits,
             &self.cancel,
         )?;
         let mut merged = inventories[0].clone();
@@ -803,6 +812,10 @@ impl World {
             .iter()
             .flat_map(|inventory| inventory.exclusions.clone())
             .filter(|e| seen.insert((e.language.clone(), e.relative_path.clone())))
+            .collect();
+        merged.capped_documents = inventories
+            .iter()
+            .flat_map(|inventory| inventory.capped_documents.clone())
             .collect();
         Ok(MemoryAdmission {
             pin,
@@ -837,13 +850,22 @@ impl World {
         descriptor: &(PathBuf, String),
         mutations: DestinationMutations,
     ) -> anyhow::Result<trellis::semantic_import::RejoinResult> {
+        self.memory_rejoin_with(descriptor, mutations, &BatchLimits::PRODUCTION)
+    }
+
+    fn memory_rejoin_with(
+        &self,
+        descriptor: &(PathBuf, String),
+        mutations: DestinationMutations,
+        limits: &BatchLimits,
+    ) -> anyhow::Result<trellis::semantic_import::RejoinResult> {
         let MemoryAdmission {
             parsed,
             r1,
             r1_sources,
             merged,
             ..
-        } = self.memory_admission(descriptor);
+        } = self.try_memory_admission_with(descriptor, limits)?;
         let head = self.store.index_baseline().unwrap();
         let (mut destination, destination_sources) =
             self.store.retained_native_snapshot_at(head).unwrap();
@@ -1884,8 +1906,13 @@ fn duplicate_symbol_key_within_one_artifact_is_rejected_typed() {
         )
         .map(|_| ())
         .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("duplicate semantic symbol key"),
+    // A producer artifact error, typed (#394: rust-analyzer gives `crate/` and `main().` to
+    // every Cargo target), not an internal one.
+    assert_eq!(
+        error.downcast_ref::<ScipCaptureError>(),
+        Some(&ScipCaptureError::InvalidArtifact(
+            "duplicate semantic symbol key".into()
+        )),
         "{error:#}"
     );
 }
@@ -5371,4 +5398,334 @@ async fn none_or_multiple_producers_show_syntax_with_a_note() {
     let descriptor = multiple.write(&second);
     drop(multiple.publish(&descriptor).unwrap());
     check(&multiple, trellis::store::MULTIPLE_PRODUCERS_NOTE, 470, 2);
+}
+
+// Real rust-analyzer 1.98.1 output (`rust-analyzer scip`, the profile-pinned binary) for the
+// crate in `tests/fixtures/scip-rust-analyzer/workspace`. Only its Metadata unit (the absolute
+// project root) was dropped; the document units are the producer's exact bytes, and
+// `rust_analyzer_artifact` re-adds metadata for the test workspace. rust-analyzer writes
+// `position_encoding` (field 6) in every signature `Document` and gives same-document references
+// their target definition's range as `enclosing_range` (#394).
+const RUST_ANALYZER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer"
+);
+
+fn rust_analyzer_world() -> World {
+    world(|root| copy_tree(&Path::new(RUST_ANALYZER).join("workspace"), root))
+}
+
+fn rust_analyzer_artifact(world: &World) -> Vec<u8> {
+    let mut index = scip::types::Index::new();
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "rust-analyzer".into();
+    tool.version = "1.98.1 (48a229ce 2026-09-01)".into();
+    metadata.tool_info = Some(tool).into();
+    index.metadata = Some(metadata).into();
+    let mut bytes = index.write_to_bytes().unwrap();
+    bytes.extend(fs::read(Path::new(RUST_ANALYZER).join("documents.scip")).unwrap());
+    bytes
+}
+
+fn rust_analyzer_batch(world: &World) -> (PathBuf, String) {
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 2);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(ordinal, rust_analyzer_artifact(world));
+    world.write(&fixture)
+}
+
+/// The staged publication of `descriptor` under `limits`, checked identical to the in-memory
+/// oracle's under the same limits.
+fn rust_analyzer_publications(
+    world: &World,
+    descriptor: &(PathBuf, String),
+    limits: &BatchLimits,
+    case: &str,
+) -> SemanticPublication {
+    let (mut admitted, _, _) = world
+        .join_with(descriptor, limits, DestinationMutations::default())
+        .unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let memory = world
+        .memory_rejoin_with(descriptor, DestinationMutations::default(), limits)
+        .unwrap()
+        .publication;
+    assert_same_publication(&staged, &memory, case);
+    staged
+}
+
+/// `(document, callee spelling, resolution)` of every call binding, sorted.
+fn rust_calls(world: &World, publication: &SemanticPublication) -> Vec<(String, String, String)> {
+    let mut calls: Vec<_> = publication
+        .call_bindings
+        .iter()
+        .map(|binding| {
+            assert!(binding.call_id.is_some());
+            let anchor = &binding.join.anchor;
+            let source = fs::read_to_string(world.root.join(&anchor.document.path)).unwrap();
+            (
+                anchor.document.path.clone(),
+                source[anchor.range.start..anchor.range.end].to_owned(),
+                format!("{:?}", binding.resolution),
+            )
+        })
+        .collect();
+    calls.sort();
+    calls
+}
+
+fn coverage_of<'p>(
+    publication: &'p SemanticPublication,
+    path: &str,
+) -> &'p trellis::semantic_evidence::Coverage {
+    publication
+        .coverage
+        .iter()
+        .find(|row| row.document_path == path)
+        .unwrap()
+}
+
+#[test]
+fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_calls() {
+    let documents = fs::read(Path::new(RUST_ANALYZER).join("documents.scip")).unwrap();
+    let signatures: Vec<_> = scip::types::Index::parse_from_bytes(&documents)
+        .unwrap()
+        .documents
+        .iter()
+        .flat_map(|document| document.symbols.clone())
+        .filter_map(|symbol| symbol.signature_documentation.into_option())
+        .collect();
+    assert!(!signatures.is_empty());
+    assert!(
+        signatures.iter().all(|signature| signature
+            .special_fields
+            .unknown_fields()
+            .iter()
+            .any(|(number, _)| number == 6)),
+        "rust-analyzer writes position_encoding in every signature"
+    );
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let staged =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "real rust");
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    assert!(
+        staged
+            .coverage
+            .iter()
+            .all(|row| row.diagnostic.as_deref() != Some("occurrence_cap_exceeded"))
+    );
+    // `saturating(value, value)` in util.rs, `Counter::new()` and `counter.add(..)` carry an
+    // enclosing range (their target's definition) that does not enclose the reference; they
+    // bind at their exact callee spans like the cross-document calls, which carry none.
+    // Before #394 none of the three bound a call.
+    assert_eq!(
+        rust_calls(&world, &staged),
+        [
+            ("src/lib.rs".into(), "add".into(), "Resolved".into()),
+            ("src/lib.rs".into(), "double".into(), "Resolved".into()),
+            // rust-analyzer's associated-function kind does not bind the measured method
+            // declaration, so `Counter::new()` binds its call but resolves no target.
+            ("src/lib.rs".into(), "new".into(), "Unresolved".into()),
+            ("src/lib.rs".into(), "saturating".into(), "Resolved".into()),
+            ("src/util.rs".into(), "saturating".into(), "Resolved".into()),
+            (
+                "src/util.rs".into(),
+                "saturating_add".into(),
+                "External".into()
+            ),
+        ]
+    );
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    drop(admitted);
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    // An unrelated edit rejoins the stored original, field 6 included, with no failure.
+    let proofs = stored_proofs(&world);
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(stored_proofs(&world), proofs);
+    let head = world.store.index_baseline().unwrap();
+    assert_eq!(
+        world.store.semantic_at(head).unwrap().call_bindings.len(),
+        staged.call_bindings.len()
+    );
+}
+
+/// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
+/// per-document cap shrunk below src/lib.rs's 36 occurrences: the document is admitted partial
+/// with the typed reason, keeps exactly its definitions, and both join paths agree.
+#[test]
+fn real_rust_analyzer_over_cap_document_is_admitted_partial_with_its_reason() {
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let full =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "uncapped");
+    let limits = BatchLimits {
+        document_occurrences: 20,
+        ..BatchLimits::PRODUCTION
+    };
+    let capped = rust_analyzer_publications(&world, &descriptor, &limits, "capped");
+    let lib = coverage_of(&capped, "src/lib.rs");
+    assert_eq!(
+        lib.state,
+        trellis::semantic_evidence::CoverageState::Partial
+    );
+    assert_eq!(lib.diagnostic.as_deref(), Some("occurrence_cap_exceeded"));
+    assert!(lib.selected);
+    // The observed roles are those the kept definition facts author: never `call`.
+    let full_lib = coverage_of(&full, "src/lib.rs");
+    assert!(
+        lib.observed_roles
+            .iter()
+            .all(|role| full_lib.observed_roles.contains(role))
+    );
+    assert!(
+        lib.observed_roles
+            .contains(&trellis::semantic_evidence::Role::Definition)
+    );
+    assert!(
+        !lib.observed_roles
+            .contains(&trellis::semantic_evidence::Role::Call)
+    );
+    assert!(
+        full_lib
+            .observed_roles
+            .contains(&trellis::semantic_evidence::Role::Call)
+    );
+    // util.rs (12 occurrences) is untouched.
+    assert_eq!(
+        coverage_of(&capped, "src/util.rs"),
+        coverage_of(&full, "src/util.rs")
+    );
+    let in_lib = |publication: &SemanticPublication| {
+        publication
+            .declaration_bindings
+            .iter()
+            .filter(|binding| binding.join.anchor.document.path == "src/lib.rs")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(!in_lib(&capped).is_empty());
+    assert_eq!(
+        in_lib(&capped),
+        in_lib(&full),
+        "the kept definitions bind as before"
+    );
+    assert!(
+        capped
+            .call_bindings
+            .iter()
+            .all(|binding| binding.join.anchor.document.path != "src/lib.rs"),
+        "dropped references author no call"
+    );
+    // The admitted claims of the capped document are its definitions and symbols only.
+    let admission = world
+        .try_memory_admission_with(&descriptor, &limits)
+        .unwrap();
+    assert_eq!(
+        admission.merged.capped_documents,
+        std::collections::BTreeSet::from([("rust".to_owned(), "src/lib.rs".to_owned())])
+    );
+    let lib_claims: Vec<_> = admission
+        .merged
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.envelope.relative_path == "src/lib.rs"
+                && claim.envelope.record_kind == "occurrence"
+        })
+        .collect();
+    assert_eq!(lib_claims.len(), 11);
+    assert!(
+        lib_claims
+            .iter()
+            .all(|claim| claim.envelope.raw["symbolRoles"].as_u64().unwrap() & 1 == 1)
+    );
+    // Publication keeps the partial row and records the capped document with the raw capture.
+    let (mut admitted, joined, _) = world
+        .join_with(&descriptor, &limits, DestinationMutations::default())
+        .unwrap();
+    let leader = world.store.publication_for_tests().unwrap();
+    let pin = world
+        .store
+        .publish_semantic_batch(
+            &joined,
+            admitted.stage_mut(),
+            joined.destination_pin(),
+            &leader,
+            &world.cancel,
+        )
+        .unwrap();
+    drop(leader);
+    let published = world.store.semantic_at(pin).unwrap();
+    let stored = published
+        .coverage
+        .iter()
+        .find(|row| row.document_path == "src/lib.rs")
+        .unwrap();
+    assert_eq!(
+        (stored.state, &stored.diagnostic, &stored.observed_roles),
+        (lib.state, &lib.diagnostic, &lib.observed_roles)
+    );
+    assert_eq!(
+        world.count(
+            "SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=1 AND path='src/lib.rs'"
+        ),
+        1
+    );
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM semantic_raw_documents WHERE capped=0"),
+        1
+    );
+}
+
+/// The aggregate candidate cap still fails typed and atomically on both paths (#394, a).
+#[test]
+fn real_rust_analyzer_aggregate_candidate_cap_fails_typed_and_atomically() {
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let head = world.store.index_baseline().unwrap();
+    // 48 occurrences and 18 symbol informations: 66 candidates.
+    let limits = BatchLimits {
+        candidates: 65,
+        ..BatchLimits::PRODUCTION
+    };
+    let error = world
+        .join_with(&descriptor, &limits, DestinationMutations::default())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::LimitExceeded(name)) if name == "candidate facts"
+        ),
+        "{error:#}"
+    );
+    assert_eq!(
+        world
+            .try_memory_admission_with(&descriptor, &limits)
+            .map(|_| ())
+            .unwrap_err(),
+        ScipCaptureError::LimitExceeded("candidate facts".into())
+    );
+    assert_nothing_published(&world, head);
+    assert!(world.stage_dirs().is_empty());
+    let limits = BatchLimits {
+        candidates: 66,
+        ..BatchLimits::PRODUCTION
+    };
+    world
+        .join_with(&descriptor, &limits, DestinationMutations::default())
+        .unwrap();
 }

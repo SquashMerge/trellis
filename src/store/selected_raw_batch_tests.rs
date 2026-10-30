@@ -48,6 +48,7 @@ fn batch() -> SelectedRawBatch {
         decoder_version: crate::scip_raw::DECODER_VERSION.into(),
         captures,
         exclusions: vec![],
+        capped_documents: Default::default(),
         proofs: vec![],
         documents: BTreeMap::from([(
             ("javascript".into(), "b.js".into()),
