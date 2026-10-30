@@ -916,8 +916,7 @@ fn sqlite_snapshot(
             let mut statement = db.prepare(&sql).unwrap();
             let column_names: Vec<String> = statement
                 .column_names()
-                .iter()
-                .map(|name| (*name).to_owned())
+                .map(str::to_owned)
                 .collect();
             let mut rows = statement
                 .query_map([&revision_id], |row| {
