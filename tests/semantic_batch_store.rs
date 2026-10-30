@@ -1109,18 +1109,80 @@ fn staged_and_memory_join_stores_produce_identical_publications() {
                     staged.references.iter().any(|r| r.spelling == "target"),
                     "{case}"
                 );
+                assert!(!staged.call_bindings.is_empty(), "{case}");
+            }
+            // `target()` is a plain call of a free function (#470): direct exactly while it
+            // settles resolved, on both paths (`check` compared them), also under rejoin and
+            // a destination that makes the target ambiguous.
+            for binding in &staged.call_bindings {
+                assert_eq!(
+                    binding.dispatch == trellis::semantic_evidence::Dispatch::Direct,
+                    binding.resolution == Resolution::Resolved,
+                    "{case}: {binding:?}"
+                );
             }
         }
     }
-    let world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
-    let descriptor = one_artifact_per_language(&world, vec![("java", vec![java_doc()])]);
+    let java_world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
+    let descriptor = one_artifact_per_language(&java_world, vec![("java", vec![java_doc()])]);
     let (staged, _) = check(
-        &world,
+        &java_world,
         &descriptor,
         DestinationMutations::default(),
         "java types",
     );
     assert_eq!(staged.type_relationships.len(), 1);
+    // Dispatch shapes (#470) on both paths: `new` of a class by identifier and by dotted name
+    // is constructor, a plain call of a free function is direct; a class called without `new`
+    // and a member call of the same free function stay unknown.
+    let source =
+        "class W {}\nfunction m(o){ new W(); new o.W(); W(); h(); o.h(); }\nfunction h(){}\n";
+    let world = world(|root| write_files(root, &[("D.js", source)]));
+    let mut doc = DocSpec::new("D.js")
+        .symbol("pkg W#", 7, &[])
+        .symbol("pkg h().", 17, &[]);
+    for (needle, nth, symbol, roles) in [
+        ("W", 0, "pkg W#", 1),
+        ("h", 2, "pkg h().", 1),
+        ("W", 1, "pkg W#", 0),
+        ("W", 2, "pkg W#", 0),
+        ("W", 3, "pkg W#", 0),
+        ("h", 0, "pkg h().", 0),
+        ("h", 1, "pkg h().", 0),
+    ] {
+        doc = occ_at(doc, source, (needle, nth), None, symbol, roles);
+    }
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
+    let (staged, _) = check(
+        &world,
+        &descriptor,
+        DestinationMutations::default(),
+        "dispatch shapes",
+    );
+    let mut dispatches: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|b| {
+            assert_eq!(b.resolution, Resolution::Resolved);
+            let range = &b.join.anchor.range;
+            (range.start, &source[range.start - 2..range.end], b.dispatch)
+        })
+        .collect();
+    dispatches.sort_by_key(|(start, _, _)| *start);
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    assert_eq!(
+        dispatches
+            .into_iter()
+            .map(|(_, text, dispatch)| (text, dispatch))
+            .collect::<Vec<_>>(),
+        [
+            ("w W", Constructor),
+            ("o.W", Constructor),
+            ("; W", Unknown),
+            ("; h", Direct),
+            ("o.h", Unknown),
+        ]
+    );
 }
 
 /// Adds an occurrence of the `nth` `needle` in `source`. `enclosing` is the byte length of the
@@ -2336,6 +2398,7 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             "nat_docs",
             "nat_declarations",
             "g_definitions",
+            "g_callables",
             "g_methods",
             "w_docs",
             "out_coverage",
@@ -3274,20 +3337,35 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
     drop(admitted);
     let memory = world.memory_publication(&descriptor, DestinationMutations::default());
     assert_same_publication(&staged, &memory, "real scip-typescript calls");
-    let mut callees: Vec<_> = staged
-        .call_bindings
-        .iter()
-        .map(|binding| {
-            let range = &binding.join.anchor.range;
-            assert!(binding.call_id.is_some());
-            &main[range.start..range.end]
-        })
-        .collect();
-    callees.sort();
-    assert_eq!(
-        callees,
-        ["Widget", "helper", "plain", "plain", "register", "run"]
-    );
+    // Callee and dispatch (owner ruling 2026-10-30, #470): plain calls of free functions,
+    // the imported `helper` included, are direct. scip-typescript's constructor and method
+    // symbols bind no target (kind 0 fails the method-kind check), so they stay unknown.
+    let callees = |bindings: &[trellis::semantic_evidence::CallBinding]| {
+        let mut callees: Vec<_> = bindings
+            .iter()
+            .map(|binding| {
+                let range = &binding.join.anchor.range;
+                assert!(binding.call_id.is_some());
+                (&main[range.start..range.end], binding.dispatch)
+            })
+            .collect();
+        callees.sort_by_key(|(callee, _)| *callee);
+        callees
+    };
+    {
+        use trellis::semantic_evidence::Dispatch::{Direct, Unknown};
+        assert_eq!(
+            callees(&staged.call_bindings),
+            [
+                ("Widget", Unknown),
+                ("helper", Direct),
+                ("plain", Direct),
+                ("plain", Direct),
+                ("register", Direct),
+                ("run", Unknown),
+            ]
+        );
+    }
     let helper = staged
         .call_bindings
         .iter()
@@ -3310,8 +3388,8 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
     assert_eq!(world.rejoin_failures(), 0);
     let head = world.store.index_baseline().unwrap();
     assert_eq!(
-        world.store.semantic_at(head).unwrap().call_bindings.len(),
-        6
+        callees(&world.store.semantic_at(head).unwrap().call_bindings),
+        callees(&staged.call_bindings)
     );
 }
 
@@ -3358,9 +3436,11 @@ fn real_typescript_ambiguous_calls_read_as_one_edge_with_the_union() {
     for (callee, count) in [("Set", 4), ("Error", 2)] {
         let rows = rows_of(callee);
         assert_eq!(rows.len(), count, "{callee} rows");
+        // Plain-call shape, but ambiguous: never direct (#470).
         assert!(rows.iter().all(|b| b.resolution == Resolution::Ambiguous
             && b.call_id == rows[0].call_id
-            && b.candidates.len() == count));
+            && b.candidates.len() == count
+            && b.dispatch == trellis::semantic_evidence::Dispatch::Unknown));
     }
     let producer = published.producers[0].id.clone();
     let (_, native, _) = index_workspace_bundle(
@@ -5460,20 +5540,23 @@ fn rust_analyzer_publications(
     staged
 }
 
-/// `(document, callee spelling, resolution)` of every call binding, sorted.
-fn rust_calls(world: &World, publication: &SemanticPublication) -> Vec<(String, String, String)> {
-    let mut calls: Vec<_> = publication
-        .call_bindings
+/// `(document, callee spelling, resolution, dispatch)` of every call binding, sorted.
+fn rust_calls(
+    world: &World,
+    bindings: &[trellis::semantic_evidence::CallBinding],
+) -> Vec<[String; 4]> {
+    let mut calls: Vec<_> = bindings
         .iter()
         .map(|binding| {
             assert!(binding.call_id.is_some());
             let anchor = &binding.join.anchor;
             let source = fs::read_to_string(world.root.join(&anchor.document.path)).unwrap();
-            (
+            [
                 anchor.document.path.clone(),
                 source[anchor.range.start..anchor.range.end].to_owned(),
                 format!("{:?}", binding.resolution),
-            )
+                format!("{:?}", binding.dispatch),
+            ]
         })
         .collect();
     calls.sort();
@@ -5526,22 +5609,26 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     // `saturating(value, value)` in util.rs, `Counter::new()` and `counter.add(..)` carry an
     // enclosing range (their target's definition) that does not enclose the reference; they
     // bind at their exact callee spans like the cross-document calls, which carry none.
-    // Before #394 none of the three bound a call.
+    // Before #394 none of the three bound a call. The recursive `spin(value)` carries its own
+    // definition's range, which encloses the reference but joins no invocation: under owner
+    // ruling 4 (2026-10-30, #394) that range is absent and the exact callee span binds it.
+    // Dispatch (owner ruling 2026-10-30, #470): plain and path calls of free functions are
+    // direct; the method call `counter.add(..)` and unresolved or external calls are unknown.
+    let call = |path: &str, callee: &str, resolution: &str, dispatch: &str| {
+        [path, callee, resolution, dispatch].map(str::to_owned)
+    };
     assert_eq!(
-        rust_calls(&world, &staged),
+        rust_calls(&world, &staged.call_bindings),
         [
-            ("src/lib.rs".into(), "add".into(), "Resolved".into()),
-            ("src/lib.rs".into(), "double".into(), "Resolved".into()),
+            call("src/lib.rs", "add", "Resolved", "Unknown"),
+            call("src/lib.rs", "double", "Resolved", "Direct"),
             // rust-analyzer's associated-function kind does not bind the measured method
             // declaration, so `Counter::new()` binds its call but resolves no target.
-            ("src/lib.rs".into(), "new".into(), "Unresolved".into()),
-            ("src/lib.rs".into(), "saturating".into(), "Resolved".into()),
-            ("src/util.rs".into(), "saturating".into(), "Resolved".into()),
-            (
-                "src/util.rs".into(),
-                "saturating_add".into(),
-                "External".into()
-            ),
+            call("src/lib.rs", "new", "Unresolved", "Unknown"),
+            call("src/lib.rs", "saturating", "Resolved", "Direct"),
+            call("src/util.rs", "saturating", "Resolved", "Direct"),
+            call("src/util.rs", "saturating_add", "External", "Unknown"),
+            call("src/util.rs", "spin", "Resolved", "Direct"),
         ]
     );
     let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
@@ -5556,10 +5643,179 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     assert_eq!(world.rejoin_failures(), 0);
     assert_eq!(stored_proofs(&world), proofs);
     let head = world.store.index_baseline().unwrap();
+    // The rejoined calls keep their resolution and dispatch (#470).
     assert_eq!(
-        world.store.semantic_at(head).unwrap().call_bindings.len(),
-        staged.call_bindings.len()
+        rust_calls(
+            &world,
+            &world.store.semantic_at(head).unwrap().call_bindings
+        ),
+        rust_calls(&world, &staged.call_bindings)
     );
+}
+
+/// Owner ruling 2026-10-30 (#470) through the #40 call graph and the sequence view, on the real
+/// rust-analyzer fixture: `run` -> `util::double` -> `saturating` are direct path and plain
+/// calls of free functions, so the graph expands into them under the depth and node bounds,
+/// while `counter.add(..)` stays a dispatch boundary and `Counter::new()` an unresolved one.
+#[test]
+fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
+    use trellis::graph_query::{BoundaryReason, FrontierReason, GraphQuery, Visit};
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let id_of = |name: &str| {
+        let found: Vec<_> = native
+            .declarations
+            .iter()
+            .filter(|d| d.name.as_deref() == Some(name) && d.kind == "function")
+            .collect();
+        assert_eq!(found.len(), 1, "{name}");
+        found[0].syntax_id.clone()
+    };
+    let (run, double, saturating) = (id_of("run"), id_of("double"), id_of("saturating"));
+    let graph = |depth: u64, max_nodes: u64| {
+        world
+            .store
+            .evidence_response()
+            .unwrap()
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: run.clone(),
+                    semantic_producer_id: Some(producer.clone()),
+                    depth,
+                    max_nodes,
+                    max_calls: 500,
+                    include_external: true,
+                    include_tests: true,
+                },
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .outcome
+            .expect("contract success")
+    };
+    let nodes = |result: &trellis::graph_query::GraphResult| {
+        result
+            .nodes
+            .iter()
+            .map(|n| (n.declaration.syntax_id.clone(), n.depth))
+            .collect::<Vec<_>>()
+    };
+    let edge = |result: &trellis::graph_query::GraphResult, callee: &str| {
+        let found: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.call.spelling.as_deref() == Some(callee))
+            .cloned()
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}");
+        found.into_iter().next().unwrap()
+    };
+
+    // Depth 2 follows the direct edge into `double`, then `double`'s into `saturating`.
+    let deep = graph(2, 150);
+    assert_eq!(
+        nodes(&deep),
+        [
+            (run.clone(), 0),
+            (double.clone(), 1),
+            (saturating.clone(), 2)
+        ]
+    );
+    for (callee, from, to) in [
+        ("double", &run, &double),
+        ("saturating", &double, &saturating),
+    ] {
+        let e = edge(&deep, callee);
+        assert_eq!(
+            (e.visit, e.boundary_reason),
+            (Visit::New, BoundaryReason::None)
+        );
+        assert_eq!((&e.from, e.to.as_ref()), (from, Some(to)));
+        let binding = e.binding.unwrap();
+        assert_eq!(
+            binding.dispatch,
+            trellis::semantic_evidence::Dispatch::Direct
+        );
+    }
+    for (callee, reason) in [
+        ("add", BoundaryReason::Dispatch),
+        ("new", BoundaryReason::Unresolved),
+    ] {
+        let e = edge(&deep, callee);
+        assert_eq!(
+            (e.visit, e.boundary_reason),
+            (Visit::Boundary, reason),
+            "{callee}"
+        );
+        assert_eq!(e.to, None);
+    }
+    // The depth bound stops at `saturating`: its own call is depth frontier, not expanded.
+    assert!(
+        deep.frontier
+            .iter()
+            .any(|f| f.reason == FrontierReason::Depth && f.node_id == saturating)
+    );
+    assert!(deep.edges.iter().all(|e| e.from != saturating));
+
+    // Depth 1 admits `double` and leaves its call on the depth frontier.
+    let shallow = graph(1, 150);
+    assert_eq!(nodes(&shallow), [(run.clone(), 0), (double.clone(), 1)]);
+    assert!(
+        shallow
+            .frontier
+            .iter()
+            .any(|f| f.reason == FrontierReason::Depth && f.node_id == double)
+    );
+    assert!(shallow.edges.iter().all(|e| e.from == run));
+
+    // The node bound holds: with room for two nodes the direct call into `saturating` is a
+    // node-limit boundary and the result is partial.
+    let bounded = graph(2, 2);
+    assert_eq!(nodes(&bounded), [(run.clone(), 0), (double.clone(), 1)]);
+    let e = edge(&bounded, "saturating");
+    assert_eq!(
+        (e.visit, e.boundary_reason, e.to),
+        (Visit::Boundary, BoundaryReason::NodeLimit, None)
+    );
+    assert!(bounded.partial);
+
+    // The sequence view takes the same disposition: the direct call names its target.
+    let view = world.store.sequence_at(&run, pin, false).unwrap().unwrap();
+    fn steps(all: &[trellis::behavior::SequenceStep]) -> Vec<&trellis::behavior::SequenceStep> {
+        all.iter()
+            .flat_map(|s| {
+                std::iter::once(s)
+                    .chain(steps(&s.children))
+                    .chain(steps(&s.alternate))
+            })
+            .collect()
+    }
+    let evidence = |label: &str| {
+        let found: Vec<_> = steps(&view.steps)
+            .into_iter()
+            .filter(|s| s.call_evidence.is_some() && s.label.contains(label))
+            .collect();
+        assert_eq!(found.len(), 1, "{label}");
+        (
+            found[0].target.clone(),
+            found[0].call_evidence.as_ref().unwrap().boundary_reason,
+        )
+    };
+    assert_eq!(evidence("double"), (Some(double), BoundaryReason::None));
+    assert_eq!(evidence("add"), (None, BoundaryReason::Dispatch));
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
@@ -5603,7 +5859,7 @@ fn real_rust_analyzer_over_cap_document_is_admitted_partial_with_its_reason() {
             .observed_roles
             .contains(&trellis::semantic_evidence::Role::Call)
     );
-    // util.rs (12 occurrences) is untouched.
+    // util.rs (16 occurrences) is untouched.
     assert_eq!(
         coverage_of(&capped, "src/util.rs"),
         coverage_of(&full, "src/util.rs")
@@ -5696,9 +5952,9 @@ fn real_rust_analyzer_aggregate_candidate_cap_fails_typed_and_atomically() {
     let world = rust_analyzer_world();
     let descriptor = rust_analyzer_batch(&world);
     let head = world.store.index_baseline().unwrap();
-    // 48 occurrences and 18 symbol informations: 66 candidates.
+    // 52 occurrences and 20 symbol informations: 72 candidates.
     let limits = BatchLimits {
-        candidates: 65,
+        candidates: 71,
         ..BatchLimits::PRODUCTION
     };
     let error = world
@@ -5722,7 +5978,7 @@ fn real_rust_analyzer_aggregate_candidate_cap_fails_typed_and_atomically() {
     assert_nothing_published(&world, head);
     assert!(world.stage_dirs().is_empty());
     let limits = BatchLimits {
-        candidates: 66,
+        candidates: 72,
         ..BatchLimits::PRODUCTION
     };
     world
