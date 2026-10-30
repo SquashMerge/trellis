@@ -58,6 +58,14 @@ fn limit(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
         },
     }
 }
+/// An optional explicit semantic producer (#467): 1..=512 bytes, never null.
+fn semantic_producer(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
+    match o.get("semanticProducerId") {
+        None => Ok(()),
+        Some(Value::String(id)) if crate::model::valid_semantic_producer_id(id) => Ok(()),
+        Some(_) => Err("invalid_request"),
+    }
+}
 /// An architecture page offset is any safe UInt; one past the result is
 /// `range_too_large` once the result is known.
 fn offset(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
@@ -149,6 +157,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "schemaVersion",
                 "symbolId",
                 "limit",
+                "semanticProducerId",
                 "expectedBasis",
                 "workspace",
             ],
@@ -256,6 +265,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 return call_graph_arguments(o).and_then(|()| workspace_field(o));
             }
             if name != "trellis_declaration" {
+                semantic_producer(o)?;
                 limit(o)
             } else {
                 Ok(())
@@ -1203,7 +1213,7 @@ mod tests {
         let mut valid = json!({"schemaVersion":1,"symbolId":sid(),"limit":20,
             "expectedBasis":pin()});
         assert_eq!(validate(name, Some(&valid)), Ok(()));
-        for field in ["view", "semanticProducerId", "other"] {
+        for field in ["view", "other"] {
             valid[field] = json!("invalid");
             check(name, &valid, "invalid_request");
             valid.as_object_mut().unwrap().remove(field);
@@ -1230,6 +1240,29 @@ mod tests {
         let (_dir, workspace) = context();
         let prepared = prepare(name, Some(&valid), &json!(1), true, &workspace);
         assert!(prepared.valid_arguments);
+    }
+    /// #467: the call tools take an optional explicit producer of 1..=512 bytes; anything
+    /// else, including an explicit null, is `invalid_request` before any read.
+    #[test]
+    fn call_tools_bound_the_explicit_semantic_producer() {
+        for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
+            let mut valid = good(name);
+            for producer in [json!("scip-typescript"), json!("p".repeat(512))] {
+                valid["semanticProducerId"] = producer;
+                assert_eq!(validate(name, Some(&valid)), Ok(()), "{name}");
+            }
+            for producer in [
+                Value::Null,
+                json!(""),
+                json!("p".repeat(513)),
+                json!("a\u{0}b"),
+                json!(7),
+                json!(["scip-typescript"]),
+            ] {
+                valid["semanticProducerId"] = producer;
+                check(name, &valid, "invalid_request");
+            }
+        }
     }
     #[test]
     fn summary_uses_the_singular_for_one_item() {
