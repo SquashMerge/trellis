@@ -583,37 +583,46 @@ pub fn stage_and_join_admitted(
     Ok((admitted, joined, counters))
 }
 
-/// The staged `out_*` rows, read back as the publication the in-memory join would build.
+/// The staged `out_*` rows, read back as the publication the in-memory join would build:
+/// the publisher's per-document rows, with provenance and references in their global contract
+/// order (raw ID then evidence kind, and reference ID).
 pub fn staged_publication(batch: &mut AdmittedBatch) -> Result<semantic::SemanticPublication> {
     let producer = batch.producer().producer();
     let conn = batch.stage_mut().conn()?;
-    fn rows<T: serde::de::DeserializeOwned>(conn: &Connection, table: &str) -> Result<Vec<T>> {
-        // Provenance and references read in their global contract order by indexed key; the
-        // other families' document-major `ord` is already their contract order.
-        let order = match table {
-            "out_provenance" => "derived_from, kind_rank",
-            "out_references" => "reference_id",
-            _ => "ord",
+    let mut publication = semantic::SemanticPublication {
+        producers: vec![producer.clone()],
+        coverage: vec![],
+        provenance: vec![],
+        symbols: vec![],
+        declaration_bindings: vec![],
+        references: vec![],
+        call_bindings: vec![],
+        type_relationships: vec![],
+    };
+    crate::semantic_import::read_staged_documents(conn, "", &producer, &mut |document| {
+        publication.coverage.extend(document.coverage);
+        publication.provenance.extend(document.provenance);
+        publication.symbols.extend(document.symbols);
+        publication
+            .declaration_bindings
+            .extend(document.declaration_bindings);
+        publication.references.extend(document.references);
+        publication.call_bindings.extend(document.call_bindings);
+        publication
+            .type_relationships
+            .extend(document.type_relationships);
+        Ok(())
+    })?;
+    publication.provenance.sort_by(|a, b| {
+        let raw = |row: &semantic::Provenance| {
+            row.derived_from
+                .as_ref()
+                .map(|derived| derived.provenance_id.clone())
         };
-        let mut statement = conn.prepare(&format!("SELECT body FROM {table} ORDER BY {order}"))?;
-        let bodies = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        bodies
-            .iter()
-            .map(|body| Ok(serde_json::from_str(body)?))
-            .collect()
-    }
-    Ok(semantic::SemanticPublication {
-        producers: vec![producer],
-        coverage: rows(conn, "out_coverage")?,
-        provenance: rows(conn, "out_provenance")?,
-        symbols: rows(conn, "out_symbols")?,
-        declaration_bindings: rows(conn, "out_declaration_bindings")?,
-        references: rows(conn, "out_references")?,
-        call_bindings: rows(conn, "out_call_bindings")?,
-        type_relationships: rows(conn, "out_type_relationships")?,
-    })
+        (raw(a), a.evidence_kind).cmp(&(raw(b), b.evidence_kind))
+    });
+    publication.references.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(publication)
 }
 
 /// The ordered cursor queries of the staged join, for query-plan tests.

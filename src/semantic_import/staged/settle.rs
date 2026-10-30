@@ -4,6 +4,7 @@
 //! that document, validated row by row and written to `out_*`. Every rule that settlement reads
 //! is document-local: a fact's raw proof, its reference and call site all belong to the
 //! document; only target authority (`nat_declarations`, captured exact definitions) is global.
+use super::codec;
 use super::streaming::{self, CompletedGlobal};
 use super::*;
 
@@ -18,6 +19,8 @@ pub(super) struct DocumentOutcome {
     /// Distinct claims whose final outcome is matched, and ambiguous.
     pub(super) matched: u64,
     pub(super) ambiguous: u64,
+    /// The stored provenance template the document's provenance rows share, if it has any.
+    pub(super) provenance: Option<String>,
 }
 
 /// Retarget decisions already made in this document, by target identity. An optional cache
@@ -245,10 +248,16 @@ impl StagedJoin<'_> {
         let _keys = self.view_keys(doc, 2)?;
         let captured_view = streaming::claims_side(&self.captured, doc.clone(), claims.clone())?;
         let view = streaming::claims_side(&self.filtered, doc.clone(), claims)?;
-        let (mut captured, _captured_reservation) =
+        let (mut captured, captured_reservation) =
             streaming::join_document(&captured_view, captured_global, encoding)?;
-        let (destination, _destination_reservation) =
-            streaming::join_document(&view, destination_global, encoding)?;
+        let (destination, _destination_reservation) = if self.identical_joins.get() {
+            // Same claims, native revision and global rows: the destination join would
+            // recompute the captured facts. Admit the copy at the original's charge first.
+            let reservation = self.ctx.live.reserve(captured_reservation.bytes())?;
+            (captured.clone(), reservation)
+        } else {
+            streaming::join_document(&view, destination_global, encoding)?
+        };
         #[cfg(feature = "test-support")]
         crate::semantic_batch::testing::run_document_common_observer(
             1,
@@ -343,12 +352,7 @@ impl StagedJoin<'_> {
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("symbol", &mut symbol)?;
                 self.check_row(&view, &raw, kind, None, |v, p, f| v.symbol(&symbol, p, f))?;
-                let body = to_json(&symbol)?;
-                self.emit(
-                    "out_symbols",
-                    "INSERT INTO out_symbols VALUES(?1,?2,?3)",
-                    &[&self.next_ord(SYMBOLS), &symbol.provenance_id, &body],
-                )?;
+                self.emit_fact("out_symbols", SYMBOLS, &mut symbol)?;
             } else if own {
                 outcome.omitted = true;
             }
@@ -378,12 +382,7 @@ impl StagedJoin<'_> {
                 Some(&binding.join.anchor.document),
                 |v, p, f| v.declaration_binding(&binding, p, f),
             )?;
-            let body = to_json(&binding)?;
-            self.emit(
-                "out_declaration_bindings",
-                "INSERT INTO out_declaration_bindings VALUES(?1,?2,?3)",
-                &[&self.next_ord(BINDINGS), &binding.provenance_id, &body],
-            )?;
+            self.emit_fact("out_declaration_bindings", BINDINGS, &mut binding)?;
         }
 
         // Each destination reference claim takes its captured reference's resolution; claims
@@ -506,14 +505,15 @@ impl StagedJoin<'_> {
             self.check_row(&view, &raw, kind, Some(&reference.document), |v, p, f| {
                 v.reference(&reference, p, f)
             })?;
-            let body = to_json(&reference)?;
+            let body = codec::fact_body(&mut reference)?;
             self.emit(
                 "out_references",
-                "INSERT INTO out_references VALUES(?1,?2,?3,?4)",
+                "INSERT INTO out_references VALUES(?1,?2,?3,?4,?5)",
                 &[
                     &self.next_ord(REFERENCES),
+                    &self.current_document(),
                     &reference.id,
-                    &reference.provenance_id,
+                    &codec::digest(&reference.provenance_id),
                     &body,
                 ],
             )?;
@@ -662,12 +662,7 @@ impl StagedJoin<'_> {
                 Some(&call.join.anchor.document),
                 |v, p, f| v.call_binding(&call, p, f),
             )?;
-            let body = to_json(&call)?;
-            self.emit(
-                "out_call_bindings",
-                "INSERT INTO out_call_bindings VALUES(?1,?2,?3)",
-                &[&self.next_ord(CALLS), &call.provenance_id, &body],
-            )?;
+            self.emit_fact("out_call_bindings", CALLS, &mut call)?;
         }
 
         // Captured type relationships of eligible claims survive when both endpoints retarget.
@@ -689,22 +684,13 @@ impl StagedJoin<'_> {
                 self.check_row(&view, &raw, kind, None, |v, p, f| {
                     v.type_relationship(&relationship, p, f)
                 })?;
-                let body = to_json(&relationship)?;
-                self.emit(
-                    "out_type_relationships",
-                    "INSERT INTO out_type_relationships VALUES(?1,?2,?3)",
-                    &[
-                        &self.next_ord(RELATIONSHIPS),
-                        &relationship.provenance_id,
-                        &body,
-                    ],
-                )?;
+                self.emit_fact("out_type_relationships", RELATIONSHIPS, &mut relationship)?;
             } else {
                 outcome.omitted = true;
             }
         }
 
-        self.provenance(&view, doc, &sources, destination_manifest_hash)?;
+        outcome.provenance = self.provenance(&view, doc, &sources, destination_manifest_hash)?;
         for value in outcomes.values() {
             match value {
                 1 => outcome.matched += 1,
@@ -715,32 +701,47 @@ impl StagedJoin<'_> {
         Ok(outcome)
     }
 
-    /// Writes this document's provenance in (raw ID, evidence kind) order.
+    /// Writes one validated fact row of the current document.
+    fn emit_fact<T: codec::ProvenanceOwned>(
+        &self,
+        table: &'static str,
+        family: usize,
+        row: &mut T,
+    ) -> Result<()> {
+        let provenance = codec::digest(row.provenance_id());
+        let body = codec::fact_body(row)?;
+        self.emit(
+            table,
+            &format!("INSERT INTO {table} VALUES(?1,?2,?3,?4)"),
+            &[
+                &self.next_ord(family),
+                &self.current_document(),
+                &provenance,
+                &body,
+            ],
+        )
+    }
+
+    /// Writes this document's provenance in (raw ID, evidence kind) order and returns the
+    /// stored template its rows share, for the document's coverage row.
     fn provenance(
         &self,
         view: &StagedSide<'_>,
         doc: &native::DocumentKey,
         sources: &BTreeSet<(String, semantic::EvidenceKind)>,
         destination_manifest_hash: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         if sources.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let conn = self.conn();
+        // Every derived proof is a claim of this document, decoded from its staged row.
         let lookup = |proof: &str, kind: &str, digest: &str| -> Result<RawClaimDocument> {
-            conn.prepare_cached(
-                "SELECT s.language, s.path, a.sha256 FROM claims c JOIN sources s ON s.ord=c.source_ord \
-                 JOIN artifacts a ON a.ordinal=c.artifact WHERE c.proof_id=?1 AND c.record_kind=?2 AND c.fact_digest=?3",
-            )?
-            .query_row(params![proof, kind, digest], |row| {
-                Ok(RawClaimDocument {
-                    language: row.get(0)?,
-                    path: row.get(1)?,
-                    artifact_hash: row.get(2)?,
-                })
+            let (claim, _) = view.local_claim(proof, kind, digest)?;
+            Ok(RawClaimDocument {
+                language: claim.language.clone(),
+                path: claim.envelope.relative_path.clone(),
+                artifact_hash: claim.artifact_hash.clone(),
             })
-            .optional()?
-            .ok_or_else(|| ScipCaptureError::MissingProof.into())
         };
         let basis = self
             .basis
@@ -767,6 +768,7 @@ impl StagedJoin<'_> {
         } else {
             semantic::Freshness::Fresh
         };
+        let mut template = None;
         for (raw, kind) in sources {
             self.ctx.check_cancel()?;
             let claim = view
@@ -803,27 +805,24 @@ impl StagedJoin<'_> {
                 }),
             };
             self.validator.provenance(&provenance, &lookup)?;
+            if template.is_none() {
+                template = Some(codec::provenance_template(&provenance)?);
+            }
             self.ctx.charge(1)?;
-            let artifact: i64 = conn
-                .prepare_cached("SELECT artifact FROM claims WHERE proof_id=?1")?
-                .query_row([raw], |row| row.get(0))?;
-            let body = to_json(&provenance)?;
+            let (_, claim_id) = view.local_claim(raw, &claim.record_kind, &claim.fact_digest)?;
             self.emit(
                 "out_provenance",
-                "INSERT INTO out_provenance VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT INTO out_provenance VALUES(?1,?2,?3,?4,?5)",
                 &[
                     &self.next_ord(PROVENANCE),
-                    &provenance.id,
-                    &artifact,
-                    raw,
-                    &claim.record_kind,
-                    &claim.fact_digest,
-                    &kind_rank(*kind),
-                    &body,
+                    &self.current_document(),
+                    &claim_id,
+                    &codec::kind_rank(*kind),
+                    &codec::digest(&provenance.id),
                 ],
             )?;
         }
-        Ok(())
+        Ok(template)
     }
 }
 

@@ -1666,9 +1666,12 @@ fn streaming_common_uses_only_final_eligible_presence() {
             if document.path != "src/A.js" {
                 return;
             }
+            // Presence is read from the admitted claims: all of them for the captured side,
+            // those of eligible documents for the destination.
             let presence: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM g_presence WHERE side=?1 AND symbol='pkg target.'",
+                    "SELECT COUNT(*) FROM claims c WHERE symbol='pkg target.' AND (?1=0 OR EXISTS \
+                     (SELECT 1 FROM w_docs w WHERE w.source_ord=c.source_ord AND w.eligible=1 AND w.failed=0))",
                     [side],
                     |row| row.get(0),
                 )
@@ -1717,11 +1720,21 @@ fn streaming_exact_definition_authority_survives_incompatible_common_kind() {
         if document.path != "J.java" {
             return;
         }
+        // A shared pin keeps one side of global rows: side 1 reads side 0's eligible rows.
         let exact: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM g_definitions WHERE side=?1 AND symbol='pkg A#' AND common_compatible=0",
+            "SELECT COUNT(*) FROM g_definitions g WHERE side=0 AND symbol='pkg A#' AND common_compatible=0 \
+             AND (?1=0 OR EXISTS (SELECT 1 FROM w_docs w WHERE w.source_ord=g.owner_doc AND w.eligible=1 AND w.failed=0))",
             [side], |row| row.get(0),
         ).unwrap();
         assert_eq!(exact, 1);
+        let side_one: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM g_definitions WHERE side=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(side_one, 0);
         assert_eq!(facts.declaration_bindings.len(), 1);
         assert!(facts.declaration_bindings[0].syntax_id.is_some());
         assert!(facts.symbols.iter().all(|row| row.declarations.is_empty()));
@@ -1803,25 +1816,31 @@ fn forged_derived_from_is_rejected_before_publication() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
-    testing::before_join_closure(|conn| {
-        conn.execute(
-            "UPDATE out_provenance SET derived_digest=?1 WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
-            ["0".repeat(64)],
-        )
-        .unwrap();
-    });
-    let error = world
-        .join_with(
-            &descriptor,
-            &BatchLimits::PRODUCTION,
-            DestinationMutations::default(),
-        )
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("derived provenance without staged claim"),
-        "{error:#}"
-    );
+    // A provenance row names its raw claim by ID: a missing claim, a claim of another
+    // document and an unknown evidence kind are each rejected by the closure.
+    for sql in [
+        "UPDATE out_provenance SET claim_id=-1 WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
+        "UPDATE out_provenance SET claim_id=(SELECT c.claim_id FROM claims c JOIN sources s ON s.ord=c.source_ord \
+         JOIN out_coverage v ON v.ord=out_provenance.doc WHERE s.path<>v.path LIMIT 1) \
+         WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
+        "UPDATE out_provenance SET kind=7 WHERE ord=(SELECT MIN(ord) FROM out_provenance)",
+    ] {
+        testing::before_join_closure(move |conn| {
+            assert_eq!(conn.execute(sql, []).unwrap(), 1, "{sql}");
+        });
+        let error = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("derived provenance without staged claim"),
+            "{sql}: {error:#}"
+        );
+    }
 }
 
 type RowEdit = fn(&mut Value);
@@ -1952,13 +1971,100 @@ fn staged_rows_run_the_row_local_validators() {
 }
 
 #[test]
+fn compact_output_rows_decode_to_the_publication_and_corruption_is_typed() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let (mut admitted, _, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let decoded = testing::staged_publication(&mut admitted).unwrap();
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    assert_same_publication(&decoded, &memory, "compact rows");
+    {
+        let conn = admitted.stage_mut().conn().unwrap();
+        // IDs are stored as their bytes, a fact body without its provenance ID, and one
+        // provenance template per document.
+        let (blobs, empty, templates, documents): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM out_provenance WHERE typeof(id)='blob' AND length(id)=32), \
+                 (SELECT COUNT(*) FROM out_references WHERE json_extract(body,'$.provenanceId')=''), \
+                 (SELECT COUNT(*) FROM out_coverage WHERE provenance IS NOT NULL), \
+                 (SELECT COUNT(DISTINCT doc) FROM out_provenance)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(blobs as usize, decoded.provenance.len());
+        assert_eq!(empty as usize, decoded.references.len());
+        assert_eq!(templates, documents);
+    }
+    // Each defect is a typed read failure, never a partial publication.
+    for (sql, message) in [
+        (
+            "UPDATE out_symbols SET doc=doc+100",
+            "staged row without coverage",
+        ),
+        (
+            "UPDATE out_references SET doc=-1 WHERE ord=(SELECT MAX(ord) FROM out_references)",
+            "staged output order",
+        ),
+        (
+            "UPDATE out_coverage SET provenance=NULL",
+            "staged provenance without template",
+        ),
+        (
+            "UPDATE out_provenance SET id=x'00' WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_provenance SET kind=9 WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_references SET provenance_id=x'0102' WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_symbols SET body=json_set(body,'$.provenanceId','x') WHERE ord=0",
+            "staged output row",
+        ),
+        (
+            "UPDATE out_coverage SET provenance=json_set(provenance,'$.id','x') WHERE provenance IS NOT NULL",
+            "staged output row",
+        ),
+    ] {
+        let (mut admitted, _, _) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let changed = admitted
+            .stage_mut()
+            .conn()
+            .unwrap()
+            .execute(sql, [])
+            .unwrap();
+        assert!(changed > 0, "{sql}");
+        let error = testing::staged_publication(&mut admitted).unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{sql}: {error:#}");
+    }
+}
+
+#[test]
 fn staged_closure_rejects_cross_row_defects() {
     let world = definitions_world();
     let (a, b) = definitions_docs();
     let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
     let cases: [(&str, &str, &str); 3] = [
         (
-            "INSERT INTO out_declaration_bindings SELECT (SELECT MAX(ord)+1 FROM out_declaration_bindings), provenance_id, body \
+            "INSERT INTO out_declaration_bindings SELECT (SELECT MAX(ord)+1 FROM out_declaration_bindings), doc, provenance_id, body \
              FROM out_declaration_bindings WHERE ord=(SELECT MIN(ord) FROM out_declaration_bindings)",
             "duplicate declaration binding fact",
             "duplicate binding",
@@ -1969,7 +2075,7 @@ fn staged_closure_rejects_cross_row_defects() {
             "proof on failed coverage",
         ),
         (
-            "UPDATE out_provenance SET body=json_set(body,'$.contentHash',?1)",
+            "UPDATE out_coverage SET provenance=json_set(provenance,'$.contentHash',?1) WHERE provenance IS NOT NULL",
             "captured proof document hash mismatch",
             "hash mismatch",
         ),
@@ -2003,16 +2109,28 @@ fn lookup_staged_row_and_output_limits_are_typed() {
             (|l: &mut BatchLimits| l.lookup_steps = 3) as fn(&mut BatchLimits),
         ),
         ("staged rows", |l| l.staged_rows = 5),
-        ("output bytes", |l| l.output_bytes = 10),
     ] {
         let mut limits = BatchLimits::PRODUCTION;
         edit(&mut limits);
         let error = world
             .join_with(&descriptor, &limits, DestinationMutations::default())
             .map(|_| ())
-            .unwrap_err();
+            .expect_err(name);
         assert_eq!(detail(&error), name, "{error:#}");
     }
+    // The compact rows of two small documents fit the pages the stage schema already holds,
+    // so the physical output meter is exercised on a batch whose rows grow the stage file.
+    let mixed = mixed_language_world();
+    let mixed_descriptor = mixed_language_batch(&mixed);
+    let limits = BatchLimits {
+        output_bytes: 10,
+        ..BatchLimits::PRODUCTION
+    };
+    let error = mixed
+        .join_with(&mixed_descriptor, &limits, DestinationMutations::default())
+        .map(|_| ())
+        .expect_err("output bytes");
+    assert_eq!(detail(&error), "output bytes", "{error:#}");
     let mut counters = BatchCounters::default();
     let mut admitted = world
         .stage(&descriptor, &BatchLimits::PRODUCTION, &mut counters)
@@ -2112,7 +2230,6 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             "nat_docs",
             "nat_declarations",
             "g_definitions",
-            "g_presence",
             "g_methods",
             "w_docs",
             "out_coverage",
@@ -2165,6 +2282,36 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             .unwrap();
         assert_eq!(ledger["w_docs"], captured_documents as u64);
         assert!(ledger["out_references"] > 0 && ledger["out_provenance"] > 0);
+        // A shared pin writes no destination-side global rows: its eligible context is the
+        // eligible view of the captured rows. A changed destination is discovered again.
+        let side_one: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM g_definitions WHERE side=1) + (SELECT COUNT(*) FROM g_methods WHERE side=1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(side_one > 0, changed, "changed {changed}");
+        // On a shared pin the captured revision's declaration status covers its
+        // exact-definition targets (this fixture has no duplicate syntax IDs), not every
+        // native declaration; a changed destination keeps both revisions' full status.
+        let (status, targets, destination, full): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM nat_declarations WHERE rev=0), \
+                 (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions WHERE side=0)), \
+                 (SELECT COUNT(*) FROM nat_declarations WHERE rev=1), \
+                 (SELECT declarations FROM nat_done WHERE rev=0)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(targets > 0);
+        assert_eq!(full == 1, changed, "changed {changed}");
+        if changed {
+            assert!(status > targets && destination > 0);
+        } else {
+            assert_eq!((status, destination), (targets, 0));
+        }
     }
 }
 
@@ -3568,6 +3715,43 @@ fn cancelled_publication_changes_nothing() {
     assert_nothing_published(&world, joined.destination_pin());
 }
 
+/// A provenance row whose raw claim vanished after the seal is a corrupt stage: publication
+/// fails typed and rolls back, never publishing the document without that row and its facts.
+#[test]
+fn provenance_row_without_its_claim_after_the_seal_rolls_back() {
+    let world = definitions_world();
+    let descriptor = split_definitions(&world, false);
+    let (mut admitted, joined, _) = world
+        .join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        )
+        .unwrap();
+    let removed = admitted
+        .stage_mut()
+        .conn()
+        .unwrap()
+        .execute(
+            "DELETE FROM claims WHERE claim_id=(SELECT claim_id FROM out_provenance ORDER BY ord LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(removed, 1);
+    admitted.stage_mut().release_connection();
+    let leader = world.store.publication_for_tests().unwrap();
+    let head = joined.destination_pin();
+    let error = world
+        .store
+        .publish_semantic_batch(&joined, admitted.stage_mut(), head, &leader, &world.cancel)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("staged provenance without claim"),
+        "{error:#}"
+    );
+    assert_nothing_published(&world, head);
+}
+
 #[test]
 fn ambiguous_commit_is_resolved_from_durable_state() {
     use trellis::store::BatchPublishFault;
@@ -3723,9 +3907,10 @@ fn publication_statements_use_the_stage_indexes() {
             .unwrap()
             .map(Result::unwrap)
             .collect();
+        // No statement sorts: raw rows follow their staged table, and every output family is
+        // read by one cursor in `ord` (rowid) order.
         assert!(
-            plan.iter()
-                .all(|step| !step.contains("TEMP B-TREE") || sql.contains("provenance_id IN")),
+            plan.iter().all(|step| !step.contains("TEMP B-TREE")),
             "{sql}: {plan:?}"
         );
         // Joined stage tables are searched by key, never scanned per driving row. The ordinal
@@ -3740,19 +3925,10 @@ fn publication_statements_use_the_stage_indexes() {
             })
             .collect();
         assert!(scans.len() <= 1, "{sql}: {plan:?}");
-        if sql.contains("out_provenance") && !sql.contains("INSERT") {
+        if sql.contains("out_provenance") {
             assert!(
                 plan.iter()
-                    .any(|step| step.contains("out_provenance_document")
-                        || step.contains("out_provenance_provenance_id")
-                        || step.contains("sqlite_autoindex_out_provenance")),
-                "{sql}: {plan:?}"
-            );
-        }
-        if sql.contains("provenance_id IN") {
-            assert!(
-                plan.iter().any(|step| step.contains("_provenance (")
-                    || step.contains("USING INDEX out_")),
+                    .any(|step| step.starts_with("SEARCH c USING INTEGER PRIMARY KEY")),
                 "{sql}: {plan:?}"
             );
         }
@@ -3909,7 +4085,7 @@ fn cross_row_defects_are_rejected_by_whole_publication_validation_on_both_paths(
         ),
         (
             "freshness differs from the independent recomputation",
-            "UPDATE out_provenance SET body=json_set(body,'$.freshness','stale')",
+            "UPDATE out_coverage SET provenance=json_set(provenance,'$.freshness','stale') WHERE provenance IS NOT NULL",
             |publication| {
                 for proof in &mut publication.provenance {
                     proof.freshness = Freshness::Stale;
