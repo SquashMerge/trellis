@@ -2297,25 +2297,19 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
         // captured status of its targets. An unshared pin keeps the destination status of
         // every captured or destination target, and captured status only for destination
         // targets that are not captured ones (none here).
-        let (captured_status, captured_targets, destination_status, all_targets, other_targets): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = conn
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM nat_declarations WHERE rev=0), \
-                 (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions WHERE side=0)), \
-                 (SELECT COUNT(*) FROM nat_declarations WHERE rev=1), \
-                 (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions)), \
-                 (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions g WHERE side=1 \
-                  AND NOT EXISTS (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
-                  AND c.syntax_id=g.syntax_id)))",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        let captured_status = count("SELECT COUNT(*) FROM nat_declarations WHERE rev=0");
+        let destination_status = count("SELECT COUNT(*) FROM nat_declarations WHERE rev=1");
+        let captured_targets = count(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions WHERE side=0)",
+        );
+        let all_targets =
+            count("SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions)");
+        let other_targets = count(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions g WHERE side=1 \
+             AND NOT EXISTS (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
+             AND c.syntax_id=g.syntax_id))",
+        );
         assert!(captured_targets > 0);
         if changed {
             assert_eq!(
@@ -2346,7 +2340,8 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
 /// must still equal the independent memory join, with the same report and full validation.
 #[test]
 fn unshared_target_status_matches_memory_when_destination_declarations_change() {
-    let edits: [(&str, &[(&str, &str)], &[&str]); 5] = [
+    type Files = &'static [(&'static str, &'static str)];
+    let edits: [(&str, Files, &[&str]); 5] = [
         (
             "target renamed",
             &[("src/B.js", "function other(){ }\n")],
