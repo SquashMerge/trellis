@@ -50,6 +50,7 @@ CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT 
 CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id BLOB NOT NULL, n INTEGER NOT NULL, named INTEGER NOT NULL, name_ok INTEGER NOT NULL, PRIMARY KEY(rev, doc_ord, syntax_id, n)) WITHOUT ROWID;
 CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID;
 CREATE INDEX g_definitions_owner ON g_definitions(side,owner_doc,syntax_id);
+CREATE TABLE g_callables(side INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, callable INTEGER NOT NULL CHECK(callable IN (1,2)), PRIMARY KEY(side,owner_doc,syntax_id)) WITHOUT ROWID;
 CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL);
 CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_doc);
 CREATE INDEX g_methods_target ON g_methods(side,symbol,local_doc);
@@ -68,6 +69,7 @@ CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, doc INTEGER NOT NUL
 pub const JOIN_TABLES: &[&str] = &[
     "nat_declarations",
     "g_definitions",
+    "g_callables",
     "g_methods",
     "w_docs",
     "out_coverage",

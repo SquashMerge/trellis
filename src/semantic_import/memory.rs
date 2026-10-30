@@ -1,6 +1,7 @@
 //! In-memory `JoinStore` over fully materialized indexes.
 use super::{
     CoordinateMaps, InventoryIndex, JoinedFacts, MeasuredFacts, RoleSites, ScopedKey,
+    TargetCallable,
     join_store::{
         BasisFor, Bytes, DocumentJoinState, GlobalJoinReads, IndexedJoinStore, JoinFacts,
         JoinIndex, JoinSink, JoinStore, MethodSummary, NativeFacts, OccurrenceRow, ProofIdentities,
@@ -345,6 +346,7 @@ impl<'a> IndexedJoinStore for MemoryJoinStore<'a> {
 #[derive(Default)]
 pub(super) struct MemoryJoinIndex {
     declarations: BTreeMap<ScopedKey, BTreeSet<(native::DocumentKey, String)>>,
+    callables: BTreeMap<(native::DocumentKey, String), TargetCallable>,
     type_uses: BTreeMap<(native::DocumentKey, usize, usize), BTreeSet<String>>,
     occurrences: Vec<OccurrenceRow>,
     relationships: BTreeMap<(String, String), Vec<RelationshipRow>>,
@@ -374,6 +376,18 @@ impl GlobalJoinReads for MemoryJoinIndex {
             .flatten()
             .cloned()
             .collect())
+    }
+
+    fn target_callable(
+        &self,
+        document: &native::DocumentKey,
+        syntax_id: &str,
+    ) -> Result<TargetCallable> {
+        Ok(self
+            .callables
+            .get(&(document.clone(), syntax_id.to_owned()))
+            .copied()
+            .unwrap_or_default())
     }
 
     fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)> {
@@ -574,7 +588,10 @@ impl JoinIndex for MemoryJoinIndex {
         key: ScopedKey,
         document: native::DocumentKey,
         syntax_id: String,
+        callable: TargetCallable,
     ) -> Result<()> {
+        self.callables
+            .insert((document.clone(), syntax_id.clone()), callable);
         self.declarations
             .entry(key)
             .or_default()

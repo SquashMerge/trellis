@@ -36,6 +36,10 @@ fn definitions_sql(filtered: bool) -> String {
     )
 }
 
+/// The callable kind discovery recorded for one exact definition (#470); absent is `Other`.
+const TARGET_CALLABLE_SQL: &str = "SELECT c.callable FROM g_callables c JOIN sources s \
+    ON s.ord=c.owner_doc WHERE c.side=?1 AND s.language=?2 AND s.path=?3 AND c.syntax_id=?4";
+
 fn methods_sql(target: bool, filtered: bool) -> String {
     let key = if target {
         format!("local_doc={LOCAL_DOC}")
@@ -252,6 +256,28 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
             (&a.0.language, &a.0.path, &a.1).cmp(&(&b.0.language, &b.0.path, &b.1))
         });
         Ok(result)
+    }
+    fn target_callable(
+        &self,
+        document: &native::DocumentKey,
+        syntax_id: &str,
+    ) -> Result<TargetCallable> {
+        self.ctx.charge(1)?;
+        let code: Option<i64> = self
+            .ctx
+            .conn
+            .prepare_cached(TARGET_CALLABLE_SQL)?
+            .query_row(
+                params![
+                    self.side,
+                    document.language,
+                    document.path,
+                    codec::sid(syntax_id)
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        code.map_or(Ok(TargetCallable::Other), TargetCallable::from_code)
     }
     fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)> {
         use crate::semantic_batch::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION};
@@ -523,8 +549,27 @@ impl GlobalDiscoverySink for GlobalWriter<'_> {
         document: native::DocumentKey,
         syntax_id: String,
         common_compatible: bool,
+        callable: TargetCallable,
     ) -> Result<()> {
         let (language, path) = local_columns(&key);
+        if callable != TargetCallable::Other {
+            // A function of the owner document's native declaration: repeats agree.
+            self.global.ctx.row("g_callables")?;
+            self.global
+                .ctx
+                .conn
+                .prepare_cached(
+                    "INSERT INTO g_callables VALUES(?1,(SELECT ord FROM sources WHERE language=?2 \
+                 AND path=?3),?4,?5) ON CONFLICT(side,owner_doc,syntax_id) DO NOTHING",
+                )?
+                .execute(params![
+                    self.global.side,
+                    document.language,
+                    document.path,
+                    codec::sid(&syntax_id),
+                    callable as i64
+                ])?;
+        }
         if !self.targets.contains(&syntax_id) {
             self.targets_reservation.grow(sizes::sum(&[
                 sizes::map_entries::<String, ()>(1)?,
@@ -753,6 +798,13 @@ impl GlobalJoinReads for DocumentIndex<'_, '_> {
             reads.declarations.insert(key.clone(), rows.clone());
         }
         Ok(rows)
+    }
+    fn target_callable(
+        &self,
+        document: &native::DocumentKey,
+        syntax_id: &str,
+    ) -> Result<TargetCallable> {
+        self.global.target_callable(document, syntax_id)
     }
     fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)> {
         let key = (symbol.to_owned(), target.cloned());
@@ -1324,6 +1376,7 @@ impl GlobalDiscoverySink for DiscardDiscovery {
         _document: native::DocumentKey,
         _syntax_id: String,
         _compatible: bool,
+        _callable: TargetCallable,
     ) -> Result<()> {
         Ok(())
     }

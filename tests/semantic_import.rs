@@ -717,16 +717,44 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
     };
     // Plain call, imported call, constructor, method call, a call whose argument is a
     // callback, and a plain call after a supplementary-plane character (UTF-16 columns).
+    // Owner ruling 2026-10-30 (#470): dispatch follows the measured call shape and the bound
+    // declaration's kind. Plain calls of free functions, the imported one included, are
+    // direct. scip-typescript 0.4.0 gives every symbol information kind 0, so its constructor
+    // (`Widget#<constructor>().`) and method (`Widget#run().`) symbols fail the existing
+    // native method-kind compatibility check and bind no target: unresolved, never classified.
+    // `new` of a resolved class is covered by `constructor_call_to_class_is_constructor_dispatch`.
+    let (resolved, unresolved) = (
+        semantic::Resolution::Resolved,
+        semantic::Resolution::Unresolved,
+    );
     let bound = [
-        issue444_span("plain", "();\n  helper", 0),
-        issue444_span("helper", "(2)", 0),
-        issue444_span("Widget", "(3)", 0),
-        issue444_span("run", "()", 0),
-        issue444_span("register", "(plain)", 0),
-        issue444_span("plain", "();\n  return", 0),
+        (
+            issue444_span("plain", "();\n  helper", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
+        (
+            issue444_span("helper", "(2)", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
+        (
+            issue444_span("Widget", "(3)", 0),
+            (unresolved, semantic::Dispatch::Unknown),
+        ),
+        (
+            issue444_span("run", "()", 0),
+            (unresolved, semantic::Dispatch::Unknown),
+        ),
+        (
+            issue444_span("register", "(plain)", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
+        (
+            issue444_span("plain", "();\n  return", 0),
+            (resolved, semantic::Dispatch::Direct),
+        ),
     ];
     assert_eq!(output.call_bindings.len(), bound.len());
-    for callee in &bound {
+    for (callee, expected) in &bound {
         let call = issue444_call(&native, callee);
         let bindings: Vec<_> = output
             .call_bindings
@@ -739,7 +767,12 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
         assert_eq!(binding.join.status, semantic::JoinStatus::Exact);
         assert_eq!(&binding.join.anchor.range, callee);
         assert_eq!(binding.join.candidate_ids, vec![call.id.clone()]);
-        assert_eq!(binding.dispatch, semantic::Dispatch::Unknown);
+        assert_eq!(
+            (binding.resolution, binding.dispatch),
+            *expected,
+            "{:?}",
+            call.spelling
+        );
         let reference = reference_at(callee);
         assert!(
             reference.roles.contains(&semantic::Role::Call),
@@ -750,7 +783,7 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
     let helper = output
         .call_bindings
         .iter()
-        .find(|b| b.join.anchor.range == bound[1])
+        .find(|b| b.join.anchor.range == bound[1].0)
         .unwrap();
     assert_eq!(helper.resolution, semantic::Resolution::Resolved);
     assert!(matches!(
@@ -781,6 +814,122 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
                 .iter()
                 .all(|r| Some(&r.range) != call.callee_range.as_ref())
         );
+    }
+}
+
+/// Owner ruling 2026-10-30 (#470): dispatch is the measured native call shape plus the exact
+/// bound target's declaration kind. `new` of a class (by identifier or dotted name) is
+/// constructor and a plain call of a free function is direct. A class called without `new`,
+/// `new` of a function, and member calls (`o.f()`, `o?.f()`) of the same resolved free
+/// function stay unknown.
+#[test]
+fn constructor_call_to_class_is_constructor_dispatch() {
+    let source = "class W { constructor() {} }\nfunction f() { return 1; }\n\
+        function m(o) { new W(); W(); f(); o.f(); o?.f(); new f(); new o.W(); }\n";
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let (w, f) = ("pkg W#", "pkg f().");
+    let uses = [
+        (at("new W(", 4), w, semantic::Dispatch::Constructor),
+        (at("; W();", 2), w, semantic::Dispatch::Unknown),
+        (at("; f();", 2), f, semantic::Dispatch::Direct),
+        (at("o.f(", 2), f, semantic::Dispatch::Unknown),
+        (at("o?.f(", 3), f, semantic::Dispatch::Unknown),
+        (at("new f(", 4), f, semantic::Dispatch::Unknown),
+        (at("o.W(", 2), w, semantic::Dispatch::Constructor),
+    ];
+    let mut occurrences = vec![
+        (at("class W", 6), at("class W", 7), w, 1),
+        (at("function f", 9), at("function f", 10), f, 1),
+    ];
+    occurrences.extend(
+        uses.iter()
+            .map(|(start, symbol, _)| (*start, start + 1, *symbol, 0)),
+    );
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        occurrences,
+        vec![(w, 7, vec![]), (f, 17, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), uses.len());
+    for (start, _, dispatch) in uses {
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.join.anchor.range.start == start)
+            .unwrap_or_else(|| panic!("binding at {start}"));
+        assert_eq!(binding.join.anchor.kind, semantic::JoinKind::Callee);
+        assert_eq!(
+            binding.resolution,
+            semantic::Resolution::Resolved,
+            "{start}"
+        );
+        assert_eq!(binding.dispatch, dispatch, "{start}");
+    }
+}
+
+/// Owner ruling 2026-10-30 (#470) for Rust: identifier, generic and path calls of a free
+/// function are direct; method-call syntax, and a path call of an associated function, stay
+/// unknown (trait and inherent dispatch are #14).
+#[test]
+fn rust_path_and_plain_calls_of_free_functions_are_direct() {
+    let source = "mod m { pub fn f() {} }\nstruct S;\nimpl S { fn g(&self) {} fn h() {} }\n\
+        fn f2() {}\nfn f3<T>() {}\n\
+        fn k(s: S) { m::f(); f2(); crate::m::f(); s.g(); S::h(); f3::<u8>(); }\n";
+    let at = |needle: &str, inner: usize| source.find(needle).unwrap() + inner;
+    let (f, f2, f3, g, h) = (
+        "rust-analyzer cargo c 0.1.0 m/f().",
+        "rust-analyzer cargo c 0.1.0 f2().",
+        "rust-analyzer cargo c 0.1.0 f3().",
+        "rust-analyzer cargo c 0.1.0 S#g().",
+        "rust-analyzer cargo c 0.1.0 S#h().",
+    );
+    let uses = [
+        (at("{ m::f(", 5), 1, f, semantic::Dispatch::Direct),
+        (at("; f2(", 2), 2, f2, semantic::Dispatch::Direct),
+        (at("crate::m::f(", 10), 1, f, semantic::Dispatch::Direct),
+        (at("s.g(", 2), 1, g, semantic::Dispatch::Unknown),
+        (at("S::h(", 3), 1, h, semantic::Dispatch::Unknown),
+        (at("f3::<", 0), 2, f3, semantic::Dispatch::Direct),
+    ];
+    let mut occurrences = vec![
+        (at("fn f()", 3), at("fn f()", 4), f, 1),
+        (at("fn f2", 3), at("fn f2", 5), f2, 1),
+        (at("fn f3", 3), at("fn f3", 5), f3, 1),
+        (at("fn g", 3), at("fn g", 4), g, 1),
+        (at("fn h", 3), at("fn h", 4), h, 1),
+    ];
+    occurrences.extend(
+        uses.iter()
+            .map(|(start, width, symbol, _)| (*start, start + width, *symbol, 0)),
+    );
+    let (_root, native, sources, inventory) = admitted_case(
+        "rust",
+        source,
+        occurrences,
+        vec![
+            (f, 17, vec![]),
+            (f2, 17, vec![]),
+            (f3, 17, vec![]),
+            (g, 26, vec![]),
+            (h, 26, vec![]),
+        ],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
+    assert_eq!(output.call_bindings.len(), uses.len());
+    for (start, _, _, dispatch) in uses {
+        let binding = output
+            .call_bindings
+            .iter()
+            .find(|b| b.join.anchor.range.start == start)
+            .unwrap_or_else(|| panic!("binding at {start}"));
+        assert_eq!(
+            binding.resolution,
+            semantic::Resolution::Resolved,
+            "{start}"
+        );
+        assert_eq!(binding.dispatch, dispatch, "{start}");
     }
 }
 
@@ -1902,6 +2051,36 @@ fn admitted_distinct_call_claims_reconcile_ambiguous_targets() {
     );
 }
 
+/// Each claim alone is a plain call of a resolved free function, classified direct at join
+/// time; settlement makes the call ambiguous over both, so neither row stays direct (#470).
+#[test]
+fn settlement_ambiguity_clears_join_time_direct_dispatch() {
+    let source = "function f(){ g(); }\nfunction g(){}\nfunction h(){}\n";
+    let at = source.find("g(); ").unwrap();
+    let (g, h) = (source.find("g(){}").unwrap(), source.find("h(){}").unwrap());
+    let (_root, native, sources, inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![
+            (g, g + 1, "pkg g().", 1),
+            (h, h + 1, "pkg h().", 1),
+            (at, at + 1, "pkg g().", 0),
+            (at, at + 1, "pkg h().", 0),
+        ],
+        vec![("pkg g().", 17, vec![]), ("pkg h().", 17, vec![])],
+    );
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), 2);
+    assert!(output.call_bindings.iter().all(|b| {
+        b.resolution == semantic::Resolution::Ambiguous
+            && b.candidates.len() == 2
+            && b.dispatch == semantic::Dispatch::Unknown
+    }));
+}
+
+/// Owner ruling 4 (2026-10-30, #394): a producer enclosing range that encloses the use but
+/// joins no invocation exactly is treated as absent, and the exact callee span decides. One
+/// that exactly joins a different invocation than the callee's still binds no call (#453).
 #[test]
 fn call_role_requires_the_same_exact_raw_invocation_as_binding() {
     let source = "function f(){ f(); }";
@@ -1918,7 +2097,39 @@ fn call_role_requires_the_same_exact_raw_invocation_as_binding() {
         .iter_mut()
         .find(|c| c.envelope.record_kind == "occurrence")
         .unwrap();
+    // The callee token alone: it encloses the use and matches no measured invocation.
     raw.envelope.raw["enclosingRange"] = json!({"encoding":"legacy","values":[0,at,at+1]});
+    let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
+    assert_eq!(output.call_bindings.len(), 1);
+    let binding = &output.call_bindings[0];
+    assert_eq!(binding.join.anchor.kind, semantic::JoinKind::Callee);
+    assert_eq!(binding.call_id, Some(native.calls[0].id.clone()));
+    assert!(output.references[0].roles.contains(&semantic::Role::Call));
+    assert!(
+        output
+            .joins
+            .iter()
+            .all(|(_, j)| j.anchor.kind != semantic::JoinKind::Invocation),
+        "an absent enclosing range authors no invocation join"
+    );
+
+    // `f` is the callee of the inner call; its range names the outer invocation exactly.
+    let source = "function f(){ g(f()); }";
+    let at = source.rfind("f(").unwrap();
+    let outer = source.find("g(").unwrap();
+    let close = source.rfind(')').unwrap() + 1;
+    let (_root, native, sources, mut inventory) = admitted_case(
+        "javascript",
+        source,
+        vec![(at, at + 1, "external pkg f.", 8)],
+        vec![],
+    );
+    let raw = inventory
+        .claims
+        .iter_mut()
+        .find(|c| c.envelope.record_kind == "occurrence")
+        .unwrap();
+    raw.envelope.raw["enclosingRange"] = json!({"encoding":"legacy","values":[0,outer,close]});
     let output = join_inventory(&inventory, &native, &sources, 2).unwrap();
     assert!(output.call_bindings.is_empty());
     assert!(
@@ -1932,7 +2143,7 @@ fn call_role_requires_the_same_exact_raw_invocation_as_binding() {
             .joins
             .iter()
             .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
-                && j.status == semantic::JoinStatus::Unmatched)
+                && j.status == semantic::JoinStatus::Exact)
     );
 }
 
@@ -2299,6 +2510,8 @@ fn type_role_marks_field_type_not_value_with_same_symbol() {
     );
 }
 
+/// Two measured calls share the span: the invocation join is ambiguous, so the enclosing range
+/// is absent (owner ruling 4, 2026-10-30, #394), and the ambiguous callee join binds nothing.
 #[test]
 fn nonexact_invocation_does_not_grant_role_or_binding_even_with_exact_callee() {
     let source = "function f(){ f(); }";
@@ -2324,7 +2537,13 @@ fn nonexact_invocation_does_not_grant_role_or_binding_even_with_exact_callee() {
         output
             .joins
             .iter()
-            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Invocation
+            .all(|(_, j)| j.anchor.kind != semantic::JoinKind::Invocation)
+    );
+    assert!(
+        output
+            .joins
+            .iter()
+            .any(|(_, j)| j.anchor.kind == semantic::JoinKind::Callee
                 && j.status == semantic::JoinStatus::Ambiguous)
     );
     assert!(
