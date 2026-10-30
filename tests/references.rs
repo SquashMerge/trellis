@@ -4748,7 +4748,7 @@ fn references_python_declared_distributions_do_not_prove_import_names() {
             native_revision_id: input.documents[0].declarations[0].revision_id.clone(),
             dependency_hash: "captured-python-dependencies".into(),
             path: path.into(),
-            content_hash: Some(format!("{:x}", Sha256::digest(manifest.as_bytes()))),
+            content_hash: Some(hex::encode(Sha256::digest(manifest.as_bytes()))),
             bytes: Some(manifest.as_bytes().to_vec()),
         });
         let data = project_python_source(&input, 20);
