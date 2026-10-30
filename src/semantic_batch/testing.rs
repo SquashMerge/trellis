@@ -587,6 +587,7 @@ pub fn single_artifact_batch(
             "ordinal": 0, "relativePath": "artifact.scip", "byteLength": artifact.len(),
             "sha256": scip_raw::sha(artifact), "language": language,
         }],
+        "generation": null,
     });
     Ok((serde_json::to_vec(&descriptor)?, pages))
 }

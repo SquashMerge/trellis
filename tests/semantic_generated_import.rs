@@ -623,9 +623,19 @@ fn external_import_cannot_claim_generation() {
     }
     assert_eq!(world.batches(), 0);
     assert_eq!(world.head().index_generation, before.index_generation);
-    // The same batch without a generation imports.
-    let (plain, sha) = edit_descriptor(&descriptor, |value| {
+    // The key is required (owner ruling 2026-10-30, #21): without it the descriptor is not
+    // closed, and nothing is published.
+    let (absent, sha) = edit_descriptor(&descriptor, |value| {
         value.as_object_mut().unwrap().remove("generation");
+    });
+    let output = import(&world, &absent, &sha);
+    assert!(!output.status.success(), "a descriptor without generation");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("closed descriptor"), "{stderr}");
+    assert_eq!(world.batches(), 0);
+    // The same batch with a null generation imports.
+    let (plain, sha) = edit_descriptor(&descriptor, |value| {
+        value["generation"] = Value::Null;
     });
     let output = import(&world, &plain, &sha);
     assert!(

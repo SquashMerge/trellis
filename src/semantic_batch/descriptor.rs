@@ -136,8 +136,9 @@ pub struct Descriptor {
     pub totals: Totals,
     pub pages: Vec<PageEntry>,
     pub artifacts: Vec<ArtifactEntry>,
-    /// Provenance of a batch Trellis wrote itself (#21). Absent means an external batch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Provenance of a batch Trellis wrote itself (#21). Required on every descriptor; `null`
+    /// means an external batch.
+    #[serde(deserialize_with = "nullable")]
     pub generation: Option<Generation>,
 }
 
@@ -265,7 +266,7 @@ impl Descriptor {
         pinned_producer(&self.trust_origin, &self.profile_id, &self.producer)
     }
 
-    /// Generation-origin rule: an external import carries no `generation`; a generated one
+    /// Generation-origin rule: an external import carries a null `generation`; a generated one
     /// carries exactly the origin and ID of its job.
     pub fn check_origin(&self, origin: ImportOrigin, generation_id: Option<&str>) -> Result<()> {
         let matches = match (origin, &self.generation) {

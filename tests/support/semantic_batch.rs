@@ -459,6 +459,7 @@ impl BatchFixture {
                 "pageBytes":page_bytes,"artifactBytes":artifact_bytes},
             "pages":pages,
             "artifacts":artifacts,
+            "generation":null,
         });
         write_descriptor(dir, &descriptor)
     }

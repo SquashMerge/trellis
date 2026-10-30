@@ -45,6 +45,7 @@ fn descriptor_json() -> Value {
             {"ordinal": 0, "relativePath": "a/0.scip", "byteLength": 10, "sha256": hex('4'), "language": "java"},
             {"ordinal": 1, "relativePath": "a/1.scip", "byteLength": 20, "sha256": hex('5'), "language": "javascript"},
         ],
+        "generation": null,
     })
 }
 
@@ -439,22 +440,18 @@ fn with_generation(generation: Value) -> Value {
     value
 }
 
+/// Owner ruling 2026-10-30 (#21): `generation` is required and nullable, like every other
+/// descriptor key; an absent key is a closed-descriptor failure.
 #[test]
-fn absent_generation_parses_as_null() {
+fn generation_is_required_and_nullable() {
     let mut value = descriptor_json();
-    assert_eq!(
-        Descriptor::parse(&descriptor_bytes(&value))
-            .unwrap()
-            .generation,
-        None
-    );
-    value["generation"] = Value::Null;
-    assert_eq!(
-        Descriptor::parse(&descriptor_bytes(&value))
-            .unwrap()
-            .generation,
-        None
-    );
+    let parsed = Descriptor::parse(&descriptor_bytes(&value)).unwrap();
+    assert_eq!(parsed.generation, None);
+    let written: Value = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(written["generation"], Value::Null);
+    value.as_object_mut().unwrap().remove("generation");
+    let error = Descriptor::parse(&descriptor_bytes(&value)).unwrap_err();
+    assert_eq!(admission_detail(error), "closed descriptor");
 }
 
 #[test]
