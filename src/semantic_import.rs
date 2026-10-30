@@ -30,6 +30,8 @@ pub(crate) type AnchorParts = (
 );
 
 type AnchorKey = (native::DocumentKey, usize, usize, semantic::JoinKind);
+/// An `AnchorKey` whose document is its rank among the artifact's interned documents.
+type RankedAnchor = (usize, usize, usize, semantic::JoinKind);
 type ScopedKey = (String, Option<native::DocumentKey>);
 
 /// Import-local native indexes. Distinct native identities, not raw-claim counts,
@@ -55,7 +57,9 @@ pub struct MeasuredFacts<'a> {
 struct MeasuredAnchors<'a> {
     sources: BTreeMap<native::DocumentKey, &'a str>,
     documents: BTreeMap<native::DocumentKey, &'a native::Document>,
-    candidates: BTreeMap<AnchorKey, BTreeSet<String>>,
+    /// The interned documents, in key order: `candidates` names a document by its rank here.
+    ranks: Vec<native::DocumentKey>,
+    candidates: BTreeMap<RankedAnchor, BTreeSet<String>>,
     declarations: BTreeMap<String, Vec<&'a native::Declaration>>,
     calls: BTreeMap<String, Vec<&'a native::Call>>,
     references: BTreeMap<String, Vec<&'a native::Reference>>,
@@ -70,12 +74,17 @@ impl<'a> MeasuredFacts<'a> {
         let MeasuredAnchors {
             sources,
             documents,
+            ranks,
             candidates,
             declarations,
             calls,
             references,
             support,
         } = Self::anchors(native, sources)?;
+        let candidates = candidates
+            .into_iter()
+            .map(|((rank, start, end, kind), ids)| ((ranks[rank].clone(), start, end, kind), ids))
+            .collect();
         let mut declaration_names: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut declaration_keys: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut by_document: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
@@ -118,7 +127,8 @@ impl<'a> MeasuredFacts<'a> {
         document: &native::DocumentKey,
     ) -> Result<AnchorParts> {
         let anchors = Self::anchors(native, sources)?;
-        Ok(Self::parts(anchors.candidates, anchors.support, document))
+        let rank = anchors.ranks.binary_search(document).ok();
+        Ok(Self::parts(anchors.candidates, anchors.support, rank, document))
     }
 
     fn anchors(
@@ -149,13 +159,40 @@ impl<'a> MeasuredFacts<'a> {
             source_text.entry(doc.key.clone()).or_insert(text);
             documents.entry(doc.key.clone()).or_insert(doc);
         }
+        // Every document a record or the revision names, interned to its rank in key order:
+        // ordering anchors by rank is ordering them by document key, without a key copy or
+        // comparison per record.
+        let mut keys: Vec<&native::DocumentKey> =
+            native.revision.documents.iter().map(|d| &d.key).collect();
+        let named = native
+            .declarations
+            .iter()
+            .map(|d| &d.document)
+            .chain(native.calls.iter().map(|c| &c.document))
+            .chain(native.references.iter().map(|r| &r.document));
+        for document in named {
+            if keys.last() != Some(&document) {
+                keys.push(document);
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let mut last = 0;
+        let mut rank = |document: &native::DocumentKey| -> usize {
+            if keys.get(last) != Some(&document) {
+                last = keys
+                    .binary_search(&document)
+                    .expect("every record document is interned");
+            }
+            last
+        };
         let mut declarations: BTreeMap<String, Vec<&native::Declaration>> = BTreeMap::new();
         let mut calls: BTreeMap<String, Vec<&native::Call>> = BTreeMap::new();
         let mut references: BTreeMap<String, Vec<&native::Reference>> = BTreeMap::new();
-        let mut anchors: BTreeMap<AnchorKey, BTreeSet<String>> = BTreeMap::new();
-        let mut insert = |doc: &native::DocumentKey, range: &native::Range, kind, id: &str| {
+        let mut anchors: BTreeMap<RankedAnchor, BTreeSet<String>> = BTreeMap::new();
+        let mut insert = |doc: usize, range: &native::Range, kind, id: &str| {
             anchors
-                .entry((doc.clone(), range.start, range.end, kind))
+                .entry((doc, range.start, range.end, kind))
                 .or_default()
                 .insert(id.to_owned());
         };
@@ -163,7 +200,7 @@ impl<'a> MeasuredFacts<'a> {
             declarations.entry(d.syntax_id.clone()).or_default().push(d);
             if let Some(range) = &d.name_range {
                 insert(
-                    &d.document,
+                    rank(&d.document),
                     range,
                     semantic::JoinKind::DeclarationName,
                     &d.syntax_id,
@@ -172,27 +209,31 @@ impl<'a> MeasuredFacts<'a> {
         }
         for c in &native.calls {
             calls.entry(c.id.clone()).or_default().push(c);
+            let doc = rank(&c.document);
             if let Some(range) = &c.callee_range {
-                insert(&c.document, range, semantic::JoinKind::Callee, &c.id);
+                insert(doc, range, semantic::JoinKind::Callee, &c.id);
             }
-            insert(&c.document, &c.range, semantic::JoinKind::Invocation, &c.id);
+            insert(doc, &c.range, semantic::JoinKind::Invocation, &c.id);
         }
         for r in &native.references {
             references.entry(r.id.clone()).or_default().push(r);
-            insert(&r.document, &r.range, semantic::JoinKind::Reference, &r.id);
+            insert(rank(&r.document), &r.range, semantic::JoinKind::Reference, &r.id);
         }
+        let texts: Vec<Option<&str>> = keys
+            .iter()
+            .map(|key| source_text.get(*key).copied())
+            .collect();
         let mut raw_ranges: BTreeMap<_, Vec<(usize, usize)>> = BTreeMap::new();
         let mut candidates = BTreeMap::new();
-        for ((document, start, end, kind), ids) in &anchors {
+        for ((rank, start, end, kind), ids) in &anchors {
+            let document = keys[*rank];
             raw_ranges
-                .entry((document.clone(), *kind))
+                .entry((*rank, *kind))
                 .or_default()
                 .push((*start, *end));
             #[cfg(test)]
             complexity_work(|work| work.native_gap_index_records += 1);
-            let spelling = source_text
-                .get(document)
-                .and_then(|source| source.get(*start..*end));
+            let spelling = texts[*rank].and_then(|source| source.get(*start..*end));
             let lookup = if *kind == semantic::JoinKind::Reference {
                 spelling.and_then(|s| native::lookup(&document.language, s).ok())
             } else {
@@ -234,7 +275,7 @@ impl<'a> MeasuredFacts<'a> {
                 })
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            candidates.insert((document.clone(), *start, *end, *kind), compatible);
+            candidates.insert((*rank, *start, *end, *kind), compatible);
         }
         for ranges in raw_ranges.values_mut() {
             ranges.sort_unstable();
@@ -277,10 +318,11 @@ impl<'a> MeasuredFacts<'a> {
                 );
                 #[cfg(test)]
                 complexity_work(|work| work.native_gap_queries += 1);
-                let contradicts =
-                    raw_ranges
-                        .get(&(document.clone(), *kind))
-                        .is_some_and(|ranges| {
+                let contradicts = keys
+                    .binary_search(&document)
+                    .ok()
+                    .and_then(|rank| raw_ranges.get(&(rank, *kind)))
+                    .is_some_and(|ranges| {
                             let first = ranges.partition_point(|(start, _)| {
                                 #[cfg(test)]
                                 complexity_work(|work| work.native_gap_query_records += 1);
@@ -298,9 +340,11 @@ impl<'a> MeasuredFacts<'a> {
                 );
             }
         }
+        let documents_by_rank = keys.into_iter().cloned().collect();
         Ok(MeasuredAnchors {
             sources: source_text,
             documents,
+            ranks: documents_by_rank,
             candidates,
             declarations,
             calls,
@@ -365,16 +409,17 @@ impl<'a> MeasuredFacts<'a> {
     /// The anchor candidates and capability families of one document. A document group keeps
     /// these and serves joins from them.
     fn parts(
-        candidates: BTreeMap<AnchorKey, BTreeSet<String>>,
+        candidates: BTreeMap<RankedAnchor, BTreeSet<String>>,
         support: BTreeMap<
             (native::DocumentKey, semantic::JoinKind),
             &'a native::MeasurementSupport,
         >,
+        rank: Option<usize>,
         document: &native::DocumentKey,
     ) -> AnchorParts {
         let candidates = candidates
             .into_iter()
-            .filter(|((owner, ..), _)| owner == document)
+            .filter(|((owner, ..), _)| Some(*owner) == rank)
             .map(|((_, start, end, kind), ids)| ((start, end, kind), ids))
             .collect();
         let support = support
