@@ -563,7 +563,7 @@ impl PickupOwner {
                     ));
                 }
                 Step::Unchanged(descriptor_sha256) => {
-                    return Ok(unchanged(
+                    return unchanged(
                         store,
                         producer,
                         &entry,
@@ -571,7 +571,7 @@ impl PickupOwner {
                         &descriptor_sha256,
                         &sha256,
                         &revision,
-                    )?);
+                    );
                 }
                 Step::Write(written) => written,
             };
