@@ -415,6 +415,12 @@ pub(super) trait JoinStore: JoinFacts + ProofIdentities {
     ) -> Result<RoleSites> {
         self.role_sites(document)
     }
+    /// The syntax tree role sites were read from for `document`, if the store kept it: the
+    /// tree of the same source and grammar its direct type bases are read from. Taking it ends
+    /// its lifetime; a store that keeps none parses again.
+    fn take_parsed_tree(&self, _document: &native::DocumentKey) -> Option<tree_sitter::Tree> {
+        None
+    }
     /// Accounts `units` of lookup work against a backend budget.
     fn charge(&self, units: usize) -> Result<()>;
 }

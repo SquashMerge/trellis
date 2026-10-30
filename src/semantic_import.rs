@@ -1931,15 +1931,17 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             note_parsed_type_document(doc);
         }
         let mut relationship_operation = store.operation()?;
+        let parsed = store.take_parsed_tree(doc);
         let mut reserve_bases =
             |bytes: LazyBytes<'_>| store.reserve_operation(&mut relationship_operation, bytes);
         let bases = match doc.language.as_str() {
-            "java" => direct_java_types(bytes, &mut reserve_bases)?,
+            "java" => direct_java_types(bytes, parsed, &mut reserve_bases)?,
             "javascript" => direct_script_types(
                 bytes,
                 tree_sitter_javascript::LANGUAGE.into(),
                 "class_declaration",
                 "class_heritage",
+                parsed,
                 &mut reserve_bases,
             )?,
             "python" => direct_script_types(
@@ -1947,6 +1949,7 @@ fn emit_type_relationships<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                 tree_sitter_python::LANGUAGE.into(),
                 "class_definition",
                 "argument_list",
+                parsed,
                 &mut reserve_bases,
             )?,
             _ => continue,
@@ -2288,13 +2291,19 @@ fn collect_direct_bases(
 
 fn direct_java_types(
     source: &[u8],
+    parsed: Option<tree_sitter::Tree>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
-    #[cfg(test)]
-    complexity_work(|work| work.java_type_parses += 1);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
-    let tree = parser.parse(source, None).context("Java parser failed")?;
+    let tree = match parsed {
+        Some(tree) => tree,
+        None => {
+            #[cfg(test)]
+            complexity_work(|work| work.java_type_parses += 1);
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_java::LANGUAGE.into())?;
+            parser.parse(source, None).context("Java parser failed")?
+        }
+    };
     collect_direct_bases(reserve, |emit| java_base_rows(tree.root_node(), emit))
 }
 
@@ -2461,13 +2470,24 @@ fn source_role_sites_reserved(
     source: &[u8],
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<RoleSites> {
+    Ok(source_role_sites_parsed(language, source, reserve)?.0)
+}
+
+/// The role sites of `source`, and the syntax tree they were read from (`None` for a language
+/// without role sites). Each supported language's tree is the one its direct type bases are
+/// read from too.
+fn source_role_sites_parsed(
+    language: &str,
+    source: &[u8],
+    reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
+) -> Result<(RoleSites, Option<tree_sitter::Tree>)> {
     reserve(&mut || Ok(std::mem::size_of::<RoleSites>() as u64))?;
     let grammar: tree_sitter::Language = match language {
         "java" => tree_sitter_java::LANGUAGE.into(),
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
-        _ => return Ok(RoleSites::default()),
+        _ => return Ok((RoleSites::default(), None)),
     };
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&grammar)?;
@@ -2601,7 +2621,7 @@ fn source_role_sites_reserved(
         }
         Ok(true)
     })?;
-    Ok(sites)
+    Ok((sites, Some(tree)))
 }
 
 fn js_direct_class_span(
@@ -2649,13 +2669,19 @@ fn direct_script_types(
     language: tree_sitter::Language,
     owner_kind: &str,
     clause_kind: &str,
+    parsed: Option<tree_sitter::Tree>,
     reserve: &mut impl FnMut(LazyBytes<'_>) -> Result<()>,
 ) -> Result<Vec<DirectBase>> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language)?;
-    let tree = parser
-        .parse(source, None)
-        .context("semantic source parser failed")?;
+    let tree = match parsed {
+        Some(tree) => tree,
+        None => {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language)?;
+            parser
+                .parse(source, None)
+                .context("semantic source parser failed")?
+        }
+    };
     collect_direct_bases(reserve, |emit| {
         walk_named_reverse(tree.root_node(), &mut |node| {
             if node.kind() == owner_kind

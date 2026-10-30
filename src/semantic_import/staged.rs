@@ -485,6 +485,10 @@ struct DocumentClaims {
     symbol_kinds: BTreeMap<String, Option<i64>>,
     /// Claim index and staged `claim_id`, by proof ID.
     by_proof: BTreeMap<String, (usize, i64)>,
+    /// The syntax tree role sites were last read from, with the group text it parsed, until
+    /// the same join takes it for the document's direct type bases. One tree at a time, as
+    /// when each step parsed its own; tree-sitter memory is outside the live budget.
+    parsed: RefCell<Option<(Rc<str>, tree_sitter::Tree)>>,
     reservation: RefCell<Reservation>,
 }
 
@@ -585,6 +589,7 @@ impl DocumentClaims {
             coordinates: RefCell::new(None),
             symbol_kinds,
             by_proof,
+            parsed: RefCell::new(None),
             reservation: RefCell::new(reservation),
         })
     }
@@ -1176,11 +1181,23 @@ impl<'a> JoinStore for StagedSide<'a> {
         #[cfg(feature = "test-support")]
         super::note_parsed_role_site_document(document);
         let group = self.require_group(document)?;
-        super::source_role_sites_reserved(
+        let (sites, tree) = super::source_role_sites_parsed(
             document.language.as_str(),
             group.text.as_bytes(),
             &mut |bytes| operation.grow(bytes()?),
-        )
+        )?;
+        if let Some(local) = &self.local_claims {
+            *local.parsed.borrow_mut() = tree.map(|tree| (group.text.clone(), tree));
+        }
+        Ok(sites)
+    }
+
+    fn take_parsed_tree(&self, document: &native::DocumentKey) -> Option<tree_sitter::Tree> {
+        let local = self.local_claims.as_ref()?;
+        let (text, tree) = local.parsed.borrow_mut().take()?;
+        // Only the tree of this view's own document group text.
+        let group = self.local_group.as_ref()?;
+        (self.document.as_ref() == Some(document) && Rc::ptr_eq(&text, &group.text)).then_some(tree)
     }
 
     fn charge(&self, units: usize) -> Result<()> {
