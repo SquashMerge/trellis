@@ -696,7 +696,7 @@ impl<'a> StagedSide<'a> {
         }
         self.ctx.charge(1)?;
         self.ctx.check_cancel()?;
-        let native_bytes = self.reader.document_reservation_bytes(&row)?;
+        let native_bytes = self.reservation_bytes(ord, &row)?;
         let mut reservation = self.ctx.reserve_native(native_bytes)?;
         // Rc<str> construction overlaps the source Vec returned by the reader.
         reservation.grow(row.byte_length as u64)?;
@@ -718,6 +718,25 @@ impl<'a> StagedSide<'a> {
         let mut counters = self.ctx.counters.borrow_mut();
         cache.activate(key, group.clone(), &mut counters);
         Ok(Some(group))
+    }
+
+    /// The native load reservation of document `ord` of this revision: computed by its first
+    /// load and kept on its `nat_docs` row, so a later pass that loads it again skips the scan.
+    fn reservation_bytes(&self, ord: i64, row: &native::Document) -> Result<u64> {
+        let stored: Option<i64> = self
+            .ctx
+            .conn
+            .prepare_cached("SELECT reserve FROM nat_docs WHERE rev=?1 AND ord=?2")?
+            .query_row(params![self.rev, ord], |found| found.get(0))?;
+        if let Some(bytes) = stored {
+            return Ok(u64::try_from(bytes)?);
+        }
+        let bytes = self.reader.document_reservation_bytes(row)?;
+        self.ctx
+            .conn
+            .prepare_cached("UPDATE nat_docs SET reserve=?3 WHERE rev=?1 AND ord=?2")?
+            .execute(params![self.rev, ord, i64::try_from(bytes)?])?;
+        Ok(bytes)
     }
 
     fn require_group(&self, document: &native::DocumentKey) -> Result<Rc<DocGroup>> {
@@ -1262,7 +1281,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<
         while let Some(document) = stream.next_document()? {
             ctx.check_cancel()?;
             ctx.row("nat_docs")?;
-            conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6)")?
+            conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6,NULL)")?
                 .execute(params![
                     rev,
                     ord,

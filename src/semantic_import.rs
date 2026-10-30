@@ -234,8 +234,8 @@ impl<'a> MeasuredFacts<'a> {
             .map(|key| source_text.get(*key).copied())
             .collect();
         let mut raw_ranges: BTreeMap<_, Vec<(usize, usize)>> = BTreeMap::new();
-        let mut candidates = BTreeMap::new();
-        for ((rank, start, end, kind), ids) in &anchors {
+        // Each anchor keeps, in place, the candidates compatible with its spelling.
+        for ((rank, start, end, kind), ids) in anchors.iter_mut() {
             let document = keys[*rank];
             raw_ranges
                 .entry((*rank, *kind))
@@ -249,44 +249,38 @@ impl<'a> MeasuredFacts<'a> {
             } else {
                 None
             };
-            let compatible = ids
-                .iter()
-                .filter(|id| {
-                    #[cfg(test)]
-                    complexity_work(|work| work.native_candidates += 1);
-                    match kind {
-                        semantic::JoinKind::DeclarationName => {
-                            declarations.get(*id).is_some_and(|rows| {
-                                rows.iter().any(|d| {
-                                    &d.document == document && d.name.as_deref() == spelling
-                                })
-                            })
-                        }
-                        semantic::JoinKind::Callee => calls.get(*id).is_some_and(|rows| {
-                            rows.iter().any(|c| {
-                                &c.document == document && c.spelling.as_deref() == spelling
-                            })
-                        }),
-                        semantic::JoinKind::Invocation => calls.get(*id).is_some_and(|rows| {
-                            rows.iter().any(|c| {
-                                &c.document == document
-                                    && c.range.start == *start
-                                    && c.range.end == *end
-                            })
-                        }),
-                        semantic::JoinKind::Reference => references.get(*id).is_some_and(|rows| {
-                            rows.iter().any(|r| {
-                                &r.document == document
-                                    && spelling == Some(r.spelling.as_str())
-                                    && lookup.as_deref() == Some(r.lookup_key.as_str())
-                            })
-                        }),
+            ids.retain(|id| {
+                #[cfg(test)]
+                complexity_work(|work| work.native_candidates += 1);
+                match kind {
+                    semantic::JoinKind::DeclarationName => {
+                        declarations.get(id).is_some_and(|rows| {
+                            rows.iter()
+                                .any(|d| &d.document == document && d.name.as_deref() == spelling)
+                        })
                     }
-                })
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            candidates.insert((*rank, *start, *end, *kind), compatible);
+                    semantic::JoinKind::Callee => calls.get(id).is_some_and(|rows| {
+                        rows.iter()
+                            .any(|c| &c.document == document && c.spelling.as_deref() == spelling)
+                    }),
+                    semantic::JoinKind::Invocation => calls.get(id).is_some_and(|rows| {
+                        rows.iter().any(|c| {
+                            &c.document == document
+                                && c.range.start == *start
+                                && c.range.end == *end
+                        })
+                    }),
+                    semantic::JoinKind::Reference => references.get(id).is_some_and(|rows| {
+                        rows.iter().any(|r| {
+                            &r.document == document
+                                && spelling == Some(r.spelling.as_str())
+                                && lookup.as_deref() == Some(r.lookup_key.as_str())
+                        })
+                    }),
+                }
+            });
         }
+        let candidates = anchors;
         for ranges in raw_ranges.values_mut() {
             ranges.sort_unstable();
             let mut min_end = usize::MAX;

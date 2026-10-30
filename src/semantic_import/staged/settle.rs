@@ -174,12 +174,14 @@ impl StagedJoin<'_> {
     }
 
     /// Runs the emission validator's row-local checks for the row stemming from raw proof
-    /// `raw` of `view`'s document, against that document's destination group. `anchor` is the
-    /// document the row itself names.
+    /// `raw` of `view`'s document, against that document's destination group. `id` is the
+    /// row's provenance ID as derived from `raw` (`id_for`), before any test edit of the row.
+    /// `anchor` is the document the row itself names.
     fn check_row(
         &self,
         view: &StagedSide<'_>,
         raw: &str,
+        id: &str,
         kind: semantic::EvidenceKind,
         anchor: Option<&native::DocumentKey>,
         check: impl for<'a> FnOnce(
@@ -199,12 +201,9 @@ impl StagedJoin<'_> {
             anchor.is_none_or(|anchor| anchor == document),
             "semantic fact/provenance tuple mismatch"
         );
-        let proof = self.validator.fact_proof(
-            &self.id_for(raw, kind),
-            document.clone(),
-            kind,
-            &group.document.content_hash,
-        );
+        let proof =
+            self.validator
+                .fact_proof(id, document.clone(), kind, &group.document.content_hash);
         let source = group.text.as_bytes();
         let sources = |candidate: &native::DocumentKey| (candidate == document).then_some(source);
         let declaration = |id: &str| {
@@ -364,10 +363,13 @@ impl StagedJoin<'_> {
                 let raw = symbol.provenance_id.clone();
                 let kind = semantic::EvidenceKind::DeclarationBinding;
                 source(&mut sources, &mut owner, &raw, kind)?;
-                symbol.provenance_id = self.id_for(&raw, kind);
+                let id = self.id_for(&raw, kind);
+                symbol.provenance_id = id.clone();
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("symbol", &mut symbol)?;
-                self.check_row(&view, &raw, kind, None, |v, p, f| v.symbol(&symbol, p, f))?;
+                self.check_row(&view, &raw, &id, kind, None, |v, p, f| {
+                    v.symbol(&symbol, p, f)
+                })?;
                 self.emit_fact("out_symbols", SYMBOLS, &mut symbol)?;
             } else if own {
                 outcome.omitted = true;
@@ -388,12 +390,14 @@ impl StagedJoin<'_> {
             source(&mut sources, &mut owner, &raw, kind)?;
             set_outcome(&mut outcomes, &mut owner, &raw, 1)?;
             outcome.observed.insert(semantic::Role::Definition);
-            binding.provenance_id = self.id_for(&raw, kind);
+            let id = self.id_for(&raw, kind);
+            binding.provenance_id = id.clone();
             #[cfg(feature = "test-support")]
             crate::semantic_batch::testing::edit_row("declarationBinding", &mut binding)?;
             self.check_row(
                 &view,
                 &raw,
+                &id,
                 kind,
                 Some(&binding.join.anchor.document),
                 |v, p, f| v.declaration_binding(&binding, p, f),
@@ -515,12 +519,18 @@ impl StagedJoin<'_> {
             outcome.observed.extend(reference.roles.iter().copied());
             let raw = reference.provenance_id.clone();
             let kind = semantic::EvidenceKind::SemanticReference;
-            reference.provenance_id = self.id_for(&raw, kind);
+            let proof_id = self.id_for(&raw, kind);
+            reference.provenance_id = proof_id.clone();
             #[cfg(feature = "test-support")]
             crate::semantic_batch::testing::edit_row("reference", &mut reference)?;
-            self.check_row(&view, &raw, kind, Some(&reference.document), |v, p, f| {
-                v.reference(&reference, p, f)
-            })?;
+            self.check_row(
+                &view,
+                &raw,
+                &proof_id,
+                kind,
+                Some(&reference.document),
+                |v, p, f| v.reference(&reference, p, f),
+            )?;
             let body = codec::fact_body(&mut reference)?;
             self.emit(
                 "out_references",
@@ -668,12 +678,14 @@ impl StagedJoin<'_> {
             set_outcome(&mut outcomes, &mut owner, &raw, value)?;
             outcome.observed.insert(semantic::Role::Call);
             let kind = semantic::EvidenceKind::SemanticReference;
-            call.provenance_id = self.id_for(&raw, kind);
+            let id = self.id_for(&raw, kind);
+            call.provenance_id = id.clone();
             #[cfg(feature = "test-support")]
             crate::semantic_batch::testing::edit_row("callBinding", &mut call)?;
             self.check_row(
                 &view,
                 &raw,
+                &id,
                 kind,
                 Some(&call.join.anchor.document),
                 |v, p, f| v.call_binding(&call, p, f),
@@ -694,10 +706,11 @@ impl StagedJoin<'_> {
                 source(&mut sources, &mut owner, &raw, kind)?;
                 set_outcome(&mut outcomes, &mut owner, &raw, 1)?;
                 outcome.observed.insert(semantic::Role::Type);
-                relationship.provenance_id = self.id_for(&raw, kind);
+                let id = self.id_for(&raw, kind);
+                relationship.provenance_id = id.clone();
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("typeRelationship", &mut relationship)?;
-                self.check_row(&view, &raw, kind, None, |v, p, f| {
+                self.check_row(&view, &raw, &id, kind, None, |v, p, f| {
                     v.type_relationship(&relationship, p, f)
                 })?;
                 self.emit_fact("out_type_relationships", RELATIONSHIPS, &mut relationship)?;
