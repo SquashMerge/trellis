@@ -1529,6 +1529,76 @@ fn batch_memory_high_water_is_one_unit_not_the_corpus() {
     );
 }
 
+/// The unit-expansion budget bounds one document's working set plus the document cache, not
+/// the batch: documents that each fit join even when their charges sum past the budget, while
+/// one document that does not fit is still denied, typed.
+#[test]
+fn documents_that_each_fit_join_although_their_sum_exceeds_the_budget() {
+    const DOCUMENTS: usize = 24;
+    let source = calls_source(48, "\n");
+    let path = |n: usize| format!("src/D{n:02}.js");
+    let world = world(|root| {
+        for n in 0..DOCUMENTS {
+            write_files(root, &[(path(n).as_str(), source.as_str())]);
+        }
+    });
+    let docs = |count: usize| {
+        (0..count)
+            .map(|n| {
+                let mut doc = DocSpec::new(&path(n));
+                for (line, column) in positions(&source, "f()") {
+                    doc = doc.occurrence(
+                        &[line, column, column + 1],
+                        &[line, column, column + 3],
+                        "external pkg f.",
+                        0,
+                    );
+                }
+                doc
+            })
+            .collect::<Vec<_>>()
+    };
+    let run = |count: usize, limits: &BatchLimits| {
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", docs(count))]);
+        world
+            .join_with(&descriptor, limits, DestinationMutations::default())
+            .map(|(mut admitted, _, counters)| {
+                (
+                    testing::staged_publication(&mut admitted).unwrap(),
+                    counters,
+                )
+            })
+    };
+    let (_, one) = run(1, &BatchLimits::PRODUCTION).unwrap();
+    let peak = one.join_reservation_high_water_bytes;
+    assert!(peak > 0);
+    let (unbounded, many) = run(DOCUMENTS, &BatchLimits::PRODUCTION).unwrap();
+    assert_eq!(unbounded.call_bindings.len(), 48 * DOCUMENTS);
+    let mut limits = BatchLimits::PRODUCTION;
+    limits.unit_expansion_bytes = 3 * peak;
+    limits.document_cache_bytes = peak;
+    // Under the production cache bound the cache alone kept more live charge than the bounded
+    // budget allows: the bounded run fits only because its cache is held to its own bound.
+    assert!(
+        many.document_cache_high_water_bytes > limits.unit_expansion_bytes,
+        "fixture too small: {} vs {}",
+        many.document_cache_high_water_bytes,
+        limits.unit_expansion_bytes
+    );
+    let (bounded, counters) = run(DOCUMENTS, &limits).unwrap();
+    assert_same_publication(&bounded, &unbounded, "bounded budget");
+    assert!(counters.join_reservation_high_water_bytes <= limits.unit_expansion_bytes);
+    assert!(counters.document_cache_high_water_bytes <= limits.document_cache_bytes);
+    // One document larger than the whole budget is still refused, typed.
+    let mut tight = BatchLimits::PRODUCTION;
+    tight.unit_expansion_bytes = peak / 2;
+    let error = run(1, &tight)
+        .map(|_| ())
+        .expect_err("an oversized document is denied");
+    assert!(matches!(error.downcast_ref::<ScipCaptureError>(),
+        Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"));
+}
+
 fn split_definitions(world: &World, swap: bool) -> (PathBuf, String) {
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture();
@@ -2292,25 +2362,198 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             )
             .unwrap();
         assert_eq!(side_one > 0, changed, "changed {changed}");
-        // On a shared pin the captured revision's declaration status covers its
-        // exact-definition targets (this fixture has no duplicate syntax IDs), not every
-        // native declaration; a changed destination keeps both revisions' full status.
-        let (status, targets, destination, full): (i64, i64, i64, i64) = conn
+        // Declaration status covers exact-definition targets only (this fixture has no
+        // duplicate syntax IDs), never every native declaration. A shared pin keeps the
+        // captured status of its targets. An unshared pin keeps the destination status of
+        // every captured or destination target, and captured status only for destination
+        // targets that are not captured ones (none here).
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        let captured_status = count("SELECT COUNT(*) FROM nat_declarations WHERE rev=0");
+        let destination_status = count("SELECT COUNT(*) FROM nat_declarations WHERE rev=1");
+        let captured_targets = count(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions WHERE side=0)",
+        );
+        let all_targets =
+            count("SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions)");
+        let other_targets = count(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions g WHERE side=1 \
+             AND NOT EXISTS (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
+             AND c.syntax_id=g.syntax_id))",
+        );
+        assert!(captured_targets > 0);
+        if changed {
+            assert_eq!(
+                (captured_status, destination_status),
+                (other_targets, all_targets),
+                "changed"
+            );
+            assert_eq!(other_targets, 0);
+        } else {
+            assert_eq!((captured_status, destination_status), (captured_targets, 0));
+        }
+        // Native status is rewritten every attempt; only the document inventory is retained.
+        let retained: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nat_docs", [], |row| row.get(0))
+            .unwrap();
+        assert!(retained > 0);
+        assert_eq!(
+            ledger["nat_declarations"],
+            (captured_status + destination_status) as u64,
+            "changed {changed}"
+        );
+    }
+}
+
+/// An unshared pin keeps destination declaration status only for exact-definition targets.
+/// Each case changes the destination's declarations between the pins (a target renamed, moved,
+/// removed, its referrer edited, or a competing declaration added) and the staged publication
+/// must still equal the independent memory join, with the same report and full validation.
+#[test]
+fn unshared_target_status_matches_memory_when_destination_declarations_change() {
+    type Files = &'static [(&'static str, &'static str)];
+    let edits: [(&str, Files, &[&str]); 6] = [
+        (
+            "target renamed",
+            &[("src/B.js", "function other(){ }\n")],
+            &[],
+        ),
+        (
+            "target moved",
+            &[("src/B.js", "\n\nfunction target(){ }\n")],
+            &[],
+        ),
+        ("target removed", &[], &["src/B.js"]),
+        (
+            "referrer edited",
+            &[("src/A.js", "function run(){ target(); }\n// edit\n")],
+            &[],
+        ),
+        (
+            "competing declaration",
+            &[("src/C.js", "function target(){ }\n")],
+            &[],
+        ),
+        // Unchanged sources, but the destination measures B's target under another syntax
+        // ID: a destination-only target whose captured status the remaining pass writes.
+        (
+            "target re-measured",
+            &[("src/C.js", "function other(){ }\n")],
+            &[],
+        ),
+    ];
+    for (case, writes, removals) in edits {
+        let world = definitions_world();
+        let (a, b) = definitions_docs();
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+        write_files(&world.root, writes);
+        for path in removals {
+            fs::remove_file(world.root.join(path)).unwrap();
+        }
+        world.republish();
+        let mutations = DestinationMutations {
+            renamed_b_target: case == "target re-measured",
+            ..Default::default()
+        };
+        let (mut admitted, sealed, counters) = world
+            .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let rejoined = world.memory_rejoin(&descriptor, mutations).unwrap();
+        assert_same_publication(&staged, &rejoined.publication, case);
+        assert_eq!(
+            report_tallies(sealed.report()),
+            report_tallies(&rejoined.report),
+            "{case}: report tallies"
+        );
+        let full = world.full_validation(&descriptor, mutations, &staged);
+        let reference = world.full_validation(&descriptor, mutations, &rejoined.publication);
+        assert_eq!(
+            full.is_ok(),
+            reference.is_ok(),
+            "{case}: {full:?} {reference:?}"
+        );
+        // The status rows are bounded by the targets: each one names a target key.
+        let conn = admitted.stage_mut().conn().unwrap();
+        let (status, keyed): (i64, i64) = conn
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM nat_declarations WHERE rev=0), \
-                 (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions WHERE side=0)), \
-                 (SELECT COUNT(*) FROM nat_declarations WHERE rev=1), \
-                 (SELECT declarations FROM nat_done WHERE rev=0)",
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM g_definitions g \
+                 JOIN sources s ON s.ord=g.owner_doc JOIN nat_docs d ON d.language=s.language \
+                 AND d.path=s.path WHERE d.rev=n.rev AND d.ord=n.doc_ord AND g.syntax_id=n.syntax_id)) \
+                 FROM nat_declarations n",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert!(targets > 0);
-        assert_eq!(full == 1, changed, "changed {changed}");
-        if changed {
-            assert!(status > targets && destination > 0);
+        assert_eq!(status, keyed, "{case}");
+        assert_eq!(
+            counters.staged_row_attempts["nat_declarations"], status as u64,
+            "{case}"
+        );
+        let destination_only: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM g_definitions g WHERE side=1 AND NOT EXISTS \
+                 (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
+                 AND c.syntax_id=g.syntax_id)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(destination_only > 0, case == "target re-measured", "{case}");
+    }
+}
+
+/// On a shared pin eligibility and settlement run as one walk that assumes every document with
+/// claims is eligible. Whichever document breaks the assumption, the result must equal the
+/// separate passes', and the discarded rows stay charged.
+#[test]
+fn fused_settlement_falls_back_to_the_separate_passes_exactly() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let run = |separate: bool, failed: Option<&str>| {
+        testing::separate_settlement(separate);
+        testing::fail_eligibility_of(failed);
+        let result = world.join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        );
+        testing::separate_settlement(false);
+        testing::fail_eligibility_of(None);
+        let (mut admitted, sealed, counters) = result.unwrap();
+        let publication = testing::staged_publication(&mut admitted).unwrap();
+        let conn = admitted.stage_mut().conn().unwrap();
+        let coverage: i64 = conn
+            .query_row("SELECT COUNT(*) FROM out_coverage", [], |row| row.get(0))
+            .unwrap();
+        (
+            publication,
+            sealed.report().clone(),
+            counters.staged_row_attempts["out_coverage"],
+            coverage as u64,
+        )
+    };
+    for failed in [None, Some("src/A.js"), Some("src/B.js")] {
+        let case = format!("{failed:?}");
+        let (fused, fused_report, fused_attempts, rows) = run(false, failed);
+        let (separate, separate_report, separate_attempts, separate_rows) = run(true, failed);
+        assert_same_publication(&fused, &separate, &case);
+        assert_eq!(fused_report, separate_report, "{case}");
+        assert_eq!((rows, separate_rows), (2, 2), "{case}");
+        assert_eq!(separate_attempts, 2, "{case}");
+        // A.js settles first: when B.js fails, A.js's settled rows were discarded but stay
+        // charged. When A.js fails, nothing was settled before the assumption broke.
+        let discarded = u64::from(failed == Some("src/B.js"));
+        assert_eq!(fused_attempts, 2 + discarded, "{case}");
+        if failed.is_none() {
+            assert!(fused.references.iter().any(|r| r.spelling == "target"));
         } else {
-            assert_eq!((status, destination), (targets, 0));
+            assert!(
+                fused
+                    .coverage
+                    .iter()
+                    .any(|c| c.state == trellis::semantic_evidence::CoverageState::Failed)
+            );
         }
     }
 }

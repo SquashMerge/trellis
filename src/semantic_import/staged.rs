@@ -193,8 +193,10 @@ fn stage_bytes(conn: &Connection) -> Result<u64> {
 type GroupKey = (u8, i64);
 
 /// Document groups: one active, the rest in an LRU bounded by `document_cache_bytes`. The
-/// LRU bound is on estimated bytes (`DocGroup::bytes`), not measured heap size. A group evicted
-/// while a caller still holds it stays pinned until the caller drops it.
+/// LRU bound is on the live reservations its groups keep (`DocGroup::bytes`), so the cache
+/// never holds more of the unit-expansion budget than its own bound, however many documents
+/// pass through it. A group evicted while a caller still holds it stays pinned until the
+/// caller drops it.
 #[derive(Default)]
 struct DocCache {
     budget: u64,
@@ -251,12 +253,16 @@ struct DocGroup {
     text: Rc<str>,
     native: native::Artifact,
     declaration_ids: BTreeMap<String, Vec<usize>>,
-    declaration_keys: BTreeMap<Vec<u8>, Vec<usize>>,
+    /// Declarations by canonical key bytes, built on first use (only Java method owners ask).
+    /// Its bytes are part of the group's build reservation either way.
+    declaration_keys: std::cell::OnceCell<BTreeMap<Vec<u8>, Vec<usize>>>,
     declaration_names: BTreeSet<(usize, usize, String)>,
     call_ids: BTreeMap<String, Vec<usize>>,
     reference_ids: BTreeMap<String, Vec<usize>>,
     candidates: BTreeMap<(usize, usize, semantic::JoinKind), BTreeSet<String>>,
     support: BTreeMap<semantic::JoinKind, native::MeasurementSupport>,
+    /// The live reservation the group holds, which is what keeping it cached costs: the
+    /// document cache's budget bounds the sum of its cached groups' live charges.
     bytes: u64,
     _native_reservation: Reservation,
 }
@@ -293,15 +299,10 @@ impl DocGroup {
         let text: Rc<str> = Rc::from(String::from_utf8(bytes).context("non-UTF8 native source")?);
         let (declarations, calls, references) = (&mini.declarations, &mini.calls, &mini.references);
         let mut declaration_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        let mut declaration_keys: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
         for (index, d) in declarations.iter().enumerate() {
             declaration_ids
                 .entry(d.syntax_id.clone())
-                .or_default()
-                .push(index);
-            declaration_keys
-                .entry(crate::native_ids::canonical(&serde_json::to_value(&d.key)?))
                 .or_default()
                 .push(index);
             if let (Some(range), Some(name)) = (&d.name_range, &d.name) {
@@ -316,17 +317,14 @@ impl DocGroup {
         for (index, r) in references.iter().enumerate() {
             reference_ids.entry(r.id.clone()).or_default().push(index);
         }
-        let bytes = text.len() as u64
-            + 512 * declarations.len() as u64
-            + 256 * (calls.len() + references.len()) as u64
-            + 128 * candidates.len() as u64
-            + 1024;
+        // A cached group keeps its whole live reservation, so the cache counts exactly that.
+        let bytes = native_reservation.bytes();
         Ok(Self {
             document,
             text,
             native: mini,
             declaration_ids,
-            declaration_keys,
+            declaration_keys: std::cell::OnceCell::new(),
             declaration_names,
             call_ids,
             reference_ids,
@@ -335,6 +333,19 @@ impl DocGroup {
             bytes,
             _native_reservation: native_reservation,
         })
+    }
+
+    fn declaration_keys(&self) -> Result<&BTreeMap<Vec<u8>, Vec<usize>>> {
+        if let Some(keys) = self.declaration_keys.get() {
+            return Ok(keys);
+        }
+        let mut keys: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+        for (index, d) in self.native.declarations.iter().enumerate() {
+            keys.entry(crate::native_ids::canonical(&serde_json::to_value(&d.key)?))
+                .or_default()
+                .push(index);
+        }
+        Ok(self.declaration_keys.get_or_init(|| keys))
     }
 
     fn pick<'s, T: Clone>(
@@ -475,6 +486,11 @@ struct DocumentClaims {
     symbol_kinds: BTreeMap<String, Option<i64>>,
     /// Claim index and staged `claim_id`, by proof ID.
     by_proof: BTreeMap<String, (usize, i64)>,
+    /// The syntax tree role sites were last read from, and the address and length of the
+    /// group text it parsed, until the same document join takes it for the document's direct
+    /// type bases; `streaming::join_document` drops any it left. One tree at a time, as when
+    /// each step parsed its own (tree-sitter memory is outside the live budget, as before).
+    parsed: RefCell<Option<((usize, usize), tree_sitter::Tree)>>,
     reservation: RefCell<Reservation>,
 }
 
@@ -575,6 +591,7 @@ impl DocumentClaims {
             coordinates: RefCell::new(None),
             symbol_kinds,
             by_proof,
+            parsed: RefCell::new(None),
             reservation: RefCell::new(reservation),
         })
     }
@@ -686,7 +703,7 @@ impl<'a> StagedSide<'a> {
         }
         self.ctx.charge(1)?;
         self.ctx.check_cancel()?;
-        let native_bytes = self.reader.document_reservation_bytes(&row)?;
+        let native_bytes = self.reservation_bytes(ord, &row)?;
         let mut reservation = self.ctx.reserve_native(native_bytes)?;
         // Rc<str> construction overlaps the source Vec returned by the reader.
         reservation.grow(row.byte_length as u64)?;
@@ -708,6 +725,25 @@ impl<'a> StagedSide<'a> {
         let mut counters = self.ctx.counters.borrow_mut();
         cache.activate(key, group.clone(), &mut counters);
         Ok(Some(group))
+    }
+
+    /// The native load reservation of document `ord` of this revision: computed by its first
+    /// load and kept on its `nat_docs` row, so a later pass that loads it again skips the scan.
+    fn reservation_bytes(&self, ord: i64, row: &native::Document) -> Result<u64> {
+        let stored: Option<i64> = self
+            .ctx
+            .conn
+            .prepare_cached("SELECT reserve FROM nat_docs WHERE rev=?1 AND ord=?2")?
+            .query_row(params![self.rev, ord], |found| found.get(0))?;
+        if let Some(bytes) = stored {
+            return Ok(u64::try_from(bytes)?);
+        }
+        let bytes = self.reader.document_reservation_bytes(row)?;
+        self.ctx
+            .conn
+            .prepare_cached("UPDATE nat_docs SET reserve=?3 WHERE rev=?1 AND ord=?2")?
+            .execute(params![self.rev, ord, i64::try_from(bytes)?])?;
+        Ok(bytes)
     }
 
     fn require_group(&self, document: &native::DocumentKey) -> Result<Rc<DocGroup>> {
@@ -929,7 +965,7 @@ impl JoinFacts for StagedSide<'_> {
         Ok(match self.borrowed_group(document)? {
             Some(group) => DocGroup::pick(
                 &group.native.declarations,
-                group.declaration_keys.get(key),
+                group.declaration_keys()?.get(key),
                 operation,
             )?,
             None => vec![],
@@ -1147,11 +1183,25 @@ impl<'a> JoinStore for StagedSide<'a> {
         #[cfg(feature = "test-support")]
         super::note_parsed_role_site_document(document);
         let group = self.require_group(document)?;
-        super::source_role_sites_reserved(
+        let (sites, tree) = super::source_role_sites_parsed(
             document.language.as_str(),
             group.text.as_bytes(),
             &mut |bytes| operation.grow(bytes()?),
-        )
+        )?;
+        if let Some(local) = &self.local_claims {
+            let text = (group.text.as_ptr() as usize, group.text.len());
+            *local.parsed.borrow_mut() = tree.map(|tree| (text, tree));
+        }
+        Ok(sites)
+    }
+
+    fn take_parsed_tree(&self, document: &native::DocumentKey) -> Option<tree_sitter::Tree> {
+        let local = self.local_claims.as_ref()?;
+        let (text, tree) = local.parsed.borrow_mut().take()?;
+        // Only the tree of this view's own document group text.
+        let group = self.local_group.as_ref()?;
+        let current = (group.text.as_ptr() as usize, group.text.len());
+        (self.document.as_ref() == Some(document) && text == current).then_some(tree)
     }
 
     fn charge(&self, units: usize) -> Result<()> {
@@ -1233,36 +1283,17 @@ impl BasisFor for StagedBasis<'_> {
     }
 }
 
-/// Streams the revision's inventory once into `nat_docs` and, with `declarations`, every
-/// declaration's name status into `nat_declarations`: the identity and name checks the rejoin
-/// needs about declarations of documents it is not reading. The captured revision skips the
-/// declarations: settlement only asks it about exact-definition targets, whose status captured
-/// discovery writes from the document group it already holds.
-fn native_pass(
-    ctx: &JoinCtx<'_>,
-    reader: &NativeReader<'_>,
-    rev: u8,
-    mutate: bool,
-    declarations: bool,
-) -> Result<()> {
+/// Streams the revision's inventory once into `nat_docs`: the identity of every document the
+/// rejoin may ask about. Declaration name status (`nat_declarations`) is not streamed here:
+/// settlement only asks about exact-definition targets, whose status discovery writes from the
+/// document groups it holds (`streaming::GlobalWriter::target_declarations`), every attempt.
+fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<()> {
     let conn = ctx.conn;
-    // A pass without declarations (a shared pin's captured revision) does not satisfy a later
-    // attempt that needs them: that attempt streams the revision again in full.
-    let done: Option<bool> = conn
-        .query_row(
-            "SELECT declarations FROM nat_done WHERE rev=?1",
-            [rev],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match done {
-        Some(full) if full || !declarations => return Ok(()),
-        Some(_) => {
-            for table in ["nat_docs", "nat_declarations", "nat_done"] {
-                conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
-            }
-        }
-        None => {}
+    if exists(conn, "SELECT 1 FROM nat_done WHERE rev=?1", &[&rev])? {
+        return Ok(());
+    }
+    for table in ["nat_docs", "nat_done"] {
+        conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
     }
     conn.execute_batch("BEGIN")?;
     let outcome = (|| -> Result<()> {
@@ -1271,7 +1302,7 @@ fn native_pass(
         while let Some(document) = stream.next_document()? {
             ctx.check_cancel()?;
             ctx.row("nat_docs")?;
-            conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6)")?
+            conn.prepare_cached("INSERT INTO nat_docs VALUES(?1,?2,?3,?4,?5,?6,NULL)")?
                 .execute(params![
                     rev,
                     ord,
@@ -1280,40 +1311,9 @@ fn native_pass(
                     document.content_hash,
                     document.byte_length as i64
                 ])?;
-            if !declarations {
-                ord += 1;
-                continue;
-            }
-            let mut reservation =
-                ctx.reserve_native(reader.document_reservation_bytes(&document)?)?;
-            let mut rows = reader.join_document(&document)?;
-            if mutate {
-                reservation.grow(sizes::mutation(&rows, ctx.mutations)?)?;
-                ctx.mutations
-                    .apply(&mut rows.declarations, &mut rows.references);
-            }
-            let text = std::str::from_utf8(&rows.source).context("non-UTF8 native source")?;
-            for (n, declaration) in rows.declarations.iter().enumerate() {
-                ctx.row("nat_declarations")?;
-                let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
-                    text.get(range.start..range.end) == declaration.name.as_deref()
-                });
-                conn.prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6)")?
-                    .execute(params![
-                        rev,
-                        ord,
-                        codec::sid(&declaration.syntax_id),
-                        i64::try_from(n)?,
-                        declaration.name_range.is_some(),
-                        name_ok
-                    ])?;
-            }
             ord += 1;
         }
-        conn.execute(
-            "INSERT INTO nat_done VALUES(?1,?2)",
-            params![rev, declarations],
-        )?;
+        conn.execute("INSERT INTO nat_done VALUES(?1)", [rev])?;
         Ok(())
     })();
     match outcome {
@@ -1323,7 +1323,7 @@ fn native_pass(
         }
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
-            for table in ["nat_docs", "nat_declarations", "nat_done"] {
+            for table in ["nat_docs", "nat_done"] {
                 let _ = conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev]);
             }
             Err(error)
@@ -1350,12 +1350,6 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64
     for table in JOIN_TABLES {
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
-    // A shared pin's captured discovery rewrites its target status every attempt.
-    conn.execute(
-        "DELETE FROM nat_declarations WHERE rev=0 AND EXISTS \
-         (SELECT 1 FROM nat_done WHERE rev=0 AND declarations=0)",
-        [],
-    )?;
     let generation = destination.index_generation.to_string();
     let previous: Option<(String, i64)> = conn
         .query_row("SELECT generation, revision FROM join_state", [], |row| {
@@ -1363,7 +1357,7 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64
         })
         .optional()?;
     if previous.as_ref() != Some(&(generation.clone(), destination.index_revision as i64)) {
-        for table in ["nat_docs", "nat_declarations", "nat_done"] {
+        for table in ["nat_docs", "nat_done"] {
             conn.execute(&format!("DELETE FROM {table} WHERE rev=1"), [])?;
         }
     }
@@ -1383,14 +1377,12 @@ static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// together with the rows this attempt writes.
 fn retained_rows(conn: &Connection) -> Result<u64> {
     let mut total = 0u64;
-    for table in ["nat_docs", "nat_declarations"] {
-        let count = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        total = total
-            .checked_add(u64::try_from(count)?)
-            .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
-    }
+    let count = conn.query_row("SELECT COUNT(*) FROM nat_docs", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    total = total
+        .checked_add(u64::try_from(count)?)
+        .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
     Ok(total)
 }
 
@@ -1422,6 +1414,24 @@ const BINDINGS: usize = 3;
 const REFERENCES: usize = 4;
 const CALLS: usize = 5;
 const RELATIONSHIPS: usize = 6;
+
+/// A captured document's join as eligibility computed it: its decoded claims, facts and charge.
+struct CapturedJoin {
+    claims: Rc<DocumentClaims>,
+    facts: super::JoinedFacts,
+    reservation: Reservation,
+}
+
+/// The output tables of settlement, which a discarded speculative settlement clears.
+const OUTPUT_TABLES: [&str; 7] = [
+    "out_coverage",
+    "out_provenance",
+    "out_symbols",
+    "out_declaration_bindings",
+    "out_references",
+    "out_call_bindings",
+    "out_type_relationships",
+];
 
 /// The source-eligibility decision of one captured document: the single `w_docs` row its
 /// eligibility pass writes, and everything coverage later needs from that pass.
@@ -1491,6 +1501,18 @@ impl StagedJoin<'_> {
         )
     }
 
+    /// Whether `syntax_id` is a captured exact definition of `document`: the anchor of an exact
+    /// declaration-name join of the captured revision, so a named captured declaration.
+    fn captured_definition(&self, document: &native::DocumentKey, syntax_id: &str) -> Result<bool> {
+        self.ctx.charge(1)?;
+        exists(
+            self.conn(),
+            "SELECT 1 FROM g_definitions WHERE side=0 AND owner_doc=\
+             (SELECT ord FROM sources WHERE language=?1 AND path=?2) AND syntax_id=?3",
+            &[&document.language, &document.path, &codec::sid(syntax_id)],
+        )
+    }
+
     /// The document ordinal and name facts of one declaration in a revision.
     fn declaration_status(
         &self,
@@ -1543,58 +1565,134 @@ impl StagedJoin<'_> {
         }
         // Each document's decision is independent of the others, so the order is free.
         for document in self.captured.documents_reversed() {
-            let document = document?;
-            self.ctx.check_cancel()?;
-            let mut flags = DocFlags::default();
-            if self
-                .producer
-                .languages
-                .contains(&language_of(&document.language)?)
-            {
-                let reason = self.exclusion(&document)?;
-                if reason.as_deref() != Some("notRequested") {
-                    flags.requested = true;
-                }
-                if reason.as_deref() == Some("failed")
-                    || (reason.as_deref() != Some("notRequested") && !self.unchanged(&document)?)
-                {
-                    flags.failed = true;
-                }
-            }
-            let claims = DocumentClaims::load(&self.captured, &document)?;
-            if !claims.claims.is_empty() {
-                flags.claims = claims.non_information();
-                let _keys = self.view_keys(&document, 1)?;
-                let local =
-                    streaming::claims_side(&self.captured, document.clone(), Rc::new(claims))?;
-                let (facts, _facts_reservation) =
-                    streaming::join_document(&local, global, self.admitted_encoding)?;
-                #[cfg(feature = "test-support")]
-                crate::semantic_batch::testing::run_document_common_observer(
-                    0,
-                    &document,
-                    &facts,
-                    self.conn(),
-                );
-                self.classify(&document, &local, &facts, &mut flags)?;
-            }
-            self.ctx.row("w_docs")?;
-            self.conn()
-                .prepare_cached(
-                    "INSERT INTO w_docs SELECT ord,?3,?4,?5,?6,?7,?8 FROM sources WHERE language=?1 AND path=?2",
-                )?
-                .execute(params![
-                    document.language,
-                    document.path,
-                    flags.requested,
-                    flags.failed,
-                    flags.eligible,
-                    flags.unsupported,
-                    i64::try_from(flags.unsupported_claims)?,
-                    i64::try_from(flags.claims)?,
-                ])?;
+            self.eligibility_document(&document?, global)?;
         }
         Ok(())
+    }
+
+    /// Decides one captured document's source eligibility and writes its `w_docs` row. Returns
+    /// the decision and, for a document with claims, the captured join it was decided on, with
+    /// its decoded claims and the join's charge.
+    fn eligibility_document(
+        &self,
+        document: &native::DocumentKey,
+        global: &streaming::CompletedGlobal<'_>,
+    ) -> Result<(DocFlags, Option<CapturedJoin>)> {
+        self.ctx.check_cancel()?;
+        let mut flags = DocFlags::default();
+        if self
+            .producer
+            .languages
+            .contains(&language_of(&document.language)?)
+        {
+            let reason = self.exclusion(document)?;
+            if reason.as_deref() != Some("notRequested") {
+                flags.requested = true;
+            }
+            if reason.as_deref() == Some("failed")
+                || (reason.as_deref() != Some("notRequested") && !self.unchanged(document)?)
+            {
+                flags.failed = true;
+            }
+        }
+        let claims = DocumentClaims::load(&self.captured, document)?;
+        let mut joined = None;
+        if !claims.claims.is_empty() {
+            flags.claims = claims.non_information();
+            let claims = Rc::new(claims);
+            let _keys = self.view_keys(document, 1)?;
+            let local = streaming::claims_side(&self.captured, document.clone(), claims.clone())?;
+            let (facts, reservation) =
+                streaming::join_document(&local, global, self.admitted_encoding)?;
+            #[cfg(feature = "test-support")]
+            crate::semantic_batch::testing::run_document_common_observer(
+                0,
+                document,
+                &facts,
+                self.conn(),
+            );
+            self.classify(document, &local, &facts, &mut flags)?;
+            #[cfg(feature = "test-support")]
+            if crate::semantic_batch::testing::eligibility_forced_failed(document) {
+                flags.failed = true;
+            }
+            joined = Some(CapturedJoin {
+                claims,
+                facts,
+                reservation,
+            });
+        }
+        self.ctx.row("w_docs")?;
+        self.conn()
+            .prepare_cached(
+                "INSERT INTO w_docs SELECT ord,?3,?4,?5,?6,?7,?8 FROM sources WHERE language=?1 AND path=?2",
+            )?
+            .execute(params![
+                document.language,
+                document.path,
+                flags.requested,
+                flags.failed,
+                flags.eligible,
+                flags.unsupported,
+                i64::try_from(flags.unsupported_claims)?,
+                i64::try_from(flags.claims)?,
+            ])?;
+        Ok((flags, joined))
+    }
+
+    /// Passes 2 and 4 in one walk, for a shared pin: each document's eligibility, then at
+    /// once its settlement and coverage, reusing the captured join eligibility was decided
+    /// on. Settling a document before every decision is made assumes every document with
+    /// claims is eligible, so that the eligible destination context is the whole captured
+    /// one and each destination join equals its captured join (`identical_joins`). The first
+    /// document with claims that is not eligible ends the assumption: the remaining decisions
+    /// are still made, the settled rows are discarded (their row attempts stay charged) and
+    /// `None` asks the caller for the separate settlement pass.
+    fn eligibility_and_settlement(
+        &self,
+        global: &streaming::CompletedGlobal<'_>,
+    ) -> Result<Option<BTreeMap<semantic::Language, LanguageTally>>> {
+        if exists(self.conn(), UNLISTED_CLAIM_DOCUMENT_SQL, &[])? {
+            anyhow::bail!("missing admitted claim document");
+        }
+        let manifest_hash = self.destination_manifest_hash()?;
+        let mut tallies = BTreeMap::new();
+        let mut settling = true;
+        self.identical_joins.set(true);
+        for document in self.destination.documents() {
+            let document = document?;
+            let (_, joined) = self.eligibility_document(&document, global)?;
+            if !settling {
+                continue;
+            }
+            let (flags, excluded) = self.document_flags(&document)?;
+            let settled = flags.eligible && !flags.failed;
+            if joined.is_some() && !settled {
+                settling = false;
+                continue;
+            }
+            let outcome = if settled {
+                self.settle_document(&document, global, global, &manifest_hash, joined)?
+            } else {
+                settle::DocumentOutcome::default()
+            };
+            self.document_coverage(
+                &document,
+                flags,
+                excluded.as_deref(),
+                &outcome,
+                &mut tallies,
+            )?;
+        }
+        if settling {
+            return Ok(Some(tallies));
+        }
+        self.identical_joins.set(false);
+        for table in OUTPUT_TABLES {
+            self.conn().execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        self.emitted.set([0; 7]);
+        Ok(None)
     }
 
     /// Classifies each claim of one captured document against its captured facts and the
@@ -1837,23 +1935,35 @@ impl StagedJoin<'_> {
             self.ctx.check_cancel()?;
             let (flags, excluded) = self.document_flags(&document)?;
             let outcome = if flags.eligible && !flags.failed {
-                self.settle_document(&document, captured, destination, &manifest_hash)?
+                self.settle_document(&document, captured, destination, &manifest_hash, None)?
             } else {
                 settle::DocumentOutcome::default()
             };
-            let language = language_of(&document.language)?;
-            if self.producer.languages.contains(&language) {
-                self.coverage(
-                    &document,
-                    language,
-                    flags,
-                    excluded.as_deref(),
-                    &outcome,
-                    &mut tallies,
-                )?;
-            }
+            self.document_coverage(
+                &document,
+                flags,
+                excluded.as_deref(),
+                &outcome,
+                &mut tallies,
+            )?;
         }
         Ok(tallies)
+    }
+
+    /// Emits a document's coverage row when the producer covers its language.
+    fn document_coverage(
+        &self,
+        document: &native::DocumentKey,
+        flags: DocFlags,
+        excluded: Option<&str>,
+        outcome: &settle::DocumentOutcome,
+        tallies: &mut BTreeMap<semantic::Language, LanguageTally>,
+    ) -> Result<()> {
+        let language = language_of(&document.language)?;
+        if self.producer.languages.contains(&language) {
+            self.coverage(document, language, flags, excluded, outcome, tallies)?;
+        }
+        Ok(())
     }
 
     fn destination_manifest_hash(&self) -> Result<String> {
@@ -2004,16 +2114,36 @@ impl StagedJoin<'_> {
     fn run(&self) -> Result<serde_json::Value> {
         let encoding = self.admitted_encoding;
         self.ctx.pass("native");
+        let shared = self.destination.rev == self.captured.rev;
         let captured = in_transaction(self.conn(), || {
             streaming::discover_side(
                 &self.captured,
                 encoding,
-                self.destination.rev == self.captured.rev,
+                if shared {
+                    streaming::TargetStatus::Own
+                } else {
+                    streaming::TargetStatus::None
+                },
             )
         })?;
         self.ctx.pass("captured discovery");
-        in_transaction(self.conn(), || self.eligibility(&captured))?;
-        self.ctx.pass("eligibility");
+        #[cfg(feature = "test-support")]
+        let fuse = shared && !crate::semantic_batch::testing::settlement_separated();
+        #[cfg(not(feature = "test-support"))]
+        let fuse = shared;
+        if fuse {
+            let fused = in_transaction(self.conn(), || self.eligibility_and_settlement(&captured))?;
+            self.ctx.pass("eligibility and settlement");
+            if let Some(tallies) = fused {
+                #[cfg(feature = "test-support")]
+                crate::semantic_batch::testing::run_before_closure_hook(self.conn());
+                self.closure()?;
+                return self.report(tallies);
+            }
+        } else {
+            in_transaction(self.conn(), || self.eligibility(&captured))?;
+            self.ctx.pass("eligibility");
+        }
         // With a shared pin both sides read the same native revision without destination
         // edits, and every global row stems from one claim's own document. Discovery over the
         // eligible claims would therefore write exactly the captured rows of eligible owner
@@ -2021,13 +2151,19 @@ impl StagedJoin<'_> {
         // No known producer input leaves a document with claims ineligible on a shared pin
         // (that needs duplicate native anchors), so the filtering view is a fallback that only
         // a unit test exercises; the common case reuses the captured join.
-        let destination = if self.destination.rev == self.captured.rev {
+        let destination = if shared {
             self.identical_joins
                 .set(!exists(self.conn(), INELIGIBLE_CLAIM_DOCUMENT_SQL, &[])?);
             captured.eligible_view()?
         } else {
             in_transaction(self.conn(), || {
-                streaming::discover_side(&self.filtered, encoding, false)
+                let destination = streaming::discover_side(
+                    &self.filtered,
+                    encoding,
+                    streaming::TargetStatus::OwnAndCaptured,
+                )?;
+                streaming::remaining_target_status(&self.captured, &self.destination)?;
+                Ok(destination)
             })?
         };
         self.ctx.pass("destination discovery");
@@ -2301,13 +2437,9 @@ pub fn join_staged(
             let captured_header = captured.header()?;
             let destination_header = destination_reader.header()?;
             let descriptor = parts.descriptor;
-            // With a shared pin the captured revision is also the destination, and settlement
-            // asks it only about exact-definition targets: captured discovery writes their
-            // status. A changed destination can ask the captured revision about targets its
-            // own discovery found, so both revisions then keep their full status.
-            native_pass(&ctx, captured, 0, false, !shared)?;
+            native_pass(&ctx, captured, 0)?;
             if !shared {
-                native_pass(&ctx, destination_reader, 1, !ctx.mutations.is_empty(), true)?;
+                native_pass(&ctx, destination_reader, 1)?;
             }
             let destination_rev = if shared { 0 } else { 1 };
             let side = |reader, header, rev, side, filtered| StagedSide {

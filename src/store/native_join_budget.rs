@@ -8,8 +8,6 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::mem::size_of;
 
-const CARD_ANCESTORS_SQL: &str = "SELECT COALESCE(length(CAST(json_extract(CASE WHEN j.type='object' THEN j.value ELSE '{}' END,'$.kind') AS BLOB)),0),COALESCE(length(CAST(json_extract(CASE WHEN j.type='object' THEN j.value ELSE '{}' END,'$.name') AS BLOB)),0),COALESCE(length(CAST(json_extract(CASE WHEN j.type='object' THEN j.value ELSE '{}' END,'$.self_type') AS BLOB)),0),COALESCE(length(CAST(json_extract(CASE WHEN j.type='object' THEN j.value ELSE '{}' END,'$.trait_name') AS BLOB)),0) FROM native_version_search_cards c,json_each(c.facts_json,'$.ancestors') j WHERE c.vid=?1";
-
 fn limit() -> anyhow::Error {
     ScipCaptureError::LimitExceeded("unit expansion".into()).into()
 }
@@ -185,9 +183,11 @@ pub(super) fn document_bytes(
         "SELECT COALESCE(length(CAST(name AS BLOB)),0),COALESCE(length(CAST(type_name AS BLOB)),0) FROM native_version_parameters WHERE vid=?1",
         vid,
     )?;
-    let (cr, [cr_parent, cr_kind, cr_arm]) = scan(
+    // Control regions are counted only for the call-region links the call reader resolves:
+    // a join load leaves the regions themselves (and search cards) unread.
+    let (cr, _) = scan::<0>(
         db,
-        "SELECT parent_id IS NOT NULL,length(CAST(kind AS BLOB)),COALESCE(length(CAST(arm AS BLOB)),0) FROM native_version_control_regions WHERE vid=?1",
+        "SELECT 1 FROM native_version_control_regions WHERE vid=?1",
         vid,
     )?;
     let (c, [cs, cl, ck]) = scan(
@@ -220,21 +220,6 @@ pub(super) fn document_bytes(
         "SELECT length(CAST(kind AS BLOB)),length(CAST(diagnostic AS BLOB)) FROM native_version_capability_gaps WHERE vid=?1",
         vid,
     )?;
-    let (cards, [card_text, card_hash, card_json, card_doc, card_head]) = scan(
-        db,
-        "SELECT length(CAST(card_text AS BLOB)),length(CAST(card_hash AS BLOB)),length(CAST(facts_json AS BLOB)),COALESCE(length(CAST(json_extract(facts_json,'$.facts.doc') AS BLOB)),0),COALESCE(length(CAST(json_extract(facts_json,'$.facts.head') AS BLOB)),0) FROM native_version_search_cards WHERE vid=?1",
-        vid,
-    )?;
-    let (card_list, [card_list_text]) = scan(
-        db,
-        "SELECT COALESCE(length(CAST(j.value AS BLOB)),0) FROM native_version_search_cards c,json_each(c.facts_json,'$.facts.calls') j WHERE c.vid=?1 UNION ALL \
-         SELECT COALESCE(length(CAST(j.value AS BLOB)),0) FROM native_version_search_cards c,json_each(c.facts_json,'$.facts.types') j WHERE c.vid=?1 UNION ALL \
-         SELECT COALESCE(length(CAST(j.value AS BLOB)),0) FROM native_version_search_cards c,json_each(c.facts_json,'$.facts.strings') j WHERE c.vid=?1 UNION ALL \
-         SELECT COALESCE(length(CAST(j.value AS BLOB)),0) FROM native_version_search_cards c,json_each(c.facts_json,'$.facts.error_codes') j WHERE c.vid=?1 UNION ALL \
-         SELECT COALESCE(length(CAST(j.value AS BLOB)),0) FROM native_version_search_cards c,json_each(c.facts_json,'$.facts.members') j WHERE c.vid=?1",
-        vid,
-    )?;
-    let (card_ancestors, [card_ak, card_an, card_as, card_at]) = scan(db, CARD_ANCESTORS_SQL, vid)?;
     let (cov_state, cov_diag): (i64, i64) = db.query_row(
         "SELECT length(CAST(coverage_state AS BLOB)),COALESCE(length(CAST(coverage_diagnostic AS BLOB)),0) FROM revision_documents WHERE revision_id=?1 AND language=?2 AND path=?3 AND vid=?4",
         rusqlite::params![scope.revision_key, scope.key.language, scope.key.path, vid],
@@ -415,56 +400,6 @@ pub(super) fn document_bytes(
         64,
         size_of::<serde_json::Value>() as u64,
     ])?;
-    type ControlRow = (
-        String,
-        String,
-        i64,
-        String,
-        i64,
-        i64,
-        Option<String>,
-        Option<String>,
-    );
-    let controls = add(&[
-        vector::<String>(d)?,
-        vector::<ControlRow>(cr)?,
-        times(id, add(&[d, times(cr, 2)?, cr_parent])?)?,
-        cr_kind,
-        cr_arm,
-        vector::<n::ControlRegion>(cr)?,
-        times(cr, add(&[times(id, 2)?, identity])?)?,
-        times(cr_parent, id)?,
-        cr_kind,
-        cr_arm,
-        map::<String, ()>(d)?,
-        times(d, id)?,
-        times(map::<String, usize>(cr)?, 2)?,
-        times(times(cr, 2)?, id)?,
-        proof,
-    ])?;
-    let card_rows = add(&[
-        vector::<crate::search_capture::CapturedCard>(cards)?,
-        times(cards, add(&[scope.key.path.len() as u64, id])?)?,
-        card_text,
-        card_hash,
-        grouped::<crate::search_card::Ancestor>(card_ancestors, cards)?,
-        card_ak,
-        card_an,
-        card_as,
-        card_at,
-        grouped::<String>(card_list, times(cards, 5)?)?,
-        card_doc,
-        card_head,
-        card_list_text,
-        size_of::<(Vec<u8>, String, String, String)>() as u64,
-        card_json,
-        16,
-        if card_json == 0 {
-            0
-        } else {
-            times(card_json, 2)?.max(8)
-        },
-    ])?;
     add(&[
         size_of::<super::NativeDocumentRows>() as u64,
         source,
@@ -488,29 +423,8 @@ pub(super) fn document_bytes(
         json,
         times(d, id)?,
         times(scope_bytes, 4)?,
-        controls,
-        card_rows,
         proof_json,
         times(proof, 3)?,
         16,
     ])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrong_shape_card_ancestor_probe_leaves_rejection_to_the_typed_reader() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE native_version_search_cards(vid INTEGER,facts_json TEXT)")
-            .unwrap();
-        db.execute(
-            "INSERT INTO native_version_search_cards VALUES(1,?1)",
-            [r#"{"ancestors":["plain",null,42]}"#],
-        )
-        .unwrap();
-        let result = scan::<4>(&db, CARD_ANCESTORS_SQL, 1).unwrap();
-        assert_eq!(result, (3, [0; 4]));
-    }
 }

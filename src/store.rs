@@ -973,13 +973,14 @@ impl NativeReader<'_> {
             .read_native_document(self.db, self.selected, document)
     }
 
-    /// Native rows for staged joins, retaining the general reader's integrity checks.
+    /// Native rows for staged joins, retaining the general reader's integrity checks. A join
+    /// never reads control regions or search cards, so they are not loaded (left empty).
     pub(crate) fn join_document(
         &self,
         document: &crate::native_evidence::Document,
     ) -> Result<NativeDocumentRows> {
         self.store
-            .read_native_document(self.db, self.selected, document)
+            .read_native_document_rows(self.db, self.selected, document, false)
     }
 
     /// Logical peak estimate for native document loading, before owning its row bodies.
@@ -20486,6 +20487,18 @@ impl Store {
         selected: &ReadRevision,
         document: &crate::native_evidence::Document,
     ) -> Result<NativeDocumentRows> {
+        self.read_native_document_rows(db, selected, document, true)
+    }
+
+    /// One document's native rows; without `complete`, its control regions and search cards
+    /// are left empty (the staged join reads neither).
+    fn read_native_document_rows(
+        &self,
+        db: &Connection,
+        selected: &ReadRevision,
+        document: &crate::native_evidence::Document,
+        complete: bool,
+    ) -> Result<NativeDocumentRows> {
         use crate::native_evidence as n;
         #[cfg(feature = "test-support")]
         crate::semantic_import::note_selected_original_native_row(&document.key);
@@ -20511,10 +20524,18 @@ impl Store {
             },
             declarations: read_native_declarations_v8(db, &scope, None, true)?,
             calls: read_native_calls_v8(db, &scope, None)?,
-            control_regions: read_native_control_regions_v8(db, &scope, None)?,
+            control_regions: if complete {
+                read_native_control_regions_v8(db, &scope, None)?
+            } else {
+                vec![]
+            },
             references: read_native_references(db, &scope, None)?,
             capability_report: read_native_capability_report(db, &scope)?,
-            search_cards: search::read_cards(db, scope.vid, &document.key.path)?,
+            search_cards: if complete {
+                search::read_cards(db, scope.vid, &document.key.path)?
+            } else {
+                vec![]
+            },
         })
     }
 
