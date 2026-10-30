@@ -5867,6 +5867,7 @@ fn authenticate_stored_batch(
         "raw captured native/source identity differs"
     );
     let uri = crate::scip_admission::file_uri(root).context("raw project root")?;
+    let module_roots = scip_raw::ModuleRoots::from_native_config(&captured.native_config);
     let mut claims = Vec::new();
     for capture in &raw.captures {
         // The artifact covers every retained document of its language that the batch did not
@@ -5929,6 +5930,7 @@ fn authenticate_stored_batch(
             protocol_version: 0,
             text_document_encoding: 1,
             project_root_uri: &uri,
+            module_roots: &module_roots,
             assigned_documents: docs.len() as u64,
         };
         let by_path: BTreeMap<&str, &AuthenticatedScipDocument<'_>> = docs
@@ -11478,6 +11480,20 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
             });
         }
         expected.insert(format!("directory:{directory}"));
+    }
+    // Nested package roots of JavaScript sources (#443); a non-regular one is not admitted.
+    for source in source_paths.iter().filter(|path| {
+        matches!(
+            Path::new(path).extension().and_then(|x| x.to_str()),
+            Some("js" | "mjs" | "cjs")
+        )
+    }) {
+        for dir in Path::new(source).ancestors().skip(1) {
+            let key = format!("config:{}/package.json", dir.to_string_lossy());
+            if !dir.as_os_str().is_empty() && actual.contains(&key) {
+                expected.insert(key);
+            }
+        }
     }
     expected.insert(
         executable.ok_or_else(|| {

@@ -58,6 +58,8 @@ pub(crate) struct Passes<'a> {
     pub limits: &'a BatchLimits,
     pub cancel: &'a CancelFlag,
     pub budget: StageBudget,
+    /// Package roots from the captured revision's retained native config (#443).
+    pub module_roots: &'a scip_raw::ModuleRoots,
 }
 
 fn check_cancel(cancel: &CancelFlag) -> std::result::Result<(), ScipCaptureError> {
@@ -342,6 +344,7 @@ impl Passes<'_> {
             protocol_version: descriptor.metadata.protocol_version,
             text_document_encoding: descriptor.metadata.text_document_encoding,
             project_root_uri: &descriptor.metadata.project_root,
+            module_roots: self.module_roots,
             assigned_documents: assigned as u64,
         };
         let mut sink = StageClaimSink::new(conn, &self.budget, entry.ordinal, &entry.language);
@@ -516,6 +519,9 @@ pub fn stage_batch(
     descriptor.check_pages(limits)?;
     descriptor.check_artifacts(limits)?;
     descriptor.check_paths(root)?;
+    let module_roots = scip_raw::ModuleRoots::from_native_config(
+        &store.retained_native_components_at(captured)?.1,
+    );
     let mut stage = Stage::create(
         &store.semantic_stage_parent()?,
         owner.request_id,
@@ -527,6 +533,7 @@ pub fn stage_batch(
         limits,
         cancel,
         budget: stage.budget(limits),
+        module_roots: &module_roots,
     };
     let mut inputs = FileInputs { root };
     passes.begin(stage.conn()?, &bytes, descriptor_sha256)?;
