@@ -1233,36 +1233,17 @@ impl BasisFor for StagedBasis<'_> {
     }
 }
 
-/// Streams the revision's inventory once into `nat_docs` and, with `declarations`, every
-/// declaration's name status into `nat_declarations`: the identity and name checks the rejoin
-/// needs about declarations of documents it is not reading. The captured revision skips the
-/// declarations: settlement only asks it about exact-definition targets, whose status captured
-/// discovery writes from the document group it already holds.
-fn native_pass(
-    ctx: &JoinCtx<'_>,
-    reader: &NativeReader<'_>,
-    rev: u8,
-    mutate: bool,
-    declarations: bool,
-) -> Result<()> {
+/// Streams the revision's inventory once into `nat_docs`: the identity of every document the
+/// rejoin may ask about. Declaration name status (`nat_declarations`) is not streamed here:
+/// settlement only asks about exact-definition targets, whose status discovery writes from the
+/// document groups it holds (`streaming::GlobalWriter::target_declarations`), every attempt.
+fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8) -> Result<()> {
     let conn = ctx.conn;
-    // A pass without declarations (a shared pin's captured revision) does not satisfy a later
-    // attempt that needs them: that attempt streams the revision again in full.
-    let done: Option<bool> = conn
-        .query_row(
-            "SELECT declarations FROM nat_done WHERE rev=?1",
-            [rev],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match done {
-        Some(full) if full || !declarations => return Ok(()),
-        Some(_) => {
-            for table in ["nat_docs", "nat_declarations", "nat_done"] {
-                conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
-            }
-        }
-        None => {}
+    if exists(conn, "SELECT 1 FROM nat_done WHERE rev=?1", &[&rev])? {
+        return Ok(());
+    }
+    for table in ["nat_docs", "nat_done"] {
+        conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
     }
     conn.execute_batch("BEGIN")?;
     let outcome = (|| -> Result<()> {
@@ -1280,40 +1261,9 @@ fn native_pass(
                     document.content_hash,
                     document.byte_length as i64
                 ])?;
-            if !declarations {
-                ord += 1;
-                continue;
-            }
-            let mut reservation =
-                ctx.reserve_native(reader.document_reservation_bytes(&document)?)?;
-            let mut rows = reader.join_document(&document)?;
-            if mutate {
-                reservation.grow(sizes::mutation(&rows, ctx.mutations)?)?;
-                ctx.mutations
-                    .apply(&mut rows.declarations, &mut rows.references);
-            }
-            let text = std::str::from_utf8(&rows.source).context("non-UTF8 native source")?;
-            for (n, declaration) in rows.declarations.iter().enumerate() {
-                ctx.row("nat_declarations")?;
-                let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
-                    text.get(range.start..range.end) == declaration.name.as_deref()
-                });
-                conn.prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6)")?
-                    .execute(params![
-                        rev,
-                        ord,
-                        codec::sid(&declaration.syntax_id),
-                        i64::try_from(n)?,
-                        declaration.name_range.is_some(),
-                        name_ok
-                    ])?;
-            }
             ord += 1;
         }
-        conn.execute(
-            "INSERT INTO nat_done VALUES(?1,?2)",
-            params![rev, declarations],
-        )?;
+        conn.execute("INSERT INTO nat_done VALUES(?1)", [rev])?;
         Ok(())
     })();
     match outcome {
@@ -1323,7 +1273,7 @@ fn native_pass(
         }
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
-            for table in ["nat_docs", "nat_declarations", "nat_done"] {
+            for table in ["nat_docs", "nat_done"] {
                 let _ = conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev]);
             }
             Err(error)
@@ -1350,12 +1300,6 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64
     for table in JOIN_TABLES {
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
-    // A shared pin's captured discovery rewrites its target status every attempt.
-    conn.execute(
-        "DELETE FROM nat_declarations WHERE rev=0 AND EXISTS \
-         (SELECT 1 FROM nat_done WHERE rev=0 AND declarations=0)",
-        [],
-    )?;
     let generation = destination.index_generation.to_string();
     let previous: Option<(String, i64)> = conn
         .query_row("SELECT generation, revision FROM join_state", [], |row| {
@@ -1363,7 +1307,7 @@ fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64
         })
         .optional()?;
     if previous.as_ref() != Some(&(generation.clone(), destination.index_revision as i64)) {
-        for table in ["nat_docs", "nat_declarations", "nat_done"] {
+        for table in ["nat_docs", "nat_done"] {
             conn.execute(&format!("DELETE FROM {table} WHERE rev=1"), [])?;
         }
     }
@@ -1383,14 +1327,12 @@ static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// together with the rows this attempt writes.
 fn retained_rows(conn: &Connection) -> Result<u64> {
     let mut total = 0u64;
-    for table in ["nat_docs", "nat_declarations"] {
-        let count = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        total = total
-            .checked_add(u64::try_from(count)?)
-            .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
-    }
+    let count = conn.query_row("SELECT COUNT(*) FROM nat_docs", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    total = total
+        .checked_add(u64::try_from(count)?)
+        .ok_or_else(|| ScipCaptureError::LimitExceeded("staged rows".into()))?;
     Ok(total)
 }
 
@@ -1488,6 +1430,18 @@ impl StagedJoin<'_> {
             "SELECT 1 FROM nat_docs a JOIN nat_docs b ON b.rev=1 AND b.language=a.language AND b.path=a.path \
              WHERE a.rev=0 AND a.language=?1 AND a.path=?2 AND b.content_hash=a.content_hash",
             &[&document.language, &document.path],
+        )
+    }
+
+    /// Whether `syntax_id` is a captured exact definition of `document`: the anchor of an exact
+    /// declaration-name join of the captured revision, so a named captured declaration.
+    fn captured_definition(&self, document: &native::DocumentKey, syntax_id: &str) -> Result<bool> {
+        self.ctx.charge(1)?;
+        exists(
+            self.conn(),
+            "SELECT 1 FROM g_definitions WHERE side=0 AND owner_doc=\
+             (SELECT ord FROM sources WHERE language=?1 AND path=?2) AND syntax_id=?3",
+            &[&document.language, &document.path, &codec::sid(syntax_id)],
         )
     }
 
@@ -2004,11 +1958,16 @@ impl StagedJoin<'_> {
     fn run(&self) -> Result<serde_json::Value> {
         let encoding = self.admitted_encoding;
         self.ctx.pass("native");
+        let shared = self.destination.rev == self.captured.rev;
         let captured = in_transaction(self.conn(), || {
             streaming::discover_side(
                 &self.captured,
                 encoding,
-                self.destination.rev == self.captured.rev,
+                if shared {
+                    streaming::TargetStatus::Own
+                } else {
+                    streaming::TargetStatus::None
+                },
             )
         })?;
         self.ctx.pass("captured discovery");
@@ -2021,13 +1980,19 @@ impl StagedJoin<'_> {
         // No known producer input leaves a document with claims ineligible on a shared pin
         // (that needs duplicate native anchors), so the filtering view is a fallback that only
         // a unit test exercises; the common case reuses the captured join.
-        let destination = if self.destination.rev == self.captured.rev {
+        let destination = if shared {
             self.identical_joins
                 .set(!exists(self.conn(), INELIGIBLE_CLAIM_DOCUMENT_SQL, &[])?);
             captured.eligible_view()?
         } else {
             in_transaction(self.conn(), || {
-                streaming::discover_side(&self.filtered, encoding, false)
+                let destination = streaming::discover_side(
+                    &self.filtered,
+                    encoding,
+                    streaming::TargetStatus::OwnAndCaptured,
+                )?;
+                streaming::remaining_target_status(&self.captured, &self.destination)?;
+                Ok(destination)
             })?
         };
         self.ctx.pass("destination discovery");
@@ -2301,13 +2266,9 @@ pub fn join_staged(
             let captured_header = captured.header()?;
             let destination_header = destination_reader.header()?;
             let descriptor = parts.descriptor;
-            // With a shared pin the captured revision is also the destination, and settlement
-            // asks it only about exact-definition targets: captured discovery writes their
-            // status. A changed destination can ask the captured revision about targets its
-            // own discovery found, so both revisions then keep their full status.
-            native_pass(&ctx, captured, 0, false, !shared)?;
+            native_pass(&ctx, captured, 0)?;
             if !shared {
-                native_pass(&ctx, destination_reader, 1, !ctx.mutations.is_empty(), true)?;
+                native_pass(&ctx, destination_reader, 1)?;
             }
             let destination_rev = if shared { 0 } else { 1 };
             let side = |reader, header, rev, side, filtered| StagedSide {

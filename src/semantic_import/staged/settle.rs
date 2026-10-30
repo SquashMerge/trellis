@@ -100,10 +100,16 @@ impl StagedJoin<'_> {
                 let kept = match known {
                     Some(kept) => kept,
                     None => {
-                        let original = self
-                            .declaration_status(self.captured.rev, document, syntax_id)?
-                            .iter()
-                            .any(|(named, _)| *named);
+                        // A captured exact definition is a named captured declaration (its
+                        // exact declaration-name join anchors on the name). An unshared pin
+                        // keeps captured status only for the other targets; a shared pin's
+                        // captured status covers every target, so it needs no probe.
+                        let original = (self.destination.rev != self.captured.rev
+                            && self.captured_definition(document, syntax_id)?)
+                            || self
+                                .declaration_status(self.captured.rev, document, syntax_id)?
+                                .iter()
+                                .any(|(named, _)| *named);
                         let kept = original && {
                             let candidates: Vec<_> = self
                                 .declaration_status(self.destination.rev, document, syntax_id)?

@@ -2292,26 +2292,128 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             )
             .unwrap();
         assert_eq!(side_one > 0, changed, "changed {changed}");
-        // On a shared pin the captured revision's declaration status covers its
-        // exact-definition targets (this fixture has no duplicate syntax IDs), not every
-        // native declaration; a changed destination keeps both revisions' full status.
-        let (status, targets, destination, full): (i64, i64, i64, i64) = conn
+        // Declaration status covers exact-definition targets only (this fixture has no
+        // duplicate syntax IDs), never every native declaration. A shared pin keeps the
+        // captured status of its targets. An unshared pin keeps the destination status of
+        // every captured or destination target, and captured status only for destination
+        // targets that are not captured ones (none here).
+        let (captured_status, captured_targets, destination_status, all_targets, other_targets): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM nat_declarations WHERE rev=0), \
                  (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions WHERE side=0)), \
                  (SELECT COUNT(*) FROM nat_declarations WHERE rev=1), \
-                 (SELECT declarations FROM nat_done WHERE rev=0)",
+                 (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions)), \
+                 (SELECT COUNT(*) FROM (SELECT DISTINCT owner_doc, syntax_id FROM g_definitions g WHERE side=1 \
+                  AND NOT EXISTS (SELECT 1 FROM g_definitions c WHERE c.side=0 AND c.owner_doc=g.owner_doc \
+                  AND c.syntax_id=g.syntax_id)))",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .unwrap();
-        assert!(targets > 0);
-        assert_eq!(full == 1, changed, "changed {changed}");
+        assert!(captured_targets > 0);
         if changed {
-            assert!(status > targets && destination > 0);
+            assert_eq!(
+                (captured_status, destination_status),
+                (other_targets, all_targets),
+                "changed"
+            );
+            assert_eq!(other_targets, 0);
         } else {
-            assert_eq!((status, destination), (targets, 0));
+            assert_eq!((captured_status, destination_status), (captured_targets, 0));
         }
+        // Native status is rewritten every attempt; only the document inventory is retained.
+        let retained: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nat_docs", [], |row| row.get(0))
+            .unwrap();
+        assert!(retained > 0);
+        assert_eq!(
+            ledger["nat_declarations"],
+            (captured_status + destination_status) as u64,
+            "changed {changed}"
+        );
+    }
+}
+
+/// An unshared pin keeps destination declaration status only for exact-definition targets.
+/// Each case changes the destination's declarations between the pins (a target renamed, moved,
+/// removed, its referrer edited, or a competing declaration added) and the staged publication
+/// must still equal the independent memory join, with the same report and full validation.
+#[test]
+fn unshared_target_status_matches_memory_when_destination_declarations_change() {
+    let edits: [(&str, &[(&str, &str)], &[&str]); 5] = [
+        (
+            "target renamed",
+            &[("src/B.js", "function other(){ }\n")],
+            &[],
+        ),
+        (
+            "target moved",
+            &[("src/B.js", "\n\nfunction target(){ }\n")],
+            &[],
+        ),
+        ("target removed", &[], &["src/B.js"]),
+        (
+            "referrer edited",
+            &[("src/A.js", "function run(){ target(); }\n// edit\n")],
+            &[],
+        ),
+        (
+            "competing declaration",
+            &[("src/C.js", "function target(){ }\n")],
+            &[],
+        ),
+    ];
+    for (case, writes, removals) in edits {
+        let world = definitions_world();
+        let (a, b) = definitions_docs();
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+        write_files(&world.root, writes);
+        for path in removals {
+            fs::remove_file(world.root.join(path)).unwrap();
+        }
+        world.republish();
+        let mutations = DestinationMutations::default();
+        let (mut admitted, sealed, counters) = world
+            .join_with(&descriptor, &BatchLimits::PRODUCTION, mutations)
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let rejoined = world.memory_rejoin(&descriptor, mutations).unwrap();
+        assert_same_publication(&staged, &rejoined.publication, case);
+        assert_eq!(
+            report_tallies(sealed.report()),
+            report_tallies(&rejoined.report),
+            "{case}: report tallies"
+        );
+        let full = world.full_validation(&descriptor, mutations, &staged);
+        let reference = world.full_validation(&descriptor, mutations, &rejoined.publication);
+        assert_eq!(
+            full.is_ok(),
+            reference.is_ok(),
+            "{case}: {full:?} {reference:?}"
+        );
+        // The status rows are bounded by the targets: each one names a target key.
+        let conn = admitted.stage_mut().conn().unwrap();
+        let (status, keyed): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM g_definitions g \
+                 JOIN sources s ON s.ord=g.owner_doc JOIN nat_docs d ON d.language=s.language \
+                 AND d.path=s.path WHERE d.rev=n.rev AND d.ord=n.doc_ord AND g.syntax_id=n.syntax_id)) \
+                 FROM nat_declarations n",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, keyed, "{case}");
+        assert_eq!(
+            counters.staged_row_attempts["nat_declarations"], status as u64,
+            "{case}"
+        );
     }
 }
 

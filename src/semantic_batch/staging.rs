@@ -39,10 +39,11 @@ CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
 CREATE INDEX claims_symbol ON claims(symbol, presence) WHERE symbol IS NOT NULL;
 CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL, attempt INTEGER NOT NULL);
-CREATE TABLE nat_done(rev INTEGER PRIMARY KEY, declarations INTEGER NOT NULL);
+CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
 CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
 CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id BLOB NOT NULL, n INTEGER NOT NULL, named INTEGER NOT NULL, name_ok INTEGER NOT NULL, PRIMARY KEY(rev, doc_ord, syntax_id, n)) WITHOUT ROWID;
 CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID;
+CREATE INDEX g_definitions_owner ON g_definitions(side,owner_doc,syntax_id);
 CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL);
 CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_doc);
 CREATE INDEX g_methods_target ON g_methods(side,symbol,local_doc);
@@ -56,8 +57,10 @@ CREATE TABLE out_call_bindings(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, pr
 CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
 ";
 
-/// Tables a join fills that depend on the destination revision. A new destination clears them all.
+/// Tables one join attempt fills from its claims and destination. Every attempt clears them all;
+/// only `nat_docs` (and `nat_done`) outlive an attempt, as its retained native seed.
 pub const JOIN_TABLES: &[&str] = &[
+    "nat_declarations",
     "g_definitions",
     "g_methods",
     "w_docs",
