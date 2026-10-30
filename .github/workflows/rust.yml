@@ -76,8 +76,7 @@ jobs:
           key: ${{ matrix.job }}
           workspaces: ${{ matrix.workspaces }}
           cache-directories: ${{ matrix.job == 'checks' && env.COMPOSITION_TARGET || '' }}
-          # TEMPORARY (#489): prime this PR's caches for a warm measurement; reverted before review.
-          save-if: true
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-')) }}
       # verify provisions the browser packages and the pinned Chromium itself.
       # On Linux the browser job also installs Chromium's system packages in the
       # background, since only the browser suite at its end needs them (#244).
