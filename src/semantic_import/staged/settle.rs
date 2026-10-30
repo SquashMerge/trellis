@@ -1002,7 +1002,17 @@ mod tests {
             revision: native::Revision {
                 id: "revision".into(),
                 source_set_id: "set".into(),
-                documents: vec![],
+                // A nonempty document, so building the index allocates.
+                documents: vec![native::Document {
+                    key: native::DocumentKey {
+                        source_set_id: "set".into(),
+                        language: "rust".into(),
+                        path: "src/lib.rs".into(),
+                    },
+                    revision_id: "revision".into(),
+                    content_hash: "c".repeat(64),
+                    byte_length: 0,
+                }],
                 toolchain_hash: "t".into(),
                 config_hash: "c".into(),
                 dependency_hash: "d".into(),
@@ -1018,10 +1028,15 @@ mod tests {
         };
         let bytes = semantic::NativeIndex::bytes(&native);
         assert!(bytes > 0);
-        // No room: typed refusal, nothing built.
+        // No room: typed refusal, and nothing allocated before it, not even the estimate's
+        // scratch: the refusal peaks exactly where the budget's own refusal does.
         let budget = LiveBudget::new(bytes - 1);
         let cell = ValidationIndex::new();
-        let error = validation_index(&cell, &budget, &native).err().unwrap();
+        let (refused, _, refusal_peak) =
+            crate::test_alloc::measure_peak(|| validation_index(&cell, &budget, &native).err());
+        let (_, _, reserve_peak) = crate::test_alloc::measure_peak(|| budget.reserve(bytes).err());
+        assert_eq!(refusal_peak, reserve_peak);
+        let error = refused.unwrap();
         assert!(
             matches!(error.downcast_ref::<ScipCaptureError>(), Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion")
         );

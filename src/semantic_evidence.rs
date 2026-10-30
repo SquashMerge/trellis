@@ -368,9 +368,12 @@ impl NativeIndex {
     /// - The lists are pushed (gap ends collected), so each non-empty list holds at most
     ///   `max(2 * len, 4)` slots: twice the entries plus four slots for each of a document's
     ///   five lists (gap ends: for each family).
+    ///
+    /// It allocates nothing itself, since it runs before the admission (#476): documents are
+    /// counted as runs of equal keys over the facts, an upper bound of the distinct ones.
     pub(crate) fn bytes(native: &native::Artifact) -> u64 {
-        let mut documents = BTreeSet::new();
-        let strings = native
+        let mut previous: Option<&native::DocumentKey> = None;
+        let (documents, strings) = native
             .revision
             .documents
             .iter()
@@ -378,15 +381,16 @@ impl NativeIndex {
             .chain(native.declarations.iter().map(|d| &d.document))
             .chain(native.calls.iter().map(|c| &c.document))
             .chain(native.references.iter().map(|r| &r.document))
-            .filter(|document| documents.insert(*document))
-            .map(|key| (key.source_set_id.len() + key.language.len() + key.path.len()) as u64)
-            .fold(0u64, u64::saturating_add);
+            .filter(|key| previous.replace(*key) != Some(*key))
+            .fold((0u64, 0u64), |(documents, strings), key| {
+                let length = key.source_set_id.len() + key.language.len() + key.path.len();
+                (documents + 1, strings.saturating_add(length as u64))
+            });
         let word = size_of::<usize>() as u64;
         let node = (2 * word
             + 11 * (size_of::<native::DocumentKey>() + size_of::<DocumentIndex>()) as u64)
             .next_multiple_of(word)
             + 12 * word;
-        let documents = documents.len() as u64;
         let map = (2 * (documents / 5 + 1)).saturating_mul(node);
         let entries = (native.declarations.len() as u64)
             .saturating_add((native.calls.len() as u64).saturating_mul(2))
@@ -3137,7 +3141,9 @@ mod native_index_tests {
             .map(|family| crate::test_alloc::measure(|| SupportIndex::gap_ends(&family.gaps)).1)
             .sum();
         drop(index);
-        let bound = NativeIndex::bytes(native);
+        // The estimate runs before admission, so it allocates nothing itself.
+        let (bound, _, scratch) = crate::test_alloc::measure_peak(|| NativeIndex::bytes(native));
+        assert_eq!(scratch, 0, "the estimate allocated");
         assert!(
             peak + ends <= bound,
             "{} documents: built {peak} + gap ends {ends} > bound {bound}",
