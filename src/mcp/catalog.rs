@@ -260,10 +260,9 @@ mod tests {
             .find(|e| e["name"] == "trellis_outgoing_calls")
             .unwrap();
         assert_eq!(
-            format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_string(outgoing).unwrap().as_bytes())
-            ),
+            hex::encode(Sha256::digest(
+                serde_json::to_string(outgoing).unwrap().as_bytes()
+            )),
             "9379caaeea4dcc63df8286ef3da1d21cf462bddab34b85c7920a661b9b8e1e0d"
         );
     }
