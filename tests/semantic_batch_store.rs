@@ -3476,8 +3476,9 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
     let memory = world.memory_publication(&descriptor, DestinationMutations::default());
     assert_same_publication(&staged, &memory, "real scip-typescript calls");
     // Callee and dispatch (owner ruling 2026-10-30, #470): plain calls of free functions,
-    // the imported `helper` included, are direct. scip-typescript's constructor and method
-    // symbols bind no target (kind 0 fails the method-kind check), so they stay unknown.
+    // the imported `helper` included, are direct. scip-typescript's kind 0 (unspecified) defers
+    // to the measured native kind (#473), so `new Widget(3)` binds the class constructor and is
+    // constructor, and the member call `w.run()` binds the method with dispatch unknown.
     let callees = |bindings: &[trellis::semantic_evidence::CallBinding]| {
         let mut callees: Vec<_> = bindings
             .iter()
@@ -3491,11 +3492,11 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         callees
     };
     {
-        use trellis::semantic_evidence::Dispatch::{Direct, Unknown};
+        use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
         assert_eq!(
             callees(&staged.call_bindings),
             [
-                ("Widget", Unknown),
+                ("Widget", Constructor),
                 ("helper", Direct),
                 ("plain", Direct),
                 ("plain", Direct),
@@ -3504,15 +3505,17 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
             ]
         );
     }
-    let helper = staged
-        .call_bindings
-        .iter()
-        .find(|binding| {
-            let range = &binding.join.anchor.range;
-            &main[range.start..range.end] == "helper"
-        })
-        .unwrap();
-    assert_eq!(helper.resolution, Resolution::Resolved);
+    for name in ["helper", "Widget", "run"] {
+        let binding = staged
+            .call_bindings
+            .iter()
+            .find(|binding| {
+                let range = &binding.join.anchor.range;
+                &main[range.start..range.end] == name
+            })
+            .unwrap();
+        assert_eq!(binding.resolution, Resolution::Resolved, "{name}");
+    }
 
     let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
     let staged = testing::staged_publication(&mut admitted).unwrap();
@@ -3529,6 +3532,107 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         callees(&world.store.semantic_at(head).unwrap().call_bindings),
         callees(&staged.call_bindings)
     );
+}
+
+/// #473: the real #444 bytes with an explicit SCIP kind on the constructor and `run` symbols.
+/// `Method` (26) agrees with their native `method` declarations and binds as kind 0 does;
+/// `Function` (17) conflicts, so neither call binds a target. Batch equals memory either way.
+#[test]
+fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memory() {
+    use protobuf::EnumOrUnknown;
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue444-javascript-calls");
+    let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
+    let (lib, main) = (read("src/lib.js"), read("src/main.js"));
+    for (kind, widget, run) in [
+        (
+            26,
+            (Resolution::Resolved, Constructor),
+            (Resolution::Resolved, Unknown),
+        ),
+        (
+            17,
+            (Resolution::Unresolved, Unknown),
+            (Resolution::Unresolved, Unknown),
+        ),
+    ] {
+        let mut index = scip::types::Index::parse_from_bytes(
+            &fs::read(fixture_dir.join("index.scip")).unwrap(),
+        )
+        .unwrap();
+        let mut replaced = 0;
+        for info in index
+            .documents
+            .iter_mut()
+            .flat_map(|d| d.symbols.iter_mut())
+        {
+            if ["Widget#`<constructor>`().", "Widget#run()."]
+                .iter()
+                .any(|suffix| info.symbol.ends_with(suffix))
+            {
+                info.kind = EnumOrUnknown::from_i32(kind);
+                replaced += 1;
+            }
+        }
+        assert_eq!(replaced, 2);
+        let world = world(|root| {
+            write_files(
+                root,
+                &[
+                    ("src/lib.js", &lib),
+                    ("src/main.js", &main),
+                    (
+                        "package.json",
+                        r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+                    ),
+                ],
+            )
+        });
+        let mut fixture = world.fixture().reference("scip-typescript");
+        let ordinal = fixture.artifact(
+            "javascript",
+            vec![DocSpec::new("src/lib.js"), DocSpec::new("src/main.js")],
+        );
+        fixture.override_artifact_raw(ordinal, index.write_to_bytes().unwrap());
+        let descriptor = world.write(&fixture);
+        let (mut admitted, _, _) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        drop(admitted);
+        let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+        assert_same_publication(&staged, &memory, &format!("explicit kind {kind}"));
+        let mut callees: Vec<_> = staged
+            .call_bindings
+            .iter()
+            .map(|binding| {
+                let range = &binding.join.anchor.range;
+                (
+                    &main[range.start..range.end],
+                    (binding.resolution, binding.dispatch),
+                )
+            })
+            .collect();
+        callees.sort_by_key(|(callee, _)| *callee);
+        let direct = (Resolution::Resolved, Direct);
+        assert_eq!(
+            callees,
+            [
+                ("Widget", widget),
+                ("helper", direct),
+                ("plain", direct),
+                ("plain", direct),
+                ("register", direct),
+                ("run", run),
+            ],
+            "explicit kind {kind}"
+        );
+    }
 }
 
 /// Real scip-typescript 0.4.0 bytes for issue #466 (`index` with the fixture's `tsconfig.json`,
@@ -5333,35 +5437,30 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
             .collect();
         shown.sort_by(|a, b| a.0.cmp(&b.0));
         // #470's owner ruling: a resolved plain call to a free function is `Direct`, so the
-        // graph follows it (no boundary). Calls that stay unresolved (`new Widget(3)`,
-        // `w.run()`) keep `Unknown` dispatch and their `unresolved` boundary.
-        let followed = |name: &str, target: &str| {
+        // graph follows it (no boundary), as it does `new Widget(3)`, which binds the class
+        // constructor and is `Constructor` (#473: scip-typescript's unspecified kind defers to
+        // the native kind). The member call `w.run()` binds the method with `Unknown`
+        // dispatch, so it keeps a `dispatch` boundary.
+        let resolved = |name: &str, dispatch: &str, boundary, target: &str| {
             (
                 name.to_owned(),
                 "Resolved".to_owned(),
-                "Direct".to_owned(),
-                BoundaryReason::None,
+                dispatch.to_owned(),
+                boundary,
                 Some(ids[target].clone()),
             )
         };
-        let unresolved = |name: &str| {
-            (
-                name.to_owned(),
-                "Unresolved".to_owned(),
-                "Unknown".to_owned(),
-                BoundaryReason::Unresolved,
-                None,
-            )
-        };
+        let followed =
+            |name: &str, target: &str| resolved(name, "Direct", BoundaryReason::None, target);
         assert_eq!(
             shown,
             [
-                unresolved("Widget"),
+                resolved("Widget", "Constructor", BoundaryReason::None, "constructor"),
                 followed("helper", "helper"),
                 followed("plain", "plain"),
                 followed("plain", "plain"),
                 followed("register", "register"),
-                unresolved("run"),
+                resolved("run", "Unknown", BoundaryReason::Dispatch, "run"),
             ]
         );
         for binding in &view.semantic.bindings {
@@ -5453,9 +5552,16 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
             ids["helper"]
         );
         assert_eq!(helper["semanticBasis"]["producerId"], producer.as_str());
-        // A member call whose target stays unresolved keeps its boundary.
+        // A resolved member call has unknown dispatch, so it keeps a dispatch boundary.
         let run = calls.iter().find(|c| c["calleeText"] == "run").unwrap();
-        assert_eq!(run["boundaryReason"], "unresolved", "{run}");
+        assert_eq!(run["disposition"], "resolved", "{run}");
+        assert_eq!(run["boundaryReason"], "dispatch", "{run}");
+        assert_eq!(run["targetId"], ids["run"], "{run}");
+        // `new Widget(3)` is a resolved constructor call and is followed (#473).
+        let widget = calls.iter().find(|c| c["calleeText"] == "Widget").unwrap();
+        assert_eq!(widget["binding"]["dispatch"], "constructor", "{widget}");
+        assert_eq!(widget["boundaryReason"], "none", "{widget}");
+        assert_eq!(widget["targetId"], ids["constructor"], "{widget}");
         assert_eq!(run["binding"]["dispatch"], "unknown", "{run}");
         let unbound = calls.iter().find(|c| c["calleeText"] == "method").unwrap();
         assert_eq!(unbound["binding"], Value::Null);

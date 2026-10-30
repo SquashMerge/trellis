@@ -1388,9 +1388,13 @@ fn measure_occurrence<S: JoinStore>(
             .declaration_of(doc, &binding.candidate_ids[0])?
             .context("missing exact native declaration")?;
         callable = TargetCallable::of(&candidate);
+        // A stated SCIP kind must agree with the measured native kind. An unspecified kind
+        // (`0`, as scip-typescript 0.4.0 emits for every symbol) states nothing to conflict,
+        // so it defers to the measured native kind of this exact, authenticated target (#473).
         let compatible = store
             .symbol_kind(&doc.language, &doc.path, symbol)?
             .is_some_and(|kind| match candidate.kind.as_str() {
+                _ if kind == 0 => true,
                 "type" => matches!(kind, 7 | 11 | 21),
                 "method" => kind == 26,
                 _ => true,
