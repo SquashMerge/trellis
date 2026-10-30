@@ -375,15 +375,15 @@ fn source(path: &Path) -> bool {
         Some("js" | "mjs" | "cjs" | "rs" | "java" | "py")
     )
 }
-/// Directories strictly below `root` that contain a JavaScript source, directly or nested.
-fn nested_package_dirs(root: &Path, sources: &[PathBuf]) -> BTreeSet<PathBuf> {
+/// Directories strictly below `root` that contain a source with one of `extensions`,
+/// directly or nested.
+fn nested_package_dirs(root: &Path, sources: &[PathBuf], extensions: &[&str]) -> BTreeSet<PathBuf> {
     sources
         .iter()
         .filter(|path| {
-            matches!(
-                path.extension().and_then(|x| x.to_str()),
-                Some("js" | "mjs" | "cjs")
-            )
+            path.extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| extensions.contains(&x))
         })
         .flat_map(|path| path.ancestors().skip(1))
         .filter(|dir| dir.starts_with(root) && *dir != root)
@@ -393,6 +393,13 @@ fn nested_package_dirs(root: &Path, sources: &[PathBuf]) -> BTreeSet<PathBuf> {
 /// A nested package root admitted for scip-typescript module markers (#443).
 pub(crate) fn nested_package_manifest(root: &Path, path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == "package.json")
+        && path.starts_with(root)
+        && path.parent() != Some(root)
+}
+/// A nested Cargo manifest admitted for Cargo target symbol namespaces (owner ruling
+/// 2026-10-30, #394).
+pub(crate) fn nested_cargo_manifest(root: &Path, path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "Cargo.toml")
         && path.starts_with(root)
         && path.parent() != Some(root)
 }
@@ -707,8 +714,17 @@ impl Capture {
         // scip-typescript names a module relative to the nearest package.json directory, so
         // nested package roots of JavaScript sources are admitted beside the root inputs
         // (owner ruling 2026-10-29, #443). Like the producer, only a regular file counts.
-        for dir in nested_package_dirs(&root, &sources) {
-            let path = dir.join("package.json");
+        // Rust symbol keys are scoped by Cargo target, so nested Cargo manifests of Rust
+        // sources are admitted the same way (owner ruling 2026-10-30, #394).
+        let nested = nested_package_dirs(&root, &sources, &["js", "mjs", "cjs"])
+            .into_iter()
+            .map(|dir| dir.join("package.json"))
+            .chain(
+                nested_package_dirs(&root, &sources, &["rs"])
+                    .into_iter()
+                    .map(|dir| dir.join("Cargo.toml")),
+            );
+        for path in nested {
             let cap = options.max_file_bytes.min(16 * 1024 * 1024);
             if metadata(&path)?.is_some_and(|item| item.kind != 2 || item.len > cap) {
                 continue;
@@ -971,6 +987,7 @@ impl Capture {
                     roles.push(format!("toolchain:{relative}"));
                 } else if ROOT_INPUTS.contains(&relative.as_str())
                     || nested_package_manifest(&self.root, path)
+                    || nested_cargo_manifest(&self.root, path)
                 {
                     roles.push(format!("config:{relative}"));
                 }
@@ -1092,6 +1109,7 @@ impl Capture {
                     roles.push(format!("toolchain:{rel}"));
                 } else if ROOT_INPUTS.contains(&rel.as_str())
                     || nested_package_manifest(&self.root, path)
+                    || nested_cargo_manifest(&self.root, path)
                 {
                     roles.push(format!("config:{rel}"));
                 }

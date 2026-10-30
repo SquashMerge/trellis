@@ -40,6 +40,7 @@ fn symbol_shape(symbol: &semantic::SymbolKey) -> Result<(u64, u64)> {
     let scope = match symbol.scope {
         semantic::SymbolScope::Global => "global",
         semantic::SymbolScope::Document => "document",
+        semantic::SymbolScope::Target => "target",
     };
     let (document, storage) = symbol
         .document

@@ -13,7 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Read};
 use std::sync::atomic::Ordering;
 
+pub mod cargo_targets;
 pub mod module_roots;
+pub use cargo_targets::{CargoTarget, CargoTargets, CargoTargetsBuilder};
 pub use module_roots::ModuleRoots;
 
 pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/2";
@@ -119,6 +121,45 @@ pub struct CapturedScipFactV1 {
     pub relative_path: String,
     pub position_encoding: u8,
     pub raw: Value,
+    /// The Cargo target of a Rust document whose target is determined (owner ruling
+    /// 2026-10-30, #394). It is part of the envelope, so the fact digest and proof identity
+    /// of the same raw fact differ between targets. Absent for every other document.
+    pub cargo_target: Option<CargoTarget>,
+}
+
+impl CapturedScipFactV1 {
+    /// The envelope's `cargoTarget`, as `make_claim` writes it.
+    pub fn cargo_target_json(target: &CargoTarget) -> Value {
+        json!({"kind": target.kind, "package": target.package, "root": target.root, "version": target.version})
+    }
+
+    /// Reads an envelope's `cargoTarget` back: absent, or exactly a known kind, a package
+    /// name, a root and a version string or null.
+    pub fn cargo_target_from(envelope: &Value) -> Result<Option<CargoTarget>, ScipCaptureError> {
+        let Some(value) = envelope.get("cargoTarget") else {
+            return Ok(None);
+        };
+        let object = value.as_object().filter(|object| object.len() == 4);
+        let text = |key: &str| object.and_then(|o| o.get(key)).and_then(Value::as_str);
+        let version = match object.and_then(|o| o.get("version")) {
+            Some(Value::Null) => Some(None),
+            Some(Value::String(version)) => Some(Some(version.clone())),
+            _ => None,
+        };
+        match (text("kind"), text("package"), text("root"), version) {
+            (Some(kind), Some(package), Some(root), Some(version))
+                if cargo_targets::TARGET_KINDS.contains(&kind) && valid_path(root) =>
+            {
+                Ok(Some(CargoTarget {
+                    kind: kind.to_owned(),
+                    root: root.to_owned(),
+                    package: package.to_owned(),
+                    version,
+                }))
+            }
+            _ => Err(invalid("cargo target")),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedClaim {
@@ -835,10 +876,16 @@ fn make_claim(
         relative_path: d.relative_path.clone(),
         position_encoding: d.position_encoding.value() as u8,
         raw,
+        cargo_target: (language == "rust")
+            .then(|| artifact.cargo_targets.target_of(&d.relative_path))
+            .flatten()
+            .cloned(),
     };
-    let bytes = canonical(
-        &json!({"formatVersion":1,"recordKind":kind,"relativePath":d.relative_path,"positionEncoding":envelope.position_encoding,"raw":envelope.raw}),
-    );
+    let mut value = json!({"formatVersion":1,"recordKind":kind,"relativePath":d.relative_path,"positionEncoding":envelope.position_encoding,"raw":envelope.raw});
+    if let Some(target) = &envelope.cargo_target {
+        value["cargoTarget"] = CapturedScipFactV1::cargo_target_json(target);
+    }
+    let bytes = canonical(&value);
     let fact = digest(b"trellis.semantic-fact.v1\0", &bytes);
     let proof = digest(
         b"trellis.capture-proof.v1\0",
@@ -869,6 +916,8 @@ pub struct AuthenticatedArtifact<'a> {
     pub project_root_uri: &'a str,
     /// Package roots that bind scip-typescript module markers (#443).
     pub module_roots: &'a ModuleRoots,
+    /// The Cargo target of each Rust document, its symbol namespace (#394).
+    pub cargo_targets: &'a CargoTargets,
     /// Source documents assigned to this artifact; every one must appear exactly once.
     pub assigned_documents: u64,
 }
@@ -1495,6 +1544,7 @@ pub(crate) fn decode_authenticated_with(
         text_document_encoding: input.text_document_encoding,
         project_root_uri: &input.project_root_uri,
         module_roots: &ModuleRoots::default(),
+        cargo_targets: &CargoTargets::default(),
         assigned_documents: admitted.len() as u64,
     };
     let mut resolve = |path: &str, language: &str| {
@@ -1760,6 +1810,7 @@ mod tests {
                 text_document_encoding: 1,
                 project_root_uri: "file:///synthetic",
                 module_roots: &ModuleRoots::default(),
+                cargo_targets: &CargoTargets::default(),
                 assigned_documents: documents.len() as u64,
             };
             let mut resolve = |path: &str, _language: &str| {

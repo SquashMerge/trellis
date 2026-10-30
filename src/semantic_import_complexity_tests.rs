@@ -53,6 +53,7 @@ fn case(
                 raw: json!({"range":{"encoding":"legacy","values":[line,column,column+1]},
                 "enclosingRange":{"encoding":"legacy","values":[line,column,column+3]},
                 "symbol":"external pkg f.","symbolRoles":0,"syntaxKind":0}),
+                cargo_target: None,
             };
             let canonical_bytes =
                 native_ids::canonical(&json!({"formatVersion":1,"recordKind":"occurrence",
@@ -391,6 +392,7 @@ fn java_local_method_in_other_document_does_not_make_override_endpoint_ambiguous
             relative_path: path.into(),
             position_encoding: 1,
             raw,
+            cargo_target: None,
         };
         let canonical_bytes = native_ids::canonical(&json!({
             "formatVersion": 1, "recordKind": kind, "relativePath": path,
@@ -508,6 +510,7 @@ fn java_relationship_indexes_visit_each_snapshot_once_and_preserve_method_multip
                 relative_path: path.into(),
                 position_encoding: 1,
                 raw,
+                cargo_target: None,
             };
             let canonical_bytes = native_ids::canonical(&json!({
                 "formatVersion": 1, "recordKind": kind, "relativePath": path,
@@ -698,6 +701,7 @@ fn java_override_uses_global_method_owner_from_another_language() {
             relative_path: document.path.clone(),
             position_encoding: 1,
             raw,
+            cargo_target: None,
         };
         let canonical_bytes = native_ids::canonical(&json!({
             "formatVersion": 1, "recordKind": kind, "relativePath": document.path,

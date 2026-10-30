@@ -623,7 +623,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        28
+        29
     );
     let files = db
         .prepare("SELECT path FROM revision_documents WHERE revision_id=?1 ORDER BY path")
@@ -739,7 +739,7 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    // Check exact schema-28 names before comparing evidence and the logical
+    // Check exact schema-29 names before comparing evidence and the logical
     // search corpus. FTS shadow bytes depend on publication/merge history.
     const REQUIRED_V28_TABLES: [&str; 74] = [
         "class_projections",
@@ -820,7 +820,7 @@ fn sqlite_snapshot(
     assert_eq!(
         tables.iter().map(String::as_str).collect::<Vec<_>>(),
         REQUIRED_V28_TABLES,
-        "exact schema-28 evidence and search table inventory"
+        "exact schema-29 evidence and search table inventory"
     );
     if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
@@ -903,7 +903,7 @@ fn sqlite_snapshot(
                 name if name.starts_with("native_version_") =>
                     ("vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("semantic_") => ("?1 IS NOT NULL", ""),
-                _ => panic!("unhandled schema-28 evidence table: {table}"),
+                _ => panic!("unhandled schema-29 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
