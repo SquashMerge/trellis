@@ -14,12 +14,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Cargo target kinds, as they appear in a claim's `cargoTarget.kind`.
 pub const TARGET_KINDS: [&str; 6] = ["lib", "bin", "build", "example", "test", "bench"];
 
-/// One Cargo target: its kind and its crate root document path. The root path is the
-/// target's namespace identity.
+/// One Cargo target: its kind, its crate root document path, and its package's `[package]`
+/// name and literal version (`None` when the manifest has none or inherits it). The root path
+/// is the target's namespace identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CargoTarget {
     pub kind: String,
     pub root: String,
+    pub package: String,
+    pub version: Option<String>,
 }
 
 impl CargoTarget {
@@ -319,6 +322,10 @@ fn package_targets(
     };
     let package = package.as_table()?;
     let name = package.get("name")?.as_str()?;
+    let version = package
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
     let edition_2015 = match package.get("edition") {
         None => Some(true),
         Some(toml::Value::String(edition)) => Some(edition == "2015"),
@@ -332,6 +339,8 @@ fn package_targets(
         let target = CargoTarget {
             kind: kind.to_owned(),
             root,
+            package: name.to_owned(),
+            version: version.clone(),
         };
         if !targets.contains(&target) {
             targets.push(target);

@@ -201,7 +201,8 @@ pub(super) trait GlobalJoinReads {
     fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
         Ok(self.presence(symbol, None)?.1)
     }
-    /// The Cargo targets in which `symbol` is present, as `(crate root, is library)` (#394).
+    /// The Cargo targets in which `symbol` is present, as `(crate root, library package)`
+    /// (#394).
     fn defining_targets(&self, symbol: &str) -> Result<Vec<ClaimTarget>>;
     fn source_methods(
         &self,
@@ -319,8 +320,12 @@ pub(super) trait JoinIndex: DocumentJoinState {
     ) -> Result<()>;
 }
 
-/// The Cargo target of a claim's document: its crate root and whether it is a library (#394).
-pub(super) type ClaimTarget = (native::DocumentKey, bool);
+/// The Cargo target of a claim's document: its crate root and, for a library, its package
+/// (#394).
+pub(super) type ClaimTarget = (native::DocumentKey, Option<LibraryPackage>);
+
+/// A library target's package: its manifest name and literal version, if any (#394).
+pub(super) type LibraryPackage = (String, Option<String>);
 
 /// Global information learned from authenticated claims, independent of occurrence storage.
 pub(super) trait GlobalDiscoverySink {

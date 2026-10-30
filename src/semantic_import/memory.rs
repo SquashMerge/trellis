@@ -607,7 +607,7 @@ impl JoinIndex for MemoryJoinIndex {
                 self.targets
                     .entry(symbol.to_owned())
                     .or_default()
-                    .insert((root.clone(), *library));
+                    .insert((root.clone(), library.clone()));
             }
         }
         Ok(())

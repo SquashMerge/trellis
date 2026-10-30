@@ -166,14 +166,25 @@ impl Counter<'_> {
     fn cargo_target(&mut self) -> Result<u64> {
         self.literal(b"{\"kind\":")?;
         let kind = self.string()?;
+        self.literal(b",\"package\":")?;
+        let package = self.string()?;
         self.literal(b",\"root\":")?;
         let root = self.string()?;
+        self.literal(b",\"version\":")?;
+        let version = if self.peek() == Some(b'n') {
+            self.literal(b"null")?;
+            0
+        } else {
+            self.string()?
+        };
         self.literal(b"}")?;
         sizes::sum(&[
             kind,
+            package,
             root,
-            "kindroot".len() as u64,
-            sizes::map_entries::<String, serde_json::Value>(2)?,
+            version,
+            "kindpackagerootversion".len() as u64,
+            sizes::map_entries::<String, serde_json::Value>(4)?,
         ])
     }
     fn raw(&mut self) -> Result<u64> {

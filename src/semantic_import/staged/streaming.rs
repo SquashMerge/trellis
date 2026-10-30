@@ -85,7 +85,7 @@ fn target_presence_sql(filtered: bool) -> String {
 /// row per claim.
 fn defining_targets_sql(filtered: bool) -> String {
     eligible(
-        "SELECT s.language, s.path, c.target_lib FROM claims c \
+        "SELECT s.language, s.path, c.target_lib, c.target_package, c.target_version FROM claims c \
          JOIN sources s ON s.ord=c.target_root WHERE c.symbol=?1 AND c.presence>0",
         "c.source_ord",
         filtered,
@@ -288,7 +288,9 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
                     language: row.get(0)?,
                     path: row.get(1)?,
                 },
-                row.get::<_, i64>(2)? == 1,
+                (row.get::<_, i64>(2)? == 1)
+                    .then(|| Ok::<_, rusqlite::Error>((row.get(3)?, row.get(4)?)))
+                    .transpose()?,
             ));
         }
         Ok(result.into_iter().collect())
@@ -779,11 +781,14 @@ impl GlobalJoinReads for DocumentIndex<'_, '_> {
             sizes::map_entries::<String, Vec<ClaimTarget>>(1)?,
             symbol.len() as u64,
         ])?;
-        for (root, _) in &found {
+        for (root, package) in &found {
             bytes = sizes::sum(&[
                 bytes,
                 std::mem::size_of::<ClaimTarget>() as u64,
                 sizes::document(root)?,
+                package.as_ref().map_or(0, |(name, version)| {
+                    (name.len() + version.as_ref().map_or(0, String::len)) as u64
+                }),
             ])?;
         }
         // Optional like the presence cache: without room the roots are returned uncached.
@@ -1783,7 +1788,7 @@ mod reservation_tests {
         CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, eligible INTEGER NOT NULL, failed INTEGER NOT NULL); \
         CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID; \
         CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL); \
-        CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, source_ord INTEGER NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0); \
+        CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, source_ord INTEGER NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0, target_package TEXT, target_version TEXT); \
         CREATE INDEX claims_symbol ON claims(symbol, presence, target_root) WHERE symbol IS NOT NULL;";
 
     #[test]

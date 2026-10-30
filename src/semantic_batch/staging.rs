@@ -18,7 +18,8 @@ const STAGE_DB: &str = "stage.db";
 /// claim's symbol (`PRESENCE_INFORMATION`) and a definition occurrence's (`PRESENCE_DECLARED`),
 /// `NULL`/0 otherwise. A side's presence context is this index over its claim set.
 /// `claims.target_root` is the `sources.ord` of the crate root of a Rust claim's Cargo target
-/// (`NULL` without one) and `target_lib` is 1 when that target is a library (#394).
+/// (`NULL` without one), `target_lib` is 1 when that target is a library, and
+/// `target_package`/`target_version` are its package's manifest name and version (#394).
 ///
 /// Compact join tables. Documents are integers: `sources.ord` for `g_*` owners and local
 /// symbol scopes (`-1` for none), `nat_docs.ord` for native declarations, and the document's
@@ -39,7 +40,7 @@ CREATE TABLE coverage(source_ord INTEGER PRIMARY KEY REFERENCES sources(ord), ar
 CREATE INDEX coverage_artifact ON coverage(artifact, source_ord);
 CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, language TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, capped INTEGER NOT NULL CHECK(capped IN (0,1)), UNIQUE(artifact,path));
-CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0, UNIQUE(artifact,fact_digest));
+CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0, target_package TEXT, target_version TEXT, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
 CREATE INDEX claims_symbol ON claims(symbol, presence, target_root) WHERE symbol IS NOT NULL;
@@ -492,8 +493,8 @@ impl ClaimSink for StageClaimSink<'_> {
             return Err(stage_storage());
         };
         let inserted = self.conn.prepare_cached(
-            "INSERT INTO claims(artifact, source_ord, record_kind, fact_digest, proof_id, canonical_bytes, symbol, presence, target_root, target_lib) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,CASE WHEN ?9 IS NULL THEN NULL ELSE (SELECT ord FROM sources WHERE language=?10 AND path=?9) END,?11) ON CONFLICT DO NOTHING",
+            "INSERT INTO claims(artifact, source_ord, record_kind, fact_digest, proof_id, canonical_bytes, symbol, presence, target_root, target_lib, target_package, target_version) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,CASE WHEN ?9 IS NULL THEN NULL ELSE (SELECT ord FROM sources WHERE language=?10 AND path=?9) END,?11,?12,?13) ON CONFLICT DO NOTHING",
         );
         let (symbol, presence) = claim_presence(&claim);
         let target = claim.envelope.cargo_target.as_ref();
@@ -509,7 +510,9 @@ impl ClaimSink for StageClaimSink<'_> {
                 presence,
                 target.map(|t| t.root.as_str()),
                 claim.language,
-                target.is_some_and(|t| t.is_lib())
+                target.is_some_and(|t| t.is_lib()),
+                target.map(|t| t.package.as_str()),
+                target.and_then(|t| t.version.as_deref())
             ])
         });
         if self.record(changed)? == 0 {

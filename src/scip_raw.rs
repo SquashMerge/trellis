@@ -130,25 +130,31 @@ pub struct CapturedScipFactV1 {
 impl CapturedScipFactV1 {
     /// The envelope's `cargoTarget`, as `make_claim` writes it.
     pub fn cargo_target_json(target: &CargoTarget) -> Value {
-        json!({"kind": target.kind, "root": target.root})
+        json!({"kind": target.kind, "package": target.package, "root": target.root, "version": target.version})
     }
 
-    /// Reads an envelope's `cargoTarget` back: absent, or exactly a known kind and a root.
+    /// Reads an envelope's `cargoTarget` back: absent, or exactly a known kind, a package
+    /// name, a root and a version string or null.
     pub fn cargo_target_from(envelope: &Value) -> Result<Option<CargoTarget>, ScipCaptureError> {
         let Some(value) = envelope.get("cargoTarget") else {
             return Ok(None);
         };
-        let object = value.as_object().filter(|object| object.len() == 2);
-        match (
-            object.and_then(|o| o.get("kind")).and_then(Value::as_str),
-            object.and_then(|o| o.get("root")).and_then(Value::as_str),
-        ) {
-            (Some(kind), Some(root))
+        let object = value.as_object().filter(|object| object.len() == 4);
+        let text = |key: &str| object.and_then(|o| o.get(key)).and_then(Value::as_str);
+        let version = match object.and_then(|o| o.get("version")) {
+            Some(Value::Null) => Some(None),
+            Some(Value::String(version)) => Some(Some(version.clone())),
+            _ => None,
+        };
+        match (text("kind"), text("package"), text("root"), version) {
+            (Some(kind), Some(package), Some(root), Some(version))
                 if cargo_targets::TARGET_KINDS.contains(&kind) && valid_path(root) =>
             {
                 Ok(Some(CargoTarget {
                     kind: kind.to_owned(),
                     root: root.to_owned(),
+                    package: package.to_owned(),
+                    version,
                 }))
             }
             _ => Err(invalid("cargo target")),

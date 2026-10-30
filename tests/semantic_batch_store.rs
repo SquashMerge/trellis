@@ -5439,3 +5439,120 @@ fn real_rust_analyzer_duplicate_keys_within_a_target_or_against_a_global_key_rej
         assert_duplicate_key_rejected(&world, &descriptor, case);
     }
 }
+
+// Real rust-analyzer 1.98.1 output for the two-package workspace in
+// `tests/fixtures/scip-rust-analyzer-packages/workspace`, Metadata unit dropped: libraries
+// `alpha 0.1.0` and `beta 0.2.0` each define `run()`, and beta's test crate calls both.
+const RUST_ANALYZER_PACKAGES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-rust-analyzer-packages"
+);
+const ALPHA_RUN: &str = "rust-analyzer cargo alpha 0.1.0 run().";
+
+/// A batch of the two-package fixture, each symbol spelling passed through `rename` in the
+/// documents `rename` is given.
+fn rust_packages_batch(world: &World, rename: &dyn Fn(&str, &str) -> String) -> (PathBuf, String) {
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "rust-analyzer".into();
+    tool.version = "1.98.1 (48a229ce 2026-09-01)".into();
+    metadata.tool_info = Some(tool).into();
+    let mut header = scip::types::Index::new();
+    header.metadata = Some(metadata).into();
+    let mut artifact = header.write_to_bytes().unwrap();
+    let documents = fs::read(Path::new(RUST_ANALYZER_PACKAGES).join("documents.scip")).unwrap();
+    let mut index = scip::types::Index::parse_from_bytes(&documents).unwrap();
+    for document in &mut index.documents {
+        let path = document.relative_path.clone();
+        for occurrence in &mut document.occurrences {
+            occurrence.symbol = rename(&path, &occurrence.symbol);
+        }
+        for symbol in &mut document.symbols {
+            symbol.symbol = rename(&path, &symbol.symbol);
+        }
+    }
+    artifact.extend(index.write_to_bytes().unwrap());
+    let mut fixture = world.fixture().reference("rust-analyzer");
+    let docs = fixture.paths("rust");
+    assert_eq!(docs.len(), 3);
+    let ordinal = fixture.artifact("rust", docs);
+    fixture.override_artifact_raw(ordinal, artifact);
+    world.write(&fixture)
+}
+
+/// Supervisor ruling on #394 ruling 2: the library fallback must also match the package
+/// rust-analyzer's key names against the admitted manifest's `[package]` name and version.
+/// Two workspace libraries defining the same key resolve by package; a key whose package
+/// version is not the manifest's keeps the global key.
+#[test]
+fn real_rust_analyzer_library_fallback_matches_the_keys_package() {
+    let world = world(|root| copy_tree(&Path::new(RUST_ANALYZER_PACKAGES).join("workspace"), root));
+    let uses = "crates/beta/tests/uses.rs";
+    let resolved = |path: &str| (Resolution::Resolved, Some(path.to_owned()));
+    let alpha = "crates/alpha/src/lib.rs";
+    // The producer's own keys: each call resolves to its package's library.
+    let descriptor = rust_packages_batch(&world, &|_, symbol| symbol.to_owned());
+    let staged = rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "own");
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    assert_eq!(
+        symbol_scopes(&staged, ALPHA_RUN),
+        [("Target".to_owned(), Some(alpha.to_owned()))]
+    );
+    let calls = |publication: &SemanticPublication| {
+        let mut found: Vec<_> = publication
+            .references
+            .iter()
+            .filter(|r| r.document.path == uses && r.spelling == "run")
+            .map(|r| {
+                (
+                    r.resolution,
+                    match &r.declared_target {
+                        Some(trellis::semantic_evidence::Target::Internal { document, .. }) => {
+                            Some(document.path.clone())
+                        }
+                        _ => None,
+                    },
+                )
+            })
+            .collect();
+        found.sort_by_key(|(_, path)| path.clone());
+        found
+    };
+    assert_eq!(
+        calls(&staged),
+        [resolved(alpha), resolved("crates/beta/src/lib.rs")]
+    );
+    // Both libraries define alpha's key: only alpha's manifest names its package.
+    let same_key = |path: &str, symbol: &str| {
+        if path == "crates/beta/src/lib.rs" {
+            symbol.replace("cargo beta 0.2.0 run().", "cargo alpha 0.1.0 run().")
+        } else {
+            symbol.to_owned()
+        }
+    };
+    let descriptor = rust_packages_batch(&world, &same_key);
+    let staged =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "same key");
+    assert_eq!(
+        symbol_scopes(&staged, ALPHA_RUN),
+        [
+            ("Target".to_owned(), Some(alpha.to_owned())),
+            (
+                "Target".to_owned(),
+                Some("crates/beta/src/lib.rs".to_owned())
+            ),
+        ]
+    );
+    assert!(calls(&staged).contains(&resolved(alpha)));
+    // A key naming a version the manifest does not state matches no library: global key,
+    // which no document defines, so the use stays unresolved.
+    let other_version = |_: &str, symbol: &str| symbol.replace("alpha 0.1.0", "alpha 9.9.9");
+    let descriptor = rust_packages_batch(&world, &other_version);
+    let staged =
+        rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "version");
+    assert!(calls(&staged).contains(&(Resolution::Unresolved, None)));
+}

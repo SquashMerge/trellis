@@ -1002,7 +1002,9 @@ fn claim_target(source_set_id: &str, claim: &CapturedClaim) -> Option<join_store
                 language: claim.language.clone(),
                 path: target.root.clone(),
             },
-            target.is_lib(),
+            target
+                .is_lib()
+                .then(|| (target.package.clone(), target.version.clone())),
         )
     })
 }
@@ -1017,6 +1019,21 @@ fn defining_key(
     match target {
         Some((root, _)) if !symbol.starts_with("local ") => (symbol.to_owned(), Some(root.clone())),
         _ => scoped_key(symbol, document),
+    }
+}
+
+/// Whether a SCIP key's package is the Cargo package `name` (and `version`, when the manifest
+/// states one). A key that names no package, or a package without a name, passes: it carries
+/// nothing to check against.
+fn key_names_package(symbol: &str, name: &str, version: Option<&str>) -> bool {
+    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
+        return false;
+    };
+    match parsed.package.as_ref() {
+        Some(package) if !package.name.is_empty() => {
+            package.name == name && version.is_none_or(|version| package.version == version)
+        }
+        _ => true,
     }
 }
 
@@ -1041,10 +1058,21 @@ fn using_key<G: GlobalJoinReads>(
         return Ok((symbol.to_owned(), Some(root.clone())));
     }
     let defining = index.defining_targets(symbol)?;
+    // The library must also be the package rust-analyzer's key names: its manifest name, and
+    // its version when the manifest states one (supervisor ruling on #394 ruling 2).
+    let named = |package: &Option<join_store::LibraryPackage>| {
+        package
+            .as_ref()
+            .is_some_and(|(name, version)| key_names_package(symbol, name, version.as_deref()))
+    };
     let library = match (target, &defining[..]) {
-        (None, [(root, true)]) => Some(root),
+        (None, [(root, package)]) if named(package) => Some(root),
         (None, _) => None,
-        (Some(_), _) => match &defining.iter().filter(|(_, lib)| *lib).collect::<Vec<_>>()[..] {
+        (Some(_), _) => match &defining
+            .iter()
+            .filter(|(_, package)| named(package))
+            .collect::<Vec<_>>()[..]
+        {
             [(root, _)] => Some(root),
             _ => None,
         },
