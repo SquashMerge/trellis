@@ -1,3 +1,4 @@
+pub mod architecture_details;
 pub mod auth;
 pub mod behavior;
 mod behavior_bindings;

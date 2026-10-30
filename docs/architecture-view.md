@@ -66,15 +66,74 @@ status line reports the total not drawn. Test and fixture layers without a `disp
 hint stay in the hidden footer until **Include tests and fixtures in metrics** is on.
 
 Click a module or select it with Enter/Space to inspect its identity, layer, captured
-physical file lines, callable count, every metric and incident references. Select a
+physical file lines, callable count, every metric, and its incident references and rule
+instances (read on demand, [below](#summary-and-detail-reads-448)). Select a
 summary edge to inspect its exact contributing module pairs, production/test counts,
 verdicts, exceptions and source-site samples. Omitted sample counts stay visible;
 sampling never changes totals. Explicit source actions read cached indexed text at
 the displayed revision. They never fall back to the live file.
 
+## Summary and detail reads (#448)
+
+`GET architecture` returns what the view draws plus exact counts, not per-site
+detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields are:
+
+- `layers`, `modules` and summary `edges` (each edge keeps its contributing pairs and
+  their bounded site samples);
+- `references`: `referencesVersion`, `counts` (`scannedDocuments`, `mappedSites`,
+  `unresolvedSites`), `limitations` and `externalPackages`, each descriptor with the
+  display `layer` its `$layers` instances report (null when unassigned);
+- `rules`: `rulesVersion`, `rulesFile`, `counts`, `testCounts`, `unassignedCount` and
+  `limitations`.
+
+`counts`, `testCounts` and `unassignedCount` (the length of `unassigned`) equal
+`trellis rules check --format json` on the same pin and rules file. The reference
+`counts` equal `trellis references`. The summary has no `modules`, `production`,
+`tests` or `unresolved` reference arrays, and no `instances`, `testOnly`,
+`unassigned` or `externalPackages` rule arrays.
+
+`GET architecture/details` serves that detail one bounded page at a time. It requires
+`kind`, the complete pin (`indexGeneration`, `indexRevision`) and the summary's
+`rulesHash`. `offset` defaults to 0, and `limit` defaults to 100 (range 1–500). A
+page also stops at 4 MiB of serialized items, but always holds at least one item.
+The kinds and their exact-match filters are:
+
+| `kind` | Item | Filters |
+| --- | --- | --- |
+| `instances` | `{role, instance}`: production `instances`, then `testOnly` | `role`, `rule`, `status`, `excepted`, `exceptionReason`, `sourceLayer`, `destinationLayer`, `layer` (source or destination), `path` (target or destination path) |
+| `pairs` | `{role, sourceLayer, targetLayer, pair}`: production pairs, then test pairs | `role`, `path` (source or target path), `source` and `target` (an exact endpoint identity as JSON: a native target or an external package), `layer` (either endpoint), `unlayered=true` (same-layer or an unassigned endpoint) |
+| `unresolved` | one unresolved site | `path` (source path) |
+
+The response is `{indexGeneration, indexRevision, rulesFile, kind, offset, total,
+nextOffset, items}`. `total` counts every matching item; `nextOffset` is null on the
+last page. Items keep the evaluation's order and shapes, so the pages of one kind
+concatenate to the CLI's arrays. Unknown or duplicate fields, filters that do not
+apply to the kind, and an offset past `total` fail `invalid_request` (HTTP 400). A
+stale pin fails like the summary (409 `revision_conflict` or `pin_expired`). A rules
+file that changed since the summary fails 409 `rules_conflict` (or 422 `invalid_rules`
+with the located diagnostic when the new file does not parse). A detail read
+evaluates the same admitted snapshot as the summary, without metrics, and it never
+indexes or writes. Existing Bearer, Host/Origin, deadline, cancellation and
+response limits apply.
+
+The browser reads details only when an inspector or list needs them:
+
+- a module's pairs and rule instances;
+- a layer's pairs and instances;
+- an edge's instances;
+- unresolved sites;
+- same-layer and unassigned pairs;
+- `$external` results;
+- the review list;
+- the witnessed deviations a glob selection chooses from.
+
+An edge lists the `$layers` instances of its exact verdict and exception group;
+`$external` results have their own list in the notices. Each list shows one page and a **Show more** button for the next one. Repository
+text in details is inserted with `textContent`.
+
 ## Review and authoring
 
-The review list shows rule instances with source/destination files, layers, production or
+The review list pages rule instances from `architecture/details` with source/destination files, layers, production or
 test role, underlying verdict and exception reason. Filters do not change the indexed
 metric population. Evidence remains syntax-tier: captured source-owner identities and
 spellings are not resolved destination-symbol bindings. Site samples and omitted counts

@@ -130,6 +130,10 @@ async function ready(page) {
   await page.locator("#architecture-state[data-state=ready]").waitFor();
   await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
 }
+// Inspector and review details load on demand (#448); wait until every list has its page.
+async function settled(page) {
+  await page.waitForFunction(() => ![...document.querySelectorAll(".architecture-detail-list")].some(list => list.textContent.includes("Loading details…")));
+}
 // Re-renders replace the SVG; mark the old one so a wait sees the new one.
 async function rerendered(page, action) {
   await page.evaluate(() => { const svg = document.querySelector("#architecture-diagram svg"); if (svg) svg.__old = true; });
@@ -170,7 +174,28 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(new Set(dto.modules.map(module => identityKey(module.identity))).size, dto.modules.length);
   const cli = await H.run(H.binary, ["references", "--workspace", paths.workspace, "--pin", `${pin.indexGeneration}:${pin.indexRevision}`, "--limit", "5"], {env:paths.env});
   const references = JSON.parse(cli.stdout).payload;
-  assert.deepEqual(dto.references, references, "browser reads exactly the same references projection at the complete pin");
+  // #448: the default view carries counts, not per-site detail; counts equal the CLI at the same pin.
+  for (const field of ["production", "tests", "unresolved", "modules"]) assert.equal(dto.references[field], undefined, field);
+  for (const field of ["instances", "testOnly", "unassigned"]) assert.equal(dto.rules[field], undefined, field);
+  assert.deepEqual(dto.references.counts, references.counts); assert.deepEqual(dto.references.limitations, references.limitations);
+  const checked = rulesCheck(selected);
+  assert.deepEqual(dto.rules.counts, checked.counts); assert.deepEqual(dto.rules.testCounts, checked.testCounts);
+  assert.equal(dto.rules.unassignedCount, checked.unassigned.length);
+  // Paged details at the same pin and rules hash reproduce the CLI rows.
+  const detailRows = async (kind, limit) => {
+    const rows = [];
+    for (let offset = 0; offset !== null;) {
+      const query = new URLSearchParams({kind, indexGeneration:pin.indexGeneration, indexRevision:pin.indexRevision, rulesHash:dto.rulesFile.contentHash, offset, limit});
+      const page = await H.api(selected.server.base, paths.token, "GET", H.scoped(selected.server.rootKey, `architecture/details?${query}`));
+      assert.equal(page.status, 200, JSON.stringify(page.data));
+      rows.push(...page.data.payload.items); offset = page.data.payload.nextOffset;
+    }
+    return rows;
+  };
+  dto.rules.instances = (await detailRows("instances", 3)).filter(row => row.role === "production").map(row => row.instance);
+  dto.rules.testOnly = (await detailRows("instances", 3)).filter(row => row.role === "test").map(row => row.instance);
+  assert.deepEqual(dto.rules.instances, checked.instances); assert.deepEqual(dto.rules.testOnly, checked.testOnly);
+  assert.deepEqual((await detailRows("unresolved", 1)), references.unresolved);
   assert.equal(siteTotal(references.production), 10); assert.equal(siteTotal(references.tests), 3);
   assert.equal(references.counts.mappedSites, 13); assert.equal(references.counts.unresolvedSites, 1);
   const reverse = references.production.find(edge => edge.source.path === "src/low.rs" && edge.target.path === "src/top.rs");
@@ -198,6 +223,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   }
   assert.equal(dto.modules.find(module => module.identity.path === "src/unassigned.rs").layer, null);
   await ready(page);
+  assert.equal(selected.requests.filter(row => row.url.pathname.endsWith("/architecture/details")).length, 0, "drawing reads only the summary");
   await expandAll(page);
   await page.locator("#section-files").click();
   await page.waitForFunction(() => document.body.classList.contains("files-section"));
@@ -221,17 +247,23 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(await page.getByRole("button", {name:"Open in Treemap", exact:true}).count(), 0, "Treemap navigation is only offered for a selected module");
 
   await page.locator("#architecture-notices > summary").click();
-  await page.getByRole("button", {name:"Inspect unresolved sites", exact:true}).click();
+  await page.getByRole("button", {name:"Inspect unresolved sites", exact:true}).click(); await settled(page);
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "Unresolved structural references");
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /external::unknown/);
-  await page.getByRole("button", {name:"Inspect same-layer and unassigned references", exact:true}).click();
+  await page.getByRole("button", {name:"Inspect same-layer and unassigned references", exact:true}).click(); await settled(page);
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /src\/unassigned\.rs/);
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /src\/top\.rs.*1 reference sites/is);
   const module = page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/});
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-module-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-module-id")).sort()), measured(dto).map(row => identityKey(row.identity)).sort(), "every measured native identity maps once, never by label or position");
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), dto.edges.filter(row => row.role === "production").map(summaryKey).sort(), "summary identity includes direction, role, policy and exception");
   await module.click();
-  await page.waitForFunction(() => document.querySelector("#architecture-inspector-title")?.textContent === "src/low.rs");
+  await page.waitForFunction(() => document.querySelector("#architecture-inspector-title")?.textContent === "src/low.rs"); await settled(page);
+  const detailRequests = selected.requests.filter(row => row.url.pathname.endsWith("/architecture/details"));
+  assert.ok(detailRequests.some(row => row.url.searchParams.get("kind") === "pairs" && row.url.searchParams.get("path") === "src/low.rs"), "the module inspector reads its pairs on demand");
+  for (const row of detailRequests) {
+    assert.equal(row.url.searchParams.get("indexGeneration"), pin.indexGeneration); assert.equal(row.url.searchParams.get("indexRevision"), String(pin.indexRevision));
+    assert.equal(row.url.searchParams.get("rulesHash"), dto.rulesFile.contentHash);
+  }
   assert.equal(await page.getByRole("button", {name:"Open in Treemap", exact:true}).count(), 1);
   const low = dto.modules.find(row => row.identity.path === "src/low.rs");
   const detail = await page.locator("#architecture-inspector-content").textContent();
@@ -574,7 +606,7 @@ test("Architecture applies authored display hints without changing evaluation", 
     assert.equal(hiddenModule.excludedReason, "hidden_layer"); assert.equal(hiddenModule.metrics.cognitive, null);
     assert.match(await page.locator("#architecture-state").textContent(), /1 authored hidden-layer files/);
     assert.equal(siteTotal(dto.edges.filter(edge => edge.role === "production")), 8, "the hint never changes summary counts");
-    assert.equal(siteTotal(dto.references.production), 10);
+    assert.equal(dto.references.counts.mappedSites, 13);
     assert.equal(dto.edges.find(edge => edge.role === "production" && edge.sourceLayer === "mid" && edge.destinationLayer === "peer").status, "deviates");
     assert.deepEqual(await bandStates(page), [["low", "false"], ["mid", "false"], ["shared", "false"], ["top", "true"]], "hidden is in the footer; expanded starts open");
     assert.equal(await page.locator("#architecture-hidden-toggle").textContent(), "▸ 1 hidden layer · 1 file · 1 production edge");
@@ -634,7 +666,7 @@ test("Architecture review keeps exact evidence, independent filters and all unas
   const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation$/});
   // In the summary a skip-level count can sit under a peer count; select it by keyboard.
   await edge.focus(); await page.keyboard.press("Enter");
-  await page.locator("#architecture-review-panel").waitFor({state:"visible"});
+  await page.locator("#architecture-review-panel").waitFor({state:"visible"}); await settled(page);
   const row = reviewPair(page, "src/low.rs", "src/top.rs");
   assert.equal(await row.count(), 1);
   assert.match(await row.textContent(), /\$layers.*src\/low\.rs.*src\/top\.rs.*deviates/is);
@@ -650,23 +682,23 @@ test("Architecture review keeps exact evidence, independent filters and all unas
   await sample.getByRole("button", {name:"Read indexed reference source", exact:true}).click();
   await page.waitForFunction(() => document.querySelector("#source .source-line.highlight"));
   assert.match(await page.locator("#source-path").textContent(), /src\/low\.rs.*cached snapshot/is);
-  const reference = dto.references.production.find(value => value.source.path === "src/low.rs" && value.target.path === "src/top.rs");
+  const reference = dto.edges.filter(edge => edge.role === "production").flatMap(edge => edge.pairs).find(value => value.source.path === "src/low.rs" && value.target.path === "src/top.rs");
   assert.equal(await page.locator("#source .source-line.highlight .line-number").first().textContent(), String(reference.sites[0].lines.start));
 
   await page.locator("#architecture-review").click();
   await page.locator("#architecture-review-role").selectOption("production");
-  await page.locator("#architecture-review-state").selectOption("deviates");
+  await page.locator("#architecture-review-state").selectOption("deviates"); await settled(page);
   const production = await page.locator("#architecture-review-list").textContent();
   assert.match(production, /src\/low\.rs.*src\/top\.rs/is);
   assert.match(production, /src\/mid\.rs.*src\/peer\.rs/is);
-  await page.locator("#architecture-review-role").selectOption("test");
+  await page.locator("#architecture-review-role").selectOption("test"); await settled(page);
   const tests = await page.locator("#architecture-review-list").textContent();
   assert.match(tests, /src\/low\.rs.*src\/top\.rs/is);
   assert.doesNotMatch(tests, /src\/mid\.rs.*src\/peer\.rs/is);
   assert.equal(await page.locator("#architecture-metric-tests").isChecked(), false, "review role never changes the heat population");
   assert.equal(await page.locator("#architecture-tests").isChecked(), false, "review role never changes the reference overlay");
   await page.locator("#architecture-review-role").selectOption("all");
-  await page.locator("#architecture-review-state").selectOption("unknown");
+  await page.locator("#architecture-review-state").selectOption("unknown"); await settled(page);
   assert.match(await page.locator("#architecture-review-list").textContent(), /unknown/i);
   assert.equal(await page.locator("#architecture-review-list input[type=checkbox]:enabled").count(), 0, "unknown destinations cannot be waived");
   await page.locator("#architecture-unassigned").click();
@@ -683,7 +715,7 @@ test("Architecture groups two witnessed pairs in one reason, previews once and a
   await ready(page);
   await page.locator("#architecture-review").click();
   await page.locator("#architecture-review-role").selectOption("production");
-  await page.locator("#architecture-review-state").selectOption("deviates");
+  await page.locator("#architecture-review-state").selectOption("deviates"); await settled(page);
   for (const [source, destination] of [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]]) {
     await reviewPair(page, source, destination).getByRole("checkbox").check();
   }
@@ -715,7 +747,7 @@ test("Architecture groups two witnessed pairs in one reason, previews once and a
   assert.equal(applied.baseHash, body.baseHash);
   assert.equal(applied.proposedHash, preview.proposedHash);
   for (const [source, destination] of [["src/low.rs", "src/top.rs"], ["src/mid.rs", "src/peer.rs"]]) {
-    const instance = dto.rules.instances.find(row => row.rule === "$layers" && row.target.path === source && row.destination?.path === destination);
+    const instance = rulesCheck(selected).instances.find(row => row.rule === "$layers" && row.target.path === source && row.destination?.path === destination);
     assert.equal(instance.excepted, true);
     assert.equal(instance.status, "deviates", "excepted keeps the underlying verdict");
     assert.equal(instance.exceptionReason, reason);
@@ -724,21 +756,21 @@ test("Architecture groups two witnessed pairs in one reason, previews once and a
   assert.equal(await page.locator("#architecture-review-panel img, #architecture-editor img").count(), 0);
 
   await page.locator("#architecture-review").click();
-  await page.locator("#architecture-review-state").selectOption("excepted");
+  await page.locator("#architecture-review-state").selectOption("excepted"); await settled(page);
   assert.ok((await page.locator("#architecture-review-list").textContent()).includes(reason));
   await page.locator("#architecture-authored").click();
   const exception = page.locator("#architecture-exceptions").getByRole("button", {name:"Edit reason", exact:true}).first();
   await exception.click();
   await page.locator("#architecture-reason").fill("Updated reviewed reason");
   const edited = await previewChange(selected);
-  const editedDto = await confirmChange(selected, edited);
-  assert.ok(editedDto.rules.instances.some(row => row.excepted && row.exceptionReason === "Updated reviewed reason"));
+  await confirmChange(selected, edited);
+  assert.ok(rulesCheck(selected).instances.some(row => row.excepted && row.exceptionReason === "Updated reviewed reason"));
   await page.locator("#architecture-review").click();
   await page.locator("#architecture-authored").click();
   await page.locator("#architecture-exceptions").getByRole("button", {name:"Remove", exact:true}).first().click();
   const removed = await previewChange(selected);
-  const removedDto = await confirmChange(selected, removed);
-  assert.equal(removedDto.rules.instances.filter(row => row.rule === "$layers" && row.excepted).length, 1, "removal changes only the chosen entry");
+  await confirmChange(selected, removed);
+  assert.equal(rulesCheck(selected).instances.filter(row => row.rule === "$layers" && row.excepted).length, 1, "removal changes only the chosen entry");
 }));
 
 
@@ -747,7 +779,7 @@ test("Architecture preserves a conflicted draft, reloads explicitly and requires
   const {page, paths} = selected;
   await ready(page);
   await page.locator("#architecture-review").click();
-  await page.locator("#architecture-review-role").selectOption("production");
+  await page.locator("#architecture-review-role").selectOption("production"); await settled(page);
   await reviewPair(page, "src/low.rs", "src/top.rs").getByRole("checkbox").check();
   await page.locator("#architecture-add-selected").click();
   const reason = "Keep this draft through an ordinary editor conflict";
@@ -778,7 +810,7 @@ test("Architecture preserves a conflicted draft, reloads explicitly and requires
   assert.equal(rulesPosts(selected, "preview").length, 2, "the retained draft needs a new explicit preview");
   const dto = await confirmChange(selected, rebased);
   assert.equal(rulesPosts(selected, "apply").length, 2);
-  assert.ok(dto.rules.instances.some(row => row.target.path === "src/low.rs" && row.destination?.path === "src/top.rs" && row.excepted));
+  assert.ok(rulesCheck(selected).instances.some(row => row.target.path === "src/low.rs" && row.destination?.path === "src/top.rs" && row.excepted));
 }));
 
 

@@ -9867,6 +9867,12 @@
           "minimum": 1,
           "maximum": 50,
           "default": 5
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
         }
       },
       "required": [
@@ -11673,6 +11679,33 @@
                   "items": {
                     "$ref": "#/$defs/ExternalPackage"
                   }
+                },
+                "page": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "offset": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "nextOffset": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "total": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "offset",
+                    "nextOffset",
+                    "total"
+                  ]
                 }
               },
               "required": [
@@ -11687,7 +11720,8 @@
                 "unresolved",
                 "counts",
                 "limitations",
-                "externalPackages"
+                "externalPackages",
+                "page"
               ]
             },
             "evidenceBasis": {
@@ -11801,6 +11835,18 @@
             "minLength": 1,
             "maxLength": 4096
           }
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 5
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
         }
       },
       "required": [
@@ -12751,6 +12797,9 @@
             },
             "referenceCount": {
               "$ref": "#/$defs/UInt"
+            },
+            "omittedEvidence": {
+              "$ref": "#/$defs/UInt"
             }
           },
           "required": [
@@ -12765,7 +12814,8 @@
             "constraints",
             "evidence",
             "unresolved",
-            "referenceCount"
+            "referenceCount",
+            "omittedEvidence"
           ]
         },
         "RuleCounts": {
@@ -13655,6 +13705,33 @@
                   "items": {
                     "$ref": "#/$defs/ExternalPackage"
                   }
+                },
+                "page": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "offset": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "nextOffset": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "total": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "offset",
+                    "nextOffset",
+                    "total"
+                  ]
                 }
               },
               "required": [
@@ -13668,7 +13745,8 @@
                 "testCounts",
                 "unassigned",
                 "limitations",
-                "externalPackages"
+                "externalPackages",
+                "page"
               ]
             },
             "evidenceBasis": {
@@ -13788,6 +13866,18 @@
         },
         "destination": {
           "$ref": "#/$defs/Destination"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 5
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "default": 0
         }
       },
       "required": [
@@ -15003,6 +15093,9 @@
             },
             "referenceCount": {
               "$ref": "#/$defs/UInt"
+            },
+            "omittedEvidence": {
+              "$ref": "#/$defs/UInt"
             }
           },
           "required": [
@@ -15017,7 +15110,8 @@
             "constraints",
             "evidence",
             "unresolved",
-            "referenceCount"
+            "referenceCount",
+            "omittedEvidence"
           ]
         },
         "RuleCounts": {
@@ -15907,6 +16001,33 @@
                   "items": {
                     "$ref": "#/$defs/ExternalPackage"
                   }
+                },
+                "page": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "offset": {
+                      "$ref": "#/$defs/UInt"
+                    },
+                    "nextOffset": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "total": {
+                      "$ref": "#/$defs/UInt"
+                    }
+                  },
+                  "required": [
+                    "offset",
+                    "nextOffset",
+                    "total"
+                  ]
                 }
               },
               "required": [
@@ -15920,7 +16041,8 @@
                 "testCounts",
                 "unassigned",
                 "limitations",
-                "externalPackages"
+                "externalPackages",
+                "page"
               ]
             },
             "evidenceBasis": {

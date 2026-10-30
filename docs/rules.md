@@ -650,8 +650,9 @@ Every emitted module retains its native revision, content hash and provenance.
 A source filter matching no documents returns empty `modules`, `production`,
 `tests`, `externalPackages` and `unresolved` arrays with zero counts; this is a complete empty
 structural scope, not semantic completeness. Unrelated modules do not consume
-response bytes. No cap is raised and no verdict or proof is clipped; genuinely
-oversized selected evidence still fails atomically with `response_too_large`.
+response bytes. No cap is raised and no verdict or proof is clipped. The MCP tools
+page larger selected results ([paging](mcp-readonly-pilot-contract.md#architecture-references-and-reviewed-rules-129)); the CLI and
+the browser detail reads ([Architecture view](architecture-view.md#summary-and-detail-reads-448)) keep these exact shapes.
 Modules are ordered by full document key. Edges sort by source and target identities within each role
 array; samples sort by range, kind and spelling. Unresolved sites sort by source,
 range, kind and reason and are not clipped. `count` is exact and
@@ -709,6 +710,14 @@ explain include the external descriptors needed by returned instances and
 unassigned identities; explain preserves its informational unassigned catalog.
 These pre-release `references:v2` / `rules:v2` shapes replace v1 without a
 compatibility mode.
+
+Over MCP only, both payloads add the required `page:{offset,nextOffset,total}`, and
+their arrays hold one page of the
+[paged sequence](mcp-readonly-pilot-contract.md#architecture-references-and-reviewed-rules-129). Each
+check/explain `Instance` keeps at most `limit` (default 5) `evidence` entries and adds
+`omittedEvidence:UInt`, the exact number not shown. Counts, statuses and
+`referenceCount` are those of the whole evaluation. The CLI and the browser's detail
+reads return the complete arrays above.
 
 ## Proposal workflow
 

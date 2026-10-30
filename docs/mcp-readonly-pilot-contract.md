@@ -299,9 +299,9 @@ meaning, clipping rules and errors unchanged. The three new flat closed inputs a
 
 | Tool | Exact input |
 | --- | --- |
-| `trellis_references` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[],limit?:UInt}` |
-| `trellis_rules_check` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[]}` |
-| `trellis_rules_explain` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,rule:string,target:Target,destination?:Destination}` |
+| `trellis_references` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[],limit?:UInt,offset?:UInt}` |
+| `trellis_rules_check` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,paths?:string[],limit?:UInt,offset?:UInt}` |
+| `trellis_rules_explain` | `{schemaVersion:1,workspace?:string,expectedBasis?:Basis,rule:string,target:Target,destination?:Destination,limit?:UInt,offset?:UInt}` |
 
 `Target` is exactly `{sourceSetId,language,path,sid}` with native canonical SID,
 full document identity and indexed checkout-relative path. `rule` is nonempty,
@@ -328,11 +328,31 @@ a preserved unassigned catalog after explain filtering.
 A no-match source scope returns complete empty structural arrays and zero counts,
 while `semanticComplete:false` remains invariant. Module revision/hash/provenance
 links and all selected unresolved sites remain intact. Rules' informational
-`unassigned` catalog still uses the full snapshot map. References `limit` defaults
-to 5 and accepts 1–50 **sample sites per edge**, not a cap on edges/counts;
-out-of-range integer fails `range_too_large`. Unrelated modules cannot force
-reference response overflow; genuinely oversized selected evidence still fails
-atomically with `response_too_large`, without raising the cap or clipping proof.
+`unassigned` catalog still uses the full snapshot map. `limit` defaults to 5 and
+accepts 1–50. For references, it is the number of **sample sites per edge**. For
+check/explain, it is the number of **evidence entries per rule instance**: the
+instance keeps exact `referenceCount`, status and constraints, and adds
+`omittedEvidence` (the number of evidence entries not shown). It is never a cap on
+edges, instances or counts. An out-of-range integer fails `range_too_large`. The
+`trellis rules check` CLI keeps every evidence entry.
+
+**Paging (#448).** `paths` selects sources before anything is measured, so unrelated
+modules never consume response bytes. Each tool's arrays form one ordered sequence:
+
+- references: `modules`, `externalPackages`, `production`, `tests`, `unresolved`;
+- check/explain: `instances`, `testOnly`, `unassigned`, `externalPackages`.
+
+A result holds the whole items of that sequence from `offset` (default 0, any safe
+UInt) that fit in the unchanged 65,536-byte response cap. The required
+`page:{offset,nextOffset,total}` continues it: call again with the same arguments,
+`expectedBasis` and `offset:nextOffset`, until `nextOffset` is null. `total` counts
+every item. Every page carries the whole result's `counts`, `testCounts`,
+`limitations`, `rulesFile` and pin. The pages concatenate, in order, to the complete
+selected result, and closures such as module and external-package descriptors hold
+across the sequence, not within each page. An `offset` past `total` fails
+`range_too_large`. Only an item that cannot fit even alone still fails atomically
+with `response_too_large`. The cap is never raised, and no verdict, count or site is
+clipped.
 
 The exact closed payloads, ordering, module/site identity, counts, supported
 structural mapping, grammar and exception semantics are in
@@ -417,8 +437,9 @@ required `diagnostic:{code,kind,path,range,line,column,attribution,message}` as
 [defined for rules](rules.md#work-bounds-and-located-failures). Other failures do
 not acquire this field. No partial instances accompany malformed configuration,
 source parse/work failure or overflow. The full JSON-RPC line, summary and LF must
-fit 65,536 bytes; new results fail atomically with `response_too_large` rather than
-clip verdicts, unresolved sites, proof or TOML. This does not change the original
+fit 65,536 bytes. Larger results page as described above. An item that cannot fit
+alone fails atomically with `response_too_large` rather than clip verdicts,
+unresolved sites, proof or TOML. This does not change the original
 tools' existing prefix/`range_too_large` behavior. Only static `tools/list` retains
 the 262,144-byte catalog cap/headroom requirement.
 

@@ -2385,6 +2385,19 @@ impl CheckoutRuntime {
         })
     }
 
+    /// One paged Architecture detail read, bounded like the summary.
+    pub fn architecture_details_response(
+        &self,
+        query: &crate::architecture_details::Query,
+        check: &mut (impl FnMut() -> anyhow::Result<()> + Send),
+        hooks: MetricsResponseHooks<'_>,
+        max_bytes: usize,
+    ) -> anyhow::Result<(Vec<u8>, bool)> {
+        self.projected_response(check, hooks, max_bytes, |response, check| {
+            response.architecture_details(query, &mut || check())
+        })
+    }
+
     fn projected_response<P: serde::Serialize, F: FnMut() -> anyhow::Result<()> + Send>(
         &self,
         check: &mut F,

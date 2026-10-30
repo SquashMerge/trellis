@@ -223,16 +223,17 @@ async fn architecture_role_filters_metrics_without_changing_reference_evidence()
     let baseline = &omitted["payload"];
     assert_eq!(baseline["role"], "all");
     assert!(
-        !baseline["references"]["production"]
-            .as_array()
+        baseline["references"]["counts"]["mappedSites"]
+            .as_u64()
             .unwrap()
-            .is_empty()
+            > 0
     );
     assert!(
-        !baseline["references"]["tests"]
+        baseline["edges"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .iter()
+            .any(|edge| edge["role"] == "test")
     );
     let generation = baseline["indexGeneration"].as_str().unwrap();
     let revision = baseline["indexRevision"].as_u64().unwrap();
@@ -394,4 +395,249 @@ async fn workbench_architecture_option_forwards_hidden_layer_population() {
         let (status, data) = request(app.clone(), &key, query).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {data}");
     }
+}
+
+/// Every detail page of one kind, followed from offset 0 with `limit`.
+async fn all_details(app: &axum::Router, key: &str, query: &str, limit: usize) -> Vec<Value> {
+    let (mut offset, mut items) = (0, Vec::new());
+    loop {
+        let (status, page) = request(
+            app.clone(),
+            key,
+            &format!("/details?{query}&limit={limit}&offset={offset}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}: {page}");
+        let page = &page["payload"];
+        assert_eq!(page["offset"], offset);
+        let rows = page["items"].as_array().unwrap();
+        assert!(rows.len() <= limit);
+        items.extend(rows.iter().cloned());
+        match page["nextOffset"].as_u64() {
+            Some(next) => {
+                assert_eq!(next as usize, offset + rows.len());
+                offset = next as usize;
+            }
+            None => {
+                assert_eq!(page["total"], items.len());
+                return items;
+            }
+        }
+    }
+}
+
+/// #448: the summary keeps counts only; details are paged at the same pin and
+/// rules hash, and together they equal `trellis rules check` / `references`.
+#[tokio::test]
+async fn architecture_summary_counts_equal_cli_and_details_page_at_the_same_pin() {
+    let (base, runtime, browser, key) = fixture_with_roles(true).await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=1\npaths=['src/target.rs']",
+    );
+    let app = browser.router();
+    let (status, summary) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let summary = &summary["payload"];
+    for (field, absent) in [
+        (
+            "references",
+            ["modules", "production", "tests", "unresolved"].as_slice(),
+        ),
+        (
+            "rules",
+            ["instances", "testOnly", "unassigned", "externalPackages"].as_slice(),
+        ),
+    ] {
+        for name in absent {
+            assert!(summary[field].get(*name).is_none(), "{field}.{name}");
+        }
+    }
+    let pin: trellis::model::IndexPin = serde_json::from_value(serde_json::json!({
+        "indexGeneration": summary["indexGeneration"], "indexRevision": summary["indexRevision"]
+    }))
+    .unwrap();
+    let (response, _) = runtime.evidence_response().unwrap();
+    let basis = serde_json::json!({ "expectedBasis": pin });
+    let checked = response
+        .architecture_response("check", &basis, &mut || Ok(()))
+        .unwrap();
+    let references = response
+        .architecture_response("references", &basis, &mut || Ok(()))
+        .unwrap();
+    response.finish(()).unwrap();
+    // The same counts `trellis rules check --format json` prints.
+    assert_eq!(summary["rules"]["counts"], checked["counts"]);
+    assert_eq!(summary["rules"]["testCounts"], checked["testCounts"]);
+    assert_eq!(
+        summary["rules"]["unassignedCount"],
+        checked["unassigned"].as_array().unwrap().len()
+    );
+    assert_eq!(summary["references"]["counts"], references["counts"]);
+    let hash = summary["rulesFile"]["contentHash"].as_str().unwrap();
+    let pinned = format!(
+        "indexGeneration={}&indexRevision={}&rulesHash={hash}",
+        pin.index_generation, pin.index_revision
+    );
+    let instances = all_details(&app, &key, &format!("kind=instances&{pinned}"), 1).await;
+    let expected: Vec<Value> = [("instances", "production"), ("testOnly", "test")]
+        .into_iter()
+        .flat_map(|(field, role)| {
+            checked[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(move |row| serde_json::json!({"role":role,"instance":row}))
+        })
+        .collect();
+    assert!(expected.len() > 1);
+    assert_eq!(
+        instances, expected,
+        "pages concatenate to the CLI instances"
+    );
+    let pairs = all_details(&app, &key, &format!("kind=pairs&{pinned}"), 2).await;
+    let edges: Vec<_> = [("production", "production"), ("tests", "test")]
+        .into_iter()
+        .flat_map(|(field, role)| {
+            references[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(move |pair| (role, pair.clone()))
+        })
+        .collect();
+    assert_eq!(pairs.len(), edges.len());
+    for (item, (role, pair)) in pairs.iter().zip(&edges) {
+        assert_eq!(item["role"], *role);
+        assert_eq!(item["pair"], *pair);
+    }
+    let unresolved = all_details(&app, &key, &format!("kind=unresolved&{pinned}"), 1).await;
+    assert_eq!(unresolved, *references["unresolved"].as_array().unwrap());
+    // Filters are exact and keep evaluation order.
+    let scoped = all_details(
+        &app,
+        &key,
+        &format!("kind=instances&{pinned}&role=test&path=src%2Froles.rs"),
+        50,
+    )
+    .await;
+    assert!(!scoped.is_empty());
+    assert!(scoped.iter().all(|row| row["role"] == "test"
+        && (row["instance"]["target"]["path"] == "src/roles.rs"
+            || row["instance"]["destination"]["path"] == "src/roles.rs")));
+    let layered = all_details(&app, &key, &format!("kind=pairs&{pinned}&layer=target"), 50).await;
+    assert!(!layered.is_empty());
+    assert!(
+        layered
+            .iter()
+            .all(|row| row["targetLayer"] == "target" || row["sourceLayer"] == "target")
+    );
+    let unpinned = format!(
+        "kind=instances&indexGeneration={}&indexRevision={}",
+        pin.index_generation, pin.index_revision
+    );
+    for query in [
+        unpinned,
+        format!("kind=bogus&{pinned}"),
+        format!("kind=instances&{pinned}&limit=0"),
+        format!("kind=instances&{pinned}&limit=501"),
+        format!("kind=instances&{pinned}&offset=-1"),
+        format!("kind=instances&{pinned}&offset=100000"),
+        format!("kind=instances&{pinned}&role=all"),
+        format!("kind=instances&{pinned}&status=bad"),
+        format!("kind=instances&{pinned}&unexpected=1"),
+        format!("kind=unresolved&{pinned}&role=production"),
+        format!("kind=pairs&{pinned}&unlayered=false"),
+        format!("kind=pairs&{pinned}&path="),
+        format!("kind=pairs&{pinned}&kind=pairs"),
+    ] {
+        let (status, error) = request(app.clone(), &key, &format!("/details?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {error}");
+    }
+    let stale_rules = format!(
+        "/details?kind=instances&indexGeneration={}&indexRevision={}&rulesHash=sha256%3Aold",
+        pin.index_generation, pin.index_revision
+    );
+    let (status, conflict) = request(app.clone(), &key, &stale_rules).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "rules_conflict");
+    let stale_pin = format!(
+        "/details?kind=instances&indexGeneration={}&indexRevision={}&rulesHash={hash}",
+        pin.index_generation,
+        pin.index_revision + 1
+    );
+    let (status, conflict) = request(app.clone(), &key, &stale_pin).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert!(
+        matches!(
+            conflict["error"]["code"].as_str(),
+            Some("revision_conflict" | "pin_expired")
+        ),
+        "{conflict}"
+    );
+    // A pair endpoint filter is an exact identity, not a path.
+    let pair = &edges[0].1;
+    let exact = |identity: &Value| url_encode(&serde_json::to_string(identity).unwrap());
+    let selected = all_details(
+        &app,
+        &key,
+        &format!(
+            "kind=pairs&{pinned}&role={}&source={}&target={}",
+            edges[0].0,
+            exact(&pair["source"]),
+            exact(&pair["target"])
+        ),
+        5,
+    )
+    .await;
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0]["pair"], *pair);
+    let mut other = pair["source"].clone();
+    other["sourceSetId"] = Value::from("another-source-set");
+    let none = all_details(
+        &app,
+        &key,
+        &format!("kind=pairs&{pinned}&source={}", exact(&other)),
+        5,
+    )
+    .await;
+    assert!(
+        none.is_empty(),
+        "the same path in another source set is not selected"
+    );
+    let (status, _) = request(
+        app.clone(),
+        &key,
+        &format!("/details?kind=pairs&{pinned}&source=src%2Froles.rs"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a bare path is not an identity"
+    );
+    // The rules file changing after the summary is a typed conflict, never a stale page.
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=1\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=2\npaths=['src/target.rs']",
+    );
+    let (status, conflict) = request(
+        app.clone(),
+        &key,
+        &format!("/details?kind=instances&{pinned}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "rules_conflict");
+}
+
+fn url_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }

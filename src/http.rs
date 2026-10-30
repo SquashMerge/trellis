@@ -3911,6 +3911,7 @@ enum BrowserCoreRoute {
     GitDiff,
     Metrics,
     Architecture,
+    ArchitectureDetails,
     RulesInventory,
     RulesPreview,
     RulesApply,
@@ -3945,6 +3946,7 @@ impl BrowserCoreRoute {
             (&Method::GET, "git/diff") => Some(Self::GitDiff),
             (&Method::GET, "metrics") => Some(Self::Metrics),
             (&Method::GET, "architecture") => Some(Self::Architecture),
+            (&Method::GET, "architecture/details") => Some(Self::ArchitectureDetails),
             (&Method::GET, "architecture/rules") => Some(Self::RulesInventory),
             (&Method::POST, "architecture/rules/preview") => Some(Self::RulesPreview),
             (&Method::POST, "architecture/rules/apply") => Some(Self::RulesApply),
@@ -4311,35 +4313,59 @@ fn architecture_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOpti
     Ok(options)
 }
 
-fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
-    use std::collections::BTreeMap;
-    fn decode(value: &str) -> Result<String, ApiError> {
-        if value.len() > 8192 {
+/// Detail pages require the summary's full pin and rules hash; see
+/// `architecture_details::Query` for the closed filter set.
+fn architecture_details_query(
+    uri: &axum::http::Uri,
+) -> Result<crate::architecture_details::Query, ApiError> {
+    let query = uri.query().ok_or_else(invalid)?;
+    if query.len() > 8192 {
+        return Err(invalid());
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').ok_or_else(invalid)?;
+        if fields
+            .insert(decode_query(name)?, decode_query(value)?)
+            .is_some()
+        {
             return Err(invalid());
         }
-        let mut bytes = Vec::with_capacity(value.len());
-        let input = value.as_bytes();
-        let mut i = 0;
-        while i < input.len() {
-            match input[i] {
-                b'%' => {
-                    let hex = input.get(i + 1..i + 3).ok_or_else(invalid)?;
-                    let hex = std::str::from_utf8(hex).map_err(|_| invalid())?;
-                    bytes.push(u8::from_str_radix(hex, 16).map_err(|_| invalid())?);
-                    i += 3;
-                }
-                b'+' => {
-                    bytes.push(b' ');
-                    i += 1;
-                }
-                byte => {
-                    bytes.push(byte);
-                    i += 1;
-                }
+    }
+    crate::architecture_details::Query::from_fields(fields).map_err(|_| invalid())
+}
+
+/// Percent-decode one bounded query component.
+fn decode_query(value: &str) -> Result<String, ApiError> {
+    if value.len() > 8192 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::with_capacity(value.len());
+    let input = value.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        match input[i] {
+            b'%' => {
+                let hex = input.get(i + 1..i + 3).ok_or_else(invalid)?;
+                let hex = std::str::from_utf8(hex).map_err(|_| invalid())?;
+                bytes.push(u8::from_str_radix(hex, 16).map_err(|_| invalid())?);
+                i += 3;
+            }
+            b'+' => {
+                bytes.push(b' ');
+                i += 1;
+            }
+            byte => {
+                bytes.push(byte);
+                i += 1;
             }
         }
-        String::from_utf8(bytes).map_err(|_| invalid())
     }
+    String::from_utf8(bytes).map_err(|_| invalid())
+}
+
+fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, ApiError> {
+    use std::collections::BTreeMap;
     let mut fields = BTreeMap::new();
     if let Some(query) = uri.query() {
         if query.len() > 8192 {
@@ -4347,7 +4373,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
         }
         for pair in query.split('&') {
             let (name, value) = pair.split_once('=').ok_or_else(invalid)?;
-            let name = decode(name)?;
+            let name = decode_query(name)?;
             if !matches!(
                 name.as_str(),
                 "scope"
@@ -4362,7 +4388,7 @@ fn metrics_query(uri: &axum::http::Uri) -> Result<crate::store::MetricsOptions, 
                     | "metrics"
                     | "topCognitive"
                     | "workbench"
-            ) || fields.insert(name, decode(value)?).is_some()
+            ) || fields.insert(name, decode_query(value)?).is_some()
             {
                 return Err(invalid());
             }
@@ -4502,9 +4528,20 @@ async fn provisioned_core_answer(
         BrowserCoreRoute::GitStatus | BrowserCoreRoute::GitDiff => {
             unreachable!("Git reads bypass index activation")
         }
-        BrowserCoreRoute::Metrics | BrowserCoreRoute::Architecture => {
+        BrowserCoreRoute::Metrics
+        | BrowserCoreRoute::Architecture
+        | BrowserCoreRoute::ArchitectureDetails => {
             let architecture = matches!(route, BrowserCoreRoute::Architecture);
-            let options = if architecture {
+            let details = if matches!(route, BrowserCoreRoute::ArchitectureDetails) {
+                Some(architecture_details_query(uri)?)
+            } else {
+                None
+            };
+            let detail_read = details.is_some();
+            let options = if detail_read {
+                // A detail page evaluates the whole revision, like the summary.
+                crate::store::MetricsOptions::default()
+            } else if architecture {
                 architecture_query(uri)?
             } else {
                 metrics_query(uri)?
@@ -4597,7 +4634,9 @@ async fn provisioned_core_answer(
                     on_write: &mut on_write,
                     on_progress: &mut on_progress,
                 };
-                let result = if architecture {
+                let result = if let Some(details) = &details {
+                    runtime.architecture_details_response(details, &mut check, hooks, metrics.limit)
+                } else if architecture {
                     runtime.architecture_response(&options, &mut check, hooks, metrics.limit)
                 } else {
                     runtime.metrics_response(&options, &mut check, hooks, metrics.limit)
@@ -4628,6 +4667,20 @@ async fn provisioned_core_answer(
                                 .into_response(),
                             false,
                         ));
+                    }
+                    // Only detail reads add these typed refusals; other routes keep their mapping.
+                    for cause in error.chain().filter(|_| detail_read) {
+                        let text = cause.to_string();
+                        if text.starts_with("rules_conflict:") {
+                            return Err(ApiError(
+                                StatusCode::CONFLICT,
+                                "rules_conflict",
+                                "Rules changed on disk; reload the Architecture view",
+                            ));
+                        }
+                        if text.starts_with("invalid_request:") {
+                            return Err(invalid());
+                        }
                     }
                     return Err(ApiError::from(error));
                 }

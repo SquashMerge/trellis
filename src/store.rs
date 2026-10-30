@@ -1640,10 +1640,10 @@ impl EvidenceResponse {
         let snapshot = self
             .architecture_snapshot(Some(selected.pin), check)
             .map_err(|error| self.store.report_index_failure(error))?;
-        let mut references = crate::references::project(&snapshot, &[], 5, check)?;
+        let references = crate::references::project(&snapshot, &[], 5, check)?;
         let evaluated =
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
-        let mut rules = evaluated.data;
+        let rules = evaluated.data;
         let assignments = evaluated.layers;
         let metrics = self.metrics_at_with_config(
             &MetricsOptions {
@@ -1724,7 +1724,6 @@ impl EvidenceResponse {
             }
             modules.push(row);
         }
-        drop(assignments);
         // Keep policy and exception contributions separate even on the same pair.
         type SummaryKey = (String, String, String, String, bool, Option<String>);
         let mut summaries: BTreeMap<SummaryKey, serde_json::Value> = BTreeMap::new();
@@ -1796,16 +1795,55 @@ impl EvidenceResponse {
                     .push(pair.clone());
             }
         }
-        for value in [&mut references.data, &mut rules] {
+        // Undrawn detail (sites, pairs, instances) is served by paged detail reads (#448).
+        let (mut references, mut rules) = crate::architecture_details::summary(
+            &references.data,
+            &rules,
+            &crate::architecture_details::Layers::new(&assignments, &rules),
+        )?;
+        drop(assignments);
+        for value in [&mut references, &mut rules] {
             value["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
             value["indexRevision"] = serde_json::json!(snapshot.pin.index_revision);
         }
         payload["modules"] = serde_json::json!(modules);
         payload["edges"] = serde_json::json!(summaries.into_values().collect::<Vec<_>>());
-        payload["references"] = references.data;
+        payload["references"] = references;
         payload["rules"] = rules;
         check()?;
         Ok(payload)
+    }
+
+    /// One bounded page of Architecture detail at the summary's pin and rules hash.
+    /// A different rules file fails `rules_conflict`; a stale pin fails like the summary.
+    pub fn architecture_details(
+        &self,
+        query: &crate::architecture_details::Query,
+        check: &mut (impl FnMut() -> Result<()> + Send),
+    ) -> Result<serde_json::Value> {
+        check()?;
+        let config = crate::rules::load(Path::new(self.store.workspace_root()))?
+            .context("rules_conflict: rules file missing")?;
+        ensure!(
+            config.content_hash == query.rules_hash,
+            "rules_conflict: rules changed since the summary"
+        );
+        let snapshot = self
+            .architecture_snapshot(Some(query.pin), check)
+            .map_err(|error| self.store.report_index_failure(error))?;
+        let references = crate::references::project(&snapshot, &[], 5, check)?;
+        let evaluated =
+            crate::rules::evaluate_with_layers(&config, &snapshot, &references, &[], check)?;
+        let layers = crate::architecture_details::Layers::new(&evaluated.layers, &evaluated.data);
+        let page = crate::architecture_details::page(
+            query,
+            &references.data,
+            &evaluated.data,
+            &layers,
+            check,
+        )?;
+        check()?;
+        Ok(page)
     }
 
     /// Browser rule authoring validates the entire proposal against one admitted

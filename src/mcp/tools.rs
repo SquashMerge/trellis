@@ -58,6 +58,14 @@ fn limit(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
         },
     }
 }
+/// An architecture page offset is any safe UInt; one past the result is
+/// `range_too_large` once the result is known.
+fn offset(o: &serde_json::Map<String, Value>) -> Result<(), &'static str> {
+    match o.get("offset") {
+        Some(value) if wire::uint(value).is_none() => Err("invalid_request"),
+        _ => Ok(()),
+    }
+}
 fn valid_path(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 4096
@@ -83,11 +91,19 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "expectedBasis",
                 "paths",
                 "limit",
+                "offset",
             ],
             &["schemaVersion"],
         ),
         "trellis_rules_check" => (
-            &["schemaVersion", "workspace", "expectedBasis", "paths"],
+            &[
+                "schemaVersion",
+                "workspace",
+                "expectedBasis",
+                "paths",
+                "limit",
+                "offset",
+            ],
             &["schemaVersion"],
         ),
         "trellis_rules_explain" => (
@@ -98,6 +114,8 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "rule",
                 "target",
                 "destination",
+                "limit",
+                "offset",
             ],
             &["schemaVersion", "rule", "target"],
         ),
@@ -184,7 +202,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }) {
                 return Err("invalid_request");
             }
-            limit(o)
+            limit(o).and_then(|()| offset(o))
         }
         "trellis_rules_explain" => {
             let rule = string(o.get("rule")).ok_or("invalid_request")?;
@@ -200,7 +218,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             {
                 return Err("invalid_request");
             }
-            Ok(())
+            limit(o).and_then(|()| offset(o))
         }
         "trellis_find_symbols" | "trellis_search_symbols" => {
             let q = string(o.get("query")).ok_or("invalid_request")?;
@@ -1278,12 +1296,41 @@ mod tests {
             ),
             Err("range_too_large")
         );
+        // #448: every architecture tool pages with `offset` and bounds samples with `limit`.
+        for name in ["trellis_references", "trellis_rules_check"] {
+            assert_eq!(
+                validate(
+                    name,
+                    Some(&json!({"schemaVersion":1,"limit":1,"offset":9007199254740991_u64}))
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                validate(name, Some(&json!({"schemaVersion":1,"limit":0}))),
+                Err("range_too_large")
+            );
+            for offset in [json!(-1), json!(1.5), json!("1"), json!(null)] {
+                assert_eq!(
+                    validate(name, Some(&json!({"schemaVersion":1,"offset":offset}))),
+                    Err("invalid_request")
+                );
+            }
+        }
         assert_eq!(
             validate(
-                "trellis_rules_check",
-                Some(&json!({"schemaVersion":1,"limit":1}))
+                "trellis_rules_explain",
+                Some(
+                    &json!({"schemaVersion":1,"rule":"$layers","target":identity,"limit":50,"offset":2})
+                )
             ),
-            Err("invalid_request")
+            Ok(())
+        );
+        assert_eq!(
+            validate(
+                "trellis_rules_explain",
+                Some(&json!({"schemaVersion":1,"rule":"$layers","target":identity,"limit":51}))
+            ),
+            Err("range_too_large")
         );
         assert_eq!(
             validate(
