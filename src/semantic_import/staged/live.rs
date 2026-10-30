@@ -50,6 +50,11 @@ impl Reservation {
         Ok(())
     }
 
+    /// The bytes this guard holds.
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// Release storage only after its owner has actually dropped or moved to another guard.
     pub(super) fn release(&mut self, bytes: u64) -> Result<()> {
         anyhow::ensure!(

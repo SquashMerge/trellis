@@ -19,6 +19,9 @@ use memory::{MemoryJoinSink, MemoryJoinStore};
 #[cfg(feature = "test-support")]
 pub(crate) use staged::cursor_sql as staged_cursor_sql;
 pub use staged::join_staged;
+pub(crate) use staged::publication::read_documents as read_staged_documents;
+#[cfg(feature = "test-support")]
+pub(crate) use staged::publication::statements as staged_publication_statements;
 
 /// Per-document anchor candidates and capability families.
 pub(crate) type AnchorParts = (
@@ -47,11 +50,81 @@ pub struct MeasuredFacts<'a> {
     support: BTreeMap<(native::DocumentKey, semantic::JoinKind), &'a native::MeasurementSupport>,
 }
 
+/// The measured anchor index of a native artifact: what `MeasuredFacts` and a staged document
+/// group share. The per-declaration name, key and document indexes are `MeasuredFacts`' own.
+struct MeasuredAnchors<'a> {
+    sources: BTreeMap<native::DocumentKey, &'a str>,
+    documents: BTreeMap<native::DocumentKey, &'a native::Document>,
+    candidates: BTreeMap<AnchorKey, BTreeSet<String>>,
+    declarations: BTreeMap<String, Vec<&'a native::Declaration>>,
+    calls: BTreeMap<String, Vec<&'a native::Call>>,
+    references: BTreeMap<String, Vec<&'a native::Reference>>,
+    support: BTreeMap<(native::DocumentKey, semantic::JoinKind), &'a native::MeasurementSupport>,
+}
+
 impl<'a> MeasuredFacts<'a> {
     pub fn new(
         native: &'a native::Artifact,
         sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
     ) -> Result<Self> {
+        let MeasuredAnchors {
+            sources,
+            documents,
+            candidates,
+            declarations,
+            calls,
+            references,
+            support,
+        } = Self::anchors(native, sources)?;
+        let mut declaration_names: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
+        let mut declaration_keys: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
+        let mut by_document: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
+        for d in &native.declarations {
+            by_document.entry(d.document.clone()).or_default().push(d);
+            declaration_keys
+                .entry((
+                    d.document.clone(),
+                    native_ids::canonical(&serde_json::to_value(&d.key)?),
+                ))
+                .or_default()
+                .push(d);
+            if let (Some(range), Some(name)) = (&d.name_range, &d.name) {
+                declaration_names
+                    .entry((d.document.clone(), range.start, range.end, name.clone()))
+                    .or_default()
+                    .push(d);
+            }
+        }
+        Ok(Self {
+            native,
+            sources,
+            documents,
+            candidates,
+            declarations,
+            declaration_names,
+            declaration_keys,
+            by_document,
+            calls,
+            references,
+            support,
+        })
+    }
+
+    /// The anchor candidates and capability families of `document` alone, without building the
+    /// per-record indexes a document group keeps itself.
+    pub(crate) fn anchor_parts(
+        native: &'a native::Artifact,
+        sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
+        document: &native::DocumentKey,
+    ) -> Result<AnchorParts> {
+        let anchors = Self::anchors(native, sources)?;
+        Ok(Self::parts(anchors.candidates, anchors.support, document))
+    }
+
+    fn anchors(
+        native: &'a native::Artifact,
+        sources: &'a BTreeMap<native::DocumentKey, Vec<u8>>,
+    ) -> Result<MeasuredAnchors<'a>> {
         #[cfg(feature = "test-support")]
         count_publication_work(|work| {
             if work.destination_revision == native.revision.id {
@@ -79,9 +152,6 @@ impl<'a> MeasuredFacts<'a> {
         let mut declarations: BTreeMap<String, Vec<&native::Declaration>> = BTreeMap::new();
         let mut calls: BTreeMap<String, Vec<&native::Call>> = BTreeMap::new();
         let mut references: BTreeMap<String, Vec<&native::Reference>> = BTreeMap::new();
-        let mut declaration_names: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
-        let mut declaration_keys: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
-        let mut by_document: BTreeMap<_, Vec<&native::Declaration>> = BTreeMap::new();
         let mut anchors: BTreeMap<AnchorKey, BTreeSet<String>> = BTreeMap::new();
         let mut insert = |doc: &native::DocumentKey, range: &native::Range, kind, id: &str| {
             anchors
@@ -91,20 +161,6 @@ impl<'a> MeasuredFacts<'a> {
         };
         for d in &native.declarations {
             declarations.entry(d.syntax_id.clone()).or_default().push(d);
-            by_document.entry(d.document.clone()).or_default().push(d);
-            declaration_keys
-                .entry((
-                    d.document.clone(),
-                    native_ids::canonical(&serde_json::to_value(&d.key)?),
-                ))
-                .or_default()
-                .push(d);
-            if let (Some(range), Some(name)) = (&d.name_range, &d.name) {
-                declaration_names
-                    .entry((d.document.clone(), range.start, range.end, name.clone()))
-                    .or_default()
-                    .push(d);
-            }
             if let Some(range) = &d.name_range {
                 insert(
                     &d.document,
@@ -242,15 +298,11 @@ impl<'a> MeasuredFacts<'a> {
                 );
             }
         }
-        Ok(Self {
-            native,
+        Ok(MeasuredAnchors {
             sources: source_text,
             documents,
             candidates,
             declarations,
-            declaration_names,
-            declaration_keys,
-            by_document,
             calls,
             references,
             support,
@@ -310,17 +362,22 @@ impl<'a> MeasuredFacts<'a> {
         )
     }
 
-    /// The anchor candidates and capability families, without the per-record indexes. A
-    /// document group keeps these and serves joins from them.
-    pub(crate) fn into_anchor_parts(self, document: &native::DocumentKey) -> AnchorParts {
-        let candidates = self
-            .candidates
+    /// The anchor candidates and capability families of one document. A document group keeps
+    /// these and serves joins from them.
+    fn parts(
+        candidates: BTreeMap<AnchorKey, BTreeSet<String>>,
+        support: BTreeMap<
+            (native::DocumentKey, semantic::JoinKind),
+            &'a native::MeasurementSupport,
+        >,
+        document: &native::DocumentKey,
+    ) -> AnchorParts {
+        let candidates = candidates
             .into_iter()
             .filter(|((owner, ..), _)| owner == document)
             .map(|((_, start, end, kind), ids)| ((start, end, kind), ids))
             .collect();
-        let support = self
-            .support
+        let support = support
             .into_iter()
             .filter(|((owner, _), _)| owner == document)
             .map(|((_, kind), family)| (kind, family.clone()))
@@ -2283,29 +2340,58 @@ struct RoleSites {
     imports: BTreeSet<(usize, usize)>,
 }
 
-// Matches the former push-forward/pop-last traversal without a Rust Node Vec.
+/// Visits `root`'s named subtree in reverse pre-order (a node, then its named children last to
+/// first), descending only where `visit` returns true: the former push-forward/pop-last
+/// traversal. One tree cursor walks it; its stack is bounded by the tree depth, and unlike
+/// `Node::parent` and `Node::prev_named_sibling` no step re-descends from the tree root.
 fn walk_named_reverse<'t>(
     root: tree_sitter::Node<'t>,
     visit: &mut impl FnMut(tree_sitter::Node<'t>) -> Result<bool>,
 ) -> Result<()> {
-    let mut node = root;
+    let mut cursor = root.walk();
     loop {
-        if visit(node)?
-            && let Some(child) =
-                node.named_child(u32::try_from(node.named_child_count().saturating_sub(1))?)
-        {
-            node = child;
+        if visit(cursor.node())? && goto_last_named_child(&mut cursor) {
             continue;
         }
         loop {
-            if node == root {
+            if cursor.node() == root {
                 return Ok(());
             }
-            if let Some(sibling) = node.prev_named_sibling() {
-                node = sibling;
+            if goto_previous_named_sibling(&mut cursor) {
                 break;
             }
-            node = node.parent().context("missing AST parent")?;
+            // No earlier named sibling: the cursor rests on a sibling, whose parent is the same.
+            anyhow::ensure!(cursor.goto_parent(), "missing AST parent");
+        }
+    }
+}
+
+/// Moves to the last named child, or leaves the cursor where it was.
+fn goto_last_named_child(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    if !cursor.goto_last_child() {
+        return false;
+    }
+    if goto_named_or_previous(cursor) {
+        return true;
+    }
+    cursor.goto_parent();
+    false
+}
+
+/// Moves to the nearest earlier named sibling. On failure the cursor rests on some sibling of
+/// the start node (or the start node itself).
+fn goto_previous_named_sibling(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    cursor.goto_previous_sibling() && goto_named_or_previous(cursor)
+}
+
+/// Stays on a named node, else steps back through siblings to the first named one.
+fn goto_named_or_previous(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    loop {
+        if cursor.node().is_named() {
+            return true;
+        }
+        if !cursor.goto_previous_sibling() {
+            return false;
         }
     }
 }
@@ -4160,3 +4246,124 @@ pub(crate) fn manifest_hash(revision: &native::Revision) -> String {
 #[cfg(test)]
 #[path = "semantic_import_complexity_tests.rs"]
 mod complexity_tests;
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+
+    /// The former traversal, over `Node::parent` and `Node::prev_named_sibling`.
+    fn reference_walk<'t>(
+        root: tree_sitter::Node<'t>,
+        visit: &mut impl FnMut(tree_sitter::Node<'t>) -> bool,
+    ) {
+        let mut node = root;
+        loop {
+            if visit(node)
+                && let Some(child) = node
+                    .named_child(u32::try_from(node.named_child_count().saturating_sub(1)).unwrap())
+            {
+                node = child;
+                continue;
+            }
+            loop {
+                if node == root {
+                    return;
+                }
+                if let Some(sibling) = node.prev_named_sibling() {
+                    node = sibling;
+                    break;
+                }
+                node = node.parent().unwrap();
+            }
+        }
+    }
+
+    fn sources() -> Vec<(tree_sitter::Language, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![];
+        let mut pending = vec![root.join("tests/fixtures")];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files.extend(
+            ["src/semantic_import.rs", "src/scip_raw.rs"]
+                .iter()
+                .map(|path| root.join(path)),
+        );
+        files.sort();
+        let mut sources = vec![];
+        for path in files {
+            let language: tree_sitter::Language = match path.extension().and_then(|e| e.to_str()) {
+                Some("java") => tree_sitter_java::LANGUAGE.into(),
+                Some("js") => tree_sitter_javascript::LANGUAGE.into(),
+                Some("py") => tree_sitter_python::LANGUAGE.into(),
+                Some("rs") => tree_sitter_rust::LANGUAGE.into(),
+                _ => continue,
+            };
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                sources.push((language, text));
+            }
+        }
+        // Malformed input parses with error and missing nodes.
+        for (language, text) in [
+            (
+                tree_sitter_java::LANGUAGE.into(),
+                "class A extends { void f( }",
+            ),
+            (tree_sitter_python::LANGUAGE.into(), "def f(:\n  return (\n"),
+            (
+                tree_sitter_javascript::LANGUAGE.into(),
+                "class A extends B { f( } /*",
+            ),
+            (tree_sitter_rust::LANGUAGE.into(), "impl<T> X for { fn f( }"),
+        ] {
+            sources.push((language, text.to_owned()));
+        }
+        sources
+    }
+
+    #[test]
+    fn cursor_walk_visits_exactly_the_former_traversal() {
+        let sources = sources();
+        assert!(sources.len() > 20, "{} sources", sources.len());
+        for (language, source) in &sources {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(language).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            // Descend everywhere, and also prune by kind, as the role-site visitors do.
+            for prune in [None, Some(0usize), Some(1)] {
+                let descend = |node: tree_sitter::Node<'_>| match prune {
+                    None => true,
+                    Some(parity) => node.kind().len() % 2 != parity,
+                };
+                // The whole tree and a nested subtree, whose siblings must stay unvisited.
+                let mut roots = vec![tree.root_node()];
+                let mut cursor = tree.root_node().walk();
+                if let Some(child) = tree.root_node().named_children(&mut cursor).nth(1) {
+                    roots.push(child);
+                }
+                for root in roots {
+                    let mut expected = vec![];
+                    reference_walk(root, &mut |node| {
+                        expected.push(node.id());
+                        descend(node)
+                    });
+                    let mut actual = vec![];
+                    walk_named_reverse(root, &mut |node| {
+                        actual.push(node.id());
+                        Ok(descend(node))
+                    })
+                    .unwrap();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+}

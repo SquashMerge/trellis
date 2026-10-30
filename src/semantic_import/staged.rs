@@ -3,13 +3,16 @@
 //! byte-bounded LRU of document groups. The binding, ambiguity and rejoin rules are the ones
 //! the in-memory backend runs; this module streams them one document at a time:
 //!
-//! 1. captured global discovery (`g_*` side 0: exact definitions, presence, methods);
+//! 1. captured global discovery (`g_*` side 0: exact definitions and methods; symbol presence
+//!    is the admitted claims' presence index);
 //! 2. per captured document, its captured join and whole-document eligibility (`w_docs`);
-//! 3. eligible destination global discovery (`g_*` side 1);
-//! 4. per destination document, both joins recomputed and settled into validated `out_*` rows
-//!    and its coverage; then the SQL closure.
+//! 3. eligible destination global discovery (`g_*` side 1). A shared pin writes nothing here:
+//!    its destination context is the eligible view of side 0;
+//! 4. per destination document, both joins recomputed (once, when they must be equal) and
+//!    settled into validated `out_*` rows and its coverage; then the SQL closure.
 //!
-//! No per-occurrence or per-fact corpus is persisted between documents.
+//! Each pass runs in one stage transaction. No per-occurrence or per-fact corpus is persisted
+//! between documents.
 use super::{
     CoordinateMap, DestinationMutations, MeasuredFacts, Position, RoleSites, ScopedKey,
     compose_join, document_coordinates,
@@ -43,8 +46,10 @@ use std::{
 };
 
 mod claim_size;
+pub(crate) mod codec;
 pub(super) mod group_size;
 mod live;
+pub(crate) mod publication;
 mod settle;
 pub(super) mod sizes;
 mod streaming;
@@ -53,6 +58,8 @@ use live::{LiveBudget, Reservation};
 
 const DOCUMENT_SQL: &str =
     "SELECT ord, language, path FROM nat_docs WHERE rev=?1 AND ord>?2 ORDER BY ord LIMIT 128";
+const REVERSE_DOCUMENT_SQL: &str =
+    "SELECT ord, language, path FROM nat_docs WHERE rev=?1 AND ord<?2 ORDER BY ord DESC LIMIT 128";
 
 /// The ordered cursor queries of the join, for plan tests.
 #[cfg(feature = "test-support")]
@@ -61,8 +68,9 @@ pub(crate) fn cursor_sql() -> Vec<String> {
         document_claim_sql(false),
         document_claim_sql(true),
         DOCUMENT_SQL.to_owned(),
+        REVERSE_DOCUMENT_SQL.to_owned(),
     ];
-    queries.extend(streaming::cursor_sql().into_iter().map(str::to_owned));
+    queries.extend(streaming::cursor_sql());
     queries
 }
 
@@ -280,10 +288,7 @@ impl DocGroup {
             capability_reports: vec![rows.capability_report],
             search_cards: vec![],
         };
-        let (candidates, support) = {
-            let facts = MeasuredFacts::new(&mini, &sources)?;
-            facts.into_anchor_parts(&key)
-        };
+        let (candidates, support) = MeasuredFacts::anchor_parts(&mini, &sources, &key)?;
         let bytes = sources.into_values().next().expect("one source");
         let text: Rc<str> = Rc::from(String::from_utf8(bytes).context("non-UTF8 native source")?);
         let (declarations, calls, references) = (&mini.declarations, &mini.calls, &mini.references);
@@ -388,12 +393,13 @@ fn build_claim(parts: ClaimParts) -> Result<CapturedClaim> {
     claim_from_stage(canonical, digest, proof, language, artifact_hash)
 }
 
-/// The documents of one native revision in stored order, read a page at a time.
+/// The documents of one native revision in stored order (or its reverse), a page at a time.
 struct DocumentCursor<'a> {
     conn: &'a Connection,
     rev: u8,
     source_set_id: String,
     last: i64,
+    reverse: bool,
     page: VecDeque<native::DocumentKey>,
     done: bool,
 }
@@ -410,7 +416,11 @@ impl Iterator for DocumentCursor<'_> {
                 return None;
             }
             let fetched = (|| -> Result<Vec<(i64, String, String)>> {
-                let mut statement = self.conn.prepare_cached(DOCUMENT_SQL)?;
+                let mut statement = self.conn.prepare_cached(if self.reverse {
+                    REVERSE_DOCUMENT_SQL
+                } else {
+                    DOCUMENT_SQL
+                })?;
                 Ok(statement
                     .query_map(params![self.rev, self.last], |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -463,7 +473,8 @@ struct DocumentClaims {
     claims: Vec<CapturedClaim>,
     coordinates: RefCell<Option<BTreeMap<u8, CoordinateMap>>>,
     symbol_kinds: BTreeMap<String, Option<i64>>,
-    by_proof: BTreeMap<String, usize>,
+    /// Claim index and staged `claim_id`, by proof ID.
+    by_proof: BTreeMap<String, (usize, i64)>,
     reservation: RefCell<Reservation>,
 }
 
@@ -530,6 +541,7 @@ impl DocumentClaims {
         let mut by_proof = BTreeMap::new();
         while let Some(row) = rows.next()? {
             side.ctx.charge(1)?;
+            let claim_id: i64 = row.get(0)?;
             let claim = decode_reserved_claim(row, &side.ctx.live, &mut reservation)?;
             if claim.envelope.record_kind == "symbolInformation"
                 && let Some(symbol) = claim.envelope.raw["symbol"].as_str()
@@ -543,11 +555,11 @@ impl DocumentClaims {
             }
             reservation.grow(sizes::sum(&[
                 claim.captured_proof_id.len() as u64,
-                sizes::map_entries::<String, usize>(1)?,
+                sizes::map_entries::<String, (usize, i64)>(1)?,
             ])?)?;
             by_proof
                 .entry(claim.captured_proof_id.clone())
-                .or_insert(claims.len());
+                .or_insert((claims.len(), claim_id));
             if claims.len() == claims.capacity() {
                 // New slots are covered by retained claim roots; old slots overlap the move.
                 let overlap = (claims.capacity() as u64)
@@ -702,6 +714,39 @@ impl<'a> StagedSide<'a> {
         self.group(document)?.context("foreign anchor document")
     }
 
+    /// The revision's documents in reverse stored order. A pass between two forward passes
+    /// walks backwards so the document cache still holds the groups the previous pass loaded
+    /// last and the next pass loads first.
+    fn documents_reversed(&self) -> DocumentCursor<'a> {
+        DocumentCursor {
+            conn: self.ctx.conn,
+            rev: self.rev,
+            source_set_id: self.header.source_set.id.clone(),
+            last: i64::MAX,
+            reverse: true,
+            page: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    /// The decoded claim of this document view with `proof`, `kind` and `digest`, and its
+    /// staged `claim_id`. Uncharged: the caller already charged the lookup that found it.
+    fn local_claim(&self, proof: &str, kind: &str, digest: &str) -> Result<(&CapturedClaim, i64)> {
+        let local = self
+            .local_claims
+            .as_ref()
+            .context("document claim owner required")?;
+        let (index, claim_id) = *local
+            .by_proof
+            .get(proof)
+            .ok_or(ScipCaptureError::MissingProof)?;
+        let claim = &local.claims[index];
+        if claim.envelope.record_kind != kind || claim.fact_digest != digest {
+            return Err(ScipCaptureError::MissingProof.into());
+        }
+        Ok((claim, claim_id))
+    }
+
     fn proof_filter(&self) -> &'static str {
         if self.filtered { ELIGIBLE_JOIN } else { "" }
     }
@@ -819,6 +864,7 @@ impl JoinFacts for StagedSide<'_> {
             rev: self.rev,
             source_set_id: self.header.source_set.id.clone(),
             last: -1,
+            reverse: false,
             page: VecDeque::new(),
             done: false,
         })
@@ -966,7 +1012,7 @@ impl ProofIdentities for StagedSide<'_> {
     fn proof(&self, proof_id: &str) -> Result<Option<ProofRef>> {
         if let Some(local) = &self.local_claims {
             self.ctx.charge(1)?;
-            return Ok(local.by_proof.get(proof_id).map(|&index| {
+            return Ok(local.by_proof.get(proof_id).map(|&(index, _)| {
                 let claim = &local.claims[index];
                 ProofRef {
                     language: claim.language.clone(),
@@ -1041,7 +1087,7 @@ impl<'a> JoinStore for StagedSide<'a> {
         let claim = local
             .by_proof
             .get(proof)
-            .map(|&index| &local.claims[index])
+            .map(|&(index, _)| &local.claims[index])
             .ok_or(ScipCaptureError::MissingProof)?;
         if claim.envelope.record_kind != kind || claim.fact_digest != digest {
             return Err(ScipCaptureError::MissingProof.into());
@@ -1133,12 +1179,6 @@ fn language_of(name: &str) -> Result<semantic::Language> {
     Ok(serde_json::from_value(serde_json::json!(name))?)
 }
 
-/// The evidence kind's discriminant, which follows its declared (`Ord`) order, so ordering by
-/// `(derived_from, kind_rank)` is the contract's (raw ID, evidence kind) provenance order.
-fn kind_rank(kind: semantic::EvidenceKind) -> i64 {
-    kind as i64
-}
-
 /// The captured basis of a document, from the batch header and the document's artifact (§4.4 e).
 struct StagedBasis<'a> {
     conn: &'a Connection,
@@ -1193,12 +1233,36 @@ impl BasisFor for StagedBasis<'_> {
     }
 }
 
-/// Streams the revision's inventory once into `nat_docs` and `nat_declarations`: the identity
-/// and name checks the rejoin needs about declarations of documents it is not reading.
-fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bool) -> Result<()> {
+/// Streams the revision's inventory once into `nat_docs` and, with `declarations`, every
+/// declaration's name status into `nat_declarations`: the identity and name checks the rejoin
+/// needs about declarations of documents it is not reading. The captured revision skips the
+/// declarations: settlement only asks it about exact-definition targets, whose status captured
+/// discovery writes from the document group it already holds.
+fn native_pass(
+    ctx: &JoinCtx<'_>,
+    reader: &NativeReader<'_>,
+    rev: u8,
+    mutate: bool,
+    declarations: bool,
+) -> Result<()> {
     let conn = ctx.conn;
-    if exists(conn, "SELECT 1 FROM nat_done WHERE rev=?1", &[&rev])? {
-        return Ok(());
+    // A pass without declarations (a shared pin's captured revision) does not satisfy a later
+    // attempt that needs them: that attempt streams the revision again in full.
+    let done: Option<bool> = conn
+        .query_row(
+            "SELECT declarations FROM nat_done WHERE rev=?1",
+            [rev],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match done {
+        Some(full) if full || !declarations => return Ok(()),
+        Some(_) => {
+            for table in ["nat_docs", "nat_declarations", "nat_done"] {
+                conn.execute(&format!("DELETE FROM {table} WHERE rev=?1"), [rev])?;
+            }
+        }
+        None => {}
     }
     conn.execute_batch("BEGIN")?;
     let outcome = (|| -> Result<()> {
@@ -1216,6 +1280,10 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
                     document.content_hash,
                     document.byte_length as i64
                 ])?;
+            if !declarations {
+                ord += 1;
+                continue;
+            }
             let mut reservation =
                 ctx.reserve_native(reader.document_reservation_bytes(&document)?)?;
             let mut rows = reader.join_document(&document)?;
@@ -1225,7 +1293,7 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
                     .apply(&mut rows.declarations, &mut rows.references);
             }
             let text = std::str::from_utf8(&rows.source).context("non-UTF8 native source")?;
-            for declaration in &rows.declarations {
+            for (n, declaration) in rows.declarations.iter().enumerate() {
                 ctx.row("nat_declarations")?;
                 let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
                     text.get(range.start..range.end) == declaration.name.as_deref()
@@ -1234,15 +1302,18 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
                     .execute(params![
                         rev,
                         ord,
-                        declaration.syntax_id,
-                        declaration.name_range.as_ref().map(|r| r.start as i64),
-                        declaration.name_range.as_ref().map(|r| r.end as i64),
+                        codec::sid(&declaration.syntax_id),
+                        i64::try_from(n)?,
+                        declaration.name_range.is_some(),
                         name_ok
                     ])?;
             }
             ord += 1;
         }
-        conn.execute("INSERT INTO nat_done VALUES(?1)", [rev])?;
+        conn.execute(
+            "INSERT INTO nat_done VALUES(?1,?2)",
+            params![rev, declarations],
+        )?;
         Ok(())
     })();
     match outcome {
@@ -1260,11 +1331,31 @@ fn native_pass(ctx: &JoinCtx<'_>, reader: &NativeReader<'_>, rev: u8, mutate: bo
     }
 }
 
+/// Runs one pass in a single stage transaction. The stage has no journal, so a failed pass
+/// commits what it wrote rather than rolling back; the next attempt clears every join table.
+fn in_transaction<T>(conn: &Connection, pass: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("BEGIN")?;
+    let result = pass();
+    let committed = conn.execute_batch("COMMIT");
+    if committed.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    let value = result?;
+    committed?;
+    Ok(value)
+}
+
 /// Clears the destination-dependent tables when the destination differs from the last attempt.
 fn reset_for_destination(conn: &Connection, destination: IndexPin) -> Result<i64> {
     for table in JOIN_TABLES {
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
+    // A shared pin's captured discovery rewrites its target status every attempt.
+    conn.execute(
+        "DELETE FROM nat_declarations WHERE rev=0 AND EXISTS \
+         (SELECT 1 FROM nat_done WHERE rev=0 AND declarations=0)",
+        [],
+    )?;
     let generation = destination.index_generation.to_string();
     let previous: Option<(String, i64)> = conn
         .query_row("SELECT generation, revision FROM join_state", [], |row| {
@@ -1316,6 +1407,10 @@ struct StagedJoin<'a> {
     validator: EmissionValidator<'a>,
     basis: StagedBasis<'a>,
     emitted: Cell<[i64; 7]>,
+    /// Set after eligibility when a document's destination join must equal its captured join:
+    /// a shared pin, and every document with claims eligible, so the eligible view of the
+    /// captured global rows is all of them.
+    identical_joins: Cell<bool>,
     identity_kind: &'static str,
     descriptor_sha256: &'a str,
 }
@@ -1349,6 +1444,11 @@ const UNLISTED_CLAIM_DOCUMENT_SQL: &str = "SELECT 1 FROM sources s WHERE EXISTS 
     (SELECT 1 FROM claims c WHERE c.source_ord=s.ord) AND NOT EXISTS (SELECT 1 FROM nat_docs d \
     WHERE d.rev=0 AND d.language=s.language AND d.path=s.path) LIMIT 1";
 
+/// A captured document with claims that is not eligible: its global rows leave the eligible
+/// view of a shared pin.
+const INELIGIBLE_CLAIM_DOCUMENT_SQL: &str = "SELECT 1 FROM w_docs w WHERE (w.eligible=0 OR w.failed=1) \
+    AND EXISTS (SELECT 1 FROM claims c WHERE c.source_ord=w.source_ord) LIMIT 1";
+
 const DOCUMENT_FLAGS_SQL: &str = "SELECT w.requested, w.failed, w.eligible, w.unsupported, \
     w.unsupported_claims, w.claims, c.exclusion FROM sources s LEFT JOIN w_docs w ON \
     w.source_ord=s.ord LEFT JOIN coverage c ON c.source_ord=s.ord WHERE s.language=?1 AND s.path=?2";
@@ -1364,6 +1464,11 @@ impl StagedJoin<'_> {
 
     fn destination_id(&self) -> &str {
         &self.destination_header.revision.id
+    }
+
+    /// The `out_coverage.ord` of the document being settled: its coverage row follows its facts.
+    fn current_document(&self) -> i64 {
+        self.emitted.get()[COVERAGE]
     }
 
     fn next_ord(&self, table: usize) -> i64 {
@@ -1395,12 +1500,12 @@ impl StagedJoin<'_> {
     ) -> Result<Vec<(bool, bool)>> {
         self.ctx.charge(1)?;
         let mut statement = self.conn().prepare_cached(
-            "SELECT n.name_start IS NOT NULL, n.name_ok FROM nat_declarations n JOIN nat_docs d \
+            "SELECT n.named, n.name_ok FROM nat_declarations n JOIN nat_docs d \
              ON d.rev=n.rev AND d.ord=n.doc_ord WHERE n.rev=?1 AND d.language=?2 AND d.path=?3 AND n.syntax_id=?4",
         )?;
         Ok(statement
             .query_map(
-                params![rev, document.language, document.path, syntax_id],
+                params![rev, document.language, document.path, codec::sid(syntax_id)],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?
             .collect::<rusqlite::Result<_>>()?)
@@ -1436,7 +1541,8 @@ impl StagedJoin<'_> {
         if exists(self.conn(), UNLISTED_CLAIM_DOCUMENT_SQL, &[])? {
             anyhow::bail!("missing admitted claim document");
         }
-        for document in self.captured.documents() {
+        // Each document's decision is independent of the others, so the order is free.
+        for document in self.captured.documents_reversed() {
             let document = document?;
             self.ctx.check_cancel()?;
             let mut flags = DocFlags::default();
@@ -1849,8 +1955,14 @@ impl StagedJoin<'_> {
         let body = to_json(&row)?;
         self.emit(
             "out_coverage",
-            "INSERT INTO out_coverage VALUES(?1,?2,?3,?4)",
-            &[&self.next_ord(COVERAGE), &doc.language, &doc.path, &body],
+            "INSERT INTO out_coverage VALUES(?1,?2,?3,?4,?5)",
+            &[
+                &self.next_ord(COVERAGE),
+                &doc.language,
+                &doc.path,
+                &body,
+                &outcome.provenance,
+            ],
         )?;
         // [requested, matched, skipped, ambiguous, unsupported]; every claim without a settled
         // outcome is skipped, and a failed document skips all of its claims.
@@ -1892,13 +2004,34 @@ impl StagedJoin<'_> {
     fn run(&self) -> Result<serde_json::Value> {
         let encoding = self.admitted_encoding;
         self.ctx.pass("native");
-        let captured = streaming::discover_side(&self.captured, encoding)?;
+        let captured = in_transaction(self.conn(), || {
+            streaming::discover_side(
+                &self.captured,
+                encoding,
+                self.destination.rev == self.captured.rev,
+            )
+        })?;
         self.ctx.pass("captured discovery");
-        self.eligibility(&captured)?;
+        in_transaction(self.conn(), || self.eligibility(&captured))?;
         self.ctx.pass("eligibility");
-        let destination = streaming::discover_side(&self.filtered, encoding)?;
+        // With a shared pin both sides read the same native revision without destination
+        // edits, and every global row stems from one claim's own document. Discovery over the
+        // eligible claims would therefore write exactly the captured rows of eligible owner
+        // documents: the eligible view of side 0 is that context, and no side-1 rows exist.
+        // No known producer input leaves a document with claims ineligible on a shared pin
+        // (that needs duplicate native anchors), so the filtering view is a fallback that only
+        // a unit test exercises; the common case reuses the captured join.
+        let destination = if self.destination.rev == self.captured.rev {
+            self.identical_joins
+                .set(!exists(self.conn(), INELIGIBLE_CLAIM_DOCUMENT_SQL, &[])?);
+            captured.eligible_view()?
+        } else {
+            in_transaction(self.conn(), || {
+                streaming::discover_side(&self.filtered, encoding, false)
+            })?
+        };
         self.ctx.pass("destination discovery");
-        let tallies = self.settle(&captured, &destination)?;
+        let tallies = in_transaction(self.conn(), || self.settle(&captured, &destination))?;
         self.ctx.pass("settlement");
         #[cfg(feature = "test-support")]
         crate::semantic_batch::testing::run_before_closure_hook(self.conn());
@@ -1934,16 +2067,18 @@ impl StagedJoin<'_> {
             anyhow::ensure!(
                 count(&format!(
                     "SELECT COUNT(*) FROM {table} o WHERE NOT EXISTS \
-                     (SELECT 1 FROM out_provenance p WHERE p.provenance_id=o.provenance_id)"
+                     (SELECT 1 FROM out_provenance p WHERE p.id=o.provenance_id AND p.doc=o.doc)"
                 ))? == 0,
                 "semantic row without provenance"
             );
         }
+        // A provenance row derives from a staged claim of its own coverage document.
         anyhow::ensure!(
             count(
-                "SELECT COUNT(*) FROM out_provenance o WHERE o.derived_from IS NOT NULL AND NOT EXISTS \
-                 (SELECT 1 FROM claims c WHERE c.proof_id=o.derived_from AND c.record_kind=o.derived_kind \
-                  AND c.fact_digest=o.derived_digest)"
+                "SELECT COUNT(*) FROM out_provenance o LEFT JOIN claims c ON c.claim_id=o.claim_id \
+                 LEFT JOIN sources s ON s.ord=c.source_ord LEFT JOIN out_coverage v ON v.ord=o.doc \
+                 WHERE s.ord IS NULL OR v.ord IS NULL OR s.language<>v.language OR s.path<>v.path \
+                 OR o.kind NOT IN (0,1,2,3)"
             )? == 0,
             "derived provenance without staged claim"
         );
@@ -1965,22 +2100,22 @@ impl StagedJoin<'_> {
             ),
             (
                 "SELECT COUNT(*) FROM (SELECT 1 FROM out_symbols s JOIN out_provenance p \
-                 ON p.provenance_id=s.provenance_id \
-                 GROUP BY p.artifact, json_extract(s.body,'$.key') HAVING COUNT(*)>1)",
+                 ON p.id=s.provenance_id JOIN claims c ON c.claim_id=p.claim_id \
+                 GROUP BY c.artifact, json_extract(s.body,'$.key') HAVING COUNT(*)>1)",
                 "duplicate semantic symbol key",
             ),
             (
                 "SELECT COUNT(*) FROM out_provenance p WHERE NOT EXISTS (SELECT 1 FROM out_coverage c \
-                 WHERE c.language=json_extract(p.body,'$.document.language') \
-                 AND c.path=json_extract(p.body,'$.document.path') \
+                 WHERE c.ord=p.doc AND c.provenance IS NOT NULL \
                  AND json_extract(c.body,'$.state') IN ('complete','partial'))",
                 "proof on non-fact-bearing coverage",
             ),
             (
-                "SELECT COUNT(*) FROM out_provenance p WHERE NOT EXISTS (SELECT 1 FROM nat_docs d \
-                 WHERE d.rev=0 AND d.language=json_extract(p.body,'$.document.language') \
-                 AND d.path=json_extract(p.body,'$.document.path') \
-                 AND d.content_hash=json_extract(p.body,'$.contentHash'))",
+                "SELECT COUNT(*) FROM out_coverage c WHERE c.provenance IS NOT NULL AND NOT EXISTS \
+                 (SELECT 1 FROM nat_docs d WHERE d.rev=0 AND d.language=c.language AND d.path=c.path \
+                 AND json_extract(c.provenance,'$.document.language')=c.language \
+                 AND json_extract(c.provenance,'$.document.path')=c.path \
+                 AND d.content_hash=json_extract(c.provenance,'$.contentHash'))",
                 "captured proof document hash mismatch",
             ),
         ] {
@@ -2166,9 +2301,13 @@ pub fn join_staged(
             let captured_header = captured.header()?;
             let destination_header = destination_reader.header()?;
             let descriptor = parts.descriptor;
-            native_pass(&ctx, captured, 0, false)?;
+            // With a shared pin the captured revision is also the destination, and settlement
+            // asks it only about exact-definition targets: captured discovery writes their
+            // status. A changed destination can ask the captured revision about targets its
+            // own discovery found, so both revisions then keep their full status.
+            native_pass(&ctx, captured, 0, false, !shared)?;
             if !shared {
-                native_pass(&ctx, destination_reader, 1, !ctx.mutations.is_empty())?;
+                native_pass(&ctx, destination_reader, 1, !ctx.mutations.is_empty(), true)?;
             }
             let destination_rev = if shared { 0 } else { 1 };
             let side = |reader, header, rev, side, filtered| StagedSide {
@@ -2222,6 +2361,7 @@ pub fn join_staged(
                     captured: &captured_header.revision,
                 },
                 emitted: Cell::new([0; 7]),
+                identical_joins: Cell::new(false),
                 identity_kind: descriptor.producer.identity_kind.as_str(),
                 descriptor_sha256: parts.descriptor_sha256,
             };

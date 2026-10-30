@@ -5720,6 +5720,26 @@ fn semantic_target_values(
     })
 }
 
+/// `Connection::execute` through the statement cache: the semantic writers run the same few
+/// statements once per row of every publication.
+fn execute_cached(
+    db: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<usize> {
+    db.prepare_cached(sql)?.execute(params)
+}
+
+/// `Connection::query_row` through the statement cache.
+fn query_row_cached<T>(
+    db: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    map: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    db.prepare_cached(sql)?.query_row(params, map)
+}
+
 fn insert_semantic_target(
     db: &Connection,
     table: &str,
@@ -5732,7 +5752,8 @@ fn insert_semantic_target(
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(",");
-    db.execute(
+    execute_cached(
+        db,
         &format!("INSERT INTO {table} VALUES({placeholders})"),
         rusqlite::params_from_iter(values),
     )?;
@@ -7419,14 +7440,29 @@ fn write_import_coverage(
             .iter()
             .find(|p| p.id == coverage.producer_id)
             .context("missing semantic producer")?;
-        db.execute("INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![key,coverage.producer_id,producer.version,semantic_variant(&coverage.language)?,coverage.document_path,coverage.requested,coverage.selected,semantic_variant(&coverage.state)?,coverage.diagnostic])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_coverage(revision_id,producer_id,producer_version,language,path,requested,selected,state,diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                key,
+                coverage.producer_id,
+                producer.version,
+                semantic_variant(&coverage.language)?,
+                coverage.document_path,
+                coverage.requested,
+                coverage.selected,
+                semantic_variant(&coverage.state)?,
+                coverage.diagnostic
+            ],
+        )?;
         let tuple = db.last_insert_rowid();
         for (kind, roles) in [
             ("supported", &coverage.supported_roles),
             ("observed", &coverage.observed_roles),
         ] {
             for (ordinal, role) in roles.iter().enumerate() {
-                db.execute(
+                execute_cached(
+                    db,
                     "INSERT INTO semantic_coverage_roles VALUES(?1,?2,?3,?4)",
                     params![tuple, kind, ordinal as i64, semantic_variant(role)?],
                 )?;
@@ -7551,8 +7587,6 @@ fn fill_capture_blob(
 const RAW_DOCUMENTS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_documents SELECT m.capture_id,s.language,s.path,s.content_hash,d.wire_digest FROM stage.documents d CROSS JOIN stage.sources s ON s.ord=d.source_ord CROSS JOIN capture_ids m ON m.ordinal=d.artifact ORDER BY d.source_ord";
 const RAW_EXCLUSIONS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_exclusions SELECT ?1,s.language,s.path,c.exclusion FROM stage.coverage c JOIN stage.sources s ON s.ord=c.source_ord WHERE c.exclusion IS NOT NULL ORDER BY c.source_ord";
 const RAW_PROOFS_SQL: &str = "INSERT OR IGNORE INTO semantic_raw_proofs SELECT m.capture_id,c.proof_id,c.record_kind,c.fact_digest,s.language,s.path,c.canonical_bytes FROM stage.claims c CROSS JOIN stage.sources s ON s.ord=c.source_ord CROSS JOIN capture_ids m ON m.ordinal=c.artifact ORDER BY c.claim_id";
-const STAGED_DOCUMENT: &str =
-    "json_extract(body,'$.document.language')=?1 AND json_extract(body,'$.document.path')=?2";
 
 fn with_capture_ids(values: &str, statement: &str) -> String {
     format!("WITH capture_ids(ordinal,capture_id) AS (VALUES {values}) {statement}")
@@ -7566,25 +7600,11 @@ pub fn batch_publication_statements_for_tests() -> Vec<String> {
         with_capture_ids("(0,1)", RAW_DOCUMENTS_SQL),
         RAW_EXCLUSIONS_SQL.to_owned(),
         with_capture_ids("(0,1)", RAW_PROOFS_SQL),
-        format!("SELECT body FROM stage.out_provenance WHERE {STAGED_DOCUMENT} ORDER BY ord"),
     ];
-    statements.extend(
-        [
-            "out_symbols",
-            "out_declaration_bindings",
-            "out_references",
-            "out_call_bindings",
-            "out_type_relationships",
-        ]
-        .map(staged_owned_rows_sql),
-    );
+    statements.extend(crate::semantic_import::staged_publication_statements(
+        "stage.",
+    ));
     statements
-}
-
-fn staged_owned_rows_sql(table: &str) -> String {
-    format!(
-        "SELECT body FROM stage.{table} WHERE provenance_id IN (SELECT provenance_id FROM stage.out_provenance WHERE {STAGED_DOCUMENT}) ORDER BY ord"
-    )
 }
 
 /// Writes the batch row, one capture per staged artifact, and the document, exclusion and proof
@@ -7659,61 +7679,26 @@ fn write_staged_raw_rows(
     Ok(batch_id)
 }
 
-/// Streams the staged `out_*` rows into the semantic tables one coverage tuple at a time: each
-/// tuple's rows are read through the document and provenance indexes, so memory is bounded by
-/// one document and the rows match what the in-memory writer produces.
+/// Streams the staged `out_*` rows into the semantic tables one coverage tuple at a time:
+/// each family is read by one cursor in emission order, so memory is bounded by one document
+/// and the rows match what the in-memory writer produces.
 fn write_staged_semantic(
     db: &Connection,
     key: &str,
     producer: &crate::semantic_evidence::Producer,
     gate: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
-    use crate::semantic_evidence as sem;
-    fn rows<T: serde::de::DeserializeOwned>(
-        statement: &mut rusqlite::Statement<'_>,
-        params: impl rusqlite::Params,
-    ) -> Result<Vec<T>> {
-        let bodies = statement
-            .query_map(params, |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        bodies
-            .iter()
-            .map(|body| serde_json::from_str(body).context("staged output row"))
-            .collect()
-    }
-    let mut coverage_cursor = db.prepare("SELECT body FROM stage.out_coverage ORDER BY ord")?;
-    let mut provenance_query = db.prepare(&format!(
-        "SELECT body FROM stage.out_provenance WHERE {STAGED_DOCUMENT} ORDER BY ord"
-    ))?;
-    let owned = |table: &str| db.prepare(&staged_owned_rows_sql(table));
-    let mut symbols_query = owned("out_symbols")?;
-    let mut bindings_query = owned("out_declaration_bindings")?;
-    let mut references_query = owned("out_references")?;
-    let mut calls_query = owned("out_call_bindings")?;
-    let mut relationships_query = owned("out_type_relationships")?;
-    let coverage_bodies = coverage_cursor.query_map([], |row| row.get::<_, String>(0))?;
-    for (index, body) in coverage_bodies.enumerate() {
-        let coverage: sem::Coverage = serde_json::from_str(&body?).context("staged output row")?;
-        let key_params = params![
-            semantic_variant(&coverage.language)?,
-            coverage.document_path
-        ];
-        let publication = sem::SemanticPublication {
-            producers: vec![producer.clone()],
-            provenance: rows(&mut provenance_query, key_params)?,
-            symbols: rows(&mut symbols_query, key_params)?,
-            declaration_bindings: rows(&mut bindings_query, key_params)?,
-            references: rows(&mut references_query, key_params)?,
-            call_bindings: rows(&mut calls_query, key_params)?,
-            type_relationships: rows(&mut relationships_query, key_params)?,
-            coverage: vec![coverage],
-        };
+    // The tuple writers' statements, each target table's included, stay prepared.
+    db.set_prepared_statement_cache_capacity(64);
+    let mut index = 0u64;
+    crate::semantic_import::read_staged_documents(db, "stage.", producer, &mut |publication| {
         write_import_coverage(db, key, &publication)?;
         if index % 1000 == 999 {
             gate()?;
         }
-    }
-    Ok(())
+        index += 1;
+        Ok(())
+    })
 }
 
 /// Witness fast path over a stored batch (R18). `Ok(None)` sends the rejoin to the FULL path.
@@ -9498,14 +9483,28 @@ fn write_semantic_tuple(
         let basis_id = if let Some(&id) = basis_ids.get(&encoded) {
             id
         } else {
-            db.execute("INSERT INTO semantic_basis(tuple_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![
-                tuple,basis.producer_id,basis.producer_version,basis.producer_hash,basis.artifact_hash,
-                semantic_variant(&basis.language)?,basis.source_set_id,basis.revision_id,basis.source_manifest_hash,
-                basis.toolchain_hash,basis.config_hash,basis.dependency_hash,
-            ])?;
+            execute_cached(
+                db,
+                "INSERT INTO semantic_basis(tuple_id,producer_id,producer_version,producer_hash,artifact_hash,language,source_set_id,captured_native_revision_id,source_manifest_hash,toolchain_hash,config_hash,dependency_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    tuple,
+                    basis.producer_id,
+                    basis.producer_version,
+                    basis.producer_hash,
+                    basis.artifact_hash,
+                    semantic_variant(&basis.language)?,
+                    basis.source_set_id,
+                    basis.revision_id,
+                    basis.source_manifest_hash,
+                    basis.toolchain_hash,
+                    basis.config_hash,
+                    basis.dependency_hash,
+                ],
+            )?;
             let id = db.last_insert_rowid();
             for (ordinal, lookup) in basis.lookup_dependencies.iter().enumerate() {
-                db.execute(
+                execute_cached(
+                    db,
                     "INSERT INTO semantic_basis_lookup_dependencies VALUES(?1,?2,?3)",
                     params![id, ordinal as i64, lookup],
                 )?;
@@ -9515,14 +9514,38 @@ fn write_semantic_tuple(
         };
         let derived = proof.derived_from.as_ref();
         let capture_id: Option<i64> = if derived.is_some() {
-            Some(db.query_row("SELECT capture_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4", params![proof.producer_id,basis.artifact_hash,basis.source_set_id,basis.revision_id], |row| row.get(0))?)
+            Some(query_row_cached(
+                db,
+                "SELECT capture_id FROM semantic_raw_captures WHERE producer_id=?1 AND artifact_hash=?2 AND source_set_id=?3 AND captured_revision=?4",
+                params![
+                    proof.producer_id,
+                    basis.artifact_hash,
+                    basis.source_set_id,
+                    basis.revision_id
+                ],
+                |row| row.get(0),
+            )?)
         } else {
             None
         };
-        db.execute("INSERT INTO semantic_provenance(tuple_id,provenance_id,content_hash,evidence_kind,freshness,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![
-            tuple,proof.id,proof.content_hash,semantic_variant(&proof.evidence_kind)?,semantic_variant(&proof.freshness)?,basis_id,
-            capture_id,derived.map(|d| &d.provenance_id),derived.map(|d| semantic_variant(&d.record_kind)).transpose()?,derived.map(|d| &d.fact_digest),
-        ])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_provenance(tuple_id,provenance_id,content_hash,evidence_kind,freshness,basis_id,capture_id,derived_from_provenance_id,derived_from_record_kind,derived_from_fact_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                tuple,
+                proof.id,
+                proof.content_hash,
+                semantic_variant(&proof.evidence_kind)?,
+                semantic_variant(&proof.freshness)?,
+                basis_id,
+                capture_id,
+                derived.map(|d| &d.provenance_id),
+                derived
+                    .map(|d| semantic_variant(&d.record_kind))
+                    .transpose()?,
+                derived.map(|d| &d.fact_digest),
+            ],
+        )?;
         provenance.insert(proof.id.as_str());
     }
     let owns = |proof: &str| provenance.contains(proof);
@@ -9532,11 +9555,21 @@ fn write_semantic_tuple(
         .filter(|s| owns(&s.provenance_id))
         .enumerate()
     {
-        db.execute("INSERT INTO semantic_symbols(tuple_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![
-            tuple,ordinal as i64,semantic_variant(&symbol.key.scheme)?,symbol.key.symbol,semantic_variant(&symbol.key.scope)?,
-            symbol.key.document.as_ref().map(|d| d.language.as_str()),symbol.key.document.as_ref().map(|d| d.path.as_str()),
-            symbol.display_name,symbol.provenance_id,
-        ])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_symbols(tuple_id,ordinal,key_scheme,key_symbol,key_scope,key_document_language,key_document_path,display_name,provenance_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                tuple,
+                ordinal as i64,
+                semantic_variant(&symbol.key.scheme)?,
+                symbol.key.symbol,
+                semantic_variant(&symbol.key.scope)?,
+                symbol.key.document.as_ref().map(|d| d.language.as_str()),
+                symbol.key.document.as_ref().map(|d| d.path.as_str()),
+                symbol.display_name,
+                symbol.provenance_id,
+            ],
+        )?;
         let id = db.last_insert_rowid();
         for (ordinal, target) in symbol.declarations.iter().enumerate() {
             insert_semantic_target(
@@ -9554,14 +9587,35 @@ fn write_semantic_tuple(
         .enumerate()
     {
         let anchor = &binding.join.anchor;
-        db.execute("INSERT INTO semantic_declaration_bindings(tuple_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![
-            tuple,ordinal as i64,binding.syntax_id.as_ref().map(|id| id_codec::encode_sid(id).context("invalid semantic syntax ID").map(|b| b.to_vec())).transpose()?,binding.provenance_id,
-            anchor.document.language,anchor.document.path,anchor.revision_id,anchor.content_hash,anchor.range.start as i64,anchor.range.end as i64,
-            semantic_variant(&anchor.kind)?,semantic_variant(&binding.join.status)?,binding.join.diagnostic,
-        ])?;
+        execute_cached(
+            db,
+            "INSERT INTO semantic_declaration_bindings(tuple_id,ordinal,syntax_id,provenance_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                tuple,
+                ordinal as i64,
+                binding
+                    .syntax_id
+                    .as_ref()
+                    .map(|id| id_codec::encode_sid(id)
+                        .context("invalid semantic syntax ID")
+                        .map(|b| b.to_vec()))
+                    .transpose()?,
+                binding.provenance_id,
+                anchor.document.language,
+                anchor.document.path,
+                anchor.revision_id,
+                anchor.content_hash,
+                anchor.range.start as i64,
+                anchor.range.end as i64,
+                semantic_variant(&anchor.kind)?,
+                semantic_variant(&binding.join.status)?,
+                binding.join.diagnostic,
+            ],
+        )?;
         let id = db.last_insert_rowid();
         for (ordinal, key) in binding.symbols.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_declaration_binding_symbols VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     id,
@@ -9575,7 +9629,8 @@ fn write_semantic_tuple(
             )?;
         }
         for (ordinal, candidate) in binding.join.candidate_ids.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_declaration_join_candidates VALUES(?1,?2,?3)",
                 params![
                     id,
@@ -9616,7 +9671,8 @@ fn write_semantic_tuple(
             vec![rusqlite::types::Value::Null; 10]
         });
         values.push(reference.provenance_id.clone().into());
-        db.execute(
+        execute_cached(
+            db,
             &format!(
                 "INSERT INTO semantic_references VALUES({})",
                 (1..=values.len())
@@ -9627,7 +9683,8 @@ fn write_semantic_tuple(
             rusqlite::params_from_iter(values),
         )?;
         for (ordinal, role) in reference.roles.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_reference_roles VALUES(?1,?2,?3,?4)",
                 params![tuple, id, ordinal as i64, semantic_variant(role)?],
             )?;
@@ -9683,7 +9740,17 @@ fn write_semantic_tuple(
             binding.stale_target.map(|value| value as i64).into(),
             binding.provenance_id.clone().into(),
         ]);
-        db.execute(&format!("INSERT INTO semantic_call_bindings(tuple_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_id) VALUES({})",(1..=values.len()).map(|i|format!("?{i}")).collect::<Vec<_>>().join(",")),rusqlite::params_from_iter(values))?;
+        execute_cached(
+            db,
+            &format!(
+                "INSERT INTO semantic_call_bindings(tuple_id,ordinal,call_id,join_document_language,join_document_path,join_native_revision_id,join_content_hash,join_start,join_end,join_kind,join_status,join_diagnostic,resolution,declared_kind,declared_internal_syntax_id,declared_internal_language,declared_internal_path,declared_internal_native_revision_id,declared_external_scheme,declared_external_symbol,declared_external_scope,declared_external_language,declared_external_path,dispatch,possible_dispatch_complete,stale_target,provenance_id) VALUES({})",
+                (1..=values.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            rusqlite::params_from_iter(values),
+        )?;
         let id = db.last_insert_rowid();
         for (table, targets) in [
             ("semantic_call_candidates", &binding.candidates),
@@ -9697,7 +9764,8 @@ fn write_semantic_tuple(
             }
         }
         for (ordinal, candidate) in binding.join.candidate_ids.iter().enumerate() {
-            db.execute(
+            execute_cached(
+                db,
                 "INSERT INTO semantic_call_join_candidates VALUES(?1,?2,?3)",
                 params![
                     id,
@@ -9723,7 +9791,8 @@ fn write_semantic_tuple(
         values.extend(semantic_target_values(&relationship.source)?);
         values.extend(semantic_target_values(&relationship.target)?);
         values.push(relationship.provenance_id.clone().into());
-        db.execute(
+        execute_cached(
+            db,
             &format!(
                 "INSERT INTO semantic_type_relationships VALUES(NULL,{})",
                 (1..=values.len())
@@ -12375,6 +12444,8 @@ fn read_native_references(
     }
     let mut references = vec![];
     let mut ordinals = BTreeMap::<String, usize>::new();
+    // One document's references share one proof: digest it once, not per row.
+    let proof = scope.proof_id();
     for row in db.prepare("SELECT id,owner_syntax_id,ordinal,start_byte,end_byte,spelling,COALESCE(lookup_key,spelling) FROM native_version_references WHERE vid=?1 ORDER BY owner_syntax_id,ordinal")?
         .query_map([scope.vid], |r| Ok((stored_id_row(r, 0, true)?, stored_id_row(r, 1, false)?,
             r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)))? {
@@ -12388,7 +12459,7 @@ fn read_native_references(
             id, owner_syntax_id: reference_owner, ordinal: ordinal as usize,
             document: scope.key.clone(), revision_id: scope.native_revision_id.clone(),
             range: Range { start: start as usize, end: end as usize }, spelling, lookup_key,
-            provenance_id: scope.proof_id(),
+            provenance_id: proof.clone(),
         });
     }
     if let Some(owner) = owner {

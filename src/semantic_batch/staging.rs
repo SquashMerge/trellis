@@ -12,11 +12,21 @@ use std::{
 pub const STAGE_PREFIX: &str = "semantic-stage-";
 const STAGE_DB: &str = "stage.db";
 
-/// The join emits `out_*` one document at a time, so `ord` is document-major. Within one
-/// document each family is in contract order, which is all the per-document publisher reads.
-/// The global contract order of provenance (raw ID, then evidence kind) and of references
-/// (reference ID) is the key `(derived_from, kind_rank)` and `reference_id`. Nothing in
-/// production reads that global order, so no index is spent on the provenance key.
+/// `claims.symbol`/`presence` index each admitted claim's symbol presence: a symbol-information
+/// claim's symbol (`PRESENCE_INFORMATION`) and a definition occurrence's (`PRESENCE_DECLARED`),
+/// `NULL`/0 otherwise. A side's presence context is this index over its claim set.
+///
+/// Compact join tables. Documents are integers: `sources.ord` for `g_*` owners and local
+/// symbol scopes (`-1` for none), `nat_docs.ord` for native declarations, and the document's
+/// `out_coverage.ord` (`doc`) for every output row. Native syntax IDs and 64-hex provenance IDs
+/// are stored as their bytes when canonical, as text otherwise (`staged::codec`).
+///
+/// The join emits `out_*` one document at a time, so every table's `ord` is document-major and
+/// the publisher reads each family with one cursor in `ord` order. Within one document each
+/// family is in contract order. A document's shared provenance fields (document, revision,
+/// content hash, basis, freshness) are stored once, as a template on its coverage row; a
+/// provenance row holds only its raw claim, evidence kind and ID. Fact bodies store an empty
+/// `provenanceId`; the row's `provenance_id` column is authoritative.
 const STAGE_SCHEMA: &str = "
 CREATE TABLE header(singleton INTEGER PRIMARY KEY CHECK(singleton=1), descriptor_sha256 TEXT NOT NULL, descriptor_bytes BLOB NOT NULL);
 CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, UNIQUE(language,path));
@@ -24,40 +34,31 @@ CREATE TABLE coverage(source_ord INTEGER PRIMARY KEY REFERENCES sources(ord), ar
 CREATE INDEX coverage_artifact ON coverage(artifact, source_ord);
 CREATE TABLE artifacts(ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, language TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, byte_length INTEGER NOT NULL, documents INTEGER NOT NULL DEFAULT 0, claims INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE documents(source_ord INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, path TEXT NOT NULL, wire_digest TEXT NOT NULL, UNIQUE(artifact,path));
-CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, UNIQUE(artifact,fact_digest));
+CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, artifact INTEGER NOT NULL, source_ord INTEGER NOT NULL, record_kind TEXT NOT NULL, fact_digest TEXT NOT NULL, proof_id TEXT NOT NULL, canonical_bytes BLOB NOT NULL, symbol TEXT, presence INTEGER NOT NULL, UNIQUE(artifact,fact_digest));
 CREATE INDEX claims_order ON claims(source_ord, canonical_bytes);
 CREATE UNIQUE INDEX claims_proof ON claims(proof_id);
+CREATE INDEX claims_symbol ON claims(symbol, presence) WHERE symbol IS NOT NULL;
 CREATE TABLE join_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation TEXT NOT NULL, revision INTEGER NOT NULL, attempt INTEGER NOT NULL);
-CREATE TABLE nat_done(rev INTEGER PRIMARY KEY);
+CREATE TABLE nat_done(rev INTEGER PRIMARY KEY, declarations INTEGER NOT NULL);
 CREATE TABLE nat_docs(rev INTEGER NOT NULL, ord INTEGER NOT NULL, language TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_length INTEGER NOT NULL, PRIMARY KEY(rev, ord), UNIQUE(rev, language, path)) WITHOUT ROWID;
-CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id TEXT NOT NULL, name_start INTEGER, name_end INTEGER, name_ok INTEGER NOT NULL);
-CREATE INDEX nat_declarations_id ON nat_declarations(rev, doc_ord, syntax_id);
-CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_language TEXT NOT NULL, local_path TEXT NOT NULL, owner_language TEXT NOT NULL, owner_path TEXT NOT NULL, syntax_id TEXT NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_language,local_path,owner_language,owner_path,syntax_id)) WITHOUT ROWID;
-CREATE INDEX g_definitions_owner ON g_definitions(side,owner_language,owner_path,symbol,syntax_id);
-CREATE TABLE g_presence(side INTEGER NOT NULL, symbol TEXT NOT NULL, declared INTEGER NOT NULL, information INTEGER NOT NULL, PRIMARY KEY(side,symbol)) WITHOUT ROWID;
-CREATE TABLE g_methods(side INTEGER NOT NULL, ord INTEGER NOT NULL, symbol TEXT NOT NULL, local_language TEXT NOT NULL, local_path TEXT NOT NULL, owner_language TEXT NOT NULL, owner_path TEXT NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL, PRIMARY KEY(side,ord)) WITHOUT ROWID;
-CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_language,owner_path,ord);
-CREATE INDEX g_methods_target ON g_methods(side,symbol,local_language,local_path,ord);
+CREATE TABLE nat_declarations(rev INTEGER NOT NULL, doc_ord INTEGER NOT NULL, syntax_id BLOB NOT NULL, n INTEGER NOT NULL, named INTEGER NOT NULL, name_ok INTEGER NOT NULL, PRIMARY KEY(rev, doc_ord, syntax_id, n)) WITHOUT ROWID;
+CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID;
+CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL);
+CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_doc);
+CREATE INDEX g_methods_target ON g_methods(side,symbol,local_doc);
 CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, requested INTEGER NOT NULL, failed INTEGER NOT NULL, eligible INTEGER NOT NULL, unsupported INTEGER NOT NULL, unsupported_claims INTEGER NOT NULL, claims INTEGER NOT NULL);
-CREATE TABLE out_coverage(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL UNIQUE, artifact INTEGER, derived_from TEXT, derived_kind TEXT, derived_digest TEXT, kind_rank INTEGER NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_symbols(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_declaration_bindings(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_references(ord INTEGER PRIMARY KEY, reference_id TEXT NOT NULL UNIQUE, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_call_bindings(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, provenance_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE INDEX out_provenance_document ON out_provenance(json_extract(body,'$.document.language'), json_extract(body,'$.document.path'), ord);
-CREATE INDEX out_symbols_provenance ON out_symbols(provenance_id);
-CREATE INDEX out_declaration_bindings_provenance ON out_declaration_bindings(provenance_id);
-CREATE INDEX out_references_provenance ON out_references(provenance_id);
-CREATE INDEX out_call_bindings_provenance ON out_call_bindings(provenance_id);
-CREATE INDEX out_type_relationships_provenance ON out_type_relationships(provenance_id);
+CREATE TABLE out_coverage(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL, provenance TEXT);
+CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, claim_id INTEGER NOT NULL, kind INTEGER NOT NULL, id BLOB NOT NULL UNIQUE);
+CREATE TABLE out_symbols(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_declaration_bindings(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_references(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, reference_id TEXT NOT NULL UNIQUE, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_call_bindings(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
+CREATE TABLE out_type_relationships(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);
 ";
 
 /// Tables a join fills that depend on the destination revision. A new destination clears them all.
 pub const JOIN_TABLES: &[&str] = &[
     "g_definitions",
-    "g_presence",
     "g_methods",
     "w_docs",
     "out_coverage",
@@ -274,6 +275,31 @@ pub fn remove_abandoned_semantic_stages(index_dir: &Path) -> usize {
     removed
 }
 
+/// `claims.presence` bit of a definition occurrence's symbol.
+pub const PRESENCE_DECLARED: i64 = 1;
+/// `claims.presence` bit of a symbol-information claim's symbol.
+pub const PRESENCE_INFORMATION: i64 = 2;
+
+/// The symbol presence a claim contributes, as the join's discovery records it: the symbol of
+/// a symbol-information claim, and of an occurrence whose roles include the definition bit. A
+/// claim the join would reject (no symbol, invalid roles) contributes none; the join fails it.
+pub fn claim_presence(claim: &CapturedClaim) -> (Option<&str>, i64) {
+    let raw = &claim.envelope.raw;
+    match claim.envelope.record_kind.as_str() {
+        "symbolInformation" => match raw["symbol"].as_str() {
+            Some(symbol) => (Some(symbol), PRESENCE_INFORMATION),
+            None => (None, 0),
+        },
+        "occurrence" => match (raw["symbol"].as_str(), raw["symbolRoles"].as_u64()) {
+            (Some(symbol), Some(roles)) if !symbol.is_empty() && roles & 1 != 0 => {
+                (Some(symbol), PRESENCE_DECLARED)
+            }
+            _ => (None, 0),
+        },
+        _ => (None, 0),
+    }
+}
+
 /// Rebuilds a claim from its staged row.
 pub(crate) fn claim_from_stage(
     canonical_bytes: Vec<u8>,
@@ -450,9 +476,10 @@ impl ClaimSink for StageClaimSink<'_> {
             return Err(stage_storage());
         };
         let inserted = self.conn.prepare_cached(
-            "INSERT INTO claims(artifact, source_ord, record_kind, fact_digest, proof_id, canonical_bytes) \
-             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING",
+            "INSERT INTO claims(artifact, source_ord, record_kind, fact_digest, proof_id, canonical_bytes, symbol, presence) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT DO NOTHING",
         );
+        let (symbol, presence) = claim_presence(&claim);
         let changed = inserted.and_then(|mut statement| {
             statement.execute(params![
                 self.artifact,
@@ -460,7 +487,9 @@ impl ClaimSink for StageClaimSink<'_> {
                 claim.envelope.record_kind,
                 claim.fact_digest,
                 claim.captured_proof_id,
-                claim.canonical_bytes
+                claim.canonical_bytes,
+                symbol,
+                presence
             ])
         });
         if self.record(changed)? == 0 {

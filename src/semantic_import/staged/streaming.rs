@@ -4,28 +4,92 @@ use super::super::{
     JoinedFacts, discover_join_claim, emit_join_symbols, emit_type_relationships, join_occurrence,
     method_target_owner_matches, scoped_key, settle_join_references,
 };
+use super::codec;
 use super::*;
 
-const DEFINITIONS_SQL: &str = "SELECT owner_language,owner_path,syntax_id FROM g_definitions WHERE side=?1 \
-    AND symbol=?2 AND local_language=?3 AND local_path=?4 AND common_compatible=1 \
-    ORDER BY owner_language,owner_path,syntax_id";
-const TARGET_METHODS_SQL: &str = "SELECT body,body_bytes,decoded_bytes FROM g_methods WHERE side=?1 AND symbol=?2 AND local_language=?3 AND local_path=?4 ORDER BY ord";
-const SOURCE_METHODS_SQL: &str = "SELECT body,body_bytes,decoded_bytes FROM g_methods WHERE side=?1 AND symbol=?2 AND owner_language=?3 AND owner_path=?4 ORDER BY ord";
-const PRESENCE_SQL: &str =
-    "SELECT declared,information FROM g_presence WHERE side=?1 AND symbol=?2";
+/// The `sources.ord` of a local symbol's scope document, `-1` for a global symbol (`?3`,
+/// `?4` are its language and path, both empty for a global one).
+const LOCAL_DOC: &str =
+    "CASE WHEN ?4='' THEN -1 ELSE (SELECT ord FROM sources WHERE language=?3 AND path=?4) END";
+
+/// Restricts a query to rows whose owning document is eligible.
+fn eligible(sql: &str, owner: &str, filtered: bool) -> String {
+    if filtered {
+        format!(
+            "{sql} AND EXISTS (SELECT 1 FROM w_docs w WHERE w.source_ord={owner} \
+             AND w.eligible=1 AND w.failed=0)"
+        )
+    } else {
+        sql.to_owned()
+    }
+}
+
+fn definitions_sql(filtered: bool) -> String {
+    eligible(
+        &format!(
+            "SELECT s.language, s.path, g.syntax_id FROM g_definitions g JOIN sources s ON s.ord=g.owner_doc \
+             WHERE g.side=?1 AND g.symbol=?2 AND g.local_doc={LOCAL_DOC} AND g.common_compatible=1"
+        ),
+        "g.owner_doc",
+        filtered,
+    )
+}
+
+fn methods_sql(target: bool, filtered: bool) -> String {
+    let key = if target {
+        format!("local_doc={LOCAL_DOC}")
+    } else {
+        "owner_doc=(SELECT ord FROM sources WHERE language=?3 AND path=?4)".to_owned()
+    };
+    format!(
+        "{} ORDER BY ord",
+        eligible(
+            &format!(
+                "SELECT body,body_bytes,decoded_bytes FROM g_methods WHERE side=?1 AND symbol=?2 AND {key}"
+            ),
+            "owner_doc",
+            filtered,
+        )
+    )
+}
+
+/// Presence is a function of the claim set alone, so it is read from the admitted claims'
+/// presence index: all of them for the captured side, the eligible ones for the destination.
+/// One keyed probe per presence bit (`?2`), whatever the number of claims naming the symbol.
+fn presence_sql(filtered: bool) -> String {
+    format!(
+        "{} LIMIT 1",
+        eligible(
+            "SELECT 1 FROM claims WHERE symbol=?1 AND presence=?2",
+            "claims.source_ord",
+            filtered,
+        )
+    )
+}
+
 /// Captured exact-definition membership of a raw symbol, in any document or scope.
 const CAPTURED_SYMBOL_SQL: &str = "SELECT 1 FROM g_definitions WHERE side=0 AND symbol=?1 LIMIT 1";
 
 #[cfg(feature = "test-support")]
-pub(super) fn cursor_sql() -> [&'static str; 3] {
-    [DEFINITIONS_SQL, TARGET_METHODS_SQL, SOURCE_METHODS_SQL]
+pub(super) fn cursor_sql() -> Vec<String> {
+    let mut queries = vec![];
+    for filtered in [false, true] {
+        queries.push(definitions_sql(filtered));
+        queries.push(methods_sql(true, filtered));
+        queries.push(methods_sql(false, filtered));
+        queries.push(presence_sql(filtered));
+    }
+    queries
 }
 
 /// The completed global context of one side: exact definitions, symbol presence and measured
-/// methods in `g_*`, queried by key one row at a time.
+/// methods in `g_*`, queried by key one row at a time. With `filtered`, the context is the
+/// rows of `side` whose owning document is eligible: for a shared pin, the eligible
+/// destination context is exactly that restriction of the captured one (see `StagedJoin::run`).
 pub(super) struct CompletedGlobal<'a> {
     ctx: &'a JoinCtx<'a>,
     side: u8,
+    filtered: bool,
     source_set_id: String,
     _source_reservation: Reservation,
 }
@@ -56,7 +120,22 @@ fn push_reserved<T>(
     Ok(())
 }
 
-impl CompletedGlobal<'_> {
+impl<'a> CompletedGlobal<'a> {
+    fn new(ctx: &'a JoinCtx<'a>, side: u8, filtered: bool, source_set_id: &str) -> Result<Self> {
+        Ok(Self {
+            ctx,
+            side,
+            filtered,
+            _source_reservation: ctx.live.reserve(source_set_id.len() as u64)?,
+            source_set_id: source_set_id.to_owned(),
+        })
+    }
+
+    /// The restriction of this context to the rows of eligible owner documents.
+    pub(super) fn eligible_view(&self) -> Result<CompletedGlobal<'a>> {
+        Self::new(self.ctx, self.side, true, &self.source_set_id)
+    }
+
     /// One query over the matching methods; each row is charged and admitted before decode.
     fn methods(
         &self,
@@ -71,12 +150,8 @@ impl CompletedGlobal<'_> {
         } else {
             (document.language.as_str(), document.path.as_str())
         };
-        let sql = if target {
-            TARGET_METHODS_SQL
-        } else {
-            SOURCE_METHODS_SQL
-        };
-        let mut statement = self.ctx.conn.prepare_cached(sql)?;
+        let sql = methods_sql(target, self.filtered);
+        let mut statement = self.ctx.conn.prepare_cached(&sql)?;
         let mut rows = statement.query(params![self.side, symbol, language, path])?;
         let mut result = Vec::new();
         reserve(std::mem::size_of::<Vec<MethodSummary>>() as u64)?;
@@ -121,7 +196,8 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
     ) -> Result<Vec<(native::DocumentKey, String)>> {
         self.ctx.charge(1)?;
         let (language, path) = local_columns(key);
-        let mut statement = self.ctx.conn.prepare_cached(DEFINITIONS_SQL)?;
+        let sql = definitions_sql(self.filtered);
+        let mut statement = self.ctx.conn.prepare_cached(&sql)?;
         let mut rows = statement.query(params![self.side, key.0, language, path])?;
         let mut result = Vec::new();
         reserve(std::mem::size_of::<Vec<(native::DocumentKey, String)>>() as u64)?;
@@ -131,7 +207,7 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
                 self.source_set_id.len() as u64,
                 row.get_ref(0)?.as_str()?.len() as u64,
                 row.get_ref(1)?.as_str()?.len() as u64,
-                row.get_ref(2)?.as_str()?.len() as u64,
+                codec::sid_len(row.get_ref(2)?)?,
             ])?;
             push_reserved(&mut result, bytes, reserve, || {
                 Ok((
@@ -140,23 +216,25 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
                         language: row.get(0)?,
                         path: row.get(1)?,
                     },
-                    row.get(2)?,
+                    codec::sid_text(row.get_ref(2)?)?,
                 ))
             })?;
         }
+        // Owners are stored by ordinal; the lookup's order stays (language, path, syntax ID).
+        result.sort_unstable_by(|a, b| {
+            (&a.0.language, &a.0.path, &a.1).cmp(&(&b.0.language, &b.0.path, &b.1))
+        });
         Ok(result)
     }
     fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
-        self.ctx.charge(1)?;
-        Ok(self
-            .ctx
-            .conn
-            .prepare_cached(PRESENCE_SQL)?
-            .query_row(params![self.side, symbol], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()?
-            .unwrap_or_default())
+        use crate::semantic_batch::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION};
+        // Side 1 is always the eligible claim set.
+        let sql = presence_sql(self.filtered || self.side == 1);
+        let probe = |bit: i64| -> Result<bool> {
+            self.ctx.charge(1)?;
+            exists(self.ctx.conn, &sql, &[&symbol, &bit])
+        };
+        Ok((probe(PRESENCE_DECLARED)?, probe(PRESENCE_INFORMATION)?))
     }
     fn source_methods(
         &self,
@@ -175,17 +253,69 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
         self.methods(document, symbol, true, reserve)
     }
 }
+
+/// Writes one side's exact definitions and methods. Presence needs no write: the admitted
+/// claims' presence index already holds it (`claim_presence`). `targets` collects the current
+/// document's exact-definition syntax IDs, the only declarations of the captured revision
+/// whose name status settlement ever asks for.
 struct GlobalWriter<'a> {
     global: CompletedGlobal<'a>,
-    methods: i64,
+    targets: BTreeSet<String>,
+    targets_reservation: Reservation,
+}
+
+impl GlobalWriter<'_> {
+    /// Writes the captured name status (`nat_declarations` rev 0) of the current document's
+    /// exact-definition targets, from its loaded native group, and ends the document.
+    fn captured_declarations(
+        &mut self,
+        store: &StagedSide<'_>,
+        document: &native::DocumentKey,
+    ) -> Result<()> {
+        let targets = std::mem::take(&mut self.targets);
+        // The moved set keeps its charge until this function drops it.
+        let _targets_charge = std::mem::replace(
+            &mut self.targets_reservation,
+            self.global.ctx.live.reserve(0)?,
+        );
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let group = store
+            .borrowed_group(document)?
+            .context("missing native document")?;
+        let (ord, _) = store
+            .doc_row(document)?
+            .context("missing native document")?;
+        for (n, declaration) in group.native.declarations.iter().enumerate() {
+            if !targets.contains(&declaration.syntax_id) {
+                continue;
+            }
+            self.global.ctx.row("nat_declarations")?;
+            let name_ok = declaration.name_range.as_ref().is_some_and(|range| {
+                group.text.get(range.start..range.end) == declaration.name.as_deref()
+            });
+            self.global
+                .ctx
+                .conn
+                .prepare_cached("INSERT INTO nat_declarations VALUES(?1,?2,?3,?4,?5,?6)")?
+                .execute(params![
+                    store.rev,
+                    ord,
+                    codec::sid(&declaration.syntax_id),
+                    i64::try_from(n)?,
+                    declaration.name_range.is_some(),
+                    name_ok
+                ])?;
+        }
+        Ok(())
+    }
 }
 
 impl GlobalDiscoverySink for GlobalWriter<'_> {
     fn symbol_presence(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
-        self.global.ctx.row("g_presence")?;
-        self.global.ctx.conn.prepare_cached(
-            "INSERT INTO g_presence VALUES(?1,?2,?3,?4) ON CONFLICT(side,symbol) DO UPDATE SET declared=MAX(declared,excluded.declared),information=MAX(information,excluded.information)",
-        )?.execute(params![self.global.side,symbol,declared,information])?;
+        // The claim's admitted row already records this presence.
+        let _ = (symbol, declared, information);
         Ok(())
     }
     fn exact_definition(
@@ -196,10 +326,18 @@ impl GlobalDiscoverySink for GlobalWriter<'_> {
         common_compatible: bool,
     ) -> Result<()> {
         let (language, path) = local_columns(&key);
+        if !self.targets.contains(&syntax_id) {
+            self.targets_reservation.grow(sizes::sum(&[
+                sizes::map_entries::<String, ()>(1)?,
+                syntax_id.len() as u64,
+            ])?)?;
+            self.targets.insert(syntax_id.clone());
+        }
         self.global.ctx.row("g_definitions")?;
-        self.global.ctx.conn.prepare_cached(
-            "INSERT INTO g_definitions VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(side,symbol,local_language,local_path,owner_language,owner_path,syntax_id) DO UPDATE SET common_compatible=MAX(common_compatible,excluded.common_compatible)",
-        )?.execute(params![self.global.side,key.0,language,path,document.language,document.path,syntax_id,common_compatible])?;
+        self.global.ctx.conn.prepare_cached(&format!(
+            "INSERT INTO g_definitions VALUES(?1,?2,{LOCAL_DOC},(SELECT ord FROM sources WHERE language=?5 AND path=?6),?7,?8) \
+             ON CONFLICT(side,symbol,local_doc,owner_doc,syntax_id) DO UPDATE SET common_compatible=MAX(common_compatible,excluded.common_compatible)",
+        ))?.execute(params![self.global.side,key.0,language,path,document.language,document.path,codec::sid(&syntax_id),common_compatible])?;
         Ok(())
     }
 }
@@ -264,10 +402,12 @@ impl GlobalWriter<'_> {
         self.global
             .ctx
             .conn
-            .prepare_cached("INSERT INTO g_methods VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")?
+            .prepare_cached(&format!(
+                "INSERT INTO g_methods(side,symbol,local_doc,owner_doc,body,body_bytes,decoded_bytes) \
+                 VALUES(?1,?2,{LOCAL_DOC},(SELECT ord FROM sources WHERE language=?5 AND path=?6),?7,?8,?9)"
+            ))?
             .execute(params![
                 self.global.side,
-                self.methods,
                 symbol,
                 language,
                 path,
@@ -277,7 +417,6 @@ impl GlobalWriter<'_> {
                 i64::try_from(body_bytes)?,
                 i64::try_from(decoded_bytes)?,
             ])?;
-        self.methods += 1;
         Ok(())
     }
 }
@@ -995,18 +1134,15 @@ pub(super) fn claims_side<'a>(
 pub(super) fn discover_side<'a>(
     side: &StagedSide<'a>,
     encoding: u8,
+    target_status: bool,
 ) -> Result<CompletedGlobal<'a>> {
     let global = || -> Result<CompletedGlobal<'a>> {
-        Ok(CompletedGlobal {
-            ctx: side.ctx,
-            side: side.side,
-            _source_reservation: side.ctx.live.reserve(side.source_set_id().len() as u64)?,
-            source_set_id: side.source_set_id().to_owned(),
-        })
+        CompletedGlobal::new(side.ctx, side.side, false, side.source_set_id())
     };
     let mut writer = GlobalWriter {
         global: global()?,
-        methods: 0,
+        targets: BTreeSet::new(),
+        targets_reservation: side.ctx.live.reserve(0)?,
     };
     for document in side.documents() {
         let document = document?;
@@ -1063,6 +1199,14 @@ pub(super) fn discover_side<'a>(
                 };
                 writer.method(&document, &symbol, summary)?;
             }
+        }
+        // A shared pin's captured side records its targets' name status; otherwise both
+        // revisions' status comes from their full native passes.
+        if target_status {
+            writer.captured_declarations(&local_store, &document)?;
+        } else {
+            writer.targets.clear();
+            writer.targets_reservation = side.ctx.live.reserve(0)?;
         }
     }
     Ok(writer.global)
@@ -1166,10 +1310,10 @@ mod reservation_tests {
     #[test]
     fn sql_declarations_are_one_charged_pass_admitting_each_row_before_it_is_built() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE g_definitions(side, symbol, local_language, local_path, owner_language, owner_path, syntax_id, common_compatible);").unwrap();
+        conn.execute_batch(&format!("{GLOBAL_TEST_SCHEMA} INSERT INTO sources VALUES(0,'java','β.java'),(1,'java','é.java');")).unwrap();
         for (path, id) in [("é.java", "id-é"), ("β.java", "id-β")] {
             conn.execute(
-                "INSERT INTO g_definitions VALUES(0,'pkg Té#','','','java',?1,?2,1)",
+                "INSERT INTO g_definitions VALUES(0,'pkg Té#',-1,(SELECT ord FROM sources WHERE path=?1),?2,1)",
                 params![path, id],
             )
             .unwrap();
@@ -1228,14 +1372,17 @@ mod reservation_tests {
     #[test]
     fn sql_methods_are_one_charged_pass_and_scratch_denial_precedes_decode() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE g_methods(side,ord,symbol,local_language,local_path,owner_language,owner_path,body,body_bytes,decoded_bytes);").unwrap();
+        conn.execute_batch(&format!(
+            "{GLOBAL_TEST_SCHEMA} INSERT INTO sources VALUES(0,'java','é.java');"
+        ))
+        .unwrap();
         let first = method_fixture();
         let mut second = method_fixture();
         second.method.syntax_id = "method-β".into();
         for (ordinal, summary) in [(0, &first), (1, &second)] {
             let body = serde_json::to_string(summary).unwrap();
             conn.execute(
-                "INSERT INTO g_methods VALUES(0,?1,'pkg Té#','','','java','é.java',?2,?3,?4)",
+                "INSERT INTO g_methods VALUES(?1,0,'pkg Té#',-1,0,?2,?3,?4)",
                 params![
                     ordinal,
                     body,
@@ -1272,7 +1419,7 @@ mod reservation_tests {
         }
         conn.execute("DELETE FROM g_methods", []).unwrap();
         conn.execute(
-            "INSERT INTO g_methods VALUES(0,0,'pkg Té#','','','java','é.java','{',1,?1)",
+            "INSERT INTO g_methods VALUES(0,0,'pkg Té#',-1,0,'{',1,?1)",
             [sizes::decoded_method(&first).unwrap() as i64],
         )
         .unwrap();
@@ -1408,10 +1555,88 @@ mod reservation_tests {
         drop(ctx.live.reserve(ctx.limits.unit_expansion_bytes).unwrap());
     }
 
+    /// The tables the global reads touch, as the stage creates them.
+    const GLOBAL_TEST_SCHEMA: &str = "CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL); \
+        CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, eligible INTEGER NOT NULL, failed INTEGER NOT NULL); \
+        CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID; \
+        CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL); \
+        CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, source_ord INTEGER NOT NULL, symbol TEXT, presence INTEGER NOT NULL); \
+        CREATE INDEX claims_symbol ON claims(symbol, presence) WHERE symbol IS NOT NULL;";
+
+    #[test]
+    fn eligible_view_keeps_exactly_the_rows_of_eligible_owner_documents() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "{GLOBAL_TEST_SCHEMA} INSERT INTO sources VALUES(0,'java','A.java'),(1,'java','B.java'),(2,'java','C.java'); \
+             INSERT INTO w_docs VALUES(0,1,0),(1,1,1),(2,0,0); \
+             INSERT INTO g_definitions VALUES(0,'pkg S#',-1,0,'a',1),(0,'pkg S#',-1,1,'b',1),(0,'pkg S#',-1,2,'c',1); \
+             INSERT INTO claims VALUES(1,0,NULL,0),(2,1,'pkg D#',2),(3,2,'pkg D#',1),(4,0,'pkg E#',1);"
+        ))
+        .unwrap();
+        let summary = method_fixture();
+        let body = serde_json::to_string(&summary).unwrap();
+        for (ord, owner) in [(0, 0), (1, 1), (2, 2)] {
+            conn.execute(
+                "INSERT INTO g_methods VALUES(?1,0,'pkg S#',-1,?2,?3,?4,?5)",
+                params![
+                    ord,
+                    owner,
+                    body,
+                    body.len() as i64,
+                    sizes::decoded_method(&summary).unwrap() as i64
+                ],
+            )
+            .unwrap();
+        }
+        let ctx = row_context(&conn, BatchLimits::PRODUCTION);
+        let captured = local_global(&ctx);
+        let view = captured.eligible_view().unwrap();
+        let key = ("pkg S#".to_owned(), None);
+        let ids = |global: &CompletedGlobal<'_>| {
+            global
+                .declarations(&key, &mut |_| Ok(()))
+                .unwrap()
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&captured), ["a", "b", "c"]);
+        // B failed and C is not eligible: only A's rows remain.
+        assert_eq!(ids(&view), ["a"]);
+        let document = summary.method.document.clone();
+        assert_eq!(
+            captured
+                .target_methods(&document, "pkg S#", &mut |_| Ok(()))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            view.target_methods(&document, "pkg S#", &mut |_| Ok(()))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Presence is the claims' own: all of them captured, the eligible ones in the view.
+        assert_eq!(captured.presence("pkg D#").unwrap(), (true, true));
+        assert_eq!(view.presence("pkg D#").unwrap(), (false, false));
+        assert_eq!(view.presence("pkg E#").unwrap(), (true, false));
+        assert_eq!(captured.presence("pkg F#").unwrap(), (false, false));
+        // A lookup is two keyed probes, however many claims name the symbol.
+        for claim in 10..60 {
+            conn.execute("INSERT INTO claims VALUES(?1,0,'pkg D#',1)", [claim])
+                .unwrap();
+        }
+        let before = ctx.budget.borrow().used();
+        assert_eq!(captured.presence("pkg D#").unwrap(), (true, true));
+        assert_eq!(ctx.budget.borrow().used() - before, 2);
+    }
+
     fn local_global<'a>(ctx: &'a JoinCtx<'a>) -> CompletedGlobal<'a> {
         CompletedGlobal {
             ctx,
             side: 0,
+            filtered: false,
             source_set_id: "source".into(),
             _source_reservation: ctx.live.reserve(0).unwrap(),
         }
@@ -1729,7 +1954,7 @@ mod reservation_tests {
     #[test]
     fn document_read_cache_degrades_to_queries_when_the_live_budget_is_full() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE g_definitions(side, symbol, local_language, local_path, owner_language, owner_path, syntax_id, common_compatible); INSERT INTO g_definitions VALUES(0,'pkg A#','','','java','A.java','id',1);").unwrap();
+        conn.execute_batch(&format!("{GLOBAL_TEST_SCHEMA} INSERT INTO sources VALUES(0,'java','A.java'); INSERT INTO g_definitions VALUES(0,'pkg A#',-1,0,'id',1);")).unwrap();
         let ctx = row_context(&conn, BatchLimits::PRODUCTION);
         let global = local_global(&ctx);
         let document = native::DocumentKey {
@@ -1813,6 +2038,7 @@ mod reservation_tests {
         let global = CompletedGlobal {
             ctx: &ctx,
             side: 0,
+            filtered: false,
             source_set_id: "source".into(),
             _source_reservation: ctx.live.reserve(0).unwrap(),
         };
