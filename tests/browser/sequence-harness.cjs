@@ -44,11 +44,20 @@ function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = 
     child.stdout.on("data", chunk => { stdout += chunk; if (stdout.length > 16_000_000) child.kill("SIGTERM"); });
     child.stderr.on("data", chunk => { stderr += chunk; if (stderr.length > 16_000_000) child.kill("SIGTERM"); });
     child.on("error", error => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } });
-    child.on("exit", (code, signal) => {
+    // #475: "exit" can fire before the child's stdout has been read, which gave an
+    // empty stdout for a successful CLI. "close" fires once the process has exited
+    // and its stdio has ended, so the result holds everything the child wrote.
+    child.on("close", (code, signal) => {
       if (settled) return;
       settled = true; clearTimeout(timer);
-      if (code === 0) resolveRun({stdout, stderr});
-      else reject(new Error(`${basename(command)} ${args.join(" ")} failed (${code ?? signal}):\n${stderr.slice(-16000)}`));
+      const label = `${basename(command)} ${args.join(" ")}`;
+      // A parse failure names the exit code, the stdout size and stderr.
+      const json = () => {
+        try { return JSON.parse(stdout); }
+        catch (error) { throw new Error(`${label} exited ${code} with unparseable stdout (${stdout.length} chars: ${error.message}):\n${stderr.slice(-16000)}`); }
+      };
+      if (code === 0) resolveRun({stdout, stderr, code, json});
+      else reject(new Error(`${label} failed (${code ?? signal}):\n${stderr.slice(-16000)}`));
     });
   });
 }
@@ -59,7 +68,7 @@ async function builtBinary() {
   const prebuilt = process.env.TRELLIS_SUITE_BINARY;
   if (prebuilt) return resolve(prebuilt);
   const metadata = await run("cargo", ["metadata", "--no-deps", "--format-version", "1"], {timeout:60000});
-  const target = JSON.parse(metadata.stdout).target_directory;
+  const target = metadata.json().target_directory;
   assert.equal(typeof target, "string");
   await run("cargo", ["build", "--locked", "--bin", "trellis"], {timeout:900000});
   return join(target, "debug", process.platform === "win32" ? "trellis.exe" : "trellis");

@@ -1,5 +1,5 @@
 //! Complete side discovery followed by document-local Common classification.
-use super::super::join_store::{GlobalDiscoverySink, MethodSummary, RowReserve};
+use super::super::join_store::{ClaimTarget, GlobalDiscoverySink, MethodSummary, RowReserve};
 use super::super::{
     JoinedFacts, discover_join_claim, emit_join_symbols, emit_type_relationships, join_occurrence,
     method_target_owner_matches, scoped_key, settle_join_references,
@@ -7,8 +7,9 @@ use super::super::{
 use super::codec;
 use super::*;
 
-/// The `sources.ord` of a local symbol's scope document, `-1` for a global symbol (`?3`,
-/// `?4` are its language and path, both empty for a global one).
+/// The `sources.ord` of a symbol's scope document (a local symbol's document, or the crate
+/// root of a Cargo-target-scoped one, #394), `-1` for a global symbol (`?3`, `?4` are its
+/// language and path, both empty for a global one).
 const LOCAL_DOC: &str =
     "CASE WHEN ?4='' THEN -1 ELSE (SELECT ord FROM sources WHERE language=?3 AND path=?4) END";
 
@@ -72,6 +73,30 @@ fn presence_sql(filtered: bool) -> String {
     )
 }
 
+/// The same probe restricted to one Cargo target, by its crate root (`?3` language, `?4` path).
+fn target_presence_sql(filtered: bool) -> String {
+    format!(
+        "{} LIMIT 1",
+        eligible(
+            "SELECT 1 FROM claims WHERE symbol=?1 AND presence=?2 \
+             AND target_root=(SELECT ord FROM sources WHERE language=?3 AND path=?4)",
+            "claims.source_ord",
+            filtered,
+        )
+    )
+}
+
+/// Crate roots and library flags of the Cargo targets whose claims name `?1` as present, one
+/// row per claim.
+fn defining_targets_sql(filtered: bool) -> String {
+    eligible(
+        "SELECT s.language, s.path, c.target_lib, c.target_package, c.target_version FROM claims c \
+         JOIN sources s ON s.ord=c.target_root WHERE c.symbol=?1 AND c.presence>0",
+        "c.source_ord",
+        filtered,
+    )
+}
+
 /// Captured exact-definition membership of a raw symbol, in any document or scope.
 const CAPTURED_SYMBOL_SQL: &str = "SELECT 1 FROM g_definitions WHERE side=0 AND symbol=?1 LIMIT 1";
 
@@ -88,6 +113,8 @@ pub(super) fn cursor_sql() -> Vec<String> {
         queries.push(methods_sql(true, filtered));
         queries.push(methods_sql(false, filtered));
         queries.push(presence_sql(filtered));
+        queries.push(target_presence_sql(filtered));
+        queries.push(defining_targets_sql(filtered));
     }
     queries
 }
@@ -258,15 +285,47 @@ impl GlobalJoinReads for CompletedGlobal<'_> {
             .optional()?;
         code.map_or(Ok(TargetCallable::Other), TargetCallable::from_code)
     }
-    fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
+    fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)> {
         use crate::semantic_batch::staging::{PRESENCE_DECLARED, PRESENCE_INFORMATION};
         // Side 1 is always the eligible claim set.
-        let sql = presence_sql(self.filtered || self.side == 1);
+        let filtered = self.filtered || self.side == 1;
+        let sql = match target {
+            None => presence_sql(filtered),
+            Some(_) => target_presence_sql(filtered),
+        };
         let probe = |bit: i64| -> Result<bool> {
             self.ctx.charge(1)?;
-            exists(self.ctx.conn, &sql, &[&symbol, &bit])
+            match target {
+                None => exists(self.ctx.conn, &sql, &[&symbol, &bit]),
+                Some(root) => exists(
+                    self.ctx.conn,
+                    &sql,
+                    &[&symbol, &bit, &root.language, &root.path],
+                ),
+            }
         };
         Ok((probe(PRESENCE_DECLARED)?, probe(PRESENCE_INFORMATION)?))
+    }
+    fn defining_targets(&self, symbol: &str) -> Result<Vec<ClaimTarget>> {
+        self.ctx.charge(1)?;
+        let sql = defining_targets_sql(self.filtered || self.side == 1);
+        let mut statement = self.ctx.conn.prepare_cached(&sql)?;
+        let mut rows = statement.query(params![symbol])?;
+        let mut result = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            self.ctx.charge(1)?;
+            result.insert((
+                native::DocumentKey {
+                    source_set_id: self.source_set_id.clone(),
+                    language: row.get(0)?,
+                    path: row.get(1)?,
+                },
+                (row.get::<_, i64>(2)? == 1)
+                    .then(|| Ok::<_, rusqlite::Error>((row.get(3)?, row.get(4)?)))
+                    .transpose()?,
+            ));
+        }
+        Ok(result.into_iter().collect())
     }
     fn source_methods(
         &self,
@@ -479,9 +538,15 @@ pub(super) fn remaining_target_status(
 }
 
 impl GlobalDiscoverySink for GlobalWriter<'_> {
-    fn symbol_presence(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
+    fn symbol_presence(
+        &mut self,
+        symbol: &str,
+        target: Option<&ClaimTarget>,
+        declared: bool,
+        information: bool,
+    ) -> Result<()> {
         // The claim's admitted row already records this presence.
-        let _ = (symbol, declared, information);
+        let _ = (symbol, target, declared, information);
         Ok(())
     }
     fn exact_definition(
@@ -640,7 +705,8 @@ struct DocumentIndex<'g, 'a> {
 /// and symbol information name the same symbols many times; each is queried once per join.
 struct ReadCache {
     declarations: BTreeMap<ScopedKey, Vec<(native::DocumentKey, String)>>,
-    presence: BTreeMap<String, (bool, bool)>,
+    presence: BTreeMap<(String, Option<native::DocumentKey>), (bool, bool)>,
+    targets: BTreeMap<String, Vec<ClaimTarget>>,
     retained: Reservation,
 }
 
@@ -668,6 +734,7 @@ impl<'g, 'a> DocumentIndex<'g, 'a> {
             reads: RefCell::new(ReadCache {
                 declarations: BTreeMap::new(),
                 presence: BTreeMap::new(),
+                targets: BTreeMap::new(),
                 retained: global.ctx.live.reserve(0)?,
             }),
         })
@@ -740,18 +807,46 @@ impl GlobalJoinReads for DocumentIndex<'_, '_> {
     ) -> Result<TargetCallable> {
         self.global.target_callable(document, syntax_id)
     }
-    fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
-        if let Some(found) = self.reads.borrow().presence.get(symbol) {
+    fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)> {
+        let key = (symbol.to_owned(), target.cloned());
+        if let Some(found) = self.reads.borrow().presence.get(&key) {
             return Ok(*found);
         }
-        let found = self.global.presence(symbol)?;
+        let found = self.global.presence(symbol, target)?;
         let mut reads = self.reads.borrow_mut();
         let bytes = sizes::sum(&[
-            sizes::map_entries::<String, (bool, bool)>(1)?,
+            sizes::map_entries::<(String, Option<native::DocumentKey>), (bool, bool)>(1)?,
             symbol.len() as u64,
+            target.map_or(Ok(0), sizes::document)?,
         ])?;
         if reads.retained.grow(bytes).is_ok() {
-            reads.presence.insert(symbol.to_owned(), found);
+            reads.presence.insert(key, found);
+        }
+        Ok(found)
+    }
+    fn defining_targets(&self, symbol: &str) -> Result<Vec<ClaimTarget>> {
+        if let Some(found) = self.reads.borrow().targets.get(symbol) {
+            return Ok(found.clone());
+        }
+        let found = self.global.defining_targets(symbol)?;
+        let mut reads = self.reads.borrow_mut();
+        let mut bytes = sizes::sum(&[
+            sizes::map_entries::<String, Vec<ClaimTarget>>(1)?,
+            symbol.len() as u64,
+        ])?;
+        for (root, package) in &found {
+            bytes = sizes::sum(&[
+                bytes,
+                std::mem::size_of::<ClaimTarget>() as u64,
+                sizes::document(root)?,
+                package.as_ref().map_or(0, |(name, version)| {
+                    (name.len() + version.as_ref().map_or(0, String::len)) as u64
+                }),
+            ])?;
+        }
+        // Optional like the presence cache: without room the roots are returned uncached.
+        if reads.retained.grow(bytes).is_ok() {
+            reads.targets.insert(symbol.to_owned(), found.clone());
         }
         Ok(found)
     }
@@ -1270,6 +1365,7 @@ impl GlobalDiscoverySink for DiscardDiscovery {
     fn symbol_presence(
         &mut self,
         _symbol: &str,
+        _target: Option<&ClaimTarget>,
         _declared: bool,
         _information: bool,
     ) -> Result<()> {
@@ -1762,8 +1858,8 @@ mod reservation_tests {
         CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, eligible INTEGER NOT NULL, failed INTEGER NOT NULL); \
         CREATE TABLE g_definitions(side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, syntax_id BLOB NOT NULL, common_compatible INTEGER NOT NULL, PRIMARY KEY(side,symbol,local_doc,owner_doc,syntax_id)) WITHOUT ROWID; \
         CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL); \
-        CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, source_ord INTEGER NOT NULL, symbol TEXT, presence INTEGER NOT NULL); \
-        CREATE INDEX claims_symbol ON claims(symbol, presence) WHERE symbol IS NOT NULL;";
+        CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, source_ord INTEGER NOT NULL, symbol TEXT, presence INTEGER NOT NULL, target_root INTEGER, target_lib INTEGER NOT NULL DEFAULT 0, target_package TEXT, target_version TEXT); \
+        CREATE INDEX claims_symbol ON claims(symbol, presence, target_root) WHERE symbol IS NOT NULL;";
 
     #[test]
     fn eligible_view_keeps_exactly_the_rows_of_eligible_owner_documents() {
@@ -1772,7 +1868,7 @@ mod reservation_tests {
             "{GLOBAL_TEST_SCHEMA} INSERT INTO sources VALUES(0,'java','A.java'),(1,'java','B.java'),(2,'java','C.java'); \
              INSERT INTO w_docs VALUES(0,1,0),(1,1,1),(2,0,0); \
              INSERT INTO g_definitions VALUES(0,'pkg S#',-1,0,'a',1),(0,'pkg S#',-1,1,'b',1),(0,'pkg S#',-1,2,'c',1); \
-             INSERT INTO claims VALUES(1,0,NULL,0),(2,1,'pkg D#',2),(3,2,'pkg D#',1),(4,0,'pkg E#',1);"
+             INSERT INTO claims(claim_id,source_ord,symbol,presence) VALUES(1,0,NULL,0),(2,1,'pkg D#',2),(3,2,'pkg D#',1),(4,0,'pkg E#',1);"
         ))
         .unwrap();
         let summary = method_fixture();
@@ -1820,17 +1916,20 @@ mod reservation_tests {
             1
         );
         // Presence is the claims' own: all of them captured, the eligible ones in the view.
-        assert_eq!(captured.presence("pkg D#").unwrap(), (true, true));
-        assert_eq!(view.presence("pkg D#").unwrap(), (false, false));
-        assert_eq!(view.presence("pkg E#").unwrap(), (true, false));
-        assert_eq!(captured.presence("pkg F#").unwrap(), (false, false));
+        assert_eq!(captured.presence("pkg D#", None).unwrap(), (true, true));
+        assert_eq!(view.presence("pkg D#", None).unwrap(), (false, false));
+        assert_eq!(view.presence("pkg E#", None).unwrap(), (true, false));
+        assert_eq!(captured.presence("pkg F#", None).unwrap(), (false, false));
         // A lookup is two keyed probes, however many claims name the symbol.
         for claim in 10..60 {
-            conn.execute("INSERT INTO claims VALUES(?1,0,'pkg D#',1)", [claim])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO claims(claim_id,source_ord,symbol,presence) VALUES(?1,0,'pkg D#',1)",
+                [claim],
+            )
+            .unwrap();
         }
         let before = ctx.budget.borrow().used();
-        assert_eq!(captured.presence("pkg D#").unwrap(), (true, true));
+        assert_eq!(captured.presence("pkg D#", None).unwrap(), (true, true));
         assert_eq!(ctx.budget.borrow().used() - before, 2);
     }
 

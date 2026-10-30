@@ -75,7 +75,7 @@ async function published(config, callback, extra = new Map()) {
   let server, browser, context;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
-    const pin = JSON.parse(indexed.stdout).status.revision;
+    const pin = indexed.json().status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
     browser = await chromium.launch();
     context = await browser.newContext({viewport:{width:1440, height:1000}});
@@ -173,7 +173,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(dto.modules.length, 42);
   assert.equal(new Set(dto.modules.map(module => identityKey(module.identity))).size, dto.modules.length);
   const cli = await H.run(H.binary, ["references", "--workspace", paths.workspace, "--pin", `${pin.indexGeneration}:${pin.indexRevision}`, "--limit", "5"], {env:paths.env});
-  const references = JSON.parse(cli.stdout).payload;
+  const references = cli.json().payload;
   // #448: the default view carries counts, not per-site detail; counts equal the CLI at the same pin.
   for (const field of ["production", "tests", "unresolved", "modules"]) assert.equal(dto.references[field], undefined, field);
   for (const field of ["instances", "testOnly", "unassigned"]) assert.equal(dto.rules[field], undefined, field);

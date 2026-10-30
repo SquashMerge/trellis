@@ -163,6 +163,32 @@ impl Counter<'_> {
         ])?;
         Ok(payload)
     }
+    /// A Rust claim's `cargoTarget` object (#394): `(strings, object)`, the payload bytes of
+    /// its four strings, which the claim's `CargoTarget` keeps, and the parsed `Value`
+    /// object's own entries and keys, which reconstruction drops.
+    fn cargo_target(&mut self) -> Result<(u64, u64)> {
+        self.literal(b"{\"kind\":")?;
+        let kind = self.string()?;
+        self.literal(b",\"package\":")?;
+        let package = self.string()?;
+        self.literal(b",\"root\":")?;
+        let root = self.string()?;
+        self.literal(b",\"version\":")?;
+        let version = if self.peek() == Some(b'n') {
+            self.literal(b"null")?;
+            0
+        } else {
+            self.string()?
+        };
+        self.literal(b"}")?;
+        Ok((
+            sizes::sum(&[kind, package, root, version])?,
+            sizes::sum(&[
+                "kindpackagerootversion".len() as u64,
+                super::heap::btree::<String, serde_json::Value>(4),
+            ])?,
+        ))
+    }
     fn raw(&mut self) -> Result<u64> {
         self.literal(b"{")?;
         let (entries, keys, payload) =
@@ -232,7 +258,17 @@ pub(super) fn measure(canonical: &[u8], metadata_bytes: u64) -> Result<ClaimSize
         max_string: 0,
         max_number: 0,
     };
-    counter.literal(b"{\"formatVersion\":")?;
+    // A Rust claim whose Cargo target is determined leads with `cargoTarget` (#394).
+    let target_prefix = b"{\"cargoTarget\":";
+    let (target, target_object) = if canonical.starts_with(target_prefix) {
+        counter.literal(target_prefix)?;
+        let target = counter.cargo_target()?;
+        counter.literal(b",\"formatVersion\":")?;
+        target
+    } else {
+        counter.literal(b"{\"formatVersion\":")?;
+        (0, 0)
+    };
     let format = counter.integer()?;
     counter.literal(b",\"positionEncoding\":")?;
     let encoding = counter.integer()?;
@@ -253,13 +289,21 @@ pub(super) fn measure(canonical: &[u8], metadata_bytes: u64) -> Result<ClaimSize
         kind,
         path,
         raw,
+        target,
         metadata_bytes,
     ])?;
     // Current reconstruction parses an envelope Value then moves raw out. Its remaining
     // fields and object entries overlap the final claim; raw itself is not copied.
     let scratch = sizes::sum(&[
-        super::heap::btree::<String, serde_json::Value>(5),
+        // The parsed envelope has a sixth entry, `cargoTarget`, holding its own object and a
+        // copy of the target strings, when the claim has a target.
+        super::heap::btree::<String, serde_json::Value>(if target_object > 0 { 6 } else { 5 }),
         "formatVersionpositionEncodingrawrecordKindrelativePath".len() as u64,
+        if target_object > 0 {
+            sizes::sum(&["cargoTarget".len() as u64, target_object, target])?
+        } else {
+            0
+        },
         format,
         encoding,
         kind,
@@ -401,10 +445,26 @@ mod tests {
             "symbolInformation",
             "relationship",
         ];
+        // Each shape without a Cargo target, and with one (#394), with and without a version.
+        let targets = [
+            None,
+            Some(
+                serde_json::json!({"kind":"lib","package":"trellis","root":"src/lib.rs","version":"0.1.0"}),
+            ),
+            Some(
+                serde_json::json!({"kind":"test","package":"trellis","root":"tests/store.rs","version":null}),
+            ),
+        ];
         raws.iter()
             .zip(kinds)
-            .map(|(raw, kind)| {
-                crate::native_ids::canonical(&serde_json::json!({"formatVersion":1,"positionEncoding":1,"raw":raw,"recordKind":kind,"relativePath":"src/store.rs"}))
+            .flat_map(|(raw, kind)| {
+                targets.iter().map(move |target| {
+                    let mut envelope = serde_json::json!({"formatVersion":1,"positionEncoding":1,"raw":raw,"recordKind":kind,"relativePath":"src/store.rs"});
+                    if let Some(target) = target {
+                        envelope["cargoTarget"] = target.clone();
+                    }
+                    crate::native_ids::canonical(&envelope)
+                })
             })
             .collect()
     }

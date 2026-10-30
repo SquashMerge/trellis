@@ -35,6 +35,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
         "selects nested package.json config inputs (#443), captured and compared per revision",
     ),
     (
+        "capture::nested_cargo_manifest",
+        "selects nested Cargo.toml config inputs (#394), captured and compared per revision",
+    ),
+    (
         "capture::CaptureInputObservation",
         "persisted change classification, not extraction",
     ),
@@ -72,6 +76,10 @@ const NON_NATIVE_SOURCE_PARSERS: &[(&str, &str)] = &[
     (
         "src/semantic_import.rs",
         "post-native semantic relationships from authenticated source",
+    ),
+    (
+        "src/scip_raw/cargo_targets.rs",
+        "post-native semantic admission: module declarations naming each Rust document's Cargo target (#394)",
     ),
     (
         "src/semantic_import/staged/group_size.rs",

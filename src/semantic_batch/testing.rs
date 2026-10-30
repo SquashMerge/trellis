@@ -277,6 +277,7 @@ fn admit(
             cancel,
             budget: stage.budget(&limits),
             module_roots: &module_roots,
+            native_config,
         };
         let mut inputs = MemoryInputs {
             pages,
@@ -291,12 +292,19 @@ fn admit(
         let dir = stage.dir().to_owned();
         let conn = stage.conn()?;
         passes.begin(conn, descriptor_bytes, &sha)?;
-        passes.source_pass(conn, &mut inputs, &mut native, &mut counters)?;
+        let cargo_targets = passes.source_pass(conn, &mut inputs, &mut native, &mut counters)?;
         if let Some(hook) = BEFORE_COVERAGE.with(|slot| slot.borrow_mut().take()) {
             hook(conn);
         }
         passes.coverage_pass(conn, &mut inputs, &mut counters)?;
-        passes.artifact_pass(&dir, conn, &mut inputs, &mut native, &mut counters)?;
+        passes.artifact_pass(
+            &dir,
+            conn,
+            &mut inputs,
+            &mut native,
+            &cargo_targets,
+            &mut counters,
+        )?;
         read_inventories(conn, &descriptor)
     })();
     outcome.map_err(|error| match error.downcast::<ScipCaptureError>() {
@@ -355,6 +363,7 @@ fn read_inventories(
                         value["positionEncoding"].as_u64().unwrap_or(0),
                     )?,
                     raw: value["raw"].clone(),
+                    cargo_target: CapturedScipFactV1::cargo_target_from(&value)?,
                 },
                 canonical_bytes,
                 fact_digest,

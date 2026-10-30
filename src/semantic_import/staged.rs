@@ -2284,6 +2284,16 @@ impl StagedJoin<'_> {
                  GROUP BY c.artifact, json_extract(s.body,'$.key') HAVING COUNT(*)>1)",
                 DUPLICATE_SYMBOL_KEY,
             ),
+            // Keys are unique per Cargo target (#394), but a global key still conflicts with
+            // the same key in any target.
+            (
+                "SELECT COUNT(*) FROM (SELECT 1 FROM out_symbols s JOIN out_provenance p \
+                 ON p.id=s.provenance_id JOIN claims c ON c.claim_id=p.claim_id \
+                 WHERE json_extract(s.body,'$.key.scope') IN ('global','target') \
+                 GROUP BY c.artifact, json_extract(s.body,'$.key.symbol') \
+                 HAVING SUM(json_extract(s.body,'$.key.scope')='global')>0 AND COUNT(*)>1)",
+                DUPLICATE_SYMBOL_KEY,
+            ),
             (
                 "SELECT COUNT(*) FROM out_provenance p WHERE NOT EXISTS (SELECT 1 FROM out_coverage c \
                  WHERE c.ord=p.doc AND c.provenance IS NOT NULL \

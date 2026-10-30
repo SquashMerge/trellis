@@ -121,7 +121,8 @@ function checkWitnesses(row, source, within, expectedEncoding) {
       fail("WITNESS.MISSING", leaf.field, "source leaf witness missing");
 }
 function symbolKey(key) {
-  if ((key.scope === "document") !== (key.document !== null))
+  // A target-scoped key names its Cargo target's crate root (#394).
+  if ((key.scope !== "global") !== (key.document !== null))
     fail("NORMALIZE.SYMBOL", "key", "symbol scope/document mismatch");
 }
 

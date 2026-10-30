@@ -164,7 +164,7 @@ export const types = Object.freeze({
   SymbolKey: object({
     scheme: literal("scip"),
     symbol: "Text",
-    scope: enumOf("global", "document"),
+    scope: enumOf("global", "document", "target"),
     document: nullable("DocumentKey"),
   }),
   Target: union("kind", {

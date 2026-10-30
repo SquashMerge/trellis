@@ -201,11 +201,15 @@ pub(super) trait GlobalJoinReads {
         document: &native::DocumentKey,
         syntax_id: &str,
     ) -> Result<TargetCallable>;
-    /// `(declared, information)` presence of one symbol.
-    fn presence(&self, symbol: &str) -> Result<(bool, bool)>;
+    /// `(declared, information)` presence of one symbol: in the Cargo target whose crate
+    /// root is `target`, or, for `None`, in any document (#394).
+    fn presence(&self, symbol: &str, target: Option<&native::DocumentKey>) -> Result<(bool, bool)>;
     fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self.presence(symbol)?.1)
+        Ok(self.presence(symbol, None)?.1)
     }
+    /// The Cargo targets in which `symbol` is present, as `(crate root, library package)`
+    /// (#394).
+    fn defining_targets(&self, symbol: &str) -> Result<Vec<ClaimTarget>>;
     fn source_methods(
         &self,
         document: &native::DocumentKey,
@@ -308,7 +312,13 @@ pub(super) trait JoinIndex: DocumentJoinState {
         syntax_id: String,
         callable: TargetCallable,
     ) -> Result<()>;
-    fn put_symbol(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()>;
+    fn put_symbol(
+        &mut self,
+        symbol: &str,
+        target: Option<&ClaimTarget>,
+        declared: bool,
+        information: bool,
+    ) -> Result<()>;
     fn put_method(
         &mut self,
         document: &native::DocumentKey,
@@ -317,9 +327,22 @@ pub(super) trait JoinIndex: DocumentJoinState {
     ) -> Result<()>;
 }
 
+/// The Cargo target of a claim's document: its crate root and, for a library, its package
+/// (#394).
+pub(super) type ClaimTarget = (native::DocumentKey, Option<LibraryPackage>);
+
+/// A library target's package: its manifest name and literal version, if any (#394).
+pub(super) type LibraryPackage = (String, Option<String>);
+
 /// Global information learned from authenticated claims, independent of occurrence storage.
 pub(super) trait GlobalDiscoverySink {
-    fn symbol_presence(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()>;
+    fn symbol_presence(
+        &mut self,
+        symbol: &str,
+        target: Option<&ClaimTarget>,
+        declared: bool,
+        information: bool,
+    ) -> Result<()>;
     fn exact_definition(
         &mut self,
         key: ScopedKey,
@@ -331,8 +354,14 @@ pub(super) trait GlobalDiscoverySink {
 }
 
 impl<I: JoinIndex> GlobalDiscoverySink for I {
-    fn symbol_presence(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
-        self.put_symbol(symbol, declared, information)
+    fn symbol_presence(
+        &mut self,
+        symbol: &str,
+        target: Option<&ClaimTarget>,
+        declared: bool,
+        information: bool,
+    ) -> Result<()> {
+        self.put_symbol(symbol, target, declared, information)
     }
 
     fn exact_definition(

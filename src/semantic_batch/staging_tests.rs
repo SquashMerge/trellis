@@ -29,6 +29,7 @@ fn claim(bytes: &[u8], digest: &str, proof: &str) -> CapturedClaim {
             relative_path: "a.java".into(),
             position_encoding: 1,
             raw: serde_json::json!({}),
+            cargo_target: None,
         },
         canonical_bytes: bytes.to_vec(),
         fact_digest: digest.into(),

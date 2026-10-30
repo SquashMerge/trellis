@@ -874,8 +874,12 @@ pub(crate) fn captured_components(
         {
             config.push(entry(root, p, b)?);
         }
-        // Present nested package roots bind scip-typescript module markers (#443).
-        if b.is_some() && crate::capture::nested_package_manifest(root, p) {
+        // Present nested package roots bind scip-typescript module markers (#443), and
+        // nested Cargo manifests scope Rust symbol keys by Cargo target (#394).
+        if b.is_some()
+            && (crate::capture::nested_package_manifest(root, p)
+                || crate::capture::nested_cargo_manifest(root, p))
+        {
             config.push(entry(root, p, b)?);
         }
     }
