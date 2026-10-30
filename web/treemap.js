@@ -20,6 +20,18 @@
     let serial = 0, renderSerial = 0, selectionSerial = 0, navigationSerial = 0, view = null, basis = null, selectedKey = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, hideTests = true, path = "", language = "", scope = null;
     let relayout = null, resizeTimer = null;
+    // Published for tests (#459): "pending" while the current render, an observed resize or
+    // a relayout of the current render can still replace the SVG; "settled" otherwise.
+    // A superseded render or relayout only paints stale, so it never holds this open.
+    let layoutRender = false, layoutResize = false;
+    const layoutRelayouts = new Set();
+    const publishLayout = () => {
+      get("treemap-diagram").dataset.layout = layoutRender || layoutResize || layoutRelayouts.size ? "pending" : "settled";
+    };
+    const trackRelayout = work => {
+      const token = {}, done = () => { layoutRelayouts.delete(token); publishLayout(); };
+      layoutRelayouts.add(token); publishLayout(); work.then(done, done);
+    };
     const population = () => role === "all" ? "all indexed callables" : "production callables";
     const state = (message, kind = "ready") => { get("treemap-state").textContent = message; get("treemap-state").dataset.state = kind; };
     const paragraph = (target, message) => target.append(make("p", message));
@@ -58,6 +70,7 @@
     }
     function reset(message = "Open Treemap to read the indexed snapshot.") {
       serial++; renderSerial++; relayout = null; clearInspection(); view = null; basis = null;
+      layoutRender = false; layoutRelayouts.clear(); publishLayout();
       for (const id of ["treemap-diagram", "treemap-files", "treemap-legend", "treemap-breadcrumbs"]) get(id).replaceChildren();
       get("treemap-diagram").setAttribute("aria-busy", "false"); state(message, "empty");
     }
@@ -149,6 +162,7 @@
       const files = visibleFiles(), values = files.map(file => metricValue(file.metrics, metric));
       const scale = createScale(metric, aggregate, values, relative);
       breadcrumbs(active); legend(scale);
+      layoutRender = true; layoutRelayouts.clear(); publishLayout();
       try {
         if (files.some(file => file.physicalLines > 0)) {
           if (!window.TrellisTreemapPele) throw new Error("Treemap renderer unavailable. Nothing displayed.");
@@ -204,13 +218,17 @@
         state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
         // Resizes during the first paint had no relayout to call; reconcile with the box once.
-        void relayout?.();
+        const reconciled = relayout?.();
+        if (reconciled) trackRelayout(reconciled);
       } catch (error) {
         if (!active()) return;
         ready = false; clearInspection();
         for (const id of ["treemap-diagram", "treemap-files", "treemap-legend"]) get(id).replaceChildren();
         state(error.message || "Treemap rendering failed. Nothing displayed.", "error");
-      } finally { if (active()) get("treemap-diagram").setAttribute("aria-busy", "false"); }
+      } finally {
+        if (active()) get("treemap-diagram").setAttribute("aria-busy", "false");
+        if (ticket === renderSerial) { layoutRender = false; publishLayout(); }
+      }
     }
     async function refresh() {
       reset(); const c = capture();
@@ -245,7 +263,15 @@
     }
     if (typeof ResizeObserver === "function") {
       // One trailing relayout per burst of resizes; a newer one supersedes an older one.
-      new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => relayout?.(), 120); }).observe(get("treemap-diagram"));
+      new ResizeObserver(() => {
+        clearTimeout(resizeTimer); layoutResize = true; publishLayout();
+        resizeTimer = setTimeout(() => {
+          layoutResize = false;
+          const work = relayout?.();
+          if (work) trackRelayout(work); else publishLayout();
+          return work;
+        }, 120);
+      }).observe(get("treemap-diagram"));
     }
     get("treemap-relative").checked = false;
     get("treemap-relative").addEventListener("change", event => { relative = event.target.checked; return render(); });

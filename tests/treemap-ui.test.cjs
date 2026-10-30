@@ -307,7 +307,7 @@ function resizeHarness() {
   // The adapter's click/keyboard handler: inert unless its owner is current.
   const click = (control, file) => { if (control.options.isCurrent()) control.options.onSelectFile(file); };
   const settle = () => new Promise(resolve => setImmediate(resolve));
-  return {...h, observers, painted, held, setBox, resize, click, settle, holdWhen:fn => { hold = fn; }};
+  return {...h, observers, timers, painted, held, setBox, resize, click, settle, holdWhen:fn => { hold = fn; }};
 }
 const widths = r => r.painted.map(control => control.projection.width);
 
@@ -359,4 +359,32 @@ test("a resize during the initial paint is reconciled once that paint publishes 
   assert.deepEqual(widths(r), [1000, 2000], "the current box is painted after the old size publishes");
   assert.equal(r.painted[1].options.isCurrent(), true); assert.equal(r.painted[0].options.isCurrent(), false);
   await r.resize(2000); assert.equal(r.renders.length, 2, "and then it is the committed size");
+});
+
+test("the layout signal is pending while the current render, a resize or its relayout can still replace the SVG (#459)", async () => {
+  const r = resizeHarness(), layout = () => r.get("treemap-diagram").dataset.layout;
+  let holdNext = true;
+  r.holdWhen(() => { const hold = holdNext; holdNext = false; return hold; }); r.setBox(1000);
+  const loading = r.controller.refresh(); await r.settle();
+  assert.equal(layout(), "pending", "the first paint is in flight");
+  r.held[0].resolve(); await loading; await r.settle();
+  assert.equal(layout(), "settled", "published, with no relayout pending");
+  r.setBox(1200); r.observers[0]();
+  assert.equal(layout(), "pending", "an observed resize is pending before its debounced relayout runs");
+  holdNext = true;
+  const relayout = r.timers.pop()(); r.timers.length = 0;
+  assert.equal(layout(), "pending", "its relayout paint is in flight");
+  r.held[1].resolve(); await relayout; await r.settle();
+  assert.equal(layout(), "settled"); assert.deepEqual(widths(r), [1000, 1200]);
+  r.setBox(1200); r.observers[0](); await r.timers.pop()(); r.timers.length = 0; await r.settle();
+  assert.equal(layout(), "settled", "a same-size relayout settles without painting"); assert.equal(r.renders.length, 2);
+  // A superseded render's paint can only be stale, so it never holds the signal open.
+  holdNext = true;
+  const input = r.get("treemap-path"), type = value => { input.value = value; return input.listeners.input[0]({target:input}); };
+  void type("src/main"); await r.settle();
+  assert.equal(layout(), "pending", "the newer render's paint is held");
+  await type("src/"); await r.settle();
+  assert.equal(layout(), "settled", "the newest render published while the superseded paint is still held");
+  r.held[2].resolve(); await r.settle();
+  assert.equal(layout(), "settled"); assert.equal(r.painted.at(-1).files.every(file => file.path.includes("src/")), true);
 });

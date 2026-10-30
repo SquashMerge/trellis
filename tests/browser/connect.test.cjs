@@ -77,7 +77,7 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
   let server, browser, context;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
-    server = await H.startDaemon(paths, JSON.parse(indexed.stdout).status.revision.indexRevision);
+    server = await H.startDaemon(paths, indexed.json().status.revision.indexRevision);
     browser = await chromium.launch();
     context = await browser.newContext({viewport:{width:1440,height:900}});
     const page = await context.newPage();

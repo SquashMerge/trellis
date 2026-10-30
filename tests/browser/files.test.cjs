@@ -65,7 +65,7 @@ async function published({git = false, width = 1440, sourceText = source} = {}, 
       await gitCommand(paths, "commit", "--allow-empty", "-qm", "Local sibling", "--only");
     }
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
-    const pin = JSON.parse(indexed.stdout).status.revision;
+    const pin = indexed.json().status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
     browser = await chromium.launch();
     context = await browser.newContext({viewport:{width, height:width <= 900 ? 844 : 900}});

@@ -96,7 +96,7 @@ async function published(callback, signal, {library = false, rules = null, git =
       }
     }
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
-    const pin = JSON.parse(indexed.stdout).status.revision;
+    const pin = indexed.json().status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
     browser = await chromium.launch();
     context = await browser.newContext({viewport:{width:1440, height:900}});
@@ -817,7 +817,11 @@ test("invalid rules keep Explorer and Treemap heat with a warning while Architec
   assert.doesNotMatch(await page.locator('.file-pick[title="src/flow.js"] .metric-swatch').getAttribute("class"), /neutral/);
 
   await page.locator("#view-treemap").click();
-  await page.locator("#treemap-state[data-state=ready]").waitFor();
+  // #459: ready, and no render or resize relayout pending that could replace the
+  // tile under the click below. The next frame observes any resize the switch caused.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await page.waitForFunction(() => document.querySelector("#treemap-state")?.dataset.state === "ready" &&
+    document.querySelector("#treemap-diagram")?.dataset.layout === "settled");
   assert.ok(await page.locator("#treemap-state").isVisible());
   assert.ok((await page.locator("#treemap-state").textContent()).includes(warning));
   const tiles = page.locator("#treemap-diagram [data-trellis-file-id]");

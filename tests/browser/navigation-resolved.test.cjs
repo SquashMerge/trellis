@@ -13,7 +13,7 @@ test.before(async () => {
   if (!fixtureBinary) {
     const metadata = await H.run("cargo", ["metadata", "--no-deps", "--format-version", "1"]);
     await H.run("cargo", ["build", "--locked", "--features", "test-support", "--bin", "trellis"], {timeout:900000});
-    fixtureBinary = join(JSON.parse(metadata.stdout).target_directory, "debug", process.platform === "win32" ? "trellis.exe" : "trellis");
+    fixtureBinary = join(metadata.json().target_directory, "debug", process.platform === "win32" ? "trellis.exe" : "trellis");
   }
   process.env.TRELLIS_SUITE_BINARY = resolve(fixtureBinary);
   await H.setup();
@@ -27,7 +27,7 @@ for (const mode of ["zero", "sole", "multiple", "unresolved"]) {
     let server, browser, context;
     try {
       const seeded = await H.run(H.binary, ["navigation-fixture", "--workspace", paths.workspace, "--mode", mode], {env:paths.env});
-      const fixture = JSON.parse(seeded.stdout), pin = fixture.revision;
+      const fixture = seeded.json(), pin = fixture.revision;
       server = await H.startDaemon(paths, pin.indexRevision);
       browser = await chromium.launch();
       context = await browser.newContext();
@@ -104,7 +104,7 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
     let server, browser, context;
     try {
       const seeded = await H.run(H.binary, ["navigation-fixture", "--workspace", paths.workspace, "--mode", `sequence-${mode}`], {env:paths.env});
-      const fixture = JSON.parse(seeded.stdout), pin = fixture.revision;
+      const fixture = seeded.json(), pin = fixture.revision;
       assert.equal(fixture.calls.length, 2);
       assert.notEqual(fixture.calls[0], fixture.calls[1]);
       server = await H.startDaemon(paths, pin.indexRevision);

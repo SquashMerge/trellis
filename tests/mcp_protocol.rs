@@ -469,6 +469,40 @@ fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
     assert!(alive, "a different fixture's elected daemon was signaled");
 }
 
+/// Holds an auto-started daemon's first checkout startup reconciliation at its
+/// pre-capture hook (`TRELLIS_TEST_DAEMON_STARTUP_SOCKET`), before anything can
+/// be published, until `release`.
+struct DaemonStartupHold {
+    path: PathBuf,
+    arrived: Receiver<std::os::unix::net::UnixStream>,
+}
+impl DaemonStartupHold {
+    fn bind(dir: &Path) -> Self {
+        let path = dir.join("startup.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (sender, arrived) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+                .unwrap();
+            if stream.read_exact(&mut [0]).is_ok() {
+                let _ = sender.send(stream);
+            }
+        });
+        Self { path, arrived }
+    }
+    fn release(&self) {
+        let mut stream = self
+            .arrived
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .expect("daemon startup never reached its pre-publication hook");
+        stream.write_all(&[1]).unwrap();
+    }
+}
+
 fn checkout(base: &Path) -> PathBuf {
     let path = base.join("checkout");
     fs::create_dir_all(path.join(".git")).unwrap();
@@ -894,7 +928,18 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
     for legacy in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
         let root = checkout(tmp.path());
-        let mut peer = Peer::start(Some(&root));
+        // #478: the auto-started daemon indexes this virgin checkout. Its startup
+        // reconciliation, before the first publication, is held until every
+        // not-ready assertion is done, so no head can be published first.
+        let startup = DaemonStartupHold::bind(tmp.path());
+        let mut peer = Peer::start_with_phase_env(
+            Some(&root),
+            None,
+            &[(
+                "TRELLIS_TEST_DAEMON_STARTUP_SOCKET",
+                startup.path.as_os_str(),
+            )],
+        );
         if legacy {
             let init = peer.ask(request(
                 json!(1),
@@ -987,6 +1032,8 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
                 );
             }
         }
+        // Every tool answered while the first publication was still held.
+        startup.release();
         let control_id = format!("{}aa", "\u{0000}".repeat(42));
         let fields = json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}});
         let max_call = if legacy {
@@ -3034,13 +3081,22 @@ fn final_resolved_drift_is_attributed_for_five_tools_and_both_modes() {
 
 /// A PATH whose `git` outlasts the 750 ms lookup bound while `flag` exists:
 /// only the first run after it appears when `once`, every run otherwise.
-fn stalling_git_path(temp: &Path, flag: &Path, once: bool) -> std::ffi::OsString {
+/// Unstalled, the fixture's common-directory lookups are answered as fixed
+/// fixture input, so a selection's own bounded lookups never wait on real Git
+/// startup on a loaded host (#197); other commands run the real Git.
+fn stalling_git_path(
+    temp: &Path,
+    flag: &Path,
+    once: bool,
+    (main, linked): (&Path, &Path),
+) -> std::ffi::OsString {
     use std::os::unix::fs::PermissionsExt;
     let search = std::env::var_os("PATH").unwrap();
     let git = std::env::split_paths(&search)
         .map(|dir| dir.join("git"))
         .find(|path| path.is_file())
         .expect("git on PATH");
+    let common = main.join(".git").canonicalize().unwrap();
     let armed = if once {
         format!("rm '{}' 2>/dev/null", flag.display())
     } else {
@@ -3051,7 +3107,18 @@ fn stalling_git_path(temp: &Path, flag: &Path, once: bool) -> std::ffi::OsString
     fs::write(
         bin.join("git"),
         format!(
-            "#!/bin/sh\nif {armed}; then exec sleep 3; fi\nexec '{}' \"$@\"\n",
+            r#"#!/bin/sh
+if {armed}; then exec sleep 3; fi
+if [ "$#" -eq 5 ] && [ "$1" = -C ] &&
+   [ "$3" = rev-parse ] && [ "$4" = --path-format=absolute ] &&
+   [ "$5" = --git-common-dir ]; then
+  case "$2" in '{}'|'{}') printf '%s\n' '{}'; exit 0 ;; esac
+fi
+exec '{}' "$@"
+"#,
+            main.display(),
+            linked.display(),
+            common.display(),
             git.display()
         ),
     )
@@ -3237,7 +3304,7 @@ fn a_stalled_final_check_does_not_hold_other_calls() {
     let temp = tempfile::tempdir().unwrap();
     let (main, linked) = git_linked_fixture(temp.path());
     let stalled = temp.path().join("stall-git");
-    let path = stalling_git_path(temp.path(), &stalled, false);
+    let path = stalling_git_path(temp.path(), &stalled, false, (&main, &linked));
     let socket = temp.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let mut peer = Peer::start_with_phase_env(
@@ -3372,7 +3439,7 @@ impl FinalRecheckFixture {
             ..Default::default()
         };
         let stalled = temp.join("stall-git");
-        let path = stalling_git_path(temp, &stalled, false);
+        let path = stalling_git_path(temp, &stalled, false, (&main, &linked));
         let socket = temp.join("phase.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let mut fixture = Self {
@@ -3517,39 +3584,64 @@ async fn a_call_finishing_near_its_deadline_is_not_held_behind_a_recheck() {
 }
 
 /// #195 re-review: no call's send decision waits on another call's final
-/// identity lookup. B is accepted first and its worker held until 4.4 s after
-/// it was written; A, accepted just after, has its final check stalled by Git
-/// and held at `hold_stage` until 4.5 s. A check run on the coordinator would
-/// keep B's decision past B's deadline; B must be answered with its result.
+/// identity lookup. B is accepted first and its worker held; A, accepted just
+/// after, has its final check stalled by Git and held at `hold_stage`. Only
+/// then is B's worker released, while A stays held. A check run on the
+/// coordinator would keep B's decision behind A's held check, past B's
+/// deadline; B must be answered with its result, and A is `deadline_exceeded`
+/// at its own deadline. The overlap is ordered by hooks, not host time (#197).
 fn earlier_call_is_decided_while_a_later_final_check_stalls(hold_stage: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Sender, channel};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    type Pause = (Sender<()>, Receiver<()>);
     let temp = tempfile::tempdir().unwrap();
     let (main, linked) = git_linked_fixture(temp.path());
     let stalled = temp.path().join("stall-git");
-    let path = stalling_git_path(temp.path(), &stalled, false);
+    let path = stalling_git_path(temp.path(), &stalled, false, (&main, &linked));
     let socket = temp.path().join("phase.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let written_b: Arc<Mutex<Option<Instant>>> = Arc::default();
-    let (b_held, b_held_at) = std::sync::mpsc::channel::<()>();
-    let (flag, start) = (stalled.clone(), written_b.clone());
-    let (mut b_pending, mut a_pending) = (true, true);
-    serve_pauses(&listener, move |stage| {
-        let start = (*start.lock().unwrap())?;
-        if stage == "call_worker" && std::mem::take(&mut b_pending) {
-            b_held.send(()).unwrap();
-            return Some(start + Duration::from_millis(4400));
+    // Each pause reports its arrival and waits for its own release.
+    let (b_arrived, b_held) = channel();
+    let (release_b, b_gate) = channel();
+    let (a_arrived, a_held) = channel();
+    let (release_a, a_gate) = channel();
+    let pauses: Arc<Mutex<(Option<Pause>, Option<Pause>)>> = Arc::new(Mutex::new((
+        Some((b_arrived, b_gate)),
+        Some((a_arrived, a_gate)),
+    )));
+    // Armed once the warm-up calls are answered: B's is the next call worker.
+    let armed = Arc::new(AtomicBool::new(false));
+    let (flag, arm) = (stalled.clone(), armed.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let (pauses, flag, arm) = (pauses.clone(), flag.clone(), arm.clone());
+            std::thread::spawn(move || {
+                let mut stage = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut stage)
+                    .unwrap();
+                let stage = stage.trim_end();
+                let pause = if !arm.load(Ordering::Acquire) {
+                    None
+                } else if stage == "call_worker" {
+                    pauses.lock().unwrap().0.take()
+                } else {
+                    if stage == "selected_final" {
+                        fs::write(&flag, b"").unwrap();
+                    }
+                    (stage == hold_stage)
+                        .then(|| pauses.lock().unwrap().1.take())
+                        .flatten()
+                };
+                if let Some((arrived, gate)) = pause {
+                    arrived.send(()).unwrap();
+                    let _ = gate.recv();
+                }
+                let _ = stream.write_all(b"x");
+            });
         }
-        if stage == "selected_final" {
-            fs::write(&flag, b"").unwrap();
-        }
-        // A recheck is held once one starts after 3.6 s, so it overlaps B.
-        let due =
-            hold_stage != "final_recheck" || Instant::now() >= start + Duration::from_millis(3600);
-        if stage == hold_stage && due && std::mem::take(&mut a_pending) {
-            return Some(start + Duration::from_millis(4500));
-        }
-        None
     });
     let mut peer = Peer::start_with_phase_env(
         Some(&main),
@@ -3566,14 +3658,20 @@ fn earlier_call_is_decided_while_a_later_final_check_stalls(hold_stage: &'static
     );
     let warm = peer.ask(serde_json::from_slice(&describe_frame(json!(1), Some(&linked))).unwrap());
     tool(&warm, None, true);
-    *written_b.lock().unwrap() = Some(Instant::now());
+    armed.store(true, Ordering::Release);
     peer.send_raw(&describe_frame(json!("B"), None));
-    b_held_at
+    b_held
         .recv_timeout(trellis::testing::HANG_BACKSTOP)
         .expect("B's worker never started");
     peer.send_raw(&describe_frame(json!("A"), Some(&linked)));
+    a_held
+        .recv_timeout(trellis::testing::HANG_BACKSTOP)
+        .unwrap_or_else(|_| panic!("A's final check never reached {hold_stage}"));
+    release_b.send(()).unwrap();
+    // A stays held: its decision can come only from its own deadline.
     let first = peer.reply();
     let second = peer.reply();
+    release_a.send(()).unwrap();
     let _ = fs::remove_file(&stalled);
     let (b, a) = if first["id"] == "B" {
         (first, second)
