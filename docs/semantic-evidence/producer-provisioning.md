@@ -15,7 +15,11 @@ Pins live in [`hardware/mac-mini-m5-pro-v1.json`](hardware/mac-mini-m5-pro-v1.js
 
 A shim launcher (mise, asdf, pyenv) or a shim `node` is refused with `producer_unavailable`: detection reads files and never executes a shim to ask its version.
 
-The scip-java and rust-analyzer rows are confirmed by the strict runs of the slices that add their tests. The scip-java row was confirmed against a strict run with the mise Temurin 25.0.3 on the declared `PATH` and Temurin 17.0.20.1 in the coursier archive cache.
+The scip-java and rust-analyzer rows are confirmed by the strict runs of the slices that add their tests. The scip-java row was confirmed against a strict run with the mise Temurin 25.0.3 on the declared `PATH` and Temurin 17.0.20.1 in the coursier archive cache. The rust-analyzer row was confirmed against a strict run with the Homebrew `rustup` proxy on the declared `PATH`, `RUSTUP_HOME=$HOME/.rustup` and `CARGO_HOME=$HOME/.cargo`: `rustup run 1.98.1 rust-analyzer` reports `rust-analyzer 1.98.1 (48a229ce 2026-09-01)` and the binary under `$RUSTUP_HOME/toolchains/1.98.1-aarch64-apple-darwin/bin/` matched the pinned hash.
+
+### rust-analyzer trusted profile
+
+rust-analyzer runs only in the trusted profile. The restricted profile refuses it with `profile_unsupported`, because `rust-analyzer scip` cannot disable build scripts or proc macros. The trusted run therefore executes the fixture's build scripts and proc macros, and cargo may download crates into `CARGO_HOME`. The command is `rustup run 1.98.1 rust-analyzer scip . --output <out>` with `RUSTUP_HOME`, `CARGO_HOME`, `RUSTUP_AUTO_INSTALL=0` and `CARGO_TARGET_DIR=<run directory>/target`, so build output goes to the run directory and the workspace tree digest is unchanged. The fixture (`tests/fixtures/producers/rust/`) has no dependencies, so the strict run needs no network.
 
 ### scip-java JVM prerequisite
 
