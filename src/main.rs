@@ -227,7 +227,7 @@ struct QueryArgs {
     include_callbacks: bool,
     #[arg(long)]
     exclude_path: Vec<String>,
-    /// A published semantic producer for call bindings. Default: the sole published one.
+    /// A published semantic producer for call bindings. Default: each language's sole one.
     #[arg(long)]
     semantic_producer_id: Option<String>,
 }

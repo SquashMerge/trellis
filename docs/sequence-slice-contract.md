@@ -11,11 +11,13 @@ not integer revisions. All evidence and declaration targets are read inside the 
 selected SQLite transaction. No provider, filesystem read, index request or callee-body
 expansion is performed by enrichment.
 
-The store uses the sole published semantic producer at that selected snapshot. Zero
-producers preserves the syntax-only DTO. Multiple producers preserves syntax and adds
-`multiple semantic producers; showing syntax`; it never picks or merges producers.
-A sole producer that does not cover the seed language also preserves the plain
-syntax-only DTO, including receiver hints, without semantic labels or declarations.
+The store uses, at that selected snapshot, the sole published semantic producer whose
+profile covers the seed's language (owner ruling 2026-10-30, #483, amending #392). Zero
+producers preserves the syntax-only DTO. Multiple producers for the seed's language
+preserves syntax and adds `multiple semantic producers for <language>; showing syntax`; it
+never picks or merges producers. Published producers that do not cover the seed language
+also preserve the plain syntax-only DTO, including receiver hints, without semantic labels
+or declarations.
 
 A measured call step may contain `callEvidence`:
 

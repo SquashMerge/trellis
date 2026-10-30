@@ -490,7 +490,7 @@ A body-only or unrelated edit therefore preserves duplicate anchors only with in
 | `GraphRequest.sourceSetId` | `Text` | Admitted source set. | Denied/unknown is `sourceSetDenied`. |
 | `.revisionId` | `Text` | Exact immutable revision; no current fallback. | Missing is `revisionUnavailable`. |
 | `.rootSyntaxId` | `SyntaxId` | Exact root, no fuzzy name. | Missing is `rootMissing`. |
-| `.semanticProducerId` | `Text?` | Null means syntax-only; otherwise exactly one producer, no merge. | Unavailable is `producerUnavailable`. |
+| `.semanticProducerId` | `Text?` | Null selects the per-language default (owner ruling 2026-10-30, #483): each document uses the sole published producer whose profile covers its language, and a language that none or several cover is syntax-only. A source with no published-producer view (a fixture) treats null as syntax-only. Otherwise exactly one producer, applied to the languages it covers; never a merge. | Unavailable is `producerUnavailable`. |
 | `.depth` | `UInt` | Default 2; valid 0–5; no clamping. | Outside range is `invalidRequest`. |
 | `.maxNodes` | `UInt` | Default 150; valid 1–150; root counts. | Outside range is `invalidRequest`. |
 | `.maxCalls` | `UInt` | Default 500; valid 0–500 emitted edge groups, not measured sites. | Outside range is `invalidRequest`. |
@@ -542,7 +542,7 @@ A `GraphResult` carries **exactly** one warning for each key `(code, provenanceI
 
 | Code | Required if and only if | `provenanceId` |
 |---|---|---|
-| `syntaxOnly` | `request.semanticProducerId` is null. | null |
+| `syntaxOnly` | `request.semanticProducerId` is null and a returned document's language has no default producer (owner ruling 2026-10-30, #483). The message names each such language's reason, for example `multiple semantic producers for rust; showing syntax`. | null |
 | `coverageIncomplete` | At least one returned *selected* coverage row is not complete. This is exactly the selected-coverage-incomplete operand of `partial`, not `partial` as a whole: a selected row has `state=failed` or `state=partial`. | null |
 | `staleEvidence` | A returned `Provenance` has `freshness=stale`. | That provenance's `id`; one warning for each stale provenance. |
 | `staleEvidence` | At least one returned `Provenance` has `freshness=possiblyStale`. | null; one aggregate warning, however many provenances are possibly stale. |
@@ -559,7 +559,7 @@ Deduplicate by `(code, provenanceId)` even when multiple edges share one binding
 
 The following are hand-evaluated warning-key arrays; each assumes an otherwise valid result, a nonempty message for every listed warning, no unmentioned trigger, and the required coverage/provenance/edge fields. The arrays state `(code, provenanceId)` only because message text does not affect the required set.
 
-1. **Syntax only.** The request has `semanticProducerId=null`, all returned selected coverage is complete, the root has no calls, and no returned provenance is non-fresh. `partial=false`; warning keys are `[(syntaxOnly,null)]`. No `coverageIncomplete` follows from syntax-only selection itself.
+1. **Syntax only.** The request has `semanticProducerId=null`, no published producer covers the root's language, all returned selected coverage is complete, the root has no calls, and no returned provenance is non-fresh. `partial=false`; warning keys are `[(syntaxOnly,null)]`. No `coverageIncomplete` follows from syntax-only selection itself.
 2. **Two ambiguous bindings, one provenance.** The request names a semantic producer; two returned edges have ambiguous bindings with `provenanceId=pA`, and all selected coverage is complete and returned provenance fresh. Both edges are boundaries, so `partial=true`, but warning keys are only `[(bindingAmbiguous,pA)]`—not two warnings and not `coverageIncomplete`.
 3. **Three possibly-stale provenances.** Returned provenances `p1,p2,p3` each have `freshness=possiblyStale`; the request names a semantic producer, selected coverage is complete, and no returned edge binding is ambiguous or has a stale target. Warning keys are `[(staleEvidence,null)]`, not three per-provenance warnings. Each provenance still exposes its own freshness.
 4. **Mixed freshness and a stale boundary.** Returned `p1` and `p3` are `possiblyStale`, `p2` is `stale`, and a returned edge binding captured at the requested revision has `provenanceId=p3`. `p3` is `possiblyStale` because the request compares its producer at a different version (same revision, same occurrences), so the edge is a `stale` boundary. `p2` is a historical declaration proof for a returned declaration in document `D2`. `D2`'s bytes changed since `p2`'s captured revision, and the producer's requested-revision tuple for `D2` is `omitted`, which is unselected and so adds no `coverageIncomplete`. The request names a semantic producer and selected coverage is complete. Warning keys, in code-enum and null-before-text order, are `[(staleEvidence,null),(staleEvidence,p2)]`; the stale boundary sets `partial=true` without adding `coverageIncomplete`. No `staleTarget` key arises in v1 (see `CallBinding.staleTarget`).

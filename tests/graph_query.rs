@@ -425,6 +425,71 @@ const B: u64 = 2;
 const C: u64 = 3;
 const D: u64 = 4;
 
+/// #483: without an explicit producer, the source's per-language default selects each
+/// language's sole producer. A language that two producers cover is syntax only, and the
+/// `syntaxOnly` warning names it; a prefix replays the recorded default.
+#[test]
+fn default_producers_select_per_language_and_name_conflicts() {
+    use trellis::graph_query::{DefaultProducers, multiple_producers_note};
+    let published = |rows: &[(&str, &str)]| {
+        Some(DefaultProducers::from_published(rows.iter().map(
+            |(producer, language)| (producer.to_string(), Some(language.to_string())),
+        )))
+    };
+    let mut facts = graph(&[(A, 100, B), (B, 101, C)], true).build();
+    facts.defaults = published(&[(PRODUCER, "rust"), ("js-only", "javascript")]);
+    let r = run(&mut facts, &request(A, false));
+    assert_eq!(
+        edges(&r),
+        [
+            (100, A, Some(B), Visit::New, BoundaryReason::None),
+            (101, B, Some(C), Visit::New, BoundaryReason::None)
+        ]
+    );
+    assert!(r.warnings.iter().all(|w| w.code != WarningCode::SyntaxOnly));
+    let answer = trellis::graph_query::GraphAnswer {
+        basis: serde_json::from_value(
+            serde_json::json!({"indexGeneration":"58f31c74-f89c-42d9-a26e-b2ffbc113066","indexRevision":1}),
+        )
+        .unwrap(),
+        requested: request(A, false),
+        outcome: Ok(r.clone()),
+        facts: facts.clone(),
+    };
+    let prefix = answer.prefix(1).unwrap();
+    assert_eq!(edges(&prefix), edges(&r)[..1]);
+    assert!(
+        prefix
+            .warnings
+            .iter()
+            .all(|w| w.code != WarningCode::SyntaxOnly)
+    );
+
+    facts.defaults = published(&[(PRODUCER, "rust"), ("other", "rust")]);
+    let r = run(&mut facts, &request(A, false));
+    assert_eq!(
+        edges(&r),
+        [(
+            100,
+            A,
+            None,
+            Visit::Boundary,
+            BoundaryReason::MissingEvidence
+        )]
+    );
+    let syntax: Vec<_> = r
+        .warnings
+        .iter()
+        .filter(|w| w.code == WarningCode::SyntaxOnly)
+        .map(|w| w.message.clone())
+        .collect();
+    assert_eq!(syntax, [multiple_producers_note("rust")]);
+    // An explicit producer overrides the conflict.
+    let r = run(&mut facts, &request(A, true));
+    assert_eq!(edges(&r)[0].4, BoundaryReason::None);
+    assert!(r.warnings.iter().all(|w| w.code != WarningCode::SyntaxOnly));
+}
+
 #[test]
 fn case1_source_order_versus_evaluation() {
     let (f, g) = (5, 6);

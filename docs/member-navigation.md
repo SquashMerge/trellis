@@ -24,9 +24,10 @@ Unresolved calls are not globally name-matched. Syntax candidates, same-class na
 sequence participant labels are not resolved callees. The enclosing measured method remains a
 sequence choice when no eligible callee binding exists.
 
-For resolved-callee navigation, the browser uses the sole published semantic producer at the source
-snapshot. With none, it shows syntax choices only. With several, it also shows
-`multiple semantic producers; showing syntax`. There is no producer picker. Menus label measured
+For resolved-callee navigation, the browser uses the sole published semantic producer whose profile
+covers the source document's language at the source snapshot (owner ruling 2026-10-30, #483). With
+none, it shows syntax choices only. With several, it also shows
+`multiple semantic producers for <language>; showing syntax`. There is no producer picker. Menus label measured
 declarations as **syntax** and eligible callees as **resolved**; selecting a producer alone does not
 turn an unresolved, stale, external or dispatch-only binding into a callee action.
 

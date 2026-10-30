@@ -200,29 +200,61 @@ fn direct_and_constructor_expand_virtual_does_not() {
     assert_eq!(result.edges[2].to, None);
 }
 
+/// #483: the CLI query walks traversable bindings (`boundaryReason: none`) to its depth, as
+/// the MCP call graph does. Depth 0 keeps only the seed's own calls; the node limit counts
+/// omitted targets.
 #[test]
-fn query_view_never_traverses_semantic_bindings() {
+fn query_view_walks_direct_bindings_to_its_depth() {
     let (state, root) = workspace();
     let mut publisher = Publisher::open(state.path(), root.path());
     let mut spec = Spec::new(&[("a.rs", CHAIN)]);
     spec.bindings = vec![bind("a", 0, "b"), bind("b", 0, "c")];
     publisher.publish(&spec);
-    let seed = publisher
-        .graph
-        .as_ref()
-        .unwrap()
-        .nodes
-        .iter()
-        .find(|node| node.name == "a")
-        .unwrap()
-        .id
-        .clone();
-    let view: trellis::model::ViewQuery =
-        serde_json::from_value(serde_json::json!({"seed": seed, "depth": 5})).unwrap();
-    let view = publisher.store.query_view(&view).unwrap().unwrap();
-    assert_eq!(view.nodes.len(), 1);
-    assert_eq!(view.nodes[0].id, seed);
-    assert!(!view.calls.is_empty());
+    let id = |name: &str| {
+        publisher
+            .graph
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id
+            .clone()
+    };
+    let (a, b, c) = (id("a"), id("b"), id("c"));
+    let view = |depth: usize, max_nodes: usize| {
+        let query: trellis::model::ViewQuery = serde_json::from_value(serde_json::json!({
+            "seed": a, "depth": depth, "maxNodes": max_nodes
+        }))
+        .unwrap();
+        publisher.store.query_view(&query).unwrap().unwrap()
+    };
+    let nodes = |view: &trellis::model::ViewResult| {
+        view.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+    };
+    let callers = |view: &trellis::model::ViewResult| {
+        view.calls
+            .iter()
+            .map(|call| call.caller.clone())
+            .collect::<Vec<_>>()
+    };
+    let seed_only = view(0, 40);
+    assert_eq!(nodes(&seed_only), std::slice::from_ref(&a));
+    assert_eq!(callers(&seed_only), std::slice::from_ref(&a));
+    let one = view(1, 40);
+    assert_eq!(nodes(&one), [a.clone(), b.clone()]);
+    assert_eq!(callers(&one), std::slice::from_ref(&a));
+    assert_eq!(one.semantic.bindings[0].target_id.as_ref(), Some(&b));
+    let deep = view(5, 40);
+    assert_eq!(nodes(&deep), [a.clone(), b.clone(), c.clone()]);
+    assert_eq!(callers(&deep), [a.clone(), b.clone()]);
+    assert_eq!(deep.semantic.bindings.len(), 2);
+    assert!(!deep.truncated);
+    let bounded = view(5, 1);
+    assert_eq!(nodes(&bounded), std::slice::from_ref(&a));
+    assert_eq!(bounded.omitted_nodes, 1);
+    assert!(bounded.truncated);
 }
 
 fn sequence_steps(
@@ -476,7 +508,7 @@ fn sequence_zero_and_multiple_producers_are_syntax_only() {
         assert_eq!(
             view.warnings
                 .iter()
-                .any(|warning| warning == "multiple semantic producers; showing syntax"),
+                .any(|warning| *warning == trellis::store::multiple_producers_note("rust")),
             multiple
         );
     }

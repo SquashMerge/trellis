@@ -9,8 +9,9 @@ POST /api/navigation request (deny unknown fields):
   `semanticProducerId` is an optional explicit published producer ID. `semanticProducerPolicy` may
   be `"solePublished"`; it is mutually exclusive with an explicit ID. With neither, navigation stays
   syntax-only. Empty/unknown IDs, unknown policies and conflicting selectors are invalid requests.
-  The browser requests `"solePublished"`: select the sole published producer at the exact source pin;
-  none means syntax-only; several mean syntax-only plus `multiple semantic producers; showing syntax`.
+  The browser requests `"solePublished"`: at the exact source pin, select the sole published producer
+  whose profile covers the source document's language (owner ruling 2026-10-30, #483); none means
+  syntax-only; several mean syntax-only plus `multiple semantic producers for <language>; showing syntax`.
   Never merge producers or substitute the current head. No producer picker is provided.
 - Member selector: {expectedRevision, classId, memberName, startByte, endByte}.
 Selectors are exclusive. Member selector MUST match a recorded ClassMember by name+exact byte range;
