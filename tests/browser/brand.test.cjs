@@ -72,7 +72,7 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
   let server, browser, context;
   try {
     const indexed = await H.run(H.binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:120000});
-    const pin = JSON.parse(indexed.stdout).status.revision;
+    const pin = indexed.json().status.revision;
     server = await H.startDaemon(paths,pin.indexRevision);
     browser = await chromium.launch();
     context = await browser.newContext({viewport:{width:1440,height:900}});

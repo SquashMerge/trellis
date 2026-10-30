@@ -42,9 +42,18 @@ const hiddenTest = row => row.fileRole === "test" || (row.roleCounts.production 
 const physicalLines = text => text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
 const nextFrame = page => page.evaluate(() => new Promise(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(resolveFrame))));
 const metricRequests = selected => selected.requests.filter(row => row.url.pathname.endsWith("/metrics") && row.url.searchParams.get("scope") === "revision");
+// #459: a render, or a resize the last action caused (the inspector drawer opening or
+// closing), can still replace the SVG after the state reads ready. The next rendering
+// frame observes such a resize; the panel publishes "settled" once no render or relayout
+// is pending, so later actions and reads never meet a replaced or detached SVG.
+async function settled(page) {
+  await nextFrame(page);
+  await page.waitForFunction(() => document.querySelector("#treemap-diagram")?.dataset.layout === "settled");
+}
 async function ready(page) {
-  await page.locator("#treemap-state[data-state=ready]").waitFor();
-  await page.locator("#treemap-diagram svg").waitFor({state:"attached"});
+  await nextFrame(page);
+  await page.waitForFunction(() => document.querySelector("#treemap-diagram")?.dataset.layout === "settled" &&
+    document.querySelector("#treemap-state")?.dataset.state === "ready" && !!document.querySelector("#treemap-diagram svg"));
 }
 async function capture(page, name) {
   if (!process.env.TRELLIS_BROWSER_SCREENSHOTS) return;
@@ -72,6 +81,7 @@ async function selectFile(page, row, {keyboard, list = false} = {}) {
   const control = candidates.nth(keys.indexOf(fileKey(row)));
   if (keyboard) { await control.focus(); await page.keyboard.press(keyboard); } else await control.click();
   await page.waitForFunction(path => document.querySelector("#treemap-inspector-title")?.textContent === path, row.path);
+  await settled(page);
   return control;
 }
 async function nativeKeys(page) {
@@ -96,7 +106,7 @@ async function published(callback) {
   let server, browser, context;
   try {
     const indexed = await H.run(H.binary, ["index", "--workspace", paths.workspace], {env:paths.env, timeout:120000});
-    const pin = JSON.parse(indexed.stdout).status.revision;
+    const pin = indexed.json().status.revision;
     server = await H.startDaemon(paths, pin.indexRevision);
     browser = await chromium.launch(); context = await browser.newContext({viewport:{width:1440, height:1000}, hasTouch:true});
     const page = await context.newPage(), errors = [], requests = [];
@@ -248,13 +258,17 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   await capture(page, "treemap-desktop");
 }));
 
+// A drill waits for its own scope's breadcrumb, never a ready state left from before it.
 async function drill(page, sourceSetId, path, keyboard = "Enter") {
+  await ready(page);
   const candidates = page.locator("#treemap-diagram [data-trellis-directory-id]");
   const keys = await candidates.evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-directory-id")));
   const index = keys.indexOf(JSON.stringify([sourceSetId, path]));
   assert.notEqual(index, -1, `native directory ${path}`);
   const control = candidates.nth(index);
-  await control.focus(); await page.keyboard.press(keyboard); await ready(page);
+  await control.focus(); await page.keyboard.press(keyboard);
+  await page.waitForFunction(leaf => document.querySelector("#treemap-breadcrumbs > button:last-child")?.textContent === leaf, path.split("/").at(-1));
+  await ready(page);
 }
 
 test("Treemap native identities drill and return, Architecture selects exactly, source stays pinned and mobile scrolls", {timeout:240000}, async () => published(async selected => {
