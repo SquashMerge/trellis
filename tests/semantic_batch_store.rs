@@ -2519,7 +2519,6 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             "nat_docs",
             "nat_declarations",
             "g_definitions",
-            "g_callables",
             "g_methods",
             "w_docs",
             "out_coverage",
@@ -2806,6 +2805,24 @@ fn join_cursor_plans_use_no_temp_btree() {
             "{sql}: {plan:?}"
         );
     }
+    // The per-call callable probe (#481) is a keyed search of the covering owner index, never
+    // a scan of a side's definitions.
+    let sql = testing::join_target_callable_sql();
+    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let params = vec![rusqlite::types::Value::Null; statement.parameter_count()];
+    let plan: Vec<String> = statement
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter().any(|step| step.contains(
+            "USING COVERING INDEX g_definitions_owner (side=? AND owner_doc=? AND syntax_id=?)"
+        )),
+        "{sql}: {plan:?}"
+    );
 }
 
 impl World {
@@ -3459,8 +3476,9 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
     let memory = world.memory_publication(&descriptor, DestinationMutations::default());
     assert_same_publication(&staged, &memory, "real scip-typescript calls");
     // Callee and dispatch (owner ruling 2026-10-30, #470): plain calls of free functions,
-    // the imported `helper` included, are direct. scip-typescript's constructor and method
-    // symbols bind no target (kind 0 fails the method-kind check), so they stay unknown.
+    // the imported `helper` included, are direct. scip-typescript's kind 0 (unspecified) defers
+    // to the measured native kind (#473), so `new Widget(3)` binds the class constructor and is
+    // constructor, and the member call `w.run()` binds the method with dispatch unknown.
     let callees = |bindings: &[trellis::semantic_evidence::CallBinding]| {
         let mut callees: Vec<_> = bindings
             .iter()
@@ -3474,11 +3492,11 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         callees
     };
     {
-        use trellis::semantic_evidence::Dispatch::{Direct, Unknown};
+        use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
         assert_eq!(
             callees(&staged.call_bindings),
             [
-                ("Widget", Unknown),
+                ("Widget", Constructor),
                 ("helper", Direct),
                 ("plain", Direct),
                 ("plain", Direct),
@@ -3487,15 +3505,17 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
             ]
         );
     }
-    let helper = staged
-        .call_bindings
-        .iter()
-        .find(|binding| {
-            let range = &binding.join.anchor.range;
-            &main[range.start..range.end] == "helper"
-        })
-        .unwrap();
-    assert_eq!(helper.resolution, Resolution::Resolved);
+    for name in ["helper", "Widget", "run"] {
+        let binding = staged
+            .call_bindings
+            .iter()
+            .find(|binding| {
+                let range = &binding.join.anchor.range;
+                &main[range.start..range.end] == name
+            })
+            .unwrap();
+        assert_eq!(binding.resolution, Resolution::Resolved, "{name}");
+    }
 
     let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
     let staged = testing::staged_publication(&mut admitted).unwrap();
@@ -3512,6 +3532,107 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         callees(&world.store.semantic_at(head).unwrap().call_bindings),
         callees(&staged.call_bindings)
     );
+}
+
+/// #473: the real #444 bytes with an explicit SCIP kind on the constructor and `run` symbols.
+/// `Method` (26) agrees with their native `method` declarations and binds as kind 0 does;
+/// `Function` (17) conflicts, so neither call binds a target. Batch equals memory either way.
+#[test]
+fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memory() {
+    use protobuf::EnumOrUnknown;
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import/issue444-javascript-calls");
+    let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
+    let (lib, main) = (read("src/lib.js"), read("src/main.js"));
+    for (kind, widget, run) in [
+        (
+            26,
+            (Resolution::Resolved, Constructor),
+            (Resolution::Resolved, Unknown),
+        ),
+        (
+            17,
+            (Resolution::Unresolved, Unknown),
+            (Resolution::Unresolved, Unknown),
+        ),
+    ] {
+        let mut index = scip::types::Index::parse_from_bytes(
+            &fs::read(fixture_dir.join("index.scip")).unwrap(),
+        )
+        .unwrap();
+        let mut replaced = 0;
+        for info in index
+            .documents
+            .iter_mut()
+            .flat_map(|d| d.symbols.iter_mut())
+        {
+            if ["Widget#`<constructor>`().", "Widget#run()."]
+                .iter()
+                .any(|suffix| info.symbol.ends_with(suffix))
+            {
+                info.kind = EnumOrUnknown::from_i32(kind);
+                replaced += 1;
+            }
+        }
+        assert_eq!(replaced, 2);
+        let world = world(|root| {
+            write_files(
+                root,
+                &[
+                    ("src/lib.js", &lib),
+                    ("src/main.js", &main),
+                    (
+                        "package.json",
+                        r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+                    ),
+                ],
+            )
+        });
+        let mut fixture = world.fixture().reference("scip-typescript");
+        let ordinal = fixture.artifact(
+            "javascript",
+            vec![DocSpec::new("src/lib.js"), DocSpec::new("src/main.js")],
+        );
+        fixture.override_artifact_raw(ordinal, index.write_to_bytes().unwrap());
+        let descriptor = world.write(&fixture);
+        let (mut admitted, _, _) = world
+            .join_with(
+                &descriptor,
+                &BatchLimits::PRODUCTION,
+                DestinationMutations::default(),
+            )
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        drop(admitted);
+        let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+        assert_same_publication(&staged, &memory, &format!("explicit kind {kind}"));
+        let mut callees: Vec<_> = staged
+            .call_bindings
+            .iter()
+            .map(|binding| {
+                let range = &binding.join.anchor.range;
+                (
+                    &main[range.start..range.end],
+                    (binding.resolution, binding.dispatch),
+                )
+            })
+            .collect();
+        callees.sort_by_key(|(callee, _)| *callee);
+        let direct = (Resolution::Resolved, Direct);
+        assert_eq!(
+            callees,
+            [
+                ("Widget", widget),
+                ("helper", direct),
+                ("plain", direct),
+                ("plain", direct),
+                ("register", direct),
+                ("run", run),
+            ],
+            "explicit kind {kind}"
+        );
+    }
 }
 
 /// Real scip-typescript 0.4.0 bytes for issue #466 (`index` with the fixture's `tsconfig.json`,
@@ -5316,35 +5437,30 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
             .collect();
         shown.sort_by(|a, b| a.0.cmp(&b.0));
         // #470's owner ruling: a resolved plain call to a free function is `Direct`, so the
-        // graph follows it (no boundary). Calls that stay unresolved (`new Widget(3)`,
-        // `w.run()`) keep `Unknown` dispatch and their `unresolved` boundary.
-        let followed = |name: &str, target: &str| {
+        // graph follows it (no boundary), as it does `new Widget(3)`, which binds the class
+        // constructor and is `Constructor` (#473: scip-typescript's unspecified kind defers to
+        // the native kind). The member call `w.run()` binds the method with `Unknown`
+        // dispatch, so it keeps a `dispatch` boundary.
+        let resolved = |name: &str, dispatch: &str, boundary, target: &str| {
             (
                 name.to_owned(),
                 "Resolved".to_owned(),
-                "Direct".to_owned(),
-                BoundaryReason::None,
+                dispatch.to_owned(),
+                boundary,
                 Some(ids[target].clone()),
             )
         };
-        let unresolved = |name: &str| {
-            (
-                name.to_owned(),
-                "Unresolved".to_owned(),
-                "Unknown".to_owned(),
-                BoundaryReason::Unresolved,
-                None,
-            )
-        };
+        let followed =
+            |name: &str, target: &str| resolved(name, "Direct", BoundaryReason::None, target);
         assert_eq!(
             shown,
             [
-                unresolved("Widget"),
+                resolved("Widget", "Constructor", BoundaryReason::None, "constructor"),
                 followed("helper", "helper"),
                 followed("plain", "plain"),
                 followed("plain", "plain"),
                 followed("register", "register"),
-                unresolved("run"),
+                resolved("run", "Unknown", BoundaryReason::Dispatch, "run"),
             ]
         );
         for binding in &view.semantic.bindings {
@@ -5436,9 +5552,16 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
             ids["helper"]
         );
         assert_eq!(helper["semanticBasis"]["producerId"], producer.as_str());
-        // A member call whose target stays unresolved keeps its boundary.
+        // A resolved member call has unknown dispatch, so it keeps a dispatch boundary.
         let run = calls.iter().find(|c| c["calleeText"] == "run").unwrap();
-        assert_eq!(run["boundaryReason"], "unresolved", "{run}");
+        assert_eq!(run["disposition"], "resolved", "{run}");
+        assert_eq!(run["boundaryReason"], "dispatch", "{run}");
+        assert_eq!(run["targetId"], ids["run"], "{run}");
+        // `new Widget(3)` is a resolved constructor call and is followed (#473).
+        let widget = calls.iter().find(|c| c["calleeText"] == "Widget").unwrap();
+        assert_eq!(widget["binding"]["dispatch"], "constructor", "{widget}");
+        assert_eq!(widget["boundaryReason"], "none", "{widget}");
+        assert_eq!(widget["targetId"], ids["constructor"], "{widget}");
         assert_eq!(run["binding"]["dispatch"], "unknown", "{run}");
         let unbound = calls.iter().find(|c| c["calleeText"] == "method").unwrap();
         assert_eq!(unbound["binding"], Value::Null);
@@ -5637,7 +5760,12 @@ async fn none_or_multiple_producers_show_syntax_with_a_note() {
     second.artifact("javascript", docs);
     let descriptor = multiple.write(&second);
     drop(multiple.publish(&descriptor).unwrap());
-    check(&multiple, trellis::store::MULTIPLE_PRODUCERS_NOTE, 470, 2);
+    check(
+        &multiple,
+        &trellis::store::multiple_producers_note("javascript"),
+        470,
+        2,
+    );
 }
 
 // Real rust-analyzer 1.98.1 output (`rust-analyzer scip`, the profile-pinned binary) for the
@@ -6559,4 +6687,449 @@ fn real_rust_analyzer_library_fallback_matches_the_keys_package() {
     let staged =
         rust_analyzer_publications(&world, &descriptor, &BatchLimits::PRODUCTION, "version");
     assert!(calls(&staged).contains(&(Resolution::Unresolved, None)));
+}
+
+// Owner ruling 2026-10-30 (#483): the default semantic producer is chosen per language.
+
+const JS_FILES: [&str; 2] = ["src/lib.js", "src/main.js"];
+const JS_FIXTURE: &str = "issue444-javascript-calls";
+
+/// The real rust-analyzer crate and the real scip-typescript sources in one workspace, with
+/// the workspace marker an MCP session selects.
+fn mixed_world() -> World {
+    let js = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import")
+        .join(JS_FIXTURE);
+    world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            copy_tree(&Path::new(RUST_ANALYZER).join("workspace"), root);
+            for path in JS_FILES {
+                fs::write(root.join(path), fs::read(js.join(path)).unwrap()).unwrap();
+            }
+            // The fixture's package root names its module markers (#443).
+            fs::write(
+                root.join("package.json"),
+                r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+            )
+            .unwrap();
+        },
+        true,
+    )
+}
+
+/// The syntax ID of the declaration named `name` in `path`.
+fn declaration_in(world: &World, name: &str, path: &str) -> String {
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let found: Vec<_> = native
+        .declarations
+        .iter()
+        .filter(|d| d.name.as_deref() == Some(name) && d.document.path == path)
+        .collect();
+    assert_eq!(found.len(), 1, "{name} in {path}");
+    found[0].syntax_id.clone()
+}
+
+/// Every published producer ID at the head.
+fn head_producers(world: &World) -> Vec<String> {
+    let head = world.store.index_baseline().unwrap();
+    world
+        .store
+        .semantic_at(head)
+        .unwrap()
+        .producers
+        .iter()
+        .map(|producer| producer.id.clone())
+        .collect()
+}
+
+fn language_row<'s>(
+    status: &'s trellis::model::IndexStatus,
+    language: &str,
+) -> &'s trellis::model::LanguageSemantic {
+    status
+        .semantic_languages
+        .iter()
+        .find(|row| row.language == language)
+        .unwrap_or_else(|| panic!("{language}: {:?}", status.semantic_languages))
+}
+
+/// The step evidence of each call step in a sequence, by label.
+fn sequence_targets(view: &trellis::behavior::SequenceView) -> Vec<(String, Option<String>)> {
+    fn steps(all: &[trellis::behavior::SequenceStep]) -> Vec<&trellis::behavior::SequenceStep> {
+        all.iter()
+            .flat_map(|s| {
+                std::iter::once(s)
+                    .chain(steps(&s.children))
+                    .chain(steps(&s.alternate))
+            })
+            .collect()
+    }
+    steps(&view.steps)
+        .into_iter()
+        .filter(|step| step.call_evidence.is_some())
+        .map(|step| (step.label.clone(), step.target.clone()))
+        .collect()
+}
+
+fn warning<'v>(envelope: &'v Value, code: &str) -> Option<&'v Value> {
+    envelope["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == code)
+}
+
+/// With rust-analyzer and scip-typescript both published, each language selects its own
+/// producer: status, the CLI query and symbols, MCP and the web sequence. An explicit
+/// producer still overrides and is validated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_language_selects_its_own_published_producer() {
+    use trellis::graph_query::BoundaryReason;
+    use trellis::model::SemanticState;
+    let world = mixed_world();
+    let rust = rust_analyzer_batch(&world);
+    drop(world.publish(&rust).unwrap());
+    let (pin, _) = publish_real_fixture(&world, JS_FIXTURE, &JS_FILES);
+    assert_eq!(head_producers(&world), ["rust-analyzer", "scip-typescript"]);
+    let run = declaration_in(&world, "run", "src/lib.rs");
+    let double = declaration_in(&world, "double", "src/util.rs");
+    let saturating = declaration_in(&world, "saturating", "src/util.rs");
+    let caller = declaration_in(&world, "caller", "src/main.js");
+    let helper = declaration_in(&world, "helper", "src/lib.js");
+    let response = world.store.evidence_response().unwrap();
+
+    // Status: per-language state and counts, and their combined total.
+    for status in [response.status().unwrap(), world.store.status().unwrap()] {
+        assert_eq!(status.semantic_producer_id, None);
+        assert_eq!(status.semantic_note, None);
+        assert_eq!(status.semantic_languages.len(), 2);
+        for (language, producer) in [("javascript", "scip-typescript"), ("rust", "rust-analyzer")] {
+            let row = language_row(&status, language);
+            assert_eq!(row.semantic_producer_id.as_deref(), Some(producer));
+            assert_eq!(row.semantic_note, None);
+            assert_eq!(row.semantic_state, SemanticState::Fresh, "{row:?}");
+            assert!(row.internal > 0, "{row:?}");
+            assert_eq!(
+                row.internal + row.external + row.ambiguous + row.unresolved,
+                row.calls,
+                "{row:?}"
+            );
+        }
+        let rows = &status.semantic_languages;
+        assert_eq!(
+            status.stats.internal,
+            rows.iter().map(|row| row.internal).sum::<usize>()
+        );
+        assert_eq!(
+            status.stats.external,
+            rows.iter().map(|row| row.external).sum::<usize>()
+        );
+        assert_eq!(
+            status.stats.ambiguous,
+            rows.iter().map(|row| row.ambiguous).sum::<usize>()
+        );
+        assert_eq!(status.stats.semantic_state, SemanticState::Fresh);
+    }
+
+    // CLI query: each seed uses its own language's producer, and the walk follows direct
+    // bindings to depth 2 (`run` -> `double` -> `saturating`).
+    let mut deep = view_query(&run, None);
+    deep.depth = 2;
+    let view = response.query_view(&deep).unwrap().unwrap();
+    assert_eq!(view.revision, pin);
+    assert_eq!(view.semantic.producer_id.as_deref(), Some("rust-analyzer"));
+    assert_eq!(view.semantic.note, None);
+    let nodes: Vec<_> = view.nodes.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(nodes, [run.clone(), double.clone(), saturating.clone()]);
+    assert!(
+        view.nodes
+            .iter()
+            .all(|n| n.provenance.semantic == SemanticState::Fresh),
+        "{:?}",
+        view.nodes
+            .iter()
+            .map(|n| (&n.name, &n.path, n.provenance.semantic))
+            .collect::<Vec<_>>()
+    );
+    assert!(view.semantic.bindings.iter().any(|b| {
+        b.boundary_reason == BoundaryReason::None && b.target_id.as_ref() == Some(&saturating)
+    }));
+    let view = response
+        .query_view(&view_query(&caller, None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view.semantic.producer_id.as_deref(),
+        Some("scip-typescript")
+    );
+    assert_eq!(view.semantic.note, None);
+    assert!(
+        view.semantic
+            .bindings
+            .iter()
+            .any(|b| b.target_id.as_ref() == Some(&helper))
+    );
+    // An explicit producer overrides, and one that does not cover the language says so.
+    let view = response
+        .query_view(&view_query(&caller, Some("rust-analyzer")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.semantic.producer_id.as_deref(), Some("rust-analyzer"));
+    assert_eq!(
+        view.semantic.note.as_deref(),
+        Some(trellis::store::LANGUAGE_NOTE)
+    );
+    assert!(view.semantic.bindings.is_empty());
+    let unpublished = response
+        .query_view(&view_query(&caller, Some("not-published")))
+        .unwrap_err();
+    assert!(
+        unpublished
+            .downcast_ref::<trellis::store::ProducerNotPublished>()
+            .is_some(),
+        "{unpublished:#}"
+    );
+
+    // CLI symbols report each language's selected producer state.
+    for name in ["double", "helper"] {
+        let (_, symbols) = response.symbols_at(name, 10).unwrap();
+        let symbol = symbols.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(symbol.provenance.semantic, SemanticState::Fresh, "{name}");
+    }
+    drop(response);
+
+    // The web sequence: each seed's language uses its own producer.
+    let rust_sequence = world.store.sequence_at(&run, pin, false).unwrap().unwrap();
+    assert!(
+        sequence_targets(&rust_sequence)
+            .iter()
+            .any(|(label, target)| label.contains("double") && target.as_ref() == Some(&double)),
+        "{:?}",
+        sequence_targets(&rust_sequence)
+    );
+    let js_sequence = world
+        .store
+        .sequence_at(&caller, pin, false)
+        .unwrap()
+        .unwrap();
+    assert!(
+        sequence_targets(&js_sequence)
+            .iter()
+            .any(|(label, target)| label.contains("helper") && target.as_ref() == Some(&helper)),
+        "{:?}",
+        sequence_targets(&js_sequence)
+    );
+    for view in [&rust_sequence, &js_sequence] {
+        assert!(
+            !view.warnings.iter().any(|w| w.contains("showing syntax")),
+            "{:?}",
+            view.warnings
+        );
+    }
+
+    // MCP: the call graph, outgoing and incoming calls take each language's producer.
+    let mut mcp = McpSession::start(&world, 483);
+    for (root, target) in [(&run, &double), (&caller, &helper)] {
+        let graph = mcp.call(
+            "trellis_call_graph",
+            json!({"schemaVersion":1,"symbolId":root,"depth":1}),
+        );
+        let edges = graph["data"]["result"]["edges"].as_array().unwrap();
+        assert!(
+            edges.iter().any(|e| e["to"] == json!(target)
+                && e["boundaryReason"] == "none"
+                && e["binding"]["resolution"] == "resolved"),
+            "{graph}"
+        );
+        assert_eq!(warning(&graph, "syntaxOnly"), None, "{graph}");
+        let outgoing = mcp.call(
+            "trellis_outgoing_calls",
+            json!({"schemaVersion":1,"symbolId":root}),
+        );
+        assert!(
+            outgoing["data"]["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["targetId"] == json!(target) && c["evidenceTier"] == "semantic"),
+            "{outgoing}"
+        );
+        assert_eq!(warning(&outgoing, "syntaxOnly"), None, "{outgoing}");
+    }
+    let incoming = mcp.call(
+        "trellis_incoming_calls",
+        json!({"schemaVersion":1,"symbolId":double}),
+    );
+    assert!(
+        incoming["data"]["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["targetId"] == json!(double)),
+        "{incoming}"
+    );
+    // An explicit producer outside the root's language leaves its calls syntax only (D8).
+    let graph = mcp.call(
+        "trellis_call_graph",
+        json!({"schemaVersion":1,"symbolId":caller,"depth":1,"semanticProducerId":"rust-analyzer"}),
+    );
+    assert!(
+        graph["data"]["result"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["binding"].is_null()),
+        "{graph}"
+    );
+    mcp.finish();
+    assert!(!world.store.recovery_pending_for_tests());
+}
+
+/// Two producers covering JavaScript leave only JavaScript syntax only, with the note naming
+/// it; Rust keeps its sole producer. An explicit producer still selects one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_producers_for_one_language_fall_back_for_that_language_only() {
+    use trellis::model::SemanticState;
+    let world = mixed_world();
+    publish_real_fixture(&world, JS_FIXTURE, &JS_FILES);
+    // The synthetic producer covers every language; its artifact covers the Rust documents.
+    let mut synthetic = world.fixture();
+    let docs = synthetic.paths("rust");
+    assert_eq!(docs.len(), 2);
+    synthetic.artifact("rust", docs);
+    let descriptor = world.write(&synthetic);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producers = head_producers(&world);
+    assert_eq!(producers.len(), 2);
+    let synthetic_id = producers
+        .iter()
+        .find(|id| *id != "scip-typescript")
+        .unwrap()
+        .clone();
+    let note = trellis::store::multiple_producers_note("javascript");
+    let run = declaration_in(&world, "run", "src/lib.rs");
+    let caller = declaration_in(&world, "caller", "src/main.js");
+    let response = world.store.evidence_response().unwrap();
+
+    let status = response.status().unwrap();
+    let js = language_row(&status, "javascript");
+    assert_eq!(js.semantic_producer_id, None);
+    assert_eq!(js.semantic_note.as_deref(), Some(note.as_str()));
+    assert_eq!(js.semantic_state, SemanticState::Unavailable);
+    assert_eq!(
+        (js.internal, js.external, js.ambiguous, js.unresolved),
+        (0, 0, 0, js.calls)
+    );
+    let rust = language_row(&status, "rust");
+    assert_eq!(
+        rust.semantic_producer_id.as_deref(),
+        Some(synthetic_id.as_str())
+    );
+    assert_eq!(rust.semantic_note, None);
+    assert_ne!(rust.semantic_state, SemanticState::Unavailable);
+    assert_eq!(
+        status.semantic_producer_id.as_deref(),
+        Some(synthetic_id.as_str())
+    );
+    assert_eq!(status.semantic_note.as_deref(), Some(note.as_str()));
+
+    let view = response
+        .query_view(&view_query(&caller, None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.semantic.producer_id, None);
+    assert_eq!(view.semantic.note.as_deref(), Some(note.as_str()));
+    assert!(view.semantic.bindings.is_empty());
+    let view = response
+        .query_view(&view_query(&run, None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view.semantic.producer_id.as_deref(),
+        Some(synthetic_id.as_str())
+    );
+    assert_eq!(view.semantic.note, None);
+    // The explicit producer overrides the fallback.
+    let view = response
+        .query_view(&view_query(&caller, Some("scip-typescript")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.semantic.note, None);
+    assert!(!view.semantic.bindings.is_empty());
+    drop(response);
+
+    let js_sequence = world
+        .store
+        .sequence_at(&caller, pin, false)
+        .unwrap()
+        .unwrap();
+    assert!(
+        js_sequence.warnings.contains(&note),
+        "{:?}",
+        js_sequence.warnings
+    );
+    assert!(
+        sequence_targets(&js_sequence)
+            .iter()
+            .all(|(_, target)| target.is_none())
+    );
+    let rust_sequence = world.store.sequence_at(&run, pin, false).unwrap().unwrap();
+    assert!(!rust_sequence.warnings.contains(&note));
+
+    let mut mcp = McpSession::start(&world, 484);
+    let syntax_only = json!({"code":"syntaxOnly","message":note,"provenanceId":null});
+    let graph = mcp.call(
+        "trellis_call_graph",
+        json!({"schemaVersion":1,"symbolId":caller,"depth":1}),
+    );
+    assert_eq!(warning(&graph, "syntaxOnly"), Some(&syntax_only), "{graph}");
+    assert!(
+        graph["data"]["result"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["binding"].is_null()),
+        "{graph}"
+    );
+    let outgoing = mcp.call(
+        "trellis_outgoing_calls",
+        json!({"schemaVersion":1,"symbolId":caller}),
+    );
+    assert_eq!(
+        warning(&outgoing, "syntaxOnly"),
+        Some(&syntax_only),
+        "{outgoing}"
+    );
+    let graph = mcp.call(
+        "trellis_call_graph",
+        json!({"schemaVersion":1,"symbolId":run,"depth":1}),
+    );
+    assert_eq!(warning(&graph, "syntaxOnly"), None, "{graph}");
+    let graph = mcp.call(
+        "trellis_call_graph",
+        json!({"schemaVersion":1,"symbolId":caller,"depth":1,"semanticProducerId":"scip-typescript"}),
+    );
+    assert_eq!(warning(&graph, "syntaxOnly"), None, "{graph}");
+    assert!(
+        graph["data"]["result"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| !e["binding"].is_null()),
+        "{graph}"
+    );
+    mcp.finish();
+    assert!(!world.store.recovery_pending_for_tests());
 }

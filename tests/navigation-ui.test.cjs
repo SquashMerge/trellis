@@ -763,7 +763,7 @@ test("source retries retain solePublished without accepting policy from caller",
 
 test("multiple producer warning leaves only explicitly labelled syntax choices and no callee action",async()=>{
   const h=harness(),method=declaration();
-  const warning="multiple semantic producers; showing syntax";
+  const warning="multiple semantic producers for java; showing syntax";
   h.request=async()=>response([
     {symbol:method,reason:"enclosing",action:"sequence",matchKind:"measured"},
     {symbol:declaration("guess"),reason:"call",action:"sequence",matchKind:"syntaxCandidate"}],{warnings:[warning]});

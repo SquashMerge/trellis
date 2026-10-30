@@ -75,6 +75,12 @@ pub(crate) fn cursor_sql() -> Vec<String> {
     queries
 }
 
+/// The per-call target-callable probe (#470), for plan tests.
+#[cfg(feature = "test-support")]
+pub(crate) fn target_callable_sql() -> &'static str {
+    streaming::target_callable_sql()
+}
+
 fn document_claim_sql(filtered: bool) -> String {
     format!(
         "{} WHERE s.language=?1 AND s.path=?2 ORDER BY c.canonical_bytes,c.claim_id",

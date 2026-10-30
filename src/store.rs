@@ -16,8 +16,8 @@ pub use search::{
 };
 pub use search_startup::RecentSearchCheckout;
 pub use semantic_display::{
-    CallSemantic, LANGUAGE_NOTE, MULTIPLE_PRODUCERS_NOTE, McpSemantic, NO_PRODUCER_NOTE,
-    ProducerChoice, ProducerNotPublished,
+    CallSemantic, LANGUAGE_NOTE, McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished,
+    ProducerSelection, multiple_producers_note,
 };
 pub(crate) mod symbol_trigrams;
 pub mod topology;
@@ -14262,6 +14262,7 @@ impl Store {
             watcher: None,
             semantic_producer_id: None,
             semantic_note: None,
+            semantic_languages: Vec::new(),
         })
     }
     fn ensure_public_read_ready(&self) -> Result<()> {
@@ -20822,29 +20823,36 @@ impl Store {
             self.read_revision_for(tx, Some(request.expected_revision()), pre_startup)?;
         let revision = selected.pin;
         // Policy selection is local to this exact selected snapshot, never the head.
+        // The policy selects the source document language's sole covering producer (#483).
         let mut producer_bytes = Vec::new();
-        let mut multiple_producers = false;
+        let mut multiple_producers = None;
         let effective_request = match request {
             crate::navigation::NavigationRequest::Source(selector)
                 if selector.semantic_producer_policy.is_some() =>
             {
-                let producers = tx.prepare(
-                    "SELECT CASE WHEN length(CAST(id AS BLOB))<=?2 THEN id END FROM semantic_revision_producers WHERE revision_id=?1 ORDER BY id LIMIT 2",
-                )?.query_map(params![selected.key, crate::navigation::RECORD_BYTES], |row| row.get::<_, Option<String>>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let language: Option<String> = tx
+                    .query_row(
+                        "SELECT language FROM revision_documents WHERE revision_id=?1 AND path=?2 ORDER BY language LIMIT 1",
+                        params![selected.key, selector.path],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
                 let mut ids = Vec::new();
-                for producer in producers {
-                    let producer = producer.context(SelectedIntegrity(
-                        "selected semantic producer exceeds navigation budget".into(),
-                    ))?;
-                    selected_ensure!(
-                        crate::graph_query::valid_producer_id(&producer),
-                        "invalid selected semantic producer ID"
-                    );
-                    producer_bytes.push(serde_json::to_vec(&producer)?.len());
-                    ids.push(producer);
+                if let Some(language) = &language {
+                    let selection = semantic_display::select_producers(tx, &selected.key, None)?;
+                    for producer in selection.covering(language).iter().take(2) {
+                        let bytes = serde_json::to_vec(producer)?.len();
+                        selected_ensure!(
+                            bytes <= crate::navigation::RECORD_BYTES as usize,
+                            "selected semantic producer exceeds navigation budget"
+                        );
+                        producer_bytes.push(bytes);
+                        ids.push(producer.clone());
+                    }
                 }
-                multiple_producers = ids.len() > 1;
+                if ids.len() > 1 {
+                    multiple_producers = language.as_deref().map(multiple_producers_note);
+                }
                 let mut selector = selector.clone();
                 selector.semantic_producer_policy = None;
                 selector.semantic_producer_id = if ids.len() == 1 { ids.pop() } else { None };
@@ -20918,8 +20926,8 @@ impl Store {
                 .as_ref()
                 .map(|document| document.nodes.as_slice()),
             &mut |reader, selector| {
-                if multiple_producers {
-                    reader.warn("multiple semantic producers; showing syntax");
+                if let Some(note) = &multiple_producers {
+                    reader.warn(note);
                 }
                 for bytes in &producer_bytes {
                     if !reader.charge(*bytes) {
@@ -21121,10 +21129,13 @@ impl Store {
                 );
             }
         }
+        // `provenance.semantic` reports each document language's selected producer (#483).
+        let mut reader = semantic_display::SemanticCalls::new(tx, &selected, None)?;
         let values = rows
             .iter()
             .map(|(path, id)| {
-                documents[path]
+                let document = &documents[path];
+                let mut symbol = document
                     .nodes
                     .iter()
                     .find(|node| node.id == *id)
@@ -21133,7 +21144,10 @@ impl Store {
                         anyhow::Error::from(SelectedIntegrity(
                             "incompatible_index: selected search symbol missing".into(),
                         ))
-                    })
+                    })?;
+                symbol.provenance.semantic =
+                    reader.document_state(&document.file.language, path)?;
+                Ok(symbol)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((revision, values))
@@ -21603,7 +21617,7 @@ impl Store {
         let document = self.selected_graph_document_for(tx, path, &selected)?;
         let mut symbols = document.nodes;
         symbols.retain(|node| matches!(node.kind, SymbolKind::Method | SymbolKind::Function));
-        // `provenance.semantic` reports the sole published producer's coverage (#467).
+        // `provenance.semantic` reports the language's selected producer (#467, #483).
         semantic_display::mark_document_symbols(
             tx,
             &selected,
@@ -22026,7 +22040,7 @@ impl Store {
             return Ok(None);
         };
         let seed_document = self.selected_graph_document_for(tx, &path, &selected)?;
-        let mut seed = seed_document
+        let seed = seed_document
             .nodes
             .iter()
             .find(|symbol| symbol.id == query.seed)
@@ -22034,67 +22048,24 @@ impl Store {
             .ok_or_else(|| {
                 SelectedIntegrity("incompatible_index: selected view seed missing".into())
             })?;
-        let mut calls = Vec::new();
-        let mut region_ids = BTreeSet::new();
-        let mut truncated = false;
-        if !query.exclude_paths.iter().any(|p| seed.path.starts_with(p)) {
-            // A call's owner belongs to the seed's document. Sort its calls,
-            // then take the SQL LIMIT before filtering excluded paths.
-            let mut ordered: Vec<CallSite> = seed_document
-                .graph_calls
-                .iter()
-                .filter(|call| call.caller == seed.id)
-                .cloned()
-                .collect();
-            ordered.sort_by(crate::indexer::compare_reader_calls);
-            for call in ordered.into_iter().take(query.max_calls + 1) {
-                if query.exclude_paths.iter().any(|p| call.path.starts_with(p)) {
-                    continue;
-                }
-                if calls.len() >= query.max_calls {
-                    truncated = true;
-                    break;
-                }
-                region_ids.extend(call.regions.iter().cloned());
-                calls.push(call);
-            }
+        let walk = semantic_display::view_walk(self, tx, &selected, query, seed_document, seed)?;
+        let mut warnings = Vec::new();
+        if walk.truncated {
+            warnings.push("Measured calls truncated at the request limit.".into());
         }
-        let mut regions = BTreeMap::new();
-        while let Some(id) = region_ids.pop_first() {
-            let region = seed_document
-                .graph_regions
-                .iter()
-                .find(|region| region.id == id)
-                .cloned();
-            if let Some(region) = region {
-                if let Some(parent) = &region.parent {
-                    region_ids.insert(parent.clone());
-                }
-                regions.insert(id, region);
-            }
+        if walk.omitted_nodes > 0 {
+            warnings.push("Node limit reached; additional targets are not shown.".into());
         }
-        let semantic = semantic_display::view_semantics(
-            tx,
-            &selected,
-            query.semantic_producer_id.as_deref(),
-            &mut seed,
-            &seed_document.file.language,
-            &mut calls,
-        )?;
         Ok(Some(ViewResult {
             revision,
             query: query.clone(),
-            nodes: vec![seed],
-            calls,
-            regions: regions.into_values().collect(),
-            truncated,
-            omitted_nodes: 0,
-            warnings: if truncated {
-                vec!["Measured calls truncated at the request limit.".into()]
-            } else {
-                vec![]
-            },
-            semantic,
+            nodes: walk.nodes,
+            calls: walk.calls,
+            regions: walk.regions,
+            truncated: walk.truncated || walk.omitted_nodes > 0,
+            omitted_nodes: walk.omitted_nodes,
+            warnings,
+            semantic: walk.semantic,
         }))
     }
 }

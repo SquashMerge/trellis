@@ -86,17 +86,25 @@ Parse-error files retain recovered syntax with unavailable semantic provenance. 
 freshness. There is **no watcher**: the source may have changed since indexing.
 
 **Status of a published import (#467).** `trellis status` and `GET /api/status` read the
-head revision's published semantic producers under the browser's policy (#392/#409). With
-exactly one, `semanticProducerId` names it and `stats` reports its selected bindings:
-`semanticState` is `fresh`, or `stale` when any selected proof is not fresh. It is
-`unavailable` when no selected complete or partial coverage exists. `internal` counts
-calls resolved to an internal declaration, `external` external calls, and `ambiguous`
-ambiguous calls. Each call counts once, even when an ambiguous call publishes one row per
-provenance. `unresolved` counts the remaining measured calls. With no producer, or several,
-`semanticNote` says so (`no semantic producer published; showing syntax` or
-`multiple semantic producers; showing syntax`). `semanticState` is then `unavailable`,
-and the counts stay syntax-only. `GET /api/methods` marks each symbol's
-`provenance.semantic` with the same producer's state for that document.
+head revision's published semantic producers per language (owner ruling 2026-10-30, #483,
+amending #392/#409): each language uses the sole published producer whose profile covers
+it. `semanticLanguages` lists every indexed language as `{language, semanticProducerId,
+semanticNote, semanticState, calls, internal, external, ambiguous, unresolved}` from that
+producer's selected bindings. `semanticState` is `fresh`, or `stale` when any selected proof
+is not fresh. It is `unavailable` when no selected complete or partial coverage exists.
+`internal` counts calls resolved to an internal declaration, `external` external calls, and
+`ambiguous` ambiguous calls. Each call counts once, even when an ambiguous call publishes
+one row per provenance. `unresolved` counts the language's remaining measured calls. A
+language that none or several producers cover has a `semanticNote` (`semantic producer does
+not cover this language; showing syntax` or `multiple semantic producers for <language>;
+showing syntax`), `unavailable` and syntax-only counts. `stats` is the combined total:
+`stale` if any language is stale, else `fresh` if any is fresh. The top-level
+`semanticProducerId` names the producer when every selected language shares one, and
+`semanticNote` joins the multiple-producer notes. With no producer published,
+`semanticLanguages` is omitted. When no indexed language has a producer, `semanticNote`
+says why, `semanticState` is `unavailable` and the counts stay syntax-only.
+`GET /api/methods` and `trellis symbols` mark each symbol's `provenance.semantic` with its
+document language's producer state.
 
 ## Data and identity contract
 
@@ -158,14 +166,17 @@ A result includes `revision` as the complete `{indexGeneration,indexRevision}` p
 the effective query, `nodes`, `calls`, `regions`, `truncated`, `omittedNodes`, `warnings`
 and `semantic`. The pair and all facts are read in one SQLite transaction.
 
-`semantic` (#467) applies the browser's producer policy (#392/#409) at that revision. An
-explicit `semanticProducerId` (1–512 bytes, no NUL) must be published there: an empty or
-oversized ID fails `invalid_argument`, and an unpublished one fails `producer_unavailable`.
-Without one, the sole published producer is used. None or several leave the view syntax
-only, with `semantic.note` `no semantic producer published; showing syntax` or
-`multiple semantic producers; showing syntax`; producers are never merged. A producer that
-does not cover the seed's language gives `semantic producer does not cover this language;
-showing syntax`. Otherwise `semantic` is `{producerId, note: null, bindings}`. Each
+`semantic` (#467) applies the per-language producer selection at that revision (owner
+ruling 2026-10-30, #483). An explicit `semanticProducerId` (1–512 bytes, no NUL) must be
+published there: an empty or oversized ID fails `invalid_argument`, and an unpublished one
+fails `producer_unavailable`. Without one, each document uses the sole published producer
+whose profile covers its language. A seed language that none or several cover leaves the
+view syntax only, with `semantic.note` `no semantic producer published; showing syntax` or
+`multiple semantic producers for <language>; showing syntax`; producers are never merged. A
+producer that does not cover the seed's language gives `semantic producer does not cover
+this language; showing syntax`. The walk follows a call whose binding has `boundaryReason`
+`none` to its exact target, as the call graph does: depth 1 adds the seed's targets, and
+each further level inspects the previous level's calls (#483). Otherwise `semantic` is `{producerId, note: null, bindings}`. Each
 binding is `{callId, boundaryReason, targetId, freshness, binding}` for a returned call
 that has one. `binding` is the published contract-v1 `CallBinding`: resolution, declared
 target, the whole candidate union of an ambiguous call, dispatch and provenance ID. It is

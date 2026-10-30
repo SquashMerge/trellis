@@ -715,18 +715,17 @@ fn query_view_structurally_sorts_then_limits_then_excludes() {
     // An excluded call at LIMIT is impossible for this seed-scoped query:
     // all its calls have the seed's path. Guard the otherwise unobservable
     // ordering of the three stages in the implementation as approved in S-3.
-    let source = include_str!("../src/store.rs");
-    let method = source.split_once("fn query_view_in_for(").unwrap().1;
-    let method = method.split_once("\n    }\n").unwrap().0;
+    // The query walk (#483) applies the three stages to each node's calls.
+    let source = include_str!("../src/store/semantic_display.rs");
+    let method = source.split_once("fn view_walk(").unwrap().1;
+    let method = method.split_once("\n}\n").unwrap().0;
     let sort = method
         .find("ordered.sort_by(crate::indexer::compare_reader_calls)")
         .unwrap();
     let limit = method
-        .find("ordered.into_iter().take(query.max_calls + 1)")
+        .find("ordered.into_iter().take(remaining + 1)")
         .unwrap();
-    let exclude = method
-        .find("query.exclude_paths.iter().any(|p| call.path.starts_with(p))")
-        .unwrap();
+    let exclude = method.find("if excluded(&call.path)").unwrap();
     assert!(sort < limit && limit < exclude);
 }
 
