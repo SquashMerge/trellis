@@ -76,6 +76,11 @@ fn presence_sql(filtered: bool) -> String {
 const CAPTURED_SYMBOL_SQL: &str = "SELECT 1 FROM g_definitions WHERE side=0 AND symbol=?1 LIMIT 1";
 
 #[cfg(feature = "test-support")]
+pub(super) fn target_callable_sql() -> &'static str {
+    TARGET_CALLABLE_SQL
+}
+
+#[cfg(feature = "test-support")]
 pub(super) fn cursor_sql() -> Vec<String> {
     let mut queries = vec![];
     for filtered in [false, true] {

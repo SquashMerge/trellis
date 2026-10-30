@@ -22,6 +22,8 @@ pub use staged::join_staged;
 pub(crate) use staged::publication::read_documents as read_staged_documents;
 #[cfg(feature = "test-support")]
 pub(crate) use staged::publication::statements as staged_publication_statements;
+#[cfg(feature = "test-support")]
+pub(crate) use staged::target_callable_sql as staged_target_callable_sql;
 
 /// Per-document anchor candidates and capability families.
 pub(crate) type AnchorParts = (
