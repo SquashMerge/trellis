@@ -283,6 +283,18 @@ pub struct IndexStatus {
     /// The daemon's watcher-health witness for this checkout, on CLI status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watcher: Option<crate::watch::WatcherWitness>,
+    /// The semantic producer whose selected bindings `stats` counts (#467).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_producer_id: Option<String>,
+    /// Why `stats` counts syntax only: no published producer, or several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_note: Option<String>,
+}
+/// Bytes allowed in a requested semantic producer ID.
+pub const SEMANTIC_PRODUCER_ID_BYTES: usize = 512;
+/// A requested producer ID has 1..=512 bytes and no NUL. Publication is checked at read.
+pub fn valid_semantic_producer_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= SEMANTIC_PRODUCER_ID_BYTES && !id.contains('\0')
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -298,6 +310,9 @@ pub struct ViewQuery {
     pub include_callbacks: bool,
     #[serde(default)]
     pub exclude_paths: Vec<String>,
+    /// An explicit published semantic producer. Absent selects the sole published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_producer_id: Option<String>,
 }
 fn default_depth() -> usize {
     1
@@ -327,6 +342,12 @@ impl ViewQuery {
             self.exclude_paths.len() <= 100 && self.exclude_paths.iter().all(|x| x.len() <= 1024),
             "too many or oversized excluded path prefixes"
         );
+        anyhow::ensure!(
+            self.semantic_producer_id
+                .as_deref()
+                .is_none_or(valid_semantic_producer_id),
+            "invalid_argument: semanticProducerId must contain 1..512 bytes and no NUL"
+        );
         Ok(())
     }
 }
@@ -341,6 +362,34 @@ pub struct ViewResult {
     pub truncated: bool,
     pub omitted_nodes: usize,
     pub warnings: Vec<String>,
+    /// The producer the view used and the selected bindings of its calls (#467).
+    #[serde(default)]
+    pub semantic: ViewSemantic,
+}
+/// The semantic producer a view selected and the bindings it read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSemantic {
+    /// The selected published producer, or null when the view is syntax only.
+    pub producer_id: Option<String>,
+    /// Why the view is syntax only, when it is.
+    pub note: Option<String>,
+    /// The selected binding of each returned call that has one, in call order.
+    pub bindings: Vec<ViewCallBinding>,
+}
+/// One measured call's selected semantic binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewCallBinding {
+    pub call_id: String,
+    /// The call-graph engine's boundary reason: `none` when the graph traverses the call.
+    pub boundary_reason: crate::graph_query::BoundaryReason,
+    /// The declared internal target of a resolved binding, located exactly in this snapshot
+    /// and not stale. With a `dispatch` boundary it is the declared, not a proven, callee.
+    pub target_id: Option<String>,
+    pub freshness: crate::semantic_evidence::Freshness,
+    /// Resolution, declared target, ambiguous candidates and dispatch, as published.
+    pub binding: crate::semantic_evidence::CallBinding,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

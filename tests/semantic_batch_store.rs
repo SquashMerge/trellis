@@ -107,11 +107,20 @@ struct World {
 }
 
 fn world(populate: impl FnOnce(&Path)) -> World {
+    world_with(populate, false)
+}
+
+/// `mcp` stages the virgin request queue before the first publication, as a daemon
+/// would, so an MCP session can be served over this index.
+fn world_with(populate: impl FnOnce(&Path), mcp: bool) -> World {
     let state = tempfile::tempdir().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     populate(&root);
     let store = Store::open_for_tests(state.path(), &root).unwrap();
+    if mcp {
+        store.mcp_prepare_virgin_queue_for_tests().unwrap();
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.clone()),
@@ -1158,18 +1167,80 @@ fn staged_and_memory_join_stores_produce_identical_publications() {
                     staged.references.iter().any(|r| r.spelling == "target"),
                     "{case}"
                 );
+                assert!(!staged.call_bindings.is_empty(), "{case}");
+            }
+            // `target()` is a plain call of a free function (#470): direct exactly while it
+            // settles resolved, on both paths (`check` compared them), also under rejoin and
+            // a destination that makes the target ambiguous.
+            for binding in &staged.call_bindings {
+                assert_eq!(
+                    binding.dispatch == trellis::semantic_evidence::Dispatch::Direct,
+                    binding.resolution == Resolution::Resolved,
+                    "{case}: {binding:?}"
+                );
             }
         }
     }
-    let world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
-    let descriptor = one_artifact_per_language(&world, vec![("java", vec![java_doc()])]);
+    let java_world = world(|root| write_files(root, &[("J.java", JAVA_TYPES)]));
+    let descriptor = one_artifact_per_language(&java_world, vec![("java", vec![java_doc()])]);
     let (staged, _) = check(
-        &world,
+        &java_world,
         &descriptor,
         DestinationMutations::default(),
         "java types",
     );
     assert_eq!(staged.type_relationships.len(), 1);
+    // Dispatch shapes (#470) on both paths: `new` of a class by identifier and by dotted name
+    // is constructor, a plain call of a free function is direct; a class called without `new`
+    // and a member call of the same free function stay unknown.
+    let source =
+        "class W {}\nfunction m(o){ new W(); new o.W(); W(); h(); o.h(); }\nfunction h(){}\n";
+    let world = world(|root| write_files(root, &[("D.js", source)]));
+    let mut doc = DocSpec::new("D.js")
+        .symbol("pkg W#", 7, &[])
+        .symbol("pkg h().", 17, &[]);
+    for (needle, nth, symbol, roles) in [
+        ("W", 0, "pkg W#", 1),
+        ("h", 2, "pkg h().", 1),
+        ("W", 1, "pkg W#", 0),
+        ("W", 2, "pkg W#", 0),
+        ("W", 3, "pkg W#", 0),
+        ("h", 0, "pkg h().", 0),
+        ("h", 1, "pkg h().", 0),
+    ] {
+        doc = occ_at(doc, source, (needle, nth), None, symbol, roles);
+    }
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![doc])]);
+    let (staged, _) = check(
+        &world,
+        &descriptor,
+        DestinationMutations::default(),
+        "dispatch shapes",
+    );
+    let mut dispatches: Vec<_> = staged
+        .call_bindings
+        .iter()
+        .map(|b| {
+            assert_eq!(b.resolution, Resolution::Resolved);
+            let range = &b.join.anchor.range;
+            (range.start, &source[range.start - 2..range.end], b.dispatch)
+        })
+        .collect();
+    dispatches.sort_by_key(|(start, _, _)| *start);
+    use trellis::semantic_evidence::Dispatch::{Constructor, Direct, Unknown};
+    assert_eq!(
+        dispatches
+            .into_iter()
+            .map(|(_, text, dispatch)| (text, dispatch))
+            .collect::<Vec<_>>(),
+        [
+            ("w W", Constructor),
+            ("o.W", Constructor),
+            ("; W", Unknown),
+            ("; h", Direct),
+            ("o.h", Unknown),
+        ]
+    );
 }
 
 /// Adds an occurrence of the `nth` `needle` in `source`. `enclosing` is the byte length of the
@@ -2448,6 +2519,7 @@ fn streaming_join_charges_only_its_retained_owners_and_each_output_row_once() {
             "nat_docs",
             "nat_declarations",
             "g_definitions",
+            "g_callables",
             "g_methods",
             "w_docs",
             "out_coverage",
@@ -3386,20 +3458,35 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
     drop(admitted);
     let memory = world.memory_publication(&descriptor, DestinationMutations::default());
     assert_same_publication(&staged, &memory, "real scip-typescript calls");
-    let mut callees: Vec<_> = staged
-        .call_bindings
-        .iter()
-        .map(|binding| {
-            let range = &binding.join.anchor.range;
-            assert!(binding.call_id.is_some());
-            &main[range.start..range.end]
-        })
-        .collect();
-    callees.sort();
-    assert_eq!(
-        callees,
-        ["Widget", "helper", "plain", "plain", "register", "run"]
-    );
+    // Callee and dispatch (owner ruling 2026-10-30, #470): plain calls of free functions,
+    // the imported `helper` included, are direct. scip-typescript's constructor and method
+    // symbols bind no target (kind 0 fails the method-kind check), so they stay unknown.
+    let callees = |bindings: &[trellis::semantic_evidence::CallBinding]| {
+        let mut callees: Vec<_> = bindings
+            .iter()
+            .map(|binding| {
+                let range = &binding.join.anchor.range;
+                assert!(binding.call_id.is_some());
+                (&main[range.start..range.end], binding.dispatch)
+            })
+            .collect();
+        callees.sort_by_key(|(callee, _)| *callee);
+        callees
+    };
+    {
+        use trellis::semantic_evidence::Dispatch::{Direct, Unknown};
+        assert_eq!(
+            callees(&staged.call_bindings),
+            [
+                ("Widget", Unknown),
+                ("helper", Direct),
+                ("plain", Direct),
+                ("plain", Direct),
+                ("register", Direct),
+                ("run", Unknown),
+            ]
+        );
+    }
     let helper = staged
         .call_bindings
         .iter()
@@ -3422,8 +3509,8 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
     assert_eq!(world.rejoin_failures(), 0);
     let head = world.store.index_baseline().unwrap();
     assert_eq!(
-        world.store.semantic_at(head).unwrap().call_bindings.len(),
-        6
+        callees(&world.store.semantic_at(head).unwrap().call_bindings),
+        callees(&staged.call_bindings)
     );
 }
 
@@ -3470,9 +3557,11 @@ fn real_typescript_ambiguous_calls_read_as_one_edge_with_the_union() {
     for (callee, count) in [("Set", 4), ("Error", 2)] {
         let rows = rows_of(callee);
         assert_eq!(rows.len(), count, "{callee} rows");
+        // Plain-call shape, but ambiguous: never direct (#470).
         assert!(rows.iter().all(|b| b.resolution == Resolution::Ambiguous
             && b.call_id == rows[0].call_id
-            && b.candidates.len() == count));
+            && b.candidates.len() == count
+            && b.dispatch == trellis::semantic_evidence::Dispatch::Unknown));
     }
     let producer = published.producers[0].id.clone();
     let (_, native, _) = index_workspace_bundle(
@@ -4933,6 +5022,585 @@ fn real_typescript_markers_reject_wrong_paths_other_documents_and_reversed_range
     }
 }
 
+/// One MCP session over a world's index (#467), served before daemon startup reconciles it.
+struct McpSession {
+    client: std::os::unix::net::UnixStream,
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    session: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    release: std::sync::mpsc::SyncSender<()>,
+    next_id: i64,
+    pairs: Vec<Value>,
+}
+
+impl McpSession {
+    fn start(world: &World, session: u64) -> Self {
+        use std::io::Write;
+        use trellis::daemon::registry::CheckoutRegistry;
+        let identity = WorkspaceIdentity::discover(Some(&world.root), &world.root)
+            .unwrap()
+            .attach_marker()
+            .unwrap();
+        let state = world._state.path();
+        let topology = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+        let mut registry = CheckoutRegistry::with_roots(topology);
+        registry.attach_launch(session, &identity).unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        // Hold daemon startup: the session reads the published head as the fixture left it.
+        registry.set_next_startup_hook_for_tests(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(trellis::testing::HANG_BACKSTOP)
+                .unwrap();
+        }));
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(trellis::testing::HANG_BACKSTOP))
+            .unwrap();
+        let workspace = trellis::mcp::OpenedWorkspace::new(identity);
+        let handle = tokio::runtime::Handle::current();
+        let thread = std::thread::spawn(move || {
+            trellis::mcp::run_socket(workspace, server, registry, session, handle)
+        });
+        let reader = std::io::BufReader::new(client.try_clone().unwrap());
+        let mut mcp = Self {
+            client,
+            reader,
+            session: Some(thread),
+            release,
+            next_id: 1,
+            pairs: vec![],
+        };
+        writeln!(
+            mcp.client,
+            "{}",
+            Self::request(1, "trellis_workspace_describe", json!({"schemaVersion":1}))
+        )
+        .unwrap();
+        entered
+            .recv_timeout(trellis::testing::HANG_BACKSTOP)
+            .unwrap();
+        let reply = mcp.reply();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        mcp
+    }
+
+    fn request(id: i64, name: &str, arguments: Value) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,
+            "arguments":arguments,"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}})
+    }
+
+    fn reply(&mut self) -> Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// The structured envelope of one tool call, kept for schema validation.
+    fn call(&mut self, name: &str, arguments: Value) -> Value {
+        use std::io::Write;
+        self.next_id += 1;
+        writeln!(
+            self.client,
+            "{}",
+            Self::request(self.next_id, name, arguments)
+        )
+        .unwrap();
+        let reply = self.reply();
+        assert_eq!(reply["id"], self.next_id);
+        let envelope = reply["result"]["structuredContent"].clone();
+        self.pairs
+            .push(json!({"name":name,"structuredContent":envelope}));
+        envelope
+    }
+
+    /// Validates every envelope against the published catalog schemas, then stops.
+    fn finish(mut self) {
+        use std::io::Write;
+        let script = r#"
+const {createRequire} = require('node:module');
+const {readFileSync} = require('node:fs');
+const requireFromTests = createRequire(process.cwd() + '/tests/mcp/package.json');
+const Ajv2020 = requireFromTests('ajv/dist/2020.js').default;
+const ajv = new Ajv2020({strict: false, allErrors: true});
+const catalog = JSON.parse(readFileSync('tests/fixtures/mcp/catalog.json', 'utf8'));
+for (const {name, structuredContent} of JSON.parse(readFileSync(0, 'utf8'))) {
+    const validate = ajv.compile(catalog.find(tool => tool.name === name).outputSchema);
+    if (!validate(structuredContent)) throw Error(`${name}: ${JSON.stringify(validate.errors)}`);
+}
+"#;
+        let mut child = std::process::Command::new("node")
+            .args(["-e", script])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&self.pairs).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "structuredContent schema validation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = self.release.send(());
+        let session = self.session.take().unwrap();
+        drop(self.reader);
+        drop(self.client);
+        session.join().unwrap().unwrap();
+    }
+}
+
+/// A world over a real scip-typescript fixture's sources, with an empty `.git` whose
+/// workspace marker exists before indexing, so an MCP session selects this same index.
+fn real_fixture_world(fixture: &str, files: &[&str]) -> (World, Vec<String>) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import")
+        .join(fixture);
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|path| {
+            (
+                path.to_string(),
+                fs::read_to_string(dir.join(path)).unwrap(),
+            )
+        })
+        .collect();
+    // The fixture's package root names its module markers (#443).
+    let package = format!(
+        r#"{{"name":"{}-fixture","version":"1.0.0"}}"#,
+        fixture.split('-').next().unwrap()
+    );
+    let world = world_with(
+        |root| {
+            fs::create_dir_all(root.join(".git")).unwrap();
+            WorkspaceIdentity::discover(Some(root), root)
+                .unwrap()
+                .attach_marker()
+                .unwrap();
+            let mut all: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str()))
+                .collect();
+            all.push(("package.json", &package));
+            write_files(root, &all);
+        },
+        true,
+    );
+    (world, sources.into_iter().map(|(_, text)| text).collect())
+}
+
+/// Publish the fixture's real `index.scip` as a scip-typescript import.
+fn publish_real_fixture(world: &World, fixture: &str, files: &[&str]) -> (IndexPin, String) {
+    let mut batch = world.fixture().reference("scip-typescript");
+    let ordinal = batch.artifact(
+        "javascript",
+        files.iter().map(|path| DocSpec::new(path)).collect(),
+    );
+    let index = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/semantic-import")
+        .join(fixture)
+        .join("index.scip");
+    batch.override_artifact_raw(ordinal, fs::read(index).unwrap());
+    let descriptor = world.write(&batch);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    (pin, producer)
+}
+
+fn declaration_ids(world: &World) -> std::collections::BTreeMap<String, String> {
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    native
+        .declarations
+        .iter()
+        .filter_map(|d| Some((d.name.clone()?, d.syntax_id.clone())))
+        .collect()
+}
+
+/// The query the CLI daemon builds for `trellis query --seed ... [--semantic-producer-id ...]`.
+fn view_query(seed: &str, producer: Option<&str>) -> trellis::model::ViewQuery {
+    let mut query = json!({"seed": seed});
+    if let Some(producer) = producer {
+        query["semanticProducerId"] = json!(producer);
+    }
+    serde_json::from_value(query).unwrap()
+}
+
+/// `[internal, external, ambiguous]` calls among the published bindings, each call once.
+fn expected_counts(published: &trellis::semantic_evidence::SemanticSnapshot) -> [usize; 3] {
+    use trellis::semantic_evidence::Target;
+    let mut calls = std::collections::BTreeMap::new();
+    for binding in &published.call_bindings {
+        let kind = match (&binding.resolution, &binding.declared_target) {
+            (Resolution::Resolved, Some(Target::Internal { .. })) => 0,
+            (Resolution::External, _) | (Resolution::Resolved, Some(Target::External { .. })) => 1,
+            (Resolution::Ambiguous, _) => 2,
+            _ => 3,
+        };
+        calls.insert(binding.call_id.clone().unwrap(), kind);
+    }
+    let mut counts = [0; 3];
+    for kind in calls.values().filter(|kind| **kind < 3) {
+        counts[*kind] += 1;
+    }
+    counts
+}
+
+/// #467: with real scip-typescript 0.4.0 calls published, the CLI query, MCP outgoing and
+/// incoming calls, status and the methods API show the sole producer's selected bindings.
+/// An explicit producer selects the same one; an unpublished or malformed one is typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
+    use trellis::graph_query::BoundaryReason;
+    use trellis::model::SemanticState;
+    let files = ["src/lib.js", "src/main.js"];
+    let (world, sources) = real_fixture_world("issue444-javascript-calls", &files);
+    let main = &sources[1];
+    let (pin, producer) = publish_real_fixture(&world, "issue444-javascript-calls", &files);
+    let ids = declaration_ids(&world);
+    let response = world.store.evidence_response().unwrap();
+
+    // CLI query, under the sole-published policy and with the explicit producer.
+    for explicit in [None, Some(producer.as_str())] {
+        let view = response
+            .query_view(&view_query(&ids["caller"], explicit))
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.revision, pin);
+        assert_eq!(
+            view.semantic.producer_id.as_deref(),
+            Some(producer.as_str())
+        );
+        assert_eq!(view.semantic.note, None);
+        assert_eq!(view.nodes[0].provenance.semantic, SemanticState::Fresh);
+        let callee = |call_id: &str| {
+            let call = view.calls.iter().find(|c| c.id == call_id).unwrap();
+            let range = call.callee_range.as_ref().unwrap();
+            main[range.start_byte..range.end_byte].to_owned()
+        };
+        // scip-typescript does not prove JavaScript dispatch direct: these resolved calls
+        // keep their declared target behind a `dispatch` boundary.
+        let resolved: Vec<_> = view
+            .semantic
+            .bindings
+            .iter()
+            .filter(|b| b.binding.resolution == Resolution::Resolved)
+            .map(|b| {
+                assert_eq!(b.boundary_reason, BoundaryReason::Dispatch);
+                (callee(&b.call_id), b.target_id.clone().unwrap())
+            })
+            .collect();
+        assert!(resolved.contains(&("helper".into(), ids["helper"].clone())));
+        assert!(resolved.contains(&("plain".into(), ids["plain"].clone())));
+        for binding in &view.semantic.bindings {
+            assert_eq!(
+                binding.binding.call_id.as_deref(),
+                Some(binding.call_id.as_str())
+            );
+            assert_eq!(binding.freshness, Freshness::Fresh);
+            let call = view.calls.iter().find(|c| c.id == binding.call_id).unwrap();
+            assert_eq!(call.provenance.semantic, SemanticState::Fresh);
+        }
+        // A call without a binding stays syntax only.
+        assert!(view.calls.iter().any(|call| {
+            call.provenance.semantic == SemanticState::Unavailable
+                && !view.semantic.bindings.iter().any(|b| b.call_id == call.id)
+        }));
+    }
+    let unpublished = response
+        .query_view(&view_query(&ids["caller"], Some("not-published")))
+        .unwrap_err();
+    assert!(
+        unpublished
+            .downcast_ref::<trellis::store::ProducerNotPublished>()
+            .is_some(),
+        "{unpublished:#}"
+    );
+    let malformed = view_query(&ids["caller"], Some(&"p".repeat(513)));
+    assert!(
+        malformed
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .starts_with("invalid_argument:")
+    );
+
+    // Status and the methods API report the same selected producer.
+    let published = world.store.semantic_at(pin).unwrap();
+    let [internal, external, ambiguous] = expected_counts(&published);
+    assert!(internal >= 3, "{internal}");
+    for status in [response.status().unwrap(), world.store.status().unwrap()] {
+        assert_eq!(
+            status.semantic_producer_id.as_deref(),
+            Some(producer.as_str())
+        );
+        assert_eq!(status.semantic_note, None);
+        assert_eq!(status.stats.semantic_state, SemanticState::Fresh);
+        assert_eq!(
+            [
+                status.stats.internal,
+                status.stats.external,
+                status.stats.ambiguous
+            ],
+            [internal, external, ambiguous]
+        );
+        assert_eq!(
+            status.stats.unresolved,
+            status.stats.calls - internal - external - ambiguous
+        );
+    }
+    let methods = response
+        .methods_at("src/main.js", Some(pin))
+        .unwrap()
+        .unwrap();
+    for item in methods["items"].as_array().unwrap() {
+        assert_eq!(item["symbol"]["provenance"]["semantic"], "fresh");
+    }
+    drop(response);
+
+    // MCP outgoing and incoming calls.
+    let mut mcp = McpSession::start(&world, 467);
+    for explicit in [None, Some(&producer)] {
+        let mut arguments = json!({"schemaVersion":1,"symbolId":ids["caller"]});
+        if let Some(producer) = explicit {
+            arguments["semanticProducerId"] = json!(producer);
+        }
+        let outgoing = mcp.call("trellis_outgoing_calls", arguments);
+        let calls = outgoing["data"]["calls"].as_array().unwrap();
+        let helper = calls.iter().find(|c| c["calleeText"] == "helper").unwrap();
+        assert_eq!(helper["disposition"], "resolved");
+        assert_eq!(helper["boundaryReason"], "dispatch");
+        assert_eq!(helper["targetId"], ids["helper"]);
+        assert_eq!(helper["evidenceTier"], "semantic");
+        assert_eq!(helper["freshness"], "fresh");
+        assert_eq!(helper["binding"]["resolution"], "resolved");
+        assert_eq!(
+            helper["binding"]["declaredTarget"]["syntaxId"],
+            ids["helper"]
+        );
+        assert_eq!(helper["semanticBasis"]["producerId"], producer.as_str());
+        let unbound = calls.iter().find(|c| c["calleeText"] == "method").unwrap();
+        assert_eq!(unbound["binding"], Value::Null);
+        assert_eq!(unbound["boundaryReason"], "missingEvidence");
+        assert!(
+            outgoing["data"]["provenance"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == helper["binding"]["provenanceId"])
+        );
+        assert!(
+            outgoing["data"]["coverage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["producerId"] == producer.as_str())
+        );
+        assert!(
+            !outgoing["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "syntaxOnly"),
+            "{outgoing}"
+        );
+    }
+    let incoming = mcp.call(
+        "trellis_incoming_calls",
+        json!({"schemaVersion":1,"symbolId":ids["helper"]}),
+    );
+    let callers = incoming["data"]["callers"].as_array().unwrap();
+    assert_eq!(callers.len(), 1, "{incoming}");
+    assert_eq!(callers[0]["ownerSyntaxId"], ids["caller"]);
+    assert_eq!(callers[0]["targetId"], ids["helper"]);
+    assert_eq!(callers[0]["disposition"], "resolved");
+    assert_eq!(callers[0]["evidenceTier"], "semantic");
+    // An explicit producer this revision does not publish, or a malformed one, is typed.
+    for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
+        let failure = mcp.call(
+            name,
+            json!({"schemaVersion":1,"symbolId":ids["caller"],"semanticProducerId":"not-published"}),
+        );
+        assert_eq!(failure["error"]["code"], "not_found", "{failure}");
+        let invalid = mcp.call(
+            name,
+            json!({"schemaVersion":1,"symbolId":ids["caller"],"semanticProducerId":""}),
+        );
+        assert_eq!(invalid["error"]["code"], "invalid_request", "{invalid}");
+    }
+    mcp.finish();
+    assert!(!world.store.recovery_pending_for_tests());
+}
+
+/// #467 with #466's real ambiguous calls: `new Set(..)` and `Error(..)` show as ambiguous
+/// bindings carrying their whole candidate union, and status counts each call once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_typescript_ambiguous_bindings_show_in_query_mcp_and_status() {
+    use trellis::graph_query::BoundaryReason;
+    let files = ["src/main.js"];
+    let (world, _) = real_fixture_world("issue466-ambiguous-calls", &files);
+    let (pin, producer) = publish_real_fixture(&world, "issue466-ambiguous-calls", &files);
+    let ids = declaration_ids(&world);
+    let published = world.store.semantic_at(pin).unwrap();
+    let union = |call_id: &str| {
+        published
+            .call_bindings
+            .iter()
+            .find(|b| b.call_id.as_deref() == Some(call_id))
+            .unwrap()
+            .candidates
+            .clone()
+    };
+    let response = world.store.evidence_response().unwrap();
+    let view = response
+        .query_view(&view_query(&ids["caller"], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view.semantic.producer_id.as_deref(),
+        Some(producer.as_str())
+    );
+    let mut sizes: Vec<_> = view
+        .semantic
+        .bindings
+        .iter()
+        .filter(|b| b.boundary_reason == BoundaryReason::Ambiguous)
+        .map(|b| {
+            assert_eq!(b.binding.resolution, Resolution::Ambiguous);
+            assert_eq!(b.target_id, None);
+            assert_eq!(b.binding.candidates, union(&b.call_id));
+            b.binding.candidates.len()
+        })
+        .collect();
+    sizes.sort();
+    assert_eq!(sizes, [2, 4]);
+    let status = response.status().unwrap();
+    assert_eq!(status.stats.ambiguous, 2);
+    assert_eq!(
+        [
+            status.stats.internal,
+            status.stats.external,
+            status.stats.ambiguous
+        ],
+        expected_counts(&published)
+    );
+    drop(response);
+
+    let mut mcp = McpSession::start(&world, 468);
+    let outgoing = mcp.call(
+        "trellis_outgoing_calls",
+        json!({"schemaVersion":1,"symbolId":ids["caller"]}),
+    );
+    let ambiguous: Vec<_> = outgoing["data"]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["disposition"] == "ambiguous")
+        .collect();
+    assert_eq!(ambiguous.len(), 2, "{outgoing}");
+    for call in &ambiguous {
+        assert_eq!(call["boundaryReason"], "ambiguous");
+        assert_eq!(call["targetId"], Value::Null);
+        assert_eq!(
+            call["binding"]["candidates"],
+            serde_json::to_value(union(call["callId"].as_str().unwrap())).unwrap()
+        );
+        assert!(outgoing["warnings"].as_array().unwrap().iter().any(|w| {
+            w["code"] == "bindingAmbiguous" && w["provenanceId"] == call["binding"]["provenanceId"]
+        }));
+    }
+    assert_eq!(outgoing["partial"], true);
+    mcp.finish();
+    assert!(!world.store.recovery_pending_for_tests());
+}
+
+/// #467: with no published producer, and then with two, every read shows syntax only and
+/// says why, instead of choosing or merging producers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn none_or_multiple_producers_show_syntax_with_a_note() {
+    use trellis::model::SemanticState;
+    let files = ["src/lib.js", "src/main.js"];
+    // One world per case: a served session's released startup may reconcile its index.
+    let check = |world: &World, note: &str, session: u64, producers: usize| {
+        let ids = declaration_ids(world);
+        let head = world.store.index_baseline().unwrap();
+        assert_eq!(
+            world.store.semantic_at(head).unwrap().producers.len(),
+            producers
+        );
+        let response = world.store.evidence_response().unwrap();
+        let view = response
+            .query_view(&view_query(&ids["caller"], None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.semantic.producer_id, None);
+        assert_eq!(view.semantic.note.as_deref(), Some(note));
+        assert!(view.semantic.bindings.is_empty());
+        assert!(
+            view.calls
+                .iter()
+                .all(|c| c.provenance.semantic == SemanticState::Unavailable)
+        );
+        let status = response.status().unwrap();
+        assert_eq!(status.semantic_producer_id, None);
+        assert_eq!(status.semantic_note.as_deref(), Some(note));
+        assert_eq!(status.stats.semantic_state, SemanticState::Unavailable);
+        assert_eq!(status.stats.internal + status.stats.ambiguous, 0);
+        drop(response);
+        let mut mcp = McpSession::start(world, session);
+        for (name, symbol, items) in [
+            ("trellis_outgoing_calls", &ids["caller"], "calls"),
+            ("trellis_incoming_calls", &ids["helper"], "callers"),
+        ] {
+            let envelope = mcp.call(name, json!({"schemaVersion":1,"symbolId":symbol}));
+            let items = envelope["data"][items].as_array().unwrap();
+            assert!(!items.is_empty(), "{envelope}");
+            for item in items {
+                assert_eq!(item["binding"], Value::Null);
+                assert_eq!(item["evidenceTier"], "syntax");
+                assert_eq!(item["boundaryReason"], "missingEvidence");
+            }
+            assert_eq!(
+                envelope["warnings"].as_array().unwrap().last().unwrap(),
+                &json!({"code":"syntaxOnly","message":note,"provenanceId":null})
+            );
+        }
+        mcp.finish();
+    };
+    let (none, _) = real_fixture_world("issue444-javascript-calls", &files);
+    check(&none, trellis::store::NO_PRODUCER_NOTE, 469, 0);
+    let (multiple, _) = real_fixture_world("issue444-javascript-calls", &files);
+    publish_real_fixture(&multiple, "issue444-javascript-calls", &files);
+    let mut second = multiple.fixture();
+    let docs = second.paths("javascript");
+    second.artifact("javascript", docs);
+    let descriptor = multiple.write(&second);
+    drop(multiple.publish(&descriptor).unwrap());
+    check(&multiple, trellis::store::MULTIPLE_PRODUCERS_NOTE, 470, 2);
+}
+
 // Real rust-analyzer 1.98.1 output (`rust-analyzer scip`, the profile-pinned binary) for the
 // crate in `tests/fixtures/scip-rust-analyzer/workspace`. Only its Metadata unit (the absolute
 // project root) was dropped; the document units are the producer's exact bytes, and
@@ -4993,20 +5661,23 @@ fn rust_analyzer_publications(
     staged
 }
 
-/// `(document, callee spelling, resolution)` of every call binding, sorted.
-fn rust_calls(world: &World, publication: &SemanticPublication) -> Vec<(String, String, String)> {
-    let mut calls: Vec<_> = publication
-        .call_bindings
+/// `(document, callee spelling, resolution, dispatch)` of every call binding, sorted.
+fn rust_calls(
+    world: &World,
+    bindings: &[trellis::semantic_evidence::CallBinding],
+) -> Vec<[String; 4]> {
+    let mut calls: Vec<_> = bindings
         .iter()
         .map(|binding| {
             assert!(binding.call_id.is_some());
             let anchor = &binding.join.anchor;
             let source = fs::read_to_string(world.root.join(&anchor.document.path)).unwrap();
-            (
+            [
                 anchor.document.path.clone(),
                 source[anchor.range.start..anchor.range.end].to_owned(),
                 format!("{:?}", binding.resolution),
-            )
+                format!("{:?}", binding.dispatch),
+            ]
         })
         .collect();
     calls.sort();
@@ -5059,22 +5730,26 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     // `saturating(value, value)` in util.rs, `Counter::new()` and `counter.add(..)` carry an
     // enclosing range (their target's definition) that does not enclose the reference; they
     // bind at their exact callee spans like the cross-document calls, which carry none.
-    // Before #394 none of the three bound a call.
+    // Before #394 none of the three bound a call. The recursive `spin(value)` carries its own
+    // definition's range, which encloses the reference but joins no invocation: under owner
+    // ruling 4 (2026-10-30, #394) that range is absent and the exact callee span binds it.
+    // Dispatch (owner ruling 2026-10-30, #470): plain and path calls of free functions are
+    // direct; the method call `counter.add(..)` and unresolved or external calls are unknown.
+    let call = |path: &str, callee: &str, resolution: &str, dispatch: &str| {
+        [path, callee, resolution, dispatch].map(str::to_owned)
+    };
     assert_eq!(
-        rust_calls(&world, &staged),
+        rust_calls(&world, &staged.call_bindings),
         [
-            ("src/lib.rs".into(), "add".into(), "Resolved".into()),
-            ("src/lib.rs".into(), "double".into(), "Resolved".into()),
+            call("src/lib.rs", "add", "Resolved", "Unknown"),
+            call("src/lib.rs", "double", "Resolved", "Direct"),
             // rust-analyzer's associated-function kind does not bind the measured method
             // declaration, so `Counter::new()` binds its call but resolves no target.
-            ("src/lib.rs".into(), "new".into(), "Unresolved".into()),
-            ("src/lib.rs".into(), "saturating".into(), "Resolved".into()),
-            ("src/util.rs".into(), "saturating".into(), "Resolved".into()),
-            (
-                "src/util.rs".into(),
-                "saturating_add".into(),
-                "External".into()
-            ),
+            call("src/lib.rs", "new", "Unresolved", "Unknown"),
+            call("src/lib.rs", "saturating", "Resolved", "Direct"),
+            call("src/util.rs", "saturating", "Resolved", "Direct"),
+            call("src/util.rs", "saturating_add", "External", "Unknown"),
+            call("src/util.rs", "spin", "Resolved", "Direct"),
         ]
     );
     let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
@@ -5089,10 +5764,179 @@ fn real_rust_analyzer_artifact_imports_and_its_enclosing_range_references_bind_c
     assert_eq!(world.rejoin_failures(), 0);
     assert_eq!(stored_proofs(&world), proofs);
     let head = world.store.index_baseline().unwrap();
+    // The rejoined calls keep their resolution and dispatch (#470).
     assert_eq!(
-        world.store.semantic_at(head).unwrap().call_bindings.len(),
-        staged.call_bindings.len()
+        rust_calls(
+            &world,
+            &world.store.semantic_at(head).unwrap().call_bindings
+        ),
+        rust_calls(&world, &staged.call_bindings)
     );
+}
+
+/// Owner ruling 2026-10-30 (#470) through the #40 call graph and the sequence view, on the real
+/// rust-analyzer fixture: `run` -> `util::double` -> `saturating` are direct path and plain
+/// calls of free functions, so the graph expands into them under the depth and node bounds,
+/// while `counter.add(..)` stays a dispatch boundary and `Counter::new()` an unresolved one.
+#[test]
+fn real_rust_analyzer_direct_calls_expand_the_call_graph_and_sequence() {
+    use trellis::graph_query::{BoundaryReason, FrontierReason, GraphQuery, Visit};
+    let world = rust_analyzer_world();
+    let descriptor = rust_analyzer_batch(&world);
+    let (pin, admitted, _) = world.publish(&descriptor).unwrap();
+    drop(admitted);
+    let producer = world.store.semantic_at(pin).unwrap().producers[0]
+        .id
+        .clone();
+    let (_, native, _) = index_workspace_bundle(
+        &IndexOptions::new(world.root.clone()),
+        world.store.root_id(),
+        &world.cancel,
+        |_| {},
+    )
+    .unwrap();
+    let id_of = |name: &str| {
+        let found: Vec<_> = native
+            .declarations
+            .iter()
+            .filter(|d| d.name.as_deref() == Some(name) && d.kind == "function")
+            .collect();
+        assert_eq!(found.len(), 1, "{name}");
+        found[0].syntax_id.clone()
+    };
+    let (run, double, saturating) = (id_of("run"), id_of("double"), id_of("saturating"));
+    let graph = |depth: u64, max_nodes: u64| {
+        world
+            .store
+            .evidence_response()
+            .unwrap()
+            .graph_query(
+                &GraphQuery {
+                    root_syntax_id: run.clone(),
+                    semantic_producer_id: Some(producer.clone()),
+                    depth,
+                    max_nodes,
+                    max_calls: 500,
+                    include_external: true,
+                    include_tests: true,
+                },
+                None,
+                &mut || Ok(()),
+            )
+            .unwrap()
+            .outcome
+            .expect("contract success")
+    };
+    let nodes = |result: &trellis::graph_query::GraphResult| {
+        result
+            .nodes
+            .iter()
+            .map(|n| (n.declaration.syntax_id.clone(), n.depth))
+            .collect::<Vec<_>>()
+    };
+    let edge = |result: &trellis::graph_query::GraphResult, callee: &str| {
+        let found: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.call.spelling.as_deref() == Some(callee))
+            .cloned()
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}");
+        found.into_iter().next().unwrap()
+    };
+
+    // Depth 2 follows the direct edge into `double`, then `double`'s into `saturating`.
+    let deep = graph(2, 150);
+    assert_eq!(
+        nodes(&deep),
+        [
+            (run.clone(), 0),
+            (double.clone(), 1),
+            (saturating.clone(), 2)
+        ]
+    );
+    for (callee, from, to) in [
+        ("double", &run, &double),
+        ("saturating", &double, &saturating),
+    ] {
+        let e = edge(&deep, callee);
+        assert_eq!(
+            (e.visit, e.boundary_reason),
+            (Visit::New, BoundaryReason::None)
+        );
+        assert_eq!((&e.from, e.to.as_ref()), (from, Some(to)));
+        let binding = e.binding.unwrap();
+        assert_eq!(
+            binding.dispatch,
+            trellis::semantic_evidence::Dispatch::Direct
+        );
+    }
+    for (callee, reason) in [
+        ("add", BoundaryReason::Dispatch),
+        ("new", BoundaryReason::Unresolved),
+    ] {
+        let e = edge(&deep, callee);
+        assert_eq!(
+            (e.visit, e.boundary_reason),
+            (Visit::Boundary, reason),
+            "{callee}"
+        );
+        assert_eq!(e.to, None);
+    }
+    // The depth bound stops at `saturating`: its own call is depth frontier, not expanded.
+    assert!(
+        deep.frontier
+            .iter()
+            .any(|f| f.reason == FrontierReason::Depth && f.node_id == saturating)
+    );
+    assert!(deep.edges.iter().all(|e| e.from != saturating));
+
+    // Depth 1 admits `double` and leaves its call on the depth frontier.
+    let shallow = graph(1, 150);
+    assert_eq!(nodes(&shallow), [(run.clone(), 0), (double.clone(), 1)]);
+    assert!(
+        shallow
+            .frontier
+            .iter()
+            .any(|f| f.reason == FrontierReason::Depth && f.node_id == double)
+    );
+    assert!(shallow.edges.iter().all(|e| e.from == run));
+
+    // The node bound holds: with room for two nodes the direct call into `saturating` is a
+    // node-limit boundary and the result is partial.
+    let bounded = graph(2, 2);
+    assert_eq!(nodes(&bounded), [(run.clone(), 0), (double.clone(), 1)]);
+    let e = edge(&bounded, "saturating");
+    assert_eq!(
+        (e.visit, e.boundary_reason, e.to),
+        (Visit::Boundary, BoundaryReason::NodeLimit, None)
+    );
+    assert!(bounded.partial);
+
+    // The sequence view takes the same disposition: the direct call names its target.
+    let view = world.store.sequence_at(&run, pin, false).unwrap().unwrap();
+    fn steps(all: &[trellis::behavior::SequenceStep]) -> Vec<&trellis::behavior::SequenceStep> {
+        all.iter()
+            .flat_map(|s| {
+                std::iter::once(s)
+                    .chain(steps(&s.children))
+                    .chain(steps(&s.alternate))
+            })
+            .collect()
+    }
+    let evidence = |label: &str| {
+        let found: Vec<_> = steps(&view.steps)
+            .into_iter()
+            .filter(|s| s.call_evidence.is_some() && s.label.contains(label))
+            .collect();
+        assert_eq!(found.len(), 1, "{label}");
+        (
+            found[0].target.clone(),
+            found[0].call_evidence.as_ref().unwrap().boundary_reason,
+        )
+    };
+    assert_eq!(evidence("double"), (Some(double), BoundaryReason::None));
+    assert_eq!(evidence("add"), (None, BoundaryReason::Dispatch));
 }
 
 /// Owner ruling 2026-10-28 (#394, option c), on real rust-analyzer bytes with the
@@ -5136,7 +5980,7 @@ fn real_rust_analyzer_over_cap_document_is_admitted_partial_with_its_reason() {
             .observed_roles
             .contains(&trellis::semantic_evidence::Role::Call)
     );
-    // util.rs (12 occurrences) is untouched.
+    // util.rs (16 occurrences) is untouched.
     assert_eq!(
         coverage_of(&capped, "src/util.rs"),
         coverage_of(&full, "src/util.rs")
@@ -5229,9 +6073,9 @@ fn real_rust_analyzer_aggregate_candidate_cap_fails_typed_and_atomically() {
     let world = rust_analyzer_world();
     let descriptor = rust_analyzer_batch(&world);
     let head = world.store.index_baseline().unwrap();
-    // 48 occurrences and 18 symbol informations: 66 candidates.
+    // 52 occurrences and 20 symbol informations: 72 candidates.
     let limits = BatchLimits {
-        candidates: 65,
+        candidates: 71,
         ..BatchLimits::PRODUCTION
     };
     let error = world
@@ -5255,7 +6099,7 @@ fn real_rust_analyzer_aggregate_candidate_cap_fails_typed_and_atomically() {
     assert_nothing_published(&world, head);
     assert!(world.stage_dirs().is_empty());
     let limits = BatchLimits {
-        candidates: 66,
+        candidates: 72,
         ..BatchLimits::PRODUCTION
     };
     world

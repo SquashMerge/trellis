@@ -128,6 +128,11 @@ in order, are `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_dec
 validated cached snapshot; before a valid head is ready, evidence tools return typed
 `index_not_ready`, while describe can report not-ready status. Declaration takes a `symbolId` with
 no `limit` or `view`; outgoing calls takes a `symbolId` and optional `limit`, with no `view`.
+Outgoing and incoming calls show each call's published semantic binding (resolution, target,
+ambiguous candidates and freshness) from the sole published producer, or from an explicit
+optional `semanticProducerId`. With none or several published, they stay syntax-only and the
+`syntaxOnly` warning says why. `trellis query` (`--semantic-producer-id`) and `trellis status`
+apply the same producer policy.
 Find, declaration and outgoing results use compact `doc` references into their `documents` table.
 Symbols, declaration data and calls include inclusive 1-based `lines` beside byte ranges when the
 source is selectable; `NativeCandidate` has no `lines`. Use the returned `evidenceBasis` and

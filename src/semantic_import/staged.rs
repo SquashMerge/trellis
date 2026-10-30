@@ -15,7 +15,7 @@
 //! between documents.
 use super::{
     CoordinateMap, DestinationMutations, MeasuredFacts, Position, RoleSites, ScopedKey,
-    compose_join, document_coordinates,
+    TargetCallable, compose_join, document_coordinates,
     join_store::{
         BasisFor, Bytes, DocumentJoinState, GlobalJoinReads, JoinFacts, JoinSink, JoinStore,
         MethodSummary, OccurrenceRow, ProofIdentities, ProofRef, RelationshipRow,

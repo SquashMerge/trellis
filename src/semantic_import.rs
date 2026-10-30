@@ -1091,6 +1091,171 @@ fn declaration_target<S: JoinStore, G: GlobalJoinReads>(
 struct MeasuredOccurrence {
     row: OccurrenceRow,
     compatible_syntax_id: Option<String>,
+    /// How the exactly bound definition's native declaration can be called (#470).
+    callable: TargetCallable,
+}
+
+/// How a call's exact bound target declaration can be called, measured from its native
+/// declaration kind alone (owner ruling 2026-10-30, #470). Only JavaScript and Rust are
+/// classified; every other declaration is `Other`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum TargetCallable {
+    #[default]
+    Other = 0,
+    /// A free function: a JavaScript `function` declaration or expression, or a Rust `fn`
+    /// that is not an `impl` or trait item.
+    FreeFunction = 1,
+    /// A JavaScript class, or its `constructor` method.
+    Constructor = 2,
+}
+
+impl TargetCallable {
+    fn of(declaration: &native::Declaration) -> Self {
+        match (
+            declaration.document.language.as_str(),
+            declaration.kind.as_str(),
+        ) {
+            ("javascript" | "rust", "function") => Self::FreeFunction,
+            ("javascript", "type") => Self::Constructor,
+            ("javascript", "method") if declaration.name.as_deref() == Some("constructor") => {
+                Self::Constructor
+            }
+            _ => Self::Other,
+        }
+    }
+
+    pub(super) fn from_code(code: i64) -> Result<Self> {
+        Ok(match code {
+            0 => Self::Other,
+            1 => Self::FreeFunction,
+            2 => Self::Constructor,
+            _ => anyhow::bail!("corrupt staged target callable"),
+        })
+    }
+}
+
+/// The measured syntactic shape of a native call (#470), read from its parser-measured
+/// invocation and callee ranges and the authenticated source bytes between their starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallShape {
+    /// The callee token starts the call: a JavaScript or Rust identifier callee (`foo()`,
+    /// Rust `foo::<T>()`).
+    Plain,
+    /// A Rust path callee (`m::foo()`, `crate::m::foo()`): only path segments precede it.
+    Path,
+    /// A JavaScript `new` expression whose constructor is an identifier or dotted name.
+    New,
+    /// Member or method-call syntax, a compound callee, or anything not proved above.
+    Other,
+}
+
+fn call_shape(language: &str, call: &native::Call, source: &[u8]) -> CallShape {
+    let Some(callee) = &call.callee_range else {
+        return CallShape::Other;
+    };
+    let Some(prefix) = source.get(call.range.start..callee.start) else {
+        return CallShape::Other;
+    };
+    if prefix.is_empty() {
+        return CallShape::Plain;
+    }
+    match language {
+        // `new`, whitespace, then only a dotted name: the native callee of a `new_expression`
+        // is its constructor identifier or the last property of its dotted constructor, and
+        // no call or member expression on another value fits in that prefix.
+        "javascript" => match prefix.strip_prefix(b"new") {
+            Some(rest)
+                if rest.first().is_some_and(u8::is_ascii_whitespace)
+                    && rest.iter().all(|b| {
+                        b.is_ascii_alphanumeric()
+                            || b.is_ascii_whitespace()
+                            || matches!(b, b'_' | b'$' | b'.')
+                    }) =>
+            {
+                CallShape::New
+            }
+            _ => CallShape::Other,
+        },
+        // A path callee's native token is its `scoped_identifier` name, so the prefix is path
+        // segments ending in `::`. A method call's prefix holds the receiver and its `.`.
+        "rust"
+            if prefix.trim_ascii_end().ends_with(b"::")
+                && !prefix.iter().any(|b| {
+                    matches!(
+                        b,
+                        b'.' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'/' | b'"' | b'\''
+                    )
+                }) =>
+        {
+            CallShape::Path
+        }
+        _ => CallShape::Other,
+    }
+}
+
+/// A call binding's dispatch (owner ruling 2026-10-30, #470), from the measured native call
+/// shape and the exact bound target's declaration kind only: a plain JavaScript call, or a
+/// plain or path Rust call, to a free function is `direct`; a JavaScript `new` of a class or
+/// its constructor is `constructor`; everything else, member calls included, stays `unknown`.
+fn call_dispatch(language: &str, shape: CallShape, callable: TargetCallable) -> semantic::Dispatch {
+    match (language, shape, callable) {
+        ("javascript", CallShape::Plain, TargetCallable::FreeFunction)
+        | ("rust", CallShape::Plain | CallShape::Path, TargetCallable::FreeFunction) => {
+            semantic::Dispatch::Direct
+        }
+        ("javascript", CallShape::New, TargetCallable::Constructor) => {
+            semantic::Dispatch::Constructor
+        }
+        _ => semantic::Dispatch::Unknown,
+    }
+}
+
+/// A settled call binding's dispatch (#470): its join-time classification holds only while
+/// the settled row still resolves, with a verified target, to the same internal declaration it
+/// was classified against. Ambiguous, external, unresolved and stale outcomes are `unknown`.
+pub(super) fn settled_dispatch(
+    joined: semantic::Dispatch,
+    joined_target: Option<&semantic::Target>,
+    settled: &semantic::CallBinding,
+) -> semantic::Dispatch {
+    match (joined_target, &settled.declared_target) {
+        (
+            Some(semantic::Target::Internal {
+                syntax_id: a,
+                document: x,
+                ..
+            }),
+            Some(semantic::Target::Internal {
+                syntax_id: b,
+                document: y,
+                ..
+            }),
+        ) if settled.resolution == semantic::Resolution::Resolved
+            && settled.stale_target == Some(false)
+            && a == b
+            && x == y =>
+        {
+            joined
+        }
+        _ => semantic::Dispatch::Unknown,
+    }
+}
+
+/// A rejoined call's dispatch: the classification of whichever join, destination first then
+/// captured, was made against the settled target. A rejoin can settle a call on a captured
+/// target retargeted to the destination (its syntax ID verified unchanged) that the
+/// destination join alone did not resolve; the call's document bytes are unchanged, so the
+/// captured shape and target kind still hold.
+pub(super) fn rejoined_dispatch(
+    joins: [Option<(semantic::Dispatch, Option<&semantic::Target>)>; 2],
+    settled: &semantic::CallBinding,
+) -> semantic::Dispatch {
+    joins
+        .into_iter()
+        .flatten()
+        .map(|(dispatch, target)| settled_dispatch(dispatch, target, settled))
+        .find(|dispatch| *dispatch != semantic::Dispatch::Unknown)
+        .unwrap_or(semantic::Dispatch::Unknown)
 }
 
 fn measure_occurrence<S: JoinStore>(
@@ -1116,10 +1281,12 @@ fn measure_occurrence<S: JoinStore>(
     let reference =
         store.join_reserved(doc, range.clone(), semantic::JoinKind::Reference, operation)?;
     let call = store.join_reserved(doc, range.clone(), semantic::JoinKind::Callee, operation)?;
+    let mut callable = TargetCallable::Other;
     let compatible_syntax_id = if roles & 1 != 0 && binding.status == semantic::JoinStatus::Exact {
         let candidate = store
             .declaration_of(doc, &binding.candidate_ids[0])?
             .context("missing exact native declaration")?;
+        callable = TargetCallable::of(&candidate);
         let compatible = store
             .symbol_kind(&doc.language, &doc.path, symbol)?
             .is_some_and(|kind| match candidate.kind.as_str() {
@@ -1156,6 +1323,7 @@ fn measure_occurrence<S: JoinStore>(
             call,
         },
         compatible_syntax_id,
+        callable,
     }))
 }
 
@@ -1244,6 +1412,7 @@ fn discover_join_claim<S: JoinStore, G: GlobalDiscoverySink>(
                 doc.clone(),
                 measured.row.binding.candidate_ids[0].clone(),
                 measured.compatible_syntax_id.is_some(),
+                measured.callable,
             )?;
         }
         return Ok(Some((range, measured.row)));
@@ -1453,14 +1622,18 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
         (span.start <= own.start && own.end <= span.end)
             .then(|| store.join_reserved(&doc, span, semantic::JoinKind::Invocation, operation))
             .transpose()?
+            // Owner ruling 4 (2026-10-30, #394): an enclosing range that does not exactly join
+            // an invocation is treated as absent. A recursive rust-analyzer call's range is its
+            // target's own definition, which encloses the reference but is no call.
+            .filter(|join| join.status == semantic::JoinStatus::Exact)
     } else {
         None
     };
     // The measured call this use occurrence names (#444). SCIP has no call role, and
     // scip-typescript, scip-java and scip-python never give a reference an enclosing range,
     // so the occurrence's exact span on one measured callee identifies the call by itself.
-    // A producer-supplied enclosing range that encloses the occurrence must still join
-    // exactly to that same call.
+    // A producer-supplied enclosing range that exactly joins an invocation must join that
+    // same call; one that joins none is absent, and the exact callee span alone decides.
     let witness = match &invocation {
         Some(j) => (j.status == semantic::JoinStatus::Exact
             && (call.status != semantic::JoinStatus::Exact
@@ -1652,7 +1825,7 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             let actual = store.call_of(&doc, &candidate.candidate_ids[0])?;
             let owning_references =
                 store.references_with_id(&doc, &reference.candidate_ids[0], operation)?;
-            if actual.is_some_and(|c| {
+            if let Some(actual) = actual.as_deref().filter(|c| {
                 let primary = &reference.anchor.range;
                 c.document == doc
                     && c.range.start <= primary.start
@@ -1668,6 +1841,26 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                             && r.range == *primary
                     })
             }) {
+                // #470: only an exact, resolved internal target of this language is classified.
+                let dispatch = match &resolved {
+                    Some(semantic::Target::Internal {
+                        syntax_id,
+                        document,
+                        ..
+                    }) if resolution == semantic::Resolution::Resolved
+                        && document.language == doc.language =>
+                    {
+                        match call_shape(&doc.language, actual, &source) {
+                            CallShape::Other => semantic::Dispatch::Unknown,
+                            shape => call_dispatch(
+                                &doc.language,
+                                shape,
+                                index.target_callable(document, syntax_id)?,
+                            ),
+                        }
+                    }
+                    _ => semantic::Dispatch::Unknown,
+                };
                 index.put_call_reference(&claim.captured_proof_id, &reference.candidate_ids[0])?;
                 store.reserve_operation(operation, || {
                     staged::sizes::sum(&[
@@ -1688,7 +1881,7 @@ fn join_occurrence<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
                         }),
                         declared_target: resolved,
                         candidates,
-                        dispatch: semantic::Dispatch::Unknown,
+                        dispatch,
                         possible_dispatch: vec![],
                         possible_dispatch_complete: false,
                         provenance_id: claim.captured_proof_id.clone(),
@@ -1763,12 +1956,13 @@ fn settle_join_references<S: JoinStore, I: DocumentJoinState, K: JoinSink>(
             })?;
             let reference = out.reference(slot_of_reference)?;
             binding.resolution = reference.resolution;
-            binding.declared_target = reference.declared_target;
+            let joined = std::mem::replace(&mut binding.declared_target, reference.declared_target);
             binding.candidates = reference.candidates;
             binding.stale_target = binding
                 .declared_target
                 .as_ref()
                 .and_then(|t| matches!(t, semantic::Target::Internal { .. }).then_some(false));
+            binding.dispatch = settled_dispatch(binding.dispatch, joined.as_ref(), &binding);
             out.put_call_binding(Some(slot), binding)?;
         }
     }
@@ -3747,13 +3941,32 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                 })
         })
         .collect();
+    // The captured join's classification of each call and the target it was made against.
+    let captured_dispatch: BTreeMap<_, _> = captured
+        .call_bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.provenance_id.as_str(),
+                (binding.dispatch, binding.declared_target.as_ref()),
+            )
+        })
+        .collect();
     let mut calls = Vec::new();
+    // Each destination call's join-time dispatch and the target it was classified against.
+    let mut joined_dispatch = BTreeMap::new();
     for mut call in facts.call_bindings {
         let Some((resolution, target, candidates)) = old_targets.get(&call.provenance_id) else {
             continue;
         };
         call.resolution = *resolution;
-        call.declared_target = target.clone();
+        joined_dispatch.insert(
+            call.provenance_id.clone(),
+            (
+                call.dispatch,
+                std::mem::replace(&mut call.declared_target, target.clone()),
+            ),
+        );
         call.candidates = candidates.clone();
         if call
             .declared_target
@@ -3879,6 +4092,11 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         call.stale_target = call.declared_target.as_ref().and_then(|target| {
             matches!(target, semantic::Target::Internal { .. }).then_some(false)
         });
+        let destination = joined_dispatch
+            .get(&call.provenance_id)
+            .map(|(dispatch, target)| (*dispatch, target.as_ref()));
+        let original = captured_dispatch.get(call.provenance_id.as_str()).copied();
+        call.dispatch = rejoined_dispatch([destination, original], call);
         true
     });
     let eligible_proofs: BTreeSet<_> = filtered
