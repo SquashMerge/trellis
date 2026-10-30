@@ -85,14 +85,15 @@ fn adopt_targets(
 }
 
 /// A working copy of one destination row, admitted at its own size before the clone. The guard
-/// follows the copy: it is released when the copy drops, or moved to the owner that keeps it.
+/// follows the copy: bind it first so it is released after the copy drops, or move it to the
+/// owner that keeps the copy.
 fn working_copy<T: Clone>(
     live: &Rc<LiveBudget>,
     row: &T,
     bytes: impl FnOnce(&T) -> Result<u64>,
-) -> Result<(T, Reservation)> {
+) -> Result<(Reservation, T)> {
     let reservation = live.reserve(bytes(row)?)?;
-    Ok((row.clone(), reservation))
+    Ok((reservation, row.clone()))
 }
 
 /// Admits one new `BTreeMap` entry whose owned key/value payload is `payload` bytes.
@@ -392,7 +393,7 @@ impl StagedJoin<'_> {
 
         for row in &destination.symbols {
             self.ctx.check_cancel()?;
-            let (mut symbol, mut item) = working_copy(live, row, sizes::symbol)?;
+            let (mut item, mut symbol) = working_copy(live, row, sizes::symbol)?;
             let own = view.proof(&symbol.provenance_id)?.is_some();
             if own && let Some(targets) = captured_targets.get(symbol.key.symbol.as_str()) {
                 let replaced = sizes::targets(&symbol.declarations)?;
@@ -424,7 +425,7 @@ impl StagedJoin<'_> {
             if captured_declarations.get(row.provenance_id.as_str()) != Some(&syntax_id.as_str()) {
                 continue;
             }
-            let (mut binding, _item) = working_copy(live, row, sizes::binding)?;
+            let (_item, mut binding) = working_copy(live, row, sizes::binding)?;
             let raw = binding.provenance_id.clone();
             let kind = semantic::EvidenceKind::DeclarationBinding;
             source(&mut sources, &mut owner, &raw, kind)?;
@@ -464,7 +465,7 @@ impl StagedJoin<'_> {
             if !row.roles.iter().any(|role| prior.roles.contains(role)) {
                 continue;
             }
-            let (mut reference, mut item) = working_copy(live, row, sizes::reference)?;
+            let (mut item, mut reference) = working_copy(live, row, sizes::reference)?;
             reference.roles.retain(|role| prior.roles.contains(role));
             reference.resolution = prior.resolution;
             adopt_targets(
@@ -554,7 +555,7 @@ impl StagedJoin<'_> {
             canonical_targets(&self.ctx.live, &mut united)?;
             // The row is its first claim's destination row with the merged roles and site; its
             // own targets give way to the union (which `owner` already holds).
-            let (mut reference, mut item) = working_copy(live, pending.claim, sizes::reference)?;
+            let (mut item, mut reference) = working_copy(live, pending.claim, sizes::reference)?;
             let replaced = target_set(reference.declared_target.as_ref(), &reference.candidates)?;
             reference.declared_target = None;
             reference.candidates = Vec::new();
@@ -638,7 +639,7 @@ impl StagedJoin<'_> {
                 continue;
             };
             // The working copy, then the captured reference's targets it adopts.
-            let (mut call, mut item) = working_copy(live, row, sizes::call)?;
+            let (mut item, mut call) = working_copy(live, row, sizes::call)?;
             call.resolution = old.resolution;
             adopt_targets(
                 &mut item,

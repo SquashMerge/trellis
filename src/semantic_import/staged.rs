@@ -322,6 +322,13 @@ impl DocGroup {
         for (index, r) in references.iter().enumerate() {
             reference_ids.entry(r.id.clone()).or_default().push(index);
         }
+        // What the group does not keep drops before its charge shrinks to what it keeps.
+        drop((
+            key,
+            rows.provenance,
+            rows.control_regions,
+            rows.search_cards,
+        ));
         let mut group = Self {
             document,
             text,

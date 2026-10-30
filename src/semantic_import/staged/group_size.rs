@@ -631,7 +631,8 @@ mod retained {
             // Rc strong and weak counts beside the group.
             (size_of::<DocGroup>() + 2 * size_of::<usize>()) as u64,
             document(&group.document),
-            (group.text.len() + 2 * size_of::<usize>()) as u64,
+            ((group.text.len() + 2 * size_of::<usize>()).next_multiple_of(size_of::<usize>()))
+                as u64,
             artifact(&group.native),
             ids(&group.declaration_ids),
             declaration_keys(&group.native.declarations)?,

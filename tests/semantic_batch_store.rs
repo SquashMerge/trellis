@@ -1701,9 +1701,11 @@ fn local_calls_world(calls: usize) -> (World, (PathBuf, String)) {
 }
 
 /// The join's live reservations track the Rust storage it really holds (owner ruling
-/// 2026-10-30, #394): the most this thread held at once during the join is within 5% (plus
-/// 256 KiB of fixed working state) of the charged high water, and the charge is at most 1.25x
-/// that real peak. The fixture is one large document, so its owners dominate.
+/// 2026-10-30, #394): the most this thread held at once during the join never exceeds the
+/// charged high water by more than a fixed 256 KiB, which covers the join's own Rust working
+/// state outside the budget's owners (SQL text, the row ledger, rusqlite's statement cache);
+/// and the charge is at most 1.25x that real peak. The fixture is one large document, so its
+/// owners dominate.
 #[test]
 fn live_reservations_track_the_joins_real_storage() {
     for calls in [500, 4_000] {
@@ -1730,7 +1732,7 @@ fn live_reservations_track_the_joins_real_storage() {
         assert_eq!(publication.call_bindings.len(), calls);
         let charged = counters.join_reservation_high_water_bytes;
         assert!(
-            real <= charged + charged / 20 + 256 * 1024,
+            real <= charged + 256 * 1024,
             "{calls} calls: real peak {real} above charged {charged}"
         );
         assert!(
