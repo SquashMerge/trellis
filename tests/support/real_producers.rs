@@ -82,9 +82,9 @@ fn real_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
 }
 
-/// Directories that may hold a producer launcher and its `node`: the caller's `PATH` without
-/// shim directories, then the mise node installs recorded in the provisioning doc, newest
-/// first. Nothing here is executed.
+/// Directories that may hold a producer launcher, its `node` or its JVM: the caller's `PATH`
+/// without shim directories (where the `rustup` proxy is found), then the mise node and java
+/// installs recorded in the provisioning doc, newest first. Nothing here is executed.
 fn declared_path_dirs(home: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
