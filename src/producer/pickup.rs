@@ -450,7 +450,8 @@ impl PickupOwner {
     }
 
     /// Import the configured artifact. `force` skips the decision table, as the set command
-    /// does; an automatic trigger passes `false`. A skipped import replies `state: skipped`.
+    /// does; an automatic trigger passes `false`. A skipped import replies `state: skipped`; an
+    /// import held by a pending request replies `producer_busy` and records nothing.
     pub fn import(
         &self,
         store: &Store,
@@ -481,16 +482,12 @@ impl PickupOwner {
                 Reconcile::Pending
             )
         {
-            let entry = config.entries.iter().find(|e| e.producer == producer);
-            return Ok(json!({
-                "producer": producer,
-                "artifact": entry.map(|e| &e.artifact),
-                "state": "skipped",
-                "sha256": entry.and_then(|e| e.last_imported.as_ref()).map(|l| &l.sha256),
-                "sourceRevision": entry
-                    .and_then(|e| e.last_imported.as_ref())
-                    .map(|l| &l.source_revision),
-            }));
+            // Not a verdict: the artifact was not judged, so the watcher keeps reading it
+            // until the request settles. Nothing is recorded and no request starts.
+            anyhow::bail!(
+                "{}: an earlier import is still pending",
+                super::PRODUCER_BUSY
+            );
         }
         let entry = config
             .entries
@@ -603,8 +600,9 @@ impl PickupOwner {
             (Err(error), Some(mut last)) => {
                 // The wait ended before the accepted request settled: the request still
                 // reads the batch, so the directory stays and the sweep reclaims it once
-                // the request is terminal. The unknown outcome counts as a transient
-                // failure, so a later trigger retries after the retry interval.
+                // the request is terminal. The unknown outcome is recorded as a failed
+                // attempt naming the request; a later trigger reconciles it with the
+                // request's row and imports again only if that row no longer exists.
                 let message = format!("{error:#}");
                 let class = message.split(':').next().unwrap_or(&message);
                 last.error_code = Some(class.chars().take(120).collect());
