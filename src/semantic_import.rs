@@ -128,7 +128,12 @@ impl<'a> MeasuredFacts<'a> {
     ) -> Result<AnchorParts> {
         let anchors = Self::anchors(native, sources)?;
         let rank = anchors.ranks.binary_search(document).ok();
-        Ok(Self::parts(anchors.candidates, anchors.support, rank, document))
+        Ok(Self::parts(
+            anchors.candidates,
+            anchors.support,
+            rank,
+            document,
+        ))
     }
 
     fn anchors(
@@ -217,7 +222,12 @@ impl<'a> MeasuredFacts<'a> {
         }
         for r in &native.references {
             references.entry(r.id.clone()).or_default().push(r);
-            insert(rank(&r.document), &r.range, semantic::JoinKind::Reference, &r.id);
+            insert(
+                rank(&r.document),
+                &r.range,
+                semantic::JoinKind::Reference,
+                &r.id,
+            );
         }
         let texts: Vec<Option<&str>> = keys
             .iter()
@@ -323,17 +333,17 @@ impl<'a> MeasuredFacts<'a> {
                     .ok()
                     .and_then(|rank| raw_ranges.get(&(rank, *kind)))
                     .is_some_and(|ranges| {
-                            let first = ranges.partition_point(|(start, _)| {
-                                #[cfg(test)]
-                                complexity_work(|work| work.native_gap_query_records += 1);
-                                *start < gap.range.start
-                            });
-                            ranges.get(first).is_some_and(|(_, min_end)| {
-                                #[cfg(test)]
-                                complexity_work(|work| work.native_gap_query_records += 1);
-                                *min_end <= gap.range.end
-                            })
+                        let first = ranges.partition_point(|(start, _)| {
+                            #[cfg(test)]
+                            complexity_work(|work| work.native_gap_query_records += 1);
+                            *start < gap.range.start
                         });
+                        ranges.get(first).is_some_and(|(_, min_end)| {
+                            #[cfg(test)]
+                            complexity_work(|work| work.native_gap_query_records += 1);
+                            *min_end <= gap.range.end
+                        })
+                    });
                 ensure!(
                     !contradicts,
                     "native capability gap contradicts measured candidates"

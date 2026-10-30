@@ -251,7 +251,9 @@ struct DocGroup {
     text: Rc<str>,
     native: native::Artifact,
     declaration_ids: BTreeMap<String, Vec<usize>>,
-    declaration_keys: BTreeMap<Vec<u8>, Vec<usize>>,
+    /// Declarations by canonical key bytes, built on first use (only Java method owners ask).
+    /// Its bytes are part of the group's build reservation either way.
+    declaration_keys: std::cell::OnceCell<BTreeMap<Vec<u8>, Vec<usize>>>,
     declaration_names: BTreeSet<(usize, usize, String)>,
     call_ids: BTreeMap<String, Vec<usize>>,
     reference_ids: BTreeMap<String, Vec<usize>>,
@@ -293,15 +295,10 @@ impl DocGroup {
         let text: Rc<str> = Rc::from(String::from_utf8(bytes).context("non-UTF8 native source")?);
         let (declarations, calls, references) = (&mini.declarations, &mini.calls, &mini.references);
         let mut declaration_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        let mut declaration_keys: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
         let mut declaration_names = BTreeSet::new();
         for (index, d) in declarations.iter().enumerate() {
             declaration_ids
                 .entry(d.syntax_id.clone())
-                .or_default()
-                .push(index);
-            declaration_keys
-                .entry(crate::native_ids::canonical(&serde_json::to_value(&d.key)?))
                 .or_default()
                 .push(index);
             if let (Some(range), Some(name)) = (&d.name_range, &d.name) {
@@ -326,7 +323,7 @@ impl DocGroup {
             text,
             native: mini,
             declaration_ids,
-            declaration_keys,
+            declaration_keys: std::cell::OnceCell::new(),
             declaration_names,
             call_ids,
             reference_ids,
@@ -335,6 +332,19 @@ impl DocGroup {
             bytes,
             _native_reservation: native_reservation,
         })
+    }
+
+    fn declaration_keys(&self) -> Result<&BTreeMap<Vec<u8>, Vec<usize>>> {
+        if let Some(keys) = self.declaration_keys.get() {
+            return Ok(keys);
+        }
+        let mut keys: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+        for (index, d) in self.native.declarations.iter().enumerate() {
+            keys.entry(crate::native_ids::canonical(&serde_json::to_value(&d.key)?))
+                .or_default()
+                .push(index);
+        }
+        Ok(self.declaration_keys.get_or_init(|| keys))
     }
 
     fn pick<'s, T: Clone>(
@@ -929,7 +939,7 @@ impl JoinFacts for StagedSide<'_> {
         Ok(match self.borrowed_group(document)? {
             Some(group) => DocGroup::pick(
                 &group.native.declarations,
-                group.declaration_keys.get(key),
+                group.declaration_keys()?.get(key),
                 operation,
             )?,
             None => vec![],
