@@ -116,9 +116,7 @@ pub(crate) fn kind_of(rank: i64) -> Result<semantic::EvidenceKind> {
 }
 
 /// A fact row whose stored body carries an empty provenance ID: the row's column holds it.
-pub(crate) trait ProvenanceOwned:
-    serde::Serialize + serde::de::DeserializeOwned + Clone
-{
+pub(crate) trait ProvenanceOwned: serde::Serialize + serde::de::DeserializeOwned {
     fn provenance_id(&self) -> &str;
     fn provenance_id_mut(&mut self) -> &mut String;
 }
@@ -143,11 +141,14 @@ provenance_owned!(
     semantic::TypeRelationship
 );
 
-/// The stored body of a fact row: the row with its provenance ID left empty.
-pub(crate) fn fact_body<T: ProvenanceOwned>(row: &T) -> Result<String> {
-    let mut stored = row.clone();
-    stored.provenance_id_mut().clear();
-    Ok(serde_json::to_string(&stored)?)
+/// The stored body of a fact row: the row serialized with its provenance ID left empty. The
+/// ID is moved out for the serialization and back, so no copy of the row is made; the row is
+/// unchanged on return, also on error.
+pub(crate) fn fact_body<T: ProvenanceOwned>(row: &mut T) -> Result<String> {
+    let id = std::mem::take(row.provenance_id_mut());
+    let body = serde_json::to_string(&*row);
+    *row.provenance_id_mut() = id;
+    Ok(body?)
 }
 
 /// Decodes a stored fact row and restores its provenance ID from the row's column.
@@ -274,8 +275,10 @@ mod tests {
 
     #[test]
     fn fact_bodies_round_trip_and_reject_a_stored_provenance_id() {
-        let row = symbol();
-        let body = fact_body(&row).unwrap();
+        let mut row = symbol();
+        let body = fact_body(&mut row).unwrap();
+        // Serialized from the row itself, which keeps its ID.
+        assert_eq!(row, symbol());
         assert!(!body.contains(&row.provenance_id));
         let column = digest(&row.provenance_id);
         let decoded: semantic::Symbol = fact_row(&body, stored(&column)).unwrap();

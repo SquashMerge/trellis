@@ -352,7 +352,7 @@ impl StagedJoin<'_> {
                 #[cfg(feature = "test-support")]
                 crate::semantic_batch::testing::edit_row("symbol", &mut symbol)?;
                 self.check_row(&view, &raw, kind, None, |v, p, f| v.symbol(&symbol, p, f))?;
-                self.emit_fact("out_symbols", SYMBOLS, &symbol)?;
+                self.emit_fact("out_symbols", SYMBOLS, &mut symbol)?;
             } else if own {
                 outcome.omitted = true;
             }
@@ -382,7 +382,7 @@ impl StagedJoin<'_> {
                 Some(&binding.join.anchor.document),
                 |v, p, f| v.declaration_binding(&binding, p, f),
             )?;
-            self.emit_fact("out_declaration_bindings", BINDINGS, &binding)?;
+            self.emit_fact("out_declaration_bindings", BINDINGS, &mut binding)?;
         }
 
         // Each destination reference claim takes its captured reference's resolution; claims
@@ -505,6 +505,7 @@ impl StagedJoin<'_> {
             self.check_row(&view, &raw, kind, Some(&reference.document), |v, p, f| {
                 v.reference(&reference, p, f)
             })?;
+            let body = codec::fact_body(&mut reference)?;
             self.emit(
                 "out_references",
                 "INSERT INTO out_references VALUES(?1,?2,?3,?4,?5)",
@@ -513,7 +514,7 @@ impl StagedJoin<'_> {
                     &self.current_document(),
                     &reference.id,
                     &codec::digest(&reference.provenance_id),
-                    &codec::fact_body(&reference)?,
+                    &body,
                 ],
             )?;
             entry::<String, semantic::Reference>(&mut owner, id.len() as u64)?;
@@ -661,7 +662,7 @@ impl StagedJoin<'_> {
                 Some(&call.join.anchor.document),
                 |v, p, f| v.call_binding(&call, p, f),
             )?;
-            self.emit_fact("out_call_bindings", CALLS, &call)?;
+            self.emit_fact("out_call_bindings", CALLS, &mut call)?;
         }
 
         // Captured type relationships of eligible claims survive when both endpoints retarget.
@@ -683,7 +684,7 @@ impl StagedJoin<'_> {
                 self.check_row(&view, &raw, kind, None, |v, p, f| {
                     v.type_relationship(&relationship, p, f)
                 })?;
-                self.emit_fact("out_type_relationships", RELATIONSHIPS, &relationship)?;
+                self.emit_fact("out_type_relationships", RELATIONSHIPS, &mut relationship)?;
             } else {
                 outcome.omitted = true;
             }
@@ -705,16 +706,18 @@ impl StagedJoin<'_> {
         &self,
         table: &'static str,
         family: usize,
-        row: &T,
+        row: &mut T,
     ) -> Result<()> {
+        let provenance = codec::digest(row.provenance_id());
+        let body = codec::fact_body(row)?;
         self.emit(
             table,
             &format!("INSERT INTO {table} VALUES(?1,?2,?3,?4)"),
             &[
                 &self.next_ord(family),
                 &self.current_document(),
-                &codec::digest(row.provenance_id()),
-                &codec::fact_body(row)?,
+                &provenance,
+                &body,
             ],
         )
     }
