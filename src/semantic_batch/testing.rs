@@ -213,11 +213,13 @@ fn admit(
     source_set: &native::SourceSet,
     revision: &native::Revision,
     sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    native_config: &[serde_json::Value],
     descriptor_bytes: &[u8],
     pages: &[&[u8]],
     artifacts: &[&[u8]],
     cancel: &CancelFlag,
 ) -> std::result::Result<Vec<CapturedScipInventory>, ScipCaptureError> {
+    let module_roots = scip_raw::ModuleRoots::from_native_config(native_config);
     let outcome = (|| -> Result<Vec<CapturedScipInventory>> {
         let limits = BatchLimits::PRODUCTION;
         let sha = scip_raw::sha(descriptor_bytes);
@@ -248,6 +250,7 @@ fn admit(
             limits: &limits,
             cancel,
             budget: stage.budget(&limits),
+            module_roots: &module_roots,
         };
         let mut inputs = MemoryInputs {
             pages,
@@ -353,11 +356,14 @@ fn read_inventories(
 
 /// Runs the full admission over in-memory bytes: one inventory per artifact, in ordinal order.
 /// `pages` follow the descriptor's page order; `artifacts` follow artifact ordinals. Page and
-/// artifact paths are checked syntactically because no file exists to open.
+/// artifact paths are checked syntactically because no file exists to open. `native_config`
+/// is the captured revision's retained native config, the source of package roots.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_in_memory(
     root: &Path,
     native: &native::Artifact,
     sources: &BTreeMap<native::DocumentKey, Vec<u8>>,
+    native_config: &[serde_json::Value],
     descriptor: &[u8],
     pages: &[&[u8]],
     artifacts: &[&[u8]],
@@ -368,11 +374,17 @@ pub fn admit_in_memory(
         &native.source_set,
         &native.revision,
         sources,
+        native_config,
         descriptor,
         pages,
         artifacts,
         cancel,
     )
+}
+
+/// The retained native config a revision captured from `capture` would hold.
+pub fn captured_native_config(capture: &Capture) -> Result<Vec<serde_json::Value>> {
+    Ok(crate::native_evidence::captured_components(capture, "")?.1)
 }
 
 /// `admit_in_memory` over a fresh `Capture` of the workspace.
@@ -402,11 +414,14 @@ pub fn admit_in_memory_from_capture(
             )
         })
         .collect();
+    let native_config =
+        captured_native_config(capture).map_err(|_| admission("native captured config"))?;
     admit(
         root,
         &source_set,
         &revision,
         &sources,
+        &native_config,
         descriptor,
         pages,
         artifacts,

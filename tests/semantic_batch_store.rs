@@ -732,6 +732,13 @@ impl World {
     /// The batch decoded in memory: its descriptor, the captured native revision, the original
     /// artifact bytes and the merged inventory of every artifact.
     fn memory_admission(&self, descriptor: &(PathBuf, String)) -> MemoryAdmission {
+        self.try_memory_admission(descriptor).unwrap()
+    }
+
+    fn try_memory_admission(
+        &self,
+        descriptor: &(PathBuf, String),
+    ) -> Result<MemoryAdmission, ScipCaptureError> {
         let bytes = fs::read(&descriptor.0).unwrap();
         let parsed = Descriptor::parse(&bytes).unwrap();
         let pin = self
@@ -755,12 +762,12 @@ impl World {
             &self.root,
             &r1,
             &r1_sources,
+            &self.store.retained_native_components_at(pin).unwrap().1,
             &bytes,
             &page_refs,
             &artifact_refs,
             &self.cancel,
-        )
-        .unwrap();
+        )?;
         let mut merged = inventories[0].clone();
         merged.claims = inventories
             .iter()
@@ -788,14 +795,14 @@ impl World {
             .flat_map(|inventory| inventory.exclusions.clone())
             .filter(|e| seen.insert((e.language.clone(), e.relative_path.clone())))
             .collect();
-        MemoryAdmission {
+        Ok(MemoryAdmission {
             pin,
             parsed,
             r1,
             r1_sources,
             artifacts,
             merged,
-        }
+        })
     }
 
     /// The publication the in-memory join builds from the same batch bytes.
@@ -2559,6 +2566,11 @@ fn real_module_marker_batch(language: &str) {
     let (files, a, b, marker_symbols) = match language {
         "javascript" => (
             vec![
+                // The producer fixture's package root names its module markers (#443).
+                (
+                    "package.json",
+                    "{\"name\":\"trellis-producer-fixture-js\",\"version\":\"1.0.0\"}\n",
+                ),
                 (
                     "src/a.js",
                     "export function greet(name) {\n  return \"hello \" + name;\n}\n",
@@ -2804,7 +2816,20 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
         .join("tests/fixtures/semantic-import/issue444-javascript-calls");
     let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
     let (lib, main) = (read("src/lib.js"), read("src/main.js"));
-    let world = world(|root| write_files(root, &[("src/lib.js", &lib), ("src/main.js", &main)]));
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                ("src/lib.js", &lib),
+                ("src/main.js", &main),
+                // The fixture's package root names its module markers (#443).
+                (
+                    "package.json",
+                    r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+                ),
+            ],
+        )
+    });
     let mut fixture = world.fixture().reference("scip-typescript");
     let ordinal = fixture.artifact(
         "javascript",
@@ -3959,5 +3984,248 @@ fn an_invalid_destination_is_rejected_for_both_outputs_by_whole_publication_vali
             format!("{error:#}").contains("duplicate measured declaration ID"),
             "{error:#}"
         );
+    }
+}
+
+// Real scip-typescript 0.4.0 output (`index --infer-tsconfig`) for the workspace in
+// `tests/fixtures/scip-module-roots/workspace`. Only its Metadata unit was dropped, so the
+// document units are the producer's exact bytes; `module_roots_artifact` re-adds metadata for
+// the test workspace. The producer names `src/a.js` relative to the project root
+// (`. . src/`a.js`/`) and `tools/x/lib/c.js` relative to its nearest package root
+// (`@fixture/x 2.0.0 lib/`c.js`/`), per owner ruling 2026-10-29 (#443).
+const MODULE_ROOTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/scip-module-roots"
+);
+const PROJECT_MARKER: &str = "scip-typescript npm . . src/`a.js`/";
+const NESTED_MARKER: &str = "scip-typescript npm @fixture/x 2.0.0 lib/`c.js`/";
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn module_roots_world(edit: impl FnOnce(&Path)) -> World {
+    world(|root| {
+        copy_tree(&Path::new(MODULE_ROOTS).join("workspace"), root);
+        edit(root);
+    })
+}
+
+fn module_roots_artifact(world: &World) -> Vec<u8> {
+    let mut index = scip::types::Index::new();
+    let mut metadata = scip::types::Metadata::new();
+    metadata.project_root = format!("file://{}", world.root.display());
+    metadata.text_document_encoding = protobuf::EnumOrUnknown::from_i32(1);
+    let mut tool = scip::types::ToolInfo::new();
+    tool.name = "scip-typescript".into();
+    tool.version = "0.4.0".into();
+    metadata.tool_info = Some(tool).into();
+    index.metadata = Some(metadata).into();
+    let mut bytes = index.write_to_bytes().unwrap();
+    bytes.extend(fs::read(Path::new(MODULE_ROOTS).join("documents.scip")).unwrap());
+    bytes
+}
+
+fn module_roots_batch(world: &World, artifact: Vec<u8>) -> (PathBuf, String) {
+    let mut fixture = world.fixture().reference("scip-typescript");
+    let docs = fixture.paths("javascript");
+    assert_eq!(docs.len(), 3);
+    let ordinal = fixture.artifact("javascript", docs);
+    fixture.override_artifact_raw(ordinal, artifact);
+    world.write(&fixture)
+}
+
+fn marker_claims(world: &World, descriptor: &(PathBuf, String)) -> Vec<(String, String, u64)> {
+    let mut markers: Vec<_> = world
+        .memory_admission(descriptor)
+        .merged
+        .claims
+        .iter()
+        .filter(|claim| claim.envelope.record_kind == "occurrence")
+        .filter(|claim| claim.envelope.raw["range"]["values"] == json!([0, 0, 0]))
+        .map(|claim| {
+            (
+                claim.envelope.relative_path.clone(),
+                claim.envelope.raw["symbol"].as_str().unwrap().to_owned(),
+                claim.envelope.raw["symbolRoles"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    markers.sort();
+    markers
+}
+
+#[test]
+fn real_typescript_project_and_package_relative_markers_publish_and_rejoin() {
+    let world = module_roots_world(|_| {});
+    let descriptor = module_roots_batch(&world, module_roots_artifact(&world));
+    assert_eq!(
+        marker_claims(&world, &descriptor),
+        [
+            ("src/a.js".into(), PROJECT_MARKER.into(), 1),
+            (
+                "src/b.js".into(),
+                "scip-typescript npm . . src/`b.js`/".into(),
+                1
+            ),
+            ("tools/x/lib/c.js".into(), NESTED_MARKER.into(), 1),
+        ]
+    );
+    // The in-memory oracle and the staged batch join build the same publication.
+    let memory = world.memory_publication(&descriptor, DestinationMutations::default());
+    let (pin, mut admitted, _) = world.publish(&descriptor).unwrap();
+    let staged = testing::staged_publication(&mut admitted).unwrap();
+    assert_same_publication(&staged, &memory, "module roots");
+    world
+        .full_validation(&descriptor, DestinationMutations::default(), &staged)
+        .unwrap();
+    let published = world.store.semantic_at(pin).unwrap();
+    assert_published_matches_staged(&published, &staged);
+    for marker in [PROJECT_MARKER, NESTED_MARKER] {
+        let symbol = published
+            .symbols
+            .iter()
+            .find(|row| row.key.symbol == marker)
+            .unwrap();
+        assert!(
+            symbol.declarations.is_empty(),
+            "{marker} is not a measured name"
+        );
+    }
+    assert!(
+        published
+            .references
+            .iter()
+            .any(|row| row.spelling == "greet"),
+        "ordinary facts in the same documents still join"
+    );
+    // Stored-original rejoin re-decodes the artifact against the retained package roots.
+    let proofs = stored_proofs(&world);
+    drop(admitted);
+    write_files(&world.root, &[("Unrelated.java", "class Unrelated {}\n")]);
+    world.republish_with_rejoin();
+    assert_eq!(world.rejoin_failures(), 0);
+    assert_eq!(stored_proofs(&world), proofs);
+}
+
+/// The batch and the in-memory oracle both reject `descriptor` with a typed artifact error
+/// and publish nothing.
+fn assert_module_marker_rejected(world: &World, descriptor: &(PathBuf, String), case: &str) {
+    let head = world.store.index_baseline().unwrap();
+    let memory = world
+        .try_memory_admission(descriptor)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(memory, ScipCaptureError::InvalidArtifact(_)),
+        "{case}: memory {memory:?}"
+    );
+    let error = world.publish(descriptor).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<ScipCaptureError>(),
+            Some(ScipCaptureError::InvalidArtifact(_))
+        ),
+        "{case}: batch {error:#}"
+    );
+    assert_nothing_published(world, head);
+    assert!(world.stage_dirs().is_empty(), "{case}");
+}
+
+#[test]
+fn real_typescript_markers_reject_without_their_authenticated_package_root() {
+    let nested = "tools/x/package.json";
+    for (case, path, manifest) in [
+        (
+            "other package name",
+            nested,
+            Some(r#"{"name":"@fixture/y","version":"2.0.0"}"#),
+        ),
+        (
+            "other package version",
+            nested,
+            Some(r#"{"name":"@fixture/x","version":"2.0.1"}"#),
+        ),
+        (
+            "missing version is HEAD",
+            nested,
+            Some(r#"{"name":"@fixture/x"}"#),
+        ),
+        ("no package root", nested, None),
+        // With a root package.json the anonymous `src/` markers name the wrong package,
+        // although their paths equal the workspace-relative document paths.
+        (
+            "root package root",
+            "package.json",
+            Some(r#"{"name":"fixture-root","version":"1.0.0"}"#),
+        ),
+    ] {
+        let world = module_roots_world(|root| match manifest {
+            Some(text) => fs::write(root.join(path), text).unwrap(),
+            None => fs::remove_file(root.join(path)).unwrap(),
+        });
+        let descriptor = module_roots_batch(&world, module_roots_artifact(&world));
+        assert_module_marker_rejected(&world, &descriptor, case);
+    }
+}
+
+#[test]
+fn real_typescript_markers_reject_wrong_paths_other_documents_and_reversed_ranges() {
+    let world = module_roots_world(|_| {});
+    let original = module_roots_artifact(&world);
+    let edit_marker = |path: &str, edit: &dyn Fn(&mut scip::types::Occurrence)| {
+        semantic_batch_support::edit_scip(&original, |index| {
+            let document = index
+                .documents
+                .iter_mut()
+                .find(|document| document.relative_path == path)
+                .unwrap();
+            let marker = document
+                .occurrences
+                .iter_mut()
+                .find(|occurrence| occurrence.range == [0, 0, 0])
+                .unwrap();
+            edit(marker);
+        })
+    };
+    for (case, path, edit) in [
+        (
+            "path suffix under the wrong root",
+            "src/a.js",
+            &(|marker: &mut scip::types::Occurrence| {
+                marker.symbol = "scip-typescript npm . . `a.js`/".into()
+            }) as &dyn Fn(&mut scip::types::Occurrence),
+        ),
+        (
+            "workspace path under the package root",
+            "tools/x/lib/c.js",
+            &|marker: &mut scip::types::Occurrence| {
+                marker.symbol = "scip-typescript npm @fixture/x 2.0.0 tools/x/lib/`c.js`/".into()
+            },
+        ),
+        (
+            "marker naming another document",
+            "src/a.js",
+            &|marker: &mut scip::types::Occurrence| {
+                marker.symbol = "scip-typescript npm . . src/`b.js`/".into()
+            },
+        ),
+        (
+            "reversed range",
+            "tools/x/lib/c.js",
+            &|marker: &mut scip::types::Occurrence| marker.range = vec![0, 1, 0],
+        ),
+    ] {
+        let descriptor = module_roots_batch(&world, edit_marker(path, edit));
+        assert_module_marker_rejected(&world, &descriptor, case);
     }
 }

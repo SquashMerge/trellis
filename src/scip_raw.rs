@@ -13,6 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Read};
 use std::sync::atomic::Ordering;
 
+pub mod module_roots;
+pub use module_roots::ModuleRoots;
+
 pub const DECODER_VERSION: &str = "scip-0.10.0/CapturedScipFactV1/2";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -840,6 +843,8 @@ pub struct AuthenticatedArtifact<'a> {
     pub protocol_version: i32,
     pub text_document_encoding: i32,
     pub project_root_uri: &'a str,
+    /// Package roots that bind scip-typescript module markers (#443).
+    pub module_roots: &'a ModuleRoots,
     /// Source documents assigned to this artifact; every one must appear exactly once.
     pub assigned_documents: u64,
 }
@@ -974,6 +979,24 @@ impl Drop for UnitBuffer<'_> {
     }
 }
 
+/// A scip-typescript module-definition marker that does not name this document under its
+/// authenticated package or project root. Only an empty one is invalid; the caller checks.
+fn unresolved_module_marker(
+    artifact: &AuthenticatedArtifact<'_>,
+    language: &str,
+    path: &str,
+    o: &types::Occurrence,
+) -> bool {
+    if language != "javascript" || o.symbol_roles & 1 == 0 {
+        return false;
+    }
+    let Ok(symbol) = scip::symbol::parse_symbol(&o.symbol) else {
+        return false;
+    };
+    module_roots::typescript_module_path(&symbol).is_some()
+        && !artifact.module_roots.names_document(&symbol, path)
+}
+
 /// Decode one authenticated artifact as a stream of top-level units. Each unit is length-checked
 /// against the unit limit before it is allocated, walked, then parsed and emitted on its own, so
 /// one document unit is live at a time. Metadata is merged as `parse_from_bytes` merges repeated
@@ -1100,12 +1123,17 @@ pub fn decode_streaming<'s, R: Read>(
                 let text =
                     std::str::from_utf8(&source.bytes).map_err(|_| invalid("non-UTF8 source"))?;
                 let mut positions = Vec::with_capacity(d.occurrences.len() * 4);
+                let mut unresolved_markers = Vec::new();
                 for o in &d.occurrences {
                     traversed += 1;
                     if traversed.is_multiple_of(1024) {
                         cancelled(cancel)?;
                     }
+                    let first = positions.len();
                     let raw = occurrence(o, &mut positions)?;
+                    if unresolved_module_marker(artifact, &source.language, &d.relative_path, o) {
+                        unresolved_markers.push((positions[first], positions[first + 1]));
+                    }
                     sink.claim(make_claim(
                         artifact,
                         &d,
@@ -1115,6 +1143,20 @@ pub fn decode_streaming<'s, R: Read>(
                     ))?;
                 }
                 validate_positions(text, artifact.position_encoding, &mut positions, cancel)?;
+                if !unresolved_markers.is_empty() {
+                    let mut ends: Vec<_> = unresolved_markers
+                        .iter()
+                        .flat_map(|(start, end)| [*start, *end])
+                        .collect();
+                    let offsets =
+                        source_byte_offsets(text, artifact.position_encoding, &mut ends, cancel)?;
+                    if unresolved_markers
+                        .iter()
+                        .any(|(start, end)| offsets.get(start) == offsets.get(end))
+                    {
+                        return Err(invalid("empty or reversed SCIP range"));
+                    }
+                }
                 for s in &d.symbols {
                     traversed += 1;
                     if traversed.is_multiple_of(1024) {
@@ -1217,6 +1259,7 @@ pub(crate) fn decode_authenticated(
         protocol_version: input.protocol_version,
         text_document_encoding: input.text_document_encoding,
         project_root_uri: &input.project_root_uri,
+        module_roots: &ModuleRoots::default(),
         assigned_documents: admitted.len() as u64,
     };
     let mut resolve = |path: &str, language: &str| {
@@ -1480,6 +1523,7 @@ mod tests {
                 protocol_version: 0,
                 text_document_encoding: 1,
                 project_root_uri: "file:///synthetic",
+                module_roots: &ModuleRoots::default(),
                 assigned_documents: documents.len() as u64,
             };
             let mut resolve = |path: &str, _language: &str| {

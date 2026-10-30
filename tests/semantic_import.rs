@@ -411,7 +411,7 @@ fn admitted_case_with_calls(
     }
     index.documents.push(document);
     let bytes = index.write_to_bytes().unwrap();
-    admitted_artifact_case(language, producer_name, path, source, &bytes)
+    admitted_artifact_case(language, producer_name, path, source, &bytes, &[])
 }
 
 fn admitted_artifact_case(
@@ -420,13 +420,16 @@ fn admitted_artifact_case(
     path: &str,
     source: &str,
     bytes: &[u8],
+    files: &[(&str, &str)],
 ) -> (
     tempfile::TempDir,
     native::Artifact,
     BTreeMap<native::DocumentKey, Vec<u8>>,
     CapturedScipInventory,
 ) {
-    admitted_files_case(language, producer_name, &[(path, source)], bytes)
+    let mut all = vec![(path, source)];
+    all.extend_from_slice(files);
+    admitted_files_case(language, producer_name, &all, bytes)
 }
 
 fn admitted_files_case(
@@ -532,8 +535,18 @@ fn assert_real_module_marker_joins_without_invented_anchor(language: &str) {
     let mut index = scip::types::Index::new();
     index.documents.push(document);
     let bytes = index.write_to_bytes().unwrap();
+    // The producer fixture's package root names its module marker (#443).
+    let package = [(
+        "package.json",
+        r#"{"name":"trellis-producer-fixture-js","version":"1.0.0","private":true}"#,
+    )];
+    let files: &[(&str, &str)] = if language == "javascript" {
+        &package
+    } else {
+        &[]
+    };
     let (_root, native, sources, inventory) =
-        admitted_artifact_case(language, producer, &path, source, &bytes);
+        admitted_artifact_case(language, producer, &path, source, &bytes, files);
     let raw_marker = inventory
         .claims
         .iter()
@@ -637,7 +650,15 @@ fn issue444_case() -> (
     admitted_files_case(
         "javascript",
         "scip-typescript",
-        &[("src/lib.js", &lib), ("src/main.js", &main)],
+        &[
+            ("src/lib.js", &lib),
+            ("src/main.js", &main),
+            // The fixture's package root names its module markers (#443).
+            (
+                "package.json",
+                r#"{"name":"issue444-fixture","version":"1.0.0"}"#,
+            ),
+        ],
         &bytes,
     )
 }
@@ -782,12 +803,6 @@ fn module_marker_exception_rejects_other_empty_occurrences() {
             1,
             0,
         ),
-        (
-            "javascript",
-            "scip-typescript npm pkg 1.0.0 other/`A.js`/",
-            1,
-            0,
-        ),
         ("python", "scip-python python pkg 0 `src.A`/__init__:", 8, 0),
     ] {
         let source = if language == "python" {
@@ -808,6 +823,67 @@ fn module_marker_exception_rejects_other_empty_occurrences() {
                 Some(ScipCaptureError::InvalidArtifact(_))
             ),
             "empty non-module-definition occurrence must fail typed: {language} {symbol} roles={roles}: {error:#}"
+        );
+    }
+}
+
+// Owner ruling 2026-10-29 (#443): admission binds an empty scip-typescript module marker to
+// its document under the authenticated package root, so a mismatch rejects the artifact.
+#[test]
+fn typescript_module_marker_without_its_package_root_rejects_at_admission() {
+    use protobuf::Message;
+    let fixture = r#"{"name":"trellis-producer-fixture-js","version":"1.0.0"}"#;
+    for (case, manifest, symbol) in [
+        ("no package root", None, None),
+        (
+            "other package",
+            Some(r#"{"name":"other","version":"1.0.0"}"#),
+            None,
+        ),
+        (
+            "other document",
+            Some(fixture),
+            Some("scip-typescript npm trellis-producer-fixture-js 1.0.0 other/`a.js`/"),
+        ),
+        (
+            "path suffix",
+            Some(fixture),
+            Some("scip-typescript npm trellis-producer-fixture-js 1.0.0 `a.js`/"),
+        ),
+    ] {
+        let (mut document, _, source) = real_module_document("javascript");
+        if let Some(symbol) = symbol {
+            document.occurrences[0].symbol = symbol.into();
+        }
+        let path = document.relative_path.clone();
+        let mut index = scip::types::Index::new();
+        index.documents.push(document);
+        let bytes = index.write_to_bytes().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir_all(physical.join(&path).parent().unwrap()).unwrap();
+        fs::write(physical.join(&path), source).unwrap();
+        if let Some(text) = manifest {
+            fs::write(physical.join("package.json"), text).unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let capture =
+            Capture::admit(&IndexOptions::new(physical.clone()), &cancel, &|_| {}).unwrap();
+        let (descriptor, pages) =
+            testing::single_artifact_batch(&capture, "scip-typescript", "javascript", &bytes)
+                .unwrap();
+        let pages: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let error = testing::admit_in_memory_from_capture(
+            &capture,
+            &descriptor,
+            &pages,
+            &[&bytes],
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ScipCaptureError::InvalidArtifact(_)),
+            "{case}: {error:?}"
         );
     }
 }
@@ -2624,6 +2700,7 @@ mod batch_admission {
                     protocol_version: 0,
                     text_document_encoding: 1,
                     project_root_uri: &uri,
+                    module_roots: &trellis::scip_raw::ModuleRoots::default(),
                     assigned_documents: 3,
                 },
                 &mut resolve,
@@ -2788,6 +2865,7 @@ mod batch_admission {
                 &world.physical,
                 native,
                 &sources,
+                &testing::captured_native_config(&world.capture).unwrap(),
                 &descriptor,
                 &page_refs,
                 &[&world.artifact],

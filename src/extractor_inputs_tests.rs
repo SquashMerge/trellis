@@ -19,6 +19,10 @@ const NON_EXTRACTION_ITEMS: &[(&str, &str)] = &[
         "revision-header config inputs, captured and compared per revision",
     ),
     (
+        "capture::nested_package_manifest",
+        "selects nested package.json config inputs (#443), captured and compared per revision",
+    ),
+    (
         "capture::CaptureInputObservation",
         "persisted change classification, not extraction",
     ),
