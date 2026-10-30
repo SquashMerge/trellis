@@ -1365,6 +1365,24 @@ const REFERENCES: usize = 4;
 const CALLS: usize = 5;
 const RELATIONSHIPS: usize = 6;
 
+/// A captured document's join as eligibility computed it: its decoded claims, facts and charge.
+struct CapturedJoin {
+    claims: Rc<DocumentClaims>,
+    facts: super::JoinedFacts,
+    reservation: Reservation,
+}
+
+/// The output tables of settlement, which a discarded speculative settlement clears.
+const OUTPUT_TABLES: [&str; 7] = [
+    "out_coverage",
+    "out_provenance",
+    "out_symbols",
+    "out_declaration_bindings",
+    "out_references",
+    "out_call_bindings",
+    "out_type_relationships",
+];
+
 /// The source-eligibility decision of one captured document: the single `w_docs` row its
 /// eligibility pass writes, and everything coverage later needs from that pass.
 #[derive(Default, Clone, Copy)]
@@ -1497,58 +1515,134 @@ impl StagedJoin<'_> {
         }
         // Each document's decision is independent of the others, so the order is free.
         for document in self.captured.documents_reversed() {
-            let document = document?;
-            self.ctx.check_cancel()?;
-            let mut flags = DocFlags::default();
-            if self
-                .producer
-                .languages
-                .contains(&language_of(&document.language)?)
-            {
-                let reason = self.exclusion(&document)?;
-                if reason.as_deref() != Some("notRequested") {
-                    flags.requested = true;
-                }
-                if reason.as_deref() == Some("failed")
-                    || (reason.as_deref() != Some("notRequested") && !self.unchanged(&document)?)
-                {
-                    flags.failed = true;
-                }
-            }
-            let claims = DocumentClaims::load(&self.captured, &document)?;
-            if !claims.claims.is_empty() {
-                flags.claims = claims.non_information();
-                let _keys = self.view_keys(&document, 1)?;
-                let local =
-                    streaming::claims_side(&self.captured, document.clone(), Rc::new(claims))?;
-                let (facts, _facts_reservation) =
-                    streaming::join_document(&local, global, self.admitted_encoding)?;
-                #[cfg(feature = "test-support")]
-                crate::semantic_batch::testing::run_document_common_observer(
-                    0,
-                    &document,
-                    &facts,
-                    self.conn(),
-                );
-                self.classify(&document, &local, &facts, &mut flags)?;
-            }
-            self.ctx.row("w_docs")?;
-            self.conn()
-                .prepare_cached(
-                    "INSERT INTO w_docs SELECT ord,?3,?4,?5,?6,?7,?8 FROM sources WHERE language=?1 AND path=?2",
-                )?
-                .execute(params![
-                    document.language,
-                    document.path,
-                    flags.requested,
-                    flags.failed,
-                    flags.eligible,
-                    flags.unsupported,
-                    i64::try_from(flags.unsupported_claims)?,
-                    i64::try_from(flags.claims)?,
-                ])?;
+            self.eligibility_document(&document?, global)?;
         }
         Ok(())
+    }
+
+    /// Decides one captured document's source eligibility and writes its `w_docs` row. Returns
+    /// the decision and, for a document with claims, the captured join it was decided on, with
+    /// its decoded claims and the join's charge.
+    fn eligibility_document(
+        &self,
+        document: &native::DocumentKey,
+        global: &streaming::CompletedGlobal<'_>,
+    ) -> Result<(DocFlags, Option<CapturedJoin>)> {
+        self.ctx.check_cancel()?;
+        let mut flags = DocFlags::default();
+        if self
+            .producer
+            .languages
+            .contains(&language_of(&document.language)?)
+        {
+            let reason = self.exclusion(document)?;
+            if reason.as_deref() != Some("notRequested") {
+                flags.requested = true;
+            }
+            if reason.as_deref() == Some("failed")
+                || (reason.as_deref() != Some("notRequested") && !self.unchanged(document)?)
+            {
+                flags.failed = true;
+            }
+        }
+        let claims = DocumentClaims::load(&self.captured, document)?;
+        let mut joined = None;
+        if !claims.claims.is_empty() {
+            flags.claims = claims.non_information();
+            let claims = Rc::new(claims);
+            let _keys = self.view_keys(document, 1)?;
+            let local = streaming::claims_side(&self.captured, document.clone(), claims.clone())?;
+            let (facts, reservation) =
+                streaming::join_document(&local, global, self.admitted_encoding)?;
+            #[cfg(feature = "test-support")]
+            crate::semantic_batch::testing::run_document_common_observer(
+                0,
+                document,
+                &facts,
+                self.conn(),
+            );
+            self.classify(document, &local, &facts, &mut flags)?;
+            #[cfg(feature = "test-support")]
+            if crate::semantic_batch::testing::eligibility_forced_failed(document) {
+                flags.failed = true;
+            }
+            joined = Some(CapturedJoin {
+                claims,
+                facts,
+                reservation,
+            });
+        }
+        self.ctx.row("w_docs")?;
+        self.conn()
+            .prepare_cached(
+                "INSERT INTO w_docs SELECT ord,?3,?4,?5,?6,?7,?8 FROM sources WHERE language=?1 AND path=?2",
+            )?
+            .execute(params![
+                document.language,
+                document.path,
+                flags.requested,
+                flags.failed,
+                flags.eligible,
+                flags.unsupported,
+                i64::try_from(flags.unsupported_claims)?,
+                i64::try_from(flags.claims)?,
+            ])?;
+        Ok((flags, joined))
+    }
+
+    /// Passes 2 and 4 in one walk, for a shared pin: each document's eligibility, then at
+    /// once its settlement and coverage, reusing the captured join eligibility was decided
+    /// on. Settling a document before every decision is made assumes every document with
+    /// claims is eligible, so that the eligible destination context is the whole captured
+    /// one and each destination join equals its captured join (`identical_joins`). The first
+    /// document with claims that is not eligible ends the assumption: the remaining decisions
+    /// are still made, the settled rows are discarded (their row attempts stay charged) and
+    /// `None` asks the caller for the separate settlement pass.
+    fn eligibility_and_settlement(
+        &self,
+        global: &streaming::CompletedGlobal<'_>,
+    ) -> Result<Option<BTreeMap<semantic::Language, LanguageTally>>> {
+        if exists(self.conn(), UNLISTED_CLAIM_DOCUMENT_SQL, &[])? {
+            anyhow::bail!("missing admitted claim document");
+        }
+        let manifest_hash = self.destination_manifest_hash()?;
+        let mut tallies = BTreeMap::new();
+        let mut settling = true;
+        self.identical_joins.set(true);
+        for document in self.destination.documents() {
+            let document = document?;
+            let (_, joined) = self.eligibility_document(&document, global)?;
+            if !settling {
+                continue;
+            }
+            let (flags, excluded) = self.document_flags(&document)?;
+            let settled = flags.eligible && !flags.failed;
+            if joined.is_some() && !settled {
+                settling = false;
+                continue;
+            }
+            let outcome = if settled {
+                self.settle_document(&document, global, global, &manifest_hash, joined)?
+            } else {
+                settle::DocumentOutcome::default()
+            };
+            self.document_coverage(
+                &document,
+                flags,
+                excluded.as_deref(),
+                &outcome,
+                &mut tallies,
+            )?;
+        }
+        if settling {
+            return Ok(Some(tallies));
+        }
+        self.identical_joins.set(false);
+        for table in OUTPUT_TABLES {
+            self.conn().execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        self.emitted.set([0; 7]);
+        Ok(None)
     }
 
     /// Classifies each claim of one captured document against its captured facts and the
@@ -1791,23 +1885,35 @@ impl StagedJoin<'_> {
             self.ctx.check_cancel()?;
             let (flags, excluded) = self.document_flags(&document)?;
             let outcome = if flags.eligible && !flags.failed {
-                self.settle_document(&document, captured, destination, &manifest_hash)?
+                self.settle_document(&document, captured, destination, &manifest_hash, None)?
             } else {
                 settle::DocumentOutcome::default()
             };
-            let language = language_of(&document.language)?;
-            if self.producer.languages.contains(&language) {
-                self.coverage(
-                    &document,
-                    language,
-                    flags,
-                    excluded.as_deref(),
-                    &outcome,
-                    &mut tallies,
-                )?;
-            }
+            self.document_coverage(
+                &document,
+                flags,
+                excluded.as_deref(),
+                &outcome,
+                &mut tallies,
+            )?;
         }
         Ok(tallies)
+    }
+
+    /// Emits a document's coverage row when the producer covers its language.
+    fn document_coverage(
+        &self,
+        document: &native::DocumentKey,
+        flags: DocFlags,
+        excluded: Option<&str>,
+        outcome: &settle::DocumentOutcome,
+        tallies: &mut BTreeMap<semantic::Language, LanguageTally>,
+    ) -> Result<()> {
+        let language = language_of(&document.language)?;
+        if self.producer.languages.contains(&language) {
+            self.coverage(document, language, flags, excluded, outcome, tallies)?;
+        }
+        Ok(())
     }
 
     fn destination_manifest_hash(&self) -> Result<String> {
@@ -1971,8 +2077,23 @@ impl StagedJoin<'_> {
             )
         })?;
         self.ctx.pass("captured discovery");
-        in_transaction(self.conn(), || self.eligibility(&captured))?;
-        self.ctx.pass("eligibility");
+        #[cfg(feature = "test-support")]
+        let fuse = shared && !crate::semantic_batch::testing::settlement_separated();
+        #[cfg(not(feature = "test-support"))]
+        let fuse = shared;
+        if fuse {
+            let fused = in_transaction(self.conn(), || self.eligibility_and_settlement(&captured))?;
+            self.ctx.pass("eligibility and settlement");
+            if let Some(tallies) = fused {
+                #[cfg(feature = "test-support")]
+                crate::semantic_batch::testing::run_before_closure_hook(self.conn());
+                self.closure()?;
+                return self.report(tallies);
+            }
+        } else {
+            in_transaction(self.conn(), || self.eligibility(&captured))?;
+            self.ctx.pass("eligibility");
+        }
         // With a shared pin both sides read the same native revision without destination
         // edits, and every global row stems from one claim's own document. Discovery over the
         // eligible claims would therefore write exactly the captured rows of eligible owner

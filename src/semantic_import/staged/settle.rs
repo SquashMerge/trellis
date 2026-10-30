@@ -248,14 +248,24 @@ impl StagedJoin<'_> {
         captured_global: &CompletedGlobal<'_>,
         destination_global: &CompletedGlobal<'_>,
         destination_manifest_hash: &str,
+        prepared: Option<super::CapturedJoin>,
     ) -> Result<DocumentOutcome> {
         let encoding = self.admitted_encoding;
-        let claims = Rc::new(DocumentClaims::load(&self.filtered, doc)?);
         let _keys = self.view_keys(doc, 2)?;
-        let captured_view = streaming::claims_side(&self.captured, doc.clone(), claims.clone())?;
+        // The captured join eligibility already computed for this document, over the same
+        // claims and captured context, or a fresh one.
+        let (claims, mut captured, captured_reservation) = match prepared {
+            Some(joined) => (joined.claims, joined.facts, joined.reservation),
+            None => {
+                let claims = Rc::new(DocumentClaims::load(&self.filtered, doc)?);
+                let captured_view =
+                    streaming::claims_side(&self.captured, doc.clone(), claims.clone())?;
+                let (facts, reservation) =
+                    streaming::join_document(&captured_view, captured_global, encoding)?;
+                (claims, facts, reservation)
+            }
+        };
         let view = streaming::claims_side(&self.filtered, doc.clone(), claims)?;
-        let (mut captured, captured_reservation) =
-            streaming::join_document(&captured_view, captured_global, encoding)?;
         let (destination, _destination_reservation) = if self.identical_joins.get() {
             // Same claims, native revision and global rows: the destination join would
             // recompute the captured facts. Admit the copy at the original's charge first.

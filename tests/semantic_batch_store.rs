@@ -2417,6 +2417,62 @@ fn unshared_target_status_matches_memory_when_destination_declarations_change() 
     }
 }
 
+/// On a shared pin eligibility and settlement run as one walk that assumes every document with
+/// claims is eligible. Whichever document breaks the assumption, the result must equal the
+/// separate passes', and the discarded rows stay charged.
+#[test]
+fn fused_settlement_falls_back_to_the_separate_passes_exactly() {
+    let world = definitions_world();
+    let (a, b) = definitions_docs();
+    let descriptor = one_artifact_per_language(&world, vec![("javascript", vec![a, b])]);
+    let run = |separate: bool, failed: Option<&str>| {
+        testing::separate_settlement(separate);
+        testing::fail_eligibility_of(failed);
+        let result = world.join_with(
+            &descriptor,
+            &BatchLimits::PRODUCTION,
+            DestinationMutations::default(),
+        );
+        testing::separate_settlement(false);
+        testing::fail_eligibility_of(None);
+        let (mut admitted, sealed, counters) = result.unwrap();
+        let publication = testing::staged_publication(&mut admitted).unwrap();
+        let conn = admitted.stage_mut().conn().unwrap();
+        let coverage: i64 = conn
+            .query_row("SELECT COUNT(*) FROM out_coverage", [], |row| row.get(0))
+            .unwrap();
+        (
+            publication,
+            sealed.report().clone(),
+            counters.staged_row_attempts["out_coverage"],
+            coverage as u64,
+        )
+    };
+    for failed in [None, Some("src/A.js"), Some("src/B.js")] {
+        let case = format!("{failed:?}");
+        let (fused, fused_report, fused_attempts, rows) = run(false, failed);
+        let (separate, separate_report, separate_attempts, separate_rows) = run(true, failed);
+        assert_same_publication(&fused, &separate, &case);
+        assert_eq!(fused_report, separate_report, "{case}");
+        assert_eq!((rows, separate_rows), (2, 2), "{case}");
+        assert_eq!(separate_attempts, 2, "{case}");
+        // A.js settles first: when B.js fails, A.js's settled rows were discarded but stay
+        // charged. When A.js fails, nothing was settled before the assumption broke.
+        let discarded = u64::from(failed == Some("src/B.js"));
+        assert_eq!(fused_attempts, 2 + discarded, "{case}");
+        if failed.is_none() {
+            assert!(fused.references.iter().any(|r| r.spelling == "target"));
+        } else {
+            assert!(
+                fused
+                    .coverage
+                    .iter()
+                    .any(|c| c.state == trellis::semantic_evidence::CoverageState::Failed)
+            );
+        }
+    }
+}
+
 #[test]
 fn join_cursor_plans_use_no_temp_btree() {
     let world = definitions_world();

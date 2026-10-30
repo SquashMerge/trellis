@@ -77,6 +77,31 @@ pub(crate) fn run_document_common_observer(
     });
 }
 
+thread_local! {
+    static FAILED_ELIGIBILITY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static SEPARATE_SETTLEMENT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next staged joins on this thread decide the document at `path` failed, as a
+/// mismatched claim would, whatever its claims say. `None` clears it.
+pub fn fail_eligibility_of(path: Option<&str>) {
+    FAILED_ELIGIBILITY.with(|slot| *slot.borrow_mut() = path.map(str::to_owned));
+}
+
+pub(crate) fn eligibility_forced_failed(document: &native::DocumentKey) -> bool {
+    FAILED_ELIGIBILITY.with(|slot| slot.borrow().as_deref() == Some(document.path.as_str()))
+}
+
+/// Makes the next staged joins on this thread run eligibility and settlement as separate
+/// passes on a shared pin too, instead of the fused walk.
+pub fn separate_settlement(separate: bool) {
+    SEPARATE_SETTLEMENT.with(|slot| slot.set(separate));
+}
+
+pub(crate) fn settlement_separated() -> bool {
+    SEPARATE_SETTLEMENT.with(Cell::get)
+}
+
 type ClosureHook = Box<dyn FnOnce(&Connection)>;
 
 type RowHook = Box<dyn FnMut(&str, &mut serde_json::Value)>;
