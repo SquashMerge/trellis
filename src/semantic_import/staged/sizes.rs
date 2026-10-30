@@ -3,7 +3,24 @@
 use super::*;
 use std::mem::size_of;
 
+#[cfg(test)]
+thread_local! {
+    static ESTIMATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts estimator evaluations, so tests can show the unmetered oracle never runs one.
+#[cfg(test)]
+pub(in crate::semantic_import) fn estimates() -> u64 {
+    ESTIMATES.with(std::cell::Cell::get)
+}
+
+pub(in crate::semantic_import) fn note_estimate() {
+    #[cfg(test)]
+    ESTIMATES.with(|count| count.set(count.get() + 1));
+}
+
 pub(in crate::semantic_import) fn sum(parts: &[u64]) -> Result<u64> {
+    note_estimate();
     parts.iter().try_fold(0u64, |total, part| {
         total
             .checked_add(*part)
@@ -11,6 +28,7 @@ pub(in crate::semantic_import) fn sum(parts: &[u64]) -> Result<u64> {
     })
 }
 fn slots<T>(count: usize) -> Result<u64> {
+    note_estimate();
     (count as u64)
         .checked_mul(size_of::<T>() as u64)
         .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()).into())

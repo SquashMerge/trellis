@@ -4,7 +4,7 @@ use super::{
     join_store::{
         BasisFor, Bytes, DocumentJoinState, GlobalJoinReads, IndexedJoinStore, JoinFacts,
         JoinIndex, JoinSink, JoinStore, MethodSummary, NativeFacts, OccurrenceRow, ProofIdentities,
-        ProofRef, PublicationSink, RelationshipRow,
+        ProofRef, PublicationSink, RelationshipRow, RowReserve,
     },
     source_role_sites,
 };
@@ -106,7 +106,11 @@ impl JoinFacts for MemoryJoinStore<'_> {
     fn operation(&self) -> Result<()> {
         Ok(())
     }
-    fn reserve_operation(&self, _operation: &mut (), _bytes: u64) -> Result<()> {
+    fn reserve_operation(
+        &self,
+        _operation: &mut (),
+        _bytes: impl FnOnce() -> Result<u64>,
+    ) -> Result<()> {
         Ok(())
     }
     fn revision_id(&self) -> &str {
@@ -354,7 +358,11 @@ pub(super) struct MemoryJoinIndex {
 }
 
 impl GlobalJoinReads for MemoryJoinIndex {
-    fn declarations(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>> {
+    fn declarations(
+        &self,
+        key: &ScopedKey,
+        _reserve: RowReserve<'_>,
+    ) -> Result<Vec<(native::DocumentKey, String)>> {
         Ok(self
             .declarations
             .get(key)
@@ -364,18 +372,18 @@ impl GlobalJoinReads for MemoryJoinIndex {
             .collect())
     }
 
-    fn is_declared_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self.declared_symbols.contains(symbol))
-    }
-
-    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self.information_symbols.contains(symbol))
+    fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
+        Ok((
+            self.declared_symbols.contains(symbol),
+            self.information_symbols.contains(symbol),
+        ))
     }
 
     fn source_methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        _reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>> {
         Ok(self
             .source_methods
@@ -388,6 +396,7 @@ impl GlobalJoinReads for MemoryJoinIndex {
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        _reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>> {
         Ok(self
             .target_methods

@@ -38,19 +38,27 @@ pub(in crate::semantic_import) struct Reservation {
 }
 
 impl Reservation {
-    /// Move an existing owner's charge without changing aggregate live bytes.
-    pub(super) fn transfer_to(&mut self, other: &mut Self, bytes: u64) {
-        assert!(Rc::ptr_eq(&self.budget, &other.budget));
-        assert!(bytes <= self.bytes);
+    /// Move an existing owner's charge without changing aggregate live bytes. Moving more than
+    /// this guard holds, or into another budget, is an accounting defect, reported typed.
+    pub(super) fn transfer_to(&mut self, other: &mut Self, bytes: u64) -> Result<()> {
+        anyhow::ensure!(
+            Rc::ptr_eq(&self.budget, &other.budget) && bytes <= self.bytes,
+            "live reservation transfer exceeds its owner"
+        );
         self.bytes -= bytes;
         other.bytes += bytes;
+        Ok(())
     }
 
     /// Release storage only after its owner has actually dropped or moved to another guard.
-    pub(super) fn release(&mut self, bytes: u64) {
-        assert!(bytes <= self.bytes);
+    pub(super) fn release(&mut self, bytes: u64) -> Result<()> {
+        anyhow::ensure!(
+            bytes <= self.bytes,
+            "live reservation release exceeds its owner"
+        );
         self.bytes -= bytes;
         self.budget.used.set(self.budget.used.get() - bytes);
+        Ok(())
     }
 
     pub(super) fn grow(&mut self, bytes: u64) -> Result<()> {
@@ -103,7 +111,7 @@ mod tests {
         let budget = LiveBudget::new(10);
         let mut retained = budget.reserve(10).unwrap();
         let mut scratch = budget.reserve(0).unwrap();
-        retained.transfer_to(&mut scratch, 8);
+        retained.transfer_to(&mut scratch, 8).unwrap();
         assert_eq!(budget.used.get(), 10);
         assert_eq!(budget.high_water(), 10);
         drop(retained);
@@ -119,6 +127,23 @@ mod tests {
         assert!(budget.reserve(1).is_err());
         assert_eq!(budget.used.get(), u64::MAX);
         drop(first);
+        assert_eq!(budget.used.get(), 0);
+    }
+
+    #[test]
+    fn overdrawn_transfer_and_release_are_typed_and_change_nothing() {
+        let budget = LiveBudget::new(10);
+        let other_budget = LiveBudget::new(10);
+        let mut retained = budget.reserve(4).unwrap();
+        let mut scratch = budget.reserve(0).unwrap();
+        let mut foreign = other_budget.reserve(0).unwrap();
+        assert!(retained.transfer_to(&mut scratch, 5).is_err());
+        assert!(retained.transfer_to(&mut foreign, 1).is_err());
+        assert!(retained.release(5).is_err());
+        assert_eq!((retained.bytes, scratch.bytes, foreign.bytes), (4, 0, 0));
+        assert_eq!(budget.used.get(), 4);
+        assert_eq!(other_budget.used.get(), 0);
+        retained.release(4).unwrap();
         assert_eq!(budget.used.get(), 0);
     }
 }

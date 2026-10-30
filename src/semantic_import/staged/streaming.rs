@@ -1,5 +1,5 @@
 //! Complete side discovery followed by document-local Common classification.
-use super::super::join_store::{GlobalDiscoverySink, MethodSummary};
+use super::super::join_store::{GlobalDiscoverySink, MethodSummary, RowReserve};
 use super::super::{
     JoinedFacts, discover_join_claim, emit_join_symbols, emit_type_relationships, join_occurrence,
     method_target_owner_matches, scoped_key, settle_join_references,
@@ -9,118 +9,62 @@ use super::*;
 const DEFINITIONS_SQL: &str = "SELECT owner_language,owner_path,syntax_id FROM g_definitions WHERE side=?1 \
     AND symbol=?2 AND local_language=?3 AND local_path=?4 AND common_compatible=1 \
     ORDER BY owner_language,owner_path,syntax_id";
-const TARGET_METHODS_SQL: &str = "SELECT ord,body_bytes,decoded_bytes FROM g_methods WHERE side=?1 AND symbol=?2 AND local_language=?3 AND local_path=?4 ORDER BY ord";
-const SOURCE_METHODS_SQL: &str = "SELECT ord,body_bytes,decoded_bytes FROM g_methods WHERE side=?1 AND symbol=?2 AND owner_language=?3 AND owner_path=?4 ORDER BY ord";
+const TARGET_METHODS_SQL: &str = "SELECT body,body_bytes,decoded_bytes FROM g_methods WHERE side=?1 AND symbol=?2 AND local_language=?3 AND local_path=?4 ORDER BY ord";
+const SOURCE_METHODS_SQL: &str = "SELECT body,body_bytes,decoded_bytes FROM g_methods WHERE side=?1 AND symbol=?2 AND owner_language=?3 AND owner_path=?4 ORDER BY ord";
+const PRESENCE_SQL: &str =
+    "SELECT declared,information FROM g_presence WHERE side=?1 AND symbol=?2";
+/// Captured exact-definition membership of a raw symbol, in any document or scope.
+const CAPTURED_SYMBOL_SQL: &str = "SELECT 1 FROM g_definitions WHERE side=0 AND symbol=?1 LIMIT 1";
 
 #[cfg(feature = "test-support")]
 pub(super) fn cursor_sql() -> [&'static str; 3] {
     [DEFINITIONS_SQL, TARGET_METHODS_SQL, SOURCE_METHODS_SQL]
 }
 
-struct CompletedGlobal<'a> {
+/// The completed global context of one side: exact definitions, symbol presence and measured
+/// methods in `g_*`, queried by key one row at a time.
+pub(super) struct CompletedGlobal<'a> {
     ctx: &'a JoinCtx<'a>,
     side: u8,
     source_set_id: String,
     _source_reservation: Reservation,
 }
 
+/// Pushes one row whose bytes were admitted through `reserve`, admitting a doubled buffer
+/// first when the Vec is full. Superseded buffers stay admitted for the caller's operation.
+fn push_reserved<T>(
+    rows: &mut Vec<T>,
+    row_bytes: u64,
+    reserve: RowReserve<'_>,
+    make_row: impl FnOnce() -> Result<T>,
+) -> Result<()> {
+    if rows.len() == rows.capacity() {
+        let next = rows
+            .capacity()
+            .checked_mul(2)
+            .map(|n| n.max(4))
+            .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
+        reserve(
+            (next as u64)
+                .checked_mul(std::mem::size_of::<T>() as u64)
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+        )?;
+        rows.reserve_exact(next - rows.len());
+    }
+    reserve(row_bytes)?;
+    rows.push(make_row()?);
+    Ok(())
+}
+
 impl CompletedGlobal<'_> {
-    fn declaration_shape(&self, key: &ScopedKey) -> Result<(usize, u64)> {
-        self.ctx.charge(1)?;
-        let (language, path) = local_columns(key);
-        let mut statement = self.ctx.conn.prepare_cached(DEFINITIONS_SQL)?;
-        let mut rows = statement.query(params![self.side, key.0, language, path])?;
-        let mut count = 0usize;
-        let mut bytes = std::mem::size_of::<Vec<(native::DocumentKey, String)>>() as u64;
-        while let Some(row) = rows.next()? {
-            self.ctx.charge(1)?;
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
-            bytes = sizes::sum(&[
-                bytes,
-                std::mem::size_of::<(native::DocumentKey, String)>() as u64,
-                self.source_set_id.len() as u64,
-                row.get_ref(0)?.as_str()?.len() as u64,
-                row.get_ref(1)?.as_str()?.len() as u64,
-                row.get_ref(2)?.as_str()?.len() as u64,
-            ])?;
-        }
-        Ok((count, bytes))
-    }
-    fn declarations_query(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>> {
-        let (count, _) = self.declaration_shape(key)?;
-        let mut result = Vec::with_capacity(count);
-        self.ctx.charge(1)?;
-        let (language, path) = local_columns(key);
-        let mut statement = self.ctx.conn.prepare_cached(DEFINITIONS_SQL)?;
-        let mut rows = statement.query(params![self.side, key.0, language, path])?;
-        while let Some(row) = rows.next()? {
-            self.ctx.charge(1)?;
-            result.push((
-                native::DocumentKey {
-                    source_set_id: self.source_set_id.clone(),
-                    language: row.get(0)?,
-                    path: row.get(1)?,
-                },
-                row.get(2)?,
-            ));
-        }
-        Ok(result)
-    }
-
-    fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
-        self.ctx.charge(1)?;
-        Ok(self
-            .ctx
-            .conn
-            .prepare_cached(
-                "SELECT declared,information FROM g_presence WHERE side=?1 AND symbol=?2",
-            )?
-            .query_row(params![self.side, symbol], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()?
-            .unwrap_or_default())
-    }
-
-    fn method_shape(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-        target: bool,
-    ) -> Result<(usize, u64)> {
-        self.ctx.charge(1)?;
-        let (language, path) = if target && !symbol.starts_with("local ") {
-            ("", "")
-        } else {
-            (document.language.as_str(), document.path.as_str())
-        };
-        let sql = if target {
-            TARGET_METHODS_SQL
-        } else {
-            SOURCE_METHODS_SQL
-        };
-        let mut statement = self.ctx.conn.prepare_cached(sql)?;
-        let mut rows = statement.query(params![self.side, symbol, language, path])?;
-        let mut count = 0usize;
-        let mut bytes = std::mem::size_of::<Vec<MethodSummary>>() as u64;
-        while let Some(row) = rows.next()? {
-            self.ctx.charge(1)?;
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
-            bytes = sizes::sum(&[bytes, u64::try_from(row.get::<_, i64>(2)?)?])?;
-        }
-        Ok((count, bytes))
-    }
+    /// One query over the matching methods; each row is charged and admitted before decode.
     fn methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
         target: bool,
+        reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>> {
-        let (count, _) = self.method_shape(document, symbol, target)?;
         self.ctx.charge(1)?;
         let (language, path) = if target && !symbol.starts_with("local ") {
             ("", "")
@@ -134,12 +78,14 @@ impl CompletedGlobal<'_> {
         };
         let mut statement = self.ctx.conn.prepare_cached(sql)?;
         let mut rows = statement.query(params![self.side, symbol, language, path])?;
-        let mut result = Vec::with_capacity(count);
+        let mut result = Vec::new();
+        reserve(std::mem::size_of::<Vec<MethodSummary>>() as u64)?;
         while let Some(row) = rows.next()? {
             self.ctx.charge(1)?;
-            let ordinal: i64 = row.get(0)?;
             let body_bytes = u64::try_from(row.get::<_, i64>(1)?)?;
-
+            let decoded = u64::try_from(row.get::<_, i64>(2)?)?
+                .checked_sub(std::mem::size_of::<MethodSummary>() as u64)
+                .context("corrupt staged method size")?;
             // Borrowed SQL text avoids a String copy, but serde still owns escape scratch.
             let escape_bytes = if body_bytes == 0 {
                 0
@@ -149,67 +95,86 @@ impl CompletedGlobal<'_> {
                     .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?
                     .max(8)
             };
-            let _body_reservation = self
-                .ctx
-                .live
-                .reserve(sizes::sum(&[body_bytes, escape_bytes])?)?;
-            self.ctx.charge(1)?;
-            let mut body_statement = self
-                .ctx
-                .conn
-                .prepare_cached("SELECT body FROM g_methods WHERE side=?1 AND ord=?2")?;
-            let mut body_rows = body_statement.query(params![self.side, ordinal])?;
-            let body = body_rows.next()?.context("missing method summary")?;
-            self.ctx.charge(1)?;
-            result.push(serde_json::from_slice(body.get_ref(0)?.as_bytes()?)?);
+            // The row's text buffer lives in SQLite while serde decodes from it.
+            let scratch = sizes::sum(&[body_bytes, escape_bytes])?;
+            push_reserved(&mut result, decoded, reserve, || {
+                let _scratch = self.ctx.live.reserve(scratch)?;
+                Ok(serde_json::from_slice(row.get_ref(0)?.as_bytes()?)?)
+            })?;
         }
         Ok(result)
+    }
+
+    /// Whether any captured exact definition binds `symbol`, the existing internal-symbol
+    /// suppression set of the rejoin.
+    pub(super) fn captured_symbol(ctx: &JoinCtx<'_>, symbol: &str) -> Result<bool> {
+        ctx.charge(1)?;
+        exists(ctx.conn, CAPTURED_SYMBOL_SQL, &[&symbol])
     }
 }
 
 impl GlobalJoinReads for CompletedGlobal<'_> {
-    fn declarations_clone_bytes(&self, key: &ScopedKey) -> Result<u64> {
-        Ok(self.declaration_shape(key)?.1)
-    }
-    fn source_methods_clone_bytes(
+    fn declarations(
         &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<u64> {
-        Ok(self.method_shape(document, symbol, false)?.1)
+        key: &ScopedKey,
+        reserve: RowReserve<'_>,
+    ) -> Result<Vec<(native::DocumentKey, String)>> {
+        self.ctx.charge(1)?;
+        let (language, path) = local_columns(key);
+        let mut statement = self.ctx.conn.prepare_cached(DEFINITIONS_SQL)?;
+        let mut rows = statement.query(params![self.side, key.0, language, path])?;
+        let mut result = Vec::new();
+        reserve(std::mem::size_of::<Vec<(native::DocumentKey, String)>>() as u64)?;
+        while let Some(row) = rows.next()? {
+            self.ctx.charge(1)?;
+            let bytes = sizes::sum(&[
+                self.source_set_id.len() as u64,
+                row.get_ref(0)?.as_str()?.len() as u64,
+                row.get_ref(1)?.as_str()?.len() as u64,
+                row.get_ref(2)?.as_str()?.len() as u64,
+            ])?;
+            push_reserved(&mut result, bytes, reserve, || {
+                Ok((
+                    native::DocumentKey {
+                        source_set_id: self.source_set_id.clone(),
+                        language: row.get(0)?,
+                        path: row.get(1)?,
+                    },
+                    row.get(2)?,
+                ))
+            })?;
+        }
+        Ok(result)
     }
-    fn target_methods_clone_bytes(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<u64> {
-        Ok(self.method_shape(document, symbol, true)?.1)
-    }
-    fn declarations(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>> {
-        self.declarations_query(key)
-    }
-    fn is_declared_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self.presence(symbol)?.0)
-    }
-    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
-        Ok(self.presence(symbol)?.1)
+    fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
+        self.ctx.charge(1)?;
+        Ok(self
+            .ctx
+            .conn
+            .prepare_cached(PRESENCE_SQL)?
+            .query_row(params![self.side, symbol], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?
+            .unwrap_or_default())
     }
     fn source_methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>> {
-        self.methods(document, symbol, false)
+        self.methods(document, symbol, false, reserve)
     }
     fn target_methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>> {
-        self.methods(document, symbol, true)
+        self.methods(document, symbol, true, reserve)
     }
 }
-
 struct GlobalWriter<'a> {
     global: CompletedGlobal<'a>,
     methods: i64,
@@ -217,7 +182,7 @@ struct GlobalWriter<'a> {
 
 impl GlobalDiscoverySink for GlobalWriter<'_> {
     fn symbol_presence(&mut self, symbol: &str, declared: bool, information: bool) -> Result<()> {
-        self.global.ctx.row()?;
+        self.global.ctx.row("g_presence")?;
         self.global.ctx.conn.prepare_cached(
             "INSERT INTO g_presence VALUES(?1,?2,?3,?4) ON CONFLICT(side,symbol) DO UPDATE SET declared=MAX(declared,excluded.declared),information=MAX(information,excluded.information)",
         )?.execute(params![self.global.side,symbol,declared,information])?;
@@ -231,7 +196,7 @@ impl GlobalDiscoverySink for GlobalWriter<'_> {
         common_compatible: bool,
     ) -> Result<()> {
         let (language, path) = local_columns(&key);
-        self.global.ctx.row()?;
+        self.global.ctx.row("g_definitions")?;
         self.global.ctx.conn.prepare_cached(
             "INSERT INTO g_definitions VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(side,symbol,local_language,local_path,owner_language,owner_path,syntax_id) DO UPDATE SET common_compatible=MAX(common_compatible,excluded.common_compatible)",
         )?.execute(params![self.global.side,key.0,language,path,document.language,document.path,syntax_id,common_compatible])?;
@@ -295,7 +260,7 @@ impl GlobalWriter<'_> {
         let mut body = Vec::with_capacity(usize::try_from(body_bytes)?);
         serde_json::to_writer(&mut body, &summary)?;
         let body = std::str::from_utf8(&body)?;
-        self.global.ctx.row()?;
+        self.global.ctx.row("g_methods")?;
         self.global
             .ctx
             .conn
@@ -318,7 +283,7 @@ impl GlobalWriter<'_> {
 }
 
 /// Admit a new requested buffer while the old buffer remains live, then move the row.
-fn append_reserved<T>(
+pub(super) fn append_reserved<T>(
     rows: &mut Vec<T>,
     row: T,
     payload: u64,
@@ -327,7 +292,7 @@ fn append_reserved<T>(
     append_reserved_with(rows, payload, retained, || row)
 }
 
-fn append_reserved_with<T>(
+pub(super) fn append_reserved_with<T>(
     rows: &mut Vec<T>,
     payload: u64,
     retained: &mut Reservation,
@@ -344,7 +309,7 @@ fn append_reserved_with<T>(
             .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?;
         retained.grow(sizes::sum(&[payload, bytes])?)?;
         rows.reserve_exact(next - rows.len());
-        retained.release((capacity * std::mem::size_of::<T>()) as u64);
+        retained.release((capacity * std::mem::size_of::<T>()) as u64)?;
     } else {
         retained.grow(payload)?;
     }
@@ -362,6 +327,20 @@ struct DocumentIndex<'g, 'a> {
     endpoints: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
     reference_claims: BTreeMap<String, Vec<(String, semantic::Target)>>,
     call_references: BTreeMap<String, String>,
+    reads: RefCell<ReadCache>,
+}
+
+/// Global declaration and presence rows this document already read. A document's occurrences
+/// and symbol information name the same symbols many times; each is queried once per join.
+struct ReadCache {
+    declarations: BTreeMap<ScopedKey, Vec<(native::DocumentKey, String)>>,
+    presence: BTreeMap<String, (bool, bool)>,
+    retained: Reservation,
+}
+
+/// The owned payload of one declaration row, beyond its tuple slot.
+fn declaration_row_payload(row: &(native::DocumentKey, String)) -> Result<u64> {
+    sizes::sum(&[sizes::document(&row.0)?, row.1.len() as u64])
 }
 
 impl<'g, 'a> DocumentIndex<'g, 'a> {
@@ -380,6 +359,11 @@ impl<'g, 'a> DocumentIndex<'g, 'a> {
             endpoints: BTreeMap::new(),
             reference_claims: BTreeMap::new(),
             call_references: BTreeMap::new(),
+            reads: RefCell::new(ReadCache {
+                declarations: BTreeMap::new(),
+                presence: BTreeMap::new(),
+                retained: global.ctx.live.reserve(0)?,
+            }),
         })
     }
 
@@ -393,45 +377,73 @@ impl<'g, 'a> DocumentIndex<'g, 'a> {
 }
 
 impl GlobalJoinReads for DocumentIndex<'_, '_> {
-    fn declarations_clone_bytes(&self, key: &ScopedKey) -> Result<u64> {
-        self.global.declarations_clone_bytes(key)
-    }
-    fn source_methods_clone_bytes(
+    fn declarations(
         &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<u64> {
-        self.global.source_methods_clone_bytes(document, symbol)
+        key: &ScopedKey,
+        reserve: RowReserve<'_>,
+    ) -> Result<Vec<(native::DocumentKey, String)>> {
+        if let Some(rows) = self.reads.borrow().declarations.get(key) {
+            // The caller's copy is admitted exactly as a fetched result would be.
+            reserve(sizes::sum(&[
+                std::mem::size_of::<Vec<(native::DocumentKey, String)>>() as u64,
+                (rows.len() as u64)
+                    .checked_mul(std::mem::size_of::<(native::DocumentKey, String)>() as u64)
+                    .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+            ])?)?;
+            for row in rows {
+                reserve(declaration_row_payload(row)?)?;
+            }
+            return Ok(rows.clone());
+        }
+        let rows = self.global.declarations(key, reserve)?;
+        let mut reads = self.reads.borrow_mut();
+        let mut bytes = sizes::sum(&[
+            sizes::map_entries::<ScopedKey, Vec<(native::DocumentKey, String)>>(1)?,
+            key.0.len() as u64,
+            key.1.as_ref().map_or(Ok(0), sizes::document)?,
+            (rows.len() as u64)
+                .checked_mul(std::mem::size_of::<(native::DocumentKey, String)>() as u64)
+                .ok_or_else(|| ScipCaptureError::LimitExceeded("unit expansion".into()))?,
+        ])?;
+        for row in &rows {
+            bytes = sizes::sum(&[bytes, declaration_row_payload(row)?])?;
+        }
+        // The cache is optional: without room for it the rows are returned uncached.
+        if reads.retained.grow(bytes).is_ok() {
+            reads.declarations.insert(key.clone(), rows.clone());
+        }
+        Ok(rows)
     }
-    fn target_methods_clone_bytes(
-        &self,
-        document: &native::DocumentKey,
-        symbol: &str,
-    ) -> Result<u64> {
-        self.global.target_methods_clone_bytes(document, symbol)
-    }
-    fn declarations(&self, key: &ScopedKey) -> Result<Vec<(native::DocumentKey, String)>> {
-        self.global.declarations(key)
-    }
-    fn is_declared_symbol(&self, symbol: &str) -> Result<bool> {
-        self.global.is_declared_symbol(symbol)
-    }
-    fn is_information_symbol(&self, symbol: &str) -> Result<bool> {
-        self.global.is_information_symbol(symbol)
+    fn presence(&self, symbol: &str) -> Result<(bool, bool)> {
+        if let Some(found) = self.reads.borrow().presence.get(symbol) {
+            return Ok(*found);
+        }
+        let found = self.global.presence(symbol)?;
+        let mut reads = self.reads.borrow_mut();
+        let bytes = sizes::sum(&[
+            sizes::map_entries::<String, (bool, bool)>(1)?,
+            symbol.len() as u64,
+        ])?;
+        if reads.retained.grow(bytes).is_ok() {
+            reads.presence.insert(symbol.to_owned(), found);
+        }
+        Ok(found)
     }
     fn source_methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>> {
-        self.global.source_methods(document, symbol)
+        self.global.source_methods(document, symbol, reserve)
     }
     fn target_methods(
         &self,
         document: &native::DocumentKey,
         symbol: &str,
+        reserve: RowReserve<'_>,
     ) -> Result<Vec<MethodSummary>> {
-        self.global.target_methods(document, symbol)
+        self.global.target_methods(document, symbol, reserve)
     }
 }
 
@@ -669,7 +681,7 @@ impl DocumentJoinState for DocumentIndex<'_, '_> {
             },
         )?;
         // The returned guard follows moved payload until this settlement item ends.
-        self.retained.transfer_to(&mut moved, bytes);
+        self.retained.transfer_to(&mut moved, bytes)?;
         let result = self
             .reference_claims
             .remove(reference_id)
@@ -678,7 +690,7 @@ impl DocumentJoinState for DocumentIndex<'_, '_> {
             reference_id.len() as u64,
             sizes::map_entries::<String, Vec<(String, semantic::Target)>>(1)?
                 - std::mem::size_of::<Vec<(String, semantic::Target)>>() as u64,
-        ])?);
+        ])?)?;
         Ok((result, moved))
     }
     fn put_call_reference(&mut self, proof_id: &str, reference_id: &str) -> Result<()> {
@@ -686,7 +698,7 @@ impl DocumentJoinState for DocumentIndex<'_, '_> {
             let previous = value.len() as u64;
             self.retained.grow(reference_id.len() as u64)?;
             *value = reference_id.into();
-            self.retained.release(previous);
+            self.retained.release(previous)?;
         } else {
             self.retained.grow(sizes::sum(&[
                 sizes::map_entries::<String, String>(1)?,
@@ -758,7 +770,7 @@ impl JoinSink for DocumentSink {
             let old = sizes::reference(previous)?;
             self.retained.grow(sizes::reference(&row)?)?;
             *previous = row;
-            self.retained.release(old);
+            self.retained.release(old)?;
         } else {
             self.retained.grow(sizes::sum(&[
                 sizes::map_entries::<String, semantic::Reference>(1)?,
@@ -812,7 +824,7 @@ impl JoinSink for DocumentSink {
                     - std::mem::size_of::<semantic::Reference>() as u64;
                 self.retained.grow(payload)?;
                 *destination = row;
-                self.retained.release(previous);
+                self.retained.release(previous)?;
                 Ok(slot)
             }
             None => {
@@ -868,7 +880,7 @@ impl JoinSink for DocumentSink {
                     sizes::call(destination)? - std::mem::size_of::<semantic::CallBinding>() as u64;
                 self.retained.grow(payload)?;
                 *destination = row;
-                self.retained.release(previous);
+                self.retained.release(previous)?;
                 Ok(slot)
             }
             None => {
@@ -966,17 +978,24 @@ pub(super) fn native_document_side<'a>(
     })
 }
 
-pub(super) fn document_side<'a>(
+/// A view of one document of `side` over an already decoded claim set, which captured and
+/// destination views of the same document may share.
+pub(super) fn claims_side<'a>(
     side: &StagedSide<'a>,
     document: native::DocumentKey,
+    claims: Rc<DocumentClaims>,
 ) -> Result<StagedSide<'a>> {
-    let claims = DocumentClaims::load(side, &document)?;
     let mut local = native_document_side(side, document)?;
-    local.local_claims = Some(Rc::new(claims));
+    local.local_claims = Some(claims);
     Ok(local)
 }
 
-fn discover_side<'a>(side: &StagedSide<'a>, encoding: u8) -> Result<CompletedGlobal<'a>> {
+/// Pass 1 (captured) or 3 (eligible destination): the complete global context of one side.
+/// A document without claims contributes nothing, so its native facts are never loaded.
+pub(super) fn discover_side<'a>(
+    side: &StagedSide<'a>,
+    encoding: u8,
+) -> Result<CompletedGlobal<'a>> {
     let global = || -> Result<CompletedGlobal<'a>> {
         Ok(CompletedGlobal {
             ctx: side.ctx,
@@ -995,7 +1014,11 @@ fn discover_side<'a>(side: &StagedSide<'a>, encoding: u8) -> Result<CompletedGlo
             std::mem::size_of::<native::DocumentKey>() as u64,
             sizes::document(&document)?,
         ])?)?;
-        let local_store = document_side(side, document.clone())?;
+        let claims = DocumentClaims::load(side, &document)?;
+        if claims.claims.is_empty() {
+            continue;
+        }
+        let local_store = claims_side(side, document.clone(), Rc::new(claims))?;
         let reads = global()?;
         let mut local = DocumentIndex::new(&reads, &document)?;
         for claim in local_store.claims() {
@@ -1020,10 +1043,9 @@ fn discover_side<'a>(side: &StagedSide<'a>, encoding: u8) -> Result<CompletedGlo
                 continue;
             };
             let mut symbols_operation = local_store.operation()?;
-            local_store.reserve_operation(
-                &mut symbols_operation,
-                local.type_uses_clone_bytes(&document, range.start, range.end)?,
-            )?;
+            local_store.reserve_operation(&mut symbols_operation, || {
+                local.type_uses_clone_bytes(&document, range.start, range.end)
+            })?;
             for symbol in local.type_uses(&document, range.start, range.end)? {
                 let _summary_reservation = side.ctx.live.reserve(sizes::sum(&[
                     sizes::declaration(declaration)?,
@@ -1046,12 +1068,15 @@ fn discover_side<'a>(side: &StagedSide<'a>, encoding: u8) -> Result<CompletedGlo
     Ok(writer.global)
 }
 
-fn join_document(
+/// One document's Common join against a completed global context. The returned guard holds
+/// the facts' charge until the caller drops them.
+pub(super) fn join_document(
     store: &StagedSide<'_>,
     global: &CompletedGlobal<'_>,
     encoding: u8,
 ) -> Result<(JoinedFacts, Reservation)> {
-    let mut index = DocumentIndex::new(global, store.document.as_ref().expect("document view"))?;
+    let document = store.document.as_ref().context("document view required")?;
+    let mut index = DocumentIndex::new(global, document)?;
     for claim in store.claims() {
         let claim = claim?;
         let mut operation = store.operation()?;
@@ -1072,7 +1097,7 @@ fn join_document(
     let mut role_sites = None;
     for ordinal in 0..index.occurrence_count() {
         let mut operation = store.operation()?;
-        store.reserve_operation(&mut operation, index.occurrence_clone_bytes(ordinal)?)?;
+        store.reserve_operation(&mut operation, || index.occurrence_clone_bytes(ordinal))?;
         let row = index.occurrence(ordinal)?;
         join_occurrence(
             encoding,
@@ -1087,54 +1112,6 @@ fn join_document(
     settle_join_references(store, &mut index, &mut sink)?;
     emit_type_relationships(store, &index, &mut sink)?;
     Ok(sink.into_facts())
-}
-
-fn flush_document(facts: JoinedFacts, sink: &mut StagedFactSink<'_>) -> Result<()> {
-    for row in facts.symbols {
-        sink.symbol(row)?;
-    }
-    for row in facts.declaration_bindings {
-        sink.declaration_binding(row)?;
-    }
-    for (proof, row) in facts.reference_claims {
-        sink.reference_claim(&proof, row)?;
-    }
-    for row in facts.references {
-        sink.put_reference(None, row)?;
-    }
-    for row in facts.call_bindings {
-        sink.put_call_binding(None, row)?;
-    }
-    for row in facts.type_relationships {
-        sink.type_relationship(row)?;
-    }
-    for (document, codes) in facts.diagnostics {
-        for code in codes {
-            sink.diagnostic(&document, &code)?;
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn join_side(
-    side: &StagedSide<'_>,
-    encoding: u8,
-    sink: &mut StagedFactSink<'_>,
-) -> Result<()> {
-    let global = discover_side(side, encoding)?;
-    for document in side.documents() {
-        let store = document_side(side, document?)?;
-        let (facts, _facts_reservation) = join_document(&store, &global, encoding)?;
-        #[cfg(feature = "test-support")]
-        crate::semantic_batch::testing::run_document_common_observer(
-            side.side,
-            store.document.as_ref().expect("document view"),
-            &facts,
-            side.ctx.conn,
-        );
-        flush_document(facts, sink)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1187,7 +1164,7 @@ mod reservation_tests {
     }
 
     #[test]
-    fn sql_declaration_metadata_uses_utf8_bytes_and_exact_result_capacity() {
+    fn sql_declarations_are_one_charged_pass_admitting_each_row_before_it_is_built() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE g_definitions(side, symbol, local_language, local_path, owner_language, owner_path, syntax_id, common_compatible);").unwrap();
         for (path, id) in [("é.java", "id-é"), ("β.java", "id-β")] {
@@ -1200,43 +1177,56 @@ mod reservation_tests {
         let ctx = row_context(&conn, BatchLimits::PRODUCTION);
         let global = local_global(&ctx);
         let key = ("pkg Té#".into(), None);
-        let expected = std::mem::size_of::<Vec<(native::DocumentKey, String)>>() as u64
-            + 2 * std::mem::size_of::<(native::DocumentKey, String)>() as u64
-            + [("é.java", "id-é"), ("β.java", "id-β")]
-                .iter()
-                .map(|(path, id)| ("source".len() + "java".len() + path.len() + id.len()) as u64)
-                .sum::<u64>();
-        assert_eq!(global.declarations_clone_bytes(&key).unwrap(), expected);
-        let blocker = ctx
-            .live
-            .reserve(ctx.limits.unit_expansion_bytes - expected + 1)
+        let row =
+            |path: &str, id: &str| ("source".len() + "java".len() + path.len() + id.len()) as u64;
+        let expected = vec![
+            std::mem::size_of::<Vec<(native::DocumentKey, String)>>() as u64,
+            4 * std::mem::size_of::<(native::DocumentKey, String)>() as u64,
+            row("é.java", "id-é"),
+            row("β.java", "id-β"),
+        ];
+        let mut admitted = Vec::new();
+        let before = ctx.budget.borrow().used();
+        let rows = global
+            .declarations(&key, &mut |bytes| {
+                admitted.push(bytes);
+                Ok(())
+            })
             .unwrap();
-        let mut operation = ctx.live.reserve(0).unwrap();
-        let error = (|| -> Result<Vec<(native::DocumentKey, String)>> {
-            operation.grow(global.declarations_clone_bytes(&key)?)?;
-            global.declarations(&key)
-        })()
-        .unwrap_err();
-        assert!(
-            matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name=="unit expansion")
+        assert_eq!(
+            admitted, expected,
+            "UTF-8 byte lengths, admitted in row order"
         );
-        drop(blocker);
-        operation.grow(expected).unwrap();
-        let rows = global.declarations(&key).unwrap();
-        assert_eq!(rows.capacity(), 2);
+        assert_eq!(
+            ctx.budget.borrow().used() - before,
+            3,
+            "one query plus one per row"
+        );
         assert_eq!(
             rows.iter()
                 .map(|(doc, id)| (doc.path.as_str(), id.as_str()))
                 .collect::<Vec<_>>(),
             [("é.java", "id-é"), ("β.java", "id-β")]
         );
-        drop(rows);
-        drop(operation);
-        drop(ctx.live.reserve(ctx.limits.unit_expansion_bytes).unwrap());
+        // A denial at the second row's admission builds nothing further.
+        let mut calls = 0;
+        let error = global
+            .declarations(&key, &mut |_| {
+                calls += 1;
+                if calls == 4 {
+                    Err(ScipCaptureError::LimitExceeded("unit expansion".into()).into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name=="unit expansion")
+        );
     }
 
     #[test]
-    fn sql_methods_exact_capacity_and_scratch_denial_precedes_decode() {
+    fn sql_methods_are_one_charged_pass_and_scratch_denial_precedes_decode() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE g_methods(side,ord,symbol,local_language,local_path,owner_language,owner_path,body,body_bytes,decoded_bytes);").unwrap();
         let first = method_fixture();
@@ -1258,52 +1248,41 @@ mod reservation_tests {
         let ctx = row_context(&conn, BatchLimits::PRODUCTION);
         let global = local_global(&ctx);
         let document = first.method.document.clone();
-        let bytes = global
-            .target_methods_clone_bytes(&document, "pkg Té#")
-            .unwrap();
-        assert_eq!(
-            bytes,
-            std::mem::size_of::<Vec<MethodSummary>>() as u64
-                + sizes::decoded_method(&first).unwrap()
-                + sizes::decoded_method(&second).unwrap()
-        );
-        assert_eq!(
-            global
-                .source_methods_clone_bytes(&document, "pkg Té#")
-                .unwrap(),
-            bytes
-        );
-        let operation = ctx.live.reserve(bytes).unwrap();
-        let rows = global.target_methods(&document, "pkg Té#").unwrap();
-        assert_eq!(rows.capacity(), 2);
-        assert_eq!(rows[0].method, first.method);
-        assert_eq!(rows[1].method, second.method);
-        assert!(rows.iter().all(|row| row.target_owner_matches));
-        let probe = ctx
-            .live
-            .reserve(ctx.limits.unit_expansion_bytes - bytes)
-            .unwrap();
-        assert!(ctx.live.reserve(1).is_err());
-        drop(probe);
-        drop(rows);
-        drop(operation);
+        let root = std::mem::size_of::<MethodSummary>() as u64;
+        let expected = vec![
+            std::mem::size_of::<Vec<MethodSummary>>() as u64,
+            4 * root,
+            sizes::decoded_method(&first).unwrap() - root,
+            sizes::decoded_method(&second).unwrap() - root,
+        ];
+        for target in [true, false] {
+            let mut admitted = Vec::new();
+            let before = ctx.budget.borrow().used();
+            let rows = global
+                .methods(&document, "pkg Té#", target, &mut |bytes| {
+                    admitted.push(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(admitted, expected);
+            assert_eq!(ctx.budget.borrow().used() - before, 3);
+            assert_eq!(rows[0].method, first.method);
+            assert_eq!(rows[1].method, second.method);
+            assert!(rows.iter().all(|row| row.target_owner_matches));
+        }
         conn.execute("DELETE FROM g_methods", []).unwrap();
         conn.execute(
             "INSERT INTO g_methods VALUES(0,0,'pkg Té#','','','java','é.java','{',1,?1)",
             [sizes::decoded_method(&first).unwrap() as i64],
         )
         .unwrap();
-        let bytes = global
-            .target_methods_clone_bytes(&document, "pkg Té#")
-            .unwrap();
-        let operation = ctx.live.reserve(bytes).unwrap();
         let scratch = 1 + 8;
         let blocker = ctx
             .live
-            .reserve(ctx.limits.unit_expansion_bytes - bytes - scratch + 1)
+            .reserve(ctx.limits.unit_expansion_bytes - scratch + 1)
             .unwrap();
         let error = global
-            .target_methods(&document, "pkg Té#")
+            .target_methods(&document, "pkg Té#", &mut |_| Ok(()))
             .err()
             .expect("scratch denial");
         assert!(
@@ -1311,17 +1290,10 @@ mod reservation_tests {
         );
         drop(blocker);
         let error = global
-            .target_methods(&document, "pkg Té#")
+            .target_methods(&document, "pkg Té#", &mut |_| Ok(()))
             .err()
             .expect("corrupt body");
         assert!(error.downcast_ref::<serde_json::Error>().is_some());
-        let probe = ctx
-            .live
-            .reserve(ctx.limits.unit_expansion_bytes - bytes)
-            .unwrap();
-        assert!(ctx.live.reserve(1).is_err());
-        drop(probe);
-        drop(operation);
         drop(ctx.live.reserve(ctx.limits.unit_expansion_bytes).unwrap());
     }
 
@@ -1607,6 +1579,8 @@ mod reservation_tests {
             counters: RefCell::new(BatchCounters::default()),
             cache: RefCell::new(DocCache::default()),
             rows: Cell::new(0),
+            ledger: RefCell::new(BTreeMap::new()),
+            passes: RefCell::new(Vec::new()),
             stage_base: stage_bytes(conn).unwrap(),
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1614,87 +1588,61 @@ mod reservation_tests {
     }
 
     #[test]
-    fn bulk_row_admission_denies_before_sql_and_counts_duplicate_attempts() {
+    fn row_attempts_are_filed_by_owner_and_never_refunded() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE input(id INTEGER PRIMARY KEY); INSERT INTO input VALUES(1),(2),(3); CREATE TABLE output(id INTEGER PRIMARY KEY);").unwrap();
+        conn.execute_batch("CREATE TABLE output(id INTEGER PRIMARY KEY);")
+            .unwrap();
         let mut limits = BatchLimits::PRODUCTION;
-        limits.staged_rows = 2;
-        let ctx = row_context(&conn, limits.clone());
-        let error = ctx
-            .insert_select(
-                "SELECT COUNT(*) FROM input",
-                "INSERT INTO output SELECT * FROM input",
-            )
-            .unwrap_err();
-        assert!(
-            matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name=="staged rows")
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM output", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        limits.staged_rows = 5;
+        limits.staged_rows = 3;
         let ctx = row_context(&conn, limits);
-        ctx.insert_select(
-            "SELECT COUNT(*) FROM input",
-            "INSERT INTO output SELECT * FROM input",
-        )
-        .unwrap();
         for _ in 0..2 {
-            ctx.row().unwrap();
+            ctx.row("output").unwrap();
             conn.execute("INSERT OR IGNORE INTO output VALUES(1)", [])
                 .unwrap();
         }
-        assert_eq!(ctx.rows.get(), 5);
-        assert!(ctx.row().is_err());
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM output", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            3
+        ctx.row("other").unwrap();
+        let error = ctx.row("output").unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name=="staged rows")
         );
         conn.execute("DELETE FROM output WHERE id=1", []).unwrap();
         assert_eq!(
             ctx.rows.get(),
-            6,
-            "failed and deleted attempts are not refunded"
+            4,
+            "ignored, failed and deleted attempts are not refunded"
+        );
+        assert_eq!(
+            *ctx.ledger.borrow(),
+            BTreeMap::from([("other", 1), ("output", 3)]),
+            "every attempt has exactly one owner"
         );
     }
 
     #[test]
-    fn bulk_crossing_checks_physical_growth_after_sql_and_seed_is_native_only() {
+    fn crossing_checks_physical_growth_and_seed_is_native_only() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE input(body TEXT); INSERT INTO input VALUES(zeroblob(4000)),(zeroblob(4000)),(zeroblob(4000)); CREATE TABLE output(body TEXT); CREATE TABLE nat_docs(id); CREATE TABLE nat_declarations(id); INSERT INTO nat_docs VALUES(1); INSERT INTO nat_declarations VALUES(1),(2); CREATE TABLE claims(id); INSERT INTO claims VALUES(1),(2);").unwrap();
+        conn.execute_batch("CREATE TABLE output(body TEXT); CREATE TABLE nat_docs(id); CREATE TABLE nat_declarations(id); INSERT INTO nat_docs VALUES(1); INSERT INTO nat_declarations VALUES(1),(2); CREATE TABLE claims(id); INSERT INTO claims VALUES(1),(2);").unwrap();
         assert_eq!(retained_rows(&conn).unwrap(), 3);
         let mut limits = BatchLimits::PRODUCTION;
         limits.output_bytes = 0;
         let ctx = row_context(&conn, limits);
-        ctx.reserve_rows(OUTPUT_CHECK_ROWS - 1).unwrap();
-        let error = ctx
-            .insert_select(
-                "SELECT COUNT(*) FROM input",
-                "INSERT INTO output SELECT * FROM input",
-            )
-            .unwrap_err();
+        ctx.reserve_rows("seed", OUTPUT_CHECK_ROWS - 1).unwrap();
+        conn.execute("INSERT INTO output VALUES(zeroblob(8000))", [])
+            .unwrap();
+        let error = ctx.row("output").unwrap_err();
         assert!(
             matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name=="output bytes")
         );
-        assert_eq!(ctx.rows.get(), OUTPUT_CHECK_ROWS + 2);
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM output", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            3,
-            "growth check runs after bulk materialization"
-        );
+        assert_eq!(ctx.rows.get(), OUTPUT_CHECK_ROWS);
         let mut limits = BatchLimits::PRODUCTION;
         limits.staged_rows = 2;
         let ctx = row_context(&conn, limits);
-        assert!(ctx.reserve_rows(retained_rows(&conn).unwrap()).is_err());
+        assert!(
+            ctx.reserve_rows("seed", retained_rows(&conn).unwrap())
+                .is_err()
+        );
         ctx.rows.set(u64::MAX);
-        assert!(ctx.reserve_rows(1).is_err());
+        assert!(ctx.reserve_rows("seed", 1).is_err());
         assert_eq!(ctx.rows.get(), u64::MAX);
     }
 
@@ -1705,7 +1653,7 @@ mod reservation_tests {
         let mut operation = denied.reserve(0).unwrap();
         let mut spans = BTreeSet::new();
         let error = super::super::super::reserve_role_span(&mut spans, (1, 2), &mut |bytes| {
-            operation.grow(bytes)
+            operation.grow(bytes()?)
         })
         .unwrap_err();
         assert!(
@@ -1718,7 +1666,7 @@ mod reservation_tests {
         let budget = LiveBudget::new(bytes);
         let mut operation = budget.reserve(0).unwrap();
         super::super::super::reserve_role_span(&mut spans, (1, 2), &mut |bytes| {
-            operation.grow(bytes)
+            operation.grow(bytes()?)
         })
         .unwrap();
         super::super::super::reserve_role_span(&mut spans, (1, 2), &mut |_| {
@@ -1740,7 +1688,7 @@ mod reservation_tests {
         let budget = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
         let mut operation = budget.reserve(0).unwrap();
         let sites = super::super::super::source_role_sites_reserved("java", source, &mut |bytes| {
-            operation.grow(bytes)
+            operation.grow(bytes()?)
         })
         .unwrap();
         let expected = super::super::super::source_role_sites("java", source).unwrap();
@@ -1767,7 +1715,7 @@ mod reservation_tests {
         let error = (|| -> Result<RoleSites> {
             let mut operation = denied.reserve(0)?;
             super::super::super::source_role_sites_reserved("java", source, &mut |bytes| {
-                operation.grow(bytes)
+                operation.grow(bytes()?)
             })
         })()
         .err()
@@ -1776,6 +1724,55 @@ mod reservation_tests {
             matches!(error.downcast_ref::<ScipCaptureError>(),Some(ScipCaptureError::LimitExceeded(name)) if name=="unit expansion")
         );
         drop(denied.reserve(limit).unwrap());
+    }
+
+    #[test]
+    fn document_read_cache_degrades_to_queries_when_the_live_budget_is_full() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE g_definitions(side, symbol, local_language, local_path, owner_language, owner_path, syntax_id, common_compatible); INSERT INTO g_definitions VALUES(0,'pkg A#','','','java','A.java','id',1);").unwrap();
+        let ctx = row_context(&conn, BatchLimits::PRODUCTION);
+        let global = local_global(&ctx);
+        let document = native::DocumentKey {
+            source_set_id: "source".into(),
+            language: "java".into(),
+            path: "A.java".into(),
+        };
+        let index = DocumentIndex::new(&global, &document).unwrap();
+        let key = ("pkg A#".to_owned(), None);
+        let used = |ctx: &JoinCtx<'_>| ctx.budget.borrow().used();
+        let full = ctx
+            .live
+            .reserve(ctx.limits.unit_expansion_bytes - ctx.live.high_water());
+        let full = full.unwrap();
+        for _ in 0..2 {
+            let before = used(&ctx);
+            let rows = index.declarations(&key, &mut |_| Ok(())).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(used(&ctx) - before, 2, "uncached: every call queries");
+        }
+        drop(full);
+        index.declarations(&key, &mut |_| Ok(())).unwrap();
+        let before = used(&ctx);
+        index.declarations(&key, &mut |_| Ok(())).unwrap();
+        assert_eq!(used(&ctx), before, "cached once the budget has room");
+    }
+
+    #[test]
+    fn claim_whose_source_is_not_a_captured_document_is_detected() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sources(ord INTEGER PRIMARY KEY, language TEXT, path TEXT);
+             CREATE TABLE claims(claim_id INTEGER PRIMARY KEY, source_ord INTEGER);
+             CREATE TABLE nat_docs(rev INTEGER, ord INTEGER, language TEXT, path TEXT);
+             INSERT INTO sources VALUES(0,'java','A.java'),(1,'java','B.java');
+             INSERT INTO claims VALUES(0,0);
+             INSERT INTO nat_docs VALUES(0,0,'java','A.java'),(1,0,'java','B.java');",
+        )
+        .unwrap();
+        // A source without claims, and a revision-1 document, never satisfy the guard.
+        assert!(!exists(&conn, UNLISTED_CLAIM_DOCUMENT_SQL, &[]).unwrap());
+        conn.execute("INSERT INTO claims VALUES(1,1)", []).unwrap();
+        assert!(exists(&conn, UNLISTED_CLAIM_DOCUMENT_SQL, &[]).unwrap());
     }
 
     #[test]
@@ -1807,6 +1804,8 @@ mod reservation_tests {
             counters: RefCell::new(BatchCounters::default()),
             cache: RefCell::new(DocCache::default()),
             rows: Cell::new(0),
+            ledger: RefCell::new(BTreeMap::new()),
+            passes: RefCell::new(Vec::new()),
             stage_base: 0,
             mutations: DestinationMutations::default(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
