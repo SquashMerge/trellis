@@ -334,17 +334,17 @@ fn package_targets(
     };
     let exists = |path: &str| documents.contains(path);
     let at = |relative: &str| join(dir, relative);
+    // One entry per Cargo target, never deduplicated: two targets on one crate root (Cargo
+    // accepts two `[[bin]]` with the same `path`) must stay two, so `finish` sees the root
+    // shared. An inferred target is skipped where an explicit one claims its name or path.
     let mut targets = Vec::new();
     let mut push = |kind: &str, root: String| {
-        let target = CargoTarget {
+        targets.push(CargoTarget {
             kind: kind.to_owned(),
             root,
             package: name.to_owned(),
             version: version.clone(),
-        };
-        if !targets.contains(&target) {
-            targets.push(target);
-        }
+        });
     };
     // Library: `[lib]` with its path, else `src/lib.rs` unless `autolib = false`.
     let autolib = bool_field(package, "autolib").ok()?.unwrap_or(true);
@@ -806,6 +806,22 @@ mod tests {
         let manifest = format!("{PACKAGE}[[bin]]\nname = \"x\"\npath = \"src/lib.rs\"\n");
         let shared = targets(&[("Cargo.toml", &manifest)], &[("src/lib.rs", "")]);
         assert_eq!(of(&shared, "src/lib.rs"), None);
+        // So are two targets of one kind: two `[[bin]]` on src/main.rs, and their modules.
+        let manifest = format!(
+            "{PACKAGE}[[bin]]\nname = \"a\"\npath = \"src/main.rs\"\n\
+             [[bin]]\nname = \"b\"\npath = \"src/main.rs\"\n"
+        );
+        let shared = targets(
+            &[("Cargo.toml", &manifest)],
+            &[
+                ("src/main.rs", "mod cli;"),
+                ("src/cli.rs", ""),
+                ("src/lib.rs", ""),
+            ],
+        );
+        assert_eq!(of(&shared, "src/main.rs"), None);
+        assert_eq!(of(&shared, "src/cli.rs"), None);
+        assert_eq!(of(&shared, "src/lib.rs"), owned("lib", "src/lib.rs"));
         // Edition 2015 (the default) turns discovery off beside explicit targets, unless asked.
         let manifest = "[package]\nname = \"old\"\n[[test]]\nname = \"a\"\n";
         let old = targets(
