@@ -193,8 +193,10 @@ fn stage_bytes(conn: &Connection) -> Result<u64> {
 type GroupKey = (u8, i64);
 
 /// Document groups: one active, the rest in an LRU bounded by `document_cache_bytes`. The
-/// LRU bound is on estimated bytes (`DocGroup::bytes`), not measured heap size. A group evicted
-/// while a caller still holds it stays pinned until the caller drops it.
+/// LRU bound is on the live reservations its groups keep (`DocGroup::bytes`), so the cache
+/// never holds more of the unit-expansion budget than its own bound, however many documents
+/// pass through it. A group evicted while a caller still holds it stays pinned until the
+/// caller drops it.
 #[derive(Default)]
 struct DocCache {
     budget: u64,
@@ -259,6 +261,8 @@ struct DocGroup {
     reference_ids: BTreeMap<String, Vec<usize>>,
     candidates: BTreeMap<(usize, usize, semantic::JoinKind), BTreeSet<String>>,
     support: BTreeMap<semantic::JoinKind, native::MeasurementSupport>,
+    /// The live reservation the group holds, which is what keeping it cached costs: the
+    /// document cache's budget bounds the sum of its cached groups' live charges.
     bytes: u64,
     _native_reservation: Reservation,
 }
@@ -313,11 +317,8 @@ impl DocGroup {
         for (index, r) in references.iter().enumerate() {
             reference_ids.entry(r.id.clone()).or_default().push(index);
         }
-        let bytes = text.len() as u64
-            + 512 * declarations.len() as u64
-            + 256 * (calls.len() + references.len()) as u64
-            + 128 * candidates.len() as u64
-            + 1024;
+        // A cached group keeps its whole live reservation, so the cache counts exactly that.
+        let bytes = native_reservation.bytes();
         Ok(Self {
             document,
             text,

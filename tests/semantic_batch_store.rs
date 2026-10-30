@@ -1529,6 +1529,76 @@ fn batch_memory_high_water_is_one_unit_not_the_corpus() {
     );
 }
 
+/// The unit-expansion budget bounds one document's working set plus the document cache, not
+/// the batch: documents that each fit join even when their charges sum past the budget, while
+/// one document that does not fit is still denied, typed.
+#[test]
+fn documents_that_each_fit_join_although_their_sum_exceeds_the_budget() {
+    const DOCUMENTS: usize = 24;
+    let source = calls_source(48, "\n");
+    let path = |n: usize| format!("src/D{n:02}.js");
+    let world = world(|root| {
+        for n in 0..DOCUMENTS {
+            write_files(root, &[(path(n).as_str(), source.as_str())]);
+        }
+    });
+    let docs = |count: usize| {
+        (0..count)
+            .map(|n| {
+                let mut doc = DocSpec::new(&path(n));
+                for (line, column) in positions(&source, "f()") {
+                    doc = doc.occurrence(
+                        &[line, column, column + 1],
+                        &[line, column, column + 3],
+                        "external pkg f.",
+                        0,
+                    );
+                }
+                doc
+            })
+            .collect::<Vec<_>>()
+    };
+    let run = |count: usize, limits: &BatchLimits| {
+        let descriptor = one_artifact_per_language(&world, vec![("javascript", docs(count))]);
+        world
+            .join_with(&descriptor, limits, DestinationMutations::default())
+            .map(|(mut admitted, _, counters)| {
+                (
+                    testing::staged_publication(&mut admitted).unwrap(),
+                    counters,
+                )
+            })
+    };
+    let (_, one) = run(1, &BatchLimits::PRODUCTION).unwrap();
+    let peak = one.join_reservation_high_water_bytes;
+    assert!(peak > 0);
+    let (unbounded, many) = run(DOCUMENTS, &BatchLimits::PRODUCTION).unwrap();
+    assert_eq!(unbounded.call_bindings.len(), 48 * DOCUMENTS);
+    let mut limits = BatchLimits::PRODUCTION;
+    limits.unit_expansion_bytes = 3 * peak;
+    limits.document_cache_bytes = peak;
+    // Under the production cache bound the cache alone kept more live charge than the bounded
+    // budget allows: the bounded run fits only because its cache is held to its own bound.
+    assert!(
+        many.document_cache_high_water_bytes > limits.unit_expansion_bytes,
+        "fixture too small: {} vs {}",
+        many.document_cache_high_water_bytes,
+        limits.unit_expansion_bytes
+    );
+    let (bounded, counters) = run(DOCUMENTS, &limits).unwrap();
+    assert_same_publication(&bounded, &unbounded, "bounded budget");
+    assert!(counters.join_reservation_high_water_bytes <= limits.unit_expansion_bytes);
+    assert!(counters.document_cache_high_water_bytes <= limits.document_cache_bytes);
+    // One document larger than the whole budget is still refused, typed.
+    let mut tight = BatchLimits::PRODUCTION;
+    tight.unit_expansion_bytes = peak / 2;
+    let error = run(1, &tight)
+        .err()
+        .expect("an oversized document is denied");
+    assert!(matches!(error.downcast_ref::<ScipCaptureError>(),
+        Some(ScipCaptureError::LimitExceeded(name)) if name == "unit expansion"));
+}
+
 fn split_definitions(world: &World, swap: bool) -> (PathBuf, String) {
     let (a, b) = definitions_docs();
     let mut fixture = world.fixture();
