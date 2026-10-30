@@ -358,11 +358,16 @@ fn at<'n, T>(
 }
 
 impl NativeIndex {
-    /// An upper bound of the bytes `new` allocates for `native`, admitted before building: the
-    /// map's entries (at least one full B-tree leaf, else twice the entries for node slack) with
-    /// each key's strings, one list slot per declaration and reference and two per call, and
-    /// one end per capability gap; the lists are pushed or collected, so each may hold up to
-    /// twice its length.
+    /// An upper bound of the bytes `new` allocates for `native`, with every family's gap ends
+    /// that its rows may add later; admitted to the live budget before the build. Saturates,
+    /// so an overflowing bound is refused by the budget.
+    ///
+    /// - The map: a non-root B-tree node holds at least 5 entries, so `d` documents need at
+    ///   most `2 * (d / 5 + 1)` nodes, each at most an internal node (header, 11 keys and
+    ///   values, 12 edges); plus each key's cloned strings.
+    /// - The lists are pushed (gap ends collected), so each non-empty list holds at most
+    ///   `max(2 * len, 4)` slots: twice the entries plus four slots for each of a document's
+    ///   five lists (gap ends: for each family).
     pub(crate) fn bytes(native: &native::Artifact) -> u64 {
         let mut documents = BTreeSet::new();
         let strings = native
@@ -374,20 +379,36 @@ impl NativeIndex {
             .chain(native.calls.iter().map(|c| &c.document))
             .chain(native.references.iter().map(|r| &r.document))
             .filter(|document| documents.insert(*document))
-            .map(|key| key.source_set_id.len() + key.language.len() + key.path.len())
-            .sum::<usize>();
-        let entries = (2 * documents.len()).max(11)
-            * (size_of::<native::DocumentKey>() + size_of::<DocumentIndex>());
-        let gaps = native
+            .map(|key| (key.source_set_id.len() + key.language.len() + key.path.len()) as u64)
+            .fold(0u64, u64::saturating_add);
+        let word = size_of::<usize>() as u64;
+        let node = (2 * word
+            + 11 * (size_of::<native::DocumentKey>() + size_of::<DocumentIndex>()) as u64)
+            .next_multiple_of(word)
+            + 12 * word;
+        let documents = documents.len() as u64;
+        let map = (2 * (documents / 5 + 1)).saturating_mul(node);
+        let entries = (native.declarations.len() as u64)
+            .saturating_add((native.calls.len() as u64).saturating_mul(2))
+            .saturating_add(native.references.len() as u64);
+        let lists = entries
+            .saturating_mul(2)
+            .saturating_add(documents.saturating_mul(5 * 4))
+            .saturating_mul(size_of::<Ranged>() as u64);
+        let (gaps, families) = native
             .capability_reports
             .iter()
             .flat_map(|report| &report.families)
-            .map(|family| family.gaps.len())
-            .sum::<usize>();
-        let lists = size_of::<Ranged>()
-            * (native.declarations.len() + 2 * native.calls.len() + native.references.len())
-            + size_of::<usize>() * gaps;
-        (entries + strings + 2 * lists) as u64
+            .fold((0u64, 0u64), |(gaps, families), family| {
+                (gaps.saturating_add(family.gaps.len() as u64), families + 1)
+            });
+        let ends = gaps
+            .saturating_mul(2)
+            .saturating_add(families.saturating_mul(4))
+            .saturating_mul(word);
+        [map, strings, lists, ends]
+            .into_iter()
+            .fold(0, u64::saturating_add)
     }
 
     /// Indexes every document of `native` in one pass over its facts.
@@ -499,7 +520,9 @@ impl DocumentIndex {
 
     /// The capability support of an anchor kind's family in this document, validated on first
     /// use: its report and family exist, an unavailable family measured nothing, and every gap
-    /// is a valid span with a diagnostic and contains no measured range.
+    /// is a valid span with a diagnostic and contains no measured range. The result is kept by
+    /// family only: callers pass the artifact's own revision (`validate_join` has checked the
+    /// anchor's) and the document's one source.
     fn support<'n>(
         &self,
         native: &'n native::Artifact,
@@ -2623,7 +2646,8 @@ impl<'h> EmissionValidator<'h> {
 /// One document's measured facts, as the row-local validators read them.
 pub(crate) struct DocumentFacts<'a> {
     pub native: &'a native::Artifact,
-    /// `NativeIndex::new(native)`, built once for the document and shared by its rows.
+    /// `NativeIndex::new(native)` of this very `native` (it holds positions into it), built
+    /// once for the document and shared by its rows.
     pub index: &'a NativeIndex,
     pub sources: &'a dyn Fn(&native::DocumentKey) -> Option<&'a [u8]>,
     pub declaration: &'a dyn Fn(&str) -> Option<&'a native::Declaration>,
@@ -2969,7 +2993,54 @@ mod native_index_tests {
                 .unwrap();
             }
         }
-        let captured = captured(&native);
+        let rows: Vec<_> = native
+            .references
+            .iter()
+            .map(|r| row(r, ReferenceSite::Use, Role::Call))
+            .collect();
+        for row in &rows {
+            let exact = join(
+                &native,
+                JoinKind::Reference,
+                row.range.clone(),
+                vec![row.id.clone()],
+                None,
+            );
+            validate_join(&exact, JoinKind::Reference, &native, &index, &sources, None).unwrap();
+        }
+        check_references(&native, &index, &source, &rows).unwrap();
+        VALIDATION_WORK.with(|work| work.get())
+    }
+
+    /// A reference row of the measured reference `r`.
+    fn row(r: &native::Reference, site: ReferenceSite, role: Role) -> Reference {
+        Reference {
+            id: r.id.clone(),
+            owner_syntax_id: r.owner_syntax_id.clone(),
+            ordinal: r.ordinal,
+            document: r.document.clone(),
+            revision_id: r.revision_id.clone(),
+            range: r.range.clone(),
+            spelling: r.spelling.clone(),
+            lookup_key: r.lookup_key.clone(),
+            site,
+            roles: vec![role],
+            resolution: Resolution::Unresolved,
+            declared_target: None,
+            candidates: vec![],
+            provenance_id: "proof".into(),
+        }
+    }
+
+    /// Validates reference rows of `native`'s one document with the row-local validator.
+    fn check_references(
+        native: &native::Artifact,
+        index: &NativeIndex,
+        source: &[u8],
+        rows: &[Reference],
+    ) -> std::result::Result<(), String> {
+        let sources = |key: &native::DocumentKey| (*key == document()).then_some(source);
+        let captured = captured(native);
         let declaration = |id: &str| native.declarations.iter().find(|d| d.syntax_id == id);
         let ids: BTreeMap<_, _> = native
             .references
@@ -2979,8 +3050,8 @@ mod native_index_tests {
         let reference = |id: &str| ids.get(id).copied();
         let known = |_: &str, _: &native::DocumentKey| Ok(false);
         let env = RowEnv {
-            native: &native,
-            index: &index,
+            native,
+            index,
             captured: &captured,
             revision: &native.revision,
             sources: &sources,
@@ -3000,39 +3071,114 @@ mod native_index_tests {
             freshness: Freshness::Fresh,
             derived_from: None,
         };
-        let rows: Vec<_> = native
-            .references
-            .iter()
-            .map(|r| Reference {
-                id: r.id.clone(),
-                owner_syntax_id: r.owner_syntax_id.clone(),
-                ordinal: r.ordinal,
-                document: r.document.clone(),
-                revision_id: r.revision_id.clone(),
-                range: r.range.clone(),
-                spelling: r.spelling.clone(),
-                lookup_key: r.lookup_key.clone(),
-                site: ReferenceSite::Use,
-                roles: vec![Role::Call],
-                resolution: Resolution::Unresolved,
-                declared_target: None,
-                candidates: vec![],
-                provenance_id: "proof".into(),
-            })
-            .collect();
         let mut seen = BTreeSet::new();
-        for row in &rows {
-            let exact = join(
-                &native,
-                JoinKind::Reference,
-                row.range.clone(),
-                vec![row.id.clone()],
-                None,
-            );
-            validate_join(&exact, JoinKind::Reference, &native, &index, &sources, None).unwrap();
-            validate_reference_row(row, &proof, &env, &mut seen).unwrap();
+        for row in rows {
+            validate_reference_row(row, &proof, &env, &mut seen).map_err(|e| format!("{e:#}"))?;
         }
-        VALIDATION_WORK.with(|work| work.get())
+        Ok(())
+    }
+
+    #[test]
+    fn call_roles_find_calls_with_and_without_a_callee_range() {
+        let (mut native, source) = artifact(4);
+        let check = |native: &native::Artifact| {
+            let rows = [row(&native.references[2], ReferenceSite::Use, Role::Call)];
+            check_references(native, &NativeIndex::new(native), &source, &rows)
+        };
+        check(&native).unwrap();
+        // A call without a callee range is found by its spelling.
+        native.calls[2].callee_range = None;
+        check(&native).unwrap();
+        for (spelling, owner) in [("g", 0), ("f", 1)] {
+            let mut other = native.clone();
+            other.calls[2].spelling = Some(spelling.into());
+            other.calls[2].owner_syntax_id = format!("sid:v1:{}", hex(owner));
+            assert_eq!(
+                check(&other).unwrap_err(),
+                "call role without measured invocation"
+            );
+        }
+        // A callee range elsewhere measures no call of this reference.
+        native.calls[2].callee_range = Some(range(line(2) + 1, line(2) + 2));
+        assert_eq!(
+            check(&native).unwrap_err(),
+            "call role without measured invocation"
+        );
+    }
+
+    #[test]
+    fn declaration_sites_find_the_declaration_named_at_their_range() {
+        let (mut native, source) = artifact(2);
+        let name = native::Reference {
+            id: format!("occ:v2:{}", hex(99)),
+            range: range(3, 7),
+            spelling: "main".into(),
+            lookup_key: "main".into(),
+            ..native.references[0].clone()
+        };
+        native.references.push(name.clone());
+        let rows = [row(&name, ReferenceSite::Declaration, Role::Definition)];
+        check_references(&native, &NativeIndex::new(&native), &source, &rows).unwrap();
+        native.declarations[0].name_range = Some(range(3, 6));
+        native.declarations[0].name = Some("mai".into());
+        assert_eq!(
+            check_references(&native, &NativeIndex::new(&native), &source, &rows).unwrap_err(),
+            "declaration reference site not measured"
+        );
+    }
+
+    /// `bytes` bounds the build's peak plus every family's gap ends.
+    fn assert_bounded(native: &native::Artifact) {
+        let (index, _, peak) = crate::test_alloc::measure_peak(|| NativeIndex::new(native));
+        let ends: u64 = native
+            .capability_reports
+            .iter()
+            .flat_map(|report| &report.families)
+            .map(|family| crate::test_alloc::measure(|| SupportIndex::gap_ends(&family.gaps)).1)
+            .sum();
+        drop(index);
+        let bound = NativeIndex::bytes(native);
+        assert!(
+            peak + ends <= bound,
+            "{} documents: built {peak} + gap ends {ends} > bound {bound}",
+            native.revision.documents.len()
+        );
+    }
+
+    #[test]
+    fn admitted_bytes_bound_what_the_index_allocates() {
+        assert_bounded(&artifact(0).0);
+        assert_bounded(&artifact(1).0);
+        assert_bounded(&artifact(500).0);
+        // More documents than one B-tree leaf holds.
+        let (one, _) = artifact(3);
+        let mut many = one.clone();
+        for n in 1..40 {
+            let key = native::DocumentKey {
+                path: format!("src/m{n}.rs"),
+                ..document()
+            };
+            let rekey = |d: &mut native::DocumentKey| *d = key.clone();
+            let mut document = one.revision.documents[0].clone();
+            rekey(&mut document.key);
+            many.revision.documents.push(document);
+            for mut d in one.declarations.clone() {
+                rekey(&mut d.document);
+                many.declarations.push(d);
+            }
+            for mut c in one.calls.clone() {
+                rekey(&mut c.document);
+                many.calls.push(c);
+            }
+            for mut r in one.references.clone() {
+                rekey(&mut r.document);
+                many.references.push(r);
+            }
+            let mut report = one.capability_reports[0].clone();
+            rekey(&mut report.document);
+            many.capability_reports.push(report);
+        }
+        assert_bounded(&many);
     }
 
     #[test]
