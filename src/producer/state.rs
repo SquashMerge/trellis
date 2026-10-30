@@ -347,13 +347,16 @@ impl StateDir {
             .try_for_each(|name| remove_tree(&dir.join(name)))
     }
 
-    /// Keep `run.json` for the newest terminal runs and delete the rest.
-    pub fn prune_runs(&self) -> Result<()> {
-        let mut terminal: Vec<RunRecord> = self
-            .runs()?
-            .into_iter()
-            .filter(|record| record.state.is_terminal())
-            .collect();
+    /// Keep `run.json` for the newest terminal runs and delete the rest. A run directory in
+    /// `keep` (named by a queued or running generated import) is neither deleted nor counted:
+    /// its inputs live until the request is terminal (T09).
+    pub fn prune_runs(&self, keep: &BTreeSet<PathBuf>) -> Result<()> {
+        let mut terminal = Vec::new();
+        for record in self.runs()? {
+            if record.state.is_terminal() && !kept(keep, &self.run_dir(&record.run_id)?) {
+                terminal.push(record);
+            }
+        }
         for old in terminal.split_off(terminal.len().min(RETAINED_RUNS)) {
             remove_tree(&self.run_dir(&old.run_id)?)?;
         }
@@ -398,9 +401,7 @@ impl StateDir {
         this_daemon: &DaemonIdentity,
         keep: &BTreeSet<PathBuf>,
     ) -> Result<SweepReport> {
-        let kept = |dir: &Path| {
-            keep.contains(dir) || fs::canonicalize(dir).is_ok_and(|real| keep.contains(&real))
-        };
+        let kept = |dir: &Path| kept(keep, dir);
         let mut report = SweepReport::default();
         for (run_id, record) in self.scan_runs()? {
             let dir = self.run_dir(&run_id)?;
@@ -461,7 +462,7 @@ impl StateDir {
             }
             report.abandoned_runs.push(run_id);
         }
-        self.prune_runs()?;
+        self.prune_runs(keep)?;
         let pickups = self.path.join("pickups");
         if let Ok(entries) = fs::read_dir(&pickups) {
             for entry in entries {
@@ -476,6 +477,11 @@ impl StateDir {
         }
         Ok(report)
     }
+}
+
+/// Whether `dir`, spelled as given or canonicalized, is in `keep`.
+fn kept(keep: &BTreeSet<PathBuf>, dir: &Path) -> bool {
+    keep.contains(dir) || fs::canonicalize(dir).is_ok_and(|real| keep.contains(&real))
 }
 
 /// The recorded group leader is alive and is still the process that started

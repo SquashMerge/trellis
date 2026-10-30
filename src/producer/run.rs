@@ -765,7 +765,11 @@ impl ProducerOwner {
         cleanup.armed = false;
         // The import request is terminal or never existed, so nothing but the record is needed.
         let _ = state.strip_to_record(&run_id);
-        let _ = state.prune_runs();
+        // Retention never deletes a directory another accepted request still reads; when
+        // the pending set cannot be read, pruning waits for the next sweep.
+        if let Ok(keep) = store.pending_generation_dirs() {
+            let _ = state.prune_runs(&keep);
+        }
         written?;
         Ok(json!({
             "runId": run_id,

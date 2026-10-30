@@ -239,7 +239,7 @@ fn retains_ten_newest_run_records() {
     let mut live = record(100, RunState::Running, DaemonIdentity::current());
     live.created_at = 0;
     state.write_run_record(&live).unwrap();
-    state.prune_runs().unwrap();
+    state.prune_runs(&BTreeSet::new()).unwrap();
     let kept: BTreeSet<String> = state
         .runs()
         .unwrap()
@@ -267,7 +267,7 @@ fn pickups_do_not_consume_run_retention() {
         let dir = state.create_pickup_dir(&run_id(n)).unwrap();
         populate(&dir, &["out", "batch"]);
     }
-    state.prune_runs().unwrap();
+    state.prune_runs(&BTreeSet::new()).unwrap();
     assert_eq!(state.runs().unwrap().len(), RETAINED_RUNS);
     state.remove_pickup_dir(&run_id(1000)).unwrap();
     assert!(!state.pickup_dir(&run_id(1000)).unwrap().exists());
@@ -457,4 +457,49 @@ fn sweep_removes_unreferenced_pickup_dirs() {
             .join("out/file")
             .exists()
     );
+}
+
+/// Retention never deletes the inputs of a run whose generated import is still pending: an
+/// old importing run whose wait was lost, ten newer terminal runs and a restart sweep. Once
+/// the request settles, the next sweep reclaims it.
+#[test]
+fn retention_keeps_a_pending_run_until_its_request_settles() {
+    let fixture = fixture();
+    let state = state(&fixture);
+    state.create_run_dir(&run_id(1)).unwrap();
+    let mut importing = record(1, RunState::Importing, other_daemon());
+    importing.request_id = Some("request".into());
+    state.write_run_record(&importing).unwrap();
+    let pending = state.run_dir(&run_id(1)).unwrap();
+    populate(&pending, &["out", "batch"]);
+    for n in 2..=(RETAINED_RUNS as u32 + 1) {
+        state.create_run_dir(&run_id(n)).unwrap();
+        let mut failed = record(n, RunState::Failed, DaemonIdentity::current());
+        failed.outcome = Some("producer_failed".into());
+        state.write_run_record(&failed).unwrap();
+    }
+    let keep = BTreeSet::from([fs::canonicalize(&pending).unwrap()]);
+
+    // The restart sweep makes the old record terminal but keeps its inputs.
+    let report = state.sweep(&DaemonIdentity::current(), &keep).unwrap();
+    assert_eq!(report.abandoned_runs, [run_id(1)]);
+    assert!(pending.join("out/file").exists() && pending.join("batch/file").exists());
+    // So does the retention pass at another run's completion.
+    state.prune_runs(&keep).unwrap();
+    assert!(pending.join("out/file").exists() && pending.join("batch/file").exists());
+    assert_eq!(state.runs().unwrap().len(), RETAINED_RUNS + 1);
+
+    // Settled: no request names the directory, and the oldest record goes with its inputs.
+    state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert!(!pending.exists());
+    let kept: BTreeSet<String> = state
+        .runs()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.run_id)
+        .collect();
+    let expected: BTreeSet<String> = (2..=(RETAINED_RUNS as u32 + 1)).map(run_id).collect();
+    assert_eq!(kept, expected);
 }

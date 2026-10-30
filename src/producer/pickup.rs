@@ -305,8 +305,9 @@ impl PickupOwner {
         }
     }
 
-    /// Whether the producer's last failed outcome is due again, judged from the stored digest
-    /// without reading the artifact.
+    /// Whether the producer's last outcome is due again, judged from the stored digest without
+    /// reading the artifact: a failed outcome by the decision table, a `done` one when the head
+    /// no longer selects its evidence (a rebuild or a live recovery dropped it).
     fn retry_due(&self, store: &Store, producer: &str) -> bool {
         let _workflow = self.workflow.lock().unwrap();
         let (roots, identity) = store.state_topology();
@@ -334,6 +335,14 @@ impl PickupOwner {
         let Some(entry) = config.entries.iter().find(|e| e.producer == producer) else {
             return false;
         };
+        if entry
+            .last_imported
+            .as_ref()
+            .is_some_and(|last| last.state == "done")
+        {
+            // A selection that cannot be read is not a verdict; the next check asks again.
+            return matches!(selected_capture(store, producer, &sha256), Ok(None));
+        }
         decide_with_retry(
             entry,
             &sha256,
@@ -730,6 +739,18 @@ fn failure(producer: &str, entry: &PickupEntry, bound: Option<(&str, &str)>, cod
         "publishedRevision": null,
         "report": null,
     })
+}
+
+/// The `(descriptor_sha256, captured_revision)` of the batch the head selects for `producer`,
+/// when that batch captured the artifact whose digest is `sha256`.
+fn selected_capture(
+    store: &Store,
+    producer: &str,
+    sha256: &str,
+) -> Result<Option<(String, String)>> {
+    let (pin, _) = batch::pickup_target(producer)
+        .ok_or_else(|| anyhow::anyhow!("{INVALID_REQUEST}: pickup producer"))?;
+    store.selected_semantic_capture_at(store.index_baseline()?, &pin.name, sha256)
 }
 
 /// The revision ID of the retained native head.

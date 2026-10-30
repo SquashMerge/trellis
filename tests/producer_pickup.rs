@@ -518,3 +518,60 @@ fn pickup_reimports_unchanged_artifact_after_rebuild() {
     assert_eq!(imported["sha256"], first["sha256"]);
     assert!(!marker.exists());
 }
+
+/// V7 without a restart: a live corruption recovery in the same daemon drops the semantic
+/// selection while the artifact and its stat stay unchanged. The stat check's retry asks
+/// whether the `done` evidence is still selected and re-imports the bytes.
+#[test]
+fn pickup_reimports_unchanged_artifact_after_live_recovery() {
+    let world = configured(&intervals(
+        json!({"debounceMs": 100, "stableMs": 100, "checkMs": 100}),
+    ));
+    let Configured {
+        checkout,
+        first,
+        marker,
+        ..
+    } = &world;
+    let pid = fs::read_to_string(checkout.home.join("daemon.pid")).unwrap();
+
+    // Corrupt the published head under the running daemon; a read finds it and an explicit
+    // index request recovers in the same runtime.
+    let db = rusqlite::Connection::open(index_db(checkout)).unwrap();
+    db.execute("UPDATE index_metadata SET stats='not-json'", [])
+        .unwrap();
+    drop(db);
+    let read = checkout
+        .cli()
+        .args(["symbols", "--search", "a", "--workspace"])
+        .arg(&checkout.root)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&read.stderr);
+    assert!(
+        !read.status.success() && stderr.contains("incompatible_index"),
+        "the corrupt head was served: {stderr}"
+    );
+    let index = checkout
+        .cli()
+        .args(["index", "--workspace"])
+        .arg(&checkout.root)
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let imported = wait_last(checkout, "the recovered index to re-import", |last| {
+        last["requestId"] != first["requestId"] && last["state"] == "done"
+    });
+    assert_eq!(imported["sha256"], first["sha256"]);
+    assert_eq!(
+        fs::read_to_string(checkout.home.join("daemon.pid")).unwrap(),
+        pid,
+        "the daemon restarted"
+    );
+    assert!(!marker.exists());
+}
