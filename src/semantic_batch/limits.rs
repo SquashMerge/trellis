@@ -67,7 +67,7 @@ impl BatchLimits {
         candidates: 4_000_000,
         wire_fields: 64_000_000,
         unit_expansion_bytes: 128 * MIB,
-        document_occurrences: 10_000,
+        document_occurrences: 350_000,
         document_symbols: 10_000,
         external_symbols: 10_000,
         signature_occurrences: 10_000,

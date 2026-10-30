@@ -181,6 +181,9 @@ impl JoinCtx<'_> {
     }
 }
 
+/// Contract `Symbol.key`: a conflicting duplicate key in one producer artifact invalidates it.
+const DUPLICATE_SYMBOL_KEY: &str = "duplicate semantic symbol key";
+
 /// Rows between output-bytes checks.
 const OUTPUT_CHECK_ROWS: u64 = 10_000;
 
@@ -1446,6 +1449,8 @@ struct DocFlags {
     unsupported_claims: u64,
     /// Claims other than symbol information: the document's report denominator.
     claims: u64,
+    /// Admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
+    capped: bool,
 }
 
 /// Admitted claims whose source is not a document of the captured revision. Admission binds
@@ -1460,8 +1465,9 @@ const INELIGIBLE_CLAIM_DOCUMENT_SQL: &str = "SELECT 1 FROM w_docs w WHERE (w.eli
     AND EXISTS (SELECT 1 FROM claims c WHERE c.source_ord=w.source_ord) LIMIT 1";
 
 const DOCUMENT_FLAGS_SQL: &str = "SELECT w.requested, w.failed, w.eligible, w.unsupported, \
-    w.unsupported_claims, w.claims, c.exclusion FROM sources s LEFT JOIN w_docs w ON \
-    w.source_ord=s.ord LEFT JOIN coverage c ON c.source_ord=s.ord WHERE s.language=?1 AND s.path=?2";
+    w.unsupported_claims, w.claims, c.exclusion, d.capped FROM sources s LEFT JOIN w_docs w ON \
+    w.source_ord=s.ord LEFT JOIN coverage c ON c.source_ord=s.ord LEFT JOIN documents d ON \
+    d.source_ord=s.ord WHERE s.language=?1 AND s.path=?2";
 
 impl StagedJoin<'_> {
     fn conn(&self) -> &Connection {
@@ -1886,6 +1892,7 @@ impl StagedJoin<'_> {
             Option<i64>,
             Option<i64>,
             Option<String>,
+            Option<bool>,
         );
         let row: Option<Row> = self
             .conn()
@@ -1899,11 +1906,20 @@ impl StagedJoin<'_> {
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             })
             .optional()?;
-        let Some((requested, failed, eligible, unsupported, unsupported_claims, claims, excluded)) =
-            row
+        let Some((
+            requested,
+            failed,
+            eligible,
+            unsupported,
+            unsupported_claims,
+            claims,
+            excluded,
+            capped,
+        )) = row
         else {
             return Ok((DocFlags::default(), None));
         };
@@ -1915,6 +1931,7 @@ impl StagedJoin<'_> {
                 unsupported: unsupported.unwrap_or_default(),
                 unsupported_claims: u64::try_from(unsupported_claims.unwrap_or_default())?,
                 claims: u64::try_from(claims.unwrap_or_default())?,
+                capped: capped.unwrap_or_default(),
             },
             excluded,
         ))
@@ -1999,6 +2016,7 @@ impl StagedJoin<'_> {
         } = flags;
         let partial = excluded == Some("unsupported")
             || unsupported
+            || flags.capped
             || outcome.omitted
             || outcome.diagnostics;
         let state = if !requested {
@@ -2047,6 +2065,8 @@ impl StagedJoin<'_> {
                 Some("excluded_by_producer".into())
             } else if unsupported {
                 Some("unsupported_native_gap".into())
+            } else if flags.capped {
+                Some(crate::scip_raw::OCCURRENCE_CAP_EXCEEDED.into())
             } else if partial {
                 Some("unmeasurable_internal_target".into())
             } else {
@@ -2238,7 +2258,7 @@ impl StagedJoin<'_> {
                 "SELECT COUNT(*) FROM (SELECT 1 FROM out_symbols s JOIN out_provenance p \
                  ON p.id=s.provenance_id JOIN claims c ON c.claim_id=p.claim_id \
                  GROUP BY c.artifact, json_extract(s.body,'$.key') HAVING COUNT(*)>1)",
-                "duplicate semantic symbol key",
+                DUPLICATE_SYMBOL_KEY,
             ),
             (
                 "SELECT COUNT(*) FROM out_provenance p WHERE NOT EXISTS (SELECT 1 FROM out_coverage c \
@@ -2255,7 +2275,15 @@ impl StagedJoin<'_> {
                 "captured proof document hash mismatch",
             ),
         ] {
-            anyhow::ensure!(count(sql)? == 0, message);
+            if count(sql)? != 0 {
+                // A producer that gives one global symbol information in two documents of an
+                // artifact (rust-analyzer does across Cargo targets) is an invalid artifact,
+                // reported typed like any other, not an internal error.
+                if message == DUPLICATE_SYMBOL_KEY {
+                    return Err(ScipCaptureError::InvalidArtifact(message.into()).into());
+                }
+                anyhow::bail!(message);
+            }
         }
         let languages = self
             .producer

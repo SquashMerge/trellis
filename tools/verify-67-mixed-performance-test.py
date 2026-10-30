@@ -206,7 +206,7 @@ class SchemaParity(unittest.TestCase):
         db.execute("INSERT INTO semantic_raw_captures VALUES(1,1,0,'javascript','scip-typescript',?,?,?,x'01',?)",
                    (artifact, source_set, natives["r1"], RUNNER.DECODER_VERSION))
         db.execute("INSERT INTO semantic_raw_exclusions VALUES(1,'javascript','js/b.js','notRequested')")
-        db.execute("INSERT INTO semantic_raw_documents VALUES(1,'javascript','js/a.js',?,?)",
+        db.execute("INSERT INTO semantic_raw_documents VALUES(1,'javascript','js/a.js',?,?,0)",
                    (hashes[paths[0]], HEX))
         db.execute("INSERT INTO semantic_raw_proofs VALUES(1,'proof','occurrence',?,'javascript','js/a.js',x'7b7d')",
                    (HEX,))
@@ -243,7 +243,7 @@ class SchemaParity(unittest.TestCase):
             self.assertTrue(rows[table], table)
         return rows
 
-    def test_selected_view_normalizes_a_schema_27_batch_selection_identically_across_roots(self):
+    def test_selected_view_normalizes_a_schema_28_batch_selection_identically_across_roots(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
 
