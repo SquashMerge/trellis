@@ -306,16 +306,18 @@ pub fn claim_presence(claim: &CapturedClaim) -> (Option<&str>, i64) {
     }
 }
 
-/// Rebuilds a claim from its staged row.
+/// Rebuilds the staged join's view of a claim from its staged row: the parsed envelope and
+/// identity, decoded from the row's borrowed canonical bytes. The join never reads the
+/// canonical bytes again (they stay in the stage), so the claim does not keep a copy.
 pub(crate) fn claim_from_stage(
-    canonical_bytes: Vec<u8>,
+    canonical_bytes: &[u8],
     fact_digest: String,
     proof_id: String,
     language: String,
     artifact_hash: String,
 ) -> Result<CapturedClaim> {
     let mut value: serde_json::Value =
-        serde_json::from_slice(&canonical_bytes).context("staged claim")?;
+        serde_json::from_slice(canonical_bytes).context("staged claim")?;
     let text = |name: &str| {
         value[name]
             .as_str()
@@ -334,7 +336,7 @@ pub(crate) fn claim_from_stage(
             position_encoding,
             raw,
         },
-        canonical_bytes,
+        canonical_bytes: Vec::new(),
         fact_digest,
         captured_proof_id: proof_id,
         language,

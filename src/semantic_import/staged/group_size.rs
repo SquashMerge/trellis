@@ -1,7 +1,13 @@
 //! Additional logical owners created by DocGroup::build, excluding moved native payload.
 use super::*;
-use sizes::{document, map_entries, sum};
+use sizes::{document, sum};
 use std::mem::size_of;
+
+/// The build's map model: the logical per-entry estimate, and never less than the one leaf
+/// node a small map really allocates.
+fn map_entries<K, V>(count: usize) -> Result<u64> {
+    Ok(sizes::map_entries::<K, V>(count)?.max(super::heap::btree::<K, V>(count.min(11))))
+}
 
 fn slots<T>(count: usize) -> Result<u64> {
     (count as u64)
@@ -398,6 +404,247 @@ pub(super) fn group_build(
     sum(&[total, canonical_scratch, lookup_scratch])
 }
 
+mod retained {
+    //! What a built `DocGroup` keeps, from the real capacities of its owners.
+    use super::super::heap::{btree, buffer, optional, string, strings, value};
+    use super::*;
+
+    fn key(value: &native::DocumentKey) -> u64 {
+        string(&value.source_set_id) + string(&value.language) + string(&value.path)
+    }
+    fn document(value: &native::Document) -> u64 {
+        key(&value.key) + string(&value.revision_id) + string(&value.content_hash)
+    }
+    fn native_key(value: &native::Key) -> u64 {
+        string(&value.kind)
+            + optional(&value.name)
+            + value
+                .signature
+                .as_ref()
+                .map_or(0, |signature| strings(&signature.parameter_types))
+    }
+    fn declaration(value: &native::Declaration) -> u64 {
+        let header = &value.header;
+        let parameters = buffer(&header.parameters)
+            + header
+                .parameters
+                .iter()
+                .map(|p| optional(&p.name) + optional(&p.type_name))
+                .sum::<u64>();
+        string(&value.syntax_id)
+            + key(&value.document)
+            + string(&value.revision_id)
+            + string(&value.kind)
+            + optional(&value.name)
+            + optional(&value.lookup_key)
+            + buffer(&value.ancestors)
+            + value.ancestors.iter().map(native_key).sum::<u64>()
+            + native_key(&value.key)
+            + string(&header.kind)
+            + optional(&header.name)
+            + strings(&header.modifiers)
+            + strings(&header.type_parameters)
+            + parameters
+            + optional(&header.result_type)
+            + strings(&header.bases)
+            + string(&value.provenance_id)
+    }
+    fn call(value: &native::Call) -> u64 {
+        string(&value.id)
+            + string(&value.owner_syntax_id)
+            + key(&value.document)
+            + string(&value.revision_id)
+            + optional(&value.spelling)
+            + strings(&value.region_ids)
+            + string(&value.provenance_id)
+    }
+    fn reference(value: &native::Reference) -> u64 {
+        string(&value.id)
+            + string(&value.owner_syntax_id)
+            + key(&value.document)
+            + string(&value.revision_id)
+            + string(&value.spelling)
+            + string(&value.lookup_key)
+            + string(&value.provenance_id)
+    }
+    fn coverage(value: &native::Coverage) -> u64 {
+        string(&value.producer_id)
+            + string(&value.language)
+            + string(&value.source_set_id)
+            + string(&value.document_path)
+            + string(&value.revision_id)
+            + string(&value.state)
+            + strings(&value.supported_roles)
+            + strings(&value.observed_roles)
+            + optional(&value.diagnostic)
+    }
+    fn support(value: &native::MeasurementSupport) -> u64 {
+        optional(&value.diagnostic)
+            + buffer(&value.gaps)
+            + value
+                .gaps
+                .iter()
+                .map(|g| string(&g.diagnostic))
+                .sum::<u64>()
+    }
+    fn artifact(value: &native::Artifact) -> u64 {
+        let producer = &value.producer;
+        let source_set = &value.source_set;
+        let revision = &value.revision;
+        string(&producer.id)
+            + string(&producer.version)
+            + string(&producer.executable_hash)
+            + string(&producer.kind)
+            + strings(&producer.languages)
+            + string(&producer.position_encoding)
+            + string(&source_set.id)
+            + string(&source_set.root_id)
+            + strings(&source_set.languages)
+            + strings(&source_set.dependencies)
+            + string(&revision.id)
+            + string(&revision.source_set_id)
+            + buffer(&revision.documents)
+            + revision.documents.iter().map(document).sum::<u64>()
+            + string(&revision.toolchain_hash)
+            + string(&revision.config_hash)
+            + string(&revision.dependency_hash)
+            + buffer(&value.coverage)
+            + value.coverage.iter().map(coverage).sum::<u64>()
+            + buffer(&value.provenance)
+            + buffer(&value.declarations)
+            + value.declarations.iter().map(declaration).sum::<u64>()
+            + buffer(&value.calls)
+            + value.calls.iter().map(call).sum::<u64>()
+            + buffer(&value.control_regions)
+            + buffer(&value.references)
+            + value.references.iter().map(reference).sum::<u64>()
+            + buffer(&value.capability_reports)
+            + value
+                .capability_reports
+                .iter()
+                .map(|report| {
+                    key(&report.document)
+                        + string(&report.revision_id)
+                        + buffer(&report.families)
+                        + report.families.iter().map(support).sum::<u64>()
+                })
+                .sum::<u64>()
+            + buffer(&value.search_cards)
+    }
+    fn ids(value: &BTreeMap<String, Vec<usize>>) -> u64 {
+        btree::<String, Vec<usize>>(value.len())
+            + value
+                .iter()
+                .map(|(id, rows)| string(id) + buffer(rows))
+                .sum::<u64>()
+    }
+
+    /// The canonical declaration-key index `DocGroup::declaration_keys` builds on first use,
+    /// prepaid because it is built later without a charge of its own: the map, each key's
+    /// canonical bytes at their growth capacity, and its index Vec (at most two slots per row
+    /// plus four per key), with the largest one build's scratch.
+    fn declaration_keys(declarations: &[native::Declaration]) -> Result<u64> {
+        let mut total = btree::<Vec<u8>, Vec<usize>>(declarations.len());
+        let mut scratch = 0;
+        for declaration in declarations {
+            let (encoded, temporary) = key_bytes(&declaration.key)?;
+            total = sum(&[total, bytes_capacity(encoded)?])?;
+            scratch = scratch.max(sum(&[temporary, bytes_capacity(encoded)?])?);
+        }
+        sum(&[
+            total,
+            slots::<usize>(declarations.len().saturating_mul(6))?,
+            scratch,
+        ])
+    }
+
+    /// The bytes a loaded document's native rows keep, or `None` when they hold search cards,
+    /// which a join load never reads and this model does not count.
+    pub(in crate::semantic_import::staged) fn rows(
+        rows: &crate::store::NativeDocumentRows,
+    ) -> Option<u64> {
+        if !rows.search_cards.is_empty() {
+            return None;
+        }
+        let provenance = &rows.provenance;
+        let report = &rows.capability_report;
+        let regions = rows
+            .control_regions
+            .iter()
+            .map(|region| {
+                string(&region.id)
+                    + string(&region.owner_syntax_id)
+                    + key(&region.document)
+                    + string(&region.revision_id)
+                    + string(&region.kind)
+                    + optional(&region.parent_id)
+                    + optional(&region.arm)
+                    + string(&region.provenance_id)
+            })
+            .sum::<u64>();
+        Some(
+            buffer(&rows.source)
+                + coverage(&rows.coverage)
+                + string(&provenance.id)
+                + string(&provenance.producer_id)
+                + key(&provenance.document)
+                + string(&provenance.revision_id)
+                + string(&provenance.content_hash)
+                + string(&provenance.evidence_kind)
+                + provenance.basis.as_ref().map_or(0, value)
+                + string(&provenance.freshness)
+                + provenance.derived_from.as_ref().map_or(0, value)
+                + buffer(&rows.declarations)
+                + rows.declarations.iter().map(declaration).sum::<u64>()
+                + buffer(&rows.calls)
+                + rows.calls.iter().map(call).sum::<u64>()
+                + buffer(&rows.control_regions)
+                + regions
+                + buffer(&rows.references)
+                + rows.references.iter().map(reference).sum::<u64>()
+                + key(&report.document)
+                + string(&report.revision_id)
+                + buffer(&report.families)
+                + report.families.iter().map(support).sum::<u64>(),
+        )
+    }
+
+    /// The bytes a built group keeps: its `Rc` allocation, document, source text, native rows
+    /// and indexes, and the prepaid lazy key index.
+    pub(in crate::semantic_import::staged) fn group(group: &DocGroup) -> Result<u64> {
+        let candidates =
+            btree::<(usize, usize, semantic::JoinKind), BTreeSet<String>>(group.candidates.len())
+                + group
+                    .candidates
+                    .values()
+                    .map(|ids| btree::<String, ()>(ids.len()) + ids.iter().map(string).sum::<u64>())
+                    .sum::<u64>();
+        let names = btree::<(usize, usize, String), ()>(group.declaration_names.len())
+            + group
+                .declaration_names
+                .iter()
+                .map(|(_, _, name)| string(name))
+                .sum::<u64>();
+        let support = btree::<semantic::JoinKind, native::MeasurementSupport>(group.support.len())
+            + group.support.values().map(support).sum::<u64>();
+        sum(&[
+            // Rc strong and weak counts beside the group.
+            (size_of::<DocGroup>() + 2 * size_of::<usize>()) as u64,
+            document(&group.document),
+            (group.text.len() + 2 * size_of::<usize>()) as u64,
+            artifact(&group.native),
+            ids(&group.declaration_ids),
+            declaration_keys(&group.native.declarations)?,
+            names,
+            ids(&group.call_ids),
+            ids(&group.reference_ids),
+            candidates,
+            support,
+        ])
+    }
+}
+pub(super) use retained::{group as retained_group, rows as retained_rows};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,9 +764,187 @@ mod tests {
         drop(group);
         let source = pin.text.as_bytes();
         assert!(source.is_empty());
-        assert!(live.reserve(1).is_err());
+        // After the build the group holds its retained bytes, not the build's peak, until
+        // its last pin drops.
+        let kept = retained_group(&pin).unwrap();
+        assert_eq!(pin.bytes, kept);
+        assert!(kept < bytes);
+        assert!(live.reserve(bytes - kept + 1).is_err());
+        drop(live.reserve(bytes - kept).unwrap());
         drop(pin);
         drop(live.reserve(bytes).unwrap());
+    }
+
+    /// A document with `calls` call sites of one declared function, as native rows.
+    fn call_group_input(
+        calls: usize,
+    ) -> (
+        NativeHeader,
+        native::Document,
+        crate::store::NativeDocumentRows,
+    ) {
+        let (header, mut document, mut rows) = empty_group_input();
+        let declaration = "function target() {}\n";
+        let mut source = declaration.to_owned();
+        let key = document.key.clone();
+        let revision = document.revision_id.clone();
+        rows.declarations.push(native::Declaration {
+            role: native::DeclarationRole::Production,
+            syntax_id: "syntax:v1:declaration-target".into(),
+            document: key.clone(),
+            revision_id: revision.clone(),
+            kind: "function".into(),
+            name: Some("target".into()),
+            lookup_key: Some("target".into()),
+            ancestors: vec![],
+            key: native::Key {
+                kind: "function".into(),
+                name: Some("target".into()),
+                signature: None,
+                ordinal: 0,
+            },
+            range: native::Range {
+                start: 0,
+                end: declaration.len() - 1,
+            },
+            name_range: Some(native::Range { start: 9, end: 15 }),
+            header: native::Header {
+                kind: "function".into(),
+                name: Some("target".into()),
+                modifiers: vec![],
+                type_parameters: vec![],
+                parameters: vec![],
+                result_type: None,
+                bases: vec![],
+            },
+            provenance_id: "provenance".into(),
+        });
+        for n in 0..calls {
+            let start = source.len();
+            source.push_str("target();\n");
+            let callee = native::Range {
+                start,
+                end: start + 6,
+            };
+            rows.calls.push(native::Call {
+                id: format!("call:v1:{n:08}"),
+                owner_syntax_id: "syntax:v1:declaration-target".into(),
+                ordinal: n,
+                document: key.clone(),
+                revision_id: revision.clone(),
+                range: native::Range {
+                    start,
+                    end: start + 8,
+                },
+                callee_range: Some(callee.clone()),
+                spelling: Some("target".into()),
+                region_ids: vec![],
+                provenance_id: "provenance".into(),
+            });
+            rows.references.push(native::Reference {
+                id: format!("reference:v1:{n:08}"),
+                owner_syntax_id: "syntax:v1:declaration-target".into(),
+                ordinal: n,
+                document: key.clone(),
+                revision_id: revision.clone(),
+                range: callee,
+                spelling: "target".into(),
+                lookup_key: "target".into(),
+                provenance_id: "provenance".into(),
+            });
+        }
+        document.content_hash = crate::native_ids::digest(b"", source.as_bytes());
+        document.byte_length = source.len();
+        rows.source = source.into_bytes();
+        (header, document, rows)
+    }
+
+    /// The group's long-lived charge covers what the built group really keeps (requested
+    /// bytes, counted by the test allocator) and stays within 1.6x of it; the build's peak is
+    /// within its admitted load and build charge.
+    #[test]
+    fn retained_group_charge_tracks_real_storage() {
+        for calls in [0, 1, 10, 1_000, 5_000] {
+            let (header, document, rows) = call_group_input(calls);
+            let measure = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
+            let build = group_build(&header, &document, &rows, &measure).unwrap();
+            let rows_bytes = rows_heap(&rows);
+            // The loaded-rows model is the rows' storage exactly.
+            let (copy, copied) = crate::test_alloc::measure(|| crate::store::NativeDocumentRows {
+                source: rows.source.clone(),
+                coverage: rows.coverage.clone(),
+                provenance: rows.provenance.clone(),
+                declarations: rows.declarations.clone(),
+                calls: rows.calls.clone(),
+                control_regions: rows.control_regions.clone(),
+                references: rows.references.clone(),
+                capability_report: rows.capability_report.clone(),
+                search_cards: vec![],
+            });
+            assert_eq!(retained_rows(&copy), Some(copied), "{calls}");
+            let live = LiveBudget::new(BatchLimits::PRODUCTION.unit_expansion_bytes);
+            let (group, kept, peak) = crate::test_alloc::measure_peak(|| {
+                Rc::new(
+                    DocGroup::build(&header, document, rows, live.reserve(0).unwrap(), &live)
+                        .unwrap(),
+                )
+            });
+            // The rows were allocated before the build and move into the group.
+            let real = kept + rows_bytes;
+            assert!(
+                group.bytes >= real,
+                "{calls}: charge {} < real {real}",
+                group.bytes
+            );
+            assert!(
+                group.bytes * 5 <= real * 8,
+                "{calls}: charge {} vs real {real}",
+                group.bytes
+            );
+            assert!(
+                peak <= build,
+                "{calls}: build peak {peak} > admitted {build}"
+            );
+        }
+    }
+
+    /// The heap storage of rows built by `call_group_input`, which the build moves.
+    fn rows_heap(rows: &crate::store::NativeDocumentRows) -> u64 {
+        let strings = |values: &[&String]| values.iter().map(|s| s.capacity() as u64).sum::<u64>();
+        let key = |k: &native::DocumentKey| strings(&[&k.source_set_id, &k.language, &k.path]);
+        let mut total = rows.source.capacity() as u64
+            + (rows.declarations.capacity() * size_of::<native::Declaration>()) as u64
+            + (rows.calls.capacity() * size_of::<native::Call>()) as u64
+            + (rows.references.capacity() * size_of::<native::Reference>()) as u64;
+        for d in &rows.declarations {
+            total += strings(&[&d.syntax_id, &d.revision_id, &d.kind, &d.provenance_id])
+                + key(&d.document)
+                + [&d.name, &d.lookup_key, &d.key.name, &d.header.name]
+                    .iter()
+                    .map(|s| s.as_ref().map_or(0, |s| s.capacity() as u64))
+                    .sum::<u64>()
+                + strings(&[&d.key.kind, &d.header.kind]);
+        }
+        for c in &rows.calls {
+            total += strings(&[&c.id, &c.owner_syntax_id, &c.revision_id, &c.provenance_id])
+                + key(&c.document)
+                + c.spelling.as_ref().map_or(0, |s| s.capacity() as u64);
+        }
+        for r in &rows.references {
+            total += strings(&[&r.id, &r.owner_syntax_id, &r.revision_id, &r.spelling])
+                + strings(&[&r.lookup_key, &r.provenance_id])
+                + key(&r.document);
+        }
+        let c = &rows.coverage;
+        total += strings(&[
+            &c.producer_id,
+            &c.language,
+            &c.source_set_id,
+            &c.document_path,
+        ]) + strings(&[&c.revision_id, &c.state]);
+        total += key(&rows.capability_report.document)
+            + rows.capability_report.revision_id.capacity() as u64;
+        total
     }
 
     #[test]

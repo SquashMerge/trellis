@@ -55,6 +55,8 @@ pub mod semantic_batch;
 pub mod semantic_evidence;
 pub mod semantic_import;
 pub mod store;
+#[cfg(test)]
+mod test_alloc;
 #[doc(hidden)]
 pub mod testing;
 pub mod watch;
