@@ -5300,20 +5300,53 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
             let range = call.callee_range.as_ref().unwrap();
             main[range.start_byte..range.end_byte].to_owned()
         };
-        // scip-typescript does not prove JavaScript dispatch direct: these resolved calls
-        // keep their declared target behind a `dispatch` boundary.
-        let resolved: Vec<_> = view
+        let mut shown: Vec<_> = view
             .semantic
             .bindings
             .iter()
-            .filter(|b| b.binding.resolution == Resolution::Resolved)
             .map(|b| {
-                assert_eq!(b.boundary_reason, BoundaryReason::Dispatch);
-                (callee(&b.call_id), b.target_id.clone().unwrap())
+                (
+                    callee(&b.call_id),
+                    format!("{:?}", b.binding.resolution),
+                    format!("{:?}", b.binding.dispatch),
+                    b.boundary_reason,
+                    b.target_id.clone(),
+                )
             })
             .collect();
-        assert!(resolved.contains(&("helper".into(), ids["helper"].clone())));
-        assert!(resolved.contains(&("plain".into(), ids["plain"].clone())));
+        shown.sort_by(|a, b| a.0.cmp(&b.0));
+        // #470's owner ruling: a resolved plain call to a free function is `Direct`, so the
+        // graph follows it (no boundary). Calls that stay unresolved (`new Widget(3)`,
+        // `w.run()`) keep `Unknown` dispatch and their `unresolved` boundary.
+        let followed = |name: &str, target: &str| {
+            (
+                name.to_owned(),
+                "Resolved".to_owned(),
+                "Direct".to_owned(),
+                BoundaryReason::None,
+                Some(ids[target].clone()),
+            )
+        };
+        let unresolved = |name: &str| {
+            (
+                name.to_owned(),
+                "Unresolved".to_owned(),
+                "Unknown".to_owned(),
+                BoundaryReason::Unresolved,
+                None,
+            )
+        };
+        assert_eq!(
+            shown,
+            [
+                unresolved("Widget"),
+                followed("helper", "helper"),
+                followed("plain", "plain"),
+                followed("plain", "plain"),
+                followed("register", "register"),
+                unresolved("run"),
+            ]
+        );
         for binding in &view.semantic.bindings {
             assert_eq!(
                 binding.binding.call_id.as_deref(),
@@ -5391,7 +5424,9 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
         let calls = outgoing["data"]["calls"].as_array().unwrap();
         let helper = calls.iter().find(|c| c["calleeText"] == "helper").unwrap();
         assert_eq!(helper["disposition"], "resolved");
-        assert_eq!(helper["boundaryReason"], "dispatch");
+        // #470: a resolved plain call is `Direct` and followed, so it has no boundary.
+        assert_eq!(helper["boundaryReason"], "none");
+        assert_eq!(helper["binding"]["dispatch"], "direct");
         assert_eq!(helper["targetId"], ids["helper"]);
         assert_eq!(helper["evidenceTier"], "semantic");
         assert_eq!(helper["freshness"], "fresh");
@@ -5401,6 +5436,10 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
             ids["helper"]
         );
         assert_eq!(helper["semanticBasis"]["producerId"], producer.as_str());
+        // A member call whose target stays unresolved keeps its boundary.
+        let run = calls.iter().find(|c| c["calleeText"] == "run").unwrap();
+        assert_eq!(run["boundaryReason"], "unresolved", "{run}");
+        assert_eq!(run["binding"]["dispatch"], "unknown", "{run}");
         let unbound = calls.iter().find(|c| c["calleeText"] == "method").unwrap();
         assert_eq!(unbound["binding"], Value::Null);
         assert_eq!(unbound["boundaryReason"], "missingEvidence");
