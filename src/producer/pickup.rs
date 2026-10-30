@@ -121,6 +121,12 @@ pub fn decide_with_retry(
     }
 }
 
+/// What `reconcile` found for the request behind a failed `lastImported`.
+enum Reconcile {
+    Settled,
+    Pending,
+}
+
 /// The checkout's pickup workflow: the only writer of `pickup.json`.
 #[derive(Clone, Default)]
 pub struct PickupOwner {
@@ -316,16 +322,67 @@ impl PickupOwner {
         let Some(last) = &entry.last_imported else {
             return false;
         };
+        let sha256 = last.sha256.clone();
         let Ok(revision) = head_revision(store) else {
+            return false;
+        };
+        let mut config = config;
+        match self.reconcile(store, &state, &mut config, producer) {
+            Ok(Reconcile::Settled) => {}
+            Ok(Reconcile::Pending) | Err(_) => return false,
+        }
+        let Some(entry) = config.entries.iter().find(|e| e.producer == producer) else {
             return false;
         };
         decide_with_retry(
             entry,
-            &last.sha256,
+            &sha256,
             &revision,
             now_millis(),
             Intervals::current().retry_ms,
         ) == Decision::Import
+    }
+
+    /// Bring a failed `lastImported` that names a request in line with that request's row: a
+    /// lost wait is not a verdict. A done row is recorded as done, a failed one with its typed
+    /// code, and a queued or running one holds back any new import. A vanished row changes
+    /// nothing, and an unreadable one is an error, so no second import starts on a guess.
+    fn reconcile(
+        &self,
+        store: &Store,
+        state: &StateDir,
+        config: &mut PickupConfig,
+        producer: &str,
+    ) -> Result<Reconcile> {
+        let Some(last) = config
+            .entries
+            .iter()
+            .find(|e| e.producer == producer)
+            .and_then(|e| e.last_imported.clone())
+        else {
+            return Ok(Reconcile::Settled);
+        };
+        let Some(id) = last.request_id.clone().filter(|_| last.state == "failed") else {
+            return Ok(Reconcile::Settled);
+        };
+        let Some(row) = import::read_request(store, &id)? else {
+            return Ok(Reconcile::Settled);
+        };
+        let (new_state, code) = match row.state.as_str() {
+            "done" => ("done", None),
+            "failed" => (
+                "failed",
+                Some(row.error_code.unwrap_or_else(|| "index_failed".into())),
+            ),
+            _ => return Ok(Reconcile::Pending),
+        };
+        if last.state != new_state || last.error_code != code {
+            let mut next = last;
+            next.state = new_state.into();
+            next.error_code = code;
+            self.record_last(state, config, producer, next)?;
+        }
+        Ok(Reconcile::Settled)
     }
 
     /// Configure the producer's artifact and import it now, as an explicit owner action.
@@ -418,6 +475,23 @@ impl PickupOwner {
         let mut config = state
             .read_pickup_config()?
             .ok_or_else(|| anyhow::anyhow!("{}: no pickup configured", super::NOT_FOUND))?;
+        if !force
+            && matches!(
+                self.reconcile(store, state, &mut config, producer)?,
+                Reconcile::Pending
+            )
+        {
+            let entry = config.entries.iter().find(|e| e.producer == producer);
+            return Ok(json!({
+                "producer": producer,
+                "artifact": entry.map(|e| &e.artifact),
+                "state": "skipped",
+                "sha256": entry.and_then(|e| e.last_imported.as_ref()).map(|l| &l.sha256),
+                "sourceRevision": entry
+                    .and_then(|e| e.last_imported.as_ref())
+                    .map(|l| &l.source_revision),
+            }));
+        }
         let entry = config
             .entries
             .iter()
@@ -532,8 +606,9 @@ impl PickupOwner {
                 // the request is terminal. The unknown outcome counts as a transient
                 // failure, so a later trigger retries after the retry interval.
                 let message = format!("{error:#}");
-                last.error_code = Some(message.split(':').next().unwrap_or(&message).to_owned());
-                self.record_last(state, &mut config, producer, last)?;
+                let class = message.split(':').next().unwrap_or(&message);
+                last.error_code = Some(class.chars().take(120).collect());
+                let _ = self.record_last(state, &mut config, producer, last);
                 return Err(error);
             }
             (result, _) => {

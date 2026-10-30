@@ -61,7 +61,7 @@ pub fn options_for(
     })
 }
 
-fn read_request(store: &Store, id: &str) -> Result<Option<Request>> {
+pub fn read_request(store: &Store, id: &str) -> Result<Option<Request>> {
     let deadline = Instant::now() + BUSY_WAIT;
     loop {
         match store.request_by_id(id) {

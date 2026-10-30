@@ -368,6 +368,7 @@ fn lost_pickup_wait_keeps_the_batch_until_the_request_settles() {
     assert!(dirs[0].join("out").exists(), "{dirs:?}");
     assert!(dirs[0].join("batch").exists(), "{dirs:?}");
 
+    // With the default retry interval nothing has reconciled the lost wait yet.
     let entry = pickup_status(&checkout, "scip-java");
     assert_eq!(entry["lastImported"]["state"], "failed");
     assert_eq!(entry["lastImported"]["errorCode"], "storage_busy");
