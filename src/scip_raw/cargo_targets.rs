@@ -280,8 +280,11 @@ fn reach<'d>(
                 .filter_map(|c| documents.get(c.as_str()).copied())
                 .collect();
             match found[..] {
-                // A declared module whose file was not captured may be shared with another
-                // target: never assign around it.
+                // A declared module whose file was not captured may declare modules shared
+                // with another target: never assign around it. An included file that was not
+                // captured (a build input such as `build/*.rs` outside the sources) declares
+                // nothing this module follows.
+                [] if child_included => {}
                 [] => complete = false,
                 [child] => {
                     let child_mod_rs = child_mod_rs.unwrap_or_else(|| child.ends_with("/mod.rs"));
@@ -723,7 +726,7 @@ mod tests {
             &[
                 (
                     "lib/root.rs",
-                    "#[path = \"../shared/x.rs\"]\nmod x;\nmod plain;",
+                    "#[path = \"../shared/x.rs\"]\nmod x;\nmod plain;\ninclude!(\"uncaptured.rs\");",
                 ),
                 ("lib/plain.rs", ""),
                 ("shared/x.rs", "mod y;"),
