@@ -548,17 +548,21 @@ impl StagedJoin<'_> {
         }
 
         // Calls take the captured reference's targets, then their final reference's.
-        let mut old_targets = BTreeMap::<&str, &semantic::Reference>::new();
+        // Each also keeps its captured binding, whose join-time dispatch (#470) the rejoin may
+        // settle on.
+        let mut old_targets =
+            BTreeMap::<&str, (&semantic::Reference, &semantic::CallBinding)>::new();
         for binding in &captured.call_bindings {
             if let Some(reference) = captured.reference_claims.get(&binding.provenance_id) {
-                entry::<&str, &semantic::Reference>(&mut owner, 0)?;
-                old_targets.insert(binding.provenance_id.as_str(), reference);
+                entry::<&str, (&semantic::Reference, &semantic::CallBinding)>(&mut owner, 0)?;
+                old_targets.insert(binding.provenance_id.as_str(), (reference, binding));
             }
         }
         let mut calls = destination.call_bindings;
         let mut kept = 0;
         for index in 0..calls.len() {
-            let Some(old) = old_targets.get(calls[index].provenance_id.as_str()) else {
+            let Some(&(old, captured_call)) = old_targets.get(calls[index].provenance_id.as_str())
+            else {
                 continue;
             };
             // The working copy, then the captured reference's targets it adopts.
@@ -606,9 +610,14 @@ impl StagedJoin<'_> {
                 matches!(target, semantic::Target::Internal { .. }).then_some(false)
             });
             // `calls[index]` is still the destination join's row, classified at join time.
-            call.dispatch = super::super::settled_dispatch(
-                calls[index].dispatch,
-                calls[index].declared_target.as_ref(),
+            call.dispatch = super::super::rejoined_dispatch(
+                [
+                    Some((calls[index].dispatch, calls[index].declared_target.as_ref())),
+                    Some((
+                        captured_call.dispatch,
+                        captured_call.declared_target.as_ref(),
+                    )),
+                ],
                 &call,
             );
             #[cfg(feature = "test-support")]

@@ -1241,6 +1241,23 @@ pub(super) fn settled_dispatch(
     }
 }
 
+/// A rejoined call's dispatch: the classification of whichever join, destination first then
+/// captured, was made against the settled target. A rejoin can settle a call on a captured
+/// target retargeted to the destination (its syntax ID verified unchanged) that the
+/// destination join alone did not resolve; the call's document bytes are unchanged, so the
+/// captured shape and target kind still hold.
+pub(super) fn rejoined_dispatch(
+    joins: [Option<(semantic::Dispatch, Option<&semantic::Target>)>; 2],
+    settled: &semantic::CallBinding,
+) -> semantic::Dispatch {
+    joins
+        .into_iter()
+        .flatten()
+        .map(|(dispatch, target)| settled_dispatch(dispatch, target, settled))
+        .find(|dispatch| *dispatch != semantic::Dispatch::Unknown)
+        .unwrap_or(semantic::Dispatch::Unknown)
+}
+
 fn measure_occurrence<S: JoinStore>(
     store: &S,
     claim: &CapturedClaim,
@@ -3924,6 +3941,17 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
                 })
         })
         .collect();
+    // The captured join's classification of each call and the target it was made against.
+    let captured_dispatch: BTreeMap<_, _> = captured
+        .call_bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.provenance_id.as_str(),
+                (binding.dispatch, binding.declared_target.as_ref()),
+            )
+        })
+        .collect();
     let mut calls = Vec::new();
     // Each destination call's join-time dispatch and the target it was classified against.
     let mut joined_dispatch = BTreeMap::new();
@@ -4064,11 +4092,11 @@ fn finish_rejoin<F: NativeFacts, P: ProofIdentities, Q: ProofIdentities, B: Basi
         call.stale_target = call.declared_target.as_ref().and_then(|target| {
             matches!(target, semantic::Target::Internal { .. }).then_some(false)
         });
-        call.dispatch = joined_dispatch
+        let destination = joined_dispatch
             .get(&call.provenance_id)
-            .map_or(semantic::Dispatch::Unknown, |(dispatch, target)| {
-                settled_dispatch(*dispatch, target.as_ref(), call)
-            });
+            .map(|(dispatch, target)| (*dispatch, target.as_ref()));
+        let original = captured_dispatch.get(call.provenance_id.as_str()).copied();
+        call.dispatch = rejoined_dispatch([destination, original], call);
         true
     });
     let eligible_proofs: BTreeSet<_> = filtered
