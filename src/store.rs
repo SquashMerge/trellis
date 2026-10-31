@@ -19049,6 +19049,10 @@ impl Store {
         })
     }
 
+    /// Run `write` on a writable index connection. It takes no writer lease, so it is for a
+    /// test that owns the index: no daemon or other writer may be publishing. Its open refuses
+    /// a journal that may be hot, as every writable open does, and a live writer's committing
+    /// journal looks hot from outside its lease (#197).
     #[cfg(feature = "test-support")]
     pub fn with_index_sql_for_tests<T>(
         &self,
@@ -19056,6 +19060,24 @@ impl Store {
     ) -> Result<T> {
         let db = self.cache_write()?;
         write(&db)
+    }
+
+    /// Run `read` on a read-only index connection, the product read path: a live
+    /// publication's journal is SQLite contention (`storage_busy` once the bounded wait is
+    /// spent), never a hot-journal verdict. For tests that read while a daemon publishes.
+    #[cfg(feature = "test-support")]
+    pub fn with_index_read_for_tests<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let db = self.cache()?;
+        let tx = storage_result(db.unchecked_transaction())?;
+        begin_read_snapshot(
+            &tx,
+            &self.roots.index_db(&self.identity),
+            Duration::from_secs(5),
+        )?;
+        read(&tx)
     }
 
     /// Freeze one pin's selected captures and requested tuple attribution in producer order.

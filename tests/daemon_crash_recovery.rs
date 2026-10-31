@@ -535,3 +535,82 @@ fn short_cold_journal_does_not_defer_first_activation() {
         assert!(opened.is_ok(), "{journal_len:?}: {opened:?}");
     }
 }
+
+/// #197: a reader outside the writer lease sees a live publication's journal
+/// with SQLite's magic once the publication has spilled (and so synced the
+/// journal) before COMMIT. That is a live writer, not a crash leftover: the
+/// read path reports typed contention while the writer holds the index, then
+/// reads the committed head. Only a writable open outside the lease, which
+/// the test-support SQL helper is, refuses it as a hot journal.
+#[test]
+fn live_publication_journal_is_contention_for_a_reader_outside_the_lease() {
+    let base = tempfile::tempdir().unwrap();
+    let state = base.path().join("state");
+    let root = base.path().join("work");
+    fs::create_dir(&root).unwrap();
+    rewrite_workspace(&root, "before");
+    let store = Store::open(roots(&state), identity(&root)).unwrap();
+    let accepted = store
+        .enqueue_request(&IndexOptions::new(root.clone()), None)
+        .unwrap();
+    let (_, session) = trellis::index_coordinator::reconcile_workspace(
+        &store,
+        &IndexOptions::new(root.clone()),
+        &cancel(),
+        |_| {},
+    )
+    .unwrap();
+    // A second Store stands in for another Trellis process: its own
+    // publication gate, no writer lease.
+    let reader = Store::open(roots(&state), identity(&root)).unwrap();
+    rewrite_workspace(&root, "after");
+    store.set_publication_cache_kib_for_tests(2000);
+    let journal = index_db(&state, &root).with_file_name("index.db-journal");
+    let (paused_tx, paused) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    store.set_publication_before_commit_hook_for_tests(move || {
+        let header = fs::read(&journal).map(|bytes| bytes[..8].to_vec());
+        paused_tx
+            .send(matches!(header, Ok(bytes) if bytes == SQLITE_JOURNAL_MAGIC))
+            .unwrap();
+        release_rx.recv().unwrap();
+    });
+    let writer = std::thread::spawn(move || {
+        trellis::index_coordinator::drain_requests(&store, &session).unwrap();
+        store
+    });
+    assert!(
+        paused.recv().unwrap(),
+        "the live publication's journal did not carry SQLite's magic"
+    );
+    let count = |db: &rusqlite::Connection| -> anyhow::Result<i64> {
+        Ok(
+            db.query_row("SELECT count(*) FROM native_revisions", [], |row| {
+                row.get(0)
+            })?,
+        )
+    };
+    // The flake's signature: a writable open refuses the live journal.
+    let refused = reader.with_index_sql_for_tests(count).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .starts_with("recovery_required: hot index journal"),
+        "{refused:#}"
+    );
+    // The read path treats the same journal as the live writer it is: typed
+    // contention (`rebuild_in_progress` here, since the Stores share this
+    // process's publication gate; `storage_busy` from another process).
+    let busy = reader.with_index_read_for_tests(count).unwrap_err();
+    assert!(
+        ["storage_busy", "rebuild_in_progress"]
+            .iter()
+            .any(|code| busy.to_string().starts_with(code)),
+        "{busy:#}"
+    );
+    release.send(()).unwrap();
+    let store = writer.join().unwrap();
+    let done = store.request_by_id(&accepted.id).unwrap().unwrap();
+    assert_eq!(done.state, "done", "{done:?}");
+    assert!(reader.with_index_read_for_tests(count).unwrap() > 0);
+}
