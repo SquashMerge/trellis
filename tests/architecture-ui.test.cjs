@@ -671,6 +671,36 @@ test("the full stack stays drawn with deviations, and counted review chips open 
   assert.match(text(h.get("architecture-review-list")), /src\/no-edges.rs/);
 });
 
+// #449 review (P2): the collapsed unassigned row draws metric chips, so its measured modules
+// belong to the heat scale whether or not the row is open.
+test("an all-unassigned view colours its collapsed chips with fixed heat, not 'No measured values'", async () => {
+  const h = harness(), payload = fixture();
+  payload.modules = [["src/hot.rs", 40], ["src/mild.rs", 3]].map(([path, cognitive]) => ({...payload.modules[0], layer:null, identity:identity(path), metrics:{cognitive}}));
+  payload.edges = [];
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  const {options} = h.renders.at(-1);
+  assert.equal(options.display.unassigned.expanded, false, "the unassigned row starts collapsed");
+  assert.doesNotMatch(text(h.get("architecture-legend")), /No measured values/);
+  assert.deepEqual(payload.modules.map(options.moduleBand), [3, 0]);
+  options.display.reset();
+  assert.deepEqual(JSON.parse(JSON.stringify(options.display.summary(null, payload.modules, 4))).map(chip => [chip.shown, chip.band]), [["hot\n40", 3], ["mild\n3", 0]]);
+});
+
+test("Relative cuts include the collapsed unassigned row and stay stable when it opens", async () => {
+  const h = harness(), payload = fixture();
+  payload.modules = [...payload.modules.filter(module => module.layer === "UI"),
+    ...[["src/x.rs", 50], ["src/y.rs", 20], ["src/z.rs", 9]].map(([path, cognitive]) => ({...payload.modules[0], layer:null, identity:identity(path), metrics:{cognitive}}))];
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  h.get("architecture-relative").checked = true; await h.get("architecture-relative").fire("change");
+  const before = h.renders.at(-1), legend = text(h.get("architecture-legend")), bands = payload.modules.map(before.options.moduleBand);
+  assert.match(legend, /Relative to visible set.*>20–50|Relative to visible set.*50/, "the unassigned values set the cuts while the row is collapsed");
+  await before.options.onToggleUnassigned(); await flush();
+  const after = h.renders.at(-1);
+  assert.notEqual(after, before); assert.equal(after.options.display.unassigned.expanded, true);
+  assert.equal(text(h.get("architecture-legend")), legend, "opening the row does not move the cuts");
+  assert.deepEqual(payload.modules.map(after.options.moduleBand), bands);
+});
+
 test("without a refresh button, a rules conflict in a detail list offers an explicit Reload Architecture", async () => {
   const h = harness(); await h.controller.refresh();
   const error = new Error("rules changed"); error.code = "rules_conflict"; error.status = 409; h.setDetailError(error);

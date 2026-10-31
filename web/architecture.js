@@ -386,9 +386,10 @@
       // The inspector's review overview opens before measuring, so the drawing fits the width it gets.
       clearInspection(); overview(); get("architecture-diagram").replaceChildren();
       const layout = summary(payload);
-      // Collapsing layers or directories changes representation, not their module population.
+      // Collapsing layers or directories changes representation, not their module population. The
+      // unassigned row is always drawn (as metric chips when collapsed, #449), so it is always in the scale.
       const visible = payload.modules.filter(module =>
-        (module.layer === null ? shown.unassigned : layout.layers.has(module.layer)) && module.declarationCount > 0);
+        (module.layer === null || layout.layers.has(module.layer)) && module.declarationCount > 0);
       const values = visible.map(module => metricValue(module.metrics, metric));
       const scale = createScale(metric, aggregate, values, relative);
       legend(scale);

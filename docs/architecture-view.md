@@ -220,8 +220,8 @@ production-LOC measurement is claimed.
 Band headers show the maximum available displayed module value at the chosen
 aggregate, not a mean of file means. Heat uses the shared
 [fixed bands](metrics.md#workbench-heat-395) for max/mean. Sum is neutral and labelled relative
-totals. **Relative**, off by default, uses modules in the admitted layers and visible
-unassigned inventory, after measured filtering. Collapsed
+totals. **Relative**, off by default, uses modules in the admitted layers and the
+unassigned inventory (drawn as chips even when collapsed), after measured filtering. Collapsed
 layer/directory summaries include their member modules in that basis; expanding them does not
 move the cuts. The hidden-layer footer can change the Relative basis. Maintainability reverses severity, not values.
 Browser requests set `workbench=true`; stored tests, fixture roots, authored hidden layers and
