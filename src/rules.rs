@@ -257,6 +257,13 @@ pub struct Config {
     external_deny: BTreeSet<ExternalSelector>,
 }
 
+impl Config {
+    /// Authored `[[exceptions]]` entries, as the rules inventory lists them.
+    pub fn exception_count(&self) -> usize {
+        self.exceptions.len()
+    }
+}
+
 pub fn load(root: &Path) -> Result<Option<Config>> {
     let dir = crate::file_tree::SourceDir::open(root)?;
     match dir.read_file(RULES_PATH) {

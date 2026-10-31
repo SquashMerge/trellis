@@ -196,6 +196,10 @@ impl Drop for RunCleanup<'_> {
         if enqueued {
             return;
         }
+        // Strip before the terminal record, as the sweep does, so a reader that sees the
+        // terminal record sees the stripped directory. If the strip fails, the sweep strips
+        // the terminal `abandoned` run later.
+        let _ = self.state.strip_to_record(&self.run.run_id);
         if let Ok(Some(mut record)) = self.state.read_run_record(&self.run.run_id)
             && !record.state.is_terminal()
         {
@@ -205,7 +209,6 @@ impl Drop for RunCleanup<'_> {
             record.finished_at = Some(now_millis());
             let _ = self.state.write_run_record(&record);
         }
-        let _ = self.state.strip_to_record(&self.run.run_id);
     }
 }
 

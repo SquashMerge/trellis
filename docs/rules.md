@@ -96,15 +96,14 @@ display = "hidden" # "expanded" | "collapsed" | "hidden"
 ```
 
 - `"expanded"` draws the band open on its module chips on first view.
-- `"collapsed"` draws a one-line summary band (header and count chips) until the viewer
-  opens it. This is the same as no `display` field.
+- `"collapsed"` draws a summary band (header, count chips and one row of module chips
+  coloured by metric, or a short stack in a shared box, #449) until the viewer opens it. This is the same as no `display` field.
 - `"hidden"` leaves the band out of the diagram and lists it in a footer line
   (`N hidden layers · M files · E edges`) from which the viewer can show it.
 
 Any other value, or a non-string, is a located `invalid_rules` schema error.
-Without the field a band starts collapsed (#391 ruling), and a layer with no
-cross-layer production references is collapsed into the "quiet layers" footer.
-That automatic collapsing never applies to a layer with an explicit `display`.
+Without the field a band starts collapsed (#391 ruling). Every other layer is drawn,
+including one with no cross-layer references: the full stack (#449).
 Under the default production metrics population, a test or fixture layer **without**
 a `display` field (#424: every file is under a fixture root or holds only stored test
 callables) joins the hidden footer until **Include tests and fixtures** is on. An
@@ -115,8 +114,8 @@ references and MCP result are unchanged. The Architecture layer inventory carrie
 [`workbench=true` metrics population](metrics.md#workbench-population), authored
 `display="hidden"` also excludes that layer's files from default production heat.
 Include tests and fixtures restores those contributions. This scoped heat rule does
-not change stored roles or policy. Client-side expansion, quiet layers and automatic
-collapsing do not change metric population.
+not change stored roles or policy. Client-side expansion and collapsing do not change
+metric population.
 Rules edits preserve the field like any other authored text.
 
 ## External package policy

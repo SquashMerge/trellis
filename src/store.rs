@@ -1647,6 +1647,7 @@ impl EvidenceResponse {
             "indexRevision": selected.pin.index_revision,
             "state": if config.is_none() { "missing_rules" } else if layers.is_empty() { "no_layers" } else { "ready" },
             "rulesFile": config.as_ref().map(crate::rules::descriptor),
+            "exceptionCount": config.as_ref().map(crate::rules::Config::exception_count),
             "aggregate": options.aggregate, "metricsVersion": "metrics:v1",
             "role": options.role, "workbench": options.workbench, "evidenceTier": "syntax", "semanticComplete": false,
             "layers": layers, "modules": [], "edges": [], "references": null, "rules": null
@@ -1662,6 +1663,7 @@ impl EvidenceResponse {
         let references = crate::references::project(&snapshot, &[], 5, check)?;
         let evaluated =
             crate::rules::evaluate_with_layers(config, &snapshot, &references, &[], check)?;
+        let references_coverage = &references.coverage;
         let rules = evaluated.data;
         let assignments = evaluated.layers;
         let metrics = self.metrics_at_with_config(
@@ -1820,6 +1822,27 @@ impl EvidenceResponse {
             &rules,
             &crate::architecture_details::Layers::new(&assignments, &rules),
         )?;
+        // Exact site coverage per source layer and role, so drawn counts can be read as
+        // lower bounds next to their arrows (#449). One row per (layer, role).
+        let mut coverage: BTreeMap<(Option<&str>, bool), crate::references::SiteCoverage> =
+            BTreeMap::new();
+        for ((path, test), counted) in references_coverage {
+            check()?;
+            let layer = assignments.get(path.as_str()).copied().flatten();
+            let row = coverage.entry((layer, *test)).or_default();
+            row.sites += counted.sites;
+            row.mapped += counted.mapped;
+            row.unresolved += counted.unresolved;
+        }
+        references["coverage"] = serde_json::json!(
+            coverage
+                .into_iter()
+                .map(|((layer, test), row)| serde_json::json!({
+                    "layer": layer, "role": if test { "test" } else { "production" },
+                    "sites": row.sites, "mappedSites": row.mapped, "unresolvedSites": row.unresolved
+                }))
+                .collect::<Vec<_>>()
+        );
         drop(assignments);
         for value in [&mut references, &mut rules] {
             value["indexGeneration"] = serde_json::json!(snapshot.pin.index_generation.to_string());
