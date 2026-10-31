@@ -101,16 +101,97 @@ fn branches_and_return_guard_suffix() {
 fn question_mark_guards_arguments_outer_call_and_suffix() {
     let (_, view) = fixture("fn run() { outer(first()?, second()); after(); }", "run");
     assert_eq!(calls(&view.steps), ["first", "second", "outer", "after"]);
-    assert!(
-        !view
-            .steps
-            .iter()
-            .any(|s| ["outer", "second", "after"].contains(&s.label.as_str()))
+    // #542: the `?` and the guard it implies fold into `first`, losslessly: the early
+    // return and the guard keep their labels and ranges, and the guarded suffix follows.
+    let labels: Vec<_> = view.steps.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["first", "second", "outer", "after"]);
+    // The `?`, then the guards around `second`, `outer` and `after`.
+    let folded = &view.steps[0].folded;
+    assert_eq!(folded.len(), 4, "{folded:?}");
+    assert_eq!(
+        folded[0].label,
+        "?: continue only on success; otherwise early return"
     );
     assert!(
-        flatten(&view.steps)
+        folded[0]
+            .alternate
             .iter()
             .any(|s| s.kind == "return" && s.label.contains("residual"))
+    );
+    assert_eq!(
+        folded[1].label,
+        "only if the preceding path continues normally"
+    );
+    assert!(folded[1].children.is_empty());
+    assert!(folded[0].range.start_byte <= view.steps[0].range.start_byte);
+    assert!(view.steps[1..].iter().all(|s| s.folded.is_empty()));
+}
+
+/// #542: a guard folds only into the `?` call it guards against: after an `if` that
+/// returns, the guard stays and nests the rest.
+#[test]
+fn guard_after_another_exit_is_not_folded() {
+    let (_, view) = fixture(
+        "fn run(c: bool) -> Option<()> { a()?; if c { return None; } b(); None }",
+        "run",
+    );
+    assert_eq!(view.steps[0].label, "a");
+    assert_eq!(view.steps[0].folded.len(), 2);
+    let guard = view
+        .steps
+        .iter()
+        .find(|s| s.label == "only if the preceding path continues normally")
+        .expect("the guard after the if stays");
+    assert_eq!(calls(&guard.children), ["b"]);
+}
+
+/// #546 review: a `?` folds only into the call that is its direct operand. A tuple index or
+/// field whose base contains a call keeps its branch; the call is not marked.
+#[test]
+fn question_mark_folds_only_into_its_direct_operand_call() {
+    for source in [
+        "fn side() {} fn after() {} fn run(value: Option<u8>) -> Option<u8> { let y = (side(), value).1?; after(); Some(y) }",
+        "struct H { f: Option<u8> } fn make() -> H { H { f: None } } fn after() {} fn run() -> Option<u8> { let y = make().f?; after(); Some(y) }",
+    ] {
+        let (_, view) = fixture(source, "run");
+        assert!(
+            flatten(&view.steps).iter().all(|s| s.folded.is_empty()),
+            "{source}"
+        );
+        assert!(
+            view.steps
+                .iter()
+                .any(|s| s.kind == "branch" && s.label.starts_with("?:")),
+            "{source}: the value try keeps its branch"
+        );
+    }
+    // Parentheses are transparent; the outer call of `outer(x?, b())?` sits under the
+    // argument's continuation guard and still takes its own `?`.
+    let (_, view) = fixture(
+        "fn run(x: Option<u8>) -> Option<u8> { (first())?; outer(x?, b())?; None }",
+        "run",
+    );
+    assert_eq!(view.steps[0].label, "first");
+    assert!(view.steps[0].folded[0].label.starts_with("?:"));
+    let outer = flatten(&view.steps)
+        .into_iter()
+        .find(|s| s.label == "outer")
+        .unwrap();
+    assert!(outer.folded[0].label.starts_with("?:"), "{outer:?}");
+}
+
+/// #542: `x?` on a value has no call to fold into, so its branch and guard stay.
+#[test]
+fn question_mark_on_a_value_keeps_its_branch() {
+    let (_, view) = fixture(
+        "fn run(x: Option<u8>) -> Option<u8> { let y = x?; after(); y }",
+        "run",
+    );
+    assert!(view.steps.iter().any(|s| s.label.starts_with("?:")));
+    assert!(
+        view.steps
+            .iter()
+            .any(|s| s.label.contains("continues normally") && calls(&s.children) == ["after"])
     );
 }
 #[test]
@@ -440,7 +521,11 @@ fn open_options_chain_and_inert_imports() {
         "OpenOptions::new().read(true).write(true).create(true)\n                .truncate(false).mode(0o600).custom_flags(flags()).open(path)"
     );
     assert!(!view.warnings.iter().any(|w| w.contains("use_declaration")));
-    assert!(!view.steps.iter().any(|s| s.label == "after"));
+    // #542: `open(path)?` may return early; the guard it implies folds into it.
+    let open = group.children.last().unwrap();
+    assert_eq!(open.folded.len(), 2);
+    assert!(group.folded.is_empty());
+    assert_eq!(view.steps.last().unwrap().label, "after");
     assert_reversible(&graph, &view);
 }
 #[test]
@@ -738,12 +823,30 @@ fn try_chain_results_stay_syntactic_and_guards_are_preserved() {
     assert_eq!(chain, target_for(&view, "write"));
     assert_eq!(chain, target_for(&view, "close"));
     assert_eq!(target_for(&view, "open").label, "file");
-    assert!(
-        !view
-            .steps
-            .iter()
-            .any(|s| ["read", "write", "close", "after"].contains(&s.label.as_str()))
+    // #542: each `?` and its guard fold into the call it follows; the guarded calls
+    // follow it at the same level.
+    let labels: Vec<_> = view.steps.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["get", "read", "other", "write", "open", "close", "after"]
     );
+    // Each keeps its `?` and every guard it implies (the chain's own and the statement's).
+    for call in ["get", "other", "open"] {
+        let step = view.steps.iter().find(|s| s.label == call).unwrap();
+        let labels: Vec<_> = step.folded.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(
+            labels[0], "?: continue only on success; otherwise early return",
+            "{call}"
+        );
+        assert!(labels.len() > 1, "{call}");
+        assert!(
+            labels[1..]
+                .iter()
+                .all(|l| *l == "only if the preceding path continues normally"),
+            "{call}"
+        );
+    }
+    assert!(view.steps.iter().all(|s| s.kind != "branch"));
     assert_reversible(&graph, &view);
 }
 

@@ -113,6 +113,13 @@ pub struct SequenceStep {
     /// an expanded direct/constructor callee (#522). Absent for the seed's own steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
+    /// Control-flow steps folded into this call (#542): a Rust `?` early-return branch (its
+    /// `alternate` keeps the early return) and the "only if the preceding path continues
+    /// normally" guard that followed it, whose `children` now follow this step directly.
+    /// The call is marked "may return early"; nothing is dropped. Folded steps are not
+    /// counted against any step bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folded: Vec<SequenceStep>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -253,7 +260,7 @@ pub fn build_sequence(
     show_all: bool,
 ) -> Result<SequenceView> {
     let mut view = build_sequence_work(revision, seed, file, calls, show_all)?;
-    cap_visible(&mut view);
+    cap_visible(&mut view, MAX_STEPS);
     Ok(view)
 }
 
@@ -287,9 +294,13 @@ pub const MAX_STEPS: usize = 200;
 /// builds and expands in all, hidden ones included (#536). It keeps hostile input bounded
 /// however many of its steps are hidden.
 pub const MAX_WORK_STEPS: usize = 2000;
+/// The seed's own shown steps when it has a resolved call target (#542): the rest of
+/// [`MAX_STEPS`] is reserved for the callee bodies its first calls expand.
+pub const SEED_STEPS: usize = 150;
 pub(crate) const BOUNDS_WARNING: &str = "Sequence bounds reached (2000 steps of work, 20 participants, depth 24); omitted behavior is unknown.";
 pub(crate) const VISIBLE_WARNING: &str =
     "Sequence step limit reached (200 shown steps); later behavior is not shown.";
+pub(crate) const SEED_WARNING: &str = "Sequence step limit reached (150 shown steps of the method, 50 reserved for callee bodies); later behavior is not shown.";
 
 /// Marks an adapter's view truncated, typed as the work bound when `count` reached it.
 pub(crate) fn adapter_limit(view: &mut SequenceView, count: usize) {
@@ -309,11 +320,13 @@ pub(crate) fn tree_depth(steps: &[SequenceStep]) -> usize {
         .unwrap_or(0)
 }
 
-/// Every step in `steps`, nested ones included.
+/// Every step in `steps`, nested and folded (#542) ones included: the work they hold.
 pub(crate) fn step_count(steps: &[SequenceStep]) -> usize {
     steps
         .iter()
-        .map(|step| 1 + step_count(&step.children) + step_count(&step.alternate))
+        .map(|step| {
+            1 + step_count(&step.children) + step_count(&step.alternate) + step_count(&step.folded)
+        })
         .sum()
 }
 
@@ -339,11 +352,11 @@ pub(crate) fn hidden_count(steps: &[SequenceStep]) -> usize {
         .sum()
 }
 
-/// Keeps the view within [`MAX_STEPS`] shown steps (#536). Steps are kept in pre-order (a
-/// step, its children, then its alternate) up to the bound's last shown step; everything
-/// after it, hidden steps included, is omitted. Hidden steps before it are kept and do not
-/// count.
-pub(crate) fn cap_visible(view: &mut SequenceView) {
+/// Keeps the view within `limit` shown steps: [`MAX_STEPS`], or [`SEED_STEPS`] for a seed
+/// that reserves room for callee bodies (#536, #542). Steps are kept in pre-order (a step,
+/// its children, then its alternate) up to the bound's last shown step; everything after
+/// it, hidden steps included, is omitted. Hidden steps before it are kept and do not count.
+pub(crate) fn cap_visible(view: &mut SequenceView, limit: usize) {
     /// Keeps a prefix of `steps` within `room` shown steps; true when it cut.
     fn cap(steps: &mut Vec<SequenceStep>, room: &mut usize) -> bool {
         for at in 0..steps.len() {
@@ -368,13 +381,18 @@ pub(crate) fn cap_visible(view: &mut SequenceView) {
         }
         false
     }
-    let mut room = MAX_STEPS;
+    let mut room = limit;
     if !cap(&mut view.steps, &mut room) {
         return;
     }
     view.limit(SequenceLimit::VisibleSteps);
-    if !view.warnings.iter().any(|w| w == VISIBLE_WARNING) {
-        view.warnings.push(VISIBLE_WARNING.into());
+    let warning = if limit < MAX_STEPS {
+        SEED_WARNING
+    } else {
+        VISIBLE_WARNING
+    };
+    if !view.warnings.iter().any(|w| w == warning) {
+        view.warnings.push(warning.into());
     }
     view.hidden_steps = hidden_count(&view.steps);
 }

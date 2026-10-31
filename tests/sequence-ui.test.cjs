@@ -922,3 +922,16 @@ test("both renderers draw a resolved call's expanded body on the callee lane", (
   const arrow = d.nodes().find(n => n.attrs.class === "sequence-arrow" && n.attrs["data-trellis-call-id"] === "inner-occurrence");
   assert.ok(arrow.attrs.d.startsWith("M 340 "), arrow.attrs.d);
 });
+
+// #546 review: a collapsed chain whose last call may return early (#542) keeps the marker in
+// its compact SVG label, as Pele, the tooltip and the expanded rows already do.
+test("collapsed chain retains the early-return marker in its compact row", () => {
+  const first = call("Builder::new");
+  const second = {...call("open"), folded:[{id:"try", kind:"branch", label:"?: continue only on success; otherwise early return", path:"main.rs", range,
+    alternate:[{id:"return", kind:"return", label:"?: early return on residual", path:"main.rs", range}]}]};
+  const group = {id:"chain", kind:"group", label:"Builder chain", path:"main.rs", range, children:[first, second]};
+  const d = diagram(viewWith([group]), {showDetails:false});
+  const text = d.nodes().filter(n => n.tag === "tspan").map(n => n.textContent).join(" ");
+  assert.match(text, /calls collapsed \(entry preview\) · may return early/);
+  assert.match(d.row("chain").attrs["aria-label"], /may return early/);
+});
