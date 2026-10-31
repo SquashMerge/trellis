@@ -106,7 +106,7 @@ root/backendworker serves /sequence.js CSPself. UIworker ownsrenderer too.
 Safe DOMtextContent/createElementNS no userHTML/mermaid stringinjection. Every step keyboard-clickable source
 location through existing showSource helper; horizontaloverflowcontaineddiagramnotpage. Sourceaccessiblelist
 orbuttons equivalent; smallscreensusable. Explicit showAllsteps toggles serverrequest. Fileexpandloadsinline
-methods and preservesotherbranches; filterfilepaths localexistingcatalog, showallmethodstoggle. 200filepages
+methods and preservesotherbranches; filter searches the whole pinned catalog server-side (`q`, #447), showallmethodstoggle. 200filepages
 Loadmore control. Concurrencygenerationsperfile+diagram+session+revision prevents stale successANDfailure,
 logout/indexrevision clearcatalog/diagram/state. Showclearloading/empty/unsupported states; labelstaticpossible
 paths and uncalibrated heuristics. Preserveexisting rawquery/question features andtests. No inferencecalls.

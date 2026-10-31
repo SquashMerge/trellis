@@ -951,6 +951,29 @@ test("view toolbars are one row with Options and an About popover; Sequence and 
     assert.ok(boxes.length > 1, `${panel} has toolbar controls`);
     assert.ok(Math.max(...boxes.map(box => box.top)) < Math.min(...boxes.map(box => box.bottom)), `${panel} controls share one row at 1440px`);
   };
+  // Every toolbar popover's full box stays inside the viewport and its visible panel.
+  const inside = async (panel, popover, label) => {
+    const body = page.locator(`${panel} ${popover} > .popover-body`);
+    await body.waitFor({state:"visible"});
+    // Placement runs on the popover's toggle event; wait for it, then check the whole box.
+    await page.waitForFunction(selector => document.querySelector(selector)?.style.left !== "", `${panel} ${popover} > .popover-body`);
+    const {box, frame, width, height} = await body.evaluate((node, selector) => ({box:node.getBoundingClientRect().toJSON(),
+      frame:document.querySelector(selector).getBoundingClientRect().toJSON(), width:innerWidth, height:innerHeight}), panel);
+    assert.ok(box.width > 0 && box.left >= Math.max(0, frame.left) - 1 && box.right <= Math.min(width, frame.right) + 1 &&
+      box.top >= 0 && box.bottom <= height + 1, `${label}: ${JSON.stringify({box, frame, width})}`);
+  };
+  const popovers = [["architecture", "#architecture-panel", [".view-options", ".view-about"]], ["treemap", "#treemap-panel", [".view-options", ".view-about"]],
+    ["classes", "#classes-panel", [".view-about"]], ["sequence", "#sequence-panel", [".view-options", ".view-about"]]];
+  const checkAll = async state => {
+    for (const [view, panel, kinds] of popovers) {
+      await page.locator(`#view-${view}`).click();
+      for (const kind of kinds) {
+        await page.locator(`${panel} ${kind} > summary`).click();
+        await inside(panel, kind, `${view} ${kind} ${state}`);
+        await page.keyboard.press("Escape");
+      }
+    }
+  };
   for (const [view, panel] of [["architecture", "#architecture-panel"], ["treemap", "#treemap-panel"], ["classes", "#classes-panel"]]) {
     await page.locator(`#view-${view}`).click();
     await rowOf(panel);
@@ -961,6 +984,17 @@ test("view toolbars are one row with Options and an About popover; Sequence and 
     await capture(page, `toolbar-${view}-about`);
     await page.keyboard.press("Escape");
   }
+  await checkAll("at 1440px");
+  await page.locator('.directory-pick[title="src/"]').click();
+  await page.locator("#call-inspector").waitFor({state:"visible"});
+  await checkAll("with the inspector open");
+  await capture(page, "toolbar-popover-inspector-open");
+  await page.locator("#inspector-clear").click();
+  for (const width of [900, 390]) {
+    await page.setViewportSize({width, height:844});
+    await checkAll(`at ${width}px`);
+  }
+  await page.setViewportSize({width:1440, height:900});
   await page.locator("#view-architecture").click();
   for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests", "architecture-deviations-only"]) {
     assert.equal(await page.locator(`#${id}`).isVisible(), false, `${id} waits in Options`);
@@ -1006,6 +1040,18 @@ test("the rail is just the tree: its filter searches unopened folders through th
   await match.click();
   await page.locator(".method-pick").filter({hasText:"moderate"}).waitFor();
   await capture(page, "rail-filter-unopened-folder");
+  // Reveal from the filter opens the never-opened ancestors in the live tree.
+  await page.locator(".method-pick").filter({hasText:"moderate"}).click();
+  await page.waitForFunction(() => document.querySelector("#sequence-state")?.textContent.includes("moderate"));
+  await H.reveal(page, "#reveal-method"); await page.locator("#reveal-method").click();
+  await page.locator('.directory-pick[title="src/nested/"][aria-expanded="true"]').waitFor();
+  assert.equal(await filter.inputValue(), "", "reveal clears the filter");
+  assert.equal(await page.locator('.directory-pick[title="src/"]').getAttribute("aria-expanded"), "true");
+  const revealed = page.locator(".method-pick.selected");
+  await revealed.waitFor();
+  assert.match(await revealed.textContent(), /moderate/);
+  assert.equal(await revealed.evaluate(node => document.activeElement === node), true, "focus moves to the revealed method");
+  await capture(page, "rail-reveal-from-filter");
   await filter.fill("no-such-path");
   await page.locator("#file-tree").getByText("No indexed files match.").waitFor();
   await filter.fill("");

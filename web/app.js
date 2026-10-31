@@ -1535,30 +1535,50 @@ $("more-files").addEventListener("click", () => perform(() => $("file-filter").v
 $("method-source").addEventListener("click", () => { if (selectedMethod && status) perform(() => showSource(selectedMethod, status.revision)); });
 
 $("retry-files").addEventListener("click", () => perform(() => loadFiles(retryCatalogReset), $("retry-files")));
-$("reveal-method").addEventListener("click", () => {
-  if (!selectedMethod) return;
+// The live tree path of an indexed path, or null outside the browse root.
+function treePathOf(indexedPath) {
+  if (!treeRoot || !indexedWorkspace) return null;
+  const absolute = `${indexedWorkspace.replace(/\/$/, "")}/${indexedPath}`, base = treeRoot.replace(/\/$/, "");
+  return absolute.startsWith(base + "/") ? absolute.slice(base.length + 1) : null;
+}
+// Reveal opens (loading as needed) every live ancestor folder, even ones never opened, e.g. after
+// the method was found through the whole-catalog filter.
+async function revealSelectedMethod() {
+  const method = selectedMethod;
+  if (!method) return;
+  const guard = browseGuard(), current = () => guard() && selectedMethod === method;
   $("file-filter").value = ""; clearFileFilterResults();
-  if (treeMode) {
-    for (const state of directories.values()) {
-      const entry = state.items?.find(item => item.indexedPath === selectedMethod.path);
-      if (!entry) continue;
-      let path = "";
-      directories.get("").open = true;
-      for (const part of entry.path.split("/").slice(0, -1)) {
-        path = path ? path + "/" + part : part;
-        if (directories.has(path)) directories.get(path).open = true;
+  // Without a known root pair, an already-listed entry still names its live path.
+  const listed = () => { for (const state of directories.values()) { const entry = state.items?.find(item => item.indexedPath === method.path); if (entry) return entry.path; } return null; };
+  const relative = treeMode ? treePathOf(method.path) ?? listed() : null;
+  if (relative) {
+    let parent = "";
+    directoryState("", true).open = true;
+    for (const part of relative.split("/").slice(0, -1)) {
+      const path = parent ? `${parent}/${part}` : part;
+      const above = directoryState(parent, true);
+      // The folder may sit on a later page of its parent listing.
+      while (!above.items?.some(item => item.path === path) && (above.items === null || above.nextOffset != null)) {
+        const before = above.items?.length ?? -1;
+        await loadDirectory(parent, above.items === null);
+        if (!current()) return;
+        if (above.error || (above.items?.length ?? -1) === before) break;
       }
+      directoryState(path, true).open = true;
+      parent = path;
     }
+    const last = directoryState(parent, true);
+    if (last.items === null) { await loadDirectory(parent, true); if (!current()) return; }
   }
-  const parts = selectedMethod.path.split("/"); let directory = "";
+  const parts = method.path.split("/"); let directory = "";
   for (const part of parts.slice(0, -1)) { directory += part + "/"; closedDirectories.delete(directory); }
-  const state = fileStates.get(selectedMethod.path);
-  if (state) state.open = true;
+  if (!fileStates.get(method.path)?.open) { await toggleFile({path:method.path}); if (!current()) return; }
   $("all-methods").checked = true;
   renderFiles();
   const pick = $("file-tree").querySelector(".method-pick.selected");
   pick?.focus({preventScroll:true}); pick?.scrollIntoView?.({block:"nearest"});
-});
+}
+$("reveal-method").addEventListener("click", () => perform(revealSelectedMethod, $("reveal-method")));
 
 function appendMethods(li, file) {
   const state = fileStates.get(file.path);

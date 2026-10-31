@@ -181,8 +181,10 @@ pre { font: 12px/1.7 var(--mono); overflow: auto; background: var(--rail); paddi
 .popover-body p { margin: 0; color: var(--secondary); white-space: normal; }
 .popover-body label { display: flex; align-items: center; gap: 6px; }
 .menu-body > button { width: 100%; text-align: left; }
-.view-about .popover-body { width: min(360px, calc(100vw - 24px)); }
-.view-options .popover-body, .view-about .popover-body { left: 0; right: auto; max-height: min(50dvh, 360px); }
+/* Toolbar popovers are placed by shell.js under their button and clamped to the visible panel and
+   viewport, so a scrolling or narrow panel can neither clip them nor push them off screen. */
+.view-toolbar > .popover > .popover-body { position: fixed; right: auto; width: max-content; min-width: 0; max-width: min(360px, calc(100vw - 16px)); max-height: min(50dvh, 360px); }
+.view-about .popover-body { width: 360px; }
 .view-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 #app-menu .popover-body { width: min(580px, calc(100vw - 24px)); }
 #workspace-details { font-size: 14px; }

@@ -361,8 +361,33 @@
     const action = target.closest(".popover.menu .menu-body > button");
     if (action) action.closest(".popover.menu").open = false;
   });
+  // A toolbar popover sits under its button, clamped inside the visible panel and the viewport.
+  function placePopover(details) {
+    const body = details.querySelector?.(":scope > .popover-body"), summary = details.querySelector?.(":scope > summary");
+    if (!details.closest?.(".view-toolbar") || !body?.getBoundingClientRect || !summary?.getBoundingClientRect) return;
+    const frame = details.closest(".view-panel")?.getBoundingClientRect();
+    const minX = Math.max(8, (frame?.left ?? 0) + 8), maxX = Math.min(window.innerWidth - 8, (frame?.right ?? window.innerWidth) - 8);
+    body.style.maxWidth = `${Math.max(120, maxX - minX)}px`;
+    const anchor = summary.getBoundingClientRect(), width = body.getBoundingClientRect().width;
+    body.style.left = `${Math.max(minX, Math.min(anchor.left, maxX - width))}px`;
+    body.style.top = `${anchor.bottom + 4}px`;
+    body.style.maxHeight = `${Math.max(120, Math.min(360, window.innerHeight - anchor.bottom - 12))}px`;
+  }
   document.addEventListener("toggle", event => {
-    if (event.target?.classList?.contains("popover") && event.target.open) closePopovers(event.target);
+    if (!event.target?.classList?.contains("popover")) return;
+    if (!event.target.open) {
+      // A closed popover forgets its placement, so a later open never shows stale coordinates.
+      const body = event.target.querySelector?.(":scope > .popover-body");
+      for (const key of ["left", "top", "max-width", "max-height"]) body?.style?.removeProperty?.(key);
+      return;
+    }
+    closePopovers(event.target); placePopover(event.target);
+  }, true);
+  // Placed popovers follow their button when the page or panel scrolls or resizes.
+  const placed = () => [...document.querySelectorAll?.(".view-toolbar > details.popover[open]") || []];
+  window.addEventListener?.("resize", () => { for (const node of placed()) placePopover(node); });
+  document.addEventListener("scroll", event => {
+    for (const node of placed()) if (event.target?.contains?.(node)) placePopover(node);
   }, true);
   wireTabs(Object.keys(views), "view-", showView);
   wireTabs(["workspace", "library"], "dock-", showSource);

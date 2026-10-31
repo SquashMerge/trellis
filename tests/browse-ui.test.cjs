@@ -249,10 +249,39 @@ test("catalog errors have an explicit retry and successful retry clears it", asy
   h.context.fetch = async () => response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[],nextOffset:null});
   await h.run("loadFiles(retryCatalogReset)"); assert.equal(h.get("retry-files").hidden, true);
 });
-test("reveal selected method clears filter and reopens its folder and file", () => {
+test("reveal from the filter loads unopened live ancestors, across pages and the index-workspace offset", async () => {
+  const h = harness(), requests = [];
+  h.context.method = {...symbol('deep'), path:'src/deep/a.js'};
+  h.context.fetch = async path => {
+    requests.push(path);
+    if (path.startsWith('/api/methods')) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{symbol:h.context.method,consequential:true}],truncated:false});
+    const dir = new URLSearchParams(path.split('?')[1]).get('path'), offset = new URLSearchParams(path.split('?')[1]).get('offset');
+    if (dir === '' && offset === '0') return response(treePage('', [treeFile('README.md')], 1));
+    if (dir === '') return response(treePage('', [folder('sample')]));
+    if (dir === 'sample') return response(treePage('sample', [folder('sample/src'), treeFile('sample/x.js', 'x.js')]));
+    if (dir === 'sample/src') return response(treePage('sample/src', [folder('sample/src/deep')]));
+    return response(treePage('sample/src/deep', [treeFile('sample/src/deep/a.js', 'src/deep/a.js')]));
+  };
+  await h.run('loadTreeRoot()');
+  h.run('selectedMethod=method'); h.get('file-filter').value = 'a.js';
+  await h.get('reveal-method').listeners.click();
+  assert.equal(h.get('file-filter').value, '');
+  for (const path of ['sample', 'sample/src', 'sample/src/deep']) assert.equal(h.run(`directories.get('${path}').open`), true, path);
+  assert.ok(requests.some(path => path.includes('path=&offset=1&')), 'the parent listing is paged until the folder appears');
+  assert.ok(descendants(h.get('file-tree')).some(n => n.attrs?.['aria-pressed'] === 'true'), 'the selected method is shown');
+  // A selection change while folders load stops the reveal.
+  h.run("directories.clear(); fileStates.clear(); treeMode=true; selectedMethod=method");
+  const slow = deferred(), fetch = h.context.fetch;
+  h.context.fetch = path => path.includes('path=&') ? slow.promise.then(() => fetch(path)) : fetch(path);
+  const pending = h.get('reveal-method').listeners.click();
+  h.run("selectedMethod={id:'other',path:'other.js'}");
+  slow.resolve(); await pending;
+  assert.equal(h.run("directories.get('sample/src')?.open ?? false"), false, 'a superseded reveal opens nothing further');
+});
+test("reveal selected method clears filter and reopens its folder and file", async () => {
   const h = harness(); h.context.method = symbol('selected');
   h.run("files=[{path:'src/a.js',methodCount:1}]; selectedMethod=method; fileStates.set('src/a.js',{open:false,items:[{symbol:method,consequential:false}]}); closedDirectories.add('src/')");
-  h.get("file-filter").value = 'missing'; h.get("reveal-method").listeners.click();
+  h.get("file-filter").value = 'missing'; await h.get("reveal-method").listeners.click();
   assert.equal(h.get("file-filter").value, ''); assert.equal(directory(h).open, true);
   assert.equal(h.run("fileStates.get('src/a.js').open"), true);
   assert.ok(descendants(h.get('file-tree')).some(n => n.attrs?.['aria-pressed'] === 'true'));
@@ -399,7 +428,7 @@ test("stale compact expansion cannot continue into another session request", asy
   assert.equal(h.run("directories.size"), 0);
 });
 
-test("Reveal method reopens all known ancestors of a compact row", () => {
+test("Reveal method reopens all known ancestors of a compact row", async () => {
   const h = harness();
   h.context.method = {...symbol("selected"), path:"Agent.java"};
   h.context.entry = treeFile("java/com/Agent.java", "Agent.java");
@@ -410,7 +439,7 @@ test("Reveal method reopens all known ancestors of a compact row", () => {
     fileStates.set('Agent.java',{open:false,items:[{symbol:method,consequential:true}]});
     renderDirectoryTree();`);
   h.get("file-filter").value = "missing";
-  h.get("reveal-method").listeners.click();
+  await h.get("reveal-method").listeners.click();
   assert.equal(h.run("directories.get('java').open"), true);
   assert.equal(h.run("directories.get('java/com').open"), true);
   assert.equal(h.run("fileStates.get('Agent.java').open"), true);
