@@ -3535,8 +3535,8 @@ fn real_typescript_calls_bind_identically_in_batch_and_memory_joins() {
 }
 
 /// #473: the real #444 bytes with an explicit SCIP kind on the constructor and `run` symbols.
-/// `Method` (26) agrees with their native `method` declarations and binds as kind 0 does;
-/// `Function` (17) conflicts, so neither call binds a target. Batch equals memory either way.
+/// `Constructor` (9) agrees only with the constructor; `Method` (26) agrees with both native
+/// `method` declarations; `Function` (17) conflicts with both. Batch equals memory in each case.
 #[test]
 fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memory() {
     use protobuf::EnumOrUnknown;
@@ -3546,6 +3546,11 @@ fn real_typescript_explicit_symbol_kind_is_checked_identically_in_batch_and_memo
     let read = |path: &str| fs::read_to_string(fixture_dir.join(path)).unwrap();
     let (lib, main) = (read("src/lib.js"), read("src/main.js"));
     for (kind, widget, run) in [
+        (
+            9,
+            (Resolution::Resolved, Constructor),
+            (Resolution::Unresolved, Unknown),
+        ),
         (
             26,
             (Resolution::Resolved, Constructor),
