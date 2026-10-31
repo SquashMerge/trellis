@@ -482,9 +482,8 @@ pub(super) fn coverage_summary(
             "complete" => summary.complete += count,
             "failed" => summary.failed += count,
             "partial" => {
-                let documents = |index| -> rusqlite::Result<usize> {
-                    Ok(row.get::<_, i64>(index)? as usize)
-                };
+                let documents =
+                    |index| -> rusqlite::Result<usize> { Ok(row.get::<_, i64>(index)? as usize) };
                 let occurrences =
                     |index| -> rusqlite::Result<u64> { Ok(row.get::<_, i64>(index)? as u64) };
                 summary.partial += count;
