@@ -265,7 +265,7 @@ impl Builder<'_> {
                 if let Some(mut s) = self.step(n, "branch", TRY_LABEL) {
                     s.alternate.extend(self.step(n, "return", "?: early return on residual; conversion not expanded"));
                     // The call it guards may return early (#542); `x?` keeps its branch.
-                    f.steps.extend(fold_try(&mut value.steps, s));
+                    f.steps.extend(fold_try(&mut value.steps, s, try_operand(n)));
                 }
                 f.exits = true; self.then(value, f, n)
             }
@@ -732,21 +732,46 @@ fn measured_call(step: &SequenceStep) -> bool {
         && step.alternate.is_empty()
 }
 
-/// Folds a `?` early-return branch at `at` into the measured call evaluated just before it,
-/// the last of `steps` and inside the `?`'s own range (#542). `x?` on a value has no such
-/// call and keeps its branch. Lossless: the branch, with its early return as `alternate`, is
-/// kept on the call's `folded`. Returns the branch when it could not be folded.
-fn fold_try(steps: &mut [SequenceStep], branch: SequenceStep) -> Option<SequenceStep> {
-    match steps.last_mut() {
-        Some(call)
-            if measured_call(call)
-                && call.range.start_byte >= branch.range.start_byte
-                && call.range.end_byte <= branch.range.end_byte =>
-        {
+/// The byte range of a `?`'s direct operand, through transparent parentheses, when that
+/// operand is a call (#542). A field, tuple index, await or other value is not.
+fn try_operand(n: Node<'_>) -> Option<(usize, usize)> {
+    let mut operand = n.named_child(0)?;
+    while operand.kind() == "parenthesized_expression" {
+        operand = operand.named_child(0)?;
+    }
+    (operand.kind() == "call_expression").then(|| (operand.start_byte(), operand.end_byte()))
+}
+
+/// Folds a `?` early-return branch into the measured call that is its direct operand
+/// (#542). That call is evaluated last: the last of `steps`, or the last under trailing
+/// "continues normally" guards (`outer(x?, y())?`). A `?` whose operand is not a call keeps
+/// its branch. Lossless: the branch, with its early return as `alternate`, is kept on the
+/// call's `folded`. Returns the branch when it could not be folded.
+fn fold_try(
+    steps: &mut [SequenceStep],
+    branch: SequenceStep,
+    operand: Option<(usize, usize)>,
+) -> Option<SequenceStep> {
+    fn find(steps: &mut [SequenceStep], start: usize, end: usize) -> Option<&mut SequenceStep> {
+        let step = steps.last_mut()?;
+        let exact =
+            measured_call(step) && step.range.start_byte == start && step.range.end_byte == end;
+        let guard =
+            step.kind == "branch" && step.label == CONTINUES_LABEL && step.alternate.is_empty();
+        if exact {
+            Some(step)
+        } else if guard {
+            find(&mut step.children, start, end)
+        } else {
+            None
+        }
+    }
+    match operand.and_then(|(start, end)| find(steps, start, end)) {
+        Some(call) => {
             call.folded.push(branch);
             None
         }
-        _ => Some(branch),
+        None => Some(branch),
     }
 }
 

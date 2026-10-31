@@ -959,6 +959,40 @@ fn sequence_folded_question_marks_let_callee_lanes_expand() {
     }
 }
 
+/// #546 review: a class constructor target keeps its lane but has no body `expand` can
+/// build, so it reserves nothing: the seed keeps all 200 shown steps, in both show-all modes.
+#[test]
+fn sequence_class_only_target_reserves_nothing() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let calls: String = (0..220).map(|n| format!("    x{n}()\n")).collect();
+    let source = format!("class B:\n    pass\ndef a():\n    B()\n{calls}");
+    let mut spec = Spec::new(&[("a.py", &source)]);
+    spec.languages = vec![s::Language::Python];
+    spec.bindings = vec![Bind {
+        dispatch: Dispatch::Constructor,
+        ..bind("a", 0, "B")
+    }];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let class = syntax_id(publisher.native(), "B");
+    for show_all in [false, true] {
+        let view = publisher
+            .store
+            .sequence_at(&seed, pin, show_all)
+            .unwrap()
+            .unwrap();
+        assert_eq!(counts(&view.steps).1, 200, "show_all={show_all}");
+        assert!(view.participants.iter().any(|p| p.id == class));
+        assert!(
+            !view
+                .warnings
+                .iter()
+                .any(|w| w.contains("reserved for callee bodies"))
+        );
+    }
+}
+
 /// #542: the folded steps of an expanded body are relabelled like its other steps: prefixed
 /// by the expanding step's ID and on the callee's lane.
 #[test]

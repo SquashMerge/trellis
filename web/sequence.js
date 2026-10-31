@@ -261,7 +261,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     if (operator) label = `[${label}]`;
     let labels = options.showDetails ? wrap(label, capacity) : [label];
     if (display.kind === "call chain" && !options.showDetails) {
-      const suffix = ` · +${step.children.length-1} calls collapsed (entry preview)`;
+      const suffix = ` · +${step.children.length-1} calls collapsed (entry preview)${early}`;
       // Keep the collapsed count and entry-only claim visible even when the
       // measured name is long. At deep indentation the annotation can wrap.
       labels = wrap((evidence.callEvidence ? `${sequenceEvidenceLabel(evidence, view)} · ` : "") + shorten(evidence.label, Math.max(12, capacity-suffix.length)) + suffix, capacity);

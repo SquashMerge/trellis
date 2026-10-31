@@ -121,12 +121,14 @@ Owner ruling 2026-10-31 (#536, on #531): hidden incidental steps do not consume 
 Owner ruling 2026-10-31 (#542, after #541's measurement of `coordinate`). It amends the
 two sections above.
 
-- **Folded `?`.** In Rust, a `?` applied to a measured call no longer draws its own
-  "?: continue only on success; otherwise early return" branch. The branch, with its early
-  return as `alternate`, moves to the call step's `folded` list. The call then means "may
-  return early", and the browser appends that marker to its row (a chain group shows it
-  when one of its calls carries it). `x?` on a value, which has no call to fold into, keeps
-  its branch.
+- **Folded `?`.** In Rust, a `?` whose direct operand (through parentheses) is a measured
+  call no longer draws its own "?: continue only on success; otherwise early return"
+  branch. The branch, with its early return as `alternate`, moves to that call step's
+  `folded` list. The call then means "may return early", and the browser appends that
+  marker to its row (a chain group shows it when one of its calls carries it, collapsed or
+  not). A `?` on anything else keeps its branch: a value, a field or tuple index (even of a
+  call's result, `make().f?`), an await. The operand call is the one evaluated last, also
+  when it sits under its own arguments' continuation guards (`outer(x?, y())?`).
 - **Folded guards.** An "only if the preceding path continues normally" guard folds into
   the nearest call before it that carries a folded `?`, provided only plain calls (which
   cannot leave the path themselves) come between them. The guard also moves to that call's
@@ -139,12 +141,13 @@ two sections above.
   toward the 2000-step work bound.
 - **Incidental.** A call that may return early is control flow, so it is never incidental,
   even when it is bound external: it stays shown.
-- **Seed reserve: 150 + 50.** When one of the seed's first 150 shown steps is a call with a
-  fresh exact internal target other than the seed itself (a call that can expand), the
-  seed's own shown steps stop at 150 (`SEED_STEPS`). The
-  other 50 of the 200 shown steps (more when the seed is shorter) are left for the bodies
-  its first calls expand, admitted
-  all or nothing in call order as before. A seed with no such call there keeps all 200, and
+- **Seed reserve: 150 + 50.** When one of the seed's first 150 shown steps is a call that
+  can expand, the seed's own shown steps stop at 150 (`SEED_STEPS`). A call can expand when
+  its fresh exact internal target is a function or method other than the seed itself, the
+  same structural test expansion applies; a class constructor target keeps its lane but
+  reserves nothing. The other 50 of the 200 shown steps (more when the seed is shorter) are
+  left for the bodies its first calls expand, admitted all or nothing in call order as
+  before. A seed with no such call there keeps all 200, and
   so does a syntax-only view. When the seed is cut at 150 the warning is "Sequence step limit
   reached (150 shown steps of the method, 50 reserved for callee bodies); later behavior is
   not shown.", typed `visibleSteps`.

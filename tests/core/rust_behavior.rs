@@ -145,6 +145,41 @@ fn guard_after_another_exit_is_not_folded() {
     assert_eq!(calls(&guard.children), ["b"]);
 }
 
+/// #546 review: a `?` folds only into the call that is its direct operand. A tuple index or
+/// field whose base contains a call keeps its branch; the call is not marked.
+#[test]
+fn question_mark_folds_only_into_its_direct_operand_call() {
+    for source in [
+        "fn side() {} fn after() {} fn run(value: Option<u8>) -> Option<u8> { let y = (side(), value).1?; after(); Some(y) }",
+        "struct H { f: Option<u8> } fn make() -> H { H { f: None } } fn after() {} fn run() -> Option<u8> { let y = make().f?; after(); Some(y) }",
+    ] {
+        let (_, view) = fixture(source, "run");
+        assert!(
+            flatten(&view.steps).iter().all(|s| s.folded.is_empty()),
+            "{source}"
+        );
+        assert!(
+            view.steps
+                .iter()
+                .any(|s| s.kind == "branch" && s.label.starts_with("?:")),
+            "{source}: the value try keeps its branch"
+        );
+    }
+    // Parentheses are transparent; the outer call of `outer(x?, b())?` sits under the
+    // argument's continuation guard and still takes its own `?`.
+    let (_, view) = fixture(
+        "fn run(x: Option<u8>) -> Option<u8> { (first())?; outer(x?, b())?; None }",
+        "run",
+    );
+    assert_eq!(view.steps[0].label, "first");
+    assert!(view.steps[0].folded[0].label.starts_with("?:"));
+    let outer = flatten(&view.steps)
+        .into_iter()
+        .find(|s| s.label == "outer")
+        .unwrap();
+    assert!(outer.folded[0].label.starts_with("?:"), "{outer:?}");
+}
+
 /// #542: `x?` on a value has no call to fold into, so its branch and guard stay.
 #[test]
 fn question_mark_on_a_value_keeps_its_branch() {
