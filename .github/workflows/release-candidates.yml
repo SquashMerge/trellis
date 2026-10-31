@@ -10,7 +10,7 @@ on:
       - 'tools/release-smoke.py'
       - 'tools/release-linux.Dockerfile'
       - 'src/build_info.rs'
-      - 'tests/build_identity.rs'
+      - 'tests/daemon/build_identity.rs'
 permissions:
   contents: read
 # Never cancel publication midway through its draft/upload/publish sequence.

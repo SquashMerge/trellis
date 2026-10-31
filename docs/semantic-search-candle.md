@@ -131,8 +131,8 @@ The small external-model fixture test is explicit and fails if provisioning is m
 ```sh
 TRELLIS_PARITY_MODEL_DIR=/absolute/private/model-directory \
 TRELLIS_PARITY_BACKEND=metal \
-cargo test --locked --features test-support,metal --test search_embed \
-  pinned_real_model_matches_saved_fixture -- --ignored --nocapture
+cargo test --locked --features test-support,metal --test core \
+  search_embed::pinned_real_model_matches_saved_fixture -- --exact --ignored --nocapture
 ```
 
 Run with `cpu` as well. The default test lane does not run this external-weight test.

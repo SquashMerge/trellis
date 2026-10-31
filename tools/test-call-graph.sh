@@ -3,8 +3,8 @@
 set -eu
 case "${1:-}" in
   mcp)
-    # mcp_protocol's timing and hook tests need process-per-test isolation, as ./tools/verify uses; plain cargo test fails the same cluster on the unmodified base.
-    cargo nextest run --locked --no-fail-fast --features test-support --lib --test mcp_protocol
+    # mcp_protocol's timing and hook tests (in the mcp test binary) need process-per-test isolation, as ./tools/verify uses; plain cargo test fails the same cluster on the unmodified base.
+    cargo nextest run --locked --no-fail-fast --features test-support --lib --test mcp -E 'kind(lib) | test(/^mcp_protocol::/)'
     node --test tests/mcp-catalog-sdk.test.mjs ;;
   harness)
     cargo build --locked --bin trellis

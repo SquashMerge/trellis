@@ -3,7 +3,55 @@
 # Independent lanes run concurrently. Each lane stops at its first failure;
 # verify waits for every lane, prints each lane's output, and exits with the
 # first failed lane's status.
+#
+# Usage: ./tools/verify [--lane NAME]...
+# With no --lane, every lane runs: rust tests semantic cohorts checks. CI runs
+# lanes as separate jobs by naming them. The rust lane is lint then browser;
+# each half is also a lane of its own, so CI can run them on separate runners.
 set -eu
+
+all_lanes="rust tests semantic cohorts checks"
+lanes=""
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --lane)
+      [ "$#" -ge 2 ] || { echo "verify: --lane needs a lane name" >&2; exit 2; }
+      lane=$2
+      shift 2
+      ;;
+    --lane=*)
+      lane=${1#--lane=}
+      shift
+      ;;
+    *)
+      echo "verify: unknown argument: $1 (usage: ./tools/verify [--lane rust|lint|browser|tests|semantic|cohorts|checks]...)" >&2
+      exit 2
+      ;;
+  esac
+  case $lane in
+    rust | lint | browser | tests | semantic | cohorts | checks) ;;
+    *)
+      echo "verify: unknown lane: $lane" >&2
+      exit 2
+      ;;
+  esac
+  case " $lanes " in
+    *" $lane "*) continue ;;
+  esac
+  lanes="$lanes $lane"
+done
+lanes=${lanes# }
+case " $lanes " in
+  *" rust "*)
+    case " $lanes " in
+      *" lint "* | *" browser "*)
+        echo "verify: the rust lane already runs lint and browser; name either rust or its halves" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+esac
+[ -n "$lanes" ] || lanes=$all_lanes
 
 # User daemon settings must not make tests load local models or change diagnostics.
 # Tests that need these settings set them explicitly on their own child commands.
@@ -41,8 +89,13 @@ trap cleanup EXIT
 # packages (apt) while the lanes build. Only the browser suite at the end of
 # the rust lane needs them, and a slow apt mirror would otherwise hold up the
 # whole run (#244). The lane polls for the status file because it is a
-# subshell and cannot `wait` on its sibling.
-if [ -n "${TRELLIS_BROWSER_SYSTEM_DEPS:-}" ]; then
+# subshell and cannot `wait` on its sibling. Only a run that includes the
+# browser suite starts the install.
+case " $lanes " in
+  *" rust "* | *" browser "*) browser_lane=1 ;;
+  *) browser_lane="" ;;
+esac
+if [ -n "${TRELLIS_BROWSER_SYSTEM_DEPS:-}" ] && [ -n "$browser_lane" ]; then
   (
     start=$(date +%s)
     code=0
@@ -73,26 +126,33 @@ browser_system_deps() {
 }
 
 # Each Cargo target directory belongs to one lane, so no lane waits on
-# another's build lock. The rust lane owns `target`: it lints the production
-# build, lints again with the test-support hooks (off the tests lane's
-# critical path), then builds the debug binary the browser suite runs. The
-# tests lane owns `target-test-support` and runs the tests once, with the
+# another's build lock. The rust lane owns `target`: its lint half lints the
+# production build, then lints again with the test-support hooks (off the tests
+# lane's critical path); its browser half builds the debug binary the browser
+# suite runs. Naming both halves in one run shares `target`, so they take turns
+# on its build lock; CI runs them as separate jobs instead. The tests lane owns `target-test-support` and runs the tests once, with the
 # test-support hooks compiled in.
 target_dir=${CARGO_TARGET_DIR:-target}
 case $target_dir in
   /*) ;;
   *) target_dir=$PWD/$target_dir ;;
 esac
-rust() {
+lint() {
   cargo fmt --all -- --check
   cargo clippy --locked --all-targets -- -D warnings
   cargo clippy --locked --all-targets --features test-support -- -D warnings
+}
+browser() {
   cargo build --locked --features test-support --bin trellis
   cp "$target_dir/debug/trellis" "$target_dir/debug/trellis-navigation-fixture"
   cargo build --locked --bin trellis
   python3 tools/verify-40-query-performance.py --smoke --binary "$target_dir/debug/trellis"
   browser_system_deps
   TRELLIS_NAVIGATION_FIXTURE_BINARY="$target_dir/debug/trellis-navigation-fixture" TRELLIS_SUITE_BINARY="$target_dir/debug/trellis" node --test --test-concurrency=1 tests/browser/sequence-harness.test.cjs tests/browser/pele-block-labels.test.cjs tests/browser/sequence-pele.test.cjs tests/browser/sequence.test.cjs tests/browser/sequence-cost.test.cjs tests/browser/brand.test.cjs tests/browser/connect.test.cjs tests/browser/viewer-shell.test.cjs tests/browser/files.test.cjs tests/browser/architecture-pele.test.cjs tests/browser/architecture.test.cjs tests/browser/treemap.test.cjs tests/browser/classes-pele.test.cjs tests/browser/classes-app.test.cjs tests/browser/classes-languages.test.cjs tests/browser/navigation-resolved.test.cjs
+}
+rust() {
+  lint
+  browser
 }
 tests() {
   if ! nextest_version=$(cargo nextest --version 2>/dev/null); then
@@ -127,7 +187,6 @@ checks() {
   node --test tests/browse-ui.test.cjs tests/sequence-ui.test.cjs tests/token-ui.test.cjs tests/external-source-ui.test.cjs tests/dependency-ui.test.cjs tests/shell-ui.test.cjs tests/classes-ui.test.cjs tests/navigation-ui.test.cjs tests/metric-heat.test.cjs tests/viewer-metrics-ui.test.cjs tests/files-ui.test.cjs tests/architecture-ui.test.cjs tests/architecture-pele-ui.test.cjs tests/treemap-ui.test.cjs tests/treemap-pele.test.cjs
 }
 
-lanes="rust tests semantic cohorts checks"
 started=$(date +%s)
 for lane in $lanes; do
   # The inner subshell keeps errexit (it is not the left side of || or &&);
