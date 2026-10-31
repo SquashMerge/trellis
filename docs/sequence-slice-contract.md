@@ -75,8 +75,9 @@ it adds is read from the same selected snapshot.
   other package) is incidental. `incidentalSteps` counts them; unless `showAll`, they are
   `hidden` and counted in `hiddenSteps`. A chain group whose calls are all hidden is hidden.
 - `callEvidence.semanticBasis` is the selected binding's captured basis, as MCP reports it.
-- Depth 24 bounds the step tree: a step at depth 24 that still nests becomes one `boundary`
-  ("Depth limit: behavior omitted.") at its own range. The Rust adapter bounds its syntax
+- Depth 24 bounds the step tree to 24 levels, as the browser renderers already did: a step
+  on the 24th level that still nests becomes one `boundary` ("Depth limit: behavior
+  omitted.") at its own range. The Rust adapter bounds its syntax
   recursion separately, at 96 levels, so deep syntax that adds no steps keeps its calls.
 
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and

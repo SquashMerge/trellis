@@ -236,7 +236,7 @@ pub fn build_sequence(
     Ok(view)
 }
 
-/// The deepest step nesting a view may carry; top-level steps are at depth 0.
+/// The step levels a view may carry: top-level steps are at depth 0, the deepest at 23.
 pub const MAX_STEP_DEPTH: usize = 24;
 /// The step bound of one view, expanded callee bodies included.
 pub const MAX_STEPS: usize = 200;
@@ -271,7 +271,7 @@ pub(crate) fn cap_depth(view: &mut SequenceView) {
             if step.children.is_empty() && step.alternate.is_empty() {
                 continue;
             }
-            if depth == MAX_STEP_DEPTH {
+            if depth + 1 == MAX_STEP_DEPTH {
                 step.kind = "boundary".into();
                 step.label = "Depth limit: behavior omitted.".into();
                 step.call_id = None;

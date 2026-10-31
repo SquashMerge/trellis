@@ -73,8 +73,7 @@
       rows.push(row); if (!message) noteOrder.push(row);
     };
     const visit = (steps, depth) => {
-      // Depth 24 is the deepest step; its empty child lists are not deeper steps (#522).
-      if (!Array.isArray(steps) || (depth > 24 && steps.length)) unsupported("Unsupported sequence depth");
+      if (!Array.isArray(steps) || depth > 24) unsupported("Unsupported sequence depth");
       for (const step of steps) {
         if (!step || !kinds.has(step.kind) || typeof step.id !== "string" || !step.id || typeof step.label !== "string" ||
             !Array.isArray(step.children) || !Array.isArray(step.alternate) || typeof step.hidden !== "boolean" || !witness(step)) unsupported("Unsupported sequence step");

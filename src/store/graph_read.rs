@@ -882,7 +882,7 @@ impl Enrichment<'_, '_> {
             ));
             return Ok(());
         }
-        if depth + 1 + tree_depth(&body.steps) > MAX_STEP_DEPTH {
+        if depth + 1 + tree_depth(&body.steps) >= MAX_STEP_DEPTH {
             self.truncated = true;
             self.warn(format!(
                 "Sequence depth limit reached; the body of {} is not expanded.",

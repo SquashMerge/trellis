@@ -715,6 +715,36 @@ fn sequence_constructor_can_target_exact_class_declaration() {
     );
 }
 
+/// #522: a direct callee whose body would take the view past 200 steps keeps its lane and
+/// arrow but is not expanded; the view says so and is truncated.
+#[test]
+fn sequence_expansion_respects_the_step_bound() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let body = "x(); ".repeat(200);
+    let source = format!("fn a() {{ big(); }}\nfn big() {{ {body}}}\nfn x() {{}}\n");
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = vec![bind("a", 0, "big")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let big = syntax_id(publisher.native(), "big");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].target.as_deref(), Some(big.as_str()));
+    assert!(steps[0].children.is_empty());
+    assert!(view.truncated);
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w == "Sequence step limit reached; the body of big is not expanded.")
+    );
+}
+
 /// #522: a step the syntax adapter already hid (a standalone `console.log`) that is also
 /// bound external is incidental once, not hidden twice.
 #[test]

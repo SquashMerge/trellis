@@ -320,7 +320,7 @@ fn step_tree_depth_is_capped_with_an_explicit_boundary() {
     );
     let (_, view) = fixture(&source, "run");
     assert!(view.truncated);
-    assert_eq!(depth(&view.steps), 25);
+    assert_eq!(depth(&view.steps), 24);
     let boundary = flatten(&view.steps)
         .into_iter()
         .find(|s| s.label == "Depth limit: behavior omitted.")
