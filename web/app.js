@@ -1368,7 +1368,7 @@ function clearBrowse(message = "Expand a file and select a method.") {
   directories.clear(); treeMode = false; treeRoot = null; indexedWorkspace = "";
   $("index").textContent = "Index workspace";
   fileStates.clear(); closedDirectories.clear(); $("method-source").disabled = true;
-  $("file-tree").replaceChildren(); $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+  $("file-tree").replaceChildren(); $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren(); if ($("sequence-incidental")) $("sequence-incidental").hidden = true;
   $("reveal-method").hidden = true; $("retry-files").hidden = true;
   $("files-state").textContent = ""; $("sequence-state").textContent = message; $("more-files").hidden = true;
 }
@@ -1540,6 +1540,17 @@ async function selectMethod(symbol, admitted = null, callerCurrent = null) {
   await loadSequence(admitted, false, callerCurrent);
   if (callerCurrent() && selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
+// Calls bound to the standard library or another external package are incidental (#522):
+// hidden unless Show all is on. The count comes from the server; this only flips Show all.
+function renderIncidentalToggle(data) {
+  const button = $("sequence-incidental");
+  if (!button) return;
+  const count = Number.isSafeInteger(data?.incidentalSteps) ? data.incidentalSteps : 0, showing = !!$("all-steps").checked;
+  button.hidden = !count;
+  button.textContent = `${showing ? "Hide" : "Show"} ${count} incidental ${count === 1 ? "call" : "calls"}`;
+  button.title = "Calls bound to the standard library or another external package";
+  button.setAttribute("aria-pressed", String(showing));
+}
 async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {
   viewerMetrics?.clearInspection();
   window.TrellisShell?.resetInspector();
@@ -1551,6 +1562,7 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
   const current = () => (published || callerCurrent()) && guard() && section === "diagrams" && surface === sectionSerial && serial === diagramSerial && selectedMethod === symbol;
   if (!preserveSource) clearSource();
   $("sequence-diagram").replaceChildren(); $("sequence-warnings").replaceChildren();
+  if ($("sequence-incidental")) $("sequence-incidental").hidden = true;
   $("sequence-state").textContent = `Loading ${symbol.name}…`;
   await browseRequest(async () => {
     const data = admitted || await api("/api/sequence", "POST", {seed:symbol.id, expectedRevision:revision, showAll:!!$("all-steps").checked}, current);
@@ -1586,7 +1598,8 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
       window.TrellisSequence.render(diagram, data, readSource, expanded, options);
     }
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
-    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
+    renderIncidentalToggle(data);
+    $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${window.TrellisSequence.evidenceSummary(data)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}${outcome.status !== "rendered" ? ` · Pele fell back: ${outcome.reason}` : " · Pele rendered"}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
     published = true;
   }, current, "sequence-state");
@@ -1633,6 +1646,7 @@ $("show-hidden-files").addEventListener("change", event => {
 });
 $("all-methods").addEventListener("change", renderFiles);
 $("all-steps").addEventListener("change", () => loadSequence());
+$("sequence-incidental")?.addEventListener("click", () => { $("all-steps").checked = !$("all-steps").checked; void loadSequence(); });
 $("more-files").addEventListener("click", () => perform(() => $("file-filter").value.trim() && filterResults?.next != null ? searchFiles(filterResults.next) : loadFiles(), $("more-files")));
 
 $("method-source").addEventListener("click", () => { if (selectedMethod && status) perform(() => showSource(selectedMethod, status.revision)); });

@@ -3423,7 +3423,7 @@ def sink():
                 .collect();
             let expected_pin: trellis::model::IndexPin =
                 serde_json::from_value(pin.clone()).unwrap();
-            let expected_sequence = trellis::behavior::build_sequence(
+            let mut expected_sequence = trellis::behavior::build_sequence(
                 expected_pin,
                 &expected_seed,
                 &expected_file,
@@ -3431,6 +3431,10 @@ def sink():
                 false,
             )
             .unwrap();
+            // No producer is published: the store says why it shows syntax (#522).
+            expected_sequence.semantic = trellis::behavior::SequenceSemantic::syntax(Some(
+                trellis::graph_query::NO_PRODUCER_NOTE.into(),
+            ));
             assert_eq!(
                 sequence,
                 serde_json::to_value(&expected_sequence).unwrap(),

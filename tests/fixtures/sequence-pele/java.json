@@ -1,5 +1,6 @@
 {
   "hiddenSteps": 0,
+  "incidentalSteps": 0,
   "participants": [
     {
       "id": "fixture-seed",
@@ -55,6 +56,9 @@
       "startColumn": 17,
       "startLine": 1
     }
+  },
+  "semantic": {
+    "tier": "syntax"
   },
   "steps": [
     {

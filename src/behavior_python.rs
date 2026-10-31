@@ -169,6 +169,7 @@ impl Builder<'_> {
             children: vec![],
             alternate: vec![],
             hidden: false,
+            lane: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -733,7 +734,7 @@ pub fn build(
         seed.range.start_byte < seed.range.end_byte && seed.range.end_byte <= file.text.len(),
         "invalid symbol source range"
     );
-    let mut b = Builder { file, seed, calls, count: 0, visits: 0, future_annotations: false, view: SequenceView { semantic_warnings: vec![],
+    let mut b = Builder { file, seed, calls, count: 0, visits: 0, future_annotations: false, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Python types, imports, dispatch, descriptors, operator/truthiness protocols and implicit exceptions are not resolved. Async/generator bodies show possible execution on await/iteration, not call-time execution. Unsupported definition-time effects remain opaque; function bodies are deferred.".into()], hidden_steps: 0, truncated: false,
     }};
@@ -772,6 +773,7 @@ pub fn build(
             children: vec![],
             alternate: vec![],
             hidden: false,
+            lane: None,
         });
         return Ok(b.view);
     };

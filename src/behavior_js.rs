@@ -125,6 +125,7 @@ impl Builder<'_> {
             children: vec![],
             alternate: vec![],
             hidden: false,
+            lane: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -615,7 +616,7 @@ pub fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, show_all, view: SequenceView { semantic_warnings: vec![],
+    let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, show_all, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded.".into()],
         hidden_steps: 0, truncated: false,
