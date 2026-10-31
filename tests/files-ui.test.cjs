@@ -24,7 +24,7 @@ function harness(windowOptions = {}) {
   const get = id => { if(!elements.has(id)) { const item=node(); item.id=id; elements.set(id,item); } return elements.get(id); };
   const document = {getElementById:get,createElement:node,createElementNS:(_,tag)=>node(tag),createTextNode:value=>({...node("#text"),textContent:value}),createDocumentFragment:()=>node("fragment"),body:node("body"),addEventListener(){}};
   let network = () => { throw new Error("Unexpected request"); };
-  const context = vm.createContext({document, window:{...windowOptions}, console, AbortController, DOMException, TextEncoder, URLSearchParams,
+  const context = vm.createContext({document, window:{...windowOptions}, console, AbortController, DOMException, TextEncoder, TextDecoder, URLSearchParams,
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(url, options){ requests.push({url,options}); if(url === "/api/checkouts") return network(url,options); assert.ok(url.startsWith(`/api/checkouts/${ROOT}/`)); return network("/api/" + url.slice(`/api/checkouts/${ROOT}/`.length),options); }});
   const run = code => vm.runInContext(code, context); run(source);
@@ -609,7 +609,7 @@ test("outline tree keeps types and callables, nests members and lends Rust impl 
   assert.equal(all(open).find(node => node.attrs["data-symbol-id"] === "works").attrs["aria-pressed"], "true");
 });
 
-test("outline tree lists variables bound to functions as callables and attaches an impl to the type beside it", () => {
+test("outline tree keeps function-valued bindings without source by initializer extent and attaches an impl to the type beside it", () => {
   const h = harness();
   const item = (id, nativeKind, parent, startLine, name = id) => ({symbol:{id, name, kind:"function", path:"src/a.rs", parent, range:{startByte:startLine * 10, endByte:startLine * 10 + 5, startLine, startColumn:1, endLine:startLine, endColumn:2}}, nativeKind, header:{}});
   h.context.items = [
@@ -623,8 +623,13 @@ test("outline tree lists variables bound to functions as callables and attaches 
   const tree = h.run("window.TrellisFiles.outlineTree(items, sourceText)");
   const shape = entries => entries.map(entry => [entry.label || entry.item.symbol.id, shape(entry.children)]);
   assert.deepEqual(JSON.parse(JSON.stringify(shape(tree))), [
-    ["handler", []],
     ["a", [["a.X", []]]],
     ["b", [["b.X", [["run", []]]]]],
-  ], "a bound arrow function is a callable; a plain variable is not; impl methods join the same-module type");
+  ], "without an initializer in the source, no variable is a callable; impl methods join the same-module type");
+  // Without source, a function child that ends where the binding ends is its initializer;
+  // a closure passed as an argument ends earlier and does not make the binding a callable.
+  h.context.withoutSource = [...h.context.items,
+    item("callback", "variable", null, 9), {...item("wrapped", "anonymousFunction", "callback", 9, "<anonymousFunction@90>"), symbol:{...item("wrapped", "anonymousFunction", "callback", 9).symbol, range:{startByte:92, endByte:94, startLine:9, startColumn:3, endLine:9, endColumn:5}}}];
+  const fallback = h.run("window.TrellisFiles.outlineTree(withoutSource, undefined)").map(entry => entry.item.symbol.id);
+  assert.deepEqual(JSON.parse(JSON.stringify(fallback)), ["handler", "a", "b", "run"], "a bound arrow is a callable; a value holding a closure argument is not (an unread impl lends its method to the top level)");
 });

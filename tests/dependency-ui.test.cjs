@@ -115,6 +115,22 @@ test("a same-pin status refresh keeps an in-flight catalog read, so waiting entr
  assert.equal(h.run("dependencyCatalog.catalogId"),"catalog-1");
  assert.equal(typeof h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),"function");
 });
+test("a same-pin Refresh makes the next library entry read a ready catalog again",async()=>{
+ const h=harness(), pair={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}; let reads=0, id="catalog-1";
+ h.run("status.workspaceRoot='/synthetic'");
+ h.context.fetch=async url=>{if(url==="/api/dependencies"){reads++;return response(catalog(id));}if(url==="/api/status")return response({revision:pair,stats:{}});if(url.startsWith("/api/tree?"))return response({revision:pair,path:"",root:"/synthetic",items:[],nextOffset:null});throw Error(url);};
+ await h.run("ensureDependencies()");
+ assert.equal(h.run("libraryButton({ecosystem:'rust',name:'thing',origin:'test'})").tagName,"button","a catalog read since the last Refresh answers at once");
+ assert.equal(reads,1);
+ // Another local client refreshed the catalog; this page's Refresh must not keep the old one.
+ id="catalog-2";
+ await h.run("refreshStatus()"); await new Promise(setImmediate);
+ assert.equal(reads,1,"Refresh alone reads no catalog");
+ const slot=h.run("libraryButton({ecosystem:'rust',name:'thing',origin:'test'})");
+ assert.equal(slot.tagName,"span","after Refresh the entry waits for a fresh read");
+ await h.run("ensureDependencies()"); await new Promise(setImmediate);
+ assert.equal(reads,2); assert.equal(h.run("dependencyCatalog.catalogId"),"catalog-2");
+});
 test("a disabled catalog is final for the pin and is not read again",async()=>{
  const h=harness(); let reads=0;
  h.context.fetch=async()=>{reads++;return response({...catalog(),state:"disabled",catalogId:null,packages:[]});};

@@ -845,6 +845,31 @@ test("Architecture preserves a conflicted draft, reloads explicitly and requires
 
 
 
+// #527: the summary is cached per revision, but rules are read live. A rules_conflict from a
+// detail read must make "Reload Architecture" read the current rules, not the cached summary.
+test("Architecture Reload after a detail rules_conflict reads the current rules, not the cached summary", {timeout:240000}, async () => published(rules, async selected => {
+  const {page, paths, requests} = selected;
+  await ready(page); await expandAll(page);
+  const summaries = () => requests.filter(row => row.url.pathname.endsWith("/architecture")).length;
+  const before = summaries();
+  writeFileSync(rulesPath(paths), `${rules}\n# ordinary external editor changed disk at the same revision\n`);
+  const statuses = [];
+  page.on("response", response => { if (new URL(response.url()).pathname.endsWith("/architecture/details")) statuses.push(response.status()); });
+  await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
+  const reload = page.locator("#architecture-inspector").getByRole("button", {name:"Reload Architecture", exact:true});
+  await reload.first().waitFor({timeout:30000}).catch(async error => assert.fail(`${error.message}: details ${JSON.stringify(statuses)} inspector ${await page.locator("#architecture-inspector").textContent()}`));
+  assert.ok(statuses.includes(409), `a detail read refused the old rules hash: ${JSON.stringify(statuses)}`);
+  assert.match(await page.locator("#architecture-inspector-content").textContent(), /Rules changed since this diagram was loaded/);
+  await reload.first().click();
+  for (const deadline = Date.now() + 60000; summaries() === before; await page.waitForTimeout(50)) assert.ok(Date.now() < deadline, "Reload Architecture reads the summary again");
+  await ready(page); await expandAll(page);
+  const details = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/architecture/details"));
+  await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
+  assert.equal((await details).status(), 200, "the reloaded summary carries the current rules hash");
+  await settled(page);
+  assert.doesNotMatch(await page.locator("#architecture-inspector-content").textContent(), /Rules changed since this diagram was loaded/);
+}));
+
 test("Architecture assigns a no-edge unassigned file through exact preview without indexing", {timeout:240000}, async () => published(rules, async selected => {
   const {page} = selected;
   await ready(page);

@@ -468,7 +468,10 @@ async function refreshStatus(followup = false) {
   // next in-context open reads it again, and revalidates a library that is open. A rejected
   // catalog must not recursively request status while a pair refresh is pending.
   // A read still in flight is already current; it is kept so waiting entries are filled.
-  if (nextPin && !pairRefreshPending) { if (dependencyLoad?.settled) dependencyLoad = null; if (dependencyChoice) void ensureDependencies(); }
+  if (nextPin && !pairRefreshPending) {
+    if (!dependencyLoad || dependencyLoad.settled) { dependencyLoad = null; if (dependencyCatalog) dependencyCatalog.stale = true; }
+    if (dependencyChoice) void ensureDependencies();
+  }
   } finally {
     statusRefreshDepth--;
     if (!statusRefreshDepth && pairRefreshQueued) {
@@ -1221,14 +1224,27 @@ async function renderFilesMini(current) {
   $("files-open-full").disabled = false;
 }
 // The preview scales down to the inspector's width (#451). Text that overflows the drawing's
-// own box is included so nothing clips; when the scaled text would be smaller than
-// FILES_MINI_MIN_TEXT_PX, the preview says so instead of drawing it (#514).
+// own box is included so nothing clips; when the smallest text as actually rendered would be
+// under FILES_MINI_MIN_TEXT_PX, the preview says so instead of drawing it (#514).
 const FILES_MINI_MIN_TEXT_PX = 9;
+// The smallest rendered text size: each label's font size times its own screen scale.
+function smallestTextPx(svg) {
+  let smallest = Infinity;
+  const labels = [...svg.querySelectorAll("text, foreignObject")].slice(0, 2000);
+  for (const label of labels) {
+    const styled = label.tagName.toLowerCase() === "foreignobject" ? label.querySelector("*") : label;
+    const matrix = label.getScreenCTM?.(), size = styled ? parseFloat(getComputedStyle(styled).fontSize) : NaN;
+    if (!matrix || !Number.isFinite(size) || !(label.textContent || "").trim()) continue;
+    smallest = Math.min(smallest, size * Math.hypot(matrix.a, matrix.b));
+  }
+  return smallest;
+}
 function fitFilesMini() {
   const container = $("files-mini-sequence"), svg = container?.querySelector?.(":scope > svg");
-  // The section's width, so hiding an unreadable drawing does not change the measure.
-  const floor = $("files-mini-floor"), available = container?.parentElement?.clientWidth || 0;
-  if (!svg || !available) { container?.removeAttribute?.("data-fit"); if (floor) floor.hidden = true; return; }
+  const floor = $("files-mini-floor");
+  // Measure the drawing as it lays out in the inspector: shown, at its scaled size.
+  container?.removeAttribute?.("data-fit");
+  if (!svg || !container.clientWidth || typeof svg.getScreenCTM !== "function") { if (floor) floor.hidden = true; return; }
   const view = svg.viewBox?.baseVal;
   if (view?.width > 0 && view.height > 0 && typeof svg.getBBox === "function") {
     try {
@@ -1240,20 +1256,25 @@ function fitFilesMini() {
       }
     } catch (_) { /* An unrendered drawing keeps its own box. */ }
   }
-  const width = svg.viewBox?.baseVal?.width || Number(svg.getAttribute("width")) || 0;
-  const text = svg.querySelector("text");
-  const font = text ? parseFloat(getComputedStyle(text).fontSize) || 12 : 12;
-  const scale = width > 0 ? Math.min(1, available / width) : 1;
-  const unreadable = font * scale < FILES_MINI_MIN_TEXT_PX;
+  const smallest = smallestTextPx(svg);
+  const unreadable = smallest < FILES_MINI_MIN_TEXT_PX;
   container.setAttribute("data-fit", unreadable ? "floor" : "scaled");
-  container.setAttribute("data-text-px", (font * scale).toFixed(1));
+  if (Number.isFinite(smallest)) container.setAttribute("data-text-px", smallest.toFixed(2)); else container.removeAttribute("data-text-px");
   if (floor) floor.hidden = !unreadable;
 }
 if (typeof MutationObserver === "function" && $("files-mini-sequence")) {
   // Pele redraws the preview in place when a group is toggled; fit each drawing.
   new MutationObserver(() => fitFilesMini()).observe($("files-mini-sequence"), {childList:true});
 }
-if (typeof ResizeObserver === "function" && $("files-mini-sequence")?.parentElement) new ResizeObserver(() => fitFilesMini()).observe($("files-mini-sequence").parentElement);
+if (typeof ResizeObserver === "function" && $("files-mini-sequence")?.parentElement) {
+  // Only a width change can change the fit; showing the floor changes the height alone.
+  let fittedWidth = null;
+  new ResizeObserver(entries => {
+    const width = Math.round(entries.at(-1)?.contentRect?.width || 0);
+    if (width === fittedWidth) return;
+    fittedWidth = width; fitFilesMini();
+  }).observe($("files-mini-sequence").parentElement);
+}
 $("files-mini-floor-open")?.addEventListener("click", () => perform(openFilesFull, $("files-mini-floor-open")));
 async function openFilesFull() {
   if (section !== "files" || !filesMini || !filesSymbol || !IndexPin.equal(filesMini.revision, status?.revision)) return;
@@ -1731,7 +1752,8 @@ const compactDirectoryDepth = 32;
 // edit applied here drops them. An in-flight read is shared; each caller gets its own copy.
 const revisionReads = new Map();
 let revisionReadsKey = null;
-function clearRevisionReads() { revisionReads.clear(); revisionReadsKey = null; }
+let architectureRulesHash = null;
+function clearRevisionReads() { revisionReads.clear(); revisionReadsKey = null; architectureRulesHash = null; }
 async function revisionRead(path, current = () => true) {
   const route = path.split("?", 1)[0];
   if (!["/api/architecture", "/api/metrics"].includes(route) || !status?.revision) return api(path, "GET", undefined, current);
@@ -1765,12 +1787,22 @@ const treemap = window.TrellisTreemap?.create({
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
 });
 const architecture = window.TrellisArchitecture?.create({
+  // The rules file is read live, so it can change at the same revision. Any sign that it did
+  // drops the cached reads, so "Reload Architecture" and every recovery read the current file:
+  // a rules_conflict from any read, a rules read whose hash differs from the cached summary's,
+  // and any rules preview or apply.
   request: async (path, current, options = {}) => {
-    if ((options.method || "GET") === "GET") return revisionRead(path, current);
-    // Rules edits read and write the rules file on disk: an applied edit, or a conflict that
-    // shows the file changed elsewhere, changes architecture and metrics at the same revision.
-    try { return await api(path, options.method, options.body, current); }
-    finally { if (path.startsWith("/api/architecture/rules/")) clearRevisionReads(); }
+    const route = path.split("?", 1)[0], method = options.method || "GET";
+    try {
+      const data = method === "GET" ? await revisionRead(path, current) : await api(path, method, options.body, current);
+      const hash = data?.payload?.rulesFile?.contentHash;
+      if (route === "/api/architecture" && hash) architectureRulesHash = hash;
+      else if (route === "/api/architecture/rules" && hash && architectureRulesHash && hash !== architectureRulesHash) clearRevisionReads();
+      return data;
+    } catch (error) {
+      if (error?.code === "rules_conflict") clearRevisionReads();
+      throw error;
+    } finally { if (method === "POST" && route.startsWith("/api/architecture/rules/")) clearRevisionReads(); }
   },
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
@@ -2269,7 +2301,8 @@ async function openLibrary(packages, reference) {
 // Before the catalog is read, an empty slot holds the place of the button; it gains the
 // button only if the loaded catalog indexes the package.
 function libraryButton(reference) {
-  if (dependencyCatalog?.state === "ready") return libraryNode(reference);
+  // A catalog read for this pin since the last Refresh answers at once; otherwise read it first.
+  if (dependencyCatalog?.state === "ready" && !dependencyCatalog.stale) return libraryNode(reference);
   if (!libraryEcosystems[reference?.ecosystem] || typeof reference?.name !== "string" || !reference.name || !status?.revision) return null;
   const slot = element("span", undefined, "library-slot"), session = epoch, pin = IndexPin.copy(status.revision);
   void ensureDependencies().then(() => {

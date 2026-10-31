@@ -28,6 +28,23 @@
     const match = /^\s*(?:(?:pub(?:\([^)]*\))?|unsafe|default)\s+)*impl\b\s*(?:<[^{]*?>\s*)?(?:[^{]*?\bfor\s+)?(?:&\s*)?(?:dyn\s+)?([A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*)/.exec(head);
     return match ? match[1].split("::").at(-1) : null;
   }
+  // The initializer is read from the binding's own measured byte range: the text after its
+  // first assignment `=`. Without source, a function child that ends where the binding ends is
+  // its initializer (a closure passed as an argument ends before the call's `)`).
+  const FUNCTION_INITIALIZER = /^\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)|^\s*lambda\b/;
+  let encoded = {text:null, bytes:null};
+  function functionValued(item, items, sourceText) {
+    const range = item.symbol.range;
+    if (typeof sourceText === "string" && Number.isSafeInteger(range?.startByte) && Number.isSafeInteger(range?.endByte)) {
+      if (encoded.text !== sourceText) encoded = {text:sourceText, bytes:new TextEncoder().encode(sourceText)};
+      const end = Math.min(range.endByte, range.startByte + 512, encoded.bytes.length);
+      const text = new TextDecoder().decode(encoded.bytes.subarray(range.startByte, end));
+      const assign = /(?<![=!<>])=(?![=>])/.exec(text);
+      return !!assign && FUNCTION_INITIALIZER.test(text.slice(assign.index + 1));
+    }
+    return items.some(child => child.symbol.parent === item.symbol.id && ["function", "anonymousFunction"].includes(child.nativeKind) &&
+      Number.isSafeInteger(range?.endByte) && child.symbol.range?.endByte === range.endByte);
+  }
   function outlineTree(items, sourceText) {
     const byId = new Map(items.map(item => [item.symbol.id, item]));
     const nodes = new Map(), roots = [];
@@ -36,12 +53,10 @@
     const typesByName = new Map();
     for (const item of items) if (item.nativeKind === "type") typesByName.set(item.symbol.name, [...(typesByName.get(item.symbol.name) || []), item]);
     const typeFor = (name, impl) => { const types = typesByName.get(name) || []; return types.find(type => type.symbol.parent === impl.symbol.parent) || types[0]; };
-    // A variable bound to a function (`const f = () => {}`, `f = lambda: …`) is a callable row.
+    // A variable whose initializer is a function (`const f = () => {}`, `const g = function () {}`,
+    // `f = lambda: …`) is a callable row; a value that merely contains a closure is not.
     const boundFunctions = new Set();
-    for (const item of items) {
-      const parent = byId.get(item.symbol.parent);
-      if (item.nativeKind === "anonymousFunction" && parent?.nativeKind === "variable") boundFunctions.add(parent.symbol.id);
-    }
+    for (const item of items) if (item.nativeKind === "variable" && functionValued(item, items, sourceText)) boundFunctions.add(item.symbol.id);
     const callable = item => CALLABLES.has(item.nativeKind) || boundFunctions.has(item.symbol.id);
     // A named impl container per target type that is not declared in this file.
     const implRows = new Map(), implOwner = new Map();

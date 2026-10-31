@@ -61,3 +61,5 @@ body.files-section .browse-options, body.files-section #reveal-method { display:
 @media (min-width:1600px) { body.files-section .workspace-frame { grid-template-columns: 268px minmax(0, 1fr) 310px; } }
 @media (max-width:1200px) { body.files-section .workspace-frame { grid-template-columns: 214px minmax(0, 1fr) 250px; } }
 @media (max-width:900px) { body.files-section .workspace-frame { grid-template-columns: minmax(0, 1fr); } }
+/* The inspector keeps its scrollbar gutter, so showing or hiding the preview never changes its width. */
+body.files-section .call-inspector { scrollbar-gutter: stable; }

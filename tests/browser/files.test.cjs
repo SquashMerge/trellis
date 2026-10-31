@@ -33,8 +33,9 @@ ${Array.from({length:53}, (_, i) => `    watcher.measured(${i + 2});`).join("\n"
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published({git = false, width = 1440, sourceText = source} = {}, callback) {
+async function published({git = false, width = 1440, sourceText = source, files = {}} = {}, callback) {
   const paths = H.fixture(sourceText, "Watcher.java");
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(paths.workspace, name), text);
   writeFileSync(join(paths.workspace, "Uses.java"), uses);
   writeFileSync(join(paths.workspace, "clean.js"), "const clean = 1;\n");
   writeFileSync(join(paths.workspace, hostileName), "// <script>globalThis.sourceExecuted=true</script>\nconst safe = 'λ';\n");
@@ -385,6 +386,35 @@ test("Files mini-sequence keeps caveats behind ⓘ, fits the inspector and floor
     return box.x < view.x - 0.5 || box.y < view.y - 0.5 || box.x + box.width > view.x + view.width + 0.5 || box.y + box.height > view.y + view.height + 0.5;
   });
   assert.equal(clipped, false, "no label runs past the drawing's box");
+  // A simple return-only callable across ordinary column widths: whenever it is drawn, every label
+  // is at least 9 px on screen, measured from geometry (screen box over user box), not the estimate.
+  const rendered = () => page.locator("#files-mini-sequence").evaluate(node => {
+    const drawnNow = node.offsetParent !== null, svg = node.querySelector("svg");
+    if (!drawnNow || !svg) return {drawn:false, floor:!document.querySelector("#files-mini-floor").hidden};
+    let smallest = Infinity;
+    for (const text of svg.querySelectorAll("text")) {
+      if (!text.textContent.trim()) continue;
+      const user = text.getBBox(), screen = text.getBoundingClientRect();
+      if (!user.height || !screen.height) continue;
+      smallest = Math.min(smallest, parseFloat(getComputedStyle(text).fontSize) * screen.height / user.height);
+    }
+    return {drawn:true, floor:!document.querySelector("#files-mini-floor").hidden, smallest};
+  });
+  await selectSymbol(page, (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "helper"));
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false && document.querySelector("#files-mini-sequence")?.dataset.fit);
+  const states = new Set();
+  for (const width of [250, 284, 300, 320, 340, 360, 400, 450, 520, 640, 900]) {
+    await widen(width);
+    await page.waitForFunction(width => Math.abs(document.querySelector("#call-inspector").getBoundingClientRect().width - width) < 1, width);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const state = await rendered();
+    states.add(state.drawn);
+    if (state.drawn) assert.ok(state.smallest >= 8.95 && !state.floor, `drawn at ${width}px with readable text: ${JSON.stringify(state)}`);
+    else assert.ok(state.floor, `not drawn at ${width}px, so the floor shows: ${JSON.stringify(state)}`);
+  }
+  assert.deepEqual([...states].sort(), [false, true], "the sweep crosses the readable boundary");
+  await selectSymbol(page, method);
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false && document.querySelector("#files-mini-sequence")?.dataset.fit);
   await widen(150);
   await page.waitForFunction(() => document.querySelector("#files-mini-sequence")?.dataset.fit === "floor");
   const narrow = await fit();
@@ -394,6 +424,26 @@ test("Files mini-sequence keeps caveats behind ⓘ, fits the inspector and floor
   await page.waitForFunction(() => !document.body.classList.contains("files-section") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
   const route = new URLSearchParams((await page.evaluate(() => location.hash)).slice("#sequence?".length));
   assert.equal(route.get("sid"), method.symbol.id);
+}));
+
+// #526: a binding whose initializer is a function is a callable row, measured from the real
+// JavaScript producer's ranges; a value that merely contains a closure is not.
+const bindings = `const anon = function() { return 2; };
+const named = function inner() { return 3; };
+const arrow = (value) => value + 1;
+const callback = wrap(() => 4);
+const plain = 5;
+function wrap(f) { return f; }
+`;
+test("Files outlines function-valued bindings from the real producer, not values that contain a closure", {timeout:240000}, async () => published({files:{"bindings.js":bindings}}, async selected => {
+  const {page} = selected;
+  await enterFiles(selected); await openFile(selected, "bindings.js");
+  const dto = await outline(selected, "bindings.js");
+  const byName = name => dto.items.find(item => item.symbol.name === name);
+  for (const name of ["anon", "named", "inner", "arrow", "callback", "plain", "wrap"]) assert.ok(byName(name), `producer emits ${name}: ${JSON.stringify(dto.items.map(item => [item.symbol.name, item.nativeKind]))}`);
+  await page.locator(`.files-symbol-pick[data-symbol-id="${byName("anon").symbol.id}"]`).waitFor();
+  const rows = await page.locator(".files-symbol-pick").evaluateAll(nodes => nodes.map(node => node.querySelector(".files-symbol-name").textContent));
+  assert.deepEqual(rows, ["anon", "named", "arrow", "wrap"], "function-valued bindings and declarations; no inner name, closure-holding value or plain value");
 }));
 
 // #426: icon plus name on one line, with kind and line right-aligned.
