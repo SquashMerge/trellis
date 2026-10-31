@@ -139,12 +139,13 @@ two sections above.
   toward the 2000-step work bound.
 - **Incidental.** A call that may return early is control flow, so it is never incidental,
   even when it is bound external: it stays shown.
-- **Seed reserve: 150 + 50.** When the seed has a call with a fresh exact internal target
-  (the calls that can expand), the seed's own shown steps stop at 150 (`SEED_STEPS`). The
+- **Seed reserve: 150 + 50.** When one of the seed's first 150 shown steps is a call with a
+  fresh exact internal target other than the seed itself (a call that can expand), the
+  seed's own shown steps stop at 150 (`SEED_STEPS`). The
   other 50 of the 200 shown steps (more when the seed is shorter) are left for the bodies
   its first calls expand, admitted
-  all or nothing in call order as before. A seed with no such target keeps all 200, and so
-  does a syntax-only view. When the seed is cut at 150 the warning is "Sequence step limit
+  all or nothing in call order as before. A seed with no such call there keeps all 200, and
+  so does a syntax-only view. When the seed is cut at 150 the warning is "Sequence step limit
   reached (150 shown steps of the method, 50 reserved for callee bodies); later behavior is
   not shown.", typed `visibleSteps`.
 - **Show all** applies the same split: nothing is incidental-hidden, the seed stops at 150

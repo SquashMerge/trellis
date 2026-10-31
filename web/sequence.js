@@ -235,7 +235,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       (!options.isCurrent || options.isCurrent()) &&
       (typeof options.onSelect === "function" || typeof readSource === "function");
     const call = ["call", "boundary"].includes(evidence.kind) && evidence.callId, proof = call ? provenance(evidence) : null;
-    const fullLabel = tooltip(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
+    const fullLabel = tooltip(step) + sequenceEarlyReturn(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
     const control = make("g", {class:"sequence-source", "data-source-step-id":step.id,
       ...(interactive ? {role:"button", tabindex:0, "aria-label":`${options.onSelect ? "Inspect" : "Read source"}: ${fullLabel}`, "aria-pressed":String(selection.id === step.id)} : {})});
     // Compact controls remain individual, ordered fragments. No matching guard

@@ -127,6 +127,24 @@ fn question_mark_guards_arguments_outer_call_and_suffix() {
     assert!(view.steps[1..].iter().all(|s| s.folded.is_empty()));
 }
 
+/// #542: a guard folds only into the `?` call it guards against: after an `if` that
+/// returns, the guard stays and nests the rest.
+#[test]
+fn guard_after_another_exit_is_not_folded() {
+    let (_, view) = fixture(
+        "fn run(c: bool) -> Option<()> { a()?; if c { return None; } b(); None }",
+        "run",
+    );
+    assert_eq!(view.steps[0].label, "a");
+    assert_eq!(view.steps[0].folded.len(), 2);
+    let guard = view
+        .steps
+        .iter()
+        .find(|s| s.label == "only if the preceding path continues normally")
+        .expect("the guard after the if stays");
+    assert_eq!(calls(&guard.children), ["b"]);
+}
+
 /// #542: `x?` on a value has no call to fold into, so its branch and guard stay.
 #[test]
 fn question_mark_on_a_value_keeps_its_branch() {

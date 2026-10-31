@@ -867,9 +867,9 @@ fn sequence_hidden_incidental_steps_do_not_use_the_visible_bound() {
     }
 }
 
-/// #536: Show all still respects the visible bound: the shown prefix of a seed with
-/// resolved targets stops at its 150 steps (#542 reserve) and the view is truncated with
-/// the typed `visibleSteps` reason.
+/// #536: Show all still respects the visible bound: the shown prefix stops at 200 steps and
+/// the view is truncated with the typed `visibleSteps` reason. The callees come after the
+/// 150th step, so nothing is reserved for their bodies (#542).
 #[test]
 fn sequence_show_all_truncates_at_the_visible_bound() {
     let (state, root) = workspace();
@@ -886,14 +886,10 @@ fn sequence_show_all_truncates_at_the_visible_bound() {
         view.truncated_by,
         [trellis::behavior::SequenceLimit::VisibleSteps]
     );
-    assert_eq!(counts(&view.steps), (150, 150));
-    assert_eq!((view.incidental_steps, view.hidden_steps), (150, 0));
+    assert_eq!(counts(&view.steps), (200, 200));
+    assert_eq!((view.incidental_steps, view.hidden_steps), (200, 0));
     assert!(view.steps.iter().all(|step| step.target.is_none()));
-    assert!(
-        view.warnings
-            .iter()
-            .any(|w| w.contains("50 reserved for callee bodies"))
-    );
+    assert!(view.warnings.iter().any(|w| w.contains("200 shown steps")));
     let json = serde_json::to_value(&view).unwrap();
     assert_eq!(json["truncatedBy"], serde_json::json!(["visibleSteps"]));
 }
@@ -960,6 +956,33 @@ fn sequence_folded_question_marks_let_callee_lanes_expand() {
             .find(|step| step.target.as_deref() == Some(callee.as_str()))
             .unwrap_or_else(|| panic!("{name} has a lane"));
         assert_eq!(step.children.len(), 1, "{name} is expanded");
+    }
+}
+
+/// #542: the folded steps of an expanded body are relabelled like its other steps: prefixed
+/// by the expanding step's ID and on the callee's lane.
+#[test]
+fn sequence_expanded_body_relabels_folded_steps() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = "fn a() { b(); }\nfn b() -> Option<()> { x()?; y(); None }\n";
+    let mut spec = Spec::new(&[("a.rs", source)]);
+    spec.bindings = vec![bind("a", 0, "b")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let b = syntax_id(publisher.native(), "b");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let call = &view.steps[0];
+    let x = &call.children[0];
+    assert_eq!(x.folded.len(), 2);
+    assert_eq!(call.children[1].label, "y");
+    for step in x.folded.iter().chain(&x.folded[0].alternate) {
+        assert!(step.id.starts_with(&format!("{}>", call.id)), "{}", step.id);
+        assert_eq!(step.lane.as_deref(), Some(b.as_str()));
     }
 }
 
