@@ -631,6 +631,89 @@ async fn architecture_summary_counts_equal_cli_and_details_page_at_the_same_pin(
     assert_eq!(conflict["error"]["code"], "rules_conflict");
 }
 
+/// #449: the summary carries exact per-layer site coverage (so drawn counts can be read as
+/// lower bounds) and the authored exception count, bounded by the layers and equal to the
+/// reference counts at the same pin.
+#[tokio::test]
+async fn architecture_summary_reports_layer_site_coverage_and_exception_count() {
+    let (base, _runtime, browser, key) = fixture_with_roles(true).await;
+    write_rules(
+        &base,
+        "version=1\n[layers.app]\norder=2\npaths=['src/roles.rs','tests/**']\n[layers.target]\norder=1\npaths=['src/target.rs']\n[[exceptions]]\nrule='$layers'\ntarget={language='rust',path='src/roles.rs'}\ndestination={language='rust',path='src/target.rs'}\nreason='Reviewed'",
+    );
+    let app = browser.router();
+    let (status, summary) = request(app.clone(), &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let summary = &summary["payload"];
+    assert_eq!(summary["exceptionCount"], 1);
+    let coverage = summary["references"]["coverage"].as_array().unwrap();
+    let layers = summary["layers"].as_array().unwrap().len();
+    assert!(!coverage.is_empty() && coverage.len() <= 2 * (layers + 1));
+    let sum = |field: &str| {
+        coverage
+            .iter()
+            .map(|row| row[field].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let counts = &summary["references"]["counts"];
+    assert_eq!(sum("mappedSites"), counts["mappedSites"].as_u64().unwrap());
+    assert_eq!(
+        sum("unresolvedSites"),
+        counts["unresolvedSites"].as_u64().unwrap()
+    );
+    let mut keys = std::collections::BTreeSet::new();
+    for row in coverage {
+        assert!(
+            row["layer"].is_null() || ["app", "target"].contains(&row["layer"].as_str().unwrap())
+        );
+        assert!(["production", "test"].contains(&row["role"].as_str().unwrap()));
+        assert!(keys.insert((row["layer"].to_string(), row["role"].to_string())));
+        let sites = row["sites"].as_u64().unwrap();
+        let (mapped, unresolved) = (
+            row["mappedSites"].as_u64().unwrap(),
+            row["unresolvedSites"].as_u64().unwrap(),
+        );
+        assert!(
+            sites > 0 && mapped <= sites && unresolved <= sites && sites <= mapped + unresolved,
+            "{row}"
+        );
+    }
+    // Both production references in src/roles.rs (plain and feature test-support) map to src/target.rs.
+    let covered = coverage
+        .iter()
+        .find(|row| row["layer"] == "app" && row["role"] == "production")
+        .unwrap();
+    assert_eq!(covered["sites"], 2, "{covered}");
+    assert_eq!(covered["mappedSites"], 2);
+    assert_eq!(covered["unresolvedSites"], 0);
+    let app_up: u64 = summary["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|edge| edge["sourceLayer"] == "app" && edge["role"] == "production")
+        .map(|edge| edge["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        app_up, 2,
+        "every mapped app site is drawn, so its arrow is exact"
+    );
+    // Coverage is exact detail, not a sample: the paged unresolved sites agree with it.
+    let pin = format!(
+        "indexGeneration={}&indexRevision={}&rulesHash={}",
+        summary["indexGeneration"].as_str().unwrap(),
+        summary["indexRevision"],
+        url_encode(summary["rulesFile"]["contentHash"].as_str().unwrap())
+    );
+    let unresolved = all_details(&app, &key, &format!("kind=unresolved&{pin}"), 50).await;
+    assert_eq!(unresolved.len() as u64, sum("unresolvedSites"));
+    // Without rules there is no exception inventory to count.
+    fs::remove_file(base.path().join("checkout/.trellis/rules.toml")).unwrap();
+    let (status, missing) = request(app, &key, "").await;
+    assert_eq!(status, StatusCode::OK, "{missing}");
+    assert_eq!(missing["payload"]["state"], "missing_rules");
+    assert!(missing["payload"]["exceptionCount"].is_null());
+}
+
 fn url_encode(text: &str) -> String {
     text.bytes()
         .map(|byte| match byte {

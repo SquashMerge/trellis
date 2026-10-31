@@ -78,3 +78,36 @@ test("display projection: module chips, a folded band as a short composite, stat
   const raw=pele.render(p.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
   for(const id of p.nodes.keys()) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
 });
+test("#449: open bands charge the chip budget before collapsed summary rows, whatever their order",()=>{
+  const {adapter}=setup(), view=fixture(), budget={left:6}, calls=[];
+  const last=[...view.layers].filter(l=>!l.shared).sort((a,b)=>b.order-a.order||b.name.localeCompare(a.name))[0].name;
+  const display={layers:new Set(view.layers.map(l=>l.name)),edge:()=>true,unassigned:null,reset:()=>{budget.left=6;},
+    expanded:name=>name===last&&budget.left>0,
+    entries:(key,modules)=>{calls.push(["entries",key]);const kept=modules.slice(0,budget.left);budget.left-=kept.length;return kept.map(module=>({type:"module",module,name:module.identity.path}));},
+    summary:(key,modules)=>{calls.push(["summary",key]);const kept=modules.slice(0,budget.left);budget.left-=kept.length;return kept.map(module=>({type:"chip",band:null,label:"x",shown:"x"}));}};
+  const p=adapter.project(view,{display,columns:4,measureText:text=>Array.from(text).length*7});
+  assert.deepEqual(calls[0],["entries",last],"the opened band is charged first even though it is drawn last");
+  assert.equal([...p.nodes.values()].find(n=>n.kind==="L"&&n.record.name===last).expanded,true,"summary rows cannot fold a band the viewer opened");
+  assert.ok([...p.nodes.values()].filter(n=>n.kind==="M").length>0);
+});
+test("#449: collapsed bands draw summary chips, width sets chip columns, arrows carry lower bounds and coverage",()=>{
+  const {adapter,pele}=setup(), view=fixture(); let resets=0;
+  const summary=(key,modules,columns)=>modules.slice(0,columns).map((module,i)=>({type:"chip",band:i%4,label:`${module.identity.path} · chip`,shown:`m${i}\n${i}`}));
+  const display={layers:new Set(view.layers.map(l=>l.name)),expanded:()=>false,edge:()=>true,unassigned:null,entries:()=>[],summary,reset:()=>{resets++;}};
+  const edgeText=edge=>({bound:true,label:"lower bound; 9% of 100 production reference sites mapped",note:edge.status==="deviates"?"9% mapped":""});
+  const edgeTone=edge=>edge.status==="deviates"?"deviation":"allowed";
+  const options={display,edgeText,edgeTone,measureText:text=>Array.from(text).length*7};
+  const narrow=adapter.project(view,{...options,width:600}), wide=adapter.project(view,{...options,width:1800});
+  assert.equal(resets,2,"each projection resets the caller's chip budget");
+  const chips=p=>[...p.nodes.values()].filter(n=>n.kind==="C");
+  assert.ok(chips(narrow).length>0,"no band says only 'N files folded' when it has measured modules");
+  assert.equal([...narrow.nodes.values()].some(n=>n.kind==="S"),false);
+  assert.ok(chips(wide).length>chips(narrow).length,"a wider canvas holds more chips per row");
+  assert.ok(adapter.project(view,{...options,columns:3}).source.includes("columns 3"),"an explicit column count wins");
+  const up=[...wide.edges.values()].find(e=>e.record.status==="deviates"&&e.record.role==="production");
+  assert.match(up.display[0],/^↑≥\d+ · 9% mapped$/); assert.match(up.full,/lower bound; 9% of 100 production reference sites mapped$/); assert.equal(up.tone,"deviation");
+  const allowed=[...wide.edges.values()].find(e=>e.record.status==="conforms");
+  assert.match(allowed.display[0],/^.≥\d+$/,"allowed arrows keep the bound but not the coverage note"); assert.equal(allowed.tone,"allowed");
+  const raw=pele.render(wide.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
+  for(const id of wide.nodes.keys()) assert.equal((raw.match(new RegExp(`data-id="${id}"`,"g"))||[]).length,1);
+});

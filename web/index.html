@@ -140,13 +140,6 @@
                 <label><input id="architecture-metric-tests" type="checkbox"> Include tests and fixtures in metrics</label>
                 <label><input id="architecture-relative" type="checkbox"> Relative</label>
                 <label><input id="architecture-tests" type="checkbox"> Test-only edges</label>
-                <label><input id="architecture-deviations-only" type="checkbox"> Deviations only</label>
-              </div>
-              <div class="architecture-controls architecture-review-actions">
-                <button id="architecture-review" type="button">Review deviations</button>
-                <button id="architecture-unassigned" type="button">Unassigned files</button>
-                <button id="architecture-authored" type="button">Authored exceptions</button>
-                <button id="architecture-refresh" type="button">Refresh architecture</button>
               </div>
             </div>
             <section id="architecture-review-panel" aria-label="Architecture review" hidden>
@@ -184,15 +177,14 @@
                 </section>
               </section>
             </section>
-            <div class="architecture-status"><p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p>
-            <p id="architecture-focus-state" class="architecture-display-note" role="status" aria-live="polite"></p></div>
+            <div class="architecture-status"><p id="architecture-state" role="status" aria-live="polite">Open Architecture to read the indexed snapshot and reviewed rules.</p></div>
             <div id="architecture-legend" class="metric-legend" aria-label="Architecture metric heat legend"></div>
             <div id="architecture-diagram" tabindex="0" aria-label="Authored layer architecture. Select a layer band to fold it or a module chip to open its files; select a file or edge for evidence."></div>
             <div class="architecture-display-footers">
-            <div id="architecture-quiet" class="architecture-display-footer" hidden><button id="architecture-quiet-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-quiet-names" class="detail"></span></div>
             <div id="architecture-hidden" class="architecture-display-footer" hidden><button id="architecture-hidden-toggle" type="button" aria-expanded="false" aria-controls="architecture-diagram"></button><span id="architecture-hidden-names" class="detail"></span></div></div>
-            <p class="architecture-edge-legend">Arrows and band chips count reference sites · ↓ downward (allowed) · ↑ upward: always a deviation; an arrow marked “excepted” is a reviewed exception, counted under “excepted” (not ↑) in band chips · arrows ↔ between peers, ← shared outbound; band chip ⇄ counts both when they deviate · → into shared (allowed) · error colour: unexcepted deviation · Solid: production · Dashed: test-only (never production violations) · Exceptions and unknowns remain explicit.</p>
-            <details id="architecture-notices" class="warning-disclosure"><summary>Architecture coverage &amp; notices</summary><p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent.</p><div id="architecture-notice-content"></div></details>
+            <div class="architecture-edge-legend" role="group" aria-label="Arrow key"><span class="architecture-key"><b>↓</b> down · allowed</span><span class="architecture-key" data-tone="error"><b>↑</b> up · deviation</span><span class="architecture-key" data-tone="error"><b>↔</b> peer</span><span class="architecture-key"><b>→</b> into shared</span><span class="architecture-key" data-tone="error"><b>←</b> shared out</span><span class="architecture-key"><b>≥</b> lower bound</span><span class="architecture-key"><b>%</b> source sites mapped</span><span class="architecture-key"><b class="architecture-key-line"></b> production</span><span class="architecture-key"><b class="architecture-key-line" data-dash="true"></b> test-only</span><span class="architecture-key" data-tone="dim"><b class="architecture-key-line"></b> dimmed: allowed or excepted</span><span class="architecture-key"><b class="architecture-key-line" data-tone="neutral"></b> grey: unknown verdict</span>
+              <span id="architecture-coverage" class="architecture-coverage"></span></div>
+            <details id="architecture-notices" class="warning-disclosure"><summary>Architecture coverage &amp; notices</summary><p class="architecture-basis">Authored layers · structural references · syntax evidence, not resolved calls. Metrics default to production callables; test-only edges are independent. Arrows count reference sites; band chips count a layer's outgoing sites by verdict (⇄ counts peer and shared-outbound deviations; excepted sites are counted under “excepted”, not ↑). Test-only references are never production violations.</p><p id="architecture-exclusions" class="architecture-basis"></p><div id="architecture-notice-content"></div></details>
           </section>
           <section id="treemap-panel" class="view-panel" role="tabpanel" aria-labelledby="view-treemap" hidden>
             <div class="sequence-toolbar"><h2>Treemap</h2><button id="treemap-refresh" type="button">Refresh treemap</button></div>
