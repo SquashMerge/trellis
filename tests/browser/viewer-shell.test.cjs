@@ -1003,7 +1003,7 @@ test("view toolbars are one row with Options and an About popover; Sequence and 
   for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests"]) assert.equal(await page.locator(`#${id}`).isVisible(), true);
   await capture(page, "toolbar-architecture-options");
   await page.keyboard.press("Escape");
-  assert.equal(await page.locator(".architecture-basis").isVisible(), false, "caveats are behind the ⓘ");
+  assert.equal(await page.locator(".architecture-basis").first().isVisible(), false, "caveats are behind the ⓘ");
   await page.locator("#view-treemap").click();
   assert.equal(await page.locator(".treemap-basis").isVisible(), false);
   for (const view of ["sequence", "classes"]) {
