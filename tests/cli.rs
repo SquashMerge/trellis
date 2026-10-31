@@ -2079,7 +2079,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             "revision_capture_inputs",
             "revision_documents",
         ],
-        "exact schema-29 native evidence and search table inventory"
+        "exact schema-30 native evidence and search table inventory"
     );
     // Compare all corpus cells, not history-dependent FTS shadow segment bytes.
     for name in names
@@ -2134,7 +2134,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
                 "vid IN (SELECT vid FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
-            _ => panic!("unexpected schema-29 evidence table: {name}"),
+            _ => panic!("unexpected schema-30 evidence table: {name}"),
         };
         let order = if name == "native_version_references" {
             "vid,owner_syntax_id,ordinal"
@@ -2197,7 +2197,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
     assert_eq!(
         all_rows.len(),
         36,
-        "retain every native evidence table and logical search corpus in schema-29 snapshot"
+        "retain every native evidence table and logical search corpus in schema-30 snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3101,7 +3101,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&post_start_native),
-            "{name}: all 35 native schema-29 evidence tables, logical head search corpus and documents must match after only publication identity normalization"
+            "{name}: all 35 native schema-30 evidence tables, logical head search corpus and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,

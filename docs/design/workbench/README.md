@@ -136,7 +136,7 @@ The app shows every control and every caveat at once. The rule for the next pass
    - Remove "Refresh architecture"; the view refreshes on a new revision.
    - Cut "503 native file modules · 431 production / 331 test-only…" and "Showing 3 layers and 25 files…" to one line, or move them under ⓘ.
 6. **Only show tabs that can show something.**
-   - **Classes** appears only when the checkout has production Java or Python. Class diagrams only cover those languages, and trellis has Java/Python only in fixtures and tools.
+   - **Classes** appears only when the checkout has production files in a class-catalog language. `GET /api/classes` reports those as `supportedLanguages` (Java, Python and JavaScript since #452; Rust follows in its second slice). Before #452, class diagrams covered only Java and Python, which trellis has only in fixtures and tools.
    - **Sequence** opens from a method: click it in the tree, the source margin or the inspector.
    - With no method selected, the Sequence tab shows a short list of the most complex methods to start from, instead of "Expand a file and select a method."
 7. **Libraries leaves the tab row.** *This proposes changing the 2026-10-24 ruling, which kept it as a tab.* Today it's a catalog: 376 crates and 50,000 declarations with no link to this code.

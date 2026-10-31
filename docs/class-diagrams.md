@@ -1,11 +1,11 @@
 # Class diagrams and related classes
 
-Class diagrams use the indexed Java/Python snapshot. They do not load or execute the inspected
+Class diagrams use the indexed Java, Python and JavaScript snapshot. They do not load or execute the inspected
 application, run package tools, fetch dependencies, or send source to a provider.
 
 ## Use the view
 
-- Right-click an indexed `.java` or `.py` file and choose **Show class diagram**.
+- Right-click an indexed `.java`, `.py`, `.js`, `.mjs` or `.cjs` file and choose **Show class diagram**.
 - Right-click a method and choose **Show enclosing class diagram**, or use its **Class diagram** button.
 - Alternatively open **Classes**, search a class or qualified name, and choose a result.
 - The view starts with the focus and its indexed inheritance hierarchy: ancestors, subclasses and
@@ -36,8 +36,18 @@ Matching uses declaration, package/import and lexical context. Ambiguous or unma
 terminal hints; **View options → Include unmatched type hints** reveals them. They cannot be expanded as known classes.
 Python module names follow workspace-relative source paths, without guessing runtime import roots.
 Wildcards, inferred local types, dynamic factories, evaluated aliases, function-body/conditional/anonymous
-classes and third-party catalogs are not resolved. Rust and JavaScript sequences are unchanged; this
-class projection currently supports Java and Python only.
+classes and third-party catalogs are not resolved. Rust sequences are unchanged; this class
+projection does not yet cover Rust.
+
+JavaScript boxes come from named ES `class` declarations at module level, including `export class`
+and `export default class`. Cards show direct fields and methods, `static` ones included, in source
+order. `#private` members are listed but cannot open a sequence, because they are not measured
+declarations. `extends Name` or `extends ns.Name` is recorded as a terminal hint; other heritage
+expressions, such as a mixin call, record nothing. Plain JavaScript declares no field, parameter or
+return types, and JSDoc is not read, so a JavaScript class has no type hints. Class expressions,
+prototype assignment, factories and object-literal "classes" are not shown. A JavaScript qualified
+name is the workspace-relative path without its extension, with `/` written as `.`, then the class
+name (`web/shell.js` → `web.shell.Shell`); bundler and package resolution are not modelled.
 
 Repeated same-kind references between the same endpoints use a deterministic representative edge in
 the diagram. Its ID and source range are real. The full reference catalog remains stored. The relationship
@@ -67,6 +77,10 @@ are unchanged. Class layout itself is not saved as a durable view in this slice.
   returns a bounded diagram. `seed` may be a class or a method with a lexical enclosing class.
   Optional `includeHierarchy: true` prioritizes bounded transitive ancestors/descendants; the UI sends
   this flag. Omission retains the original neighborhood API behavior. It does not change stored certainty.
+
+`GET /api/classes` also returns `supportedLanguages`, the source languages the catalog extracts
+(`["java","python","javascript"]`). A client shows class views for a checkout that has indexed
+files in one of them, and each returned class carries its own `language`.
 
 Both endpoints require existing bearer/Host/Origin guards. Responses carry their snapshot revision,
 warnings, truncation and `requireIndex` state. Unsupported or invalid requests fail explicitly.

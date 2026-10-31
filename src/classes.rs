@@ -24,6 +24,13 @@ const RECORDS: usize = 250_000;
 const TEXT: usize = 2_048;
 const OUTPUT_TEXT: usize = 64 * 1024 * 1024;
 const REGISTRY_TEXT: usize = 32 * 1024 * 1024;
+/// Languages whose declarations the class catalog extracts, in API order.
+pub const SUPPORTED_LANGUAGES: [&str; 3] = ["java", "python", "javascript"];
+/// Whether `language` documents carry a class extraction (`F`) and class rows.
+pub fn supports_language(language: &str) -> bool {
+    SUPPORTED_LANGUAGES.contains(&language)
+}
+const CATALOG_NOTICE: &str = "Declared types are terminal source text, not class relationships. Direct class declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -144,6 +151,7 @@ fn method_node(n: Node<'_>) -> bool {
     matches!(
         n.kind(),
         "function_definition"
+            | "method_definition"
             | "method_declaration"
             | "constructor_declaration"
             | "compact_constructor_declaration"
@@ -153,6 +161,12 @@ fn method_node(n: Node<'_>) -> bool {
 fn declaration(mut n: Node<'_>) -> Node<'_> {
     if n.kind() == "decorated_definition"
         && let Some(d) = n.child_by_field_name("definition")
+    {
+        n = d;
+    }
+    // JavaScript `export class X` and `export default class X` declare X.
+    if n.kind() == "export_statement"
+        && let Some(d) = n.child_by_field_name("declaration")
     {
         n = d;
     }
@@ -166,12 +180,23 @@ fn join(a: &str, b: &str) -> String {
     }
 }
 fn module_name(file: &SourceFile) -> String {
-    let path = file
-        .path
-        .strip_suffix(".py")
-        .unwrap_or(&file.path)
-        .replace('/', ".");
-    path.strip_suffix(".__init__").unwrap_or(&path).to_owned()
+    match file.language.as_str() {
+        "python" => {
+            let path = file
+                .path
+                .strip_suffix(".py")
+                .unwrap_or(&file.path)
+                .replace('/', ".");
+            path.strip_suffix(".__init__").unwrap_or(&path).to_owned()
+        }
+        // Path-derived display prefix only; no package, bundler or import-map resolution.
+        "javascript" => [".js", ".mjs", ".cjs"]
+            .iter()
+            .find_map(|ext| file.path.strip_suffix(ext))
+            .unwrap_or(&file.path)
+            .replace('/', "."),
+        _ => String::new(),
+    }
 }
 fn dotted(s: &str) -> bool {
     !s.is_empty()
@@ -327,7 +352,7 @@ impl CatalogComposer {
         });
         self.result.relations.dedup_by(|a, b| a.id == b.id);
         if !self.result.classes.is_empty() {
-            self.result.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
+            self.result.warnings.push(CATALOG_NOTICE.into());
         }
         if !self.registry_complete {
             self.result.warnings.push(
@@ -389,7 +414,7 @@ fn append_complete_catalog_warnings(
     registry_complete: bool,
 ) {
     if has_classes {
-        result.warnings.push("Declared types are terminal source text, not class relationships. Direct Java/Python declarations only; no function-body, conditional/anonymous class, generated member, wildcard-import, type-alias or dependency discovery.".into());
+        result.warnings.push(CATALOG_NOTICE.into());
     }
     if !registry_complete {
         result
@@ -460,10 +485,7 @@ impl Catalog {
             return Ok(catalog);
         }
         let mut extracts = Vec::new();
-        for file in files
-            .iter()
-            .filter(|f| matches!(f.language.as_str(), "java" | "python"))
-        {
+        for file in files.iter().filter(|f| supports_language(&f.language)) {
             extracts.push(FileExtraction::extract_file(file, nodes, cancel, limits)?);
         }
         Self::compose(&extracts, files.len(), nodes.len(), limits)
@@ -560,10 +582,11 @@ impl FileExtraction {
                     .push(symbol);
             }
             let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&if file.language == "java" {
-                tree_sitter_java::LANGUAGE.into()
-            } else {
-                tree_sitter_python::LANGUAGE.into()
+            parser.set_language(&match file.language.as_str() {
+                "java" => tree_sitter_java::LANGUAGE.into(),
+                "python" => tree_sitter_python::LANGUAGE.into(),
+                "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+                other => anyhow::bail!("class catalog does not support {other}"),
             })?;
             let mut cancelled = |_: &tree_sitter::ParseState| {
                 if cancel.load(Ordering::Relaxed) {
@@ -589,11 +612,7 @@ impl FileExtraction {
             let mut ex = Extractor {
                 b: &mut b,
                 file,
-                module: if file.language == "python" {
-                    module_name(file)
-                } else {
-                    String::new()
-                },
+                module: module_name(file),
                 visits: 0,
                 classes: 0,
                 refs: 0,
@@ -1137,9 +1156,10 @@ impl Extractor<'_, '_> {
                 self.types(ty, index, base_scope, kind, depth + 1)?;
             }
         }
-        // Java interfaces have an unnamed extends_interfaces child.
+        // Java interfaces have an unnamed extends_interfaces child, and
+        // JavaScript classes an unnamed class_heritage child.
         for c in self.children(n, depth + 1)? {
-            if c.kind() == "extends_interfaces" {
+            if matches!(c.kind(), "extends_interfaces" | "class_heritage") {
                 self.types(c, index, scope, "extends", depth + 1)?;
             }
         }
@@ -1161,7 +1181,7 @@ impl Extractor<'_, '_> {
                 self.method(c, index, scope, depth + 1)?;
             } else if matches!(
                 c.kind(),
-                "field_declaration" | "constant_declaration" | "enum_constant"
+                "field_declaration" | "constant_declaration" | "enum_constant" | "field_definition"
             ) {
                 self.field(c, index, scope, depth + 1)?;
             } else if c.kind() == "expression_statement" && self.file.language == "python" {
@@ -1264,7 +1284,10 @@ impl Extractor<'_, '_> {
             {
                 self.member(n, left, ty, index, false)?;
             }
-        } else if let Some(name) = n.child_by_field_name("name") {
+        } else if let Some(name) = n
+            .child_by_field_name("name")
+            .or_else(|| n.child_by_field_name("property"))
+        {
             self.member(n, name, ty, index, false)?;
         } else {
             for c in self.detail_children(n, index, depth + 1)? {
@@ -1286,6 +1309,10 @@ impl Extractor<'_, '_> {
             .or_else(|| n.child_by_field_name("type"));
         if let Some(name) = n.child_by_field_name("name") {
             self.member(n, name, ty, index, true)?;
+        }
+        if self.file.language == "javascript" {
+            // Plain JavaScript declares no parameter or return types (no JSDoc).
+            return Ok(());
         }
         let Some(blocked) = self.type_parameters(n, depth + 1, Some(index))? else {
             return Ok(());
@@ -1362,6 +1389,24 @@ impl Extractor<'_, '_> {
         depth: usize,
     ) -> Result<()> {
         if !self.detail_tick(index, depth)? {
+            return Ok(());
+        }
+        if self.file.language == "javascript" {
+            // Only a dotted name is a base-class spelling. Calls (mixins) and
+            // other expressions are values, not declared names.
+            match n.kind() {
+                "identifier" | "member_expression" => {
+                    if let Some(text) = self.js_dotted(n).filter(|text| dotted(text)) {
+                        self.reference(n, &text, index, kind)?;
+                    }
+                }
+                "class_heritage" => {
+                    for c in self.detail_children(n, index, depth + 1)? {
+                        self.types(c, index, scope, kind, depth + 1)?;
+                    }
+                }
+                _ => {}
+            }
             return Ok(());
         }
         let java = self.file.language == "java";
@@ -1470,6 +1515,38 @@ impl Extractor<'_, '_> {
             }
         }
         Ok(())
+    }
+    /// Canonical `a.b.C` spelling of a JavaScript identifier or plain member
+    /// chain, independent of whitespace and comments. Optional chains, computed
+    /// members, calls and other expressions are not names.
+    fn js_dotted(&self, n: Node<'_>) -> Option<String> {
+        let mut parts = Vec::new();
+        let mut node = n;
+        for _ in 0..self.b.limits.depth {
+            match node.kind() {
+                "identifier" => {
+                    parts.push(self.text(node));
+                    parts.reverse();
+                    return Some(parts.join("."));
+                }
+                "member_expression" => {
+                    let mut cursor = node.walk();
+                    if node
+                        .children(&mut cursor)
+                        .any(|c| c.kind() == "optional_chain")
+                    {
+                        return None;
+                    }
+                    let property = node
+                        .child_by_field_name("property")
+                        .filter(|p| p.kind() == "property_identifier")?;
+                    parts.push(self.text(property));
+                    node = node.child_by_field_name("object")?;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
     fn reference(&mut self, n: Node<'_>, name: &str, index: usize, kind: &str) -> Result<()> {
         if !self.details(index)? {
