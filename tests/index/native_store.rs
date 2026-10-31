@@ -240,7 +240,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        31
+        32
     );
     let count: i64 = db
         .query_row(
@@ -745,7 +745,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
         let version: String = db
             .query_row("SELECT version FROM native_producers", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, "native-v11");
+        assert_eq!(version, "native-v12");
         let calls: Vec<String> = db
             .prepare("SELECT 'occ:v2:'||lower(hex(id)) FROM native_version_calls")
             .unwrap()
@@ -842,7 +842,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
         rebuilt
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        31
+        32
     );
     let stamp: String = rebuilt
         .query_row("SELECT extractor_version FROM index_metadata", [], |row| {
@@ -853,7 +853,7 @@ fn physical_v8_native_v4_index_recreates_before_role_column_read() {
     let version: String = rebuilt
         .query_row("SELECT version FROM native_producers", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, "native-v11");
+    assert_eq!(version, "native-v12");
     let roles = store
         .native_declarations_at(pin, "javascript", "hello")
         .unwrap();
@@ -3048,10 +3048,10 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
 
 #[test]
 #[cfg(feature = "test-support")]
-fn schemas16_19_23_24_26_27_28_29_and30_recreate_exclusively_without_migration_and_preserve_queue()
-{
+fn schemas16_19_23_24_26_27_28_29_30_and31_recreate_exclusively_without_migration_and_preserve_queue()
+ {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for old_version in [16, 19, 23, 24, 26, 27, 28, 29, 30] {
+    for old_version in [16, 19, 23, 24, 26, 27, 28, 29, 30, 31] {
         let (state, root, prior, cancel) = fixture();
         let queued = prior
             .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
@@ -3122,7 +3122,7 @@ fn schemas16_19_23_24_26_27_28_29_and30_recreate_exclusively_without_migration_a
             rebuilt
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            31
+            32
         );
         assert_eq!(
             rebuilt
@@ -3131,7 +3131,7 @@ fn schemas16_19_23_24_26_27_28_29_and30_recreate_exclusively_without_migration_a
                     0
                 ))
                 .unwrap(),
-            31
+            32
         );
         for table in [
             "native_version_references",
@@ -3276,7 +3276,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA user_version=32").unwrap();
+    db.execute_batch("PRAGMA user_version=33").unwrap();
     drop(db);
     let inode = fs::metadata(&path).unwrap().ino();
     let error = Store::open_for_tests(state.path(), root.path()).unwrap_err();
@@ -3296,13 +3296,13 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 32);
+    assert_eq!(version, 33);
     let metadata_version: i64 = db
         .query_row("SELECT schema_version FROM index_metadata", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(metadata_version, 31);
+    assert_eq!(metadata_version, 32);
     assert_eq!(generation, old.index_generation.to_string());
 }
 
@@ -4977,6 +4977,7 @@ fn cold_stream_matches_plain_artifact_publication_rows() {
         "native_version_references",
         "native_version_capability_families",
         "native_version_capability_gaps",
+        "native_version_macro_expansions",
         "native_version_calls",
         "native_version_call_regions",
     ] {

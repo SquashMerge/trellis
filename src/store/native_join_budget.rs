@@ -220,6 +220,11 @@ pub(super) fn document_bytes(
         "SELECT length(CAST(kind AS BLOB)),length(CAST(diagnostic AS BLOB)) FROM native_version_capability_gaps WHERE vid=?1",
         vid,
     )?;
+    let (expansions, _) = scan::<0>(
+        db,
+        "SELECT 1 FROM native_version_macro_expansions WHERE vid=?1",
+        vid,
+    )?;
     let (cov_state, cov_diag): (i64, i64) = db.query_row(
         "SELECT length(CAST(coverage_state AS BLOB)),COALESCE(length(CAST(coverage_diagnostic AS BLOB)),0) FROM revision_documents WHERE revision_id=?1 AND language=?2 AND path=?3 AND vid=?4",
         rusqlite::params![scope.revision_key, scope.key.language, scope.key.path, vid],
@@ -312,6 +317,7 @@ pub(super) fn document_bytes(
         fd,
         grouped::<n::MeasurementGap>(g, f)?,
         gd,
+        vector::<n::Range>(expansions)?,
     ])?;
     let provenance = add(&[
         size_of::<n::Provenance>() as u64,

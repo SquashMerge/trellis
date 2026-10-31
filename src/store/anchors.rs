@@ -40,7 +40,9 @@ fn measured_group<'a>(
         .iter()
         .filter(|row| same_group(focused, row))
         .collect();
-    group.sort_by_key(|row| (row.range.start, row.range.end));
+    // The native validator already proved sibling ordinals, including Decision 0019's late
+    // ordinals for declarations inside measured Rust macros; use them as the group order.
+    group.sort_by_key(|row| row.key.ordinal);
     ensure!(
         !group.is_empty() && group.iter().any(|row| row.syntax_id == focused.syntax_id),
         "invalid anchor sibling group"

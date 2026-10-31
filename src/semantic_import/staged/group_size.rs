@@ -527,6 +527,7 @@ mod retained {
                         + string(&report.revision_id)
                         + buffer(&report.families)
                         + report.families.iter().map(support).sum::<u64>()
+                        + buffer(&report.macro_expansions)
                 })
                 .sum::<u64>()
             + buffer(&value.search_cards)
@@ -605,7 +606,8 @@ mod retained {
                 + key(&report.document)
                 + string(&report.revision_id)
                 + buffer(&report.families)
-                + report.families.iter().map(support).sum::<u64>(),
+                + report.families.iter().map(support).sum::<u64>()
+                + buffer(&report.macro_expansions),
         )
     }
 
@@ -724,6 +726,7 @@ mod tests {
                 document: key,
                 revision_id: "revision".into(),
                 families: vec![],
+                macro_expansions: vec![],
             },
         };
         (header, document, rows)
