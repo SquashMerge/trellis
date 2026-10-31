@@ -86,13 +86,18 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     // Enable Chromium chooser interception before navigation, not alongside the key press.
     page.on("filechooser", chooser => fileChoosers.push(chooser));
     page.on("pageerror", error => pageErrors.push(error.message));
+    // Requests are attributed to the document that sent them: reads the previous document
+    // started (for example arrival's pinned reads) are not the reloaded page's requests.
+    let documentGeneration = 0;
+    page.on("framenavigated", frame => { if (frame === page.mainFrame()) documentGeneration++; });
+    const currentDocument = () => apiRequests.filter(request => request.generation === documentGeneration);
     page.on("request", request => {
       const url = new URL(request.url());
       assert.ok(!request.url().includes(paths.token) && !request.url().includes(wrongToken), "credentials are never placed in a URL");
       assert.ok(!(request.postData() || "").includes(paths.token), "credential is not sent in a request body");
       if (url.pathname.startsWith("/api/")) apiRequests.push({
         path:url.pathname, method:request.method(),
-        validBearer:request.headers().authorization === `Bearer ${paths.token}`,
+        validBearer:request.headers().authorization === `Bearer ${paths.token}`, generation:documentGeneration,
       });
     });
     await page.goto(`${server.base}/`, {waitUntil:"networkidle"});
@@ -165,10 +170,11 @@ test("real Connect preserves explicit token opt-in, file loading, restore, typed
     await disconnected(page);
     assert.ok(await page.locator("#token").evaluate((input, secret) => input.value === secret, paths.token), "reload restores the remembered value");
     assert.equal(await page.locator("#remember-token").isChecked(), true);
-    assert.deepEqual(apiRequests, [], "remembered token does not auto-connect on reload");
+    assert.deepEqual(currentDocument(), [], "remembered token does not auto-connect on reload");
     await page.locator("#remember-token").uncheck();
     assert.equal(await hasNoSavedToken(page), true, "unchecking Remember forgets immediately");
-    assert.deepEqual(apiRequests, []);
+    assert.deepEqual(currentDocument(), []);
+    apiRequests.length = 0;
     await page.locator("#remember-token").check();
     await page.locator("#connect-form button[type=submit]").click();
     await connectedWithoutTokenInDom(page, server, paths.token);
