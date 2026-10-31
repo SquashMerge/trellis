@@ -27,8 +27,11 @@ shasum -a 256 -c "trellis-$VERSION-$TARGET.tar.gz.sha256"   # Linux: sha256sum -
 tar xzf "trellis-$VERSION-$TARGET.tar.gz"
 mkdir -p ~/.local/bin
 install -m 755 trellis ~/.local/bin/trellis
+export PATH="$HOME/.local/bin:$PATH"
 trellis --version
 ```
+
+Add the `export` line to your shell's startup file (such as `~/.zshrc`) to keep it.
 
 The archive holds only `trellis` and `LICENSE`. The binaries aren't signed. If you downloaded the archive with a browser on macOS, clear the quarantine flag after checking the checksum: `xattr -d com.apple.quarantine trellis`.
 
@@ -177,8 +180,6 @@ PLAN=$(trellis producer plan --producer rust-analyzer --trust trusted | jq -r .p
 trellis producer run --producer rust-analyzer --trust trusted --plan-sha256 "$PLAN" | jq '{state, outcome, errorCode}'
 ```
 
-On Linux, use the Rust steps under [Feature-gated Rust code](#feature-gated-rust-code) instead: see [known limitations](known-limitations.md#supported-platforms).
-
 **Trust profiles:**
 
 - `--trust restricted` is the default and runs none of your repository's code. Java build files and `pyproject.toml` are left out, and Java runs offline. That means calls into third-party dependencies may stay unresolved.
@@ -190,7 +191,7 @@ If a run fails, `.diagnostics.stderrTail` and `.diagnostics.stdoutTail` in its o
 
 ### Re-run after edits
 
-Semantic evidence describes the code as it was when you imported it. **Any** change to an indexed source file or project config makes the evidence for **every** language [possibly stale](#possibly-stale), including files you didn't touch. Trellis keeps the old results and labels them, but it never re-runs a producer by itself. To refresh, repeat the commands above for each producer you use:
+Semantic evidence describes the code as it was when you imported it. **Any** change to an indexed source file or project config affects imported evidence for **every** language: the changed file's evidence is [stale](#stale-and-possibly-stale), and every other file's is [possibly stale](#stale-and-possibly-stale). Trellis keeps the old results for unchanged files and labels them, but it never re-runs a producer by itself. To refresh, repeat the commands above for each producer you use:
 
 ```sh
 for P in scip-typescript scip-python scip-java; do
@@ -261,13 +262,19 @@ paths = ["tools/**", "build.rs"]
 - `"collapsed"` starts as a summary. This is the default.
 - `"hidden"` leaves the layer out of the drawing and lists it in a note below, where you can show it. Use it for scripts, build helpers and fixtures. Hidden layers are also left out of the **Most complex methods** list. `display` only affects the web app: rule checks still cover the layer.
 
-Check the rules from the command line:
+Check the rules from the command line. This prints a JSON report, with a summary under `.payload.counts` and each finding under `.payload.instances`:
 
 ```sh
-trellis rules check | jq .payload.counts
+trellis rules check
 ```
 
-The command exits with `1` and prints `Error: architecture deviations` if there are any, so you can use it in a script or CI. The full JSON has each finding under `.payload.instances`. Use `--path 'src/**'` to check only some source files.
+If there are deviations, the command prints `Error: architecture deviations` and exits with `1`. It also exits with `1` if the check can't run, for example with no rules file. To fail a script or CI step, don't pipe the command: a pipeline normally returns the exit status of its last command, so `trellis rules check | jq ...` passes even with deviations. Save the report first instead:
+
+```sh
+trellis rules check > rules-report.json
+```
+
+Use `--path 'src/**'` to check only some source files.
 
 Agents can use `trellis_rules_check` and `trellis_rules_explain`, and the `trellis_propose_layers` MCP prompt drafts layers for you to review. See the [rules reference](rules.md) for exceptions and external package rules.
 
@@ -300,13 +307,20 @@ trellis status | jq '.semanticLanguages[] | {language, semanticState, semanticPr
 
 The most common cause is Rust macros. A macro Trellis can't see into is shown as a boundary, and the file counts as partial. See [known limitations](known-limitations.md#rust-macros).
 
-### Possibly stale
+### Stale and possibly stale
 
-After an edit to indexed code or config, imported evidence is *possibly stale*: it describes an earlier version of the checkout. It may still be right, but Trellis can't prove it, so it stops using it to draw conclusions until you [re-import](#re-run-after-edits).
+Imported evidence describes an earlier version of your code as soon as you edit an indexed source file or project config. Until you [re-import](#re-run-after-edits), it has one of two states:
 
-- **Web app:** Sequence falls back to `Syntax only · Semantic evidence for <file> is stale…`. The green **Fresh** label in the top bar is about the syntax index only. It doesn't mean imported evidence is current.
-- **MCP:** a language's `semantic.freshness` is `possiblyStale`, with `available: false`. Calls keep their old target, marked `freshness: "possiblyStale"`, and aren't followed any further.
-- **`trellis status`:** `semanticState` has no separate value for this, and shows `stale`.
+- **Stale:** this file changed since the import, so its evidence no longer applies. The file counts as `failed` under `coverage`, and its calls go back to syntax.
+- **Possibly stale:** this file didn't change, but something around it did. Its evidence may still be right, but Trellis can't prove it, so it stops drawing conclusions from it.
+
+Where you'll see this:
+
+- **Web app:** Sequence falls back to `Syntax only · Semantic evidence for <file> is stale…` in both cases. The green **Fresh** label in the top bar is about the syntax index only. It doesn't mean imported evidence is current.
+- **MCP, for a call in a changed file:** `evidenceTier` is `syntax`, with `boundaryReason: "missingEvidence"`. If an answer does return old evidence for a changed file, it's marked `freshness: "stale"`.
+- **MCP, for a call in an unchanged file:** the call keeps its old target, marked `freshness: "possiblyStale"`, and isn't followed any further.
+- **MCP, for a language:** `semantic.freshness` is the worst state among the files it still covers, usually `possiblyStale`, with `available: false`.
+- **`trellis status`:** `semanticState` shows `stale` in both cases.
 
 `fresh` comes back when you've re-imported.
 

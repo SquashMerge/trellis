@@ -30,7 +30,7 @@ Trellis doesn't expand Rust macros. It reads inside this fixed list and measures
 
 Everything else stays opaque, including `json!`, `matches!`, logging macros such as `tracing::info!`, your own macros, macro definitions, and attributes.
 
-A call inside an opaque macro isn't measured, even with `rust-analyzer` imported. It doesn't appear in Sequence, in call results or in callers. Sequence shows an `Opaque macro/unsafe/const boundary`, and the file counts as [partial](quickstart.md#partial).
+A call inside an opaque macro isn't measured, even with `rust-analyzer` imported. It doesn't appear in Sequence, in call results or in callers. Sequence shows an `Opaque macro/unsafe/const boundary`, and the file counts as [partial](quickstart.md#partial). Recognized logging macros are the exception: they show a logging boundary instead, which is [hidden by default](#sequence-diagrams-are-not-traces).
 
 ### Class relationships
 
@@ -44,7 +44,7 @@ Every language has syntax evidence only until you [import semantic evidence](qui
 
 ### Stale evidence after edits
 
-Semantic evidence is tied to one version of the checkout. After any edit to an indexed file or project config, even one in another language, every language's evidence is [possibly stale](quickstart.md#possibly-stale) until you re-import. Sequence falls back to syntax, and possibly stale calls aren't followed. Trellis never re-runs a producer by itself. With `producer pickup`, it only re-imports a file that has changed.
+Semantic evidence is tied to one version of the checkout. After any edit to an indexed file or project config, the changed file's evidence is stale, and every other file's evidence, in every language, is [possibly stale](quickstart.md#stale-and-possibly-stale) until you re-import. Sequence falls back to syntax, and possibly stale calls aren't followed. Trellis never re-runs a producer by itself. With `producer pickup`, it only re-imports a file that has changed.
 
 ### Sequence diagrams are not traces
 
@@ -68,8 +68,6 @@ Diagrams are also bounded: long methods stop at a step limit, with a warning tha
 - x86-64 and ARM64 Linux with glibc 2.31 or later. CPU only.
 
 There's no build for Intel macOS, Windows or musl Linux. Binaries aren't signed or notarized.
-
-`trellis producer run --producer rust-analyzer` works only on ARM64 macOS for now, because Trellis pins the hash of that platform's binary. Elsewhere it reports `executable sha256 … != pinned …`. On those platforms, run `rust-analyzer` 1.98.1 yourself and use [`producer pickup`](quickstart.md#feature-gated-rust-code).
 
 ### Local and single-user
 
