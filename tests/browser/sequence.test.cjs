@@ -214,7 +214,8 @@ test("published import candidate keeps partial provenance and original source",{
 const truncatedSource=`function measured() {\n${Array.from({length:202},(_,i)=>`  observed_${i}();\n`).join("")}}\n`;
 test("published truncated producer shows bound while retaining original call witness",{timeout:240000},async()=>published(truncatedSource,async({page,dto,pin})=>{
  assert.equal(dto.truncated,true,"the actual producer must reach its 200-step cap");
- assert.ok(dto.warnings.some(w=>w.includes("200 steps")));
+ assert.ok(dto.warnings.some(w=>w.includes("200 shown steps")));
+ assert.deepEqual(dto.truncatedBy,["visibleSteps"]);
  assert.match(await page.locator("#sequence-state").innerText(),/truncated/);
  assert.match(await page.locator("#sequence-state").innerText(),/Pele rendered/);
  const first=dto.steps.find(step=>step.kind==="call"&&step.label==="observed_0");

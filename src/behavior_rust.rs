@@ -6,7 +6,8 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
 
-const MAX_STEPS: usize = 200;
+// The work bound (#536): the visible bound is applied to the view this builds.
+const MAX_STEPS: usize = crate::behavior::MAX_WORK_STEPS;
 const MAX_PARTICIPANTS: usize = 20;
 const MAX_DEPTH: usize = 24;
 /// Bounds the recursion over nested Rust syntax. The step tree it produces is bounded to
@@ -70,8 +71,8 @@ impl Builder<'_> {
         }
     }
     fn limit(&mut self) {
-        self.view.truncated = true;
-        self.warn("Sequence bounds reached (200 steps, 20 participants, depth 24); omitted behavior is unknown.");
+        crate::behavior::adapter_limit(&mut self.view, self.count);
+        self.warn("Sequence bounds reached (2000 steps of work, 20 participants, depth 24); omitted behavior is unknown.");
     }
     fn step(&mut self, n: Node<'_>, kind: &str, label: impl AsRef<str>) -> Option<SequenceStep> {
         if self.count >= MAX_STEPS {
@@ -561,7 +562,10 @@ fn receiver_call(n: Node<'_>) -> Option<Node<'_>> {
 }
 // Presentation only: no claim about purity, builder types, or object identity.
 // Run after measurement so grouping cannot change step IDs, limits, or guards.
+// Each group is a step: grouping stops, losing nothing, before the view's steps would
+// pass the work bound (#536).
 fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -> bool {
+    let mut room = MAX_STEPS.saturating_sub(crate::behavior::step_count(steps));
     let mut cursor = n.walk();
     let mut depth = 0;
     let mut budget = MAX_STEPS * MAX_DEPTH;
@@ -578,7 +582,12 @@ fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -
                 "macro_invocation" | "unsafe_block" | "const_block" | "async_block"
             );
         if !opaque {
-            wrap_syntax_chain(node, file, steps);
+            if room == 0 {
+                return true;
+            }
+            if wrap_syntax_chain(node, file, steps) {
+                room -= 1;
+            }
             if depth < MAX_DEPTH {
                 if cursor.goto_first_child() {
                     depth += 1;
@@ -600,13 +609,14 @@ fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -
         }
     }
 }
-fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) {
+/// Wraps the call chain at `n` into one group step; true when it did.
+fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -> bool {
     if n.kind() == "call_expression" {
         let mut chain = vec![n];
         let mut receiver = n;
         while let Some(next) = receiver_call(receiver) {
             if chain.len() >= MAX_DEPTH {
-                return;
+                return false;
             }
             chain.push(next);
             receiver = next;
@@ -642,12 +652,13 @@ fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceSte
                 })
                 .collect();
             let label = format!("{} ({} calls)", labels.join(" → "), labels.len());
-            wrap_chain(n, &chain, &label, steps);
+            return wrap_chain(n, &chain, &label, steps);
         }
     }
+    false
 }
 
-fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<SequenceStep>) {
+fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<SequenceStep>) -> bool {
     // Only a flat, fully measured evaluation is eligible. Branches, opaque
     // boundaries, writes, suspension, and transfers conservatively prevent it.
     let first = steps
@@ -679,16 +690,17 @@ fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<Sequ
             group.call_id = None;
             group.children = steps.drain(first..end).collect();
             steps.insert(first, group);
-            return;
+            return true;
         }
     }
-    for step in steps {
-        // Do not wrap shorter subchains inside an already collapsed chain.
-        if step.kind != "group" {
-            wrap_chain(n, chain, label, &mut step.children);
-            wrap_chain(n, chain, label, &mut step.alternate);
-        }
-    }
+    // Do not wrap shorter subchains inside an already collapsed chain.
+    steps
+        .iter_mut()
+        .filter(|step| step.kind != "group")
+        .any(|step| {
+            wrap_chain(n, chain, label, &mut step.children)
+                || wrap_chain(n, chain, label, &mut step.alternate)
+        })
 }
 pub fn build(
     revision: IndexPin,
@@ -730,7 +742,7 @@ pub fn build(
     }
     let mut b = Builder { file, seed, calls, count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
-        steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false,
+        steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};
     let f = if !callable(node)
         || node.start_byte() != seed.range.start_byte
