@@ -196,7 +196,12 @@ Owner rulings 2026-10-31 (#543). They amend the #522, #536 and #542 sections abo
   The rule is the same for Java, Rust, Python and JavaScript. The steps evaluating its
   receiver and arguments are hidden with it, except a call that can expand. An unresolved
   `getX()` is never an accessor: the name alone never qualifies.
-- A step that may return early (#542) is never incidental, nor hidden as an argument.
+- A call that may return early (#542) is never incidental, and an operand subtree that
+  holds one is not hidden with the call it feeds. Operand subtrees are hidden whole: every
+  step they nest is marked and counted.
+- Rust `::log::`/`::tracing::` macro paths and JavaScript optional calls (`console?.log`)
+  match the same rule. Constructors (Java constructors, a JavaScript `constructor`, Python
+  `__init__`) are never accessors, and a setter assigns with plain `=` only.
 
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
 reason in the sequence status line, and offers a "Show/Hide N incidental calls" toggle

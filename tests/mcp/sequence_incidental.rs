@@ -187,3 +187,71 @@ fn javascript_accessors_and_logging_are_incidental() {
         logging: &["console.info", "this.logger.error"],
     });
 }
+
+/// Review follow-ups: more logging spellings match (constructors and compound assignment
+/// are unit-tested in `behavior_incidental`), and an operand container is hidden whole.
+#[test]
+fn more_logging_spellings_and_operand_containers() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = "class S {\n  void run() { LOGGER.warn(\"a\"); this.logger.error(\"b\"); }\n}\n";
+    let mut spec = Spec::new(&[("S.java", source)]);
+    spec.languages = vec![s::Language::Java];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "run");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    for text in ["LOGGER.warn", "this.logger.error"] {
+        assert_eq!(
+            step(&view, source, text).incidental,
+            Some(IncidentalReason::Logging),
+            "{text}"
+        );
+    }
+
+    // A JavaScript ternary in a logging call's arguments is hidden whole and counted.
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = "function f() {}\nfunction g() {}\nfunction run(c) { console.log(c ? f() : g()); console?.warn(1); work(); }\n";
+    let mut spec = Spec::new(&[("a.js", source)]);
+    spec.languages = vec![s::Language::Javascript];
+    spec.bindings = vec![bind("run", 1, "f"), bind("run", 2, "g")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "run");
+    for show_all in [false, true] {
+        let view = publisher
+            .store
+            .sequence_at(&seed, pin, show_all)
+            .unwrap()
+            .unwrap();
+        let logged: Vec<_> = flatten(&view.steps)
+            .into_iter()
+            .filter(|s| s.label != "work")
+            .collect();
+        let labels: Vec<_> = logged
+            .iter()
+            .map(|s| (s.kind.as_str(), s.label.as_str()))
+            .collect();
+        assert!(
+            logged.iter().any(|s| s.label == "f") && logged.iter().any(|s| s.label == "g"),
+            "{labels:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .all(|s| s.incidental == Some(IncidentalReason::Logging) && s.hidden == !show_all),
+            "{view:#?}"
+        );
+        assert!(
+            logged.iter().all(|s| s.lane.is_none()),
+            "nothing is expanded beneath a logging call"
+        );
+        assert_eq!(view.incidental_steps, logged.len());
+        assert_eq!(view.hidden_steps, if show_all { 0 } else { logged.len() });
+    }
+}

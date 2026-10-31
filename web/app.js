@@ -1466,7 +1466,7 @@ function renderIncidentalToggle(data) {
   const count = Number.isSafeInteger(data?.incidentalSteps) ? data.incidentalSteps : 0, showing = !!$("all-steps").checked;
   button.hidden = !count;
   button.textContent = `${showing ? "Hide" : "Show"} ${count} incidental ${count === 1 ? "call" : "calls"}`;
-  button.title = "Calls bound to the standard library or another external package, logging calls (a naming rule) and trivial accessors (#543)";
+  button.title = "Calls bound to the standard library or another external package, logging calls (a naming rule) and trivial accessors";
   button.setAttribute("aria-pressed", String(showing));
 }
 async function loadSequence(admitted = null, preserveSource = false, callerCurrent = () => true) {

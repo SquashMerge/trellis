@@ -727,8 +727,8 @@ struct Enrichment<'a, 'b> {
     /// Truncated by an adapter bound with no typed limit.
     truncated: bool,
     limits: BTreeSet<crate::behavior::SequenceLimit>,
-    /// Whether each target is a trivial accessor (#543), once per target.
-    accessors: BTreeMap<String, bool>,
+    /// The trivial accessors (#543) of each target document read so far, by path.
+    accessors: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Whether the declaration `id` in `key` is a trivial accessor (#543), from its own body in
@@ -737,21 +737,23 @@ fn accessor(
     store: &Store,
     db: &Connection,
     selected: &ReadRevision,
-    memo: &mut BTreeMap<String, bool>,
+    memo: &mut BTreeMap<String, BTreeSet<String>>,
     id: &str,
     key: &DocumentKey,
 ) -> Result<bool> {
-    if let Some(&known) = memo.get(id) {
-        return Ok(known);
+    if !memo.contains_key(&key.path) {
+        // One read and one parse per target document.
+        let document = store.selected_graph_document_for(db, &key.path, selected)?;
+        let accessors = crate::behavior_incidental::trivial_accessors(
+            &document.file,
+            document
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, SymbolKind::Function | SymbolKind::Method)),
+        );
+        memo.insert(key.path.clone(), accessors);
     }
-    let document = store.selected_graph_document_for(db, &key.path, selected)?;
-    let trivial = document
-        .nodes
-        .iter()
-        .find(|node| node.id == id)
-        .is_some_and(|symbol| crate::behavior_incidental::trivial_accessor(&document.file, symbol));
-    memo.insert(id.to_owned(), trivial);
-    Ok(trivial)
+    Ok(memo[&key.path].contains(id))
 }
 
 /// Sets which of `steps`, measured in `owner`'s body in `document`, are shown, before the
@@ -825,18 +827,15 @@ fn hide_incidental(
         } else if reason == BoundaryReason::None {
             let (id, key) = disposition.exact_target.expect("eligible target is exact");
             if step.folded.is_empty() && accessor(id, key)? {
-                step.incidental = Some(IncidentalReason::Accessor);
-                step.hidden = !show_all;
                 // Its receiver and argument steps go with it, except calls that may expand.
-                let range = step.range.clone();
-                for operand in steps[..at].iter_mut().rev().take_while(|s| {
-                    s.range.start_byte >= range.start_byte && s.range.end_byte <= range.end_byte
-                }) {
-                    if operand.folded.is_empty() && !targets.contains(&operand.id) {
-                        operand.incidental = Some(IncidentalReason::Accessor);
-                        operand.hidden = !show_all;
-                    }
-                }
+                let keep = |s: &crate::behavior::SequenceStep| targets.contains(&s.id);
+                crate::behavior_incidental::mark_with_operands(
+                    steps,
+                    at,
+                    IncidentalReason::Accessor,
+                    show_all,
+                    &keep,
+                );
             } else {
                 step.hidden = false;
                 // Only a call `expand` could build reserves room: not recursion into the
