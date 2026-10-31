@@ -11249,7 +11249,9 @@
             "relationKind": {
               "enum": [
                 "reference",
-                "import"
+                "import",
+                "call",
+                "type"
               ]
             },
             "spelling": {
@@ -11265,6 +11267,22 @@
                   "type": "null"
                 }
               ]
+            },
+            "mapping": {
+              "enum": [
+                "structural",
+                "semantic"
+              ]
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -11274,7 +11292,9 @@
             "lines",
             "relationKind",
             "spelling",
-            "callId"
+            "callId",
+            "mapping",
+            "provenanceId"
           ]
         },
         "Module": {
@@ -11323,8 +11343,15 @@
             "omittedSites": {
               "$ref": "#/$defs/UInt"
             },
-            "mapping": {
-              "const": "structural"
+            "evidenceTier": {
+              "enum": [
+                "syntax",
+                "semantic",
+                "mixed"
+              ]
+            },
+            "semanticSites": {
+              "$ref": "#/$defs/UInt"
             }
           },
           "required": [
@@ -11333,7 +11360,8 @@
             "count",
             "sites",
             "omittedSites",
-            "mapping"
+            "evidenceTier",
+            "semanticSites"
           ]
         },
         "UnresolvedReference": {
@@ -11393,7 +11421,9 @@
               "enum": [
                 "declaration",
                 "call",
-                "structuralReference"
+                "structuralReference",
+                "semanticBinding",
+                "typeRelationship"
               ]
             },
             "syntaxId": {
@@ -11452,7 +11482,11 @@
               "$ref": "#/$defs/Text"
             },
             "status": {
-              "const": "unknown"
+              "enum": [
+                "conforms",
+                "deviates",
+                "unknown"
+              ]
             },
             "evidence": {
               "type": "array",
@@ -12352,7 +12386,10 @@
                   "$ref": "#/$defs/UInt"
                 },
                 "evidenceTier": {
-                  "const": "syntax"
+                  "enum": [
+                    "syntax",
+                    "mixed"
+                  ]
                 },
                 "semanticComplete": {
                   "const": false
@@ -12393,12 +12430,16 @@
                     },
                     "unresolvedSites": {
                       "$ref": "#/$defs/UInt"
+                    },
+                    "semanticSites": {
+                      "$ref": "#/$defs/UInt"
                     }
                   },
                   "required": [
                     "scannedDocuments",
                     "mappedSites",
-                    "unresolvedSites"
+                    "unresolvedSites",
+                    "semanticSites"
                   ]
                 },
                 "limitations": {
@@ -12439,6 +12480,25 @@
                     "nextOffset",
                     "total"
                   ]
+                },
+                "semanticProducers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "language": {
+                        "$ref": "#/$defs/Language"
+                      },
+                      "producerId": {
+                        "$ref": "#/$defs/Text"
+                      }
+                    },
+                    "required": [
+                      "language",
+                      "producerId"
+                    ]
+                  }
                 }
               },
               "required": [
@@ -12447,6 +12507,7 @@
                 "indexRevision",
                 "evidenceTier",
                 "semanticComplete",
+                "semanticProducers",
                 "modules",
                 "production",
                 "tests",
@@ -12538,7 +12599,7 @@
       ],
       "type": "object"
     },
-    "description": "Read pinned structural native-module and external-package references, not resolved semantic dependencies. Production and test sites are separate. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
+    "description": "Read pinned native-module and external-package references: structural syntax sites, plus fresh semantic call and type bindings where a producer is selected. Production and test sites are separate. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
   },
   {
     "annotations": {
@@ -13223,7 +13284,9 @@
             "relationKind": {
               "enum": [
                 "reference",
-                "import"
+                "import",
+                "call",
+                "type"
               ]
             },
             "spelling": {
@@ -13239,6 +13302,22 @@
                   "type": "null"
                 }
               ]
+            },
+            "mapping": {
+              "enum": [
+                "structural",
+                "semantic"
+              ]
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -13248,7 +13327,9 @@
             "lines",
             "relationKind",
             "spelling",
-            "callId"
+            "callId",
+            "mapping",
+            "provenanceId"
           ]
         },
         "Module": {
@@ -13297,8 +13378,15 @@
             "omittedSites": {
               "$ref": "#/$defs/UInt"
             },
-            "mapping": {
-              "const": "structural"
+            "evidenceTier": {
+              "enum": [
+                "syntax",
+                "semantic",
+                "mixed"
+              ]
+            },
+            "semanticSites": {
+              "$ref": "#/$defs/UInt"
             }
           },
           "required": [
@@ -13307,7 +13395,8 @@
             "count",
             "sites",
             "omittedSites",
-            "mapping"
+            "evidenceTier",
+            "semanticSites"
           ]
         },
         "UnresolvedReference": {
@@ -13367,7 +13456,9 @@
               "enum": [
                 "declaration",
                 "call",
-                "structuralReference"
+                "structuralReference",
+                "semanticBinding",
+                "typeRelationship"
               ]
             },
             "syntaxId": {
@@ -13426,7 +13517,11 @@
               "$ref": "#/$defs/Text"
             },
             "status": {
-              "const": "unknown"
+              "enum": [
+                "conforms",
+                "deviates",
+                "unknown"
+              ]
             },
             "evidence": {
               "type": "array",
@@ -14566,7 +14661,7 @@
       ],
       "type": "object"
     },
-    "description": "Check reviewed architecture rules against pinned evidence without writing files. Unavailable call/type bindings remain unknown. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
+    "description": "Check reviewed architecture rules against pinned evidence without writing files. Call/type constraints use fresh semantic bindings where available; otherwise they remain unknown. Results page at about 24 KiB: repeat the call with `offset: page.nextOffset` until it is null."
   },
   {
     "annotations": {
@@ -15519,7 +15614,9 @@
             "relationKind": {
               "enum": [
                 "reference",
-                "import"
+                "import",
+                "call",
+                "type"
               ]
             },
             "spelling": {
@@ -15535,6 +15632,22 @@
                   "type": "null"
                 }
               ]
+            },
+            "mapping": {
+              "enum": [
+                "structural",
+                "semantic"
+              ]
+            },
+            "provenanceId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -15544,7 +15657,9 @@
             "lines",
             "relationKind",
             "spelling",
-            "callId"
+            "callId",
+            "mapping",
+            "provenanceId"
           ]
         },
         "Module": {
@@ -15593,8 +15708,15 @@
             "omittedSites": {
               "$ref": "#/$defs/UInt"
             },
-            "mapping": {
-              "const": "structural"
+            "evidenceTier": {
+              "enum": [
+                "syntax",
+                "semantic",
+                "mixed"
+              ]
+            },
+            "semanticSites": {
+              "$ref": "#/$defs/UInt"
             }
           },
           "required": [
@@ -15603,7 +15725,8 @@
             "count",
             "sites",
             "omittedSites",
-            "mapping"
+            "evidenceTier",
+            "semanticSites"
           ]
         },
         "UnresolvedReference": {
@@ -15663,7 +15786,9 @@
               "enum": [
                 "declaration",
                 "call",
-                "structuralReference"
+                "structuralReference",
+                "semanticBinding",
+                "typeRelationship"
               ]
             },
             "syntaxId": {
@@ -15722,7 +15847,11 @@
               "$ref": "#/$defs/Text"
             },
             "status": {
-              "const": "unknown"
+              "enum": [
+                "conforms",
+                "deviates",
+                "unknown"
+              ]
             },
             "evidence": {
               "type": "array",

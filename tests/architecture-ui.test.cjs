@@ -14,7 +14,7 @@ const identity = (path, sourceSetId = "workspace") => ({sourceSetId,language:"ru
 function fixture(aggregate = "max", hash = "rules-one", role = "production") {
   const a = identity("src/a.rs"), b = identity("src/b.rs");
   const site = {role:"production",relationKind:"rust_path",spelling:"crate::b",lines:{start:2,end:2},range:{start:10,end:18},ownerSyntaxId:"owner",callId:null};
-  const pair = {source:a,target:b,count:7,sites:[site],omittedSites:6,mapping:"structural"};
+  const pair = {source:a,target:b,count:7,sites:[site],omittedSites:6,evidenceTier:"syntax",semanticSites:0};
   return {...pin,state:"ready",rulesFile:{path:".trellis/rules.toml",source:"checkout-config",contentHash:hash},
     aggregate,role,workbench:true,metricsVersion:"metrics:v1",evidenceTier:"syntax",semanticComplete:false,
     layers:[{name:"UI",order:1,shared:false},{name:"Storage",order:2,shared:false}],
@@ -228,7 +228,7 @@ test("external package evidence and deny results display without fabricated nati
     path:"Cargo.toml",contentHash:"manifest-hash",importRoot:"legacy_db",section:"dependencies",key:"legacy-db",versionConstraint:"1",
   }]};
   const site = {role:"production",relationKind:"import",spelling:"legacy_db::*",lines:{start:2,end:2},range:{start:10,end:22},ownerSyntaxId:"owner",callId:null};
-  const pair = {source:payload.modules[0].identity,target:external,count:1,sites:[site],omittedSites:0,mapping:"structural"};
+  const pair = {source:payload.modules[0].identity,target:external,count:1,sites:[site],omittedSites:0,evidenceTier:"syntax",semanticSites:0};
   payload.layers.push({name:"External",order:3,shared:false});
   payload.references.externalPackages = [descriptor];
   payload.references.production.push(pair);
@@ -504,6 +504,27 @@ test("layer stats chip only non-zero production counts by verdict, with deviatio
   assert.match(h.get("architecture-coverage").textContent, /^81 of 89 reference sites mapped to a module \(91%\) · ≥ counts are lower bounds$/); assert.match(text(h.get("architecture-notice-content")), /0 of 0 production rule instances unknown/);
 });
 
+test("#523: an arrow's own coverage decides its lower bound and names its evidence tier", async () => {
+  const h = harness(), dto = fixture();
+  const exact = {...edge("UI","Storage",7), evidenceTier:"mixed", semanticSites:3,
+    coverage:{sites:7,mappedSites:7,unresolvedSites:0,semanticSites:3,complete:true}};
+  const bounded = {...edge("Storage","UI",56,"deviates"), evidenceTier:"semantic", semanticSites:56,
+    coverage:{sites:80,mappedSites:72,unresolvedSites:9,semanticSites:60,complete:false}};
+  dto.edges = [exact, bounded];
+  // A summary with semantic sites is accepted; an unknown tier is not.
+  dto.evidenceTier = "mixed";
+  // The layer rows would say otherwise; the arrow's own coverage wins.
+  dto.references.coverage = [{layer:"UI",role:"production",sites:7,mappedSites:7,unresolvedSites:4},{layer:"Storage",role:"production",sites:80,mappedSites:72,unresolvedSites:9}];
+  h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
+  const {options} = h.renders[0];
+  assert.deepEqual(JSON.parse(JSON.stringify(options.edgeText(exact))), {bound:false, label:"100% of 7 production reference sites from UI mapped to a module; syntax and semantic bindings", note:""});
+  assert.deepEqual(JSON.parse(JSON.stringify(options.edgeText(bounded))), {bound:true, label:"lower bound; 90% of 80 production reference sites from Storage mapped to a module; semantic bindings", note:"90% mapped"});
+  const invalid = harness(), wrong = fixture(); wrong.evidenceTier = "semantic";
+  invalid.setResponse(async () => ({payload:wrong})); await invalid.controller.refresh();
+  assert.equal(invalid.renders.length, 0);
+  assert.match(invalid.get("architecture-state").textContent, /Invalid Architecture response/);
+});
+
 test("one chip per module: a file and its same-named directory form one module that opens to files", async () => {
   const {commonDirectory, groupModules} = harness().window.TrellisArchitecture;
   assert.equal(commonDirectory(["src/store.rs", "src/store/a.rs", "src/model.rs"]), "src/");
@@ -726,4 +747,31 @@ test("a collapsed band draws one row of metric-coloured module chips, hottest fi
   assert.equal(chips[1].label, "warm · 2 files · cognitive 20");
   assert.equal(chips[2].label, "2 more modules · open the band to see them");
   assert.equal(options.display.summary("UI", members, 10).length, 4, "everything fits when the row is wide enough");
+});
+
+test("#523: inspectors describe semantic evidence for mixed edges and bound rule instances", async () => {
+  // Shapes from the semantic fixture: a mixed low → high edge whose sites are partly bound.
+  const h = harness(), payload = authoringFixture();
+  payload.evidenceTier = "mixed";
+  Object.assign(payload.edges[0], {evidenceTier:"mixed", semanticSites:2,
+    coverage:{sites:3,mappedSites:3,unresolvedSites:0,semanticSites:2,complete:true}});
+  const binding = {document:{sourceSetId:"s",language:"rust",path:"src/a.rs"},revisionId:"r",range:{start:1,end:2},
+    kind:"semanticBinding",syntaxId:null,callId:null,provenanceId:"call-orphan-0"};
+  payload.rules.instances[0].evidence = [binding];
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  h.renders[0].options.onSelectEdge(payload.edges[0]); await flush();
+  const edgeText = text(h.get("architecture-inspector-content"));
+  assert.match(edgeText, /Syntax evidence and fresh semantic bindings · not semantically complete/);
+  assert.match(edgeText, /reference sites, 2 bound by semantic evidence/);
+  assert.doesNotMatch(edgeText, /not compiler-resolved calls/);
+  const rule = descendants(h.get("architecture-review-list")).find(item => item.tagName === "button" && item.textContent.startsWith("$layers · "));
+  assert.ok(rule); await rule.fire("click"); await flush();
+  const ruleText = text(h.get("architecture-inspector-content"));
+  assert.match(ruleText, /Semantic evidence names a fresh producer binding/);
+  assert.doesNotMatch(ruleText, /not destination symbol bindings/);
+  // A syntax-only snapshot keeps the syntax wording.
+  const plain = harness(), syntax = authoringFixture();
+  plain.setResponse(async () => ({payload:syntax})); await plain.controller.refresh();
+  plain.renders[0].options.onSelectEdge(syntax.edges[0]); await flush();
+  assert.match(text(plain.get("architecture-inspector-content")), /Syntax evidence · not compiler-resolved calls.*structural reference sites/s);
 });

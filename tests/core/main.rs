@@ -5,8 +5,13 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+// Only test-support modules use these helpers, which need its hooks.
+#[cfg(feature = "test-support")]
+#[path = "../common/graph_fixtures.rs"]
+mod graph_fixtures;
 
 mod architecture_external;
+mod architecture_semantic;
 mod architecture_store;
 mod architecture_view;
 mod behavior;

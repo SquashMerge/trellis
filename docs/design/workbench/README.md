@@ -95,131 +95,117 @@ There are two app modes and one shared diagram set:
 
 ## Current UI vs. this design (gap list)
 
-Reviewed in the running app at `localhost:8877` on 2026-10-29 (`6925a2c`, index revision `d192e32e:2`) at 1440×900. Each finding was checked against the daemon's own API responses and the Trellis MCP tools. The owner rulings below win where they differ, except where an item says it proposes changing one.
+Reviewed in the running app at `localhost:8877` on 2026-10-31 (`cbb32684`, index revision `acb51f94:6`) at 1440×900. Each finding was checked against the daemon's API responses and the Trellis MCP tools after a daemon restart. The owner rulings below win where they differ.
 
-**Already fixed since 2026-10-28:**
+**Shipped since 2026-10-29.** These were the earlier simplification and fix items:
 
-- one header row with a single status
-- the checkout picker shows `repo ⎇ … · rev`
-- fixed per-metric color bands (#395)
-- fixtures and vendored code excluded from heat
-- Architecture folded to deviations, with ↑ counts
-- the treemap root is named `trellis`
-- one-line symbol rows
-- the Connect logo
+- **Start:** the checkout is selected automatically and the app lands on Architecture. The header is a status chip ("Fresh · rev …") instead of the false "Index failed".
+- **Layout:**
+  - the left rail is only the file tree, with a whole-tree filter
+  - one-row toolbars, with an Options popover and an ⓘ
+- **Architecture:**
+  - the full layer stack, entry layer included, with Shared beside it
+  - inspector chips: 24 deviations · 275 unassigned · 0 exceptions
+  - the "% of sites mapped" coverage note and a compact legend
+  - the payload went from 35 MB to 844 KB
+- **Tabs and Files:**
+  - the Libraries tab is removed, with "Open in library" in context
+  - the Sequence start list
+  - "Open full" opens Sequence
+  - the selected source range is raised with a lavender bar
+  - references in the inspector ("References to witness · ≥50")
+- **MCP:** `rules_check` works, paged at 25 of 259.
 
-### A. Simplify: the screens carry too much
+Items are ordered by impact.
 
-The app shows every control and every caveat at once. The rule for the next pass: **one row of controls per view, one status in the header, caveats behind an ⓘ, and every tab has something to show on arrival.**
 
-1. **Open straight into a diagram.**
-   - After Connect, select a checkout automatically: the only one, or the one last used, or the one matching the agent's cwd.
-   - Land on **Architecture**, not an empty Sequence.
-   - The picker stays in the header for switching.
-2. **Header: picker, status chip, menu.**
-   - The status chip shows "Fresh · rev 2". A failed re-index is a secondary note on the chip, and its menu holds Refresh and Diagnostics.
-   - Show the amber **Index workspace** button only when there's no usable index.
-   - Move Disconnect into the menu.
-3. **Left rail: just the file tree.** Remove:
-   - The **Indexed checkouts** card. It repeats the header picker; bring it back only when there are 2+ checkouts, as the picker's dropdown.
-   - "Agents can use these indexes through trellis mcp", the absolute path, the "Index scope & file access" disclosure and the "Expand folders to browse…" paragraph.
-   - The "Filter loaded entries" label. The tall filter box becomes a one-line filter that searches the whole tree, not just loaded folders. Today, filtering `src/watch.rs` on the Diagrams page finds nothing, because unopened folders aren't searched.
-   - The rail legend. It repeats the diagram legend; show it only as a tooltip on a swatch.
-   - Show hidden/ignored and Display options move into a ⋯ menu.
-4. **View toolbars: one row each.**
-   - Keep Color by and the aggregation select (max / sum / mean).
-   - Move the checkboxes into an **Options** popover: include tests and fixtures, relative, test-only edges. ("Deviations only" was removed by #449: the full stack is always drawn with deviations highlighted, item 11.)
-   - Replace the two or three lines of mono explanation under the toolbar (band names, "20025 callables excluded…", excluded-file counts) with the legend swatches and an ⓘ that holds the detail.
-   - Remove **Color by** from Sequence and Classes, where it has nothing to color ("No measured values").
-5. **Architecture header.**
-   - Turn "Review deviations / Unassigned files / Authored exceptions" into counted chips in the inspector: **23 deviations · 156 unassigned · 0 exceptions**.
-   - Remove "Refresh architecture"; the view refreshes on a new revision.
-   - Cut "503 native file modules · 431 production / 331 test-only…" and "Showing 3 layers and 25 files…" to one line, or move them under ⓘ.
-6. **Only show tabs that can show something.**
-   - **Classes** appears only when the checkout has production files in a class-catalog language. `GET /api/classes` reports those as `supportedLanguages` (Java, Python, JavaScript and Rust since #452). Before #452, class diagrams covered only Java and Python, which trellis has only in fixtures and tools.
-   - **Sequence** opens from a method: click it in the tree, the source margin or the inspector.
-   - With no method selected, the Sequence tab shows a short list of the most complex methods to start from, instead of "Expand a file and select a method."
-7. **Libraries leaves the tab row.** *This proposes changing the 2026-10-24 ruling, which kept it as a tab.* Today it's a catalog: 376 crates and 50,000 declarations with no link to this code.
-   - Reach it in context instead: "open in library" from a call or reference that lands in an external crate.
-   - Optionally, later: a **Dependencies** view showing which external packages each layer uses. The architecture payload already has 51 of them.
-8. **Explanatory text, once per view.** The "not a runtime trace / targets unverified / candidates do not prove dispatch" sentences currently repeat in the toolbar, canvas, inspector and footer. Keep one ⓘ "About this view" per view, plus the footer's Privacy & evidence limits.
+**Corrections after review (2026-10-31, Prime's review of PR #521; accepted by the owner):**
 
-### B. Fixes found with live data
+- **Item 1 (Sequence):** `/sequence` already enriched exact semantic targets. The single lifeline came from the Rust syntax adapter's depth bound, which cut `coordinate`'s loop, and `semantic: unavailable` is display metadata, not enrichment status. Fixed in #531.
+- **Item 7 (Classes):** Rust became a supported Classes language with #506, so Classes showing on this repo is correct. The real defect is that `tools/*.py` alone counted. Fixed in #530.
+- **Item 12 (MCP):** the `syntax` tier labels describe each native answer (for example, `find_symbols` returns native declarations). The gap is that per-language semantic availability wasn't reported. Addressed in #534.
 
-9. **The status says "Index failed" while the index is fine.**
-   - `/status` and MCP `workspace_describe` both report revision 2 as ready and fresh.
-   - What failed was the latest re-index job (`/jobs/current`), whose only error is the generic `"Index job failed"`.
-   - Show it as a note with the real cause (see item 2).
-10. **Architecture downloads 35 MB.**
-    - Drawing needs `edges` and `modules`, about 0.7 MB.
-    - The rest is undrawn detail: `references.unresolved` (32,472 sites, 15 MB), `rules.testOnly` (11.6 MB) and `rules.instances` (6 MB).
-    - The same payload makes MCP `rules_check` and `references` fail with `response_too_large`, even when limited to one file.
-    - Fix: return summary data by default, with details per edge or file on demand, and apply MCP `paths` before the size check.
-11. **The entry layer vanishes.**
-    - It has 36 modules and 172 production references, all downward and allowed.
-    - With "Deviations only" it's neither drawn nor listed under "quiet layers", which names tooling and web.
-    - Fix: draw the full stack (web, entry, query, indexing, storage, with Shared beside it). Dim the allowed arrows and highlight the deviations, rather than dropping layers.
-12. **Architecture leaves most of the panel empty.** The stack is a ~430px column inside a 1196px panel. Use the width, and put module chips colored by metric where it now says "N files folded".
-13. **Show coverage next to the arrows.**
-    - Only 3,034 of 35,506 reference sites mapped to a module (about 9%). The rest are mostly `rust_module_ownership_unproved` (16,104) and `rust_export_name_set_unknown` (13,700).
-    - 563 of 897 rule instances are unknown.
-    - So ↑ counts are lower bounds: storage → indexing shows ↑102, while #163's scan found 183. Say "≥102 · 9% of sites mapped".
-14. **Arrow legend.** Four lines of prose become a compact symbol key.
-15. **Treemap fits its panel.** The controls take about 325px of height, leaving the map 400px of the 712px panel, and it's 69px too wide, so it scrolls sideways.
-16. **"Open full" opens the wrong tab.** In Files → Inspector, "Open full" sets `#sequence?…` but shows the last-used diagram tab (Treemap).
-17. **The inspector mini-sequence is clipped.** Pele draws it at 720×374 in a 251px-wide box. Scale it to fit.
-18. **The selected method is a heavy purple slab.** Use a raised background with a lavender left bar for the selected source range.
-19. **References in the inspector.** The design lists "References to WatcherWitness · 4", and the data exists; the live inspector doesn't show it.
-20. **IDs in accessible labels.** The source-margin buttons are labelled "Sequence for witness · syntax · sid:v1:…". Drop the ID.
+### A. Data: use the semantic evidence that's already imported
 
-### C. Data limits that shape the design
+1. **Sequence ignores the semantic bindings.**
+   - MCP `outgoing_calls` now resolves calls through rust-analyzer: `Store::navigation_at → navigation_in` is `resolution: resolved`, `evidenceTier: semantic`.
+   - But the `/sequence` response still marks the seed `semantic: unavailable` and returns the seed as its only participant.
+   - `coordinate` (`src/mcp/mod.rs`, 571 lines) renders as one lifeline with 32 steps. 18 of them are std/core/alloc calls (`Arc::new`, `clone`, `into`), and the view says "0 incidental steps hidden".
+   - **Fix:** build participants from the resolved bindings, and hide standard-library calls by default as incidental, with a count and a toggle.
+2. **Architecture references ignore the semantic bindings.**
+   - Coverage is still 9%: 3,737 of 40,481 reference sites mapped to a module.
+   - `rules_check` still lists the limitation "Calls and type relationships have no admitted bindings".
+   - **Fix:** feed resolved call and type bindings into references and rules. Arrows and deviation counts stop being "≥" lower bounds where coverage is complete.
 
-- **No calls are resolved.** The index resolves 0 of 199,075 calls. MCP `outgoing_calls` for `Store::navigation_at` returns one unresolved call with a same-file candidate, `navigation_in`.
-  - That's why the `witness` sequence is a single lifeline with two "call load · target unverified" boxes.
-  - The Sequence and Class mockups, which draw resolved participants, overstate what's available.
-  - Until resolution lands (#40/#68), draw **native candidates** as dashed participants, labelled as candidates.
-- **Rust coverage is partial.** 260 of 274 Rust files are partial, because macro and attribute bodies aren't measured. This belongs in the ⓘ for every view, not in each one's body.
+### B. Architecture
+
+3. **Tooling reads as the top layer.**
+   - `tooling` (order 1, a peer of `web`) sits at the top of the stack, so `tools/` looks like part of the UI.
+   - It's developer tooling, not runtime architecture.
+   - **Fix:** treat it like `fixture-inputs`: beside the stack or hidden by default (see open questions).
+4. **Labels collide and truncate.**
+   - Arrow-count tags overlap the band header chips: in the query band, "≥65" sits over "→shared ≥7".
+   - "↑≥1 · 7% mapped" runs into the indexing header.
+   - The "1 hidden layer" tag floats over the bottom of the drawing.
+   - Band titles and chips are cut off ("1 · tooling · 115 files …", "Shared · shar…", "architecture-…", "dependency_…"), because the drawing is 715px wide in a 912px area.
+   - **Fix:** route the count tags beside the arrows, wrap or widen labels, and make the hidden-layer note part of the layout.
+5. **Repeated text.**
+   - The coverage sentence appears twice in the view (above the drawing and under the legend) and again in the inspector.
+   - Two lines of counts and bands remain above the drawing.
+   - **Fix:** keep the coverage sentence once, next to the arrows or in the inspector, and move the counts into the ⓘ.
+
+### C. Tabs, Sequence and Files
+
+6. **The Sequence start list is mostly dev scripts.** Three of the five most complex methods are `tools/semantic-contract` scripts. Limit the list to application layers, excluding tooling and fixtures, or group it by layer.
+7. **Classes shows for a Rust app.** The tab appears because `tools/*.py` counts as production Python. Base the rule on application-layer code, not on any production file.
+8. **The file tree lists every member.** The `watch.rs` outline shows fields, parameters and impl blocks (`epoch` field, `bits` parameter, `<impl>`). Show types and callables; show members when the type is expanded.
+9. **The inspector is still verbose and clips.** Under "Sequence · measured", a nine-line caveat paragraph remains; move it to the ⓘ. The mini-sequence still clips at the right edge ("External boundary – lo…").
+
+### D. Treemap and load
+
+10. **Treemap controls.**
+    - "Refresh treemap" and "All indexed files" are still buttons; Architecture dropped its equivalents.
+    - With the fixed bands (#395), most of the area is in the top orange band.
+    - Consider defaulting to a metric or aggregation that separates files (e.g. `mean`), and keep the ramp fixed.
+11. **Startup load.**
+    - Architecture takes 4.6 s and metrics 2.3 s.
+    - `/status` (61 KB) is fetched four times in the first few seconds.
+    - `/dependencies` (264 KB) loads at startup although nothing shows it until "Open in library".
+    - **Fix:** load dependencies on demand, poll a small status digest, and cache architecture and metrics per revision.
+
+### E. MCP (separate issue)
+
+12. **The reported evidence level contradicts the results.** `workspace_describe` reports "syntax" as the evidence level for every language, and `find_symbols` warns "syntaxOnly", while rust-analyzer and scip-typescript data is fresh and `outgoing_calls` returns semantic, resolved bindings. Agents will under-trust the results. Report the evidence level per language from the imported evidence.
+13. **`rules_check` pages are at the size limit.** A 25-instance page is 63 KB against the 64 KB response cap. Lower the default page size or trim the evidence per instance.
 
 ## Suggested slices (each its own issue)
 
-**Already in the running app (2026-10-28).** These were slices 1–6 of the original list:
+**Already in the running app (2026-10-31).** These were the original slices 1–6 plus the 2026-10-29 slices 1–5:
 
-- brand tokens and fonts
-- the Connect screen
-- the Without-Herdr shell: indexed checkouts, diagram tabs, inspector
-- Architecture and Treemap with color by metric
-- the Files view with the Indexed / Working tree toggle
+- the brand restyle and Connect
+- the simplified shell, Architecture and Treemap with metrics, and Files
+- the Architecture payload
+- tabs: no Libraries; the Sequence start list
+- the Files and Inspector fixes
 
-Confirm that `DESIGN.md` and `docs/design-refresh-contract.md` were amended along with the restyle. If they weren't, that amendment comes first.
+Confirm that `DESIGN.md` and `docs/design-refresh-contract.md` were amended along with the restyle.
 
 Item numbers in brackets refer to the gap list above.
 
 ### Next
 
-1. **Simplify the shell** [1–4, 8, 9].
-   - Auto-select the checkout and land on Architecture.
-   - Header: picker, status chip and menu.
-   - Left rail: the file tree with a whole-tree filter.
-   - View toolbars: one row each, with an Options popover and an ⓘ for caveats.
-2. **Architecture payload** [10].
-   - Summary by default, details on demand.
-   - MCP `paths` applied before the size check.
-   - Unblocks the MCP architecture tools.
-3. **Architecture drawing** [5, 11–14].
-   - The full layer stack with Shared beside it, and allowed arrows dimmed.
-   - Module chips colored by metric, using the full width.
-   - Coverage shown next to the arrows, and a compact legend.
-   - Counted chips for deviations, unassigned files and exceptions.
-4. **Tabs that earn their place** [6, 7].
-   - Classes only for production Java/Python.
-   - Sequence opens from a method, with a "most complex methods" starting list.
-   - Libraries reached in context (needs an owner decision: it reverses the 10-24 ruling).
-5. **Files and Inspector** [15–20].
-   - Treemap fits its panel; "Open full" opens Sequence.
-   - Mini-sequence scaled to fit; lighter selection.
-   - References list in the inspector; IDs out of accessible labels.
-6. **Candidate participants in Sequence and Class** [C]. Draw native candidates as dashed participants until call resolution lands.
-7. **Remaining diagram views.** C4, and Pele parity for Sequence and Class. No ERD.
+1. **Semantic bindings in Sequence** [1].
+   - Participants come from resolved calls.
+   - Standard-library calls are hidden as incidental, with a count and a toggle.
+2. **Semantic bindings in Architecture** [2]. References and rules use resolved call and type bindings, with coverage reported per edge.
+3. **Application layers only** [3, 6, 7].
+   - Tooling sits beside the stack or is hidden.
+   - The Sequence start list and the Classes rule consider application layers only.
+4. **Architecture layout** [4, 5]. No collisions or truncation; one coverage sentence; counts behind the ⓘ.
+5. **Files and Inspector** [8, 9]. Types and callables in the tree; caveats behind the ⓘ; the mini-sequence fits.
+6. **Treemap and load** [10, 11]. Remove the orphan buttons; lazy-load dependencies; poll a status digest; cache per revision.
+7. **MCP consistency** [12, 13]. Report the evidence level per language from the imported evidence; size `rules_check` pages under the cap.
+8. **Remaining diagram views.** C4, and Pele parity for Class. No ERD.
 
 ### Gated (don't build until the prerequisite lands)
 
@@ -235,6 +221,8 @@ Item numbers in brackets refer to the gap list above.
 - ~~How does "Follow active tab" behave when the tab's cwd isn't an indexed checkout?~~ Settled 2026-10-29: tabs whose cwd has **no Trellis index are shown greyed out and can't be clicked through to**. Following such a tab doesn't switch the view.
 
 - ~~**Libraries tab:** keep it as a tab (2026-10-24 ruling), or reach it from external calls and references only (gap item 7)?~~ Settled 2026-10-29: **remove the tab**; reach the catalog in context ("open in library" from a call or reference into an external package). Built in #450.
+
+- **Tooling layer:** draw `tooling` beside the stack (like Shared, but marked as dev tooling), or hide it by default like `fixture-inputs`? Either way, it leaves the Sequence start list and the Classes rule (gap items 3, 6, 7).
 
 ## Owner rulings on the packet (2026-10-24)
 

@@ -773,6 +773,7 @@ mod tests {
                     .key
                     .clone();
                 DocumentInput {
+                    semantic: Default::default(),
                     declarations: native
                         .declarations
                         .iter()
