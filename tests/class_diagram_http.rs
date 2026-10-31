@@ -269,11 +269,15 @@ async fn javascript_classes_are_served_with_supported_languages_and_method_seeds
     assert_eq!(members("fields"), ["#state", "label", "instances"]);
     assert_eq!(members("methods"), ["constructor", "render", "of"]);
     // A method seed resolves to its lexical ES class.
-    let render = graph
-        .nodes
-        .iter()
-        .find(|n| n.name == "render" && n.path == "web/widgets.js")
-        .unwrap();
+    let render_id = widget["methods"][1]["symbolId"].as_str().unwrap();
+    let render = graph.nodes.iter().find(|n| n.id == render_id).unwrap();
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.name == "render" && n.id != render_id),
+        "the object-literal render() is a different, unclassed method"
+    );
     let (status, diagram) = call(
         &app,
         "POST",
@@ -285,6 +289,22 @@ async fn javascript_classes_are_served_with_supported_languages_and_method_seeds
     assert_eq!(diagram["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(diagram["nodes"][0]["label"], "web.widgets.Widget");
     assert_eq!(diagram["edges"], json!([]), "extends stays a terminal hint");
+    let literal = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "render" && n.id != render_id)
+        .unwrap();
+    let (status, refused) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":literal.id,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an object-literal method has no class: {refused}"
+    );
     let (_, search) = call(
         &app,
         "GET",

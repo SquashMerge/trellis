@@ -348,6 +348,15 @@ Thing.prototype.go = function () {};
                 .iter()
                 .any(|n| n.id == id && n.path == "web/shapes.js")
         );
+        let node = g.nodes.iter().find(|n| n.id == id).unwrap();
+        let parent = g.nodes.iter().find(|n| Some(&n.id) == node.parent.as_ref());
+        assert_eq!(
+            parent.map(|p| (&p.name, p.kind)),
+            Some((&shape.symbol.name, trellis::model::SymbolKind::Class)),
+            "{} parent {:?}",
+            method.name,
+            node.parent
+        );
     }
     assert_eq!(names(&class(&c, "web.shapes.Circle").fields), ["radius"]);
     let mut relations: Vec<_> = c
