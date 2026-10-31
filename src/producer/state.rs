@@ -389,8 +389,8 @@ impl StateDir {
     /// Recover from a crashed daemon. `keep` holds the generation directories
     /// named by queued or running generated import requests.
     ///
-    /// A non-terminal run owned by another daemon is marked
-    /// `failed/abandoned` and stripped; its group is killed only when the
+    /// A non-terminal run owned by another daemon is stripped and then marked
+    /// `failed/abandoned`; its group is killed only when the
     /// recorded leader is still the process that started it. A run directory
     /// whose record fails its closed parse is removed; one that cannot be read
     /// for another reason is left and reported. A pickup
@@ -450,16 +450,19 @@ impl StateDir {
                 }
                 report.killed_groups.push(process.pgid);
             }
-            record.state = RunState::Failed;
-            record.outcome = Some("abandoned".to_owned());
-            record.error_code = Some("abandoned".to_owned());
-            record.finished_at = Some(now_millis());
-            self.write_run_record(&record)?;
+            // Strip first, then publish the terminal record, so a terminal record means the
+            // sweep is done with the directory. A crash between the two leaves a stripped
+            // directory under a non-terminal record, which the next sweep abandons again.
             if kept(&dir) {
                 self.end_producer_phase(&run_id)?;
             } else {
                 self.strip_to_record(&run_id)?;
             }
+            record.state = RunState::Failed;
+            record.outcome = Some("abandoned".to_owned());
+            record.error_code = Some("abandoned".to_owned());
+            record.finished_at = Some(now_millis());
+            self.write_run_record(&record)?;
             report.abandoned_runs.push(run_id);
         }
         self.prune_runs(keep)?;
