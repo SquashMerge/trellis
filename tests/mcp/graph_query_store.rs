@@ -777,6 +777,178 @@ fn sequence_resolved_local_call_is_not_hidden_by_a_spelling_heuristic() {
     assert_eq!((view.hidden_steps, view.incidental_steps), (0, 0));
 }
 
+/// The `nth` call of `caller` bound to an external (standard-library) declaration.
+fn bind_external(caller: &str, nth: usize) -> Bind {
+    Bind {
+        resolution: s::Resolution::External,
+        dispatch: Dispatch::Unknown,
+        target: None,
+        ..bind(caller, nth, "")
+    }
+}
+
+/// Every step below `steps`, and the shown ones (a hidden step hides what it nests).
+fn counts(steps: &[trellis::behavior::SequenceStep]) -> (usize, usize) {
+    steps.iter().fold((0, 0), |(all, shown), step| {
+        let (children, children_shown) = counts(&step.children);
+        let (alternate, alternate_shown) = counts(&step.alternate);
+        (
+            all + 1 + children + alternate,
+            shown + usize::from(!step.hidden) * (1 + children_shown + alternate_shown),
+        )
+    })
+}
+
+const COORDINATE_CALLEES: [&str; 4] = ["receive", "start_final_check", "phase_hook", "changed"];
+
+/// A `coordinate`-shaped method (#536): more syntax steps than the visible bound, almost all
+/// of them standard-library calls, with its four local callees last.
+fn coordinate_spec(incidental: usize) -> Spec {
+    let std: String = (0..incidental).map(|n| format!("x{n}(); ")).collect();
+    let callees: String = COORDINATE_CALLEES
+        .map(|name| format!("{name}(); "))
+        .concat();
+    let bodies: String = COORDINATE_CALLEES
+        .map(|name| format!("fn {name}() {{ y(); leaf(); }}\n"))
+        .concat();
+    let source = format!("fn coordinate() {{ {std}{callees}}}\n{bodies}fn leaf() {{}}\n");
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = (0..incidental)
+        .map(|nth| bind_external("coordinate", nth))
+        .collect();
+    for (nth, name) in COORDINATE_CALLEES.iter().enumerate() {
+        spec.bindings
+            .push(bind("coordinate", incidental + nth, name));
+        spec.bindings.push(bind_external(name, 0));
+        spec.bindings.push(bind(name, 1, "leaf"));
+    }
+    spec
+}
+
+/// #536: hidden incidental calls do not use the 200 visible steps, so a method with more
+/// syntax steps than that still expands its callee lanes.
+#[test]
+fn sequence_hidden_incidental_steps_do_not_use_the_visible_bound() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let pin = publisher.publish(&coordinate_spec(240));
+    let seed = syntax_id(publisher.native(), "coordinate");
+    let leaf = syntax_id(publisher.native(), "leaf");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert!(!view.truncated, "{:?}", view.warnings);
+    assert!(view.truncated_by.is_empty());
+    assert_eq!(
+        view.semantic.tier,
+        trellis::behavior::EvidenceTier::Semantic
+    );
+    // 244 seed steps and 4 two-step callee bodies; only the lanes' calls are shown.
+    assert_eq!(counts(&view.steps), (252, 8));
+    assert_eq!((view.incidental_steps, view.hidden_steps), (244, 244));
+    for name in COORDINATE_CALLEES {
+        let callee = syntax_id(publisher.native(), name);
+        let step = view
+            .steps
+            .iter()
+            .find(|step| step.target.as_deref() == Some(callee.as_str()))
+            .unwrap_or_else(|| panic!("{name} has a lane"));
+        assert!(!step.hidden);
+        assert_eq!(step.children.len(), 2, "{name} is expanded");
+        assert!(
+            step.children
+                .iter()
+                .all(|child| child.lane.as_deref() == Some(&*callee))
+        );
+        assert!(step.children[0].hidden, "its std call is incidental");
+        assert_eq!(step.children[1].target.as_deref(), Some(leaf.as_str()));
+    }
+}
+
+/// #536: Show all still respects the visible bound: the shown prefix stops at 200 steps and
+/// the view is truncated with the typed `visibleSteps` reason.
+#[test]
+fn sequence_show_all_truncates_at_the_visible_bound() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let pin = publisher.publish(&coordinate_spec(240));
+    let seed = syntax_id(publisher.native(), "coordinate");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, true)
+        .unwrap()
+        .unwrap();
+    assert!(view.truncated);
+    assert_eq!(
+        view.truncated_by,
+        [trellis::behavior::SequenceLimit::VisibleSteps]
+    );
+    assert_eq!(counts(&view.steps), (200, 200));
+    assert_eq!((view.incidental_steps, view.hidden_steps), (200, 0));
+    assert!(view.steps.iter().all(|step| step.target.is_none()));
+    assert!(view.warnings.iter().any(|w| w.contains("200 shown steps")));
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["truncatedBy"], serde_json::json!(["visibleSteps"]));
+}
+
+/// #536: hidden steps use no visible room but still count toward the hard work bound, so
+/// hostile input stays bounded: a seed is built to at most 2000 steps, and a callee body
+/// that would take the view past them is not expanded.
+#[test]
+fn sequence_work_bound_holds_for_hidden_steps() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let calls = |n: usize| (0..n).map(|n| format!("x{n}(); ")).collect::<String>();
+    let source = format!(
+        "fn huge() {{ {} }}\nfn a() {{ big(); }}\nfn big() {{ {} }}\n",
+        calls(2500),
+        calls(2000)
+    );
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = (0..2500).map(|nth| bind_external("huge", nth)).collect();
+    spec.bindings
+        .extend((0..2000).map(|nth| bind_external("big", nth)));
+    spec.bindings.push(bind("a", 0, "big"));
+    let pin = publisher.publish(&spec);
+
+    let huge = syntax_id(publisher.native(), "huge");
+    let view = publisher
+        .store
+        .sequence_at(&huge, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts(&view.steps), (2000, 0));
+    assert_eq!(
+        view.truncated_by,
+        [trellis::behavior::SequenceLimit::WorkSteps]
+    );
+    assert_eq!(view.incidental_steps, 2000);
+
+    let a = syntax_id(publisher.native(), "a");
+    let view = publisher
+        .store
+        .sequence_at(&a, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert_eq!(steps.len(), 1);
+    assert!(
+        steps[0].children.is_empty(),
+        "1 + 2000 steps exceed the work bound"
+    );
+    assert_eq!(
+        view.truncated_by,
+        [trellis::behavior::SequenceLimit::WorkSteps]
+    );
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w == "Sequence work limit reached; the body of big is not expanded.")
+    );
+}
+
 /// #522: a step the syntax adapter already hid (a standalone `console.log`) that is also
 /// bound external is incidental once, not hidden twice.
 #[test]

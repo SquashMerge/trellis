@@ -6,7 +6,8 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
 
-const MAX_STEPS: usize = 200;
+// The work bound (#536): the visible bound is applied to the view this builds.
+const MAX_STEPS: usize = crate::behavior::MAX_WORK_STEPS;
 const MAX_PARTICIPANTS: usize = 20;
 const MAX_DEPTH: usize = 24;
 /// Bounds the recursion over nested Rust syntax. The step tree it produces is bounded to
@@ -70,8 +71,8 @@ impl Builder<'_> {
         }
     }
     fn limit(&mut self) {
-        self.view.truncated = true;
-        self.warn("Sequence bounds reached (200 steps, 20 participants, depth 24); omitted behavior is unknown.");
+        crate::behavior::adapter_limit(&mut self.view, self.count);
+        self.warn("Sequence bounds reached (2000 steps of work, 20 participants, depth 24); omitted behavior is unknown.");
     }
     fn step(&mut self, n: Node<'_>, kind: &str, label: impl AsRef<str>) -> Option<SequenceStep> {
         if self.count >= MAX_STEPS {
@@ -730,7 +731,7 @@ pub fn build(
     }
     let mut b = Builder { file, seed, calls, count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
-        steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false,
+        steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};
     let f = if !callable(node)
         || node.start_byte() != seed.range.start_byte
