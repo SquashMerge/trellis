@@ -83,11 +83,37 @@ pub(crate) fn outline_syntax(file: &SourceFile) -> Option<OutlineSyntax> {
         None,
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
     )?;
-    let text = file.text.as_bytes();
     let mut found = OutlineSyntax::default();
-    let mut cursor = tree.walk();
+    let in_budget = || started.elapsed() < FILE_TIME_LIMIT;
+    collect_outline(
+        tree.root_node(),
+        file.text.as_bytes(),
+        &mut found,
+        &in_budget,
+    )?;
+    if file.language == "rust" {
+        // An `impl` measured inside a macro has syntax only in that macro's expansion (#551).
+        let mut expansions = crate::native_rust_macros::Expansions::new(&file.text);
+        if !expansions.expand_all(tree.root_node(), in_budget) {
+            return None;
+        }
+        for arguments in expansions.arguments() {
+            collect_outline(arguments, file.text.as_bytes(), &mut found, &in_budget)?;
+        }
+    }
+    Some(found)
+}
+
+/// Add the outline facts under `root`. `None` once `in_budget` fails.
+fn collect_outline(
+    root: tree_sitter::Node<'_>,
+    text: &[u8],
+    found: &mut OutlineSyntax,
+    in_budget: &impl Fn() -> bool,
+) -> Option<()> {
+    let mut cursor = root.walk();
     loop {
-        if started.elapsed() >= FILE_TIME_LIMIT {
+        if !in_budget() {
             return None;
         }
         let node = cursor.node();
@@ -115,15 +141,18 @@ pub(crate) fn outline_syntax(file: &SourceFile) -> Option<OutlineSyntax> {
         {
             found.impl_targets.insert(range, name.to_owned());
         }
-        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+        if cursor.goto_first_child() {
             continue;
         }
         loop {
-            if !cursor.goto_parent() {
-                return Some(found);
+            if cursor.node() == root {
+                return Some(());
             }
             if cursor.goto_next_sibling() {
                 break;
+            }
+            if !cursor.goto_parent() {
+                return Some(());
             }
         }
     }
@@ -466,6 +495,17 @@ mod outline_syntax_tests {
             .into_values()
             .collect();
         assert_eq!(targets, ["Budget", "Remote", "Holder"]);
+    }
+
+    #[test]
+    fn rust_impl_blocks_inside_measured_macros_name_their_type() {
+        let text = include_str!("../tests/fixtures/rust/macro_callables.rs");
+        let targets: Vec<_> = syntax("rust", text)
+            .expect("parsed in budget")
+            .impl_targets
+            .into_values()
+            .collect();
+        assert_eq!(targets, ["Meter"]);
     }
 }
 

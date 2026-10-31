@@ -2666,6 +2666,7 @@ fn extract_document(
         expand_macros,
         expanding: false,
         macro_expansions: Vec::new(),
+        measured_macros: BTreeMap::new(),
         expansion_bytes: 0,
         macro_parser: None,
         visit_ceiling: VISIT_LIMIT,
@@ -2703,6 +2704,7 @@ fn extract_document(
             &state.artifact.declarations[declaration_start..],
             &state.artifact.calls[state.call_start..],
             &state.search_nodes,
+            &state.measured_macros,
         )?);
     state.artifact.capability_reports.push(CapabilityReport {
         document: state.document.clone(),
@@ -2797,6 +2799,9 @@ struct ParserState<'a> {
     /// Set once the ordinary walk is done: allowlisted macros then expand where found.
     expanding: bool,
     macro_expansions: Vec<Range>,
+    /// Every measured macro's re-parse, nested ones included, by invocation byte range. Kept
+    /// for the search capture, which reads the declarations recorded from these trees.
+    measured_macros: crate::search_capture::MeasuredMacros,
     expansion_bytes: usize,
     macro_parser: Option<tree_sitter::Parser>,
     /// Visit ceiling for the expansion being measured, and the visit count its reservation
@@ -3065,11 +3070,8 @@ impl ParserState<'_> {
                 }
             }
             self.saw_definition |= k != "module";
-            // Search capture walks the original tree by node ID; an expansion's nodes belong
-            // to a separate, short-lived tree, so they never enter that map.
-            if !self.expanding {
-                self.search_nodes.insert(n.id(), id.clone());
-            }
+            // Search capture walks the same trees by node ID: measured macros' stay alive.
+            self.search_nodes.insert(n.id(), id.clone());
             self.artifact.declarations.push(Declaration {
                 syntax_id: id.clone(),
                 role: declaration_role(test_context),
@@ -3274,14 +3276,24 @@ impl ParserState<'_> {
         }
         let Some(tree) = macros::token_tree(site.node).and_then(|tt| {
             let (start, end) = (tt.start_byte(), tt.end_byte());
-            let budget = file.text.len().saturating_mul(8).saturating_add(1 << 16);
-            if self.expansion_bytes.saturating_add(end - start) > budget {
+            if self.expansion_bytes.saturating_add(end - start)
+                > macros::byte_budget(file.text.len())
+            {
                 return None;
             }
             self.expansion_bytes += end - start;
             let parser = self.macro_parser.as_mut()?;
-            macros::parse(parser, file.text.as_bytes(), site.form, start, end)
-                .map(|tree| (tree, start, end))
+            // Measurement reads byte ranges only, so it needs no line table.
+            let position = |byte| tree_sitter::Point::new(0, byte);
+            macros::parse(
+                parser,
+                file.text.as_bytes(),
+                site.form,
+                start,
+                end,
+                &position,
+            )
+            .map(|tree| (tree, start, end))
         }) else {
             self.unmeasured_macro(site.node);
             return Ok(false);
@@ -3313,6 +3325,10 @@ impl ParserState<'_> {
         let measured = self.measure_arguments(&site, arguments);
         (self.visit_ceiling, self.reserved_until) = enclosing;
         measured?;
+        self.measured_macros.insert(
+            (site.node.start_byte(), site.node.end_byte()),
+            macros::Expansion::new(tree, site.form, start, end),
+        );
         Ok(true)
     }
 

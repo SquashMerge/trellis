@@ -1510,3 +1510,30 @@ fn rules_portable_module_pair_does_not_require_equal_endpoint_languages() {
     assert_eq!(row["excepted"], true);
     assert_eq!(row["status"], "deviates");
 }
+
+#[test]
+fn rules_read_inheritance_of_an_impl_inside_a_measured_macro() {
+    let input = snapshot(&[(
+        "src/lib.rs",
+        "trait Port {}\nstruct Resource;\nfn local() {\n    assert!({\n        impl Port for Resource {}\n        true\n    });\n}\n",
+    )]);
+    let text = r#"version=1
+[roles.implementing]
+select={implements="Port",language=["rust"]}
+[roles.any]
+select={paths=["**"]}
+[[rules]]
+id="implements-check"
+for_each="implementing"
+require=[{calls="any"}]
+"#;
+    let config = rules::parse(text).unwrap();
+    let refs = references::project(&input, &[], 5, &mut || Ok(())).unwrap();
+    let data = rules::evaluate(&config, &input, &refs, &[], &mut || Ok(())).unwrap();
+    let rows = data["instances"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r["rule"] == "implements-check" && r["target"]["path"] == "src/lib.rs"),
+        "{data}"
+    );
+}

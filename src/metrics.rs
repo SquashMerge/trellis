@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tree_sitter::{Node, Parser};
 
 use crate::native_evidence::{Call, ControlRegion, Declaration, DeclarationRole, Range};
+use crate::native_rust_macros::Expansions;
 use crate::store::SelectedIntegrity;
 
 #[cfg(feature = "test-support")]
@@ -185,10 +186,11 @@ fn bind(
             .parse(source, None)
             .context("bounded_work: call syntax parse")?;
         check()?;
-        Some(tree)
+        Some((tree, language == "rust"))
     } else {
         None
     };
+    let mut expansions = Expansions::new(source);
     let mut rows = Vec::new();
     for (d, mut metrics) in callable_declarations(declarations)
         .into_iter()
@@ -201,16 +203,20 @@ fn bind(
             .count();
         // Exact unqualified self-call spelling is syntactic evidence, not call resolution.
         if let Some(name) = &d.name {
-            metrics.cognitive += calls
+            let mut self_calls = calls
                 .iter()
                 .filter(|c| {
-                    c.owner_syntax_id == d.syntax_id
-                        && c.spelling.as_deref() == Some(name.as_str())
-                        && syntax.as_ref().is_some_and(|tree| {
-                            unqualified_call(tree.root_node(), c, &d.document.language)
-                        })
+                    c.owner_syntax_id == d.syntax_id && c.spelling.as_deref() == Some(name.as_str())
                 })
-                .count();
+                .peekable();
+            if self_calls.peek().is_some()
+                && let Some((tree, rust)) = &syntax
+            {
+                let root = declaration_root(&mut expansions, tree.root_node(), *rust, &d.range);
+                metrics.cognitive += self_calls
+                    .filter(|c| unqualified_call(root, c, &d.document.language))
+                    .count();
+            }
         }
         metrics.max_nesting = regions
             .iter()
@@ -246,6 +252,20 @@ fn bind(
         });
     }
     Ok(rows)
+}
+/// The tree holding a declaration: the plain tree, unless it sits in a measured Rust macro,
+/// whose token tree has no syntax of its own (#551).
+fn declaration_root<'a>(
+    expansions: &'a mut Expansions<'_>,
+    plain: Node<'a>,
+    rust: bool,
+    range: &Range,
+) -> Node<'a> {
+    if rust {
+        expansions.root_for(plain, range.start, range.end)
+    } else {
+        plain
+    }
 }
 fn unqualified_call(root: Node<'_>, call: &Call, language: &str) -> bool {
     let Some(callee) = &call.callee_range else {
@@ -444,6 +464,7 @@ fn compute_source(
         .enumerate()
         .filter_map(|(i, b)| (b == b'\n').then_some(i))
         .collect();
+    let mut expansions = Expansions::new(source);
     let mut result = Vec::new();
     for d in callable_declarations(declarations) {
         check()?;
@@ -465,10 +486,12 @@ fn compute_source(
             })
             .map(|other| &other.range)
             .collect();
+        let rust = language == "rust";
+        let root = declaration_root(&mut expansions, tree.root_node(), rust, &d.range);
         result.push(score(
             language,
             source,
-            tree.root_node(),
+            root,
             d,
             &nested,
             &newline_offsets,

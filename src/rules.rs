@@ -1098,7 +1098,14 @@ fn parse_bases(
         return Err(e);
     }
     let tree = tree.context("bounded_work: selector parser stopped")?;
-    let mut stack = vec![(tree.root_node(), 0usize)];
+    let mut expansions = crate::native_rust_macros::Expansions::new(source);
+    if doc.key.language == "rust" {
+        // An `impl` measured inside a macro has syntax only in that macro's expansion (#551).
+        expansions.expand_all(tree.root_node(), || true);
+    }
+    check()?;
+    let mut stack: Vec<_> = expansions.arguments().map(|node| (node, 0usize)).collect();
+    stack.push((tree.root_node(), 0));
     let mut visits = 0;
     let mut types = BTreeMap::new();
     while let Some((node, depth)) = stack.pop() {

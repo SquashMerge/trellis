@@ -484,3 +484,60 @@ fn escaped_format_braces_keep_the_capture_gap() {
     );
     assert_eq!(artifact.coverage[0].state, "partial");
 }
+
+/// Every eligible declaration needs a search card, so a named item in a measured macro must get
+/// one, or the document cannot be published (#551). The macro's contents stay out of the cards
+/// around it.
+#[test]
+fn items_in_measured_macros_get_their_own_search_cards() {
+    let text = "struct Holder;\nimpl Holder {\n    fn outer() {\n        assert!({\n            \
+                /// Inner docs.\n            fn inner(n: Local) -> u32 {\n                \
+                let _ = \"inner text\";\n                format!(\"{}\", { fn deepest() {} 1 });\n                \
+                1\n            }\n            true\n        }, \"outer message\");\n    }\n}\n";
+    let expanded = measure(&rust("src/a.rs", text), true);
+    let card = |name: &str| {
+        let declaration = expanded
+            .declarations
+            .iter()
+            .find(|d| d.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("{name}"));
+        expanded
+            .search_cards
+            .iter()
+            .find(|card| card.syntax_id == declaration.syntax_id)
+            .unwrap_or_else(|| panic!("{name}: {:?}", expanded.search_cards))
+    };
+    let inner = card("inner");
+    assert!(
+        inner.card.text.contains("Inner docs."),
+        "{}",
+        inner.card.text
+    );
+    assert!(
+        inner.card.text.contains("inner text"),
+        "{}",
+        inner.card.text
+    );
+    assert!(inner.card.text.contains("Local"), "{}", inner.card.text);
+    assert!(
+        inner
+            .ancestors
+            .iter()
+            .any(|a| a.name.as_deref() == Some("outer"))
+    );
+    card("deepest");
+    let outer = card("outer");
+    let opaque = measure(&rust("src/a.rs", text), false);
+    let plain = opaque
+        .search_cards
+        .iter()
+        .find(|c| c.syntax_id == outer.syntax_id)
+        .expect("the same declaration without expansion");
+    assert_eq!(outer.facts, plain.facts);
+    assert_eq!(
+        expanded.search_cards.len(),
+        4,
+        "{:?}",
+        expanded.search_cards
+    );
+}

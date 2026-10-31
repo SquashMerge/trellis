@@ -2881,7 +2881,7 @@ fn source_role_sites_parsed(
         .parse(source, None)
         .context("semantic role source parser failed")?;
     let mut sites = RoleSites::default();
-    walk_named_reverse(tree.root_node(), &mut |node| {
+    let mut visit = |node: tree_sitter::Node<'_>| {
         let kind = node.kind();
         let type_field = match language {
             "java"
@@ -3006,7 +3006,18 @@ fn source_role_sites_parsed(
             }
         }
         Ok(true)
-    })?;
+    };
+    walk_named_reverse(tree.root_node(), &mut visit)?;
+    if language == "rust"
+        && let Ok(text) = std::str::from_utf8(source)
+    {
+        // Measured macro contents have syntax only in their expansions (#551).
+        let mut expansions = crate::native_rust_macros::Expansions::new(text);
+        expansions.expand_all(tree.root_node(), || true);
+        for arguments in expansions.arguments() {
+            walk_named_reverse(arguments, &mut visit)?;
+        }
+    }
     Ok((sites, Some(tree)))
 }
 
@@ -4942,5 +4953,29 @@ mod language_reason_tests {
         assert!(json["listed"].to_string().len() <= REPORT_PARTIAL_DOCUMENT_BYTES);
         assert_eq!(json["listed"].as_array().unwrap().len(), 315);
         assert_eq!(json["unlisted"], 1);
+    }
+}
+
+#[cfg(test)]
+mod macro_role_tests {
+    use super::*;
+
+    /// Measured macro contents have role sites, at their document spans (#551).
+    #[test]
+    fn role_sites_reach_into_measured_macros() {
+        let text = "fn f() {\n    assert!(items.iter().all(|v: &Item| {\n        \
+                    use std::fmt::Debug;\n        \
+                    let total: Total = format!(\"{}\", (|w: Nested| w)(v));\n        \
+                    total.ok()\n    }));\n    json!({ let hidden: Opaque = 1; });\n}\n";
+        let sites = source_role_sites("rust", text.as_bytes()).unwrap();
+        let span = |name: &str| {
+            let start = text.find(name).unwrap();
+            (start, start + name.len())
+        };
+        for name in ["Item", "Total", "Nested"] {
+            assert!(sites.types.contains(&span(name)), "{name}");
+        }
+        assert!(sites.imports.contains(&span("Debug")));
+        assert!(!sites.types.contains(&span("Opaque")));
     }
 }
