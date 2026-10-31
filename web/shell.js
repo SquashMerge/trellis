@@ -278,7 +278,7 @@
     const target = window.TrellisSequence?.target(view, entry);
     const selection = {}; targetSelection = selection;
     text("inspector-evidence", entry.callEvidence
-      ? `${window.TrellisSequence.evidenceLabel(entry, view)} · ${[entry.callEvidence.dispatch, entry.callEvidence.freshness, entry.callEvidence.provenanceId].filter(Boolean).join(" · ")}. Static possible paths, not a runtime trace.`
+      ? `${window.TrellisSequence.evidenceLabel(entry, view)} · ${[entry.callEvidence.dispatch, entry.callEvidence.freshness, entry.callEvidence.provenanceId, window.TrellisSequence.basisLabel?.(entry.callEvidence)].filter(Boolean).join(" · ")}. Static possible paths, not a runtime trace.`
       : "Measured source steps, not a runtime trace or verified dispatch.");
     const detail = get("inspector-detail");
     // Every original field and all nested guards, alternates and chain calls remain
