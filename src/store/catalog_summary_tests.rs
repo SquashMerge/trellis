@@ -28,7 +28,7 @@ fn fixture() -> (
             "class B(Base):\n    value: Base\n    def run(self):\n        return 2\n",
         ),
         ("C.java", "class C { int later; int run(){ return 3; } }\n"),
-        ("edit.js", "function edit(){ return 1; }\n"),
+        ("edit.rs", "fn edit() -> i32 { 1 }\n"),
     ] {
         fs::write(work.path().join(path), source).unwrap();
     }
@@ -192,15 +192,11 @@ fn no_hit_local_edits_equal_independent_full_and_reuse_complete_cids() {
             }
             "language" => {
                 fs::remove_file(work.path().join("A.java")).unwrap();
-                fs::write(work.path().join("A.js"), "function moved(){ return 1; }\n").unwrap();
+                fs::write(work.path().join("A.rs"), "fn moved() -> i32 { 1 }\n").unwrap();
                 "B.py"
             }
             "nonclass" => {
-                fs::write(
-                    work.path().join("edit.js"),
-                    "function changed(){ return 2; }\n",
-                )
-                .unwrap();
+                fs::write(work.path().join("edit.rs"), "fn changed() -> i32 { 2 }\n").unwrap();
                 "A.java"
             }
             _ => unreachable!(),
@@ -351,7 +347,7 @@ fn formerly_cut_declarations_and_details_recover_immediately_when_summaries_fit(
             );
         }
         let prior = selections(&store, first);
-        assert!(prior["edit.js"].2);
+        assert!(prior["edit.rs"].2);
         assert!(!prior["B.py"].2 && !prior["C.java"].2);
         fs::remove_file(work.path().join("A.java")).unwrap();
         let before = counters();
@@ -384,11 +380,7 @@ fn malformed_or_missing_summary_fails_typed_before_publication_then_repairs() {
     for payload in [Some("not-json"), None, Some(r#"{"source_bytes":-1}"#)] {
         let (_state, work, store, options, first) = fixture();
         let baseline = store.publication_index_baseline().unwrap();
-        fs::write(
-            work.path().join("edit.js"),
-            "function edit(){ return 2; }\n",
-        )
-        .unwrap();
+        fs::write(work.path().join("edit.rs"), "fn edit() -> i32 { 2 }\n").unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let capture = Capture::admit(&options, &cancel, &|_| {}).unwrap();
         {
@@ -464,11 +456,7 @@ fn intrinsic_file_truncation_is_a_complete_selection_on_no_global_hit() {
         "complete means all immutable F output, not !F.truncated"
     );
     drop(db);
-    fs::write(
-        work.path().join("edit.js"),
-        "function edit(){ return 3; }\n",
-    )
-    .unwrap();
+    fs::write(work.path().join("edit.rs"), "fn edit() -> i32 { 3 }\n").unwrap();
     let next = reindex(&store, &options, true);
     assert_eq!(counters(), before);
     assert_eq!(

@@ -4796,6 +4796,34 @@ fn resolve_class_id(
     id: &str,
     selected: &ReadRevision,
 ) -> Result<String> {
+    let lexical = lexical_class_id(store, db, id, selected);
+    if lexical.is_ok() {
+        return lexical;
+    }
+    // A method recorded as exactly one class's member belongs to that class
+    // even without a measured class ancestor (a JavaScript method's native
+    // parent, or a Rust method merged from an `impl` block).
+    let owners: Vec<Vec<u8>> = db
+        .prepare(
+            "SELECT DISTINCT c.id FROM classes c JOIN revision_documents m ON m.revision_id=?2 AND m.cid=c.cid,
+             json_each(c.payload,'$.methods') j WHERE json_extract(j.value,'$.symbolId')=?1 LIMIT 2",
+        )?
+        .query_map(params![id, selected.key], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|error| store.report_index_failure(error.into()))?;
+    match owners.as_slice() {
+        [owner] => Ok(id_codec::decode_sid(owner).context(SelectedIntegrity(
+            "incompatible_index: class id decode failed".into(),
+        ))?),
+        _ => lexical,
+    }
+}
+fn lexical_class_id(
+    store: &Store,
+    db: &Connection,
+    id: &str,
+    selected: &ReadRevision,
+) -> Result<String> {
     use crate::class_diagram::InvalidRequest;
     let mut current = id.to_owned();
     let mut seen = BTreeSet::new();
