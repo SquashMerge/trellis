@@ -19150,11 +19150,16 @@ impl Store {
                 let captured_revision_number = captured_revision_number.context(
                     SelectedIntegrity("incompatible_index: selected captured pin missing".into()),
                 )?;
+                // Claims in the decoder's (language, path, canonical bytes) order, as
+                // `VecSink::finish` sorts them, so a rejoin meets each document's claims
+                // together. Its join keeps one document's role sites at a time; `proof_id` is a
+                // digest order that interleaves documents and re-parsed a source per occurrence
+                // (#494).
                 let proofs = if metadata_only {
                     Vec::new()
                 } else {
                     db.prepare(
-                    "SELECT p.proof_id,p.record_kind,p.fact_digest,p.language,p.path,p.canonical_bytes,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.proof_id"
+                    "SELECT p.proof_id,p.record_kind,p.fact_digest,p.language,p.path,p.canonical_bytes,c.artifact_hash FROM semantic_raw_proofs p JOIN semantic_raw_captures c ON c.capture_id=p.capture_id WHERE c.batch_id=?1 ORDER BY p.language,p.path,p.canonical_bytes"
                 )?.query_map([batch_id], |r| Ok((r.get(0)?, StoredRawProof {record_kind:r.get(1)?,fact_digest:r.get(2)?,language:r.get(3)?,path:r.get(4)?,canonical_bytes:r.get(5)?,artifact_hash:r.get(6)?})))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
                 };
