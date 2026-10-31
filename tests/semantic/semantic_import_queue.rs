@@ -2348,6 +2348,40 @@ fn genuine_published_rust_macro_gap_reports_unsupported_without_losing_ordinary(
             .unwrap(),
         committed["report"]
     );
+    // #520: the CLI report and `trellis status` name the reason behind the partial row.
+    let reasons = json!({"macroInvocation":1,"attributeItem":0,"macroDefinition":0,"other":0,
+        "capped":false,"omitted":false,"capturedDiagnostics":false});
+    assert_eq!(
+        coverage
+            .reasons
+            .as_ref()
+            .map(|r| serde_json::to_value(r).unwrap()),
+        Some(reasons.clone())
+    );
+    let partial = &report["partialReasons"];
+    assert_eq!(partial["documents"], 1, "{committed}");
+    assert_eq!(partial["nativeGapsOnly"], 1);
+    assert_eq!(partial["unsupportedOccurrences"]["macroInvocation"], 1);
+    assert_eq!(
+        partial["listed"],
+        json!([{"path":"A.rs","diagnostic":"unsupported_native_gap","reasons":reasons}])
+    );
+    let status = run(&home, &["status", "--workspace", root_string]);
+    let rust = status["semanticLanguages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["language"] == "rust")
+        .unwrap();
+    assert_eq!(rust["coverage"]["partial"], 1, "{status}");
+    assert_eq!(
+        rust["coverage"]["summary"],
+        "partial: 1 · native macro/attribute gaps only"
+    );
+    assert_eq!(
+        rust["coverage"]["partialReasons"]["unsupportedOccurrences"]["macroInvocation"],
+        1
+    );
 }
 
 #[test]

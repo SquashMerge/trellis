@@ -1475,6 +1475,8 @@ struct DocFlags {
     claims: u64,
     /// Admitted under `scip_raw::OCCURRENCE_CAP_EXCEEDED`.
     capped: bool,
+    /// The unsupported claims by the kind of native gap that hid them (#520).
+    gaps: [u64; 4],
 }
 
 /// Admitted claims whose source is not a document of the captured revision. Admission binds
@@ -1489,7 +1491,8 @@ const INELIGIBLE_CLAIM_DOCUMENT_SQL: &str = "SELECT 1 FROM w_docs w WHERE (w.eli
     AND EXISTS (SELECT 1 FROM claims c WHERE c.source_ord=w.source_ord) LIMIT 1";
 
 const DOCUMENT_FLAGS_SQL: &str = "SELECT w.requested, w.failed, w.eligible, w.unsupported, \
-    w.unsupported_claims, w.claims, c.exclusion, d.capped FROM sources s LEFT JOIN w_docs w ON \
+    w.unsupported_claims, w.claims, c.exclusion, d.capped, w.gaps_macro_invocation, \
+    w.gaps_attribute_item, w.gaps_macro_definition, w.gaps_other FROM sources s LEFT JOIN w_docs w ON \
     w.source_ord=s.ord LEFT JOIN coverage c ON c.source_ord=s.ord LEFT JOIN documents d ON \
     d.source_ord=s.ord WHERE s.language=?1 AND s.path=?2";
 
@@ -1655,7 +1658,7 @@ impl StagedJoin<'_> {
         self.ctx.row("w_docs")?;
         self.conn()
             .prepare_cached(
-                "INSERT INTO w_docs SELECT ord,?3,?4,?5,?6,?7,?8 FROM sources WHERE language=?1 AND path=?2",
+                "INSERT INTO w_docs SELECT ord,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12 FROM sources WHERE language=?1 AND path=?2",
             )?
             .execute(params![
                 document.language,
@@ -1666,6 +1669,10 @@ impl StagedJoin<'_> {
                 flags.unsupported,
                 i64::try_from(flags.unsupported_claims)?,
                 i64::try_from(flags.claims)?,
+                i64::try_from(flags.gaps[0])?,
+                i64::try_from(flags.gaps[1])?,
+                i64::try_from(flags.gaps[2])?,
+                i64::try_from(flags.gaps[3])?,
             ])?;
         Ok((flags, joined))
     }
@@ -1824,6 +1831,7 @@ impl StagedJoin<'_> {
             {
                 flags.unsupported = true;
                 flags.unsupported_claims += 1;
+                flags.gaps[semantic::CoverageReasons::gap_kind(first.diagnostic.as_deref())] += 1;
                 flags.eligible = true;
                 continue;
             }
@@ -1917,6 +1925,7 @@ impl StagedJoin<'_> {
             Option<i64>,
             Option<String>,
             Option<bool>,
+            [Option<i64>; 4],
         );
         let row: Option<Row> = self
             .conn()
@@ -1931,6 +1940,7 @@ impl StagedJoin<'_> {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    [row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?],
                 ))
             })
             .optional()?;
@@ -1943,10 +1953,15 @@ impl StagedJoin<'_> {
             claims,
             excluded,
             capped,
+            stored_gaps,
         )) = row
         else {
             return Ok((DocFlags::default(), None));
         };
+        let mut gaps = [0u64; 4];
+        for (gap, stored) in gaps.iter_mut().zip(stored_gaps) {
+            *gap = u64::try_from(stored.unwrap_or_default())?;
+        }
         Ok((
             DocFlags {
                 requested: requested.unwrap_or_default(),
@@ -1956,6 +1971,7 @@ impl StagedJoin<'_> {
                 unsupported_claims: u64::try_from(unsupported_claims.unwrap_or_default())?,
                 claims: u64::try_from(claims.unwrap_or_default())?,
                 capped: capped.unwrap_or_default(),
+                gaps,
             },
             excluded,
         ))
@@ -2038,11 +2054,17 @@ impl StagedJoin<'_> {
             unsupported,
             ..
         } = flags;
-        let partial = excluded == Some("unsupported")
-            || unsupported
-            || flags.capped
-            || outcome.omitted
-            || outcome.diagnostics;
+        let reasons = semantic::CoverageReasons::new(
+            flags.gaps,
+            flags.capped,
+            outcome.omitted,
+            outcome.diagnostics,
+        );
+        anyhow::ensure!(
+            unsupported == (reasons.native_gaps() > 0),
+            "unsupported document without a native gap count"
+        );
+        let partial = excluded == Some("unsupported") || !reasons.is_empty();
         let state = if !requested {
             semantic::CoverageState::NotRequested
         } else if failed {
@@ -2096,6 +2118,7 @@ impl StagedJoin<'_> {
             } else {
                 None
             },
+            reasons: (state == semantic::CoverageState::Partial).then_some(reasons),
         };
         let conn = self.conn();
         self.validator.coverage(&row, &|language, path| {
@@ -2146,6 +2169,7 @@ impl StagedJoin<'_> {
             _ => {}
         }
         tally.unsupported_documents += u64::from(unsupported);
+        tally.reasons.add(&row);
         Ok(())
     }
 
@@ -2230,6 +2254,7 @@ struct LanguageTally {
     failed: u64,
     omitted: u64,
     unsupported_documents: u64,
+    reasons: super::LanguageReasons,
 }
 
 impl StagedJoin<'_> {
@@ -2382,6 +2407,7 @@ impl StagedJoin<'_> {
                     "ambiguous": tally.counts[3], "unsupported": tally.counts[4],
                     "complete": tally.complete, "partial": tally.partial, "failed": tally.failed,
                     "omitted": tally.omitted, "unsupportedDocuments": tally.unsupported_documents,
+                    "partialReasons": tally.reasons.json(),
                 })
             })
             .collect();

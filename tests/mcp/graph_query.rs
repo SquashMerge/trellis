@@ -70,6 +70,7 @@ fn coverage(
         supported_roles: vec![],
         observed_roles: vec![],
         diagnostic: None,
+        reasons: None,
     }
 }
 fn provenance(

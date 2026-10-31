@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -644,7 +644,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-32 tables, immutable surrogate keys, and current pin normalization.
+# schema-33 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -661,7 +661,7 @@ native_version_calls native_version_control_regions native_version_call_regions
 native_revision_release_debt native_release_candidate_versions native_release_candidate_graphs
 native_release_candidate_classes semantic_producers semantic_producer_languages
 semantic_revision_producers semantic_requested_producers semantic_requested_producer_languages
-semantic_coverage semantic_coverage_roles semantic_basis
+semantic_coverage semantic_coverage_roles semantic_coverage_reasons semantic_basis
 semantic_basis_lookup_dependencies semantic_provenance semantic_symbols
 semantic_symbol_targets semantic_declaration_bindings semantic_declaration_binding_symbols
 semantic_declaration_join_candidates semantic_references semantic_reference_roles
@@ -720,7 +720,8 @@ def selected_where(table):
         return "gid IN (SELECT gid FROM revision_documents WHERE revision_id=?)"
     elif table in {"class_projections", "classes", "class_relations"}:
         return "cid IN (SELECT cid FROM revision_documents WHERE revision_id=?)"
-    elif table in {"semantic_coverage_roles", "semantic_basis", "semantic_provenance",
+    elif table in {"semantic_coverage_roles", "semantic_coverage_reasons", "semantic_basis",
+                   "semantic_provenance",
                    "semantic_symbols", "semantic_declaration_bindings", "semantic_references",
                    "semantic_call_bindings", "semantic_type_relationships"}:
         return f"tuple_id IN ({selected})"
@@ -1048,7 +1049,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-32 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-33 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)

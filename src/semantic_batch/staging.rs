@@ -56,7 +56,7 @@ CREATE INDEX g_definitions_owner ON g_definitions(side,owner_doc,syntax_id,calla
 CREATE TABLE g_methods(ord INTEGER PRIMARY KEY, side INTEGER NOT NULL, symbol TEXT NOT NULL, local_doc INTEGER NOT NULL, owner_doc INTEGER NOT NULL, body TEXT NOT NULL, body_bytes INTEGER NOT NULL, decoded_bytes INTEGER NOT NULL);
 CREATE INDEX g_methods_source ON g_methods(side,symbol,owner_doc);
 CREATE INDEX g_methods_target ON g_methods(side,symbol,local_doc);
-CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, requested INTEGER NOT NULL, failed INTEGER NOT NULL, eligible INTEGER NOT NULL, unsupported INTEGER NOT NULL, unsupported_claims INTEGER NOT NULL, claims INTEGER NOT NULL);
+CREATE TABLE w_docs(source_ord INTEGER PRIMARY KEY, requested INTEGER NOT NULL, failed INTEGER NOT NULL, eligible INTEGER NOT NULL, unsupported INTEGER NOT NULL, unsupported_claims INTEGER NOT NULL, claims INTEGER NOT NULL, gaps_macro_invocation INTEGER NOT NULL, gaps_attribute_item INTEGER NOT NULL, gaps_macro_definition INTEGER NOT NULL, gaps_other INTEGER NOT NULL);
 CREATE TABLE out_coverage(ord INTEGER PRIMARY KEY, language TEXT NOT NULL, path TEXT NOT NULL, body TEXT NOT NULL, provenance TEXT);
 CREATE TABLE out_provenance(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, claim_id INTEGER NOT NULL, kind INTEGER NOT NULL, id BLOB NOT NULL UNIQUE);
 CREATE TABLE out_symbols(ord INTEGER PRIMARY KEY, doc INTEGER NOT NULL, provenance_id BLOB NOT NULL, body TEXT NOT NULL);

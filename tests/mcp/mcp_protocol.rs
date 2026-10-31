@@ -732,7 +732,7 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
                     row["semantic"],
                     json!({"available":false,"producerId":null,"freshness":"unavailable",
                         "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
-                        "note":"no semantic producer published; showing syntax"})
+                        "note":"no semantic producer published; showing syntax","partialReasons":null})
                 );
             }
             let partial = languages

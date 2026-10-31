@@ -62,8 +62,22 @@ Semantic search’s vector completeness and selected backend are retrieval metad
 | `.supportedRoles` | `Role[]` | Unique, enum ordered, applicable roles this producer supports. | Invalid or non-applicable role invalidates row. |
 | `.observedRoles` | `Role[]` | Unique subset of supported and applicable roles. | Non-subset invalidates row. |
 | `.diagnostic` | `Text?` | Null only for `notRequested` or `complete`; otherwise required. | Wrong nullability invalidates row. |
+| `.reasons` | `CoverageReasons?` | Absent unless an import derived a `partial` row; see [coverage reasons](#coverage-reasons-520). | Reasons on another state, empty reasons, or reasons that contradict `.diagnostic` invalidate the row. |
 
 Coverage is scoped to the complete `(producerId,language,sourceSetId,documentPath,revisionId)` tuple. Publish one row for every tuple, including selected, omitted, unsupported, failed, and not-requested documents. Two producers covering one document have two rows. `complete` means all requested, supported evidence for that document; it never means universal language support. A requested unsupported role makes the row `partial` with a diagnostic. Non-applicable roles are excluded rather than reported missing.
+
+### Coverage reasons (#520)
+
+`.diagnostic` names one reason by precedence (`unsupported_native_gap`, then `occurrence_cap_exceeded`, then `unmeasurable_internal_target`), so a capped document or an omitted dependent can hide behind a native gap. A semantic import therefore records every reason of each `partial` row it derives, at import time, in `Coverage.reasons`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `macroInvocation`, `attributeItem`, `macroDefinition`, `other` | `UInt` | The document's unsupported occurrences, by the kind of native gap whose span hid them. The native gap diagnostic names the skipped construct (`opaque Rust <kind> skipped`). Format strings and named format arguments count as `macroInvocation`; `inner_attribute_item` counts as `attributeItem`. Anything else, including a wholly unavailable family, counts as `other`. |
+| `capped` | `boolean` | The document was admitted under the per-document occurrence cap. |
+| `omitted` | `boolean` | A dependent fact was omitted because its internal target could not be verified. |
+| `capturedDiagnostics` | `boolean` | The captured join reported a diagnostic for the document. |
+
+Reasons are present exactly on import-derived `partial` rows and name at least one cause. They must agree with the diagnostic: `unsupported_native_gap` needs a gap count; `occurrence_cap_exceeded` needs `capped` and no gap count; `unmeasurable_internal_target` needs neither. The staged batch join and the in-memory join derive identical reasons. Publication validates them with the row, stores them with the tuple, and carries them with an exact copy of the tuple to a later revision. Reasons are import metadata, not evidence. `GraphResult.coverage` and other answer projections never return them, and they add no warning. The import report sums them per language (`partialReasons`), and `trellis status` and MCP `trellis_workspace_describe` summarize them per language.
 
 ## #279 amendment: production measurement capabilities
 
