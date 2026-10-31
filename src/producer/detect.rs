@@ -4,7 +4,7 @@
 
 use super::profiles::{Stub, Target};
 use super::{ProducerName, TrustProfile};
-use crate::scip_admission::PinnedProducer;
+use crate::scip_admission::{PinnedProducer, host_target};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -456,20 +456,6 @@ fn resolve_java(
     })
 }
 
-/// The toolchain triple of the host, for hosts a rust-analyzer pin exists on.
-pub(crate) fn host_triple() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64" | "x86_64") => Some(if std::env::consts::ARCH == "aarch64" {
-            "aarch64-apple-darwin"
-        } else {
-            "x86_64-apple-darwin"
-        }),
-        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
-        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
-        _ => None,
-    }
-}
-
 /// The toolchain name rustup runs the pinned rust-analyzer on, `1.98.1` for
 /// the pin version `1.98.1 (48a229ce 2026-09-01)`.
 pub fn rustup_toolchain(pin: &PinnedProducer) -> &str {
@@ -481,8 +467,19 @@ fn resolve_rust(
     declared: &Declared,
     executable: Option<&Path>,
 ) -> Result<Resolution, Unavailable> {
-    let Some(triple) = host_triple() else {
-        return unavailable("no rust-analyzer for host");
+    resolve_rust_on(&host_target(), pin, declared, executable)
+}
+
+/// Verify the rust-analyzer of toolchain `<pin>-<target>` against the hash pinned for `target`
+/// (Decision 0017 Amendment 6).
+pub(super) fn resolve_rust_on(
+    target: &str,
+    pin: &PinnedProducer,
+    declared: &Declared,
+    executable: Option<&Path>,
+) -> Result<Resolution, Unavailable> {
+    let Some(pinned_hash) = pin.target_hash(target) else {
+        return unavailable(format!("no rust-analyzer pin for target {target}"));
     };
     let rustup = match executable {
         Some(path) => {
@@ -499,17 +496,17 @@ fn resolve_rust(
     let real = declared
         .rustup_home
         .join("toolchains")
-        .join(format!("{}-{triple}", rustup_toolchain(pin)))
+        .join(format!("{}-{target}", rustup_toolchain(pin)))
         .join("bin/rust-analyzer");
     if !is_executable_file(&real) {
         return unavailable(format!("no rust-analyzer for host at {}", real.display()));
     }
     let observed = sha256_file(&canonical(&real)?)?;
-    if observed != pin.executable_hash {
+    if observed != pinned_hash {
         return unavailable(format!(
             "executable sha256 {} != pinned {}",
             short(&observed),
-            short(&pin.executable_hash)
+            short(pinned_hash)
         ));
     }
     Ok(Resolution {

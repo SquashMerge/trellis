@@ -1,4 +1,6 @@
-use super::detect::{Declared, Environment, Unavailable, resolve, resolve_base, rustup_toolchain};
+use super::detect::{
+    Declared, Environment, Unavailable, resolve, resolve_base, resolve_rust_on, rustup_toolchain,
+};
 use super::profiles::{Stub, Target};
 use super::{ProducerName, TrustProfile};
 use crate::scip_admission::PinnedProducer;
@@ -204,13 +206,79 @@ fn scip_java_verifies_the_executable_hash() {
     assert_eq!(found.java_home, Some(fs::canonicalize(&jdk).unwrap()));
 }
 
+const LINUX: &str = "x86_64-unknown-linux-gnu";
+const MAC: &str = "aarch64-apple-darwin";
+
+/// A rust-analyzer pin whose table holds `pins`.
+fn rust_pin(pins: &[(&str, &[u8])]) -> PinnedProducer {
+    let mut pinned = pin(ProducerName::RustAnalyzer);
+    pinned.target_pins = pins
+        .iter()
+        .map(|(target, bytes)| ((*target).to_owned(), hex::encode(Sha256::digest(bytes))))
+        .collect();
+    pinned
+}
+
+/// A declared environment with rustup, and the `rust-analyzer` of `target`'s 1.98.1 toolchain.
+fn rust_toolchain(tmp: &Path, target: &str, bytes: &[u8]) -> Declared {
+    let rustup_dir = tmp.join("cargo/bin");
+    write_exe(&rustup_dir.join("rustup"), b"proxy");
+    write_exe(
+        &tmp.join(format!(
+            "home/.rustup/toolchains/1.98.1-{target}/bin/rust-analyzer"
+        )),
+        bytes,
+    );
+    declared(&rustup_dir.display().to_string(), &tmp.join("home"))
+}
+
+#[test]
+fn rust_analyzer_selects_the_pin_of_the_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pinned = rust_pin(&[(MAC, b"mac analyzer"), (LINUX, b"linux analyzer")]);
+
+    let declared = rust_toolchain(tmp.path(), LINUX, b"linux analyzer");
+    let found = resolve_rust_on(LINUX, &pinned, &declared, None).unwrap();
+    assert_eq!(
+        found.verification.observed,
+        hex::encode(Sha256::digest(b"linux analyzer"))
+    );
+
+    let declared = rust_toolchain(tmp.path(), MAC, b"mac analyzer");
+    let found = resolve_rust_on(MAC, &pinned, &declared, None).unwrap();
+    assert_eq!(
+        found.verification.observed,
+        hex::encode(Sha256::digest(b"mac analyzer"))
+    );
+}
+
+#[test]
+fn rust_analyzer_refuses_another_targets_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pinned = rust_pin(&[(MAC, b"mac analyzer"), (LINUX, b"linux analyzer")]);
+    let declared = rust_toolchain(tmp.path(), LINUX, b"mac analyzer");
+    let error = resolve_rust_on(LINUX, &pinned, &declared, None).unwrap_err();
+    assert!(error.0.starts_with("executable sha256 "), "{error}");
+}
+
+#[test]
+fn rust_analyzer_refuses_a_target_with_no_pin_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pinned = rust_pin(&[(MAC, b"mac analyzer")]);
+    // The binary is present and would match another target's pin: only the table decides.
+    let declared = rust_toolchain(tmp.path(), LINUX, b"mac analyzer");
+    let error = resolve_rust_on(LINUX, &pinned, &declared, None).unwrap_err();
+    assert_eq!(
+        error.into_error().to_string(),
+        format!("producer_unavailable: no rust-analyzer pin for target {LINUX}")
+    );
+}
+
 #[test]
 fn rust_analyzer_hashes_the_real_binary_not_the_proxy() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some(triple) = super::detect::host_triple() else {
-        return;
-    };
-    let mut pinned = pin(ProducerName::RustAnalyzer);
+    let triple = crate::scip_admission::host_target();
+    let mut pinned = rust_pin(&[(&triple, b"pinned analyzer")]);
     assert_eq!(rustup_toolchain(&pinned), "1.98.1");
     let rustup_dir = tmp.path().join("cargo/bin");
     write_exe(&rustup_dir.join("rustup"), b"proxy");
@@ -227,7 +295,7 @@ fn rust_analyzer_hashes_the_real_binary_not_the_proxy() {
     let error = resolve_base(target, &pinned, &declared, None, None).unwrap_err();
     assert!(error.0.starts_with("executable sha256 "));
 
-    pinned.executable_hash = hex::encode(Sha256::digest(b"analyzer"));
+    pinned = rust_pin(&[(&triple, b"analyzer")]);
     let found = resolve_base(target, &pinned, &declared, None, None).unwrap();
     assert_eq!(found.launcher, rustup_dir.join("rustup"));
     assert_eq!(found.rustup.unwrap().dir, rustup_dir);
