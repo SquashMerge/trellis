@@ -228,15 +228,38 @@ fn unique_proof<'a, T>(
 }
 
 impl ProofInventory {
+    /// A proof-ID index for looking up many proofs without a scan of the inventory each (#494).
+    pub(crate) fn proof_lookup(&self) -> ProofLookup<'_> {
+        let mut index = BTreeMap::new();
+        for claim in &self.claims {
+            index
+                .entry(claim.proof_id.as_str())
+                .and_modify(|found| *found = None)
+                .or_insert(Some(claim));
+        }
+        ProofLookup(index)
+    }
+}
+
+/// Finds one raw proof by ID, kind and digest, as `unique_proof` does over a slice: a proof ID
+/// held by several claims (`None`) is non-unique, and a kind or digest mismatch is missing.
+pub(crate) struct ProofLookup<'a>(BTreeMap<&'a str, Option<&'a RawProofIdentity>>);
+impl<'a> ProofLookup<'a> {
     pub(crate) fn lookup(
         &self,
         id: &str,
         kind: &str,
         digest: &str,
-    ) -> Result<&RawProofIdentity, ScipCaptureError> {
-        unique_proof(&self.claims, id, kind, digest, |claim| {
-            (&claim.proof_id, &claim.record_kind, &claim.fact_digest)
-        })
+    ) -> Result<&'a RawProofIdentity, ScipCaptureError> {
+        let claim = self
+            .0
+            .get(id)
+            .ok_or(ScipCaptureError::MissingProof)?
+            .ok_or(ScipCaptureError::NonUniqueProof)?;
+        if claim.record_kind != kind || claim.fact_digest != digest {
+            return Err(ScipCaptureError::MissingProof);
+        }
+        Ok(claim)
     }
 }
 
@@ -2327,6 +2350,38 @@ mod tests {
                 "occurrence",
                 &inventory.claims[0].fact_digest
             ),
+            Err(ScipCaptureError::NonUniqueProof)
+        ));
+    }
+    #[test]
+    fn proof_lookup_index_answers_like_the_inventory_scan() {
+        let mut inventory = decoded(LEGACY).unwrap();
+        let claim = inventory.claims[0].clone();
+        let (proof, kind, digest) = (
+            claim.captured_proof_id.as_str(),
+            claim.envelope.record_kind.as_str(),
+            claim.fact_digest.as_str(),
+        );
+        let proofs = inventory.proof_identities();
+        let index = proofs.proof_lookup();
+        assert_eq!(
+            index.lookup(proof, kind, digest).unwrap(),
+            &proofs.claims[0]
+        );
+        for (id, kind, digest) in [(proof, kind, "0"), (proof, "symbolInformation", digest)] {
+            assert!(matches!(
+                index.lookup(id, kind, digest),
+                Err(ScipCaptureError::MissingProof)
+            ));
+        }
+        assert!(matches!(
+            index.lookup("0", kind, digest),
+            Err(ScipCaptureError::MissingProof)
+        ));
+        inventory.claims.push(claim.clone());
+        let proofs = inventory.proof_identities();
+        assert!(matches!(
+            proofs.proof_lookup().lookup(proof, kind, digest),
             Err(ScipCaptureError::NonUniqueProof)
         ));
     }

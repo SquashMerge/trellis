@@ -503,3 +503,53 @@ fn retention_keeps_a_pending_run_until_its_request_settles() {
     let expected: BTreeSet<String> = (2..=(RETAINED_RUNS as u32 + 1)).map(run_id).collect();
     assert_eq!(kept, expected);
 }
+
+/// A terminal record means the sweep is done with the directory: the strip comes first, so a
+/// strip that fails leaves the record non-terminal. A stripped directory under a non-terminal
+/// record, as a crash between the two leaves it, is abandoned by the next sweep.
+#[test]
+fn sweep_publishes_the_abandoned_record_only_after_the_strip() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Permission bits do not stop root from removing the locked directory.
+        return;
+    }
+    let fixture = fixture();
+    let state = state(&fixture);
+    state.create_run_dir(&run_id(1)).unwrap();
+    state
+        .write_run_record(&record(1, RunState::Importing, other_daemon()))
+        .unwrap();
+    let dir = state.run_dir(&run_id(1)).unwrap();
+    populate(&dir, &["out", "batch"]);
+    let locked = dir.join("out").join("locked");
+    populate(&locked, &["inner"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let swept = state.sweep(&DaemonIdentity::current(), &BTreeSet::new());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        swept.is_err(),
+        "the strip must fail on the locked directory"
+    );
+    assert_eq!(
+        state.read_run_record(&run_id(1)).unwrap().unwrap().state,
+        RunState::Importing,
+        "no terminal record before the directory is stripped"
+    );
+
+    // The crash shape: stripped contents under a non-terminal record.
+    fs::remove_dir_all(dir.join("out")).unwrap();
+    fs::remove_dir_all(dir.join("batch")).unwrap();
+    let report = state
+        .sweep(&DaemonIdentity::current(), &BTreeSet::new())
+        .unwrap();
+    assert_eq!(report.abandoned_runs, [run_id(1)]);
+    let after = state.read_run_record(&run_id(1)).unwrap().unwrap();
+    assert_eq!(after.state, RunState::Failed);
+    assert_eq!(after.outcome.as_deref(), Some("abandoned"));
+    let names: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["run.json"]);
+}

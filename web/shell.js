@@ -77,12 +77,13 @@
     document.body.classList.remove("architecture-inspector-active");
     syncInspector();
   }
-  function showArchitectureInspector() {
+  // `{drawer:false}` shows Architecture's resting overview without opening the narrow-screen drawer.
+  function showArchitectureInspector(options = {}) {
     resetInspector();
     hide("inspector-empty", true); hide("architecture-inspector", false);
     document.body.classList.add("architecture-inspector-active");
     if (get("inspector-clear")) get("inspector-clear").disabled = false;
-    drawer("inspector", true);
+    if (options.drawer === false) syncInspector(); else drawer("inspector", true);
   }
   function clearTreemapInspector() {
     const wasOpen = get("treemap-inspector") && !get("treemap-inspector").hidden;

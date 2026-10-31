@@ -39,8 +39,20 @@ Unassigned endpoints and unresolved sites remain explicit unknown evidence.
 
 ## Module chips and counts (#424)
 
+The view always draws the full stack: every ordered layer, with the shared layers beside
+it (#449). Only authored `display = "hidden"` layers and unhinted test or fixture layers
+wait in the hidden footer. Deviations are highlighted and allowed arrows (conforming or
+excepted) are dimmed; no layer or arrow is dropped to focus on deviations. Each render
+fits as many chip columns as the canvas width holds at that moment, and scrolls inside the
+canvas when the headers need more; resizing the window or the inspector does not redraw on
+its own (the next render refits).
+
 An open band draws **one chip per module**, not per file. Bands start collapsed unless
-their authored `display` is `"expanded"` (#391 ruling; see [rules](rules.md#layer-display-hint)). A module is a browser display
+their authored `display` is `"expanded"` (#391 ruling; see [rules](rules.md#layer-display-hint)).
+A collapsed band draws one row of its module chips (a shared box: up to six stacked),
+coloured by metric and hottest first, with a last chip counting the modules the row leaves
+out; the band header opens it. Open bands charge the size-cap budget first, so summary rows
+use only what remains and never fold a band the viewer opened. A module is a browser display
 grouping computed from the existing response, not an identity or a new API field: the
 first path component below the band's common directory, where a file and its same-named
 directory form one module (`src/store.rs` and `src/store/**` are `store`), and a
@@ -57,6 +69,24 @@ and `unknown`. Arrows between bands carry the same counts (`↑52`, `↓8 except
 the direction and verdict in their accessible names. These are sums of the summary
 edges, so they equal the `$layers` instances' `referenceCount` from
 `trellis rules check --format json` on the same pin and rules.
+
+Counts are lower bounds whenever their source layer has unresolved sites (#449): a
+reference that maps to no module draws no arrow. A bounded count reads `↑≥102`, and a bounded
+highlighted (deviating or unknown) arrow also shows the share of its source layer's sites
+that map to a module (`↑≥102 · 9% mapped`). The accessible name says the same in words.
+These figures come from the summary's measured `references.coverage`, never estimates. Unknown-verdict arrows are drawn in neutral grey.
+A compact arrow key sits under the canvas with the whole snapshot's coverage
+(`3,727 of 40,219 reference sites mapped to a module (9%) · 740 of 1,095 production rule
+instances unknown`); the longer prose lives under the coverage notices.
+
+The inspector opens on the counted review chips, **23 deviations · 156 unassigned ·
+0 exceptions**, and every Architecture inspection keeps them at its head. They open the
+review list (production deviations, which is what the first chip counts), the unassigned
+files and the authored exceptions. Deviations are `rules.counts.deviates`, unassigned is
+`rules.unassignedCount` and exceptions is `exceptionCount`. There is no refresh button: the
+view re-reads when a new revision is selected or the tab is opened again. A detail list
+that fails with `rules_conflict` offers **Reload Architecture**. On narrow screens the
+overview does not open the inspector drawer.
 
 The SPEC §9 size cap applies to chips: at most 40 per band or open module and 150 in
 the whole diagram, counting every note. The rest of a list becomes one visible "N files
@@ -83,6 +113,12 @@ detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields
 - `references`: `referencesVersion`, `counts` (`scannedDocuments`, `mappedSites`,
   `unresolvedSites`), `limitations` and `externalPackages`, each descriptor with the
   display `layer` its `$layers` instances report (null when unassigned);
+- `references.coverage` (#449): one row per source layer (null when unassigned) and
+  stored site role, `{layer, role, sites, mappedSites, unresolvedSites}`. `sites` counts
+  every scanned reference site once; a site with at least one mapped target is mapped,
+  and one with a residual reason is unresolved, so a site can be both. The rows sum to
+  `counts.mappedSites` and `counts.unresolvedSites`, and there are at most two per layer;
+- `exceptionCount`: the authored `[[exceptions]]` entries (null without a rules file);
 - `rules`: `rulesVersion`, `rulesFile`, `counts`, `testCounts`, `unassignedCount` and
   `limitations`.
 
@@ -184,10 +220,10 @@ production-LOC measurement is claimed.
 Band headers show the maximum available displayed module value at the chosen
 aggregate, not a mean of file means. Heat uses the shared
 [fixed bands](metrics.md#workbench-heat-395) for max/mean. Sum is neutral and labelled relative
-totals. **Relative**, off by default, uses modules in the admitted layers and visible
-unassigned inventory, after deviations focus and measured/involved filtering. Collapsed
+totals. **Relative**, off by default, uses modules in the admitted layers and the
+unassigned inventory (drawn as chips even when collapsed), after measured filtering. Collapsed
 layer/directory summaries include their member modules in that basis; expanding them does not
-move the cuts. Quiet/hidden layer display filters can change the Relative basis. Maintainability reverses severity, not values.
+move the cuts. The hidden-layer footer can change the Relative basis. Maintainability reverses severity, not values.
 Browser requests set `workbench=true`; stored tests, fixture roots, authored hidden layers and
 `web/vendor/` do not contribute default heat. Counts report excluded callables and files.
 Include tests and fixtures restores tests/fixtures/hidden-layer metrics, but not vendor metrics.

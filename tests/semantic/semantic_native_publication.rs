@@ -2485,3 +2485,106 @@ finally:
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A FULL rejoin joins its stored claims grouped by document (#494). Stored claims are keyed
+/// by a digest, so loading them in `proof_id` order interleaved the documents and made the
+/// one-document role-site cache re-parse a source for nearly every occurrence.
+#[test]
+fn full_rejoin_parses_each_document_a_bounded_number_of_times() {
+    use protobuf::{EnumOrUnknown, Message};
+    const CALLERS: usize = 8;
+    const CALLS: usize = 4;
+    let temp = Builder::new()
+        .prefix("semantic-rejoin-order-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("force-full"), b"1").unwrap();
+    fs::write(home.join("work-counts"), b"1").unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join(".gitignore"), ".trellis-semantic-batch*/\n").unwrap();
+    let caller =
+        |ordinal: usize| format!("function c{ordinal}(){{ {}}}\n", "target(); ".repeat(CALLS));
+    let mut documents = vec![(
+        "src/B.js".to_owned(),
+        "function target(){ return 1; }\n".to_owned(),
+    )];
+    documents.extend((0..CALLERS).map(|ordinal| (format!("src/C{ordinal}.js"), caller(ordinal))));
+    for (path, text) in &documents {
+        fs::write(root.join(path), text).unwrap();
+    }
+    let root = fs::canonicalize(root).unwrap();
+    let root_string = root.to_str().unwrap();
+    run(&home, &["index", "--workspace", root_string]);
+    let roots = TopologyRoots::isolated_for_tests(
+        if cfg!(target_os = "macos") {
+            home.join("Library/Caches/dev.squashmerge.trellis")
+        } else {
+            home.join(".cache/trellis")
+        },
+        if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/dev.squashmerge.trellis")
+        } else {
+            home.join(".local/share/trellis")
+        },
+    );
+    let identity =
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let index_db = roots.index_db(&identity);
+    let mut binary = scip::types::Index::new();
+    for (path, text) in &documents {
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = path.clone();
+        doc.language = "javascript".into();
+        doc.position_encoding = EnumOrUnknown::from_i32(2);
+        for (start, _) in text.match_indices("target") {
+            let mut occurrence = scip::types::Occurrence::new();
+            occurrence.range = vec![0, start as i32, (start + 6) as i32];
+            occurrence.symbol = "pkg target.".into();
+            occurrence.symbol_roles = i32::from(path == "src/B.js");
+            doc.occurrences.push(occurrence);
+        }
+        if path == "src/B.js" {
+            let mut info = scip::types::SymbolInformation::new();
+            info.symbol = "pkg target.".into();
+            info.kind = EnumOrUnknown::from_i32(26);
+            info.display_name = "target".into();
+            doc.symbols.push(info);
+        }
+        binary.documents.push(doc);
+    }
+    let paths: Vec<&str> = documents.iter().map(|(path, _)| path.as_str()).collect();
+    let (descriptor, digest) = write_batch(
+        &index_db,
+        &root,
+        "scip-typescript",
+        &[("javascript", &paths, binary.write_to_bytes().unwrap())],
+        &[],
+        ".trellis-semantic-batch",
+    );
+    let descriptor = descriptor.display().to_string();
+    run(&home, &import_args(root_string, &descriptor, &digest));
+    // One changed caller makes the next native publication rejoin the selected capture.
+    fs::write(root.join("src/C0.js"), caller(0) + "// edited\n").unwrap();
+    run(&home, &["index", "--workspace", root_string]);
+    let work: Value =
+        serde_json::from_slice(&fs::read(home.join("work-counts.json")).unwrap()).unwrap();
+    let mut parses = std::collections::BTreeMap::<String, usize>::new();
+    for doc in work["parsedRoleSiteDocuments"].as_array().unwrap() {
+        *parses
+            .entry(doc["path"].as_str().unwrap().to_owned())
+            .or_default() += 1;
+    }
+    // Each document's references are joined at the captured revision and, unless changed, at
+    // the destination; one join parses a document once.
+    let expected: std::collections::BTreeMap<String, usize> = documents
+        .iter()
+        .map(|(path, _)| (path.clone(), if path == "src/C0.js" { 1 } else { 2 }))
+        .collect();
+    assert_eq!(
+        parses, expected,
+        "a rejoin re-parsed a document per occurrence"
+    );
+}

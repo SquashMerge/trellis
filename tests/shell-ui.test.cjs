@@ -201,6 +201,14 @@ test("responsive drawers use classes rather than hiding desktop panels",()=>{
   h.document.listeners.keydown({key:"Escape"});assert.equal(h.get("inspector-toggle").attrs["aria-expanded"],"false");
   assert.equal(h.get("call-inspector").hidden,false);
 });
+test("Architecture's resting overview shows the inspector without opening the narrow-screen drawer (#449)",()=>{
+  const h=harness();h.context.window.matchMedia=()=>({matches:true});
+  h.shell.showArchitectureInspector({drawer:false});
+  assert.equal(h.get("architecture-inspector").hidden,false);
+  assert.equal(h.document.body.classList.contains("inspector-open"),false,"the overview never covers the diagram on a phone");
+  h.shell.showArchitectureInspector();
+  assert.equal(h.document.body.classList.contains("inspector-open"),true,"a selection still opens the drawer");
+});
 async function selectedHarness() {
   const h=harness(true),step=call(),data=view([step]);
   h.context.fetch=async path=>{h.requests.push(path);if(path==="/api/sequence")return response(data);if(path==="/api/status")return response({revision:data.revision,workspaceRoot:"/repo"});if(path.startsWith("/api/source?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:"main.rs",text:"line1\nline2\nline3"}});throw new Error("Unexpected "+path);};

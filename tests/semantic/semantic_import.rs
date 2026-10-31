@@ -866,9 +866,9 @@ fn real_scip_typescript_calls_bind_at_exact_measured_callee_spans() {
 
 /// #473: an unspecified SCIP kind (`0`) defers to the measured native declaration kind, but an
 /// explicit producer kind is still checked against it. On the real #444 bytes, stating SCIP
-/// `Method` (26) for the constructor and `run` agrees with their native `method` declarations
-/// and binds exactly as kind 0 does; stating `Function` (17) conflicts, so neither call binds
-/// a target. Plain and imported calls of free functions stay direct either way.
+/// `Method` (26) for the constructor and `run` agrees with their native `method` declarations.
+/// `Constructor` (9) agrees only with the constructor, while `Function` (17) conflicts with
+/// both. Plain and imported calls of free functions stay direct in every case.
 #[test]
 fn real_scip_typescript_explicit_symbol_kind_is_still_checked() {
     use semantic::Dispatch::{Constructor, Direct, Unknown};
@@ -897,6 +897,16 @@ fn real_scip_typescript_explicit_symbol_kind_is_still_checked() {
         })
     };
     assert_eq!(
+        calls(9),
+        [
+            ("plain", Resolved, Direct),
+            ("helper", Resolved, Direct),
+            ("Widget", Resolved, Constructor),
+            ("run", Unresolved, Unknown),
+            ("register", Resolved, Direct),
+        ]
+    );
+    assert_eq!(
         calls(26),
         [
             ("plain", Resolved, Direct),
@@ -916,6 +926,36 @@ fn real_scip_typescript_explicit_symbol_kind_is_still_checked() {
             ("register", Resolved, Direct),
         ]
     );
+}
+
+/// A Rust method named `constructor` is still an ordinary method, not the native JavaScript
+/// constructor declaration for which explicit SCIP Constructor is compatible.
+#[test]
+fn rust_method_named_constructor_still_rejects_constructor_kind() {
+    let source =
+        "struct S;\nimpl S { fn constructor(&self) {} }\nfn f(s: S) { s.constructor(); }\n";
+    let symbol = "rust-analyzer cargo c 0.1.0 S#constructor().";
+    let definition = source.find("constructor").unwrap();
+    let call = source.rfind("constructor").unwrap();
+    for (kind, resolution) in [
+        (9, semantic::Resolution::Unresolved),
+        (26, semantic::Resolution::Resolved),
+    ] {
+        let (_root, native, sources, inventory) = admitted_case(
+            "rust",
+            source,
+            vec![
+                (definition, definition + "constructor".len(), symbol, 1),
+                (call, call + "constructor".len(), symbol, 0),
+            ],
+            vec![(symbol, kind, vec![])],
+        );
+        let output = join_inventory(&inventory, &native, &sources, 1).unwrap();
+        assert_eq!(output.call_bindings.len(), 1);
+        let binding = &output.call_bindings[0];
+        assert_eq!(binding.resolution, resolution, "explicit kind {kind}");
+        assert_eq!(binding.dispatch, semantic::Dispatch::Unknown);
+    }
 }
 
 /// Owner ruling 2026-10-30 (#470): dispatch is the measured native call shape plus the exact
