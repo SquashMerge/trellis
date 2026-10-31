@@ -47,13 +47,58 @@ fn document_ref(
     refs.get(&document_key(version)).copied()
 }
 
-/// The four `LanguageStatus` rows, in #22 language order, from per-language
-/// tuple counts [selected, complete, partial, failed, unselected].
-fn language_status(rows: &[[u64; 5]; 4]) -> Vec<Value> {
-    ["java", "rust", "python", "javascript"].into_iter().zip(rows).map(|(language, row)| {
-        json!({"language":language,"evidenceTier":"syntax","coverage":{
-            "selected":row[0],"complete":row[1],"partial":row[2],"failed":row[3],"unselected":row[4]}})
-    }).collect()
+/// Semantic tiers per language in #22 order (#528); the default is syntax only everywhere.
+pub type Tiers = [crate::store::LanguageTier; 4];
+
+/// Native tuple counts per language with each language's semantic tier, as describe reads them.
+pub type LanguageCounts = ([[u64; 5]; 4], Tiers);
+
+fn counts(row: &[u64; 5]) -> Value {
+    json!({"selected":row[0],"complete":row[1],"partial":row[2],"failed":row[3],"unselected":row[4]})
+}
+
+/// The four `LanguageStatus` rows, in #22 language order, from per-language native
+/// tuple counts [selected, complete, partial, failed, unselected] and each language's
+/// selected imported evidence (#528). `evidenceTier` and `coverage` keep describing the
+/// native syntax tuples; `semantic` separately reports the selected producer, its
+/// freshness and its tuple counts, with `available` true when it is selected, fresh and
+/// covers at least one document. Partial coverage of either stays visible.
+fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
+    ["java", "rust", "python", "javascript"]
+        .into_iter()
+        .zip(rows)
+        .zip(tiers)
+        .map(|((language, row), tier)| {
+            json!({"language":language,"evidenceTier":"syntax","coverage":counts(row),
+            "semantic":{"available":tier.semantic(),"producerId":tier.producer_id,
+                "freshness":if tier.freshness.is_empty() {"unavailable"} else {tier.freshness},
+                "coverage":counts(&tier.counts),"note":tier.note}})
+        })
+        .collect()
+}
+
+const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
+
+/// The `syntaxOnly` warning for `languages` (#528). It says the answer itself is
+/// syntax-derived and names the languages without selected fresh semantic evidence; it is
+/// dropped when every one has it, since `scopeCoverage` then reports that evidence. An
+/// empty set (nothing to attribute) keeps the plain warning.
+fn syntax_only<'a>(tiers: &Tiers, languages: impl IntoIterator<Item = &'a str>) -> Option<Value> {
+    let languages: std::collections::BTreeSet<&str> = languages.into_iter().collect();
+    if languages.is_empty() {
+        return Some(
+            json!({"code":"syntaxOnly","message":"This answer is syntax-derived","provenanceId":null}),
+        );
+    }
+    let syntax: Vec<&str> = LANGUAGES
+        .into_iter()
+        .zip(tiers)
+        .filter(|(language, tier)| languages.contains(language) && !tier.semantic())
+        .map(|(language, _)| language)
+        .collect();
+    (!syntax.is_empty()).then(|| {
+        json!({"code":"syntaxOnly","message":format!("This answer is syntax-derived; no fresh semantic evidence is selected for {}", syntax.join(", ")),"provenanceId":null})
+    })
 }
 
 pub fn describe(
@@ -61,22 +106,27 @@ pub fn describe(
     label: &str,
     state: &str,
     progress: Option<Value>,
-    counts: Option<[[u64; 5]; 4]>,
+    counts: Option<LanguageCounts>,
     basis: Option<Value>,
     degraded: bool,
 ) -> Value {
-    let partial = counts
+    let partial = counts.as_ref().is_none_or(|(rows, tiers)| {
+        rows.iter()
+            .chain(tiers.iter().map(|tier| &tier.counts))
+            .any(|row| row[2] != 0 || row[3] != 0)
+    });
+    let languages: Vec<Value> = counts
         .as_ref()
-        .is_none_or(|rows| rows.iter().any(|row| row[2] != 0 || row[3] != 0));
-    let languages: Vec<Value> = counts.map_or_else(Vec::new, |rows| language_status(&rows));
+        .map_or_else(Vec::new, |(rows, tiers)| language_status(rows, tiers));
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
-      "watcherDegraded":degraded,"languages":languages,"toolVersion":2,"schemaVersion":1,
+      "watcherDegraded":degraded,"languages":languages,"toolVersion":3,"schemaVersion":1,
       "searchIndex":crate::search_model::SearchAvailability::default(),
       "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,
-        "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
-        "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":4}},
+        "sourceLines":200,"defaultLimit":20,"callDefaultLimit":super::CALL_DEFAULT_LIMIT,
+        "maxLimit":50,"pageBytes":super::architecture::PAGE_BYTES,"calleeTextBytes":1024,
+        "hintWorkMs":1000,"deadlineMs":deadline_ms,"concurrency":super::MAX_CONNECTION_CALLS}},
       "warnings":[],"partial":partial,"truncated":false,"truncationReason":null})
 }
 
@@ -97,12 +147,13 @@ mod tests {
             "project",
             "ready",
             None,
-            Some(rows),
+            Some((rows, Tiers::default())),
             Some(basis.clone()),
             true,
         );
         assert_eq!(ready["evidenceBasis"], basis);
         assert_eq!(ready["data"]["watcherDegraded"], true);
+        assert_eq!(ready["data"]["toolVersion"], 3);
         assert_eq!(
             ready["data"]["languages"][1]["coverage"],
             json!({
@@ -110,6 +161,82 @@ mod tests {
         );
         assert_eq!(ready["partial"], true);
         assert_eq!(ready["data"]["languages"].as_array().unwrap().len(), 4);
+        // Without imported evidence every language is syntax, with no producer.
+        for language in ready["data"]["languages"].as_array().unwrap() {
+            assert_eq!(language["evidenceTier"], "syntax");
+            assert_eq!(language["semantic"]["available"], false);
+            assert_eq!(language["semantic"]["producerId"], Value::Null);
+            assert_eq!(language["semantic"]["freshness"], "unavailable");
+        }
+    }
+
+    /// Rust selects a `rust-analyzer` import; the other languages have no producer.
+    pub(super) fn rust_semantic(freshness: &'static str, counts: [u64; 5]) -> Tiers {
+        let mut tiers = Tiers::default();
+        for (tier, language) in tiers.iter_mut().zip(LANGUAGES) {
+            tier.freshness = "unavailable";
+            tier.note =
+                Some("semantic producer does not cover this language; showing syntax".into());
+            if language == "rust" {
+                tier.producer_id = Some("rust-analyzer".into());
+                tier.note = None;
+                tier.freshness = freshness;
+                tier.counts = counts;
+            }
+        }
+        tiers
+    }
+
+    /// #528: a fresh selected import reports the semantic tier beside native coverage;
+    /// partial semantic coverage stays partial, and stale evidence stays syntax.
+    #[test]
+    fn describe_reports_the_imported_semantic_tier_per_language() {
+        let rows = [[1, 1, 0, 0, 0], [355, 22, 333, 0, 0], [0; 5], [0; 5]];
+        let basis =
+            json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":1});
+        let fresh = describe(
+            &json!(1),
+            "project",
+            "ready",
+            None,
+            Some((rows, rust_semantic("fresh", [355, 300, 55, 0, 0]))),
+            Some(basis.clone()),
+            false,
+        );
+        let rust = &fresh["data"]["languages"][1];
+        // The native coverage row keeps its tier; the import is reported beside it.
+        assert_eq!(rust["evidenceTier"], "syntax");
+        assert_eq!(
+            rust["coverage"],
+            json!({"selected":355,"complete":22,"partial":333,"failed":0,"unselected":0})
+        );
+        assert_eq!(
+            rust["semantic"],
+            json!({"available":true,"producerId":"rust-analyzer","freshness":"fresh","note":null,
+                "coverage":{"selected":355,"complete":300,"partial":55,"failed":0,"unselected":0}})
+        );
+        assert_eq!(
+            fresh["data"]["languages"][0]["semantic"]["available"],
+            false
+        );
+        assert_eq!(fresh["partial"], true);
+        let stale = describe(
+            &json!(2),
+            "project",
+            "ready",
+            None,
+            Some((rows, rust_semantic("stale", [355, 355, 0, 0, 0]))),
+            Some(basis),
+            false,
+        );
+        assert_eq!(
+            stale["data"]["languages"][1]["semantic"]["available"],
+            false
+        );
+        assert_eq!(
+            stale["data"]["languages"][1]["semantic"]["freshness"],
+            "stale"
+        );
     }
 }
 
@@ -135,6 +262,7 @@ fn display_key(d: &crate::native_evidence::Declaration) -> String {
 pub fn declaration(
     id: &Value,
     result: crate::store::mcp_read::McpDeclarationWithLines,
+    tiers: &Tiers,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -152,16 +280,14 @@ pub fn declaration(
         .coverage
         .iter()
         .any(|c| c.selected && c.state != "complete");
-    let warnings = if incomplete {
-        vec![
-            json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}),
-            json!({"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}),
-        ]
-    } else {
-        vec![
-            json!({"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}),
-        ]
-    };
+    let mut warnings = Vec::new();
+    if incomplete {
+        warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
+    }
+    warnings.extend(syntax_only(
+        tiers,
+        [result.declaration.document.language.as_str()],
+    ));
     let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
         "indexRevision":result.pin.index_revision});
     let envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
@@ -179,17 +305,19 @@ pub fn declaration(
 pub fn find(
     id: &Value,
     result: crate::store::mcp_read::McpFindWithLines,
+    tiers: &Tiers,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
 ) -> Result<Option<Value>, &'static str> {
-    symbols(id, result, root, catching_up, modern, None)
+    symbols(id, result, tiers, root, catching_up, modern, None)
 }
 
 /// Search relevance decorates syntax evidence; it never changes native completeness.
 pub fn search(
     id: &Value,
     result: super::search::SearchResult,
+    tiers: &Tiers,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -213,6 +341,7 @@ pub fn search(
     symbols(
         id,
         result.symbols,
+        tiers,
         root,
         catching_up,
         modern,
@@ -224,6 +353,7 @@ pub fn search(
 fn symbols(
     id: &Value,
     result: crate::store::mcp_read::McpFindWithLines,
+    tiers: &Tiers,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -232,17 +362,31 @@ fn symbols(
     // #156: completeness is a property of the whole searched scope, carried by
     // `scopeCoverage`; per-document coverage covers only the emitted symbols.
     let incomplete = result.scope.iter().any(|row| row[2] != 0 || row[3] != 0);
-    let warnings = if incomplete {
-        vec![
-            json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}),
-            json!({"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}),
-        ]
-    } else {
-        vec![
-            json!({"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}),
-        ]
+    // #528: `syntaxOnly` names the emitted symbols' languages without fresh selected
+    // semantic evidence; with no symbols, the searched languages that have selected tuples.
+    let scope_languages: Vec<&str> = LANGUAGES
+        .into_iter()
+        .zip(&result.scope)
+        .filter(|(_, row)| row[0] != 0)
+        .map(|(language, _)| language)
+        .collect();
+    let warnings_for = |n: usize| -> Vec<Value> {
+        let mut warnings = Vec::new();
+        if incomplete {
+            warnings.push(json!({"code":"coverageIncomplete","message":"Selected syntax coverage is incomplete","provenanceId":null}));
+        }
+        let languages: Vec<&str> = if n == 0 {
+            scope_languages.clone()
+        } else {
+            result.symbols[..n]
+                .iter()
+                .map(|symbol| symbol.symbol.declaration.document.language.as_str())
+                .collect()
+        };
+        warnings.extend(syntax_only(tiers, languages));
+        warnings
     };
-    let scope = language_status(&result.scope);
+    let scope = language_status(&result.scope, tiers);
     let basis = json!({"indexGeneration":result.pin.index_generation.to_string(),
         "indexRevision":result.pin.index_revision});
     let language_order = |language: &str| match language {
@@ -330,7 +474,7 @@ fn symbols(
         let mut envelope = json!({"schemaVersion":1,"requestId":id,"workspace":root,
             "catchingUp":catching_up,"evidenceBasis":basis,
             "data":{"symbols":symbols,"documents":documents,"coverage":coverage,"scopeCoverage":scope,"provenance":closure},
-            "warnings":warnings,"partial":incomplete || truncated,"truncated":truncated,
+            "warnings":warnings_for(n),"partial":incomplete || truncated,"truncated":truncated,
             "truncationReason": if n < result.symbols.len() {Some("response_bytes")}
                 else if result.has_more {Some("limit")} else {None}});
         let name = if let Some((_, status, role)) = search {
@@ -510,9 +654,16 @@ mod find_tests {
         let id = json!(7);
         for modern in [false, true] {
             // The scope that overflowed the cap with per-document rows now fits.
-            let large = find(&id, fixture(&[], LARGE_SCOPE, false), root, false, modern)
-                .unwrap()
-                .unwrap();
+            let large = find(
+                &id,
+                fixture(&[], LARGE_SCOPE, false),
+                &Default::default(),
+                root,
+                false,
+                modern,
+            )
+            .unwrap()
+            .unwrap();
             let data = &large["data"];
             assert_eq!(data["symbols"], json!([]));
             assert_eq!(data["documents"], json!([]));
@@ -521,10 +672,10 @@ mod find_tests {
             assert_eq!(
                 data["scopeCoverage"],
                 json!([
-                    {"language":"java","evidenceTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0}},
-                    {"language":"rust","evidenceTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0}},
-                    {"language":"python","evidenceTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0}},
-                    {"language":"javascript","evidenceTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0}}
+                    {"language":"java","evidenceTier":"syntax","coverage":{"selected":4,"complete":4,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
+                    {"language":"rust","evidenceTier":"syntax","coverage":{"selected":117,"complete":6,"partial":111,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
+                    {"language":"python","evidenceTier":"syntax","coverage":{"selected":9,"complete":9,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}},
+                    {"language":"javascript","evidenceTier":"syntax","coverage":{"selected":140,"complete":140,"partial":0,"failed":0,"unselected":0},"semantic":{"available":false,"producerId":null,"freshness":"unavailable","coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},"note":null}}
                 ])
             );
             // Incomplete selected scope: partial, one aggregate warning first.
@@ -536,17 +687,31 @@ mod find_tests {
 
             // A failed selected tuple alone also flags the scope.
             let failed = [[0; 5], [0; 5], [1, 0, 0, 1, 0], [0; 5]];
-            let envelope = find(&id, fixture(&[], failed, false), root, false, modern)
-                .unwrap()
-                .unwrap();
+            let envelope = find(
+                &id,
+                fixture(&[], failed, false),
+                &Default::default(),
+                root,
+                false,
+                modern,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(envelope["partial"], true);
             assert_eq!(envelope["warnings"][0]["code"], "coverageIncomplete");
 
             // Unselected-only tuples (and zero-language rows) flag nothing.
             let unselected = [[0; 5], [0, 0, 0, 0, 3], [0; 5], [2, 2, 0, 0, 0]];
-            let envelope = find(&id, fixture(&[], unselected, false), root, false, modern)
-                .unwrap()
-                .unwrap();
+            let envelope = find(
+                &id,
+                fixture(&[], unselected, false),
+                &Default::default(),
+                root,
+                false,
+                modern,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(envelope["partial"], false);
             assert_eq!(envelope["warnings"].as_array().unwrap().len(), 1);
             assert_eq!(envelope["warnings"][0]["code"], "syntaxOnly");
@@ -571,6 +736,7 @@ mod find_tests {
             let envelope = find(
                 &id,
                 fixture(&hits, COMPLETE_SCOPE, false),
+                &Default::default(),
                 root,
                 false,
                 modern,
@@ -600,6 +766,7 @@ mod find_tests {
             let repeated = find(
                 &id,
                 fixture(&hits, COMPLETE_SCOPE, false),
+                &Default::default(),
                 root,
                 false,
                 modern,
@@ -671,6 +838,7 @@ mod find_tests {
             let failure = find(
                 &json!(1),
                 conflicting,
+                &Default::default(),
                 std::path::Path::new("/workspace"),
                 false,
                 true,
@@ -695,6 +863,7 @@ mod find_tests {
             let envelope = find(
                 &id,
                 fixture(&hits, COMPLETE_SCOPE, false),
+                &Default::default(),
                 root,
                 true,
                 modern,
@@ -736,6 +905,7 @@ mod find_tests {
             let two = find(
                 &id,
                 fixture(&hits[..2], COMPLETE_SCOPE, false),
+                &Default::default(),
                 root,
                 true,
                 modern,
@@ -757,6 +927,7 @@ mod find_tests {
             let envelope = find(
                 &id,
                 fixture(&hits, COMPLETE_SCOPE, false),
+                &Default::default(),
                 root,
                 false,
                 modern,
@@ -782,6 +953,7 @@ mod find_tests {
             let envelope = find(
                 &id,
                 fixture(&hits, COMPLETE_SCOPE, true),
+                &Default::default(),
                 std::path::Path::new("/workspace"),
                 false,
                 modern,
@@ -836,6 +1008,7 @@ mod search_tests {
         search(
             &json!("search"),
             result,
+            &Default::default(),
             std::path::Path::new("/workspace"),
             true,
             modern,
@@ -870,7 +1043,7 @@ mod search_tests {
             assert_eq!(envelope["truncated"], false);
             assert_eq!(
                 envelope["warnings"],
-                json!([{"code":"syntaxOnly","message":"Only syntax evidence is available","provenanceId":null}])
+                json!([{"code":"syntaxOnly","message":"This answer is syntax-derived; no fresh semantic evidence is selected for javascript","provenanceId":null}])
             );
             assert_eq!(data["hits"][0]["rank"], 1);
             assert_eq!(data["hits"][1]["rank"], 2);
@@ -1098,6 +1271,91 @@ fn wire_row<T: serde::Serialize, U: serde::de::DeserializeOwned>(
         .map_err(|_| "store_unavailable: semantic evidence projection")
 }
 
+/// #528: emit each distinct semantic basis once per response. Items carry
+/// `semanticBasisRef` and proofs `basisRef`, both indexes into `semanticBases`, instead of
+/// repeating the whole basis. Equal bases share one entry; refs follow the entries'
+/// canonical serialization, so equal answers serialize byte-identically.
+fn intern_bases(
+    items: &mut [Value],
+    provenance: impl IntoIterator<Item = crate::native_evidence::Provenance>,
+) -> Result<(Vec<Value>, Vec<Value>), &'static str> {
+    use std::collections::BTreeMap;
+    let provenance: Vec<Value> = provenance
+        .into_iter()
+        .map(|row| {
+            serde_json::to_value(row).map_err(|_| "store_unavailable: provenance projection")
+        })
+        .collect::<Result<_, _>>()?;
+    let key = |basis: &Value| {
+        serde_json::to_string(basis).map_err(|_| "store_unavailable: basis projection")
+    };
+    let mut unique: BTreeMap<String, Value> = BTreeMap::new();
+    for basis in items
+        .iter()
+        .map(|item| &item["semanticBasis"])
+        .chain(provenance.iter().map(|row| &row["basis"]))
+        .filter(|basis| !basis.is_null())
+    {
+        unique.insert(key(basis)?, basis.clone());
+    }
+    let refs: BTreeMap<&str, usize> = unique
+        .keys()
+        .enumerate()
+        .map(|(index, key)| (key.as_str(), index))
+        .collect();
+    let reference = |basis: &Value| -> Result<Value, &'static str> {
+        if basis.is_null() {
+            return Ok(Value::Null);
+        }
+        Ok(json!(refs[key(basis)?.as_str()]))
+    };
+    for item in items.iter_mut() {
+        let item = item
+            .as_object_mut()
+            .ok_or("store_unavailable: item projection")?;
+        let basis = item.remove("semanticBasis").unwrap_or(Value::Null);
+        item.insert("semanticBasisRef".into(), reference(&basis)?);
+    }
+    let provenance = provenance
+        .into_iter()
+        .map(|mut row| {
+            let fields = row
+                .as_object_mut()
+                .ok_or("store_unavailable: provenance projection")?;
+            let basis = fields.remove("basis").unwrap_or(Value::Null);
+            fields.insert("basisRef".into(), reference(&basis)?);
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    let table = unique
+        .values()
+        .enumerate()
+        .map(|(index, basis)| {
+            let mut entry = basis.clone();
+            entry["ref"] = json!(index);
+            entry
+        })
+        .collect();
+    Ok((table, provenance))
+}
+
+/// #528 compact mode: keep the answer (items, refs, dispositions, targets, warnings and
+/// completeness) and drop the proof detail: `coverage`, `provenance`, `semanticBases`,
+/// and each item's `binding` and `semanticBasisRef`.
+fn compact_data(data: &mut Value, items: &str) {
+    if let Some(fields) = data.as_object_mut() {
+        for field in ["coverage", "provenance", "semanticBases"] {
+            fields.remove(field);
+        }
+    }
+    for item in data[items].as_array_mut().into_iter().flatten() {
+        if let Some(item) = item.as_object_mut() {
+            item.remove("binding");
+            item.remove("semanticBasisRef");
+        }
+    }
+}
+
 /// Warnings-v1 for the emitted calls (#467): coverage, stale evidence and targets, ambiguous
 /// bindings and, when no producer covers them, `syntaxOnly` carrying the producer note.
 fn call_warnings<'a>(
@@ -1178,6 +1436,7 @@ pub fn outgoing(
     id: &Value,
     result: crate::store::mcp_read::McpOutgoingWithLines,
     semantic: &crate::store::McpSemantic,
+    compact: bool,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -1338,11 +1597,16 @@ pub fn outgoing(
             semantic,
             (0..count).filter_map(|index| semantic.call(index)),
         );
+        let (bases, provenance) = intern_bases(&mut calls, provenance.into_values())?;
+        let mut data = json!({"symbolId":result.owner.selected.declaration.syntax_id,
+            "displayKey":owner_display,"calls":calls,"documents":documents,
+            "semanticBases":bases,"coverage":coverage,"provenance":provenance});
+        if compact {
+            compact_data(&mut data, "calls");
+        }
         Ok(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
-            "evidenceBasis":basis,"data":{"symbolId":result.owner.selected.declaration.syntax_id,
-                "displayKey":owner_display,"calls":calls,"documents":documents,"coverage":coverage,
-                "provenance":provenance.into_values().collect::<Vec<_>>()},
+            "evidenceBasis":basis,"data":data,
             "warnings":warnings,"partial":incomplete || truncated || boundary,
             "truncated":truncated,"truncationReason":reason}),
         )
@@ -1456,10 +1720,13 @@ fn fit_call_graph(
 
 /// Project a name-matched reverse lookup. Each caller carries its own call's selected
 /// binding, if any; the name match itself establishes no binding.
+#[allow(clippy::too_many_arguments)]
 pub fn incoming(
     id: &Value,
     result: crate::store::mcp_read::McpIncomingWithLines,
     semantic: &crate::store::McpSemantic,
+    tiers: &Tiers,
+    compact: bool,
     root: &std::path::Path,
     catching_up: bool,
     modern: bool,
@@ -1599,16 +1866,21 @@ pub fn incoming(
         let incomplete = warnings
             .first()
             .is_some_and(|warning| warning["code"] == "coverageIncomplete");
+        let (bases, provenance) = intern_bases(&mut callers, provenance.into_values())?;
+        let mut data = json!({
+            "symbolId":owner.declaration.syntax_id,"displayKey":display_key(&owner.declaration),
+            "match":{"basis":"name","sameNameDeclarations":result.same_name_declarations,
+                "limitations":["aliases","functionValues","reExports","dynamicDispatch",
+                    "opaqueMacros","sameNameDeclarations"]},
+            "callers":callers,"documents":documents,"semanticBases":bases,"coverage":coverage,
+            "scopeCoverage":language_status(&result.scope, tiers),
+            "provenance":provenance});
+        if compact {
+            compact_data(&mut data, "callers");
+        }
         Ok(
             json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":catching_up,
-            "evidenceBasis":basis,"data":{
-                "symbolId":owner.declaration.syntax_id,"displayKey":display_key(&owner.declaration),
-                "match":{"basis":"name","sameNameDeclarations":result.same_name_declarations,
-                    "limitations":["aliases","functionValues","reExports","dynamicDispatch",
-                        "opaqueMacros","sameNameDeclarations"]},
-                "callers":callers,"documents":documents,"coverage":coverage,
-                "scopeCoverage":language_status(&result.scope),
-                "provenance":provenance.into_values().collect::<Vec<_>>()},
+            "evidenceBasis":basis,"data":data,
             "warnings":warnings,"partial":incomplete || truncated || boundary,
             "truncated":truncated,"truncationReason":reason}),
         )
@@ -1696,6 +1968,7 @@ mod outgoing_tests {
             id,
             with_lines(result),
             &syntax_only(),
+            false,
             root,
             catching_up,
             modern,
@@ -1780,9 +2053,17 @@ mod outgoing_tests {
             })
         };
         let root = std::path::Path::new("/workspace");
-        let valid = outgoing(&json!(1), make_result(), &syntax_only(), root, false, true)
-            .unwrap()
-            .unwrap();
+        let valid = outgoing(
+            &json!(1),
+            make_result(),
+            &syntax_only(),
+            false,
+            root,
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
         let entry = &valid["data"]["documents"]
             [valid["data"]["calls"][0]["nativeCandidates"]["items"][0]["doc"]
                 .as_u64()
@@ -1796,7 +2077,8 @@ mod outgoing_tests {
         // The owner proof is real and present in the response, but it is not
         // the independent target declaration's proof.
         wrong.calls[0].candidate_documents[0].provenance_id = owner().provenance[0].id.clone();
-        let failure = outgoing(&json!(1), wrong, &syntax_only(), root, false, true).unwrap_err();
+        let failure =
+            outgoing(&json!(1), wrong, &syntax_only(), false, root, false, true).unwrap_err();
         assert!(failure.starts_with("store_unavailable"));
     }
 
@@ -2095,7 +2377,7 @@ pub fn source(
             "text":result.text,
             "evidence":{"evidenceTier":"syntax","semanticBasis":null,
                 "freshness":"fresh","staleBecause":[]}},
-        "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
+        "warnings":[{"code":"syntaxOnly","message":"This answer is syntax-derived",
             "provenanceId":null}],
         "partial":false,"truncated":false,"truncationReason":null,
     });
@@ -2150,6 +2432,8 @@ mod incoming_tests {
             &json!(1),
             result,
             &crate::store::McpSemantic::syntax_only(crate::store::NO_PRODUCER_NOTE, 0),
+            &Default::default(),
+            false,
             std::path::Path::new("/workspace"),
             false,
             modern,
@@ -2161,7 +2445,8 @@ mod incoming_tests {
         for modern in [false, true] {
             let empty = project(fixture(0, false, 0), modern).unwrap();
             let data = &empty["data"];
-            assert_eq!(data.as_object().unwrap().len(), 8);
+            assert_eq!(data.as_object().unwrap().len(), 9);
+            assert_eq!(data["semanticBases"], json!([]));
             assert_eq!(data["documents"], json!([]));
             assert_eq!(data["coverage"].as_array().unwrap().len(), 1);
             assert_eq!(data["provenance"].as_array().unwrap().len(), 1);
@@ -2598,5 +2883,308 @@ mod call_graph_tests {
         assert!(project(&mut huge, true).is_none());
         let mut no_calls = answer(0, 70_000);
         assert!(project(&mut no_calls, false).is_none());
+    }
+}
+
+/// #528 response-size regressions on this repository's real shapes: the owner's live
+/// `incoming_calls` on `index_workspace` returned ~62 KB and stopped at 12 callers because
+/// each semantic caller repeated an ~800-byte basis in the item and again in its proof.
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+    use crate::store::mcp_read::{
+        McpDeclaration, McpDeclarationWithLines, McpDocumentVersion, McpIncomingCallWithLines,
+        McpIncomingWithLines, McpItemSource, McpLines,
+    };
+
+    const SOURCE_SET: &str = "source-set:v1:0d7bc85f-6ff5-4e8f-b71a-8a2a5a60a4ab";
+    const REVISION: &str =
+        "revision:v2:5b541324769de8538eabba403d11f5f8fcfbf8dd27ef2e07911857b328ccb4c5";
+
+    fn hex(seed: usize, len: usize) -> String {
+        format!("{seed:x}").repeat(len)[..len].to_owned()
+    }
+
+    fn document(path: &str) -> Value {
+        json!({"language":"rust","path":path,"sourceSetId":SOURCE_SET})
+    }
+
+    /// The basis rust-analyzer imports carry, as the live install serialized it.
+    fn basis() -> Value {
+        json!({"artifactHash":hex(1, 64),"configHash":hex(2, 64),"dependencyHash":hex(3, 64),
+            "language":"rust","lookupDependencies":[],"producerHash":hex(4, 64),
+            "producerId":"rust-analyzer","producerVersion":"1.98.1 (48a229ce 2026-09-01)",
+            "revisionId":REVISION,"sourceManifestHash":hex(5, 64),"sourceSetId":SOURCE_SET,
+            "toolchainHash":hex(6, 64)})
+    }
+
+    fn native_coverage(path: &str) -> crate::native_evidence::Coverage {
+        serde_json::from_value(json!({"producerId":"trellis.native.syntax","language":"rust",
+            "sourceSetId":SOURCE_SET,"documentPath":path,"revisionId":REVISION,"requested":true,
+            "selected":true,"state":"partial","supportedRoles":["definition","call"],
+            "observedRoles":["definition","call"],
+            "diagnostic":"opaque Rust macro/attribute token trees skipped; calls and definitions inside were not measured"}))
+        .unwrap()
+    }
+
+    fn native_proof(path: &str, file: usize) -> crate::native_evidence::Provenance {
+        serde_json::from_value(
+            json!({"id":format!("native-proof:v1:{}", hex(file + 7, 64)),
+            "producerId":"trellis.native.syntax","document":document(path),"revisionId":REVISION,
+            "contentHash":hex(file + 7, 64),"evidenceKind":"measuredSyntax","basis":null,
+            "freshness":"fresh","derivedFrom":null}),
+        )
+        .unwrap()
+    }
+
+    fn declaration(
+        path: &str,
+        file: usize,
+        name: &str,
+        start: usize,
+    ) -> crate::native_evidence::Declaration {
+        serde_json::from_value(json!({"syntaxId":format!("sid:v1:{}", hex(start + 9, 32)),
+            "document":document(path),"revisionId":REVISION,"kind":"function","role":"test",
+            "name":name,"lookupKey":name,"ancestors":[],
+            "key":{"kind":"function","name":name,"signature":null,"ordinal":0},
+            "range":{"start":start,"end":start + 900},"nameRange":null,
+            "header":{"kind":"function","name":name,"modifiers":[],"typeParameters":[],
+                "parameters":[],"resultType":null,"bases":[]},
+            "provenanceId":format!("native-proof:v1:{}", hex(file + 7, 64))}))
+        .unwrap()
+    }
+
+    fn version(path: &str, file: usize) -> McpDocumentVersion {
+        McpDocumentVersion {
+            document: serde_json::from_value(document(path)).unwrap(),
+            revision_id: REVISION.into(),
+            content_hash: hex(file + 7, 64),
+            provenance_id: format!("native-proof:v1:{}", hex(file + 7, 64)),
+        }
+    }
+
+    /// `callers` name-matched sites, two per test file, each with a resolved
+    /// rust-analyzer binding and its own proof, as `index_workspace`'s callers have.
+    fn incoming(callers: usize) -> (McpIncomingWithLines, crate::store::McpSemantic) {
+        let owner_path = "src/indexer.rs";
+        let owner = declaration(owner_path, 0, "index_workspace", 100);
+        let selected = McpDeclarationWithLines {
+            selected: McpDeclaration {
+                declaration: owner.clone(),
+                content_hash: hex(7, 64),
+                coverage: vec![native_coverage(owner_path)],
+                provenance: vec![native_proof(owner_path, 0)],
+                pin: serde_json::from_value(json!({
+                    "indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":6}))
+                .unwrap(),
+            },
+            source: McpItemSource {
+                document: version(owner_path, 0),
+                lines: Some(McpLines { start: 10, end: 40 }),
+            },
+        };
+        let mut calls = Vec::new();
+        let mut semantic = Vec::new();
+        for i in 0..callers {
+            let file = 1 + i / 2; // two callers per file, as index_workspace has
+            let path = format!("tests/index/index_workspace_{file}.rs");
+            let start = 1000 * (i + 1);
+            let caller = declaration(&path, file, &format!("indexes_case_{i}"), start);
+            let call_id = format!("occ:v2:{}", hex(i + 3, 32));
+            let call: crate::native_evidence::Call = serde_json::from_value(json!({
+                "id":call_id,"ownerSyntaxId":caller.syntax_id,"ordinal":0,
+                "document":document(&path),"revisionId":REVISION,
+                "range":{"start":start + 40,"end":start + 80},
+                "calleeRange":{"start":start + 40,"end":start + 55},"spelling":"index_workspace",
+                "regionIds":[],"provenanceId":format!("native-proof:v1:{}", hex(file + 7, 64))}))
+            .unwrap();
+            let proof_id = hex(i + 11, 64);
+            let proof = json!({"id":proof_id,"producerId":"rust-analyzer",
+                "document":document(&path),"revisionId":REVISION,"contentHash":hex(file + 7, 64),
+                "evidenceKind":"semanticReference","basis":basis(),"freshness":"fresh",
+                "derivedFrom":{"factDigest":hex(i + 12, 64),"provenanceId":hex(i + 13, 64),
+                    "recordKind":"occurrence"}});
+            let binding = json!({"callId":call_id,"candidates":[],
+                "declaredTarget":{"document":document(owner_path),"kind":"internal",
+                    "revisionId":REVISION,"syntaxId":owner.syntax_id},
+                "dispatch":"unknown",
+                "join":{"anchor":{"contentHash":hex(file + 7, 64),"document":document(&path),
+                    "kind":"callee","range":{"start":start + 40,"end":start + 55},
+                    "revisionId":REVISION},"candidateIds":[call_id],"diagnostic":null,
+                    "status":"exact"},
+                "possibleDispatch":[],"possibleDispatchComplete":false,"provenanceId":proof_id,
+                "resolution":"resolved","staleTarget":false});
+            let coverage = json!({"producerId":"rust-analyzer","language":"rust",
+                "sourceSetId":SOURCE_SET,"documentPath":path,"revisionId":REVISION,
+                "requested":true,"selected":true,"state":"partial",
+                "supportedRoles":["definition","read","write","call","type","import","alias"],
+                "observedRoles":["definition","read","call","type"],
+                "diagnostic":"unsupported_native_gap"});
+            semantic.push(Some(crate::store::CallSemantic {
+                binding: serde_json::from_value(binding).unwrap(),
+                provenance: serde_json::from_value(proof.clone()).unwrap(),
+                boundary_reason: crate::graph_query::BoundaryReason::Dispatch,
+                target_id: Some(owner.syntax_id.clone()),
+                coverage: serde_json::from_value(coverage).unwrap(),
+                proofs: vec![serde_json::from_value(proof).unwrap()],
+            }));
+            calls.push(McpIncomingCallWithLines {
+                call,
+                caller,
+                content_hash: hex(file + 7, 64),
+                source: McpItemSource {
+                    document: version(&path, file),
+                    lines: Some(McpLines {
+                        start: 40 + i as u64,
+                        end: 41 + i as u64,
+                    }),
+                },
+                callee_text: "index_workspace".into(),
+                coverage: native_coverage(&path),
+                provenance: native_proof(&path, file),
+            });
+        }
+        (
+            McpIncomingWithLines {
+                selected,
+                calls,
+                same_name_declarations: 1,
+                scope: [[0; 5], [355, 22, 333, 0, 0], [0; 5], [0; 5]],
+                has_more: true,
+            },
+            crate::store::McpSemantic {
+                producer_id: Some("rust-analyzer".into()),
+                note: None,
+                calls: semantic,
+            },
+        )
+    }
+
+    fn frame_bytes(envelope: &Value) -> usize {
+        let frame = json!({"jsonrpc":"2.0","id":1,
+            "result":crate::mcp::tools::result("trellis_incoming_calls", envelope.clone(), true)});
+        serde_json::to_vec(&frame).unwrap().len() + 1
+    }
+
+    fn project(callers: usize, compact: bool) -> Value {
+        let (result, semantic) = incoming(callers);
+        super::incoming(
+            &json!(1),
+            result,
+            &semantic,
+            &super::tests::rust_semantic("fresh", [326, 14, 312, 0, 29]),
+            compact,
+            std::path::Path::new("/Users/someone/projects/trellis"),
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn default_semantic_caller_page_stays_under_25_kib() {
+        let page = project(crate::mcp::CALL_DEFAULT_LIMIT, false);
+        assert_eq!(
+            page["data"]["callers"].as_array().unwrap().len(),
+            crate::mcp::CALL_DEFAULT_LIMIT
+        );
+        let bytes = frame_bytes(&page);
+        assert!(bytes < 25 * 1024, "default incoming page is {bytes} bytes");
+        // The basis is emitted once and referenced from every caller and proof.
+        let bases = page["data"]["semanticBases"].as_array().unwrap();
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0]["ref"], 0);
+        assert_eq!(bases[0]["producerHash"], hex(4, 64));
+        let wire = serde_json::to_string(&page).unwrap();
+        assert_eq!(wire.matches(&hex(4, 64)).count(), 1);
+        for caller in page["data"]["callers"].as_array().unwrap() {
+            assert_eq!(caller["semanticBasisRef"], 0);
+            assert_eq!(caller["evidenceTier"], "semantic");
+            assert!(caller.get("semanticBasis").is_none());
+        }
+        for proof in page["data"]["provenance"].as_array().unwrap() {
+            assert!(proof.get("basis").is_none());
+            let expected = if proof["evidenceKind"] == "measuredSyntax" {
+                json!(null)
+            } else {
+                json!(0)
+            };
+            assert_eq!(proof["basisRef"], expected);
+        }
+        // Rust has fresh imported evidence: no syntaxOnly, and scope reports it beside
+        // native coverage, which stays partial.
+        assert!(
+            page["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|w| w["code"] != "syntaxOnly")
+        );
+        let rust = &page["data"]["scopeCoverage"][1];
+        assert_eq!(rust["evidenceTier"], "syntax");
+        assert_eq!(rust["coverage"]["partial"], 333);
+        assert_eq!(rust["semantic"]["available"], true);
+        assert_eq!(rust["semantic"]["coverage"]["partial"], 312);
+        assert_eq!(page["partial"], true);
+    }
+
+    #[test]
+    fn the_basis_table_more_than_halves_a_full_caller_page() {
+        // Before #528 each caller and proof repeated the whole basis: re-inline it to
+        // compare against the same 20 callers.
+        let page = project(20, false);
+        let mut inlined = page.clone();
+        let basis = basis();
+        for caller in inlined["data"]["callers"].as_array_mut().unwrap() {
+            let fields = caller.as_object_mut().unwrap();
+            fields.remove("semanticBasisRef");
+            fields.insert("semanticBasis".into(), basis.clone());
+        }
+        for proof in inlined["data"]["provenance"].as_array_mut().unwrap() {
+            let fields = proof.as_object_mut().unwrap();
+            let semantic = fields.remove("basisRef").unwrap() != Value::Null;
+            fields.insert(
+                "basis".into(),
+                if semantic { basis.clone() } else { Value::Null },
+            );
+        }
+        inlined["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("semanticBases");
+        let (now, before) = (frame_bytes(&page), frame_bytes(&inlined));
+        assert!(before > 50 * 1024, "the old shape is {before} bytes");
+        assert!(
+            now * 10 < before * 7,
+            "{now} bytes is not much below {before}"
+        );
+    }
+
+    #[test]
+    fn compact_fits_twenty_semantic_callers_under_25_kib() {
+        let page = project(20, true);
+        assert_eq!(page["data"]["callers"].as_array().unwrap().len(), 20);
+        let bytes = frame_bytes(&page);
+        assert!(bytes < 25 * 1024, "compact page is {bytes} bytes");
+        let data = page["data"].as_object().unwrap();
+        for field in ["coverage", "provenance", "semanticBases"] {
+            assert!(!data.contains_key(field), "{field}");
+        }
+        for caller in page["data"]["callers"].as_array().unwrap() {
+            assert!(caller.get("binding").is_none());
+            assert!(caller.get("semanticBasisRef").is_none());
+            assert_eq!(caller["disposition"], "resolved");
+            assert_eq!(caller["evidenceTier"], "semantic");
+            assert!(caller["targetId"].is_string());
+        }
+        // Completeness and warnings are those of the full answer.
+        let full = project(20, false);
+        assert_eq!(page["warnings"], full["warnings"]);
+        assert_eq!(page["partial"], full["partial"]);
+        // Twenty full callers overflow the cap; compact returns them all.
+        assert_eq!(full["truncationReason"], "response_bytes");
+        assert_eq!(page["truncationReason"], "limit");
+        assert_eq!(page["data"]["scopeCoverage"], full["data"]["scopeCoverage"]);
     }
 }

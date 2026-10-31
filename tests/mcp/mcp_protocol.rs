@@ -727,6 +727,13 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
                     count("complete") + count("partial") + count("failed")
                 );
                 assert!(row["evidenceTier"] == "syntax");
+                // #528: no import, so no language reports selected semantic evidence.
+                assert_eq!(
+                    row["semantic"],
+                    json!({"available":false,"producerId":null,"freshness":"unavailable",
+                        "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                        "note":"no semantic producer published; showing syntax"})
+                );
             }
             let partial = languages
                 .iter()
@@ -816,7 +823,10 @@ fn golden_settled_failure(id: &Value, root: &Value, code: &str, basis: Value) ->
 fn empty_scope_coverage() -> Value {
     let row = |language: &str| {
         json!({"language":language,"evidenceTier":"syntax","coverage":{
-            "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0}})
+            "selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+            "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
+                "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                "note":"no semantic producer published; showing syntax"}})
     };
     json!([row("java"), row("rust"), row("python"), row("javascript")])
 }
@@ -825,7 +835,7 @@ fn golden_settled_empty_find(id: &Value, root: &Value, pin: &Value) -> Value {
     json!({"schemaVersion":1,"requestId":id,"workspace":root,"catchingUp":false,
         "evidenceBasis":pin,"data":{"symbols":[],"documents":[],"coverage":[],
             "scopeCoverage":empty_scope_coverage(),"provenance":[]},
-        "warnings":[{"code":"syntaxOnly","message":"Only syntax evidence is available",
+        "warnings":[{"code":"syntaxOnly","message":"This answer is syntax-derived",
             "provenanceId":null}],"partial":false,"truncated":false,
         "truncationReason":null})
 }
@@ -5616,6 +5626,15 @@ async fn four_calls_run_concurrently_and_a_fifth_is_refused() {
     let envelope = &refused["result"]["structuredContent"];
     assert_eq!(envelope["error"]["code"], "too_many_requests", "{refused}");
     assert_eq!(envelope["error"]["retryable"], true);
+    // #528: the refusal names the per-connection limit so an agent can adapt.
+    assert_eq!(
+        envelope["error"]["message"],
+        "Too many concurrent tool calls on this connection (limit 4); wait for one to finish"
+    );
+    assert_eq!(
+        refused["result"]["content"][0]["text"],
+        "trellis_workspace_describe failed: too_many_requests: Too many concurrent tool calls on this connection (limit 4); wait for one to finish"
+    );
     assert_eq!(envelope["error"]["attemptedWorkspace"]["kind"], "path");
     assert!(envelope.get("workspace").is_none() && envelope.get("catchingUp").is_none());
     gate.open();
@@ -5670,6 +5689,10 @@ async fn timed_out_workers_keep_their_permits_across_connections() {
     assert_eq!(
         refused["result"]["structuredContent"]["error"]["code"], "too_many_requests",
         "{refused}"
+    );
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["message"],
+        "Too many concurrent tool calls in the daemon (limit 16); retry shortly"
     );
     gate.open();
     tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
@@ -6083,6 +6106,10 @@ async fn over_bound_requests_are_refused_after_validation() {
     let seventeenth = &seen["117"];
     assert_eq!(seventeenth["error"]["code"], -32000, "{seventeenth}");
     assert_eq!(seventeenth["error"]["data"]["code"], "too_many_requests");
+    assert_eq!(
+        seventeenth["error"]["message"],
+        "Too many outstanding requests on this connection (limit 16)"
+    );
     drop(reader);
     drop(client);
     session.join().unwrap().unwrap();
@@ -6744,7 +6771,10 @@ async fn mcp_find_selected_snapshot_ranks_and_keeps_zero_hit_scope() {
     let row = |language: &str, counts: [u64; 5]| {
         json!({"language":language,"evidenceTier":"syntax","coverage":{
             "selected":counts[0],"complete":counts[1],"partial":counts[2],
-            "failed":counts[3],"unselected":counts[4]}})
+            "failed":counts[3],"unselected":counts[4]},
+            "semantic":{"available":false,"producerId":null,"freshness":"unavailable",
+                "coverage":{"selected":0,"complete":0,"partial":0,"failed":0,"unselected":0},
+                "note":"no semantic producer published; showing syntax"}})
     };
     assert_eq!(
         data["data"]["scopeCoverage"],
@@ -10731,8 +10761,9 @@ fn assert_incoming_emitted_proof_closure(declaration: &Value, incoming: &Value) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incoming_default_twenty_and_limit_one_keep_exact_required_closure() {
-    for (limit, expected) in [(None, 20), (Some(1), 1)] {
+async fn incoming_default_six_limit_twenty_and_one_keep_exact_required_closure() {
+    // #528: the default call page is six items.
+    for (limit, expected) in [(None, 6), (Some(20), 20), (Some(1), 1)] {
         let (declaration, response) = incoming_many_documents_fixture(false, limit).await;
         let envelope = &response["result"]["structuredContent"];
         let data = &envelope["data"];

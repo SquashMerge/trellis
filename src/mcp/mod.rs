@@ -535,7 +535,7 @@ fn evidence_read(
 }
 
 struct DescribedSnapshot {
-    data: Option<(crate::model::IndexStatus, [[u64; 5]; 4])>,
+    data: Option<(crate::model::IndexStatus, projection::LanguageCounts)>,
     catching_up: bool,
     state: &'static str,
     progress: Option<serde_json::Value>,
@@ -544,6 +544,11 @@ struct DescribedSnapshot {
 /// Every tool call is answered within this deadline; describe reports it as
 /// `limits.deadlineMs` (contract W1).
 pub const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
+
+/// Outgoing and incoming calls emit this many items unless `limit` says otherwise (#528):
+/// six semantic bindings with their proofs measured about 23.5 KB on this repository's
+/// widest caller list (`index_workspace`); `compact` fits 50 in well under the cap.
+pub const CALL_DEFAULT_LIMIT: usize = 6;
 
 /// Keep mandatory lexical/projection work inside the original call deadline.
 const SEARCH_LEXICAL_RESERVE: std::time::Duration = std::time::Duration::from_millis(2000);
@@ -577,7 +582,8 @@ fn read_describe(
                             let data = (|| {
                                 let status = response.status()?;
                                 let counts = response.mcp_language_counts()?;
-                                Ok((status, counts))
+                                let tiers = response.mcp_language_tiers()?;
+                                Ok((status, (counts, tiers)))
                             })()
                             .map_err(|error| response.report_index_failure(error))?;
                             response.finish(data)
@@ -656,7 +662,7 @@ pub(crate) fn phase_hook(_: &str) -> std::io::Result<()> {
 static CALL_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const MAX_CALL_WORKERS: usize = 16;
 /// Outstanding calls per connection: a fifth is refused without queueing.
-const MAX_CONNECTION_CALLS: usize = 4;
+pub(crate) const MAX_CONNECTION_CALLS: usize = 4;
 
 /// Call workers alive in this process, for tests of the worker budget.
 #[cfg(feature = "test-support")]
@@ -1281,6 +1287,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             .collect();
                         let mut symbols = response.mcp_search_hydrate(&keys, pin, &mut check)?;
                         symbols.has_more = has_more;
+                        let tiers = response.mcp_language_tiers()?;
                         projection::search(
                             id,
                             search::SearchResult {
@@ -1289,6 +1296,7 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                                 search_index,
                                 role,
                             },
+                            &tiers,
                             root,
                             sampled,
                             modern,
@@ -1307,7 +1315,8 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     let expected = validated_expected_basis(args);
                     Some(Box::new(move |_, response, sampled, _query| {
                         let found = response.mcp_find_with_lines(query, limit, expected)?;
-                        Ok(projection::find(id, found, root, sampled, modern)
+                        let tiers = response.mcp_language_tiers()?;
+                        Ok(projection::find(id, found, &tiers, root, sampled, modern)
                             .map_err(|error| anyhow::anyhow!(error))?
                             .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
@@ -1318,10 +1327,15 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                     Some(Box::new(move |_, response, sampled, _query| {
                         Ok(
                             match response.mcp_declaration_with_lines(symbol_id, expected)? {
-                                Some(found) => {
-                                    projection::declaration(id, found, root, sampled, modern)
-                                        .unwrap_or_else(|| tools::failure(id, "range_too_large"))
-                                }
+                                Some(found) => projection::declaration(
+                                    id,
+                                    found,
+                                    &response.mcp_language_tiers()?,
+                                    root,
+                                    sampled,
+                                    modern,
+                                )
+                                .unwrap_or_else(|| tools::failure(id, "range_too_large")),
                                 None => tools::failure(id, "not_found"),
                             },
                         )
@@ -1329,9 +1343,10 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                 }
                 ("trellis_outgoing_calls", Some(args)) => {
                     let symbol_id = args["symbolId"].as_str().expect("validated outgoing ID");
-                    let limit = args
-                        .get("limit")
-                        .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                    let limit = args.get("limit").map_or(CALL_DEFAULT_LIMIT, |v| {
+                        wire::uint(v).expect("validated limit") as usize
+                    });
+                    let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let expected = validated_expected_basis(args);
                     let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
                     Some(Box::new(move |runtime, response, sampled, _query| {
@@ -1355,18 +1370,19 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             }
                             semantic => semantic?,
                         };
-                        Ok(
-                            projection::outgoing(id, found, &semantic, root, sampled, modern)
-                                .map_err(|error| anyhow::anyhow!(error))?
-                                .unwrap_or_else(|| tools::failure(id, "range_too_large")),
+                        Ok(projection::outgoing(
+                            id, found, &semantic, compact, root, sampled, modern,
                         )
+                        .map_err(|error| anyhow::anyhow!(error))?
+                        .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
                 }
                 ("trellis_incoming_calls", Some(args)) => {
                     let symbol_id = args["symbolId"].as_str().expect("validated incoming ID");
-                    let limit = args
-                        .get("limit")
-                        .map_or(20, |v| wire::uint(v).expect("validated limit") as usize);
+                    let limit = args.get("limit").map_or(CALL_DEFAULT_LIMIT, |v| {
+                        wire::uint(v).expect("validated limit") as usize
+                    });
+                    let compact = args.get("compact").and_then(|v| v.as_bool()) == Some(true);
                     let expected = validated_expected_basis(args);
                     let producer = args.get("semanticProducerId").and_then(|v| v.as_str());
                     Some(Box::new(move |_, response, sampled, _query| {
@@ -1385,11 +1401,18 @@ fn run_call(ctx: CallContext) -> std::io::Result<CallOutcome> {
                             }
                             semantic => semantic?,
                         };
-                        Ok(
-                            projection::incoming(id, found, &semantic, root, sampled, modern)
-                                .map_err(|error| anyhow::anyhow!(error))?
-                                .unwrap_or_else(|| tools::failure(id, "range_too_large")),
+                        Ok(projection::incoming(
+                            id,
+                            found,
+                            &semantic,
+                            &response.mcp_language_tiers()?,
+                            compact,
+                            root,
+                            sampled,
+                            modern,
                         )
+                        .map_err(|error| anyhow::anyhow!(error))?
+                        .unwrap_or_else(|| tools::failure(id, "range_too_large")))
                     }))
                 }
                 ("trellis_call_graph", Some(args)) => {
@@ -2258,6 +2281,16 @@ fn coordinate(
                             modern,
                         ))
                     };
+                    // #528: say which concurrency limit refused the call.
+                    let busy = |message: String| {
+                        let mut failure = tools::admission_failure(
+                            &admission.id,
+                            "too_many_requests",
+                            &attempted,
+                        );
+                        failure["error"]["message"] = serde_json::json!(message);
+                        Some(tools::result(name, failure, modern))
+                    };
                     if workspace.clock_now() >= deadline {
                         // The deadline overrides any outcome still unsent.
                         refuse("deadline_exceeded")
@@ -2276,7 +2309,9 @@ fn coordinate(
                             .response,
                         )
                     } else if live_calls(&session, &in_flight) >= MAX_CONNECTION_CALLS {
-                        refuse("too_many_requests")
+                        busy(format!(
+                            "Too many concurrent tool calls on this connection (limit {MAX_CONNECTION_CALLS}); wait for one to finish"
+                        ))
                     } else if let Some(permit) = WorkerPermit::acquire() {
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let resolved: Resolved = Default::default();
@@ -2327,17 +2362,21 @@ fn coordinate(
                                 continue;
                             }
                             // The permit went with the failed closure.
-                            Err(_) => refuse("too_many_requests"),
+                            Err(_) => busy(format!(
+                                "Too many concurrent tool calls in the daemon (limit {MAX_CALL_WORKERS}); retry shortly"
+                            )),
                         }
                     } else {
-                        refuse("too_many_requests")
+                        busy(format!(
+                            "Too many concurrent tool calls in the daemon (limit {MAX_CALL_WORKERS}); retry shortly"
+                        ))
                     }
                 }
                 action => {
                     non_calls += 1;
                     if non_calls > MAX_CONNECTION_REQUESTS {
                         let response = serde_json::json!({"jsonrpc":"2.0","id":admission.id,
-                            "error":{"code":-32000,"message":"Too many outstanding requests",
+                            "error":{"code":-32000,"message":format!("Too many outstanding requests on this connection (limit {MAX_CONNECTION_REQUESTS})"),
                                 "data":{"code":"too_many_requests"}}});
                         if let Some(value) = session
                             .prepare(admission.token, response)

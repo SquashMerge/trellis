@@ -673,7 +673,93 @@ impl McpSemantic {
     }
 }
 
+/// One language's selected imported evidence at the admitted head (#528): its default
+/// producer (#483), that producer's coverage tuple counts and its worst proof freshness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LanguageTier {
+    pub producer_id: Option<String>,
+    /// Why the language shows syntax only, when no producer is selected.
+    pub note: Option<String>,
+    /// Tuple counts `[selected, complete, partial, failed, unselected]`, as native ones.
+    pub counts: [u64; 5],
+    /// `fresh`, `possiblyStale` or `stale` over the usable tuples' proofs, else `unavailable`.
+    pub freshness: &'static str,
+}
+
+impl LanguageTier {
+    /// Semantic evidence is selected, fresh and covers at least one document (complete or
+    /// partial). Partial coverage stays visible in `counts`; it does not demote the tier.
+    pub fn semantic(&self) -> bool {
+        self.producer_id.is_some()
+            && self.freshness == "fresh"
+            && self.counts[1] + self.counts[2] > 0
+    }
+}
+
+/// The four MCP languages in #22 order.
+pub const MCP_LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
+
 impl EvidenceResponse {
+    /// Each MCP language's selected semantic evidence at the admitted head, in #22 order
+    /// (#528). Uses the per-language default producer, as status and the call tools do.
+    pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 4]> {
+        let selected = self.selected(None)?;
+        let defaults = default_producers(&self.db, &selected.key)?;
+        let mut tiers: [LanguageTier; 4] = Default::default();
+        for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
+            tier.freshness = "unavailable";
+            tier.note = defaults.note(language);
+            let Some(producer) = defaults.producer(language) else {
+                continue;
+            };
+            tier.producer_id = Some(producer.to_owned());
+            let mut statement = self.db.prepare_cached(
+                "SELECT selected,state,count(*) FROM semantic_coverage
+                 WHERE revision_id=?1 AND producer_id=?2 AND language=?3 GROUP BY selected,state",
+            )?;
+            for row in statement.query_map(params![selected.key, producer, language], |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })? {
+                let (chosen, state, count) = row?;
+                let count = u64::try_from(count).unwrap_or(0);
+                let bucket = match (chosen, state.as_str()) {
+                    (true, "complete") => Some(1),
+                    (true, "partial") => Some(2),
+                    (true, "failed") => Some(3),
+                    _ => None,
+                };
+                match bucket {
+                    Some(bucket) => {
+                        tier.counts[0] += count;
+                        tier.counts[bucket] += count;
+                    }
+                    None => tier.counts[4] += count,
+                }
+            }
+            if tier.counts[1] + tier.counts[2] == 0 {
+                continue;
+            }
+            let worst: i64 = self.db.query_row(
+                "SELECT coalesce(max(CASE p.freshness WHEN 'stale' THEN 2 WHEN 'possiblyStale' THEN 1 ELSE 0 END),0)
+                 FROM semantic_coverage c JOIN semantic_provenance p ON p.tuple_id=c.tuple_id
+                 WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
+                   AND c.state IN ('complete','partial')",
+                params![selected.key, producer, language],
+                |row| row.get(0),
+            )?;
+            tier.freshness = match worst {
+                2 => "stale",
+                1 => "possiblyStale",
+                _ => "fresh",
+            };
+        }
+        Ok(tiers)
+    }
+
     /// Bindings for measured calls of the admitted head, each under its document language's
     /// producer (#483). `language` is the selected declaration's, which names the producer
     /// and, without calls, the note.

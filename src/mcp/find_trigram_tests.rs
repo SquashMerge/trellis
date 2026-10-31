@@ -142,8 +142,15 @@ fn w2_output_is_byte_identical_through_the_prefilter_and_the_literal_scan() {
             let answer = || {
                 let read = store.evidence_response().unwrap();
                 let found = read.mcp_find_with_lines(query, limit, Some(pin)).unwrap();
-                let envelope =
-                    super::projection::find(&id, found, workspace.path(), false, true).unwrap();
+                let envelope = super::projection::find(
+                    &id,
+                    found,
+                    &Default::default(),
+                    workspace.path(),
+                    false,
+                    true,
+                )
+                .unwrap();
                 read.finish(()).unwrap();
                 serde_json::to_vec(&envelope).unwrap()
             };
@@ -320,8 +327,15 @@ fn id_shaped_queries_are_identical_with_and_without_the_shortcut() {
                     by_name
                 })
                 .collect();
-            let envelope =
-                super::projection::find(&id, found, workspace.path(), false, true).unwrap();
+            let envelope = super::projection::find(
+                &id,
+                found,
+                &Default::default(),
+                workspace.path(),
+                false,
+                true,
+            )
+            .unwrap();
             read.finish(()).unwrap();
             if query.chars().count() >= 3 {
                 if id_scans() == before {
@@ -335,8 +349,15 @@ fn id_shaped_queries_are_identical_with_and_without_the_shortcut() {
             let literal = with_literal_scan(|| {
                 let read = store.evidence_response().unwrap();
                 let found = read.mcp_find_with_lines(query, limit, Some(pin)).unwrap();
-                let envelope =
-                    super::projection::find(&id, found, workspace.path(), false, true).unwrap();
+                let envelope = super::projection::find(
+                    &id,
+                    found,
+                    &Default::default(),
+                    workspace.path(),
+                    false,
+                    true,
+                )
+                .unwrap();
                 read.finish(()).unwrap();
                 envelope
             });

@@ -16,7 +16,7 @@ pub use search::{
 };
 pub use search_startup::RecentSearchCheckout;
 pub use semantic_display::{
-    CallSemantic, LANGUAGE_NOTE, McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished,
+    CallSemantic, LANGUAGE_NOTE, LanguageTier, McpSemantic, NO_PRODUCER_NOTE, ProducerNotPublished,
     ProducerSelection, multiple_producers_note,
 };
 pub(crate) mod symbol_trigrams;
