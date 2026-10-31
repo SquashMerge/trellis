@@ -31,7 +31,7 @@ const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
-pub(crate) const NATIVE_VERSION: &str = "native-v11";
+pub(crate) const NATIVE_VERSION: &str = "native-v12";
 /// The build-time producer hash of this executable's extraction inputs: the
 /// listed extraction modules and crates (`build/extractor_inputs.rs`). Each
 /// revision records it; an executable rebuild with an equal hash keeps the
@@ -523,6 +523,11 @@ pub struct CapabilityReport {
     pub document: DocumentKey,
     pub revision_id: String,
     pub families: Vec<MeasurementSupport>,
+    /// Outermost allowlisted Rust expression-macro invocations measured as expressions
+    /// (Decision 0019), sorted and disjoint. Facts inside them take ordinals after the
+    /// owner's other facts, so measurement outside them is unchanged. Empty elsewhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macro_expansions: Vec<Range>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2531,6 +2536,19 @@ fn extract_known_with_witnesses(
     ids: &mut IdentityRegistry,
     header_witness: &mut dyn FnMut(&str, String, Range),
 ) -> Result<()> {
+    extract_document(a, f, document, ids, header_witness, true)
+}
+
+/// `expand_macros: false` keeps every Rust macro opaque, as before Decision 0019; only tests
+/// use it, to show that expansion leaves every fact outside the expanded macros unchanged.
+fn extract_document(
+    a: &mut Artifact,
+    f: &SourceFile,
+    document: &Document,
+    ids: &mut IdentityRegistry,
+    header_witness: &mut dyn FnMut(&str, String, Range),
+    expand_macros: bool,
+) -> Result<()> {
     language_order(&f.language)?;
     safe_path(&f.path)?;
     // Occurrence identity binds this captured document version. Authenticate its content hash
@@ -2645,7 +2663,13 @@ fn extract_known_with_witnesses(
         name_owners: BTreeMap::new(),
         lexical_owners: BTreeMap::from([(canonical(&json!([])), module_id.clone())]),
         header_witness,
+        expand_macros,
+        expanding: false,
+        macro_expansions: Vec::new(),
+        expansion_bytes: 0,
+        macro_parser: None,
     };
+    let mut macros = Vec::new();
     state.walk(
         tree.root_node(),
         &module_id,
@@ -2653,7 +2677,20 @@ fn extract_known_with_witnesses(
         &[],
         0,
         (file_test, false),
+        &mut macros,
     )?;
+    // Allowlisted expression macros are measured only after every ordinary fact, so their
+    // declarations take later sibling ordinals and everything outside them is unchanged.
+    state.expanding = true;
+    for site in macros {
+        let range = Range::node(site.node);
+        if state.measure_macro(site)? {
+            state.macro_expansions.push(range);
+        }
+    }
+    state
+        .gaps
+        .sort_by_key(|gap| (gap.range.start, gap.range.end));
     state.finish_occurrences()?;
     state
         .artifact
@@ -2677,6 +2714,7 @@ fn extract_known_with_witnesses(
                 gaps: state.gaps.clone(),
             })
             .collect(),
+        macro_expansions: std::mem::take(&mut state.macro_expansions),
     });
     let observed_roles = [
         (state.saw_definition, "definition"),
@@ -2753,6 +2791,32 @@ struct ParserState<'a> {
     name_owners: BTreeMap<(usize, usize), String>,
     lexical_owners: BTreeMap<Vec<u8>, String>,
     header_witness: &'a mut dyn FnMut(&str, String, Range),
+    expand_macros: bool,
+    /// Set once the ordinary walk is done: allowlisted macros then expand where found.
+    expanding: bool,
+    macro_expansions: Vec<Range>,
+    expansion_bytes: usize,
+    macro_parser: Option<tree_sitter::Parser>,
+}
+/// Per-document walk bounds. Exceeding them fails the document, so a macro expansion reserves
+/// its measured extent first and stays opaque rather than cross them.
+const VISIT_LIMIT: usize = 1_000_000;
+const DEPTH_LIMIT: usize = 128;
+/// An allowlisted Rust expression macro, measured after the ordinary walk in its own context.
+struct MacroSite<'t> {
+    node: Node<'t>,
+    form: crate::native_rust_macros::MacroForm,
+    owner: String,
+    ancestry: Vec<Key>,
+    regions: Vec<String>,
+    depth: usize,
+    test: bool,
+}
+/// Whether `range` lies inside one of a document's sorted, disjoint macro expansions. Facts
+/// there order after the owner's other facts (Decision 0019), so the others keep their ordinals.
+fn in_macro_expansion(expansions: &[Range], range: &Range) -> bool {
+    let i = expansions.partition_point(|e| e.start <= range.start);
+    i > 0 && range.end <= expansions[i - 1].end
 }
 impl ParserState<'_> {
     fn finish_occurrences(&mut self) -> Result<()> {
@@ -2774,7 +2838,11 @@ impl ParserState<'_> {
         for indexes in by_owner.values_mut() {
             indexes.sort_by_key(|i| {
                 let r = &self.artifact.control_regions[*i].range;
-                (r.start, r.end)
+                (
+                    in_macro_expansion(&self.macro_expansions, r),
+                    r.start,
+                    r.end,
+                )
             });
             for (ordinal, i) in indexes.iter().enumerate() {
                 let input = occurrence_input(
@@ -2813,7 +2881,11 @@ impl ParserState<'_> {
         for indexes in by_owner.values_mut() {
             indexes.sort_by_key(|i| {
                 let r = &self.artifact.calls[*i].range;
-                (r.start, r.end)
+                (
+                    in_macro_expansion(&self.macro_expansions, r),
+                    r.start,
+                    r.end,
+                )
             });
             for (ordinal, i) in indexes.iter().enumerate() {
                 let input = occurrence_input(
@@ -2849,7 +2921,11 @@ impl ParserState<'_> {
         for indexes in by_owner.values_mut() {
             indexes.sort_by_key(|i| {
                 let r = &self.artifact.references[*i].range;
-                (r.start, r.end)
+                (
+                    in_macro_expansion(&self.macro_expansions, r),
+                    r.start,
+                    r.end,
+                )
             });
             for (ordinal, i) in indexes.iter().enumerate() {
                 let input = occurrence_input(
@@ -2869,23 +2945,26 @@ impl ParserState<'_> {
         Ok(())
     }
 
-    fn walk(
+    #[allow(clippy::too_many_arguments)] // The walk's lexical context plus its macro queue.
+    fn walk<'t>(
         &mut self,
-        n: Node<'_>,
+        n: Node<'t>,
         owner: &str,
         ancestors: &[Key],
         regions: &[String],
         depth: usize,
         test_flags: (bool, bool),
+        macros: &mut Vec<MacroSite<'t>>,
     ) -> Result<()> {
         ensure!(
-            depth < 128 && self.visits < 1_000_000,
+            depth < DEPTH_LIMIT && self.visits < VISIT_LIMIT,
             "native extraction work budget exceeded"
         );
         self.visits += 1;
-        // Rust token trees and attributes are opaque source syntax. A call-shaped token
-        // inside a macro is not a measured call, and expanding it is outside #22 native
-        // extraction. Still count this subtree root against the bounded visit budget.
+        // Rust token trees and attributes are opaque source syntax: a call-shaped token
+        // inside one is not a measured call. Only allowlisted expression macros are
+        // measured, after the ordinary walk (Decision 0019). Still count this subtree root
+        // against the bounded visit budget.
         if self.file.language == "rust"
             && matches!(
                 n.kind(),
@@ -2896,14 +2975,33 @@ impl ParserState<'_> {
                     | "inner_attribute_item"
             )
         {
-            self.opaque_rust = true;
-            self.gaps.push(MeasurementGap {
-                range: Range::node(n),
-                diagnostic: format!(
+            if self.expand_macros
+                && n.kind() == "macro_invocation"
+                && let Some(form) = crate::native_rust_macros::expression_macro(n, &self.file.text)
+            {
+                let site = MacroSite {
+                    node: n,
+                    form,
+                    owner: owner.to_owned(),
+                    ancestry: ancestors.to_vec(),
+                    regions: regions.to_vec(),
+                    depth,
+                    test: test_flags.0 || test_flags.1,
+                };
+                if self.expanding {
+                    self.measure_macro(site)?;
+                } else {
+                    macros.push(site);
+                }
+                return Ok(());
+            }
+            self.opaque_gap(
+                n,
+                format!(
                     "opaque Rust {} skipped; contents require macro/attribute interpretation",
                     n.kind()
                 ),
-            });
+            );
             return Ok(());
         }
         if self.file.language == "rust" && matches!(n.kind(), "lifetime" | "label" | "metavariable")
@@ -2961,7 +3059,11 @@ impl ParserState<'_> {
                 }
             }
             self.saw_definition |= k != "module";
-            self.search_nodes.insert(n.id(), id.clone());
+            // Search capture walks the original tree by node ID; an expansion's nodes belong
+            // to a separate, short-lived tree, so they never enter that map.
+            if !self.expanding {
+                self.search_nodes.insert(n.id(), id.clone());
+            }
             self.artifact.declarations.push(Declaration {
                 syntax_id: id.clone(),
                 role: declaration_role(test_context),
@@ -3111,6 +3213,7 @@ impl ParserState<'_> {
                     &regions,
                     depth + 1,
                     (test_context, false),
+                    macros,
                 )?;
                 continue;
             }
@@ -3124,6 +3227,7 @@ impl ParserState<'_> {
                     &regions,
                     depth + 1,
                     (test_context, false),
+                    macros,
                 )?;
                 continue;
             }
@@ -3134,12 +3238,149 @@ impl ParserState<'_> {
                 &regions,
                 depth + 1,
                 (test_context, marked),
+                macros,
             )?;
             marked = false;
         }
         Ok(())
     }
+
+    fn opaque_gap(&mut self, n: Node<'_>, diagnostic: String) {
+        self.opaque_rust = true;
+        self.gaps.push(MeasurementGap {
+            range: Range::node(n),
+            diagnostic,
+        });
+    }
+
+    /// Measure one allowlisted expression macro in its recorded context (Decision 0019).
+    /// Returns whether it was measured; otherwise the whole invocation is an opaque gap, as
+    /// for any other macro. The parse is bounded by a per-document byte budget, and the
+    /// measured extent is reserved against the walk's visit and depth bounds before any fact
+    /// is recorded, so an expansion either measures completely or not at all.
+    fn measure_macro(&mut self, site: MacroSite<'_>) -> Result<bool> {
+        use crate::native_rust_macros as macros;
+        let file = self.file;
+        if self.macro_parser.is_none() {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+            self.macro_parser = Some(parser);
+        }
+        let Some(tree) = macros::token_tree(site.node).and_then(|tt| {
+            let (start, end) = (tt.start_byte(), tt.end_byte());
+            let budget = file.text.len().saturating_mul(8).saturating_add(1 << 16);
+            if self.expansion_bytes.saturating_add(end - start) > budget {
+                return None;
+            }
+            self.expansion_bytes += end - start;
+            let parser = self.macro_parser.as_mut()?;
+            macros::parse(parser, file.text.as_bytes(), site.form, start, end)
+                .map(|tree| (tree, start, end))
+        }) else {
+            self.unmeasured_macro(site.node);
+            return Ok(false);
+        };
+        let (tree, start, end) = tree;
+        let Some(arguments) = macros::arguments(&tree, site.form, start, end) else {
+            self.unmeasured_macro(site.node);
+            return Ok(false);
+        };
+        // The path, `!` and wrapper add a few visits beyond the argument subtree.
+        let reserve = VISIT_LIMIT.saturating_sub(self.visits).saturating_sub(16);
+        let fits = macros::height(arguments, reserve)
+            .is_some_and(|height| site.depth + 2 + height < DEPTH_LIMIT);
+        if !fits {
+            self.unmeasured_macro(site.node);
+            return Ok(false);
+        }
+        let flags = (site.test, false);
+        let (owner, ancestry, regions) = (&site.owner, &site.ancestry, &site.regions);
+        if let Some(path) = site.node.child_by_field_name("macro") {
+            self.walk(
+                path,
+                owner,
+                ancestry,
+                regions,
+                site.depth + 1,
+                flags,
+                &mut Vec::new(),
+            )?;
+        }
+        let format = match site.form {
+            macros::MacroForm::Arguments { format } => format,
+            macros::MacroForm::Array => None,
+        };
+        let mut index = 0;
+        let mut cursor = arguments.walk();
+        for child in arguments.named_children(&mut cursor) {
+            let expression = !matches!(
+                child.kind(),
+                "line_comment" | "block_comment" | "attribute_item"
+            );
+            let position = index;
+            index += usize::from(expression);
+            if expression
+                && Some(position) == format
+                && matches!(child.kind(), "string_literal" | "raw_string_literal")
+            {
+                // The format string stays opaque; it is a gap only where it names arguments.
+                if file.text.get(child.byte_range()).is_some_and(|literal| {
+                    macros::names_arguments(literal, child.kind() == "raw_string_literal")
+                }) {
+                    self.opaque_gap(
+                        child,
+                        "opaque Rust format string skipped; implicit captures and named arguments require format interpretation".into(),
+                    );
+                }
+                continue;
+            }
+            if expression
+                && format.is_some_and(|format| position > format)
+                && child.kind() == "assignment_expression"
+                && let Some(name) = child.child_by_field_name("left")
+                && name.kind() == "identifier"
+                && let Some(value) = child.child_by_field_name("right")
+            {
+                // `name = value` names a format argument; only the value is an expression.
+                self.opaque_gap(
+                    name,
+                    "opaque Rust named format argument skipped; argument names require format interpretation".into(),
+                );
+                self.walk(
+                    value,
+                    owner,
+                    ancestry,
+                    regions,
+                    site.depth + 3,
+                    flags,
+                    &mut Vec::new(),
+                )?;
+                continue;
+            }
+            self.walk(
+                child,
+                owner,
+                ancestry,
+                regions,
+                site.depth + 2,
+                flags,
+                &mut Vec::new(),
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn unmeasured_macro(&mut self, n: Node<'_>) {
+        self.opaque_gap(
+            n,
+            "opaque Rust macro_invocation skipped; its token tree is not measurable as Rust expressions within native bounds".into(),
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "native_rust_macros_tests.rs"]
+mod macro_expansion_tests;
 
 impl Artifact {
     /// Validates an assembled revision against the full current capture header
@@ -3406,6 +3647,17 @@ impl Artifact {
                 );
             }
         }
+        // Facts inside a document's measured macro expansions take the owner's later ordinals.
+        let expansions: BTreeMap<&DocumentKey, &[Range]> = self
+            .capability_reports
+            .iter()
+            .map(|report| (&report.document, report.macro_expansions.as_slice()))
+            .collect();
+        let late = |document: &DocumentKey, range: &Range| {
+            expansions
+                .get(document)
+                .is_some_and(|expansions| in_macro_expansion(expansions, range))
+        };
         let mut siblings: BTreeMap<Vec<u8>, Vec<&Declaration>> = BTreeMap::new();
         for d in &self.declarations {
             let group = canonical(
@@ -3414,7 +3666,7 @@ impl Artifact {
             siblings.entry(group).or_default().push(d);
         }
         for group in siblings.values_mut() {
-            group.sort_by_key(|d| (d.range.start, d.range.end));
+            group.sort_by_key(|d| (late(&d.document, &d.range), d.range.start, d.range.end));
             for (ordinal, d) in group.iter().enumerate() {
                 ensure!(d.key.ordinal == ordinal, "native sibling ordinal mismatch");
                 if ordinal != 0 {
@@ -3433,7 +3685,7 @@ impl Artifact {
                 .push(c);
         }
         for group in call_ordinals.values_mut() {
-            group.sort_by_key(|c| (c.range.start, c.range.end));
+            group.sort_by_key(|c| (late(&c.document, &c.range), c.range.start, c.range.end));
             for (ordinal, c) in group.iter().enumerate() {
                 ensure!(c.ordinal == ordinal, "native call ordinal mismatch");
                 if ordinal != 0 {
@@ -3450,7 +3702,7 @@ impl Artifact {
                 .push(r);
         }
         for group in reference_ordinals.values_mut() {
-            group.sort_by_key(|r| (r.range.start, r.range.end));
+            group.sort_by_key(|r| (late(&r.document, &r.range), r.range.start, r.range.end));
             for (ordinal, r) in group.iter().enumerate() {
                 ensure!(r.ordinal == ordinal, "native reference ordinal mismatch");
                 if ordinal != 0 {
@@ -3470,7 +3722,7 @@ impl Artifact {
                 .push(r);
         }
         for group in control_ordinals.values_mut() {
-            group.sort_by_key(|r| (r.range.start, r.range.end));
+            group.sort_by_key(|r| (late(&r.document, &r.range), r.range.start, r.range.end));
             for (ordinal, r) in group.iter().enumerate() {
                 ensure!(r.ordinal == ordinal, "native control ordinal mismatch");
                 if ordinal != 0 {
@@ -3628,6 +3880,16 @@ impl Artifact {
                 reports.insert(report.document.clone()) && report.revision_id == self.revision.id,
                 "native capability document/revision mismatch"
             );
+            let mut previous_end = None;
+            for range in &report.macro_expansions {
+                span(&file.text, range, false)?;
+                ensure!(
+                    report.document.language == "rust"
+                        && previous_end.is_none_or(|end| end <= range.start),
+                    "invalid native macro expansions"
+                );
+                previous_end = Some(range.end);
+            }
             let mut families = BTreeSet::new();
             for family in &report.families {
                 ensure!(
@@ -3880,7 +4142,7 @@ mod borrowed_witness_tests {
         let expected = digest(b"trellis.native-version-witness.v1\0", &bytes);
         assert_eq!(
             expected,
-            "50ecc8c8f7a610f77b2dd5d9bf9f3e5c4efa3b7a3c2027e603d636e260cbed14"
+            "4a323e83a6ead180e606ba795d4c38a8609b4fe504f93f9e0f2dd459b2008124"
         );
         assert_eq!(witness(&f).unwrap(), expected);
         let declarations: Vec<_> = f.declarations.iter().collect();

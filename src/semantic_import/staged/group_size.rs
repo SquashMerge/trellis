@@ -724,6 +724,7 @@ mod tests {
                 document: key,
                 revision_id: "revision".into(),
                 families: vec![],
+                macro_expansions: vec![],
             },
         };
         (header, document, rows)
