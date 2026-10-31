@@ -92,7 +92,6 @@ struct Builder<'a> {
     bindings: crate::behavior_bindings::Bindings,
     view: SequenceView,
     count: usize,
-    show_all: bool,
 }
 impl Builder<'_> {
     fn text(&self, n: Node<'_>) -> &str {
@@ -128,6 +127,7 @@ impl Builder<'_> {
             hidden: false,
             lane: None,
             folded: vec![],
+            incidental: None,
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -453,18 +453,8 @@ impl Builder<'_> {
                 ..participant
             });
         }
+        // Logging calls are hidden by `behavior::mark_logging` for every language (#543).
         if let Some(mut s) = self.step(n, "call", label) {
-            // Only the standalone wrapper is hidden, never receiver/argument effects,
-            // test expressions, returned values, warn/error, or arbitrary logger names.
-            if !self.show_all
-                && matches!(label, "console.log" | "console.debug")
-                && n.parent()
-                    .is_some_and(|p| p.kind() == "expression_statement")
-            {
-                s.hidden = true;
-                self.view.hidden_steps += 1;
-                self.warn("Standalone console.log/debug wrappers are hidden by a naming heuristic, not a proof of purity; argument effects remain. Use Show all to restore them.");
-            }
             s.call_id = Some(c.id);
             s.range = c.range;
             out.steps.push(s);
@@ -585,7 +575,7 @@ pub fn build(
     seed: &Symbol,
     file: &SourceFile,
     calls: &[CallSite],
-    show_all: bool,
+    _show_all: bool,
 ) -> Result<SequenceView> {
     ensure!(seed.path == file.path, "symbol/source path mismatch");
     ensure!(
@@ -618,7 +608,7 @@ pub fn build(
             None => break,
         }
     }
-    let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, show_all, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
+    let mut b = Builder { file, seed, calls, bindings: crate::behavior_bindings::Bindings::new(tree.root_node(), &file.text), count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
         steps: vec![], warnings: vec!["Static possible paths, not observed runtime order. Selectivity is an uncalibrated conservative heuristic. Implicit getters, coercions, iteration protocols, and other runtime effects are not expanded.".into()],
         hidden_steps: 0, truncated: false, truncated_by: vec![],

@@ -277,9 +277,11 @@
       : targetText(step, view, false));
     const target = window.TrellisSequence?.target(view, entry);
     const selection = {}; targetSelection = selection;
-    text("inspector-evidence", entry.callEvidence
+    // Why an incidental step is hidden by default (#543): server reasons, never inferred.
+    const incidental = {external:"hidden: external call", logging:"hidden: logging (naming heuristic)", accessor:"hidden: trivial accessor"}[entry.incidental];
+    text("inspector-evidence", (incidental ? `${incidental}${entry.hidden ? "" : " (shown by Show all)"} · ` : "") + (entry.callEvidence
       ? `${window.TrellisSequence.evidenceLabel(entry, view)} · ${[entry.callEvidence.dispatch, entry.callEvidence.freshness, entry.callEvidence.provenanceId, window.TrellisSequence.basisLabel?.(entry.callEvidence)].filter(Boolean).join(" · ")}. Static possible paths, not a runtime trace.`
-      : "Measured source steps, not a runtime trace or verified dispatch.");
+      : "Measured source steps, not a runtime trace or verified dispatch."));
     const detail = get("inspector-detail");
     // Every original field and all nested guards, alternates and chain calls remain
     // available as safe text. Never infer equivalent guards or invent confidence.

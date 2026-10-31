@@ -154,6 +154,50 @@ two sections above.
 - **Show all** applies the same split: nothing is incidental-hidden, the seed stops at 150
   shown steps, and bodies share the remaining 50.
 
+### Trivial accessors and logging calls (#543)
+
+Owner rulings 2026-10-31 (#543). They amend the #522, #536 and #542 sections above.
+
+- **Incidental reasons.** Each incidental step carries `incidental`, one of:
+  - `external` (#536);
+  - `logging`;
+  - `accessor`.
+
+  All three are hidden unless `showAll`, counted in `incidentalSteps` (and in `hiddenSteps`
+  while hidden) and shown under the one "Show/Hide N incidental calls" toggle. The
+  inspector labels them "hidden: external call", "hidden: logging (naming heuristic)" and
+  "hidden: trivial accessor" (with "(shown by Show all)" when shown). An incidental call is
+  never expanded, even when it has a resolved target, but a fresh exact target still keeps
+  its lane and target evidence.
+- **Logging (all languages, syntax and semantic views).** A call whose callee is
+  `<receiver>.<level>(…)` is hidden under the naming rule, where:
+  - `<receiver>` is `log`, `logger`, `LOG`, `LOGGER`, `_log`, `_logger`, `self.log`,
+    `self.logger`, `this.log`, `this.logger` or `console`;
+  - `<level>` is `trace`, `debug`, `info`, `warn`, `warning`, `error`, `fatal`, `critical`
+    or `log`.
+
+  So are the Rust macros `trace!`, `debug!`, `info!`, `warn!` and `error!`, bare or under
+  `log::`/`tracing::`. In more detail:
+  - The steps evaluating the call's receiver and arguments (the steps just before it inside
+    its source range) are hidden with it.
+  - A Rust logging macro is a boundary that continues, so it no longer guards the
+    statements after it.
+  - A warning says the rule is a naming rule.
+  - This subsumes the JavaScript `console.log`/`console.debug` rule.
+  - **The owner exception to #522's rule:** a logging call stays hidden even when fresh
+    exact evidence resolves it to a local wrapper. Show all reveals it.
+- **Trivial accessors (semantic views only).** A call with a fresh exact binding is
+  incidental when its target declaration's own body, read from the selected snapshot, is
+  one statement that either returns a field or assigns a plain name to a field:
+  - **Returns a field:** `self.f`/`this.f`; in Rust also `&self.f`, `&mut self.f` and
+    `self.f.clone()`; in Java also a bare name. Python skips a docstring.
+  - **Assigns a field:** `this.f = v`/`self.f = v`; in Java also `f = v`.
+
+  The rule is the same for Java, Rust, Python and JavaScript. The steps evaluating its
+  receiver and arguments are hidden with it, except a call that can expand. An unresolved
+  `getX()` is never an accessor: the name alone never qualifies.
+- A step that may return early (#542) is never incidental, nor hidden as an argument.
+
 The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
 reason in the sequence status line, and offers a "Show/Hide N incidental calls" toggle
 (the same `showAll` request as Options → Show all steps).
