@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -644,7 +644,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-32 tables, immutable surrogate keys, and current pin normalization.
+# schema-33 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -1049,7 +1049,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-32 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-33 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
