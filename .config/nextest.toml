@@ -8,7 +8,13 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # deadlines and assertions are unchanged. This limits tests, not all processes.
 [test-groups]
 real-workers = { max-threads = 4 }
+# Real producers run one at a time: they are heavy and share host toolchains.
+producer-e2e = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '(kind(lib) & test(/^(http::(exceptional_recovery_tests|live_tests)|daemon::registry::selection_tests)::/)) | (binary_id(trellis::mcp) & test(/^mcp_protocol::/))'
 test-group = 'real-workers'
+
+[[profile.default.overrides]]
+filter = 'binary(/^producer_e2e/)'
+test-group = 'producer-e2e'

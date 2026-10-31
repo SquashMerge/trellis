@@ -964,6 +964,19 @@ impl NativeReader<'_> {
         Store::read_native_header(self.db, self.selected)
     }
 
+    /// The original canonical toolchain, config and dependency root inputs
+    /// retained with the selected revision.
+    pub fn retained_components(
+        &self,
+    ) -> Result<(
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    )> {
+        self.store
+            .retained_native_components_from_db(self.db, self.selected)
+    }
+
     /// The retained source bytes of one inventory entry, checked against its identity.
     pub fn source_bytes(&self, document: &crate::native_evidence::Document) -> Result<Vec<u8>> {
         self.store
@@ -5832,7 +5845,7 @@ fn authenticate_stored_batch(
     captured: &crate::semantic_evidence::CapturedComponents,
     r1: &crate::native_evidence::Artifact,
     sources: &BTreeMap<crate::native_evidence::DocumentKey, Vec<u8>>,
-    root: &std::path::Path,
+    identity: &topology::WorkspaceIdentity,
     cancel: &CancelFlag,
 ) -> Result<AttestedProfileProducer> {
     use crate::native_ids::digest;
@@ -5853,8 +5866,16 @@ fn authenticate_stored_batch(
     let pinned = descriptor
         .check_producer()
         .context("raw producer not pinned")?;
+    // Every spelling admission accepts for the descriptor's origin is accepted here, so a
+    // batch that was admitted can always be re-authenticated against its retained root.
+    let workspace_uri =
+        crate::scip_admission::file_uri(&identity.root).context("raw project root")?;
     descriptor
-        .bind_header(root, &r1.source_set, &r1.revision)
+        .bind_header(
+            &descriptor.reuse_project_roots(&workspace_uri, &identity.root_key),
+            &r1.source_set,
+            &r1.revision,
+        )
         .context("raw batch header binding")?;
     let mut manifest_hash = SourceManifestHasher::new(&r1.source_set.id);
     for doc in &r1.revision.documents {
@@ -5874,7 +5895,7 @@ fn authenticate_stored_batch(
             && captured.sources == *sources,
         "raw captured native/source identity differs"
     );
-    let uri = crate::scip_admission::file_uri(root).context("raw project root")?;
+    let uri = descriptor.metadata.project_root.clone();
     let module_roots = scip_raw::ModuleRoots::from_native_config(&captured.native_config);
     // Cargo targets read from every captured Rust document, as admission read them (#394).
     let mut cargo_targets =
@@ -9048,7 +9069,7 @@ fn selected_native_rejoin_once(
                         &full_captured,
                         full_r1,
                         full_sources,
-                        &store.identity.root,
+                        &store.identity,
                         cancel,
                     )?;
                     ensure!(
@@ -9137,7 +9158,7 @@ fn selected_native_rejoin_once(
                 &captured,
                 r1,
                 r1_sources,
-                &store.identity.root,
+                &store.identity,
                 cancel,
             )?;
             ensure!(
@@ -14424,6 +14445,10 @@ impl Store {
     pub fn workspace_root(&self) -> &str {
         &self.workspace_root
     }
+    /// The topology inputs of path-only derived state such as producer state.
+    pub fn state_topology(&self) -> (&topology::TopologyRoots, &topology::WorkspaceIdentity) {
+        (&self.roots, &self.identity)
+    }
     pub fn recorded_index_options(&self) -> Result<Option<crate::indexer::IndexOptions>> {
         (|| {
             let mut db = self.cache()?;
@@ -14650,6 +14675,43 @@ impl Store {
     /// Directory that holds per-operation semantic stages: the existing index directory.
     pub(crate) fn semantic_stage_parent(&self) -> Result<std::path::PathBuf> {
         self.roots.existing_index_dir(&self.identity)
+    }
+
+    /// The canonical private directory of one generated batch: a run directory or a pickup
+    /// directory under the producer state directory. The worker derives every generated input
+    /// root here; no caller-supplied path is ever a root.
+    pub fn producer_generation_dir(
+        &self,
+        origin: crate::semantic_batch::descriptor::GenerationOrigin,
+        generation_id: &str,
+    ) -> Result<std::path::PathBuf> {
+        ensure!(
+            generation_id.len() == 32
+                && generation_id
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "invalid_request: generation directory"
+        );
+        self.roots
+            .producer_state_dir(&self.identity)
+            .join(origin.subdir())
+            .join(generation_id)
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("invalid_request: generation directory"))
+    }
+
+    /// The generation directories named by queued or running generated imports, which the
+    /// producer state sweep must keep.
+    pub fn pending_generation_dirs(
+        &self,
+    ) -> Result<std::collections::BTreeSet<std::path::PathBuf>> {
+        let mut dirs = std::collections::BTreeSet::new();
+        for (origin, id) in self.pending_generation_ids()? {
+            if let Ok(dir) = self.producer_generation_dir(origin, &id) {
+                dirs.insert(dir);
+            }
+        }
+        Ok(dirs)
     }
 
     pub(crate) fn begin_writer_publication(&self, session: &topology::WriterSession) -> Result<()> {
@@ -15290,6 +15352,25 @@ impl Store {
                     ))
                 })
                 .transpose()
+        })
+    }
+
+    /// The `(descriptor_sha256, captured_revision)` of the batch selected for `producer_id` at
+    /// `pin`, when that batch captured an artifact whose digest is `artifact_hash`.
+    pub fn selected_semantic_capture_at(
+        &self,
+        pin: IndexPin,
+        producer_id: &str,
+        artifact_hash: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.native_at(pin, |db, selected| {
+            Ok(db
+                .query_row(
+                    "SELECT b.descriptor_sha256,b.captured_revision FROM semantic_revision_raw_selections s JOIN semantic_raw_batches b ON b.batch_id=s.batch_id AND b.producer_id=s.producer_id JOIN semantic_raw_captures c ON c.batch_id=b.batch_id WHERE s.revision_id=?1 AND s.producer_id=?2 AND c.artifact_hash=?3 LIMIT 1",
+                    params![selected.key, producer_id, artifact_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?)
         })
     }
 

@@ -45,6 +45,7 @@ fn descriptor_json() -> Value {
             {"ordinal": 0, "relativePath": "a/0.scip", "byteLength": 10, "sha256": hex('4'), "language": "java"},
             {"ordinal": 1, "relativePath": "a/1.scip", "byteLength": 20, "sha256": hex('5'), "language": "javascript"},
         ],
+        "generation": null,
     })
 }
 
@@ -418,4 +419,184 @@ fn basis_artifact_rule_assigns_covered_and_excluded_documents() {
     assert_eq!(basis_artifact_ordinal(&artifacts, "java", Some(0)), 0);
     assert_eq!(basis_artifact_ordinal(&artifacts, "javascript", None), 1);
     assert_eq!(basis_artifact_ordinal(&artifacts, "rust", None), 0);
+}
+
+const RUN_ID: &str = "0123456789abcdef0123456789abcdef";
+
+fn generation_json(origin: &str) -> Value {
+    json!({
+        "origin": origin,
+        "generationId": RUN_ID,
+        "trustProfile": if origin == "ownerPickup" { Value::Null } else { json!("restricted") },
+        "runtime": [],
+        "observed": ["source", "config", "dependencyManifests"],
+        "asserted": ["producerVersion", "producerExecutable", "runtime", "externalInputs"],
+    })
+}
+
+fn with_generation(generation: Value) -> Value {
+    let mut value = descriptor_json();
+    value["generation"] = generation;
+    value
+}
+
+/// Owner ruling 2026-10-30 (#21): `generation` is required and nullable, like every other
+/// descriptor key; an absent key is a closed-descriptor failure.
+#[test]
+fn generation_is_required_and_nullable() {
+    let mut value = descriptor_json();
+    let parsed = Descriptor::parse(&descriptor_bytes(&value)).unwrap();
+    assert_eq!(parsed.generation, None);
+    let written: Value = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(written["generation"], Value::Null);
+    value.as_object_mut().unwrap().remove("generation");
+    let error = Descriptor::parse(&descriptor_bytes(&value)).unwrap_err();
+    assert_eq!(admission_detail(error), "closed descriptor");
+}
+
+#[test]
+fn generation_grammar_is_closed() {
+    let valid = with_generation(generation_json("trellisRun"));
+    let parsed = Descriptor::parse(&descriptor_bytes(&valid)).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&serde_json::to_vec(&parsed).unwrap()).unwrap(),
+        valid
+    );
+    for key in [
+        "origin",
+        "generationId",
+        "trustProfile",
+        "runtime",
+        "observed",
+        "asserted",
+    ] {
+        let mut changed = valid.clone();
+        changed["generation"].as_object_mut().unwrap().remove(key);
+        assert!(
+            Descriptor::parse(&descriptor_bytes(&changed)).is_err(),
+            "missing {key} was accepted"
+        );
+    }
+    let mut extra = valid.clone();
+    extra["generation"]["extra"] = json!(1);
+    assert!(Descriptor::parse(&descriptor_bytes(&extra)).is_err());
+    for (pointer, bad) in [
+        ("/generation/origin", json!("external")),
+        ("/generation/trustProfile", json!("ambient")),
+        ("/generation/observed", json!(["source", "network"])),
+        ("/generation/runtime", json!([{"name": "node"}])),
+        (
+            "/generation/runtime",
+            json!([{"name": "node", "sha256": hex('a'), "extra": 1}]),
+        ),
+    ] {
+        let mut changed = valid.clone();
+        *changed.pointer_mut(pointer).unwrap() = bad;
+        assert!(
+            Descriptor::parse(&descriptor_bytes(&changed)).is_err(),
+            "{pointer} accepted a value outside the grammar"
+        );
+    }
+}
+
+#[test]
+fn origin_rule_binds_job_to_generation() {
+    use super::descriptor::ImportOrigin;
+    let external = Descriptor::parse(&descriptor_bytes(&descriptor_json())).unwrap();
+    let run = Descriptor::parse(&descriptor_bytes(&with_generation(generation_json(
+        "trellisRun",
+    ))))
+    .unwrap();
+    let pickup = Descriptor::parse(&descriptor_bytes(&with_generation(generation_json(
+        "ownerPickup",
+    ))))
+    .unwrap();
+    assert!(external.check_origin(ImportOrigin::External, None).is_ok());
+    assert!(
+        run.check_origin(ImportOrigin::TrellisRun, Some(RUN_ID))
+            .is_ok()
+    );
+    assert!(
+        pickup
+            .check_origin(ImportOrigin::OwnerPickup, Some(RUN_ID))
+            .is_ok()
+    );
+    let refused = [
+        run.check_origin(ImportOrigin::External, None),
+        external.check_origin(ImportOrigin::TrellisRun, Some(RUN_ID)),
+        run.check_origin(ImportOrigin::OwnerPickup, Some(RUN_ID)),
+        run.check_origin(ImportOrigin::TrellisRun, Some(&"f".repeat(32))),
+        run.check_origin(ImportOrigin::TrellisRun, None),
+        external.check_origin(ImportOrigin::External, Some(RUN_ID)),
+    ];
+    for result in refused {
+        assert_eq!(admission_detail(result.unwrap_err()), "generation origin");
+    }
+}
+
+#[test]
+fn reuse_accepts_every_admitted_project_root() {
+    use super::{StageInput, descriptor::GenerationOrigin};
+    let workspace = std::path::Path::new("/work/my repo");
+    let workspace_uri = "file:///work/my%20repo";
+    let root_key = "ab".repeat(32);
+    let run_dir = std::path::PathBuf::from(format!("/cache/producers/{root_key}/runs/{RUN_ID}"));
+    let pickup_dir =
+        std::path::PathBuf::from(format!("/cache/producers/{root_key}/pickups/{RUN_ID}"));
+    let cases = [
+        (GenerationOrigin::OwnerPickup, pickup_dir, "ownerPickup"),
+        (GenerationOrigin::TrellisRun, run_dir, "trellisRun"),
+    ];
+    for (origin, dir, name) in cases {
+        let input = StageInput::generated(workspace, origin, RUN_ID, &dir).unwrap();
+        assert_eq!(input.project_roots.len(), 2);
+        for admitted in &input.project_roots {
+            let mut value = with_generation(generation_json(name));
+            value["metadata"]["projectRoot"] = json!(admitted);
+            let descriptor = Descriptor::parse(&descriptor_bytes(&value)).unwrap();
+            let allowed = descriptor.reuse_project_roots(workspace_uri, &root_key);
+            assert!(
+                allowed.contains(admitted),
+                "{name}: reuse refuses admitted spelling {admitted}"
+            );
+        }
+    }
+    let external = StageInput::external(workspace).unwrap();
+    assert_eq!(external.project_roots, [workspace_uri]);
+    let mut plain = descriptor_json();
+    plain["metadata"]["projectRoot"] = json!(workspace_uri);
+    let plain = Descriptor::parse(&descriptor_bytes(&plain)).unwrap();
+    assert_eq!(
+        plain.reuse_project_roots(workspace_uri, &root_key),
+        [workspace_uri]
+    );
+}
+
+#[test]
+fn reuse_refuses_run_roots_outside_the_run_directory() {
+    let root_key = "ab".repeat(32);
+    for forbidden in [
+        "file:///work".to_owned(),
+        format!("file:///cache/producers/{root_key}/runs/{RUN_ID}"),
+        format!(
+            "file:///cache/producers/{root_key}/runs/{}/worktree",
+            "f".repeat(32)
+        ),
+        format!(
+            "file:///cache/producers/{}/runs/{RUN_ID}/worktree",
+            "cd".repeat(32)
+        ),
+        format!("file:///cache/producers/{root_key}/runs/{RUN_ID}/worktree//"),
+        format!("relative/producers/{root_key}/runs/{RUN_ID}/worktree"),
+    ] {
+        let mut value = with_generation(generation_json("trellisRun"));
+        value["metadata"]["projectRoot"] = json!(forbidden);
+        let descriptor = Descriptor::parse(&descriptor_bytes(&value)).unwrap();
+        assert!(
+            descriptor
+                .reuse_project_roots("file:///work", &root_key)
+                .is_empty(),
+            "{forbidden} was accepted for reuse"
+        );
+    }
 }

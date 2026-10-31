@@ -18,9 +18,10 @@ EXCLUSIONS = ("notRequested", "unsupported", "failed")
 DESCRIPTOR_KEYS = frozenset({
     "formatVersion", "trustOrigin", "profileId", "decoderVersion", "producer", "sourceSet",
     "sourceRevision", "sourceManifestHash", "components", "metadata", "completion", "totals",
-    "pages", "artifacts",
+    "pages", "artifacts", "generation",
 })
-HEADER_KEYS = DESCRIPTOR_KEYS - {"formatVersion", "completion", "totals", "pages", "artifacts"}
+HEADER_KEYS = DESCRIPTOR_KEYS - {
+    "formatVersion", "completion", "totals", "pages", "artifacts", "generation"}
 
 
 def canonical(value):
@@ -148,6 +149,8 @@ def write_batch(out_dir, header, sources, coverage, artifacts, rows_per_page=MAX
                    "pageBytes": sum(entry["byteLength"] for entry in page_entries),
                    "artifactBytes": sum(entry["byteLength"] for entry in artifact_entries)},
         "pages": page_entries, "artifacts": artifact_entries,
+        # Required and nullable: an emitted batch is external, never Trellis-generated.
+        "generation": None,
     }
     data = canonical(descriptor)
     path = out_dir / "descriptor.json"

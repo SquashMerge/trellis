@@ -42,6 +42,8 @@ enum Command {
     Index(IndexArgs),
     /// Explicitly import pinned SCIP evidence into the selected native index.
     Semantic(SemanticCommand),
+    /// Plan and inspect headless semantic producers. Planning executes nothing.
+    Producer(ProducerCommand),
     /// Run the elected user-level socket service.
     Daemon,
     /// Serve one read-only MCP connection on line-framed stdin/stdout.
@@ -174,6 +176,80 @@ struct SemanticImportArgs {
     /// Lowercase SHA-256 of the descriptor file.
     #[arg(long = "batch-sha256")]
     batch_sha256: String,
+}
+#[derive(Args)]
+struct ProducerCommand {
+    #[command(subcommand)]
+    action: ProducerAction,
+}
+#[derive(Subcommand)]
+enum ProducerAction {
+    /// Print everything a producer run would do, with its planSha256. Executes nothing.
+    Plan(ProducerPlanArgs),
+    /// Run one producer after inspecting its plan; refused unless --plan-sha256 matches.
+    Run(ProducerRunArgs),
+    /// Cancel a run that has not yet enqueued its import.
+    Cancel(ProducerCancelArgs),
+    /// Report producer detection, trust-profile availability and run state.
+    Status(ProducerStatusArgs),
+    /// Import an owner-configured artifact without running a producer, or clear the entry.
+    Pickup(ProducerPickupArgs),
+}
+#[derive(Args)]
+struct ProducerPickupArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(trellis::producer::profiles::cli_producer_names()))]
+    producer: String,
+    /// Artifact to import now and whenever it changes.
+    #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+    artifact: Option<PathBuf>,
+    /// Remove the producer's pickup configuration.
+    #[arg(long)]
+    clear: bool,
+}
+#[derive(Args)]
+struct ProducerPlanArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(trellis::producer::profiles::cli_producer_names()))]
+    producer: String,
+    /// `restricted` runs no repository code; `trusted` allows it.
+    #[arg(long, default_value = "restricted", value_parser = ["restricted", "trusted"])]
+    trust: String,
+    /// Wall-clock bound in seconds, 1..14400.
+    #[arg(long, default_value_t = 1800)]
+    timeout_secs: u64,
+    /// Sampled resident-set bound in MiB, 64..65536.
+    #[arg(long, default_value_t = 8192)]
+    memory_mib: u64,
+    /// Launcher to use instead of resolving one on PATH.
+    #[arg(long)]
+    executable: Option<PathBuf>,
+}
+#[derive(Args)]
+struct ProducerRunArgs {
+    #[command(flatten)]
+    plan: ProducerPlanArgs,
+    /// The planSha256 printed by `producer plan` for these same arguments.
+    #[arg(long)]
+    plan_sha256: String,
+}
+#[derive(Args)]
+struct ProducerCancelArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    /// The run to cancel.
+    #[arg(long)]
+    run: String,
+}
+#[derive(Args)]
+struct ProducerStatusArgs {
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    /// Report one run.
+    #[arg(long)]
+    run: Option<String>,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -336,6 +412,7 @@ async fn main() -> Result<()> {
         }
         command @ (Command::Index(_)
         | Command::Semantic(_)
+        | Command::Producer(_)
         | Command::Status(_)
         | Command::Symbols(_)
         | Command::Query(_)
@@ -649,7 +726,17 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     let cli_bound = CLI_REPLY_BOUND;
     #[cfg(feature = "test-support")]
     let cli_bound = metrics_test_duration("TRELLIS_TEST_CLI_REPLY_BOUND_MS").unwrap_or(cli_bound);
-    let reply_bound = if matches!(request.operation.as_str(), "index" | "semantic_import") {
+    let reply_bound = if request.operation == "producer_run" {
+        // The run's own timeout, plus the termination grace and the import's wait.
+        let timeout_secs = request.payload["args"]["limits"]["timeoutSecs"]
+            .as_u64()
+            .unwrap_or(1800)
+            .min(14400);
+        Duration::from_secs(timeout_secs + 630)
+    } else if matches!(
+        request.operation.as_str(),
+        "index" | "semantic_import" | "producer_pickup"
+    ) {
         index_bound
     } else {
         cli_bound
@@ -670,6 +757,39 @@ fn send_daemon(request: &protocol::Request, read_only: bool) -> Result<serde_jso
     })
     .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
     checked_reply(reply)
+}
+
+/// The `producer_plan` and `producer_run` payload for `args`, with the caller's declared
+/// environment.
+fn producer_plan_payload(args: &ProducerPlanArgs) -> Result<serde_json::Value> {
+    ensure!(
+        trellis::producer::plan::TIMEOUT_SECS.contains(&args.timeout_secs)
+            && trellis::producer::plan::MEMORY_MIB.contains(&args.memory_mib),
+        "invalid_request: producer limits"
+    );
+    let executable = args
+        .executable
+        .as_ref()
+        .map(|path| -> Result<String> {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            Ok(absolute
+                .to_str()
+                .context("invalid_request: non-UTF8 executable path")?
+                .to_owned())
+        })
+        .transpose()?;
+    Ok(serde_json::json!({
+        "version": 1,
+        "producer": args.producer,
+        "trustProfile": args.trust,
+        "limits": {"timeoutSecs": args.timeout_secs, "memoryMiB": args.memory_mib},
+        "executable": executable,
+        "environment": trellis::producer::detect::Environment::from_process()?,
+    }))
 }
 
 fn dispatch_cli(command: &Command) -> Result<()> {
@@ -814,6 +934,79 @@ fn dispatch_cli(command: &Command) -> Result<()> {
             }),
             false,
         ),
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Plan(args),
+        }) => (
+            "producer_plan",
+            &args.workspace,
+            producer_plan_payload(args)?,
+            true,
+        ),
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Run(args),
+        }) => {
+            ensure!(
+                args.plan_sha256.len() == 64
+                    && args
+                        .plan_sha256
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "invalid_request: plan digest"
+            );
+            let mut payload = producer_plan_payload(&args.plan)?;
+            payload["planSha256"] = serde_json::json!(args.plan_sha256);
+            ("producer_run", &args.plan.workspace, payload, false)
+        }
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Cancel(args),
+        }) => (
+            "producer_cancel",
+            &args.workspace,
+            serde_json::json!({"version": 1, "runId": args.run}),
+            false,
+        ),
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Status(args),
+        }) => (
+            "producer_status",
+            &args.workspace,
+            serde_json::json!({
+                "version": 1,
+                "runId": args.run,
+                "environment": trellis::producer::detect::Environment::from_process()?,
+            }),
+            true,
+        ),
+        Command::Producer(ProducerCommand {
+            action: ProducerAction::Pickup(args),
+        }) => {
+            let artifact = args
+                .artifact
+                .as_ref()
+                .map(|path| -> Result<String> {
+                    let absolute = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    };
+                    Ok(absolute
+                        .to_str()
+                        .context("invalid_request: non-UTF8 artifact path")?
+                        .to_owned())
+                })
+                .transpose()?;
+            (
+                "producer_pickup",
+                &args.workspace,
+                serde_json::json!({
+                    "version": 1,
+                    "producer": args.producer,
+                    "artifact": artifact,
+                    "clear": args.clear,
+                }),
+                false,
+            )
+        }
         Command::Semantic(SemanticCommand {
             action: SemanticAction::Import(args),
         }) => {
@@ -906,6 +1099,29 @@ fn dispatch_cli(command: &Command) -> Result<()> {
         }
     } else {
         print_json(&value)?;
+    }
+    if let Command::Producer(ProducerCommand {
+        action: ProducerAction::Pickup(args),
+    }) = command
+        && args.artifact.is_some()
+        && value["state"] != "done"
+    {
+        anyhow::bail!(
+            "{}: producer pickup {}",
+            value["errorCode"].as_str().unwrap_or("index_failed"),
+            value["state"].as_str().unwrap_or("failed")
+        );
+    }
+    if let Command::Producer(ProducerCommand {
+        action: ProducerAction::Run(_),
+    }) = command
+        && value["state"] != "done"
+    {
+        anyhow::bail!(
+            "{}: producer run {}",
+            value["errorCode"].as_str().unwrap_or("producer_failed"),
+            value["state"].as_str().unwrap_or("failed")
+        );
     }
     if matches!(command, Command::Rules(_) | Command::References(_)) && value.get("error").is_some()
     {
@@ -1448,7 +1664,14 @@ fn dispatch_connection(
     let request_deadline = Instant::now() + if metrics { metrics_work } else { CLI_READ_WAIT };
     let read_scope = matches!(
         request.operation.as_str(),
-        "status" | "symbols" | "query" | "metrics" | "rules_check" | "references"
+        "status"
+            | "symbols"
+            | "query"
+            | "metrics"
+            | "rules_check"
+            | "references"
+            | "producer_plan"
+            | "producer_status"
     );
     let run = || -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
@@ -1507,6 +1730,11 @@ fn dispatch_connection(
                     | "metrics"
                     | "rules_check"
                     | "references"
+                    | "producer_plan"
+                    | "producer_status"
+                    | "producer_pickup"
+                    | "producer_run"
+                    | "producer_cancel"
             ),
             "unknown daemon operation"
         );
@@ -1520,7 +1748,10 @@ fn dispatch_connection(
         } else {
             None
         };
-        let identity = if request.operation == "status" {
+        let identity = if matches!(
+            request.operation.as_str(),
+            "status" | "producer_plan" | "producer_status"
+        ) {
             identity.attach_existing_marker_readonly()?
         } else {
             identity.attach_marker()?
@@ -1556,6 +1787,11 @@ fn dispatch_connection(
             let state_version = checkout.state_version();
             let selected = match request.operation.as_str() {
                 "status" => checkout.cli_status(),
+                "producer_plan" => checkout.cli_producer_plan(args),
+                "producer_status" => checkout.cli_producer_status(args),
+                "producer_pickup" => checkout.cli_producer_pickup(args),
+                "producer_run" => checkout.cli_producer_run(args),
+                "producer_cancel" => checkout.cli_producer_cancel(args),
                 "symbols" => checkout.cli_symbols(
                     args["search"].as_str().context("missing search")?,
                     args["limit"].as_u64().context("missing limit")? as usize,
@@ -1753,11 +1989,17 @@ fn dispatch_connection(
             };
             // Mandatory startup reconciliation may be running when a CLI read first attaches.
             // This only repeats read-only calls; index is never replayed.
-            if !matches!(request.operation.as_str(), "index" | "semantic_import")
-                && selected
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
+            if !matches!(
+                request.operation.as_str(),
+                "index"
+                    | "semantic_import"
+                    | "producer_pickup"
+                    | "producer_run"
+                    | "producer_cancel"
+            ) && selected
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
                 && Instant::now() < deadline
             {
                 #[cfg(all(feature = "test-support", unix))]

@@ -627,6 +627,8 @@ impl CheckoutRegistry {
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing,
             rules_edit_owner: std::sync::Mutex::new(()),
+            pickup: crate::producer::pickup::PickupOwner::default(),
+            producer: crate::producer::run::ProducerOwner::default(),
             search: self.search.clone(),
             #[cfg(feature = "test-support")]
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
@@ -659,6 +661,9 @@ impl CheckoutRegistry {
         if let Some(search_fill) = &self.search_fill {
             scheduler.set_search_fill(search_fill.register(&scheduler));
         }
+        runtime
+            .pickup
+            .start_watch(&runtime.resources()?.store, &scheduler);
         scheduler.begin_startup_reconciliation();
         Ok(runtime)
     }
@@ -747,6 +752,7 @@ impl CheckoutRegistry {
                     .root_lost
                     .store(true, std::sync::atomic::Ordering::Release);
             }
+            runtime.pickup.shutdown();
             runtime.resources.lock().unwrap().take();
         }
     }
@@ -1703,6 +1709,10 @@ pub struct CheckoutRuntime {
     root_lost: std::sync::atomic::AtomicBool,
     initial_indexing: bool,
     rules_edit_owner: std::sync::Mutex<()>,
+    /// The only writer of this checkout's `pickup.json`.
+    pickup: crate::producer::pickup::PickupOwner,
+    /// The only owner of this checkout's producer runs.
+    producer: crate::producer::run::ProducerOwner,
 }
 
 /// Startup reconciliation is due or running (not waiting out a backoff).
@@ -1744,6 +1754,15 @@ fn cli_index_request(
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+}
+
+/// Tells the closing watcher its run has ended.
+struct RunWatchGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RunWatchGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1849,6 +1868,116 @@ impl CheckoutRuntime {
         status["build"] = serde_json::to_value(crate::build_info::current())?;
         status["searchIndex"] = serde_json::to_value(self.search_availability())?;
         Ok(status)
+    }
+
+    /// The plan of one producer run. Reads and hashes files and the retained
+    /// native revision only; it executes nothing and creates no state.
+    pub fn cli_producer_plan(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::plan::PlanRequest::parse(args)?;
+        let resources = self.resources()?;
+        let _lease = resources.scheduler.admission_lease()?;
+        resources.store.verify_root()?;
+        let stub = crate::producer::profiles::Stub::from_env();
+        crate::producer::plan::plan(&resources.store, &request, stub.as_ref())
+    }
+
+    /// Producer detection, trust-profile availability and run state.
+    pub fn cli_producer_status(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::plan::StatusRequest::parse(args)?;
+        let resources = self.resources()?;
+        let _lease = resources.scheduler.admission_lease()?;
+        resources.store.verify_root()?;
+        let stub = crate::producer::profiles::Stub::from_env();
+        let mut status = crate::producer::plan::status(&resources.store, &request, stub.as_ref())?;
+        status["activeRun"] = self.producer.status();
+        if let Some(producers) = status["producers"].as_array_mut() {
+            for producer in producers {
+                let name = producer["name"].as_str().unwrap_or_default().to_owned();
+                producer["pickup"] = self.pickup.status(&resources.store, &name);
+            }
+        }
+        Ok(status)
+    }
+
+    /// Run one producer after the caller inspected its plan, and reply with the terminal
+    /// record. The run holds an admission lease, so the checkout cannot idle-retire under
+    /// it; losing the root or closing cancels it as `root_changed`. A client that
+    /// disconnects does not cancel the run.
+    pub fn cli_producer_run(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::run::RunRequest::parse(args)?;
+        let resources = self.resources()?;
+        let _lease = resources.scheduler.admission_lease()?;
+        resources.store.verify_root()?;
+        let stub = crate::producer::profiles::Stub::from_env();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _finished = RunWatchGuard(done.clone());
+        self.watch_run_closing(resources.scheduler.clone(), done);
+        self.producer.start_run(
+            &crate::producer::run::RunContext {
+                store: &resources.store,
+                scheduler: &resources.scheduler,
+                stub: stub.as_ref(),
+            },
+            &request,
+        )
+    }
+
+    /// Cancel a run that has not yet enqueued its import.
+    pub fn cli_producer_cancel(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::run::CancelRequest::parse(args)?;
+        let resources = self.resources()?;
+        let _lease = resources.scheduler.admission_lease()?;
+        resources.store.verify_root()?;
+        self.producer.cancel(&resources.store, &request.run_id)
+    }
+
+    /// Cancel the active run once the runtime closes. Woken by the runtime's own state
+    /// change; the wait timeout only bounds how long this thread outlives its run.
+    fn watch_run_closing(
+        &self,
+        scheduler: Arc<http::DaemonState>,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let owner = self.producer.clone();
+        std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                let seen = scheduler.state_version();
+                if matches!(
+                    scheduler.runtime_phase(),
+                    RuntimePhase::Closing | RuntimePhase::Retired
+                ) {
+                    owner.shutdown();
+                    return;
+                }
+                scheduler.wait_state_change(seen, Duration::from_millis(250));
+            }
+        });
+    }
+
+    /// Configure or clear an owner artifact pickup. `--artifact` imports at once and replies
+    /// with the typed import outcome; nothing here runs a producer.
+    pub fn cli_producer_pickup(
+        &self,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = crate::producer::pickup::PickupRequest::parse(args)?;
+        let resources = self.resources()?;
+        resources.store.verify_root()?;
+        match &request.artifact {
+            Some(artifact) => self.pickup.set(
+                &resources.store,
+                &resources.scheduler,
+                &request.producer,
+                artifact,
+            ),
+            None => self.pickup.clear(&resources.store, &request.producer),
+        }
     }
 
     pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
@@ -2677,6 +2806,8 @@ mod selection_tests {
             root_lost: std::sync::atomic::AtomicBool::new(false),
             initial_indexing: true,
             rules_edit_owner: std::sync::Mutex::new(()),
+            pickup: crate::producer::pickup::PickupOwner::default(),
+            producer: crate::producer::run::ProducerOwner::default(),
             mcp_clock_skew_ms: std::sync::atomic::AtomicU64::new(0),
             mcp_call_clock_origin: std::sync::Mutex::new(None),
             mcp_hint_clock_origin: std::sync::Mutex::new(None),

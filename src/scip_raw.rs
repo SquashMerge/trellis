@@ -47,6 +47,20 @@ impl std::fmt::Display for ScipCaptureError {
         write!(f, "{self:?}")
     }
 }
+impl ScipCaptureError {
+    /// The bare reason text, without the `Debug` variant wrapper that `Display` prints.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::InvalidAdmission(detail)
+            | Self::InvalidArtifact(detail)
+            | Self::LimitExceeded(detail) => detail,
+            Self::Cancelled => "cancelled",
+            Self::MissingProof => "missing proof",
+            Self::NonUniqueProof => "non-unique proof",
+            Self::DigestCollision => "digest collision",
+        }
+    }
+}
 impl std::error::Error for ScipCaptureError {}
 fn valid_path(s: &str) -> bool {
     !s.is_empty()
