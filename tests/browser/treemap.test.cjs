@@ -95,9 +95,9 @@ async function sourceText(page) {
 }
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
-async function published(callback) {
+async function published(callback, extra = new Map()) {
   const paths = H.fixture("", "placeholder.txt"); rmSync(paths.source);
-  for (const [path, text] of sources) {
+  for (const [path, text] of [...sources, ...extra]) {
     const target = join(paths.workspace, path); mkdirSync(dirname(target), {recursive:true}); writeFileSync(target, text);
   }
   for (const path of unsupportedFiles) writeFileSync(join(paths.workspace, path), "not indexed source\n");
@@ -174,7 +174,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   assert.match(legend, /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
   assert.equal(await page.locator("#treemap-relative").isChecked(), false);
   const beforeRelative = metricRequests(selected).length;
-  await page.locator("#treemap-relative").check(); await ready(page);
+  await H.reveal(page, "#treemap-relative"); await page.locator("#treemap-relative").check(); await ready(page);
   assert.equal(metricRequests(selected).length, beforeRelative);
   const relativeLegend = await page.locator("#treemap-legend").textContent();
   assert.match(relativeLegend, /Relative to visible set/);
@@ -184,7 +184,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
     const value = visible.find(row => fileKey(row) === leaf.key).metrics.cognitive;
     assert.equal(leaf.fill, value === null ? "#343644" : colors[quartiles.filter(cut => value > cut).length]);
   }
-  await page.locator("#treemap-relative").uncheck(); await ready(page);
+  await H.reveal(page, "#treemap-relative"); await page.locator("#treemap-relative").uncheck(); await ready(page);
   await page.locator("#treemap-path").fill("src/mixed.rs"); await ready(page);
   const filtered = await page.locator("#treemap-diagram g.pele-leaf[data-trellis-file-id] rect").first().getAttribute("fill");
   assert.equal(filtered, native.find(leaf => JSON.parse(leaf.key)[2] === "src/mixed.rs").fill, "fixed heat survives path filtering");
@@ -214,7 +214,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   await selectFile(page, comment, {keyboard:"Space"});
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /—/);
   const sourceSet = new Set(visible.map(fileKey)), beforeReads = metricRequests(selected).length;
-  await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
+  await H.reveal(page, "#treemap-hide-tests"); await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
   assert.equal(metricRequests(selected).length, beforeReads, "file visibility is local, not a metric-role read");
   assert.equal(await page.locator("#treemap-metric-tests").isChecked(), false);
   assert.deepEqual(await listKeys(page), dto.files.map(fileKey).sort());
@@ -222,8 +222,8 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /—|unavailable/i);
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /test.only|no production callables/i);
   assert.match(await onlyControl.locator("rect").first().getAttribute("stroke-dasharray"), /\d/, "test-only file has a non-color distinction");
-  await page.locator("#treemap-hide-tests").check(); await ready(page);
-  await page.locator("#treemap-metric-tests").check(); await ready(page);
+  await H.reveal(page, "#treemap-hide-tests"); await page.locator("#treemap-hide-tests").check(); await ready(page);
+  await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").check(); await ready(page);
   assert.equal(await page.locator("#treemap-hide-tests").isChecked(), true);
   assert.deepEqual(new Set(await listKeys(page)), sourceSet, "including tests in heat cannot reveal hidden files");
   const all = await metrics(selected, "max", "all");
@@ -234,7 +234,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   assert.ok(rowAt(all, "src/mixed.rs").metrics.cognitive > mixed.metrics.cognitive);
   await selectFile(page, rowAt(all, "src/mixed.rs"));
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /indexed callables|all.*callables/i);
-  await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
+  await H.reveal(page, "#treemap-hide-tests"); await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
   await selectFile(page, rowAt(all, "src/only.rs"));
   assert.ok(rowAt(all, "src/only.rs").metrics.cognitive > 0);
   await page.locator("#treemap-color").selectOption("role"); await ready(page);
@@ -392,18 +392,18 @@ async function restoreFetch(page) {
 
 test("Treemap late production fetch cannot replace all-callable heat and late source cannot navigate after controls change", {timeout:240000}, async () => published(async selected => {
   const {page} = selected, dto = await metrics(selected);
-  await page.locator("#treemap-metric-tests").check(); await ready(page);
+  await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").check(); await ready(page);
   await holdFetch(page, {suffix:"/metrics", query:{scope:"revision", role:"production"}});
   try {
-    await page.locator("#treemap-metric-tests").uncheck();
+    await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").uncheck();
     await page.waitForFunction(() => window.treemapFetchGate.entered);
     assert.equal(await page.locator("#treemap-diagram svg").count(), 0);
     assert.equal(await page.locator("#treemap-inspector-content").textContent(), "");
-    await page.locator("#treemap-metric-tests").check(); await ready(page);
+    await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").check(); await ready(page);
     const latest = await page.locator("#treemap-diagram").innerHTML();
     await releaseFetch(page);
     assert.equal(await page.locator("#treemap-diagram").innerHTML(), latest);
-    assert.match(await page.locator("#treemap-state").textContent(), /all indexed callables/);
+    assert.match(await page.locator("#treemap-summary").textContent(), /all indexed callables/);
   } finally { await restoreFetch(page); }
   await holdFetch(page, {suffix:"/metrics", query:{scope:"revision", aggregate:"sum"}});
   try {
@@ -414,7 +414,7 @@ test("Treemap late production fetch cannot replace all-callable heat and late so
     const latest = await page.locator("#treemap-diagram").innerHTML();
     await releaseFetch(page);
     assert.equal(await page.locator("#treemap-diagram").innerHTML(), latest);
-    assert.match(await page.locator("#treemap-state").textContent(), /mean/);
+    assert.match(await page.locator("#treemap-summary").textContent(), /mean/);
   } finally { await restoreFetch(page); }
   await holdFetch(page, {suffix:"/source", query:{path:"src/last.rs"}});
   try {
@@ -500,8 +500,8 @@ for (const transition of ["generation", "revision", "checkout", "session"]) {
 async function layout(page) {
   return page.locator("#treemap-diagram").evaluate(node => {
     const style = getComputedStyle(node), svg = node.querySelector("svg");
-    return {width:node.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
-      height:node.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+    return {width:node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+      height:node.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
       svgWidth:Number(svg?.getAttribute("width")), svgHeight:Number(svg?.getAttribute("height")),
       overflowX:node.scrollWidth > node.clientWidth, overflowY:node.scrollHeight > node.clientHeight};
   });
@@ -512,7 +512,7 @@ async function filled(page) {
   await page.waitForFunction(() => {
     const node = document.querySelector("#treemap-diagram"), svg = node?.querySelector("svg"), style = node && getComputedStyle(node);
     if (!svg) return false;
-    const width = node.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight), height = node.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const width = node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight), height = node.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
     const dx = width - Number(svg.getAttribute("width")), dy = height - Number(svg.getAttribute("height"));
     return dx >= 0 && dx < 1 && dy >= 0 && dy < 1;
   });
@@ -600,11 +600,16 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
   assert.equal(await tree.locator("li.unsupported-files").nth(1).locator("summary").textContent(), "2 files · unsupported source type · not indexed");
   assert.doesNotMatch(await tree.textContent(), /Unsupported source type/, "no per-file unsupported rows");
 
-  const legend = page.locator("#explorer-metric-legend");
-  assert.equal(await legend.isVisible(), true, "the explorer legend is visible beside its numbers in Treemap");
-  assert.match(await legend.textContent(), /Numbers: Cognitive · max · production callables · Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
+  // #447: the rail legend is a tooltip on each swatch; the full legend sits in the rail menu.
+  assert.equal(await page.locator("#explorer-metric-legend").count(), 0);
+  await H.reveal(page, "#metric-legend");
+  const legend = page.locator("#metric-legend");
+  assert.equal(await legend.isVisible(), true, "the explorer legend is one click away in Treemap");
+  assert.match(await legend.textContent(), /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
   assert.deepEqual(await legend.locator(".metric-legend-entry .metric-swatch").evaluateAll(nodes => nodes.map(node => getComputedStyle(node).backgroundColor)),
     ["rgb(52, 54, 68)", "rgb(255, 194, 10)", "rgb(255, 170, 16)", "rgb(255, 122, 0)"], "legend uses the shared heat tokens");
+  await page.keyboard.press("Escape");
+  assert.match(await page.locator('.directory-pick[title="src/"] .metric-value').getAttribute("title"), /^Cognitive · max · production callables · .*Fixed per-callable bands/);
   const folder = await page.locator('.directory-pick[title="src/"]').evaluate(pick => {
     const value = pick.querySelector(".metric-value"), swatch = value?.querySelector(".metric-swatch");
     return {number:value?.querySelector("span:last-child")?.textContent, swatch:swatch?.className, gap:pick.getBoundingClientRect().right - value.getBoundingClientRect().right};
@@ -613,7 +618,7 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
   assert.ok(Number.isFinite(value), "src/ has a measured folder number");
   assert.equal(folder.swatch, `metric-swatch heat-${[5, 15, 30].filter(cut => value > cut).length}`, "folder swatch uses the legend's fixed band");
   assert.ok(folder.gap >= 0 && folder.gap < 12, "folder number is right-aligned in its row");
-  assert.equal(await legend.getAttribute("role"), "group"); assert.equal(await page.locator("#treemap-legend").getAttribute("role"), "group");
+  assert.equal(await page.locator("#treemap-legend").getAttribute("role"), "group");
   await capture(page, "treemap-explorer-legend");
   // An open file list scrolls inside its own capped box instead of squeezing the diagram.
   await page.locator(".treemap-file-list > summary").click();
@@ -621,3 +626,43 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
   assert.ok(list.max > 0 && list.height <= list.max + 1 && list.overflow === "auto", JSON.stringify(list));
   assert.ok(fills(await filled(page)), "the diagram still fills its box with the list open");
 }));
+
+// #451: 400 one-line files need more than the panel's area at 2500 px² each.
+const bulk = new Map(Array.from({length:400}, (_, i) => [`bulk/f${String(i).padStart(3, "0")}.js`, `function f${i}() { return ${i}; }\n`]));
+test("Treemap keeps to its panel's width, grows only downward, and keeps its summary behind the view's ⓘ (#451)", {timeout:240000}, async () => published(async selected => {
+  const {page} = selected;
+  await page.setViewportSize({width:1440, height:900}); await ready(page);
+  const box = await layout(page);
+  const canvas = await page.locator("#treemap-diagram").evaluate(node => ({scrollWidth:node.scrollWidth, clientWidth:node.clientWidth, scrollHeight:node.scrollHeight, clientHeight:node.clientHeight}));
+  assert.ok(box.svgWidth <= box.width && box.width - box.svgWidth < 1, `the layout takes the panel's width: ${JSON.stringify(box)}`);
+  assert.ok(canvas.scrollWidth <= canvas.clientWidth, `no sideways scroll: ${JSON.stringify(canvas)}`);
+  assert.ok(box.svgHeight > box.height && canvas.scrollHeight > canvas.clientHeight, `a dense layout grows downward only: ${JSON.stringify({box, canvas})}`);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  const panel = await page.locator("#treemap-panel").evaluate(node => ({sideways:node.scrollWidth > node.clientWidth,
+    above:document.querySelector("#treemap-diagram").getBoundingClientRect().top - node.getBoundingClientRect().top,
+    controls:node.querySelector(".treemap-controls").getBoundingClientRect().height}));
+  assert.equal(panel.sideways, false);
+  assert.ok(panel.controls < 70, `one row of controls: ${JSON.stringify(panel)}`);
+  assert.ok(panel.above < 200, `controls, breadcrumbs and legend leave the panel to the map: ${JSON.stringify(panel)}`);
+  // The ready summary is not a visible line; it sits behind ⓘ, which opens inside the viewport.
+  assert.equal(await page.locator("#treemap-state").isVisible(), false);
+  assert.equal(await page.locator("#treemap-state").getAttribute("data-state"), "ready");
+  assert.equal(await page.locator("#treemap-summary").isVisible(), false);
+  await page.locator("#treemap-panel .view-about > summary").click();
+  const summary = page.locator("#treemap-summary");
+  assert.equal(await summary.isVisible(), true);
+  assert.match(await summary.textContent(), /^\d+ of \d+ indexed files · \d+ physical file lines · max · production callables · test files hidden/);
+  // #499 places toolbar popovers on toggle, clamped to the panel; wait for that placement.
+  await page.waitForFunction(() => document.querySelector("#treemap-panel .view-about .popover-body")?.style.left);
+  const card = await page.locator("#treemap-panel .view-about .popover-body").evaluate(node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right}; });
+  assert.ok(card.left >= 0 && card.right <= 1440, `ⓘ opens inside the viewport: ${JSON.stringify(card)}`);
+  await capture(page, "treemap-fit-about");
+  await page.keyboard.press("Escape");
+  // Loading, empty and error states stay in view, and the summary clears with them.
+  await page.locator("#treemap-path").fill("no-matching-files");
+  await page.locator("#treemap-state[data-state=empty]").waitFor();
+  assert.equal(await page.locator("#treemap-state").isVisible(), true);
+  assert.equal(await summary.textContent(), "");
+  await page.locator("#treemap-path").fill(""); await ready(page);
+  assert.equal(await page.locator("#treemap-state").isVisible(), false);
+}, bulk));

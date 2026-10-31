@@ -142,6 +142,51 @@ async fn catalog_pages_inline_methods_and_conservative_checks() {
     );
 }
 #[tokio::test]
+async fn catalog_filter_searches_the_whole_pinned_catalog() {
+    let (_dir, store, _graph, app, _session) = setup();
+    let pin = store.status().unwrap().revision;
+    let page = |query: &str| {
+        format!(
+            "/api/files?indexGeneration={}&indexRevision={}&limit=1&{query}",
+            pin.index_generation, pin.index_revision
+        )
+    };
+    // The filter is applied before pagination: the only match is the last path.
+    let (status, found) = call(&app, "GET", &page("q=Z.JS"), Value::Null).await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(found["revision"], json!(pin));
+    assert_eq!(
+        found["items"],
+        json!([{"path":"z.js","language":"javascript","methodCount":0}])
+    );
+    assert_eq!(found["nextOffset"], Value::Null);
+    let (_, both) = call(&app, "GET", &page("q=.js"), Value::Null).await;
+    assert_eq!(both["items"][0]["path"], "a.js");
+    assert_eq!(both["nextOffset"], 1, "matches page like the catalog");
+    let (_, none) = call(&app, "GET", &page("q=missing"), Value::Null).await;
+    assert_eq!(none["items"], json!([]));
+    assert_eq!(none["nextOffset"], Value::Null);
+    for query in ["q=", &format!("q={}", "a".repeat(257)), "q=a%0Ab"] {
+        assert_eq!(
+            call(&app, "GET", &page(query), Value::Null).await.0,
+            400,
+            "{query}"
+        );
+    }
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            &page(&format!("q={}", "a".repeat(256))),
+            Value::Null
+        )
+        .await
+        .0,
+        200,
+        "the bound is inclusive"
+    );
+}
+#[tokio::test]
 async fn strict_errors_revisions_and_auth() {
     let (_dir, store, graph, app, session) = setup();
     let pin = store.status().unwrap().revision;

@@ -10,7 +10,8 @@ not authorization for Herdr controls, future tabs or gated actions.
 Files is a real section of the existing shell. Diagrams retains Sequence, Classes, Libraries
 and its source dock. Files reuses the same checkout/session/full-pin owner and the existing
 cached workspace-source cache and navigation. It does not create a second source cache or
-independent checkout selection. Connecting selects no checkout; entering Files selects no file.
+independent checkout selection. Entering Files selects no file; arrival after Connect may select the
+only or last used checkout ([Viewer shell](viewer-shell.md#checkout-observation)).
 Only explicit file/source/location actions read cached source. Section switches, folder expansion
 and filtering never start indexing or call providers.
 
@@ -23,7 +24,8 @@ source or partially update the inspector. Existing authentication and stale-pin 
 
 ## Cached file catalog and all-symbol outline
 
-Files uses the pinned indexed `files` catalog for its tree. The Diagrams Explorer remains a
+Files uses the pinned indexed `files` catalog for its tree. A non-empty filter asks the same
+catalog for matching paths (`q`, at most 256 bytes) instead of filtering loaded pages. The Diagrams Explorer remains a
 live filesystem metadata browser; it is not the Files catalog. This distinction keeps captured
 files reachable after live deletion and prevents a directory listing from silently changing the
 indexed basis. A cached path need not exist on disk now. Conversely, a live-only or Git-only path
@@ -62,7 +64,10 @@ identifier/type/property-name syntax leaves with the same spelling. It excludes 
 strings and the selected declaration's own name. It does not scan live bytes, other checkouts
 or dependency roots.
 
-The panel heading is **Syntax matches · same spelling, not compiler-resolved**. Explain that
+The panel heading is **References to X · N** (#451, as in the design), where X is the matched
+spelling and N the rows shown. N reads **≥N** while more pages remain or coverage is partial,
+and **unavailable** without a spelling. Directly under it, the note **Syntax matches in the
+indexed revision · same spelling, not compiler-resolved** explains that
 homonyms, shadowing, unrelated properties and other declarations may share the spelling. The
 query concerns the selected declaration, not an illustrative return type in a design mockup.
 Results are original pinned source locations with cached snippets, not bound symbol targets or
@@ -109,19 +114,24 @@ describe the new occurrence. Choosing an actual outline declaration can then bin
 
 ## Source navigation and mini-sequences
 
-Indexed source retains the existing shared line-navigation menu and keyboard behavior. It is
+Indexed source retains the existing shared line-navigation menu and keyboard behavior.
+The selected declaration's range uses the raised surface with a lavender left bar, not a purple
+fill (#451). Source-margin Sequence actions are labelled by declaration name; the opaque symbol ID
+stays out of accessible labels and tooltips. It is
 line-based navigation, not compiler-resolved word-at-cursor navigation. Keep the source area
 focusable, Navigate and Shift-F10 actions, Up/Down line movement, native text selection/copy and
 menu dismissal/focus return. Full-pin/session/checkout checks apply to delayed menu actions.
 All source actions read cached text explicitly; no action substitutes current disk content.
 
 Only callable declarations have mini-sequences. Use the actual pinned `SequenceView` with the
-existing faithful renderer in a readable, contained scroll area. Keep original IDs/ranges,
+existing faithful renderer, scaled down to the inspector's width (#451) in a contained vertical
+scroll area; Open full shows it at full size. Keep original IDs/ranges,
 guards, alternatives, exits, unresolved or terminal boundaries, hidden/truncated counts and
 warnings. Do not replace it with guessed arrows, a source snippet parser or a falsely complete
 first-call sample. Noncallables have an honest no-sequence state, not an invented empty diagram.
 
-Open full promotes the exact callable seed and pin to Diagrams/Sequence. It uses the same admitted
+Open full promotes the exact callable seed and pin to Diagrams/Sequence. It selects the Sequence
+tab as it enters Diagrams, so the last-used diagram tab neither shows nor refreshes (#451). It uses the same admitted
 projection, or explicitly requests the intended projection under that seed and pin. It never
 silently asks for latest. Mini-sequence source callbacks retain the same pinned cached-source
 rules as the full view.
@@ -158,8 +168,8 @@ must still match checkout, path and current selection. Git never changes the ind
 
 ## Layout and safety
 
-Desktop panes scroll independently; source and mini-sequences remain readable rather than scaled
-into a tiny diagram. At 900px and below use the existing mutually exclusive Explorer/Inspector
+Desktop panes scroll independently; source remains readable, and the mini-sequence is a preview
+scaled to the inspector's width, with Open full for reading. At 900px and below use the existing mutually exclusive Explorer/Inspector
 drawers. Hidden sections and inspectors leave the focus order. Source in Files is primary and
 must not disappear as though Escape closed a secondary Diagrams dock. Retain shared menu/drawer
 Escape behavior and restore focus to a visible current control.

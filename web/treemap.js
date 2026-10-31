@@ -33,7 +33,12 @@
       layoutRelayouts.add(token); publishLayout(); work.then(done, done);
     };
     const population = () => role === "all" ? "all indexed callables" : "production callables";
-    const state = (message, kind = "ready") => { get("treemap-state").textContent = message; get("treemap-state").dataset.state = kind; };
+    // Loading, empty and error states stay in view; the ready summary lives behind the view's ⓘ (#451).
+    const state = (message, kind = "ready", warning = "") => {
+      const node = get("treemap-state"), ready = kind === "ready";
+      node.textContent = ready ? warning : message; node.dataset.state = kind; node.hidden = ready && !warning;
+      get("treemap-summary").textContent = ready ? message : "";
+    };
     const paragraph = (target, message) => target.append(make("p", message));
     function capture() {
       const c = context();
@@ -51,12 +56,12 @@
       return name && view && view.files.every(file => file.sourceSetId === sourceSetId) ? name : sourceSetId;
     }
     // The diagram box's own content size, less Pele's 8 px padding on each side; unknown while hidden.
+    // Client sizes exclude a scrollbar, so a layout grown tall never scrolls sideways (#451).
     function viewport() {
       const node = get("treemap-diagram");
-      if (!node?.offsetWidth || !node.offsetHeight || typeof getComputedStyle !== "function") return undefined;
+      if (!node?.clientWidth || !node.clientHeight || typeof getComputedStyle !== "function") return undefined;
       const style = getComputedStyle(node), px = (...names) => names.reduce((sum, name) => sum + (parseFloat(style[name]) || 0), 0);
-      return {width:node.offsetWidth - px("paddingLeft", "paddingRight", "borderLeftWidth", "borderRightWidth") - 16,
-        height:node.offsetHeight - px("paddingTop", "paddingBottom", "borderTopWidth", "borderBottomWidth") - 16};
+      return {width:node.clientWidth - px("paddingLeft", "paddingRight") - 16, height:node.clientHeight - px("paddingTop", "paddingBottom") - 16};
     }
     function markSelection() {
       window.TrellisTreemapPele?.select?.(get("treemap-diagram"), selectedKey);
@@ -215,7 +220,7 @@
         }
         const total = files.reduce((sum, file) => sum + file.physicalLines, 0);
         const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.";
-        state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty");
+        state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty", payload.layerExclusionsWarning || "");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
         // Resizes during the first paint had no relayout to call; reconcile with the box once.
         const reconciled = relayout?.();

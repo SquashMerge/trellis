@@ -94,6 +94,9 @@ test("only exact member selectors are submitted; invalid and mixed boundaries ne
   for(const bad of [null,{},[],{...selector,line:0},{...selector,line:-1},{...selector,line:1.5},{...selector,line:Number.MAX_SAFE_INTEGER+1},{...selector,path:""},{...selector,path:"x".repeat(4097)},{...selector,classId:"A"},{...selector,typeHint:"A"},{...selector,expectedRevision:2},
     {classId:"A",memberName:"run",startByte:-1,endByte:5},{classId:"A",memberName:"run",startByte:4,endByte:3},{classId:"A",memberName:"run",startByte:1.2,endByte:5},{classId:"A",memberName:"",startByte:0,endByte:5}]) await h.nav.open(h.event(),bad);
   assert.equal(h.calls.length,0);
+  await h.nav.open(h.event(),{classId:"A",memberName:"m",startByte:0,endByte:16,memberPath:"src/ops.rs"});
+  assert.equal(h.calls.at(-1).options.body.memberPath,"src/ops.rs","a merged member names its own document (#452)");
+  h.calls.length=0;
   await h.nav.open(h.event(),{classId:"A",memberName:"méthode",startByte:0,endByte:16});
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},classId:"A",memberName:"méthode",startByte:0,endByte:16});
 });
@@ -523,7 +526,8 @@ test("pinned metadata adds one-click callable declarations without changing sour
   const actions=inlineActions(p);assert.equal(actions.length,1);
   assert.equal(actions[0].parentNode,p.rows[1]);assert.equal(actions[0].getAttribute("data-symbol-id"),method.id);
   assert.equal(actions[0].getAttribute("data-source-action"),"sequence");
-  assert.equal(actions[0].textContent,"");assert.match(actions[0].getAttribute("aria-label"),/exact#λ/);
+  assert.equal(actions[0].textContent,"");assert.equal(actions[0].getAttribute("aria-label"),`Sequence for ${method.name} · syntax`);
+  assert.ok(!actions[0].getAttribute("aria-label").includes(method.id)&&!actions[0].getAttribute("title").includes(method.id),"labels carry no symbol ID (#451)");
   assert.deepEqual(p.rows.map(row=>row.children[1].textContent),original);
   assert.equal(h.selected.length,0);await actions[0].fire("click").done;
   assert.equal(h.selected[0],method);assert.equal(h.callbackPins[0].indexRevision,1);assert.equal(p.pre.dataset.navigationLine,"5");assert.equal(h.calls.length,0);
@@ -649,8 +653,11 @@ test("enclosing callable and supported class actions use measured identity, not 
   h.request=async()=>response([{symbol:{...cls,path:"web/a.mjs"},reason:"declaration",matchKind:"measured",action:"class"}]);
   await h.nav.open(h.event(),{path:"web/a.mjs",line:4});
   assert.ok(h.latest.actions.find(a=>a.label.startsWith("Class diagram")),"JavaScript classes are catalogued (#452)");
-  h.request=async()=>response([{symbol:{...cls,path:"src/A.rs"},reason:"declaration",matchKind:"measured",action:"class"}]);
-  await h.nav.open(h.event(),{path:"src/A.rs",line:4});
+  h.request=async()=>response([{symbol:{...cls,path:"src/a.rs"},reason:"declaration",matchKind:"measured",action:"class"}]);
+  await h.nav.open(h.event(),{path:"src/a.rs",line:4});
+  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Class diagram")),"Rust types are catalogued (#452)");
+  h.request=async()=>response([{symbol:{...cls,path:"src/A.go"},reason:"declaration",matchKind:"measured",action:"class"}]);
+  await h.nav.open(h.event(),{path:"src/A.go",line:4});
   assert.equal(h.latest.actions.some(a=>a.label.startsWith("Class diagram")),false);
 });
 

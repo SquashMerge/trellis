@@ -162,7 +162,7 @@ async function navigateDiagram(symbol, revision, kind = "sequence", admitted = n
   rememberNavigation({kind, symbol, admitted, showAll:false}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
-  await setSection("diagrams");
+  await setSection("diagrams", kind === "class" ? "classes" : "sequence");
   if (!current()) return;
   $("all-steps").checked = false;
   if (kind === "class") return openClasses({seed:symbol.id});
@@ -177,7 +177,7 @@ async function restoreSourceEntry(entry, current) {
   $("method-source").disabled = !selectedMethod;
   if ($("method-class")) $("method-class").disabled = !selectedMethod || !classLanguage(selectedMethod.path);
   workspaceSource = entry.source;
-  await setSection(entry.section);
+  await setSection(entry.section, entry.section === "diagrams" ? entry.view : null);
   if (!current()) return;
   diagramSequence = entry.diagram;
   if (entry.section === "diagrams" && entry.view === "sequence" && entry.diagram && entry.method) {
@@ -235,7 +235,7 @@ async function readNavigationLocation(force = false) {
       $("error").hidden = true;
       if (entry.kind === "source") return await restoreSourceEntry(entry, current);
       clearSource(); diagramSequence = null;
-      await setSection("diagrams");
+      await setSection("diagrams", entry.kind === "class" ? "classes" : "sequence");
       if (!current()) return;
       if (entry.kind === "class") return await openClasses({seed:entry.symbol.id});
       $("all-steps").checked = entry.showAll;
@@ -261,7 +261,7 @@ async function readNavigationLocation(force = false) {
       if (!IndexPin.equal(requested, revision)) throw new Error("Sequence link is stale for the selected index snapshot. Reload or select a current link.");
     }
     clearSource(); diagramSequence = null;
-    await setSection("diagrams");
+    await setSection("diagrams", "sequence");
     if (!current()) return;
     window.TrellisShell?.showView("sequence");
     $("sequence-state").textContent = "Loading sequence link…";
@@ -386,7 +386,6 @@ function showSelectedGit(git) {
   const row = checkouts.find(row => row.rootKey === selectedRootKey);
   if (row) row.git = selectedGit;
   updateCheckoutOptions();
-  renderCheckoutList();
   updateFilesBasis();
   if (treeMode || files.length || filesCatalogLoaded) renderFiles();
   window.TrellisShell?.updateCheckout(selectedWorkspaceRoot, selectedGit);
@@ -449,7 +448,6 @@ async function refreshStatus(followup = false) {
   if (listed) Object.assign(listed, {revision:nextPin, catchingUp:data.catchingUp, indexError:nextPin ? null : "index_not_ready"});
   window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
-  renderCheckoutList();
   updateCheckoutOptions();
   if (browseChanged && nextPin) {
     void viewerMetrics?.refresh();
@@ -548,14 +546,13 @@ function resetCheckout() {
   $("checkout-root").textContent = "No checkout selected";
   $("workspace").hidden = true; $("index").disabled = true; $("cancel").hidden = true;
   window.TrellisShell?.setConnected(false);
-  renderCheckoutList();
 }
 function disconnect(message) {
   tokenFileSerial++; tokenSaveFailed = false; const forgotten = forgetStoredToken();
-  resetCheckout(); checkouts = []; renderCheckoutList(); token = "";
+  resetCheckout(); checkouts = []; token = "";
   $("remember-token").checked = false; $("token-file").value = ""; $("token").value = "";
   $("checkout-picker").hidden = true; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
-  $("logout").hidden = true; $("connect-form").hidden = false;
+  $("app-menu").hidden = true; $("app-menu").open = false; $("connect-form").hidden = false;
   document.body.classList.toggle("daemon-connected", false);
   $("error").hidden = !message; $("error").textContent = message || "";
   $("notice").textContent = message || (forgotten ? "Disconnected. Saved token and cached source cleared." : "Disconnected. Browser storage could not be cleared; clear this address’s site data to forget any saved token.");
@@ -595,7 +592,7 @@ function selectedIndexStatus() {
   if (checkoutBusy) return {state:"failed", text:"Checkout busy · retry checkout list"};
   if (statusUnavailable) return {state:"failed", text:"Index status unavailable · retry status"};
   if (jobUnavailable) return {state:"failed", text:"Index job unavailable · retry status"};
-  if (job?.state === "failed") return {state:"failed", text:"Index failed · see Diagnostics"};
+  if (job?.state === "failed" && !status?.revision) return {state:"failed", text:`Index failed · ${jobCause(job)}`};
   if (job && activeJob(job)) return {state:"catching-up", text:jobText(job)};
   if (indexNotReady) return {state:"unknown", text:"Index not ready · retry status"};
   if (!status?.revision) return {...base, state:"unknown", text:"Loading index status…"};
@@ -609,13 +606,41 @@ function selectedIndexStatus() {
 }
 // The visible label follows every poll; the live region speaks only when the leading state words change.
 function stateWord(text) { return String(text).split(" · ")[0]; }
+// The recorded failure code and reason, never the generic job message.
+function jobCause(value) {
+  const code = typeof value?.error?.code === "string" && value.error.code ? value.error.code : "cause not recorded";
+  const reason = typeof value?.error?.reason === "string" && value.error.reason ? `: ${value.error.reason}` : "";
+  return `${code}${reason}`;
+}
 function renderIndexStatus() {
   const state = selectedIndexStatus();
   $("workspace-index-state")?.setAttribute("data-state", state.state);
   $("workspace-index-label").textContent = state.text;
-  const announce = $("workspace-index-announce");
-  if (announce && stateWord(announce.textContent) !== stateWord(state.text)) announce.textContent = state.text;
-  renderCheckoutList();
+  // The served revision stays the status; a failed later re-index is a secondary note.
+  const note = job?.state === "failed" && status?.revision ? `Last re-index failed · ${jobCause(job)}` : "";
+  const noteNode = $("workspace-index-note");
+  if (noteNode) { noteNode.textContent = note; noteNode.title = note; noteNode.hidden = !note; }
+  const announce = $("workspace-index-announce"), spoken = note ? `${state.text} · ${note}` : state.text;
+  if (announce && stateWord(announce.textContent) !== stateWord(spoken)) announce.textContent = spoken;
+  else if (announce && note && !announce.textContent.includes(note)) announce.textContent = spoken;
+  // Index workspace is offered, and the tabs are greyed out, only when the checkout has no usable index.
+  const noIndex = !!selectedRootKey && indexNotReady;
+  // While this page waits on an accepted first index, Stop waiting replaces the (disabled) button.
+  if ($("index")) $("index").hidden = !noIndex || (waitingForJob && !!job && activeJob(job));
+  window.TrellisShell?.setIndexAvailable?.(!noIndex);
+}
+const lastCheckoutKey = "trellis.lastCheckout.v1";
+function rememberCheckout(key) {
+  try { localStorage.setItem(lastCheckoutKey, key); } catch (_) { /* A per-browser convenience only. */ }
+}
+// Arrival picks the only selectable checkout, else the one last used in this browser.
+// The agent's working directory is not observable from the browser or daemon here.
+function arrivalCheckout() {
+  const available = checkouts.filter(selectable);
+  if (available.length === 1) return available[0].rootKey;
+  let last = null;
+  try { last = localStorage.getItem(lastCheckoutKey); } catch (_) { last = null; }
+  return validRootKey(last) && uniqueSelectableRoot(last) ? last : null;
 }
 function storageWarning() { return tokenSaveFailed ? "Browser storage is unavailable; token was not saved." : ""; }
 function updateCheckoutOptions() {
@@ -629,25 +654,6 @@ function updateCheckoutOptions() {
 }
 function showCheckoutIndexState() {
   renderIndexStatus();
-}
-function renderCheckoutList() {
-  const list = $("indexed-checkouts");
-  if (!list) return;
-  list.replaceChildren();
-  for (const row of checkouts) {
-    const li = element("li"), state = row.rootKey === selectedRootKey ? selectedIndexStatus() : checkoutIndexLabel(row);
-    const name = window.TrellisShell?.rootName(row.workspaceRoot) || row.rootKey;
-    const pick = button(name, () => selectCheckout(row.rootKey));
-    pick.className = "checkout-pick"; pick.disabled = !selectable(row);
-    pick.title = row.workspaceRoot || row.rootKey;
-    pick.setAttribute("aria-pressed", String(row.rootKey === selectedRootKey));
-    pick.append(element("span", window.TrellisShell?.formatGit(row.git) || "Git unavailable", "checkout-git"));
-    const shape = state.shape || ({fresh:"○", "catching-up":"◐", failed:"□", stale:"◇", unknown:"◇"}[state.state]);
-    const freshness = element("span", `${shape} ${state.text}`, "checkout-freshness");
-    freshness.setAttribute("data-state", state.state); pick.append(freshness);
-    li.append(pick); list.append(li);
-  }
-  if (!checkouts.length) list.append(element("li", "No indexed checkouts listed.", "detail"));
 }
 async function loadCheckouts() {
   const session = epoch, gitAtStart = gitSerial;
@@ -677,8 +683,7 @@ async function loadCheckouts() {
     }
     if (sameRoot && gitAtStart !== gitSerial) selected.git = selectedGit;
     checkouts = next;
-    renderCheckoutList();
-    if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
+      if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
       invalidateSelection("Selected checkout is no longer available. Choose again."); return;
     }
     const select = $("checkout-select"), choice = selectedRootKey || "";
@@ -698,7 +703,7 @@ async function loadCheckouts() {
     $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
       : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
       : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
-      : choice ? storageWarning() : "Choose a checkout to inspect. No checkout is selected automatically.";
+      : choice ? storageWarning() : "Choose a checkout to inspect.";
     $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
     if (choice && !busy) showCheckoutIndexState(selected);
     if (recovering) await selectCheckout(choice);
@@ -710,7 +715,7 @@ async function loadCheckouts() {
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
     if (selectedRootKey) resetCheckout();
-    checkouts = []; renderCheckoutList(); $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
+    checkouts = []; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
     $("checkout-select").disabled = true; $("checkout-retry").hidden = false;
     $("checkout-state").textContent = `Checkout list unavailable: ${error.message} Retry the list.`;
     return false;
@@ -729,10 +734,9 @@ async function selectCheckout(key) {
   if (!uniqueSelectableRoot(key)) {
     $("checkout-select").value = ""; $("checkout-state").textContent = "Choose an available checkout."; return;
   }
-  selectedRootKey = key;
+  selectedRootKey = key; rememberCheckout(key);
   const selected = checkouts.find(row => row.rootKey === key);
   selectedWorkspaceRoot = selected.workspaceRoot;
-  renderCheckoutList();
   showSelectedGit(selected.git);
   showCheckoutIndexState(selected);
   $("error").hidden = true; $("error").textContent = "";
@@ -781,7 +785,7 @@ form("connect-form", async () => {
   if (!safeTokenText(supplied)) throw new Error("Paste a daemon token or load daemon.token first.");
   tokenFileSerial++; tokenSaveFailed = false; token = supplied; $("token").value = ""; $("token-file").value = "";
   $("error").hidden = true; $("error").textContent = "";
-  $("checkout-picker").hidden = false; $("connect-form").hidden = true; $("logout").hidden = false;
+  $("checkout-picker").hidden = false; $("connect-form").hidden = true; $("app-menu").hidden = false;
   document.body.classList.toggle("daemon-connected", true);
   const [listed] = await Promise.all([loadCheckouts(), loadDaemonStatus()]);
   if (!token) return;
@@ -790,10 +794,12 @@ form("connect-form", async () => {
     try { localStorage.setItem(tokenStorageKey, token); remembered = true; }
     catch (_) { tokenSaveFailed = true; }
   } else if (listed) forgetStoredToken();
-  $("notice").textContent = listed ? `Connected to the daemon on ${window.location?.host || "this address"}. Choose a checkout before browsing.`
+  const arrival = listed && !selectedRootKey ? arrivalCheckout() : null;
+  $("notice").textContent = listed ? `Connected to the daemon on ${window.location?.host || "this address"}. ${arrival ? "Opening the checkout." : "Choose a checkout before browsing."}`
     + (remembered ? " Token saved on this browser." : tokenSaveFailed ? " Browser storage is unavailable; token was not saved." : "")
     : "Checkout list unavailable. Retry the list; no checkout has been selected.";
-  $("checkout-select").focus();
+  if (arrival) await selectCheckout(arrival);
+  else $("checkout-select").focus();
 });
 $("logout").addEventListener("click", () => disconnect());
 
@@ -901,7 +907,7 @@ function jobText(value) {
     const pin = value.revision;
     return `Indexed${pin ? ` · rev ${IndexPin.label(pin)}` : ""}`;
   }
-  if (value.state === "failed") return "Index failed · see Diagnostics";
+  if (value.state === "failed") return `Index failed · ${jobCause(value)}`;
   const parts = [value.state === "queued" ? "Index queued · accepted" : "Indexing"];
   if (progress?.phase) parts.push(progress.phase);
   if (Number.isSafeInteger(total) && total > 0) parts.push(`${progress.completed ?? 0}/${total}`);
@@ -967,6 +973,7 @@ function clearFilesInspector() {
   for (const id of ["files-symbol-location", "files-symbol-header", "files-symbol-return", "files-mini-sequence", "files-matches", "files-matches-state"]) $(id)?.replaceChildren();
   if ($("files-symbol-title")) $("files-symbol-title").textContent = "Choose a symbol";
   if ($("files-symbol-kind")) $("files-symbol-kind").textContent = "Indexed symbol";
+  if ($("files-matches-title")) $("files-matches-title").textContent = "References";
   if ($("files-mini-state")) $("files-mini-state").textContent = "Select a callable to preview its measured sequence.";
   if ($("files-open-full")) $("files-open-full").disabled = true;
   for (const id of ["files-matches-more", "files-matches-retry"]) if ($(id)) $(id).hidden = true;
@@ -982,7 +989,7 @@ function filesFailure(error, target, current) {
   if (["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) { unexpectedPair("Indexed evidence is stale. Refresh status before selecting again."); return; }
   if ($(target)) $(target).textContent = error.message;
 }
-async function setSection(name) {
+async function setSection(name, view = null) {
   if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
   if (section === name) {
     const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $("view-sequence");
@@ -997,6 +1004,13 @@ async function setSection(name) {
   window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
   window.TrellisShell?.setSection(name);
   if (name !== "files") {
+    // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
+    if (view) {
+      // The shell focused the last-used tab on entry; keep focus on the tab that is now shown.
+      const tabFocused = document.activeElement?.closest?.("#diagram-tabs");
+      showNavigationView(view);
+      if (tabFocused) $(`view-${view}`)?.focus();
+    }
     $("source").hidden = false; $("files-diff").hidden = true;
     if (!workspaceSource) window.TrellisShell?.closeSource();
     renderFiles();
@@ -1109,19 +1123,26 @@ async function loadFilesMatches(continuation = null) {
   const item = filesSymbol, pin = IndexPin.copy(status.revision), guard = filesGuard({symbol:true}), serial = ++filesMatchesSerial;
   const current = () => guard() && serial === filesMatchesSerial;
   $("files-matches-state").textContent = "Loading syntax matches…"; $("files-matches-more").hidden = true; $("files-matches-retry").hidden = true;
+  if (!continuation) $("files-matches-title").textContent = `References to ${item.symbol.name} · …`;
   try {
     const data = await api("/api/syntax-matches", "POST", {expectedRevision:pin, symbolId:item.symbol.id, ...(continuation ? {continuation} : {})}, current);
     if (!current()) return;
     if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
     if (data.symbolId !== item.symbol.id || data.evidenceKind !== "syntaxMatches") throw new Error("Syntax match provenance mismatch. Nothing displayed.");
     filesMatches = {...data, items:continuation ? [...(filesMatches?.items || []), ...data.items] : data.items}; renderFilesMatches();
-  } catch (error) { filesFailure(error, "files-matches-state", current); if (current()) $("files-matches-retry").hidden = false; }
+  } catch (error) {
+    filesFailure(error, "files-matches-state", current);
+    if (current()) { $("files-matches-retry").hidden = false; if (!continuation) $("files-matches-title").textContent = `References to ${item.symbol.name}`; }
+  }
 }
 function renderFilesMatches() {
   $("files-matches").replaceChildren();
   if (!filesMatches || !filesSymbol) return;
   const data = filesMatches, pin = IndexPin.copy(data.revision), current = filesGuard({symbol:true});
   window.TrellisFiles?.matches($("files-matches"), data.items, item => openFilesLocation(item, pin), current);
+  // A page is not a total: more pages or incomplete coverage make the count a lower bound.
+  const count = !data.scope?.spelling ? "unavailable" : `${data.continuation != null || data.partial ? "≥" : ""}${data.items.length}`;
+  $("files-matches-title").textContent = `References to ${data.scope?.spelling || filesSymbol.symbol.name} · ${count}`;
   $("files-matches-state").textContent = `${data.items.length} shown · ${data.scope?.language || "language unavailable"} · source set ${data.scope?.sourceSetId || "unavailable"}${data.scope?.spelling ? " · " + data.scope.spelling : " · spelling unavailable"}${data.partial ? " · Incomplete coverage (skipped files or work budget)" : ""}${data.truncated ? " · more available" : ""}${!data.items.length ? " · No matches returned in the scanned scope; not proof of no references." : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}`;
   $("files-matches-more").hidden = data.continuation == null;
 }
@@ -1260,6 +1281,7 @@ function clearBrowse(message = "Expand a file and select a method.") {
   viewerMetrics?.reset();
   diagramSequence = null;
   browseSerial++; diagramSerial++; catalogSerial++; directoryRefreshSerial++; files = []; nextFileOffset = null; selectedMethod = null;
+  clearFileFilterResults();
   directories.clear(); treeMode = false; treeRoot = null; indexedWorkspace = "";
   $("index").textContent = "Index workspace";
   fileStates.clear(); closedDirectories.clear(); $("method-source").disabled = true;
@@ -1342,11 +1364,13 @@ function appendGitMarker(node, path, changes) {
 }
 function renderFiles() {
   $("show-hidden-files").checked = showHiddenFiles();
-  if (section !== "files" && treeMode) { renderDirectoryTree(); return; }
+  const filter = $("file-filter").value.trim().toLowerCase(), filtering = !!filter;
+  if (section !== "files" && treeMode && !filtering) { renderDirectoryTree(); return; }
   const generation = ++treeSerial;
   const tree = $("file-tree"); tree.replaceChildren();
-  const filter = $("file-filter").value.toLowerCase();
-  const visible = files.filter(f => f.path.toLowerCase().includes(filter) && (showHiddenFiles() || !dotPath(f.path)));
+  // A filter shows only the server's whole-catalog matches for the current query.
+  const listed = filtering ? filterResults?.query === filter ? filterResults.items : [] : files;
+  const visible = listed.filter(f => showHiddenFiles() || !dotPath(f.path));
   const changes = gitChangesByPath(), metricRows = [];
   const dirs = new Map([["", tree]]);
   for (const file of visible) {
@@ -1381,11 +1405,21 @@ function renderFiles() {
     parent.append(li);
   }
   viewerMetrics?.renderLegend(metricRows.filter(Boolean));
-  $("browse-root").textContent = status?.workspaceRoot || "Indexed workspace";
+  $("browse-root").hidden = true;
   $("reveal-method").hidden = !selectedMethod;
-  if (!visible.length) tree.append(element("li", files.length ? "No loaded paths match. Clear the filter or load more files." : "No indexed files yet. Use Index workspace above, then browse the tree.", "detail"));
-  $("files-state").textContent = `${visible.length} of ${files.length} loaded files${nextFileOffset != null ? " · more available" : ""}`;
-  $("more-files").hidden = nextFileOffset == null;
+  if (filtering) {
+    const searching = filterResults?.query !== filter;
+    if (!searching && !visible.length) tree.append(element("li", "No indexed files match.", "detail"));
+    $("files-state").textContent = filterError || (searching ? "Searching indexed files…"
+      : `${visible.length} matching indexed ${visible.length === 1 ? "file" : "files"}${filterResults.next != null ? " · more available" : ""}`);
+    $("more-files").hidden = searching || filterResults.next == null;
+    $("more-files").textContent = "Load more matches";
+  } else {
+    if (!visible.length) tree.append(element("li", files.length ? "No indexed files to show." : "No indexed files yet. Use Index workspace above, then browse the tree.", "detail"));
+    $("files-state").textContent = `${visible.length} of ${files.length} loaded files${nextFileOffset != null ? " · more available" : ""}`;
+    $("more-files").hidden = nextFileOffset == null;
+    $("more-files").textContent = "Load more files";
+  }
   if (section === "files") appendChangedOnlyPaths(tree, filter);
 }
 async function toggleFile(file) {
@@ -1469,7 +1503,41 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
     published = true;
   }, current, "sequence-state");
 }
-$("file-filter").addEventListener("input", renderFiles);
+// Bounded by the server: at most 256 bytes and one 200-row page per request.
+let filterResults = null, filterError = "", filterSerial = 0, filterTimer = null;
+const filterQueryBytes = 256;
+function clearFileFilterResults() { filterSerial++; clearTimeout(filterTimer); filterTimer = null; filterResults = null; filterError = ""; }
+async function searchFiles(offset = 0) {
+  const raw = $("file-filter").value.trim(), query = raw.toLowerCase(), serial = ++filterSerial;
+  filterError = "";
+  if (!offset) filterResults = null;
+  if (!query) { filterResults = null; renderFiles(); return; }
+  if (!status?.revision) { filterResults = {query, items:[], next:null}; filterError = "No usable index to search."; renderFiles(); return; }
+  if (new TextEncoder().encode(raw).length > filterQueryBytes) { filterError = "Filter is too long."; renderFiles(); return; }
+  const guard = browseGuard(), revision = IndexPin.copy(status.revision);
+  const current = () => guard() && serial === filterSerial && $("file-filter").value.trim().toLowerCase() === query;
+  renderFiles();
+  try {
+    const data = await api(`/api/files?${IndexPin.query(revision)}&q=${encodeURIComponent(raw)}&offset=${offset}&limit=200`, "GET", undefined, current);
+    if (!current()) return;
+    if (!IndexPin.equal(data.revision, revision)) { unexpectedPair(undefined, data.revision); return; }
+    const earlier = offset && filterResults?.query === query ? filterResults.items : [];
+    filterResults = {query, items:[...earlier, ...data.items], next:data.nextOffset};
+  } catch (error) {
+    if (!current() || error.name === "AbortError") return;
+    // A stale pin rebinds like other browse reads; a failed later page keeps the matches already shown.
+    if (IndexPin.isConflict(error)) { unexpectedPair("Index changed. Refresh status before filtering again."); return; }
+    const earlier = offset && filterResults?.query === query ? filterResults.items : [];
+    filterResults = {query, items:earlier, next:null}; filterError = `Filter unavailable: ${error.message}`;
+  }
+  renderFiles();
+}
+$("file-filter").addEventListener("input", () => {
+  // Old matches never stay on screen under a new query.
+  clearFileFilterResults(); renderFiles();
+  if (!$("file-filter").value.trim()) return;
+  filterTimer = setTimeout(() => { filterTimer = null; void searchFiles(); }, 150);
+});
 $("show-hidden-files").addEventListener("change", event => {
   showHiddenFiles(); hiddenFilesShown = event.target.checked;
   try { window.localStorage.setItem(hiddenFilesKey(), String(hiddenFilesShown)); } catch { /* Not remembered; this page still applies it. */ }
@@ -1477,35 +1545,59 @@ $("show-hidden-files").addEventListener("change", event => {
 });
 $("all-methods").addEventListener("change", renderFiles);
 $("all-steps").addEventListener("change", () => loadSequence());
-$("more-files").addEventListener("click", () => perform(() => loadFiles(), $("more-files")));
+$("more-files").addEventListener("click", () => perform(() => $("file-filter").value.trim() && filterResults?.next != null ? searchFiles(filterResults.next) : loadFiles(), $("more-files")));
 
 $("method-source").addEventListener("click", () => { if (selectedMethod && status) perform(() => showSource(selectedMethod, status.revision)); });
 
 $("retry-files").addEventListener("click", () => perform(() => loadFiles(retryCatalogReset), $("retry-files")));
-$("reveal-method").addEventListener("click", () => {
-  if (!selectedMethod) return;
-  $("file-filter").value = "";
-  if (treeMode) {
-    for (const state of directories.values()) {
-      const entry = state.items?.find(item => item.indexedPath === selectedMethod.path);
-      if (!entry) continue;
-      let path = "";
-      directories.get("").open = true;
-      for (const part of entry.path.split("/").slice(0, -1)) {
-        path = path ? path + "/" + part : part;
-        if (directories.has(path)) directories.get(path).open = true;
-      }
+// The live tree path of an indexed path, or null outside the browse root.
+function treePathOf(indexedPath) {
+  if (!treeRoot || !indexedWorkspace) return null;
+  const absolute = `${indexedWorkspace.replace(/\/$/, "")}/${indexedPath}`, base = treeRoot.replace(/\/$/, "");
+  return absolute.startsWith(base + "/") ? absolute.slice(base.length + 1) : null;
+}
+// Reveal opens (loading as needed) every live ancestor folder, even ones never opened, e.g. after
+// the method was found through the whole-catalog filter.
+async function revealSelectedMethod() {
+  const method = selectedMethod;
+  if (!method) return;
+  const guard = browseGuard(), current = () => guard() && selectedMethod === method;
+  $("file-filter").value = ""; clearFileFilterResults();
+  // Without a known root pair, an already-listed entry still names its live path.
+  const listed = () => { for (const state of directories.values()) { const entry = state.items?.find(item => item.indexedPath === method.path); if (entry) return entry.path; } return null; };
+  const relative = treeMode ? treePathOf(method.path) ?? listed() : null;
+  // Page a folder's listing until it holds `path`, or the listing ends or fails.
+  const pageUntil = async (folder, path) => {
+    const state = directoryState(folder, true);
+    while (!state.items?.some(item => item.path === path) && (state.items === null || state.nextOffset != null)) {
+      const before = state.items?.length ?? -1;
+      await loadDirectory(folder, state.items === null);
+      if (!current()) return false;
+      if (state.error || (state.items?.length ?? -1) === before) break;
     }
+    return true;
+  };
+  if (relative) {
+    let parent = "";
+    directoryState("", true).open = true;
+    for (const part of relative.split("/").slice(0, -1)) {
+      const path = parent ? `${parent}/${part}` : part;
+      if (!await pageUntil(parent, path)) return;
+      directoryState(path, true).open = true;
+      parent = path;
+    }
+    // The file itself may be on a later page of its folder, loaded or not.
+    if (!await pageUntil(parent, relative)) return;
   }
-  const parts = selectedMethod.path.split("/"); let directory = "";
+  const parts = method.path.split("/"); let directory = "";
   for (const part of parts.slice(0, -1)) { directory += part + "/"; closedDirectories.delete(directory); }
-  const state = fileStates.get(selectedMethod.path);
-  if (state) state.open = true;
+  if (!fileStates.get(method.path)?.open) { await toggleFile({path:method.path}); if (!current()) return; }
   $("all-methods").checked = true;
   renderFiles();
   const pick = $("file-tree").querySelector(".method-pick.selected");
   pick?.focus({preventScroll:true}); pick?.scrollIntoView?.({block:"nearest"});
-});
+}
+$("reveal-method").addEventListener("click", () => perform(revealSelectedMethod, $("reveal-method")));
 
 function appendMethods(li, file) {
   const state = fileStates.get(file.path);
@@ -1534,6 +1626,8 @@ function appendMethods(li, file) {
 
 // Filesystem metadata is separate from the immutable indexed source catalog.
 async function loadTreeRoot() {
+  // A filter kept across a new pin searches the new catalog.
+  if ($("file-filter").value.trim()) void searchFiles();
   if (section === "files") return loadFiles(true);
   treeMode = true;
   await loadDirectory("", true);
@@ -1733,19 +1827,14 @@ function renderDirectoryTree() {
   $("browse-root").textContent = scopeMismatch
     ? `Browsing: ${treeRoot} · Index workspace: ${indexedWorkspace}. Indexing applies only to the index workspace.`
     : treeRoot || "Working directory";
+  $("browse-root").hidden = !scopeMismatch;
   $("index").textContent = scopeMismatch
     ? `Index ${indexedWorkspace.split("/").filter(Boolean).at(-1) || indexedWorkspace}`
     : "Index workspace";
-  $("browse-scope").textContent = indexedWorkspace
-    ? `Methods and diagrams come from the indexed workspace: ${indexedWorkspace}. Other files are metadata only.`
-    : "Browse the working directory. Only indexed files have methods and diagrams.";
+  // A non-empty filter shows only whole-catalog matches, even while folders (re)load.
+  if ($("file-filter").value.trim()) { renderFiles(); return; }
   $("reveal-method").hidden = !selectedMethod;
   $("retry-files").hidden = true; $("more-files").hidden = true;
-  const filter = $("file-filter").value.toLowerCase();
-  function matches(item) {
-    return !filter || item.path.toLowerCase().includes(filter) ||
-      (item.kind === "directory" && directories.get(item.path)?.items?.some(matches));
-  }
   let count = 0, hidden = 0;
   const metricRows = [], showHidden = showHiddenFiles();
   const changes = treeRoot === selectedWorkspaceRoot ? gitChangesByPath() : new Map();
@@ -1753,15 +1842,14 @@ function renderDirectoryTree() {
     const state = directories.get(path);
     if (!state) return;
     const unsupported = [];
-    for (const item of (state.items || []).filter(matches)) {
+    for (const item of state.items || []) {
       if (!showHidden && hiddenTreeEntry(item)) { hidden++; continue; }
       count++;
       if (unsupportedTreeFile(item)) { unsupported.push(item); continue; }
       const row = element("li");
       if (item.kind === "directory") {
         const compact = compactDirectory(item), child = directories.get(item.path);
-        const terminal = directories.get(compact.last.path);
-        const open = !!child?.open || (!!filter && !!terminal?.items);
+        const open = !!child?.open;
         const label = compact.items.map(entry => entry.name).join("/") + "/";
         const fullPath = compact.last.path + "/";
         const selection = metricDirectorySelection(compact.last.path);
@@ -1806,9 +1894,7 @@ function renderDirectoryTree() {
   }
   rows("", tree);
   viewerMetrics?.renderLegend(metricRows.filter(Boolean));
-  $("files-state").textContent = (filter ? `${count} matching loaded entries · unopened folders are not searched` : "Expand folders to browse. Choose an indexed file to see methods.")
-    + (hidden ? ` ${hidden} hidden or unindexed ${hidden === 1 ? "entry" : "entries"} not shown.` : "");
-  if (filter && !count) tree.append(element("li", "No loaded entries match. Clear the filter to browse folders.", "detail"));
+  $("files-state").textContent = hidden ? `${hidden} hidden or unindexed ${hidden === 1 ? "entry" : "entries"} · ⋯ to show` : "";
 }
 
 // External libraries are candidate definitions, never workspace evidence.
@@ -2126,7 +2212,7 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 
 // Class diagrams are an independent, cached-source projection. They never infer
 // a sequence participant's type or call a provider.
-function classLanguage(path) { return /\.(?:java|py|js|mjs|cjs)$/i.test(path || ""); }
+function classLanguage(path) { return /\.(?:java|py|js|mjs|cjs|rs)$/i.test(path || ""); }
 async function openClasses(options = {}) {
   architecture?.clearInspection();
   treemap?.clearInspection();

@@ -65,7 +65,7 @@ test("inert defaults request one complete revision pin and use physical lines in
   for (const [key, expected] of Object.entries({scope:"revision", aggregate:"max", role:"production", workbench:"true", indexGeneration:pin.indexGeneration, indexRevision:"1"})) assert.equal(query.get(key), expected);
   const {files, options} = h.renders[0]; assert.equal(files.length, 5); assert.ok(files.some(file => file.physicalLines === 0));
   const mixed = files.find(file => file.path === "src/main.rs" && file.sourceSetId === "workspace");
-  assert.equal(options.fileValue(mixed), 3); assert.match(h.get("treemap-state").textContent, /17 physical file lines/);
+  assert.equal(options.fileValue(mixed), 3); assert.match(h.get("treemap-summary").textContent, /17 physical file lines/);
   assert.equal(h.reads.length, 0); options.onSelectFile(mixed);
   const content = text(h.get("treemap-inspector-content"));
   assert.match(content, /8 physical file lines · includes inline test lines/); assert.match(content, /mixed callable population/);
@@ -80,9 +80,9 @@ test("include tests affects only metrics; hide tests affects only file visibilit
   const h = harness(); await h.controller.refresh();
   h.setResponse(async () => ({payload:fixture("max", "all")})); h.get("treemap-metric-tests").checked = true;
   await h.get("treemap-metric-tests").fire("change"); assert.equal(h.renders.at(-1).files.length, 5);
-  assert.match(h.calls.at(-1).url, /role=all/); assert.match(h.get("treemap-state").textContent, /17 physical file lines/);
+  assert.match(h.calls.at(-1).url, /role=all/); assert.match(h.get("treemap-summary").textContent, /17 physical file lines/);
   h.get("treemap-hide-tests").checked = false; await h.get("treemap-hide-tests").fire("change");
-  assert.equal(h.calls.length, 2); assert.equal(h.renders.at(-1).files.length, 7); assert.match(h.get("treemap-state").textContent, /22 physical file lines/);
+  assert.equal(h.calls.length, 2); assert.equal(h.renders.at(-1).files.length, 7); assert.match(h.get("treemap-summary").textContent, /22 physical file lines/);
   h.setResponse(async () => ({payload:fixture()})); h.get("treemap-metric-tests").checked = false; await h.get("treemap-metric-tests").fire("change");
   const {files, options} = h.renders.at(-1); const testOnly = files.find(file => file.path === "tests/main.rs");
   assert.equal(options.fileValue(testOnly), null); options.onSelectFile(testOnly);
@@ -110,11 +110,11 @@ test("keyboard-equivalent list selects exact duplicate paths including zero-area
 test("directory drills use exact source sets, breadcrumbs go up, language/path filters recompute area", async () => {
   const h = harness(); await h.controller.refresh();
   await h.renders[0].options.onSelectDirectory({sourceSetId:"workspace", path:"src"});
-  assert.equal(h.renders.at(-1).files.length, 2); assert.match(h.get("treemap-state").textContent, /11 physical file lines/);
+  assert.equal(h.renders.at(-1).files.length, 2); assert.match(h.get("treemap-summary").textContent, /11 physical file lines/);
   assert.deepEqual(h.get("treemap-breadcrumbs").children.map(node => node.textContent), ["All indexed files", "workspace", "src"]);
   await h.get("treemap-breadcrumbs").children[0].fire("click");
   h.get("treemap-language").value = "python"; await h.get("treemap-language").fire("change");
-  assert.equal(h.renders.at(-1).files.length, 1); assert.match(h.get("treemap-state").textContent, /2 physical file lines/);
+  assert.equal(h.renders.at(-1).files.length, 1); assert.match(h.get("treemap-summary").textContent, /2 physical file lines/);
   h.get("treemap-path").value = "missing"; await h.get("treemap-path").fire("input");
   assert.equal(h.get("treemap-state").dataset.state, "empty"); assert.equal(h.get("treemap-files").children.length, 0); assert.equal(h.calls.length, 1);
 });
@@ -242,7 +242,7 @@ test("excluded file rows retain physical area, exact reasons, raw populations an
   const rendered = h.renders.at(-1); assert.equal(rendered.files[0], excluded); assert.equal(rendered.options.fileBand(excluded), null);
   rendered.options.onSelectFile(excluded);
   assert.match(text(h.get("treemap-inspector-content")), /Excluded from heat: fixture/);
-  assert.match(h.get("treemap-state").textContent, /9 physical file lines.*8 callables excluded from heat.*1 fixture files/);
+  assert.match(h.get("treemap-summary").textContent, /9 physical file lines.*8 callables excluded from heat.*1 fixture files/);
 });
 
 
@@ -301,7 +301,7 @@ function resizeHarness() {
     if (!hold(projection)) return Promise.resolve(finish());
     const gate = deferred(); held.push(gate); return gate.promise.then(finish);
   });
-  const setBox = (width, height = 600) => { box.offsetWidth = width + 16; box.offsetHeight = height + 16; };
+  const setBox = (width, height = 600) => { box.clientWidth = box.offsetWidth = width + 16; box.clientHeight = box.offsetHeight = height + 16; };
   // One observer callback, then its debounced relayout.
   const resize = async (width, height) => { setBox(width, height); observers[0](); const run = timers.pop(); timers.length = 0; await run?.(); };
   // The adapter's click/keyboard handler: inert unless its owner is current.

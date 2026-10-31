@@ -91,16 +91,15 @@
     return typeof name === "string" && name ? name : sourceSetId;
   }
   // Without a measured viewport: 100 px per sqrt(file count), 640–4000 px square.
-  // With one: the panel's own size, grown in its aspect ratio only when it gives a
-  // file less than 50×50 px on average, and never beyond 4000 px per side. Pele's
-  // nodeWidth/nodeHeight units are ten pixels.
+  // With one: the panel's own size. The width never exceeds the panel (#451); only
+  // the height grows, when the panel gives a file less than 50×50 px on average, and
+  // never beyond 4000 px. Pele's nodeWidth/nodeHeight units are ten pixels.
   function layoutSize(count,viewport) {
     const natural = Math.min(4000,Math.max(640,Math.ceil(Math.sqrt(count)*100)));
     if (!viewport || !Number.isFinite(viewport.width) || !Number.isFinite(viewport.height)) return {width:natural,height:natural};
-    let width = Math.max(MIN_WIDTH,Math.floor(viewport.width)), height = Math.max(MIN_HEIGHT,Math.floor(viewport.height));
-    const needed = count*2500;
-    if (width*height < needed) { const scale = Math.sqrt(needed/(width*height)); width = Math.ceil(width*scale); height = Math.ceil(height*scale); }
-    return {width:Math.min(4000,width),height:Math.min(4000,height)};
+    const width = Math.min(4000,Math.max(MIN_WIDTH,Math.floor(viewport.width)));
+    const height = Math.max(MIN_HEIGHT,Math.floor(viewport.height),Math.ceil(count*2500/width));
+    return {width,height:Math.min(4000,height)};
   }
   function validatedSvg(raw, projection) {
     if (typeof raw !== "string" || bytes(raw) > 8*1024*1024) unsupported("Treemap SVG too large");

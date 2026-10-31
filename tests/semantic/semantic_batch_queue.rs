@@ -186,7 +186,7 @@ impl World {
 
     fn count(&self, sql: &str) -> i64 {
         self.store
-            .with_index_sql_for_tests(|db| Ok(db.query_row(sql, [], |row| row.get(0))?))
+            .with_index_read_for_tests(|db| Ok(db.query_row(sql, [], |row| row.get(0))?))
             .unwrap()
     }
 
@@ -1764,7 +1764,7 @@ fn head_coverage(world: &World, path: &str) -> (String, Option<String>) {
     let head = world.head();
     world
         .store
-        .with_index_sql_for_tests(|db| {
+        .with_index_read_for_tests(|db| {
             Ok(db.query_row(
                 "SELECT state, diagnostic FROM semantic_coverage WHERE revision_id=?1 AND path=?2",
                 [

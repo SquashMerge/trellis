@@ -79,6 +79,18 @@ fn pickup_status(checkout: &Checkout, producer: &str) -> Value {
     entry["pickup"].clone()
 }
 
+/// Daemon settings that keep the pickup watch from triggering an import of its own while a
+/// test runs (#197). A watcher import is legitimate, and the pickup directory it holds is
+/// present until its verdict, so a test that asserts on `pickups` after a CLI pickup must not
+/// race one. The watch still arms; only its debounce, stability and stat-check intervals are
+/// longer than any test.
+fn quiet_watch() -> Vec<(String, String)> {
+    vec![(
+        "TRELLIS_TEST_PICKUP_INTERVALS".to_owned(),
+        r#"{"debounceMs":3600000,"stableMs":3600000,"checkMs":3600000}"#.to_owned(),
+    )]
+}
+
 fn json_out(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
@@ -90,7 +102,7 @@ fn json_out(output: &Output) -> Value {
 
 #[test]
 fn pickup_set_imports_artifact_without_producer() {
-    let checkout = start_checkout(workspace, &[]);
+    let checkout = start_checkout(workspace, &quiet_watch());
     let (tripwire, marker) = tripwire_dir(checkout.temp.path());
     let artifact = java_artifact(&checkout, "index.scip");
     let before = workspace_tree_digest(&checkout.root);
@@ -141,7 +153,7 @@ fn pickup_set_imports_artifact_without_producer() {
 
 #[test]
 fn pickup_set_reports_typed_import_error() {
-    let checkout = start_checkout(workspace, &[]);
+    let checkout = start_checkout(workspace, &quiet_watch());
     let (tripwire, marker) = tripwire_dir(checkout.temp.path());
     let good = java_artifact(&checkout, "good.scip");
     let bad = checkout.temp.path().join("bad.scip");
@@ -329,13 +341,12 @@ fn pickup_config_survives_daemon_restart() {
 
 #[test]
 fn lost_pickup_wait_keeps_the_batch_until_the_request_settles() {
-    let checkout = start_checkout(
-        workspace,
-        &[(
-            "TRELLIS_TEST_PRODUCER_FAIL_WAIT".to_owned(),
-            "unused".to_owned(),
-        )],
-    );
+    let mut env = quiet_watch();
+    env.push((
+        "TRELLIS_TEST_PRODUCER_FAIL_WAIT".to_owned(),
+        "unused".to_owned(),
+    ));
+    let checkout = start_checkout(workspace, &env);
     let (tripwire, _marker) = tripwire_dir(checkout.temp.path());
     let artifact = java_artifact(&checkout, "index.scip");
     let before = status(&checkout)["head"]["indexRevision"].as_u64().unwrap();
@@ -377,7 +388,7 @@ fn lost_pickup_wait_keeps_the_batch_until_the_request_settles() {
 /// and the published evidence's status stays `done`.
 #[test]
 fn duplicate_pickup_at_same_head_is_idempotent() {
-    let checkout = start_checkout(workspace, &[]);
+    let checkout = start_checkout(workspace, &quiet_watch());
     let (tripwire, _) = tripwire_dir(checkout.temp.path());
     let artifact = java_artifact(&checkout, "index.scip");
     let args = [

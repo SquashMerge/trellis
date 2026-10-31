@@ -509,7 +509,7 @@ impl World {
 
     fn batches(&self) -> i64 {
         self.store
-            .with_index_sql_for_tests(|db| {
+            .with_index_read_for_tests(|db| {
                 Ok(
                     db.query_row("SELECT COUNT(*) FROM semantic_raw_batches", [], |r| {
                         r.get(0)
@@ -543,7 +543,7 @@ fn generation_recorded_in_retained_descriptor() {
     let head = world.head();
     let descriptor_bytes: Vec<u8> = world
         .store
-        .with_index_sql_for_tests(|db| {
+        .with_index_read_for_tests(|db| {
             Ok(db.query_row(
                 "SELECT descriptor_bytes FROM semantic_raw_batches",
                 [],

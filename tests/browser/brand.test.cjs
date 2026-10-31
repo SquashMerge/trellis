@@ -138,12 +138,13 @@ test("real shell loads local brand fonts, preserves Connect and source, and rend
     await page.keyboard.press("End");await activeTab("Libraries");
     await page.keyboard.press("Home");await activeTab("Architecture");
     await page.locator("#view-sequence").click();await activeTab("Sequence");
-    await page.locator("#refresh").click();
+    await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
     await page.waitForFunction(()=>!document.querySelector("#refresh").disabled);
     assert.equal(await page.locator("#error").isVisible(),false);
     assert.ok(checkoutRequests.includes("jobs/current"),"checkout selection still loads the current index job");
     assert.ok(checkoutRequests.every(route=>! /^(?:symbols|symbol|query|views|annotations|questions|jev|acp)(?:\/|$)/.test(route)),JSON.stringify(checkoutRequests));
     for (const selector of ["#checkout-select","#refresh"]) {
+      await H.reveal(page,selector);
       await readable(page,selector);
       const boundary = await contrast(page,selector,{border:true});
       assert.ok(boundary.ratio >= 3 && boundary.outsideRatio >= 3,`${selector} boundary contrast ${JSON.stringify(boundary)}`);

@@ -87,6 +87,7 @@ This dispatcheslanguage to behavior_js::build(...sameargs)->Result<SequenceView>
 
 Catalog/API workerowns src/store.rs src/http.rs tests/browse_http.rs (notexistingtests unlessneeded).
 GET /api/files?revision=N&offset=0&limit=200 -> {revision,items:[{path,language,methodCount}],nextOffset:number|null}.
+Optional `q` (1–256 bytes, no control characters) keeps only paths containing it, ASCII case-insensitive, across the whole pinned catalog before paging (#447).
 GET /api/methods?revision=N&path=... -> {revision,items:[{symbol:Symbol,consequential:bool,reason:String}],truncated:bool}.
 Methods = indexed Function/Method includingnestedmethods labeled bynames/path ranges; no class/moduleasmethod.
 Conservativeheuristic only hide accessor/trivialreturnliteral/identifier methods ifdemonstrablytrivial; otherwise
@@ -105,7 +106,7 @@ root/backendworker serves /sequence.js CSPself. UIworker ownsrenderer too.
 Safe DOMtextContent/createElementNS no userHTML/mermaid stringinjection. Every step keyboard-clickable source
 location through existing showSource helper; horizontaloverflowcontaineddiagramnotpage. Sourceaccessiblelist
 orbuttons equivalent; smallscreensusable. Explicit showAllsteps toggles serverrequest. Fileexpandloadsinline
-methods and preservesotherbranches; filterfilepaths localexistingcatalog, showallmethodstoggle. 200filepages
+methods and preservesotherbranches; filter searches the whole pinned catalog server-side (`q`, #447), showallmethodstoggle. 200filepages
 Loadmore control. Concurrencygenerationsperfile+diagram+session+revision prevents stale successANDfailure,
 logout/indexrevision clearcatalog/diagram/state. Showclearloading/empty/unsupported states; labelstaticpossible
 paths and uncalibrated heuristics. Preserveexisting rawquery/question features andtests. No inferencecalls.

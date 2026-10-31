@@ -49,8 +49,9 @@ function harness({saved, blocked = false, routes} = {}) {
   async function connect(value = "synthetic-new", remember = false, select = true) {
     get("token").value = value; get("remember-token").checked = remember;
     get("connect-form").listeners.submit({preventDefault() {}});
-    await flush();
-    if (select && !get("checkout-select").disabled) {
+    for (let i = 0; i < 8; i++) await flush();
+    // Arrival may already have opened the only (or last used) checkout.
+    if (select && !get("checkout-select").disabled && vm.runInContext("selectedRootKey", context) !== ROOT) {
       get("checkout-select").value = ROOT;
       await get("checkout-select").listeners.change({target:get("checkout-select")});
       await flush();
@@ -108,16 +109,18 @@ test("Files reads use the selected checkout adapter without reviving retired sym
   }
 });
 
-test("Connect enters the shell directly and reports the measured daemon address", async () => {
+test("Connect enters the shell directly and opens the only checkout", async () => {
   const h = harness();
   await h.connect("synthetic",false,false);
   assert.equal(h.run('document.body.classList.contains("daemon-connected")'),true);
   assert.equal(h.get("connect-form").hidden,true);
-  assert.equal(h.get("logout").hidden,false);
+  assert.equal(h.get("app-menu").hidden,false,"Disconnect is reachable from the header menu");
   assert.equal(h.get("token").value,"");
-  assert.match(h.get("notice").textContent,/Connected to the daemon on 127\.0\.0\.1:43127/);
-  assert.equal(h.run("selectedRootKey"),null);
-  assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status"]);
+  assert.equal(h.run("selectedRootKey"),ROOT,"the only available checkout is selected on arrival");
+  assert.equal(h.get("checkout-select").value,ROOT);
+  assert.deepEqual(h.requests.slice(0,2).map(r=>r.url),["/api/checkouts","/api/daemon/status"]);
+  assert.ok(h.requests.slice(2).every(r=>r.url.startsWith(`${SCOPED}/`)),"arrival reads only the selected checkout");
+  assert.ok(!h.requests.some(r=>r.options?.method==="POST"),"arrival never starts indexing");
   h.get("logout").listeners.click();
   assert.equal(h.run('document.body.classList.contains("daemon-connected")'),false);
   assert.equal(h.get("connect-form").hidden,false);
@@ -149,13 +152,13 @@ test("fresh browser starts with empty token and persistence off", () => {
 test("successful explicit connect persists trimmed token only with opt-in", async () => {
   const h = harness(); await h.connect("  synthetic-new\n", true);
   assert.equal(h.get("workspace").hidden, false);
-  assert.deepEqual(h.writes, [[KEY,"synthetic-new"]]);
+  assert.deepEqual(h.writes.filter(([key]) => key === KEY), [[KEY,"synthetic-new"]]);
   assert.equal(h.requests[0].options.headers.Authorization, "Bearer synthetic-new");
 });
 test("successful connect without opt-in removes existing saved token", async () => {
   const h = harness({saved:"synthetic-old"}); await h.connect("synthetic-new", false);
   assert.equal(h.get("workspace").hidden, false);
-  assert.equal(h.stored.has(KEY), false); assert.equal(h.writes.length, 0);
+  assert.equal(h.stored.has(KEY), false); assert.equal(h.writes.filter(([key]) => key === KEY).length, 0);
 });
 test("unchecking persistence immediately forgets the saved token", () => {
   const h = harness({saved:"synthetic-old"});
@@ -377,10 +380,12 @@ test("cold checkout keeps its explicit selection and never invents evidence", as
     throw new Error(`Cold checkout leaked request: ${url}`);
   }});
   await h.connect("synthetic",false,false);
-  h.get("checkout-select").value=ROOT;h.get("checkout-select").listeners.change({target:h.get("checkout-select")});await flush();
   assert.equal(h.run("selectedRootKey"),ROOT);
   assert.equal(h.run("status"),null);
   assert.match(h.get("checkout-state").textContent,/Index not ready/i);
+  assert.equal(h.get("index").hidden,false,"Index workspace is offered when there is no usable index");
+  for (const view of ["architecture","treemap","sequence","classes","libraries"]) assert.equal(h.get(`view-${view}`).disabled,true,`${view} is greyed out without an index`);
+  assert.equal(h.get("section-files").disabled,true);
   assert.equal(h.get("checkout-root").textContent.includes("/synthetic"),false,"unverified display path is not evidence");
   assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status",`${SCOPED}/git`,`${SCOPED}/status`,`${SCOPED}/git`]);
 });
@@ -752,8 +757,7 @@ test("Disconnect clears selected Git and rejects an in-flight Git read",async()=
   assert.equal(h.run("selectedRootKey"),null);
 });
 
-const checkoutNodes = node => [node,...node.children.flatMap(checkoutNodes)];
-test("checkout list shows measured freshness and shares explicit selection with the picker", async () => {
+test("several checkouts wait for an explicit picker choice, which arrival then remembers", async () => {
   const pin = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
   const rows = [
     {rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",revision:pin,catchingUp:false},
@@ -773,32 +777,29 @@ test("checkout list shows measured freshness and shares explicit selection with 
     throw new Error("Unexpected " + url);
   }});
   await h.connect("synthetic",false,false);
-  const nodes = checkoutNodes(h.get("indexed-checkouts"));
-  const labels = nodes.filter(node => node.className === "checkout-freshness");
-  assert.deepEqual(labels.map(node => node.attrs["data-state"]),["fresh","catching-up","unknown","unknown","failed"]);
-  assert.match(labels[0].textContent,/Fresh.*12345678:1/);
-  assert.match(labels[1].textContent,/Catching up.*12345678:1/);
-  assert.match(labels[2].textContent,/Indexed · idle/);
-  assert.match(labels[3].textContent,/Not indexed/);
-  assert.match(labels[4].textContent,/Failed/);
-  const picks = nodes.filter(node => node.className === "checkout-pick");
-  assert.equal(picks[4].disabled,true);
-  assert.ok(picks.slice(0,4).every(node => !node.disabled));
-  assert.equal(h.run("selectedRootKey"),null);
+  const options = h.get("checkout-select").children.filter(node => node.value);
+  assert.deepEqual(options.map(node => node.disabled),[false,false,false,false,true],"unavailable entries cannot be chosen");
+  assert.match(options[3].textContent,/Not indexed/);
+  assert.equal(h.run("selectedRootKey"),null,"with several checkouts and none used before, nothing is chosen");
+  assert.equal(h.get("checkout-state").textContent,"Choose a checkout to inspect.");
+  assert.match(h.get("notice").textContent,/Connected to the daemon on 127\.0\.0\.1:43127\. Choose a checkout before browsing\./);
   assert.deepEqual(h.requests.map(request => request.url),["/api/checkouts","/api/daemon/status"]);
-  const before = h.requests.length;
-  await picks[0].listeners.click(); await flush();
-  const listRequests = h.requests.slice(before).map(request => request.url);
-  assert.equal(h.run("selectedRootKey"),ROOT);
-  assert.equal(h.get("checkout-select").value,ROOT);
-  assert.equal(h.get("checkout-state").textContent,"");
-  h.run("resetCheckout()");
-  const pickerStart = h.requests.length;
   h.get("checkout-select").value=ROOT;
   h.get("checkout-select").listeners.change({target:h.get("checkout-select")}); await flush();
-  assert.deepEqual(h.requests.slice(pickerStart).map(request => request.url),listRequests);
   assert.equal(h.run("selectedRootKey"),ROOT);
   assert.equal(h.get("checkout-state").textContent,"");
+  assert.equal(h.stored.get("trellis.lastCheckout.v1"),ROOT);
+  // The next arrival in this browser opens the last used checkout.
+  h.get("logout").listeners.click();
+  const before = h.requests.length;
+  await h.connect("synthetic",false,false);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(h.requests[before + 2].url,`${SCOPED}/git`);
+  // A remembered checkout that is no longer selectable is ignored.
+  h.get("logout").listeners.click();
+  h.stored.set("trellis.lastCheckout.v1","e".repeat(64));
+  await h.connect("synthetic",false,false);
+  assert.equal(h.run("selectedRootKey"),null);
 });
 
 test("newer checkout list freshness updates the selected card and header at the same snapshot pin", async () => {
@@ -820,9 +821,6 @@ test("newer checkout list freshness updates the selected card and header at the 
   listedCatchingUp = true;
   const before = h.requests.length;
   await h.run("loadCheckouts()");
-  const label = checkoutNodes(h.get("indexed-checkouts")).find(node => node.className === "checkout-freshness");
-  assert.equal(label.attrs["data-state"],"catching-up");
-  assert.match(label.textContent,/Catching up/);
   assert.equal(h.get("workspace-index-state").attrs["data-state"],"catching-up");
   assert.match(h.get("workspace-index-label").textContent,/Catching up/);
   assert.equal(h.run("status.catchingUp"),false,"cached status must not override the newer list observation");

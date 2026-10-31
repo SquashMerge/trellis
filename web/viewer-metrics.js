@@ -40,7 +40,7 @@
     function clearDecorations() {
       for (const item of decorations) item.node.remove();
       decorations = [];
-      get("metric-legend")?.replaceChildren(); get("explorer-metric-legend")?.replaceChildren();
+      get("metric-legend")?.replaceChildren();
     }
     function clearInspection() {
       inspectionSerial++;
@@ -191,14 +191,14 @@
       decorations.push(decoration);
       return decoration;
     }
-    // Explorer rows carry swatch + number; this legend names what they measure in every Diagrams view.
+    // Explorer rows carry swatch + number; each row's tooltip names what it measures and its band.
     function explorerLegend(scale) {
-      const target = get("explorer-metric-legend"); target?.replaceChildren();
-      if (!target || !decorations.length) return;
-      target.append(make("span", `Numbers: ${colorNames[metric] || metric} · ${aggregate} · ${population()}${scale ? ` · ${scale.label}` : " · No measured values · — unavailable, not zero"}`));
-      for (const {label, band} of scale?.entries || []) {
-        const entry = make("span", undefined, "metric-legend-entry");
-        entry.append(make("span", undefined, `metric-swatch${band === null ? " neutral" : ` heat-${band}`}`), make("span", label)); target.append(entry);
+      for (const item of decorations) {
+        if (!match(item.selection)) continue;
+        const color = scale && item.guard && current(item.guard) ? scale.band(item.value) : null;
+        const band = scale?.entries.find(entry => entry.band === color && color !== null)?.label;
+        item.node.title = `${colorNames[metric] || metric} · ${aggregate} · ${population()} · indexed snapshot: ${display(item.value)}`
+          + (scale ? ` · ${scale.label}${band ? ` · band ${band}` : ""}` : " · No measured values · — unavailable, not zero");
       }
     }
     function renderLegend(rendered) {
