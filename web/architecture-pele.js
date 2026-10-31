@@ -11,12 +11,57 @@
   const bytes = value => new TextEncoder().encode(value).length;
   // Display chips: compact module/file chips, more per band row, and a narrow shared box.
   // CHIP_CELL is one drawn chip column (chip, padding and grid gap) at 14px Inter; the
-  // summary display fits as many columns as the canvas width holds (#449).
-  const CHIP_WIDTH = 104, CHIP_CELL = 176, CHIP_COLUMNS = 5, MAX_COLUMNS = 14, SHARED_WIDTH = 104, SHARED_ROWS = 6, STAT_GAP = "   ";
+  // summary display fits as many columns as the canvas width holds (#449). The chip text
+  // width then grows or shrinks so the drawing fills the panel width (#525).
+  const CHIP_WIDTH = 104, MIN_CHIP = 72, MAX_CHIP = 240, CHIP_CELL = 176, CHIP_COLUMNS = 5, MAX_COLUMNS = 14, SHARED_ROWS = 6, STAT_GAP = "   ";
+  // Pele's drawn node padding around a label and the grid gap between siblings.
+  const NODE_PAD = 32, GRID_GAP = 12;
+  // A stat chip is its text plus 12 units of padding, 6 apart (see statChips).
+  const STAT_PAD = 12, STAT_SPACING = 6;
+  // Lines one wrapped label line may take before its last is clipped: a bound for
+  // pathological repository names only; ordinary paths and layer names wrap whole.
+  const MAX_LINES = 12;
   // Chip columns for the ordered stack: the canvas width less one column per shared box.
   function chipColumns(width, shared) {
     if (!Number.isFinite(width) || width <= 0) return CHIP_COLUMNS;
     return Math.max(1, Math.min(MAX_COLUMNS, Math.floor(width / CHIP_CELL) - shared));
+  }
+  // Greedy word wrap at separators (space, ·, _, -, /, .); an unbreakable run is split
+  // by characters. Labels wrap rather than clip, so the drawn text is the whole text.
+  function wrap(line, width, measure, maxLines) {
+    if (measure(line) <= width) return [line];
+    const lines = [];
+    let current = "";
+    const fits = text => measure(text.trimEnd()) <= width;
+    for (const token of line.split(/(?<=[ ·_\-/.])/)) {
+      if (fits(current + token)) { current += token; continue; }
+      if (current.trim()) lines.push(current.trimEnd());
+      current = token.trimStart();
+      while (!fits(current)) {
+        let cut = 1;
+        while (cut < current.length && fits(current.slice(0, cut + 1))) cut++;
+        lines.push(current.slice(0, cut)); current = current.slice(cut);
+      }
+    }
+    if (current.trim() || !lines.length) lines.push(current.trimEnd());
+    if (lines.length <= maxLines) return lines;
+    const kept = lines.slice(0, maxLines);
+    let last = kept[maxLines - 1];
+    while (last && measure(`${last}…`) > width) last = last.slice(0, -1);
+    kept[maxLines - 1] = `${last}…`;
+    return kept;
+  }
+  // Stat chips grouped into header lines no wider than `width` once drawn.
+  function statLines(stats, width, measure) {
+    const lines = [];
+    let line = [], used = 0;
+    for (const stat of stats) {
+      const drawn = Math.ceil(measure(stat.text)) + STAT_PAD;
+      if (line.length && used + STAT_SPACING + drawn > width) { lines.push(line); line = []; used = 0; }
+      used += (line.length ? STAT_SPACING : 0) + drawn; line.push(stat);
+    }
+    if (line.length) lines.push(line);
+    return lines;
   }
   const ARROWS = {downward:"↓", upward:"↑", peer:"↔", "into shared":"→", "shared outbound":"←"};
   function direction(source, destination) {
@@ -29,23 +74,19 @@
     if (view?.state !== "ready" || !Array.isArray(view.layers) || !Array.isArray(view.modules) || !Array.isArray(view.edges)) unsupported("Invalid Architecture projection");
     const nodes = new Map(), edges = new Map(), layers = new Map(), native = new Set();
     const measure = options.measureText || (text => Array.from(text).length * 14);
+    const chip = Number.isFinite(options.chipWidth) ? Math.max(MIN_CHIP, Math.min(MAX_CHIP, Math.floor(options.chipWidth))) : CHIP_WIDTH;
     let serial = 0;
     const clean = text => String(text).replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ");
     // `shown` is the drawn text when it is shorter than the accessible `text`.
     function label(kind, record, text, pad = false, shown = text, width = null) {
       const id = kind + (serial++).toString(36), value = clean(text);
       // Uniform safe placeholders reserve width before repository text is inserted.
-      // A line is clipped, never shrunk; the accessible name keeps the full label.
-      const lineWidth = width ?? (kind === "L" || kind === "U" ? (pad ? 460 : 380) : kind === "M" ? 150 : kind === "E" ? (pad ? 240 : 150) : kind === "N" ? 260 : 200);
-      // A padded summary band is blank at its top, middle and bottom, where
-      // edge counts that meet or cross it are drawn; padded edge counts use one line.
+      // A line wraps at separators to the reserved width (#525); the accessible name keeps the full label.
+      const lineWidth = width ?? (kind === "L" || kind === "U" ? 380 : kind === "M" ? 150 : kind === "E" ? 150 : kind === "N" ? 260 : 200);
+      // Edge counts are one line, sized to their text, so they never wrap.
       const lines = clean(shown).split("\n");
-      // A shared side box adds trailing blanks so its text sits above the rows' edge counts.
-      const full = !pad ? lines : kind === "E" ? [lines.join(" ")] : ["", lines[0], "", ...lines.slice(1), "", ...(record?.shared ? Array(6).fill("") : [])], display = full.map(line => {
-        let result = "";
-        for (const c of line) { if (measure(result + c + "…") > lineWidth) return result + "…"; result += c; }
-        return result || " ";
-      });
+      const full = pad && kind === "E" ? [lines.join(" ")] : lines;
+      const display = (pad && kind === "E" ? full : full.flatMap(line => wrap(line, lineWidth, measure, MAX_LINES))).map(line => line || " ");
       const reserve = "W".repeat(Math.ceil(lineWidth / measure("W")));
       const firstReserve = "W".repeat(Math.max(1,Math.ceil((lineWidth - measure(id + "_")) / measure("W"))));
       const placeholders = display.map((_, i) => i === 0 ? id + "_" + firstReserve : reserve);
@@ -58,7 +99,8 @@
     const shownShared = view.layers.filter(l => l.shared && (!options.display || options.display.layers.has(l.name))).length;
     const COLUMNS = options.display ? options.columns ?? chipColumns(options.width, shownShared) : CHIP_COLUMNS;
     options.display?.reset?.();
-    const orderedStack = addNode("B",null,"Ordered layers");
+    // The stack title reserves no more than one chip, so it never sets the stack's width.
+    const orderedStack = addNode("B",null,"Ordered layers",false,"Ordered layers",options.display ? chip : null);
     // Optional summary display: the caller chooses drawn layers, expansion and
     // directory entries. Without it every layer is expanded to file chips.
     const display = options.display || null;
@@ -74,15 +116,19 @@
     const peerCount = order => ordered.filter(l => l.order === order).length;
     const width = display ? Math.max(1, ...ordered.map(l => peerCount(l.order))) : 1;
     const bandColumns = layer => Math.max(1, Math.floor(COLUMNS * Math.floor(width / peerCount(layer.order)) / width));
-    const headerWidth = layer => !display ? null : layer.shared ? SHARED_WIDTH : Math.max(CHIP_WIDTH, Math.min(460, bandColumns(layer) * CHIP_CELL - 32));
+    // A header wraps within its band's chip row, so it never widens or clips the band.
+    const rowWidth = columns => columns * (chip + NODE_PAD) + (columns - 1) * GRID_GAP - NODE_PAD;
+    const headerWidth = layer => !display ? null : layer.shared ? chip : Math.max(chip, rowWidth(bandColumns(layer)));
     for (const layer of drawn) {
       const header = options.layerLabel?.(layer) ?? `${layer.name}\n${layer.shared ? "Shared" : `Order ${layer.order}`}`;
-      // Non-zero reference counts become compact chips on their own header line.
+      // Non-zero reference counts become compact chips on their own header lines.
       const stats = display ? (options.layerStats?.(layer) || []).filter(stat => typeof stat?.text === "string" && stat.text) : [];
-      const chips = stats.map(stat => stat.text).join(STAT_GAP);
+      const widest = stats.reduce((most, stat) => Math.max(most, Math.ceil(measure(stat.text)) + STAT_PAD), 0);
+      const lineWidth = Math.max(headerWidth(layer) ?? 380, widest), groups = statLines(stats, lineWidth, measure);
       const item = addNode("L",layer,stats.length ? `${header}\n${stats.map(stat => stat.label || stat.text).join(" · ")}` : header,
-        false,stats.length ? `${header}\n${chips}` : header,headerWidth(layer));
-      item.stats = stats; item.statsLine = stats.length ? item.display.lastIndexOf(chips) : -1;
+        false,[header, ...groups.map(group => group.map(stat => stat.text).join(STAT_GAP))].join("\n"),lineWidth);
+      // The stat lines are the last lines; each fits its width, so wrapping leaves them whole.
+      item.statLines = groups.map((group, i) => ({stats:group, line:item.display.length - groups.length + i}));
       layers.set(layer.name,item);
     }
     const moduleRows = new Map(view.layers.map(l => [l.name,[]])); moduleRows.set(null,[]);
@@ -96,19 +142,19 @@
     function moduleNode(module, name) {
       const value = options.metric === "layer" ? undefined : options.moduleValue?.(module);
       const full = `${module.identity.path}${value === null ? "\nUnavailable" : value === undefined ? "" : `\n${value}`}`;
-      const item = typeof name === "string" ? addNode("M",module,full,false,`${name}${value === null ? "\n—" : value === undefined ? "" : `\n${value}`}`,CHIP_WIDTH) : addNode("M",module,full);
+      const item = typeof name === "string" ? addNode("M",module,full,false,`${name}${value === null ? "\n—" : value === undefined ? "" : `\n${value}`}`,chip) : addNode("M",module,full);
       item.band = heat(options.moduleBand?.(module)); leaf(item);
     }
     function emitEntries(entries, span) {
-      if (!entries.length) leaf(addNode("B",null,"No files shown",false,"No files shown",CHIP_WIDTH));
+      if (!entries.length) leaf(addNode("B",null,"No files shown",false,"No files shown",chip));
       for (const entry of entries) {
         if (entry.type === "module") moduleNode(entry.module, entry.name);
         else if (entry.type === "directory") {
-          const item = addNode("D",entry,entry.label,false,entry.open ? entry.label : entry.shown ?? entry.label,entry.open ? null : CHIP_WIDTH);
+          const item = addNode("D",entry,entry.label,false,entry.open ? entry.label : entry.shown ?? entry.label,entry.open ? rowWidth(span) : chip);
           item.band = entry.open ? null : heat(entry.band);
           if (entry.open) { open(item,span,span); emitEntries(entry.entries,span); source.push("end"); } else leaf(item);
-        } else if (entry.type === "note") leaf(addNode("N",entry,entry.label,false,entry.shown ?? entry.label,CHIP_WIDTH));
-        else if (entry.type === "chip") { const item = addNode("C",entry,entry.label,false,entry.shown ?? entry.label,CHIP_WIDTH); item.band = heat(entry.band); leaf(item); }
+        } else if (entry.type === "note") leaf(addNode("N",entry,entry.label,false,entry.shown ?? entry.label,chip));
+        else if (entry.type === "chip") { const item = addNode("C",entry,entry.label,false,entry.shown ?? entry.label,chip); item.band = heat(entry.band); leaf(item); }
         else unsupported("Invalid Architecture display entry");
       }
     }
@@ -116,7 +162,7 @@
     // whose header is the one toggle, over a short non-interactive file count.
     function folded(item, record, text, span) {
       open(item,1,span);
-      const summary = addNode("S",record,text,false,text,CHIP_WIDTH * 2); summary.owner = item; leaf(summary);
+      const summary = addNode("S",record,text,false,text,chip); summary.owner = item; leaf(summary);
       source.push("end");
     }
     function emitLayer(layer, span = 1) {
@@ -166,7 +212,7 @@
     }
     source.push("end"); shared.forEach(layer => emitLayer(layer)); if (!display) source.push("end");
     if (display?.unassigned && unassigned.length) {
-      const item = addNode("U",display.unassigned,display.unassigned.label); item.expanded = opened.has(null);
+      const item = addNode("U",display.unassigned,display.unassigned.label,false,display.unassigned.label,rowWidth(COLUMNS + shared.length)); item.expanded = opened.has(null);
       if (item.expanded) { open(item,COLUMNS + shared.length,stackSpan + shared.length); emitEntries(opened.get(null),COLUMNS + shared.length); source.push("end"); }
       else {
         const chips = display.summary ? display.summary(null,unassigned,COLUMNS + shared.length) : [];
@@ -258,24 +304,135 @@
       spans.forEach((span,i) => { span.textContent = item.display[i]; });
     } else { if (item.display.length !== 1) unsupported("Changed Architecture label wrapping"); label.textContent = item.display[0]; }
   }
-  // Replace the reserved header line with one compact chip per non-zero count.
+  // Replace each reserved header stat line with one compact chip per non-zero count.
   // Deviations use the error colour and keep their glyph, so colour is never the only cue.
   function statChips(node, label, item, measure) {
-    const line = [...label.querySelectorAll("tspan")][item.statsLine];
-    const x = Number(line?.getAttribute("x")), y = Number(line?.getAttribute("y"));
-    if (!line || !Number.isFinite(x) || !Number.isFinite(y)) unsupported("Invalid Architecture header geometry");
-    const widths = item.stats.map(stat => Math.ceil(measure(stat.text)) + 12), gap = 6;
-    const total = widths.reduce((sum, width) => sum + width, 0) + gap * (widths.length - 1);
-    const anchor = line.getAttribute("text-anchor") || label.getAttribute("text-anchor");
-    let left = anchor === "middle" ? x - total / 2 : anchor === "end" ? x - total : x;
-    line.textContent = "";
-    item.stats.forEach((stat, i) => {
-      const color = stat.tone === "error" ? "#FF8E9A" : "#B8BAC8", chip = document.createElementNS(NS,"rect"), text = document.createElementNS(NS,"text");
-      for (const [name,value] of Object.entries({x:left,y:y-15,width:widths[i],height:20,fill:"#14151D",stroke:color,rx:3})) chip.setAttribute(name,String(value));
-      for (const [name,value] of Object.entries({x:left + widths[i] / 2,y,fill:color,"text-anchor":"middle","font-size":"14"})) text.setAttribute(name,String(value));
-      text.setAttribute("class","trellis-architecture-stat"); text.setAttribute("data-tone",stat.tone === "error" ? "error" : "neutral");
-      text.textContent = stat.text; node.append(chip,text); left += widths[i] + gap;
-    });
+    const spans = [...label.querySelectorAll("tspan")];
+    for (const {stats, line:index} of item.statLines) {
+      const line = spans[index];
+      const x = Number(line?.getAttribute("x")), y = Number(line?.getAttribute("y"));
+      if (!line || !Number.isFinite(x) || !Number.isFinite(y)) unsupported("Invalid Architecture header geometry");
+      const widths = stats.map(stat => Math.ceil(measure(stat.text)) + STAT_PAD), gap = STAT_SPACING;
+      const total = widths.reduce((sum, width) => sum + width, 0) + gap * (widths.length - 1);
+      const anchor = line.getAttribute("text-anchor") || label.getAttribute("text-anchor");
+      let left = anchor === "middle" ? x - total / 2 : anchor === "end" ? x - total : x;
+      line.textContent = "";
+      stats.forEach((stat, i) => {
+        const color = stat.tone === "error" ? "#FF8E9A" : "#B8BAC8", chip = document.createElementNS(NS,"rect"), text = document.createElementNS(NS,"text");
+        for (const [name,value] of Object.entries({x:left,y:y-14,width:widths[i],height:18,fill:"#14151D",stroke:color,rx:3})) chip.setAttribute(name,String(value));
+        for (const [name,value] of Object.entries({x:left + widths[i] / 2,y,fill:color,"text-anchor":"middle","font-size":"14"})) text.setAttribute(name,String(value));
+        text.setAttribute("class","trellis-architecture-stat"); text.setAttribute("data-tone",stat.tone === "error" ? "error" : "neutral");
+        text.textContent = stat.text; node.append(chip,text); left += widths[i] + gap;
+      });
+    }
+  }
+  // Text extents of one drawn line: 14px Inter, anchored at its x.
+  function lineBox(x, y, width, anchor) {
+    const left = anchor === "middle" ? x - width / 2 : anchor === "end" ? x - width : x;
+    return {x:left, y:y - 15, w:width, h:20};
+  }
+  const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  // Points every few units along a connector's absolute M/L/Q/C path.
+  function pathPoints(d) {
+    const points = [];
+    let at = null;
+    for (const [, command, args] of d.matchAll(/([MLQC])([^MLQC]*)/g)) {
+      const values = (args.match(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi) || []).map(Number);
+      const pairs = []; for (let i = 0; i + 1 < values.length; i += 2) pairs.push([values[i], values[i + 1]]);
+      if (!pairs.length || pairs.some(pair => !pair.every(Number.isFinite))) return [];
+      const end = pairs[pairs.length - 1];
+      if (command === "M" || !at) { at = end; points.push(at); continue; }
+      const curve = t => {
+        const [p0, ...rest] = [at, ...pairs], all = [p0, ...rest];
+        // De Casteljau over the segment's control points (linear, quadratic or cubic).
+        let level = all;
+        while (level.length > 1) level = level.slice(1).map((point, i) => [level[i][0] + (point[0] - level[i][0]) * t, level[i][1] + (point[1] - level[i][1]) * t]);
+        return level[0];
+      };
+      const length = Math.hypot(end[0] - at[0], end[1] - at[1]) + (pairs.length > 1 ? Math.hypot(pairs[0][0] - at[0], pairs[0][1] - at[1]) : 0);
+      const steps = Math.max(1, Math.ceil(length / 3));
+      for (let i = 1; i <= steps; i++) points.push(curve(i / steps));
+      at = end;
+    }
+    return points;
+  }
+  // Count tags sit on or beside their own connector, clear of every header line, stat
+  // chip, drawn chip and other tag (#525). Each tag takes the nearest free spot to its
+  // connector, preferring the connector's middle; a tag with no free spot within reach
+  // keeps Pele's place. Text and boxes are obstacles; connector strokes and band borders are not.
+  function placeTags(root, controls, measure) {
+    const width = Number(root.getAttribute("width")), height = Number(root.getAttribute("height"));
+    const obstacles = [];
+    for (const text of root.querySelectorAll(".pele-cluster-label")) {
+      const anchor = text.getAttribute("text-anchor") || "start", spans = [...text.querySelectorAll("tspan")];
+      for (const line of spans.length ? spans : [text]) {
+        const content = line.textContent;
+        if (!content.trim()) continue;
+        const x = Number(line.getAttribute("x") ?? text.getAttribute("x")), y = Number(line.getAttribute("y") ?? text.getAttribute("y"));
+        if (Number.isFinite(x) && Number.isFinite(y)) obstacles.push(lineBox(x, y, measure(content), line.getAttribute("text-anchor") || anchor));
+      }
+    }
+    for (const text of root.querySelectorAll("text.trellis-architecture-stat")) {
+      const chip = text.previousElementSibling;
+      obstacles.push({x:Number(chip.getAttribute("x")), y:Number(chip.getAttribute("y")), w:Number(chip.getAttribute("width")), h:Number(chip.getAttribute("height"))});
+    }
+    for (const node of root.querySelectorAll(".pele-node")) {
+      const shift = /translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)/.exec(node.getAttribute("transform") || ""), rect = node.querySelector("rect");
+      const dx = shift ? Number(shift[1]) : 0, dy = shift ? Number(shift[2]) : 0;
+      obstacles.push({x:dx + Number(rect.getAttribute("x")), y:dy + Number(rect.getAttribute("y")), w:Number(rect.getAttribute("width")), h:Number(rect.getAttribute("height"))});
+    }
+    // A coarse grid keeps each test to the few obstacles near a candidate.
+    const CELL = 48, grid = new Map(), cells = box => {
+      const keys = [];
+      for (let i = Math.floor(box.x / CELL); i <= Math.floor((box.x + box.w) / CELL); i++)
+        for (let j = Math.floor(box.y / CELL); j <= Math.floor((box.y + box.h) / CELL); j++) keys.push(`${i},${j}`);
+      return keys;
+    };
+    const add = box => { for (const key of cells(box)) { if (!grid.has(key)) grid.set(key, []); grid.get(key).push(box); } };
+    // A tag keeps a small clearance from every obstacle, so its box never touches text.
+    const CLEAR = 2, inflate = box => ({x:box.x - CLEAR, y:box.y - CLEAR, w:box.w + 2 * CLEAR, h:box.h + 2 * CLEAR});
+    const free = box => {
+      if (box.x < 1 || box.y < 1 || box.x + box.w > width - 1 || box.y + box.h > height - 1) return false;
+      const wide = inflate(box);
+      return !cells(wide).some(key => grid.get(key)?.some(other => overlaps(wide, other)));
+    };
+    obstacles.filter(box => [box.x, box.y, box.w, box.h].every(Number.isFinite)).forEach(add);
+    // Offsets around a connector point, nearest first: on the connector, then beside it.
+    // A finer near pass, then a coarser far pass for a crowded narrow drawing.
+    const ring = (reach, stepX, stepY, skip) => {
+      const list = [];
+      for (let dx = -reach; dx <= reach; dx += stepX) for (let dy = -reach; dy <= reach; dy += stepY)
+        if (!skip || Math.abs(dx) > skip || Math.abs(dy) > skip) list.push([dx, dy]);
+      return list.sort((a, b) => Math.hypot(a[0], a[1]) - Math.hypot(b[0], b[1]) || a[1] - b[1] || a[0] - b[0]);
+    };
+    const offsets = [...ring(96, 4, 3, 0), ...ring(320, 8, 6, 96)];
+    // Wider tags choose first, while there is most room; ties keep a stable order.
+    const tagWidth = control => Number(control.node.querySelector("rect")?.getAttribute("width")) || 0;
+    const tags = [...controls.values()].filter(control => control.item.kind === "E" && control.path)
+      .sort((a, b) => tagWidth(b) - tagWidth(a) || a.item.id.localeCompare(b.item.id));
+    for (const {node, path} of tags) {
+      const rect = node.querySelector("rect"), text = node.querySelector("text");
+      const box = {x:Number(rect.getAttribute("x")), y:Number(rect.getAttribute("y")), w:Number(rect.getAttribute("width")), h:Number(rect.getAttribute("height"))};
+      const points = pathPoints(path.querySelector("path")?.getAttribute("d") || "");
+      if (![box.x, box.y, box.w, box.h].every(Number.isFinite)) continue;
+      if (!points.length) { add(box); continue; }
+      const middle = (points.length - 1) / 2, order = points.map((point, i) => [point, Math.abs(i - middle)]).sort((a, b) => a[1] - b[1]).map(([point]) => point);
+      let chosen = null;
+      for (const [dx, dy] of offsets) {
+        for (const [px, py] of order) {
+          const candidate = {x:Math.round((px + dx - box.w / 2) * 100) / 100, y:Math.round((py + dy - box.h / 2) * 100) / 100, w:box.w, h:box.h};
+          if (free(candidate)) { chosen = candidate; break; }
+        }
+        if (chosen) break;
+      }
+      if (chosen) {
+        const moveX = chosen.x - box.x, moveY = chosen.y - box.y;
+        rect.setAttribute("x", String(chosen.x)); rect.setAttribute("y", String(chosen.y));
+        text.setAttribute("x", String(Math.round((Number(text.getAttribute("x")) + moveX) * 100) / 100));
+        text.setAttribute("y", String(Math.round((Number(text.getAttribute("y")) + moveY) * 100) / 100));
+      }
+      add(chosen || box);
+    }
   }
   async function render(container, view, options = {}) {
     const current = () => !options.isCurrent || options.isCurrent();
@@ -288,20 +445,39 @@
       ctx.font = "14px Inter, sans-serif";
       const measure = text => ctx.measureText(text).width;
       if (typeof window.pele?.render !== "function") unsupported("Pele asset unavailable");
-      // Fit the canvas width (#449): start from the estimated chip columns and drop one
-      // column at a time while Pele's natural layout is wider than the canvas.
-      // Headers and the shared box set a minimum, so the narrowest layout wins when none fits.
-      let columns = options.display ? chipColumns(options.width, view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length) : undefined;
-      let projection, raw, best = null;
-      for (;;) {
-        projection = project(view,{...options,columns,measureText:measure});
+      // Fit the canvas width (#449, #525): start from the estimated chip columns, then size the
+      // chips so Pele's natural layout fills the canvas without passing it. Once a fitting and
+      // an overflowing chip width are known, bisect between them. Too wide with no fit shrinks
+      // the chips, then drops a column; the narrowest layout wins when none fits.
+      const sharedCount = options.display ? view.layers.filter(l => l.shared && options.display.layers.has(l.name)).length : 0;
+      let columns = options.display ? chipColumns(options.width, sharedCount) : undefined, chipWidth = CHIP_WIDTH;
+      let projection, raw, best = null, low = null, high = null;
+      const fit = options.display && options.width > 0;
+      for (let attempt = 0; ; attempt++) {
+        projection = project(view,{...options,columns,chipWidth,measureText:measure});
         raw = window.pele.render(projection.source,{fontSize:14,padding:8,responsive:false,links:false,images:false}).svg;
-        const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]);
-        if (!options.display || !(options.width > 0) || !(drawnWidth > options.width)) break;
-        if (!best || drawnWidth < best.drawnWidth) best = {drawnWidth,columns,projection,raw};
-        if (columns <= 1) { ({projection,raw} = best); if (best.columns !== columns) projection = project(view,{...options,columns:best.columns,measureText:measure}); break; }
-        columns--;
+        if (!fit) break;
+        const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]), cells = columns + sharedCount;
+        const fits = drawnWidth <= options.width;
+        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw};
+        if (attempt >= 12) break;
+        let next;
+        if (fits) {
+          low = chipWidth;
+          const slack = options.width - drawnWidth;
+          if (slack < 2 * cells || chipWidth >= MAX_CHIP) break;
+          next = high === null ? Math.min(MAX_CHIP, chipWidth + Math.max(2, Math.floor(slack / cells))) : Math.floor((low + high) / 2);
+        } else {
+          high = chipWidth;
+          if (low !== null) next = Math.floor((low + high) / 2);
+          else if (chipWidth > MIN_CHIP) next = Math.max(MIN_CHIP, chipWidth - Math.ceil((drawnWidth - options.width) / cells) - 1);
+          else if (columns > 1) { columns--; high = null; next = CHIP_WIDTH; }
+          else break;
+        }
+        if (low !== null && high !== null && high - low <= 1) break;
+        chipWidth = next;
       }
+      if (best) ({projection,raw} = best);
       if (!current()) return {status:"stale"};
       const {root,controls} = validatedSvg(raw,projection);
       root.classList.add("trellis-architecture-svg"); root.setAttribute("font-size","14"); root.setAttribute("font-family","Inter, sans-serif");
@@ -329,7 +505,7 @@
         else if (item.kind === "L") {
           callback = options.display ? options.onToggleLayer : options.onSelectLayer;
           if (options.display) expanded = item.expanded;
-          if (item.statsLine >= 0) statChips(node,label,item,measure);
+          if (item.statLines?.length) statChips(node,label,item,measure);
         } else if (item.kind === "E") {
           // Deviations are highlighted; allowed (conforming or excepted) arrows are dimmed, not dropped (#449).
           const danger = item.record.role === "production" && item.record.status === "deviates" && !item.record.excepted;
@@ -361,6 +537,7 @@
         };
         node.addEventListener("click",select); node.addEventListener("keydown",event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); } });
       }
+      if (options.display) placeTags(root,controls,measure);
       if (!current()) return {status:"stale"};
       container.replaceChildren(root);
       return {status:"ready",projection};

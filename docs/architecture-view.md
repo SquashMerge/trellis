@@ -41,11 +41,27 @@ Unassigned endpoints and unresolved sites remain explicit unknown evidence.
 
 The view always draws the full stack: every ordered layer, with the shared layers beside
 it (#449). Only authored `display = "hidden"` layers and unhinted test or fixture layers
-wait in the hidden footer. Deviations are highlighted and allowed arrows (conforming or
-excepted) are dimmed; no layer or arrow is dropped to focus on deviations. Each render
-fits as many chip columns as the canvas width holds at that moment, and scrolls inside the
-canvas when the headers need more; resizing the window or the inspector does not redraw on
-its own (the next render refits).
+wait in the hidden-layer note. Deviations are highlighted and allowed arrows (conforming or
+excepted) are dimmed; no layer or arrow is dropped to focus on deviations.
+
+Layout (#525): each render fits as many chip columns as the canvas width holds, then sizes
+the chips so the drawing fills the panel width without passing it (only a layout narrower
+than its minimum scrolls inside the canvas). Titles, band headers and chips **wrap** at
+separators (space, `·`, `_`, `-`, `/`, `.`) instead of being cut short; only a pathological
+name longer than twelve wrapped lines is clipped, and the accessible name always keeps the
+whole text. A band's count chips wrap onto further header lines when they do not fit one.
+Arrow count tags are placed on or beside their own arrow, at the nearest spot that clears
+every header line, count chip, module chip and other tag (crossing an arrow or a band
+border is allowed). When the panel width changes (window resize, inspector shown or
+hidden), the drawing is laid out again after a short quiet period (150 ms), from the same
+response, keeping the size cap, the inspector and the selected node. The hidden-layer note
+(`N hidden layers · M files · E production edges`, with its toggle) is laid out inside the
+canvas directly under the drawing.
+
+Nothing but the toolbar sits above the drawing. The heat legend and the arrow key sit
+under it, with the coverage sentence said once (see below). The snapshot counts (`N file
+modules · production / test-only cross-layer sites · Metrics`), the files not drawn under
+the size cap, the heat exclusions and the rule-instance counts are behind the ⓘ.
 
 An open band draws **one chip per module**, not per file. Bands start collapsed unless
 their authored `display` is `"expanded"` (#391 ruling; see [rules](rules.md#layer-display-hint)).
@@ -75,9 +91,10 @@ reference that maps to no module draws no arrow. A bounded count reads `↑≥10
 highlighted (deviating or unknown) arrow also shows the share of its source layer's sites
 that map to a module (`↑≥102 · 9% mapped`). The accessible name says the same in words.
 These figures come from the summary's measured `references.coverage`, never estimates. Unknown-verdict arrows are drawn in neutral grey.
-A compact arrow key sits under the canvas with the whole snapshot's coverage
-(`3,727 of 40,219 reference sites mapped to a module (9%) · 740 of 1,095 production rule
-instances unknown`); the longer prose lives under the coverage notices.
+A compact arrow key sits under the canvas with the whole snapshot's coverage, said once in
+the view and inspector (`3,727 of 40,219 reference sites mapped to a module (9%) · ≥ counts
+are lower bounds`, #525). The rule-instance counts (`740 of 1,095 production rule instances
+unknown`) and the longer prose live behind the ⓘ.
 
 The inspector opens on the counted review chips, **23 deviations · 156 unassigned ·
 0 exceptions**, and every Architecture inspection keeps them at its head. They open the
@@ -92,7 +109,7 @@ The SPEC §9 size cap applies to chips: at most 40 per band or open module and 1
 the whole diagram, counting every note. The rest of a list becomes one visible "N files
 not drawn" note that opens the layer's complete file list in the inspector. Once the
 budget is spent, further bands and modules stay folded and no more notes are added; the
-status line reports the total not drawn. Test and fixture layers without a `display`
+ⓘ reports the total not drawn. Test and fixture layers without a `display`
 hint stay in the hidden footer until **Include tests and fixtures in metrics** is on.
 
 Click a module or select it with Enter/Space to inspect its identity, layer, captured

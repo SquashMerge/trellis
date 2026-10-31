@@ -101,7 +101,28 @@ display = "hidden" # "expanded" | "collapsed" | "hidden"
 - `"hidden"` leaves the band out of the diagram and lists it in a footer line
   (`N hidden layers · M files · E edges`) from which the viewer can show it.
 
-Any other value, or a non-string, is a located `invalid_rules` schema error.
+**Developer tooling is hidden** ([owner ruling 2026-10-31](https://github.com/SquashMerge/trellis/issues/524)):
+scripts, build helpers, examples and other tooling are not runtime architecture, so their
+layer carries `display = "hidden"`. It then waits behind the same hidden-layer toggle as
+the fixture layer instead of reading as the top of the stack:
+
+```toml
+[layers.tooling]
+order = 1
+display = "hidden"
+paths = ["tools/**", "build.rs", "examples/**"]
+```
+
+**Application layers.** The browser's *application layers* are the layers that are not
+hidden by default: neither authored `display = "hidden"` nor an unhinted test or fixture
+layer. Unassigned files stay in. The Sequence start list (most complex methods) and the
+Classes tab's availability count only production callables in application layers. Both
+read the default production [workbench metrics population](metrics.md#workbench-population),
+which already leaves out fixture roots, stored test callables and authored hidden layers, so
+`tools/*.py` in a hidden tooling layer neither leads the start list nor earns the Classes
+tab. A checkout's own production code in a class-catalog language still does (Rust since #452).
+
+Any other `display` value, or a non-string, is a located `invalid_rules` schema error.
 Without the field a band starts collapsed (#391 ruling). Every other layer is drawn,
 including one with no cross-layer references: the full stack (#449).
 Under the default production metrics population, a test or fixture layer **without**

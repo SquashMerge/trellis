@@ -61,10 +61,10 @@ async function capture(page, name) {
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published(config, callback, extra = new Map()) {
+async function published(config, callback, extra = new Map(), base = sources) {
   const paths = H.fixture("", "placeholder.txt");
   rmSync(paths.source);
-  for (const [path, text] of [...sources, ...extra]) {
+  for (const [path, text] of [...base, ...extra]) {
     const target = join(paths.workspace, path);
     mkdirSync(dirname(target), {recursive:true}); writeFileSync(target, text);
   }
@@ -128,7 +128,7 @@ const identityKey = identity => JSON.stringify([identity.sourceSetId, identity.l
 const siteTotal = edges => edges.reduce((sum, edge) => sum + edge.count, 0);
 const summaryKey = edge => JSON.stringify([edge.sourceLayer, edge.destinationLayer, edge.role, edge.status, edge.excepted, edge.exceptionReason]);
 async function ready(page) {
-  await page.locator("#architecture-state[data-state=ready]").waitFor();
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
   await page.locator("#architecture-diagram svg").waitFor({state:"attached"});
 }
 // Inspector and review details load on demand (#448); wait until every list has its page.
@@ -140,7 +140,7 @@ async function rerendered(page, action) {
   await page.evaluate(() => { const svg = document.querySelector("#architecture-diagram svg"); if (svg) svg.__old = true; });
   await action();
   await page.waitForFunction(() => { const svg = document.querySelector("#architecture-diagram svg"); return svg && !svg.__old; });
-  await page.locator("#architecture-state[data-state=ready]").waitFor();
+  await page.locator("#architecture-state[data-state=ready]").waitFor({state:"attached"});
 }
 // Summary-first display (#391): open every band, footer and directory to reach file chips.
 async function expandAll(page) {
@@ -331,7 +331,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.deepEqual(all.edges, dto.edges, "metric population cannot change reference roles, counts or policy");
   assert.equal(all.modules.find(row => row.identity.path === "src/only.rs").metrics.cognitive, 1);
   await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
-  await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
+  await page.waitForFunction(() => document.querySelector("#architecture-summary")?.textContent.includes("Metrics: max, all indexed callables"));
   await ready(page);
   await expandAll(page);
   assert.equal(await page.locator("#architecture-tests").isChecked(), true, "metric inclusion does not alter the independent reference overlay");
@@ -360,7 +360,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await H.reveal(page, "#architecture-tests"); await page.locator("#architecture-tests").check();
   await ready(page);
   await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").uncheck();
-  await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, production callables"));
+  await page.waitForFunction(() => document.querySelector("#architecture-summary")?.textContent.includes("Metrics: max, production callables"));
   await ready(page);
   assert.equal(await page.locator("#architecture-tests").isChecked(), true);
   assert.equal(await module.locator("rect").first().getAttribute("fill"), heat);
@@ -394,11 +394,11 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await ready(page);
   assert.match(await page.locator("#architecture-legend").textContent(), /≥40.*≥20–<40.*≥10–<20.*<10/);
   await page.locator("#architecture-aggregate").selectOption("sum");
-  await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: sum")); await ready(page);
+  await page.waitForFunction(() => document.querySelector("#architecture-summary")?.textContent.includes("Metrics: sum")); await ready(page);
   assert.match(await page.locator("#architecture-legend").textContent(), /relative totals; no callable risk bands/);
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-module-id] rect").evaluateAll(nodes => [...new Set(nodes.map(node => node.getAttribute("fill")))]), ["#14151D"]);
   await page.locator("#architecture-aggregate").selectOption("mean");
-  await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: mean"));
+  await page.waitForFunction(() => document.querySelector("#architecture-summary")?.textContent.includes("Metrics: mean"));
   await ready(page);
   const means = await architecture(selected, "mean");
   assert.equal(means.status, 200, JSON.stringify(means.data));
@@ -439,7 +439,7 @@ test("Architecture rejects a route-gated production response after all-callable 
   });
   try {
     await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
-    await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
+    await page.waitForFunction(() => document.querySelector("#architecture-summary")?.textContent.includes("Metrics: max, all indexed callables"));
     await ready(page);
     await expandAll(page);
     await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
@@ -450,13 +450,13 @@ test("Architecture rejects a route-gated production response after all-callable 
     assert.equal(await page.locator("#architecture-diagram svg").count(), 0, "changing role removes old heat before the blocked read");
     assert.equal(await page.locator("#architecture-inspector-content").textContent(), "");
     await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
-    await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
+    await page.waitForFunction(() => document.querySelector("#architecture-summary")?.textContent.includes("Metrics: max, all indexed callables"));
     await ready(page);
     const allCanvas = await page.locator("#architecture-diagram").textContent();
     release();
     await page.waitForFunction(() => window.__lateArchitectureDelivered === true);
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-    assert.match(await page.locator("#architecture-state").textContent(), /all indexed callables/);
+    assert.match(await page.locator("#architecture-summary").textContent(), /all indexed callables/);
     assert.equal(await page.locator("#architecture-metric-tests").isChecked(), true);
     assert.equal(await page.locator("#architecture-diagram").textContent(), allCanvas, "old delivered response cannot replace newer heat");
   } finally {
@@ -550,7 +550,12 @@ test("Architecture draws the full stack, module chips per band, lower-bound coun
   const sites = dto.references.coverage.reduce((sum, row) => sum + row.sites, 0), mapped = dto.references.coverage.reduce((sum, row) => sum + row.mappedSites, 0);
   assert.equal(mapped, dto.references.counts.mappedSites);
   assert.ok(coverage.startsWith(`${mapped} of ${sites} reference sites mapped to a module (`), coverage);
-  assert.ok(coverage.includes(`${check.counts.unknown} of ${check.counts.comparable} production rule instances unknown`), coverage);
+  // #525: the coverage sentence is said once, beside the arrow key; the rule-instance counts sit behind the ⓘ.
+  const rulesLine = `${check.counts.unknown} of ${check.counts.comparable} production rule instances unknown`;
+  assert.ok(!coverage.includes(rulesLine), coverage);
+  assert.ok((await page.locator("#architecture-notice-content").textContent()).includes(rulesLine));
+  const said = await page.evaluate(sentence => document.body.innerText.split(sentence).length - 1, coverage.split(" · ")[0]);
+  assert.equal(said, 1, "the coverage sentence appears once in the view and inspector");
   assert.match(await page.locator(".architecture-edge-legend").textContent(), /↓ down · allowed.*↑ up · deviation.*≥ lower bound.*test-only/s, "a compact arrow key replaces the prose");
 
   // Counted review chips rest in the inspector.
@@ -610,7 +615,7 @@ test("Architecture hides test and fixture layers until tests and fixtures are in
     assert.match(await page.locator("#architecture-hidden-toggle").textContent(), /1 hidden layer · 1 file/);
     assert.equal(await page.locator("#architecture-hidden-names").textContent(), "fixtures (tests/fixtures; include them to show)");
     await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
-    await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("all indexed callables"));
+    await page.waitForFunction(() => document.querySelector("#architecture-summary")?.textContent.includes("all indexed callables"));
     await ready(page);
     assert.equal(await page.locator("#architecture-hidden").isVisible(), false);
     assert.ok((await bandStates(page)).some(([name]) => name === "fixtures"), "with tests included the edge-free fixture layer is drawn in the stack");
@@ -1011,3 +1016,190 @@ test("Architecture opens an external package reference in the library catalog, w
   assert.equal(await page.locator("#architecture-inspector").isVisible(), true, "the reference inspection stays open");
   assert.ok(!requests.some(row => /\/(sequence|navigation)$/.test(row.url.pathname)), "library candidates never seed workspace sequences");
 }, libraryFiles));
+
+// #525: layout bounds of the drawn diagram, in page pixels. Count tags may cross
+// connector strokes and band borders, but never text, a stat chip, a chip or another tag.
+function layoutBounds() {
+  const canvas = document.querySelector("#architecture-diagram"), svg = canvas.querySelector("svg");
+  const box = node => { const r = node.getBoundingClientRect(); return {x:r.x, y:r.y, w:r.width, h:r.height}; };
+  const hit = (a, b) => a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5;
+  const tags = [...svg.querySelectorAll(".pele-edge-label")].map(node => ({kind:"tag", text:node.textContent, ...box(node)}));
+  const stats = [...svg.querySelectorAll("text.trellis-architecture-stat")].map(node => ({kind:"stat", text:node.textContent, ...box(node.previousElementSibling)}));
+  const lines = [...svg.querySelectorAll(".pele-cluster-label, .pele-cluster-label tspan, .pele-label, .pele-label tspan")]
+    .filter(node => !node.querySelector("tspan") && node.textContent.trim()).map(node => ({kind:"text", text:node.textContent, ...box(node)}));
+  const chips = [...svg.querySelectorAll(".pele-node > rect")].map(node => ({kind:"chip", text:node.parentElement.textContent, ...box(node)}));
+  const overlaps = [];
+  for (const tag of tags) for (const other of [...stats, ...lines, ...chips, ...tags]) if (other !== tag && hit(tag, other)) overlaps.push(`${tag.text} × ${other.kind}:${other.text}`);
+  // A stat chip never sits on header text, nor on another stat chip.
+  for (const stat of stats) for (const other of [...lines, ...stats]) if (other !== stat && hit(stat, other)) overlaps.push(`${stat.text} × ${other.kind}:${other.text}`);
+  const style = getComputedStyle(canvas), inner = canvas.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const clipped = [...svg.querySelectorAll("text, tspan")].filter(node => !node.querySelector("tspan") && node.textContent.includes("…")).map(node => node.textContent);
+  // Each drawn line fits inside its own node or band box.
+  const spills = [];
+  for (const group of svg.querySelectorAll(".pele-node, .pele-cluster")) {
+    const frame = box(group.querySelector(":scope > rect"));
+    for (const line of group.querySelectorAll(":scope > text tspan, :scope > text")) {
+      if (line.querySelector("tspan") || !line.textContent.trim()) continue;
+      const r = box(line);
+      if (r.x < frame.x - 0.5 || r.x + r.w > frame.x + frame.w + 0.5) spills.push(line.textContent);
+    }
+  }
+  const legend = document.querySelector("#architecture-legend").getBoundingClientRect(), drawn = canvas.getBoundingClientRect();
+  return {overlaps, clipped, spills, svgWidth:svg.getBoundingClientRect().width, inner, pageFits:document.documentElement.scrollWidth <= innerWidth,
+    legendBelow:legend.top >= drawn.bottom - 0.5, stateShown:!!document.querySelector("#architecture-state").offsetParent};
+}
+async function laidOutAt(page, width) {
+  const before = await page.evaluate(() => document.querySelector("#architecture-diagram").clientWidth);
+  await page.evaluate(() => { const svg = document.querySelector("#architecture-diagram svg"); if (svg) svg.__old = true; });
+  await page.setViewportSize({width, height:1000});
+  const after = await page.evaluate(() => document.querySelector("#architecture-diagram").clientWidth);
+  if (Math.abs(after - before) >= 8) await page.waitForFunction(() => { const svg = document.querySelector("#architecture-diagram svg"); return svg && !svg.__old; });
+  await quiet(page);
+}
+// The panel can settle in more than one step (the inspector column follows the window);
+// a drawing is final once no re-layout replaces it for longer than the debounce.
+async function quiet(page) {
+  for (let round = 0; round < 20; round++) {
+    await page.evaluate(() => { document.querySelector("#architecture-diagram svg").__seen = true; });
+    await page.waitForTimeout(400);
+    if (await page.evaluate(() => document.querySelector("#architecture-diagram svg").__seen === true)) return;
+  }
+  assert.fail("Architecture kept re-laying out");
+}
+function assertLayout(bounds, label) {
+  assert.deepEqual(bounds.overlaps, [], `${label}: count tags and header chips never overlap text, chips or each other`);
+  assert.deepEqual(bounds.clipped, [], `${label}: no title, chip or tag is cut short`);
+  assert.deepEqual(bounds.spills, [], `${label}: every line fits its box`);
+  assert.ok(bounds.svgWidth <= bounds.inner + 0.5, `${label}: the drawing fits the panel (${bounds.svgWidth} in ${bounds.inner})`);
+  assert.ok(bounds.svgWidth >= 0.9 * bounds.inner, `${label}: the drawing uses the panel width (${bounds.svgWidth} in ${bounds.inner})`);
+  assert.equal(bounds.pageFits, true, `${label}: no page-level horizontal scroll`);
+}
+const longModule = "src/a_rather_long_module_name_that_wraps.rs";
+const layoutRules = rules.replace('"src/top.rs",', `"src/top.rs", "${longModule}",`)
+  .replace("[layers.peer]\norder = 2\n", "[layers.peer]\norder = 2\ndisplay = \"hidden\"\n");
+const layoutFiles = new Map([[longModule, "pub fn wraps(v: i32) -> i32 { if v > 0 { if v > 1 { if v > 2 { return crate::low::low(); } } } 0 }\n"]]);
+
+test("Architecture lays out tags, titles and chips without collisions or truncation at 1440 and 900, with one coverage sentence", {timeout:240000}, async () => published(layoutRules, async selected => {
+  const {page} = selected;
+  await ready(page);
+  for (const width of [1440, 900]) {
+    await laidOutAt(page, width);
+    await ready(page);
+    const bounds = await page.evaluate(layoutBounds);
+    assertLayout(bounds, `${width}px`);
+    assert.equal(bounds.legendBelow, true, `${width}px: the heat legend sits with the arrow key under the drawing`);
+    assert.equal(bounds.stateShown, false, `${width}px: no status or count line above the drawing`);
+    // Long names wrap at separators instead of clipping; the whole name is drawn.
+    const chip = page.locator('#architecture-diagram [data-trellis-summary-chip="top"]').filter({hasText:/a_rather/});
+    assert.equal(await chip.count(), 1, "the hottest top module is drawn as a summary chip");
+    const drawnLines = await chip.locator("tspan").allTextContents();
+    assert.ok(drawnLines.length >= 3, `the long module name wraps onto more lines: ${JSON.stringify(drawnLines)}`);
+    assert.ok(drawnLines.join("").startsWith("a_rather_long_module_name_that_wraps"), JSON.stringify(drawnLines));
+    // The hidden-layer note is part of the layout: inside the canvas, directly under the drawing.
+    const note = await page.evaluate(() => {
+      const note = document.querySelector("#architecture-hidden"), svg = document.querySelector("#architecture-diagram svg");
+      return {inside:note.parentElement?.id, below:note.getBoundingClientRect().top >= svg.getBoundingClientRect().bottom - 0.5, visible:!note.hidden};
+    });
+    assert.deepEqual(note, {inside:"architecture-diagram", below:true, visible:true});
+  }
+  // The coverage sentence is said once; the counts are behind the ⓘ.
+  const coverage = (await page.locator("#architecture-coverage").textContent()).split(" · ")[0];
+  assert.match(coverage, /^\d+ of \d+ reference sites mapped to a module/);
+  assert.equal(await page.evaluate(sentence => document.body.innerText.split(sentence).length - 1, coverage), 1);
+  assert.match(await page.locator("#architecture-summary").textContent(), /file modules · \d+ production \/ \d+ test-only cross-layer sites/);
+  assert.equal(await page.locator("#architecture-summary").isVisible(), false, "the counts wait behind the ⓘ");
+  await page.locator("#architecture-notices > summary").click();
+  assert.equal(await page.locator("#architecture-summary").isVisible(), true);
+  assert.match(await page.locator("#architecture-notice-content").textContent(), /production rule instances unknown/);
+  await capture(page, "architecture-layout-900");
+}, layoutFiles));
+
+test("Architecture re-lays out on a panel width change, keeping the selection and the inspector", {timeout:240000}, async () => published(layoutRules, async selected => {
+  const {page} = selected;
+  await ready(page);
+  const tag = page.locator("#architecture-diagram [data-trellis-edge-tone=deviation]").first();
+  const edgeId = await tag.getAttribute("data-trellis-edge-id");
+  await tag.click(); await settled(page);
+  const title = await page.locator("#architecture-inspector-title").textContent();
+  assert.match(title, / → /);
+  const widthOf = () => page.evaluate(() => document.querySelector("#architecture-diagram svg").getBoundingClientRect().width);
+  const wide = await widthOf();
+  const requests = selected.requests.length;
+  await laidOutAt(page, 1100);
+  const narrow = await widthOf();
+  assert.ok(narrow < wide, `the drawing narrows with the window (${narrow} < ${wide})`);
+  assertLayout(await page.evaluate(layoutBounds), "1100px");
+  assert.equal(await page.locator("#architecture-inspector-title").textContent(), title, "the inspection survives the re-layout");
+  const pressed = await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll((nodes, id) => nodes.filter(node => node.getAttribute("data-trellis-edge-id") === id).map(node => node.getAttribute("aria-pressed")), edgeId);
+  assert.deepEqual(pressed, ["true"], "the selected arrow stays selected");
+  assert.equal(selected.requests.slice(requests).filter(row => row.url.pathname.endsWith("/architecture")).length, 0, "a re-layout re-reads nothing");
+  // Hiding the inspector widens the panel: the drawing grows to use it.
+  await page.evaluate(() => { document.querySelector("#architecture-diagram svg").__old = true; });
+  await page.locator("#inspector-collapse").click();
+  await page.waitForFunction(() => { const svg = document.querySelector("#architecture-diagram svg"); return svg && !svg.__old; });
+  await quiet(page);
+  assert.ok(await widthOf() > narrow, "the drawing widens when the inspector is hidden");
+  assertLayout(await page.evaluate(layoutBounds), "inspector hidden");
+}, layoutFiles));
+
+// #524: developer tooling is not runtime architecture. An authored display="hidden" on the
+// tooling layer (the owner's 2026-10-31 ruling) joins it to the fixture layer behind the one
+// hidden-layer toggle, and neither layer feeds the Sequence start list or the Classes gate.
+const toolingPython = `def generate(values):
+    total = 0
+    for v in values:
+        if v > 0:
+            for w in values:
+                if w > v:
+                    if w % 2:
+                        total += w
+                    else:
+                        total -= w
+    return total
+`;
+const fixtureSource = "pub fn sample(v: i32) -> i32 { if v > 0 { if v > 1 { if v > 2 { if v > 3 { return 4; } } } } 0 }\n";
+const toolingLayer = hint => `[layers.tooling]\norder = 1\n${hint ? 'display = "hidden"\n' : ""}paths = ["tools/**"]\n`;
+async function startPaths(page) {
+  await page.locator("#view-sequence").click();
+  const starts = page.locator("#sequence-start-list button");
+  await starts.first().waitFor();
+  return starts.evaluateAll(nodes => nodes.map(node => node.querySelector(".detail").textContent.split(" · ")[0]));
+}
+test("Architecture hides tooling with fixtures behind one toggle; the Sequence start list skips both", {timeout:240000}, async () => {
+  const config = `${rules}${toolingLayer(true)}[layers.fixtures]\norder = 0\npaths = ["tests/fixtures/**"]\n`;
+  await published(config, async selected => {
+    const {page, server, paths, pin} = selected;
+    await ready(page);
+    const drawn = (await bandStates(page)).map(([name]) => name);
+    assert.ok(!drawn.includes("tooling") && !drawn.includes("fixtures"), "tooling and fixtures are hidden by default");
+    assert.match(await page.locator("#architecture-hidden-toggle").textContent(), /^▸ 2 hidden layers · 2 files/);
+    assert.equal(await page.locator("#architecture-hidden-names").textContent(), "fixtures (tests/fixtures; include them to show), tooling");
+    await rerendered(page, () => page.locator("#architecture-hidden-toggle").click());
+    const shown = (await bandStates(page)).map(([name]) => name);
+    assert.ok(shown.includes("tooling") && shown.includes("fixtures"), "the one toggle shows both");
+    // Without the application-layer rule, tooling and fixture code would lead the list.
+    const query = new URLSearchParams({scope:"revision", aggregate:"max", role:"all", workbench:"true", topCognitive:"10", indexGeneration:pin.indexGeneration, indexRevision:String(pin.indexRevision)});
+    const all = (await H.api(server.base, paths.token, "GET", H.scoped(server.rootKey, `metrics?${query}`))).data.payload.topCognitive;
+    assert.deepEqual(all.slice(0, 2).map(row => row.path).sort(), ["tests/fixtures/sample.rs", "tools/gen.py"]);
+    const starts = await startPaths(page);
+    assert.ok(starts.length >= 2, JSON.stringify(starts));
+    assert.ok(starts.every(path => path.startsWith("src/")), `start list holds application layers only: ${JSON.stringify(starts)}`);
+    // Classes stays available from the application's own Rust code (#452), not from tools/.
+    await page.locator("#view-classes").waitFor({state:"visible"});
+  }, new Map([["tools/gen.py", toolingPython], ["tests/fixtures/sample.rs", fixtureSource]]));
+});
+
+test("Classes counts application layers only: tools/*.py alone does not qualify a checkout", {timeout:240000}, async () => {
+  const app = new Map([["src/lib.rs", "#![cfg(test)]\nfn only(value: i32) -> i32 { value }\n"]]);
+  const config = hint => `version = 1\n[layers.app]\norder = 2\npaths = ["src/**"]\n${toolingLayer(hint)}`;
+  const tools = new Map([["tools/gen.py", toolingPython]]);
+  await published(config(true), async ({page}) => {
+    await page.waitForFunction(() => /Indexed snapshot/.test(document.querySelector("#metrics-state")?.textContent || ""));
+    assert.equal(await page.locator("#view-classes").isVisible(), false, "Python in the hidden tooling layer earns no Classes tab");
+    await page.locator("#view-sequence").click();
+    assert.equal(await page.locator("#sequence-start").isVisible(), false, "no application callable to start from");
+  }, tools, app);
+  await published(config(false), async ({page}) => {
+    await page.locator("#view-classes").waitFor({state:"visible"});
+  }, tools, app);
+});
