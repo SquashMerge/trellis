@@ -40,6 +40,16 @@ pub struct Projection {
     pub data: Value,
     // Rules assign layers and report unassigned modules across the full snapshot.
     pub(crate) modules: Vec<Value>,
+    /// Exact reference-site coverage per source path and role (test = true):
+    /// scanned sites, sites with at least one mapped target, and unresolved sites.
+    /// Architecture sums it per layer; it is bounded by the scanned documents.
+    pub(crate) coverage: BTreeMap<(String, bool), SiteCoverage>,
+}
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SiteCoverage {
+    pub sites: usize,
+    pub mapped: usize,
+    pub unresolved: usize,
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -318,6 +328,7 @@ fn project_inner(
     let mut site_count = 0usize;
     let mut scanned = 0usize;
     let mut mapped = 0usize;
+    let mut coverage: BTreeMap<(String, bool), SiteCoverage> = BTreeMap::new();
     for batch in selected.chunks(workers) {
         let remaining = rust.work.remaining();
         let prepared = map_batch(batch, workers, request, |&source| {
@@ -345,6 +356,10 @@ fn project_inner(
             for (item, site) in sites {
                 check()?;
                 let role = site.role;
+                let covered = coverage
+                    .entry((doc.key.path.clone(), role == Some("test")))
+                    .or_default();
+                covered.sites += 1;
                 let resolution = if site.owner_syntax_id.is_none() {
                     SiteResolution::unknown("reference_owner_ambiguous")
                 } else if doc.key.language == "rust" {
@@ -370,6 +385,7 @@ fn project_inner(
                 };
                 if !resolution.targets.is_empty() {
                     mapped += 1;
+                    covered.mapped += 1;
                     emitted_modules.extend(resolution.proof);
                 }
                 for target in resolution.targets {
@@ -383,6 +399,7 @@ fn project_inner(
                     }
                 }
                 if let Some(reason) = resolution.residual {
+                    covered.unresolved += 1;
                     unresolved
                         .push(json!({"source":identities[source],"site":site,"reason":reason}));
                 }
@@ -438,6 +455,7 @@ fn project_inner(
                 ]
             }),
             modules,
+            coverage,
         },
         rust.work.used,
     ))

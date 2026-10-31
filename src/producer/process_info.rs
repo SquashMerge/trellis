@@ -11,8 +11,10 @@ pub fn group_exists(pgid: pid_t) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// The process's start time in an opaque, stable unit. Two reads agree only
-/// for the same process, so it tells a recorded process from a reused PID.
+/// The process's start time in an opaque, stable unit: microseconds on macOS,
+/// clock ticks since boot on Linux. For one PID, two reads agree only for the
+/// same process, so it tells a recorded process from a reused PID. Different
+/// processes may share a value; identity is the PID and start time together.
 pub fn start_time(pid: pid_t) -> Option<u64> {
     imp::start_time(pid)
 }

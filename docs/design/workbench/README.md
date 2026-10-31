@@ -128,7 +128,7 @@ The app shows every control and every caveat at once. The rule for the next pass
    - Show hidden/ignored and Display options move into a ⋯ menu.
 4. **View toolbars: one row each.**
    - Keep Color by and the aggregation select (max / sum / mean).
-   - Move the checkboxes into an **Options** popover: include tests and fixtures, relative, test-only edges, deviations only.
+   - Move the checkboxes into an **Options** popover: include tests and fixtures, relative, test-only edges. ("Deviations only" was removed by #449: the full stack is always drawn with deviations highlighted, item 11.)
    - Replace the two or three lines of mono explanation under the toolbar (band names, "20025 callables excluded…", excluded-file counts) with the legend swatches and an ⓘ that holds the detail.
    - Remove **Color by** from Sequence and Classes, where it has nothing to color ("No measured values").
 5. **Architecture header.**

@@ -57,7 +57,12 @@ fn start_time_is_stable_per_process_and_none_when_gone() {
     let pid = group.0.id() as libc::pid_t;
     let first = start_time(pid).unwrap();
     assert_eq!(start_time(pid), Some(first));
-    assert_ne!(start_time(std::process::id() as libc::pid_t), Some(first));
+    // Distinct processes may share a start time (Linux counts clock ticks, so a child
+    // started in its parent's tick matches it); a process is identified by the pair of its
+    // PID and start time, never by the start time alone.
+    let this = std::process::id() as libc::pid_t;
+    let own = start_time(this).unwrap();
+    assert_eq!(start_time(this), Some(own));
     drop(group);
     assert_eq!(start_time(pid), None);
     crate::testing::wait_until("group emptied", || !group_exists(pid));
