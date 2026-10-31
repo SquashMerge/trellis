@@ -906,3 +906,19 @@ test("resolved noncallable declaration keeps lane and source action, not a calle
   lane.listeners.click(); assert.equal(opened[0],target);
   assert.equal(peleProjector().project(view).lanes.length,2);
 });
+
+// #522: a resolved call's expanded body is drawn by both renderers, on the callee's lane.
+test("both renderers draw a resolved call's expanded body on the callee lane", () => {
+  const {view, call, target} = resolvedSequence();
+  const inner = {id:"inner-declaration", name:"helper", kind:"function", path:"target.rs", range:{startLine:5,endLine:5}};
+  view.participants.push({id:inner.id, label:inner.name, kind:"function", declaration:inner});
+  const child = {...call, id:"original-call>step:1:1", callId:"inner-occurrence", label:"helper()", path:"target.rs", lane:target.id, target:inner.id, hidden:false, children:[], alternate:[]};
+  call.children = [child];
+  const projection = peleProjector().project(view);
+  assert.ok(projection.rows.some(row => row.id === child.id && row.type === "message"));
+  assert.match(projection.source, /^P1->>P2: /m);
+  const d = diagram(view, {onSelect:()=>{}});
+  assert.ok(d.row(child.id), "SVG draws the expanded child");
+  const arrow = d.nodes().find(n => n.attrs.class === "sequence-arrow" && n.attrs["data-trellis-call-id"] === "inner-occurrence");
+  assert.ok(arrow.attrs.d.startsWith("M 340 "), arrow.attrs.d);
+});

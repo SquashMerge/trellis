@@ -475,13 +475,23 @@ pub(super) fn navigation_calls(
 }
 
 /// Enrich the existing syntax tree at its already selected transaction/revision.
+///
+/// With fresh bindings from the sole producer covering the seed's language (#483), each
+/// measured call carries the engine's disposition. Exact direct/constructor targets become
+/// participants, and the first call to each one has the target's own measured body expanded
+/// beneath it, within the view's step, depth and participant bounds (#522). Calls bound to
+/// external declarations (the standard library included) are incidental: counted, and
+/// hidden unless `show_all`. Without fresh evidence for the seed the syntax view is kept,
+/// and `semantic.reason` says why.
 pub(super) fn sequence_calls(
     store: &Store,
     db: &Connection,
     selected: &ReadRevision,
     view: &mut crate::behavior::SequenceView,
+    show_all: bool,
 ) -> Result<()> {
-    use crate::graph_query::{self as engine, BoundaryReason, GraphEdge, GraphNode, Visit};
+    use crate::behavior::{EvidenceTier, SequenceSemantic};
+    use crate::graph_query::{self as engine, GraphNode};
     let (source_set_id, revision_id): (String, String) = db.query_row(
         "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
         [&selected.key],
@@ -516,139 +526,82 @@ pub(super) fn sequence_calls(
             view.warnings
                 .push(engine::multiple_producers_note(&key.language));
         }
+        view.semantic = SequenceSemantic::syntax(defaults.note(&key.language));
         return Ok(());
     };
-    let languages = Some(defaults.languages());
+    let languages = defaults.languages();
     let document = source.document(&key)?;
     let declaration = document
         .declarations
         .get(&view.seed.id)
         .ok_or_else(|| SelectedIntegrity("selected sequence declaration missing".into()))?
         .clone();
-    let Some(semantic) = engine::semantic(languages.as_ref(), &document).map_err(engine_error)?
+    let Some(semantic) = engine::semantic(Some(&languages), &document).map_err(engine_error)?
     else {
         return Ok(());
+    };
+    let seed_calls = document
+        .calls
+        .get(&view.seed.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(reason) = syntax_fallback(semantic, seed_calls, &key.path, &mut source)? {
+        view.semantic = SequenceSemantic::syntax(Some(reason));
+        return Ok(());
+    }
+    view.semantic = SequenceSemantic {
+        tier: EvidenceTier::Semantic,
+        producer_id: Some(producer.clone()),
+        reason: None,
     };
     // Syntax receiver groups are display hints, not resolved participant lanes.
     view.participants
         .retain(|participant| participant.id == view.seed.id);
-    let calls: BTreeMap<_, _> = document
-        .calls
-        .get(&view.seed.id)
-        .into_iter()
-        .flatten()
-        .map(|call| (call.id.as_str(), call))
-        .collect();
     if let Some(participant) = view.participants.iter_mut().find(|p| p.id == view.seed.id) {
         participant.declaration = Some(view.seed.clone());
-    }
-    struct Enrichment<'a, 'b> {
-        store: &'a Store,
-        db: &'a Connection,
-        selected: &'a ReadRevision,
-        source: &'b mut dyn GraphSource,
-        semantic: Option<&'a SemanticDocument>,
-        calls: &'a BTreeMap<&'a str, &'a crate::native_evidence::Call>,
-        participants: &'b mut Vec<crate::behavior::Participant>,
-        edges: Vec<GraphEdge>,
-        limited: bool,
-    }
-    impl Enrichment<'_, '_> {
-        fn steps(&mut self, steps: &mut [crate::behavior::SequenceStep]) -> Result<()> {
-            for step in steps {
-                self.source.check_work()?;
-                if let Some(call) = step.call_id.as_deref().and_then(|id| self.calls.get(id)) {
-                    let disposition = engine::call_disposition(self.semantic, call, self.source)
-                        .map_err(engine_error)?;
-                    let mut reason = disposition.boundary_reason;
-                    if reason == BoundaryReason::None {
-                        let (id, key) = disposition.exact_target.expect("eligible target is exact");
-                        if !self.participants.iter().any(|p| &p.id == id) {
-                            if self.participants.len() == 20 {
-                                reason = BoundaryReason::NodeLimit;
-                                self.limited = true;
-                            } else {
-                                let target = self
-                                    .store
-                                    .selected_graph_document_for(self.db, &key.path, self.selected)?
-                                    .nodes
-                                    .into_iter()
-                                    .find(|node| &node.id == id)
-                                    .ok_or_else(|| {
-                                        SelectedIntegrity("selected sequence target missing".into())
-                                    })?;
-                                self.participants.push(crate::behavior::Participant {
-                                    id: id.clone(),
-                                    label: target.name.clone(),
-                                    kind: serde_json::to_value(target.kind)?
-                                        .as_str()
-                                        .ok_or_else(|| {
-                                            SelectedIntegrity("invalid sequence target kind".into())
-                                        })?
-                                        .into(),
-                                    identification:
-                                        "Fresh exact semantic call target in the selected snapshot."
-                                            .into(),
-                                    declaration: Some(target),
-                                });
-                            }
-                        }
-                        if reason == BoundaryReason::None {
-                            step.target = Some(id.clone());
-                        }
-                    }
-                    let selected = disposition.selected;
-                    step.call_evidence = Some(crate::behavior::CallEvidence {
-                        boundary_reason: reason,
-                        resolution: selected.map(|(binding, _)| binding.resolution),
-                        dispatch: selected.map(|(binding, _)| binding.dispatch),
-                        freshness: selected.map(|(_, proof)| proof.freshness),
-                        provenance_id: selected.map(|(binding, _)| binding.provenance_id.clone()),
-                        external_package: selected
-                            .filter(|_| reason == BoundaryReason::External)
-                            .and_then(|(binding, _)| match &binding.declared_target {
-                                Some(sem::Target::External { symbol }) => {
-                                    crate::behavior::ExternalPackage::from_scip(&symbol.symbol)
-                                }
-                                _ => None,
-                            }),
-                    });
-                    self.edges.push(GraphEdge {
-                        call_site_count: 1,
-                        call: (*call).clone(),
-                        from: call.owner_syntax_id.clone(),
-                        to: step.target.clone(),
-                        binding: selected.map(|(binding, _)| binding.clone()),
-                        visit: if step.target.is_some() {
-                            Visit::New
-                        } else {
-                            Visit::Boundary
-                        },
-                        boundary_reason: reason,
-                    });
-                }
-                self.steps(&mut step.children)?;
-                self.steps(&mut step.alternate)?;
-            }
-            Ok(())
-        }
     }
     let mut enrichment = Enrichment {
         store,
         db,
         selected,
         source: &mut source,
-        semantic: Some(semantic),
-        calls: &calls,
+        languages: &languages,
+        revision: view.revision,
+        show_all,
         participants: &mut view.participants,
+        warnings: &mut view.warnings,
+        nodes: vec![GraphNode {
+            declaration,
+            depth: 0,
+        }],
         edges: vec![],
+        expanded: BTreeSet::new(),
+        stack: vec![view.seed.id.clone()],
+        used: crate::behavior::step_count(&view.steps),
         limited: false,
+        truncated: false,
+        hidden: 0,
+        revealed: 0,
+        incidental: 0,
     };
-    enrichment.steps(&mut view.steps)?;
-    let limited = enrichment.limited;
-    let edges = enrichment.edges;
-    if limited {
+    let seed_id = view.seed.id.clone();
+    enrichment.steps(&mut view.steps, &document, &seed_id, 0)?;
+    let Enrichment {
+        nodes,
+        edges,
+        limited,
+        truncated,
+        hidden,
+        revealed,
+        incidental,
+        ..
+    } = enrichment;
+    view.hidden_steps = (view.hidden_steps + hidden).saturating_sub(revealed);
+    view.incidental_steps = incidental;
+    if truncated || limited {
         view.truncated = true;
+    }
+    if limited {
         view.warnings
             .push("Sequence participant limit reached; additional targets are not shown.".into());
     }
@@ -663,30 +616,8 @@ pub(super) fn sequence_calls(
         include_external: true,
         include_tests: true,
     };
-    let mut nodes = vec![GraphNode {
-        declaration,
-        depth: 0,
-    }];
-    for participant in &view.participants {
-        if participant.declaration.is_none() || participant.id == view.seed.id {
-            continue;
-        }
-        let key = source
-            .locate(&participant.id)?
-            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
-        let target = source
-            .document(&key)?
-            .declarations
-            .get(&participant.id)
-            .cloned()
-            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
-        nodes.push(GraphNode {
-            declaration: target,
-            depth: 1,
-        });
-    }
     view.semantic_warnings =
-        engine::occurrence_warnings(&request, &mut source, languages.as_ref(), &nodes, &edges)
+        engine::occurrence_warnings(&request, &mut source, Some(&languages), &nodes, &edges)
             .map_err(engine_error)?;
     view.warnings.extend(
         view.semantic_warnings
@@ -694,6 +625,307 @@ pub(super) fn sequence_calls(
             .map(|warning| warning.message.clone()),
     );
     Ok(())
+}
+
+/// Why a seed with a selected producer still shows syntax (#522): its coverage is not
+/// usable, or none of its measured calls has a fresh selected binding. One fresh binding
+/// is enough to enrich; the others then keep their own stale or missing boundaries.
+fn syntax_fallback(
+    semantic: &SemanticDocument,
+    calls: &[crate::native_evidence::Call],
+    path: &str,
+    source: &mut dyn GraphSource,
+) -> Result<Option<String>> {
+    use sem::CoverageState;
+    let coverage = &semantic.coverage;
+    if !coverage.selected {
+        return Ok(Some(format!(
+            "Semantic coverage of {path} is not selected at this index revision; showing syntax."
+        )));
+    }
+    if !matches!(
+        coverage.state,
+        CoverageState::Complete | CoverageState::Partial
+    ) {
+        let state = serde_json::to_value(coverage.state)?;
+        return Ok(Some(format!(
+            "Semantic coverage of {path} is {}; showing syntax.",
+            state.as_str().unwrap_or("unusable")
+        )));
+    }
+    if calls.is_empty() {
+        return Ok(None);
+    }
+    let mut stale = false;
+    for call in calls {
+        match crate::graph_query::call_disposition(Some(semantic), call, source)
+            .map_err(engine_error)?
+            .selected
+        {
+            Some((_, proof)) if proof.freshness == sem::Freshness::Fresh => return Ok(None),
+            Some(_) => stale = true,
+            None => {}
+        }
+    }
+    Ok(Some(if stale {
+        format!(
+            "Semantic evidence for {path} is stale: it was imported for an earlier version of the file. Showing syntax."
+        )
+    } else {
+        "No semantic binding covers this method's calls; showing syntax.".to_string()
+    }))
+}
+
+/// One enrichment pass over a view's steps and the callee bodies it expands.
+struct Enrichment<'a, 'b> {
+    store: &'a Store,
+    db: &'a Connection,
+    selected: &'a ReadRevision,
+    source: &'b mut SnapshotGraphSource<'a>,
+    languages: &'b BTreeSet<String>,
+    revision: IndexPin,
+    show_all: bool,
+    participants: &'b mut Vec<crate::behavior::Participant>,
+    warnings: &'b mut Vec<String>,
+    nodes: Vec<crate::graph_query::GraphNode>,
+    edges: Vec<crate::graph_query::GraphEdge>,
+    /// Targets whose body has been expanded once, or was refused by a bound.
+    expanded: BTreeSet<String>,
+    /// The owners on the current expansion path; a target on it is not re-entered.
+    stack: Vec<String>,
+    /// Steps in the view so far, expanded bodies included.
+    used: usize,
+    limited: bool,
+    truncated: bool,
+    hidden: usize,
+    /// Steps a syntax heuristic hid that resolved to an internal target, so are shown.
+    revealed: usize,
+    incidental: usize,
+}
+
+impl Enrichment<'_, '_> {
+    fn warn(&mut self, message: String) {
+        if !self.warnings.contains(&message) {
+            self.warnings.push(message);
+        }
+    }
+
+    /// Enriches `steps`, measured in `owner`'s body in `document`, at tree `depth`.
+    fn steps(
+        &mut self,
+        steps: &mut [crate::behavior::SequenceStep],
+        document: &DocumentFacts,
+        owner: &str,
+        depth: usize,
+    ) -> Result<()> {
+        use crate::graph_query::{self as engine, BoundaryReason, GraphEdge, Visit};
+        let semantic = engine::semantic(Some(self.languages), document).map_err(engine_error)?;
+        for step in steps {
+            self.source.check_work()?;
+            self.steps(&mut step.children, document, owner, depth + 1)?;
+            self.steps(&mut step.alternate, document, owner, depth + 1)?;
+            if step.kind == "group"
+                && !step.children.is_empty()
+                && step.children.iter().all(|child| child.hidden)
+            {
+                // A chain of incidental calls folds away with its members.
+                step.hidden = true;
+            }
+            let Some(call) = step
+                .call_id
+                .as_deref()
+                .and_then(|id| document.calls.get(owner)?.iter().find(|call| call.id == id))
+            else {
+                continue;
+            };
+            let disposition =
+                engine::call_disposition(semantic, call, self.source).map_err(engine_error)?;
+            let mut reason = disposition.boundary_reason;
+            if reason == BoundaryReason::None {
+                let (id, key) = disposition.exact_target.expect("eligible target is exact");
+                if !self.participants.iter().any(|p| &p.id == id) {
+                    if self.participants.len() == 20 {
+                        reason = BoundaryReason::NodeLimit;
+                        self.limited = true;
+                    } else {
+                        self.participant(id, key)?;
+                    }
+                }
+                if reason == BoundaryReason::None {
+                    step.target = Some(id.clone());
+                    // A spelling heuristic (JavaScript `console.log`) never hides a call
+                    // with a fresh exact internal target, nor so its expanded body.
+                    if step.hidden {
+                        step.hidden = false;
+                        self.revealed += 1;
+                    }
+                }
+            }
+            let selected = disposition.selected;
+            step.call_evidence = Some(crate::behavior::CallEvidence {
+                boundary_reason: reason,
+                resolution: selected.map(|(binding, _)| binding.resolution),
+                dispatch: selected.map(|(binding, _)| binding.dispatch),
+                freshness: selected.map(|(_, proof)| proof.freshness),
+                provenance_id: selected.map(|(binding, _)| binding.provenance_id.clone()),
+                external_package: selected
+                    .filter(|_| reason == BoundaryReason::External)
+                    .and_then(|(binding, _)| match &binding.declared_target {
+                        Some(sem::Target::External { symbol }) => {
+                            crate::behavior::ExternalPackage::from_scip(&symbol.symbol)
+                        }
+                        _ => None,
+                    }),
+                semantic_basis: selected.and_then(|(_, proof)| proof.basis.clone()),
+            });
+            self.edges.push(GraphEdge {
+                call_site_count: 1,
+                call: call.clone(),
+                from: call.owner_syntax_id.clone(),
+                to: step.target.clone(),
+                binding: selected.map(|(binding, _)| binding.clone()),
+                visit: if step.target.is_some() {
+                    Visit::New
+                } else {
+                    Visit::Boundary
+                },
+                boundary_reason: reason,
+            });
+            // Only a standalone call is incidental: one that already nests steps (an
+            // expanded body or a chain) keeps them visible.
+            // A measured call the syntax adapter drew as a boundary (its source-hint lanes
+            // were full) is still a call here: those hint lanes are not drawn.
+            if reason == BoundaryReason::External
+                && matches!(step.kind.as_str(), "call" | "boundary")
+                && step.children.is_empty()
+                && step.alternate.is_empty()
+            {
+                self.incidental += 1;
+                if !self.show_all && !step.hidden {
+                    step.hidden = true;
+                    self.hidden += 1;
+                }
+            }
+            if let Some(target) = step.target.clone() {
+                self.expand(step, &target, depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds the exact target `id` in `key` as a participant lane.
+    fn participant(&mut self, id: &str, key: &crate::native_evidence::DocumentKey) -> Result<()> {
+        let target = self
+            .store
+            .selected_graph_document_for(self.db, &key.path, self.selected)?
+            .nodes
+            .into_iter()
+            .find(|node| node.id == id)
+            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+        let declaration = self
+            .source
+            .document(key)?
+            .declarations
+            .get(id)
+            .cloned()
+            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+        self.nodes.push(crate::graph_query::GraphNode {
+            declaration,
+            // The expansion level of the call that first reached it.
+            depth: self.stack.len() as u64,
+        });
+        self.participants.push(crate::behavior::Participant {
+            id: id.to_owned(),
+            label: target.name.clone(),
+            kind: serde_json::to_value(target.kind)?
+                .as_str()
+                .ok_or_else(|| SelectedIntegrity("invalid sequence target kind".into()))?
+                .into(),
+            identification: "Fresh exact semantic call target in the selected snapshot.".into(),
+            declaration: Some(target),
+        });
+        Ok(())
+    }
+
+    /// Expands the measured body of `target` beneath `step`, once per target, when it fits
+    /// the step and depth bounds and is not already on the expansion path.
+    fn expand(
+        &mut self,
+        step: &mut crate::behavior::SequenceStep,
+        target: &str,
+        depth: usize,
+    ) -> Result<()> {
+        use crate::behavior::{MAX_STEP_DEPTH, MAX_STEPS, step_count, tree_depth};
+        if self.stack.iter().any(|owner| owner == target) || !self.expanded.insert(target.into()) {
+            return Ok(());
+        }
+        let Some(symbol) = self
+            .participants
+            .iter()
+            .find(|p| p.id == target)
+            .and_then(|p| p.declaration.clone())
+            .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method))
+        else {
+            return Ok(());
+        };
+        let document =
+            self.store
+                .selected_graph_document_for(self.db, &symbol.path, self.selected)?;
+        let mut calls = document.graph_calls;
+        calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
+        let mut body = crate::behavior::build_sequence(
+            self.revision,
+            &symbol,
+            &document.file,
+            &calls,
+            self.show_all,
+        )?;
+        if body.steps.is_empty() {
+            return Ok(());
+        }
+        let count = step_count(&body.steps);
+        if self.used + count > MAX_STEPS {
+            self.truncated = true;
+            self.warn(format!(
+                "Sequence step limit reached; the body of {} is not expanded.",
+                symbol.name
+            ));
+            return Ok(());
+        }
+        if depth + 1 + tree_depth(&body.steps) >= MAX_STEP_DEPTH {
+            self.truncated = true;
+            self.warn(format!(
+                "Sequence depth limit reached; the body of {} is not expanded.",
+                symbol.name
+            ));
+            return Ok(());
+        }
+        self.used += count;
+        fn relabel(steps: &mut [crate::behavior::SequenceStep], prefix: &str, lane: &str) {
+            for step in steps {
+                step.id = format!("{prefix}>{}", step.id);
+                step.lane = Some(lane.to_owned());
+                relabel(&mut step.children, prefix, lane);
+                relabel(&mut step.alternate, prefix, lane);
+            }
+        }
+        relabel(&mut body.steps, &step.id, target);
+        for warning in std::mem::take(&mut body.warnings) {
+            self.warn(warning);
+        }
+        self.hidden += body.hidden_steps;
+        self.truncated |= body.truncated;
+        let key = self
+            .source
+            .locate(target)?
+            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+        let callee = self.source.document(&key)?;
+        self.stack.push(target.to_owned());
+        self.steps(&mut body.steps, &callee, target, depth + 1)?;
+        self.stack.pop();
+        step.children = body.steps;
+        Ok(())
+    }
 }
 
 impl EvidenceResponse {

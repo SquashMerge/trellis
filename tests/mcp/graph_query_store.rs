@@ -363,9 +363,6 @@ fn sequence_uses_engine_boundary_precedence_and_warnings() {
         ("unresolved", BoundaryReason::Unresolved),
         ("external", BoundaryReason::External),
         ("dispatch", BoundaryReason::Dispatch),
-        ("stale", BoundaryReason::Stale),
-        ("missing", BoundaryReason::MissingEvidence),
-        ("failed", BoundaryReason::MissingEvidence),
     ] {
         let (state, root) = workspace();
         let mut publisher = Publisher::open(state.path(), root.path());
@@ -398,6 +395,70 @@ fn sequence_uses_engine_boundary_precedence_and_warnings() {
                     b.possible = vec!["b".into()];
                 }
             }
+            _ => unreachable!(),
+        }
+        let pin = publisher.publish(&spec);
+        let seed = syntax_id(publisher.native(), "a");
+        let view = publisher
+            .store
+            .sequence_at(&seed, pin, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            view.semantic.tier,
+            trellis::behavior::EvidenceTier::Semantic,
+            "{mode}"
+        );
+        let steps = sequence_steps(&view.steps);
+        assert_eq!(steps.len(), 2, "{mode}");
+        // External calls are incidental (#522): kept with their evidence, but hidden.
+        let external = mode == "external";
+        assert_eq!(
+            (view.hidden_steps, view.incidental_steps),
+            if external { (2, 2) } else { (0, 0) },
+            "{mode}"
+        );
+        assert!(steps.iter().all(|step| step.hidden == external), "{mode}");
+        assert!(
+            steps.iter().all(|step| step.target.is_none()
+                && step.call_evidence.as_ref().unwrap().boundary_reason == reason),
+            "{mode}"
+        );
+        let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
+        assert_eq!(view.semantic_warnings, graph.warnings, "{mode}");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.boundary_reason == reason)
+        );
+    }
+}
+
+/// #522: a seed whose calls have no fresh selected binding keeps the syntax view (its
+/// source-hint lanes included), and says why, instead of drawing every call as a boundary.
+#[test]
+fn sequence_without_fresh_bindings_falls_back_to_syntax_with_its_reason() {
+    for (mode, reason) in [
+        (
+            "stale",
+            "Semantic evidence for a.rs is stale: it was imported for an earlier version of the file. Showing syntax.",
+        ),
+        (
+            "missing",
+            "No semantic binding covers this method's calls; showing syntax.",
+        ),
+        (
+            "failed",
+            "Semantic coverage of a.rs is failed; showing syntax.",
+        ),
+    ] {
+        let (state, root) = workspace();
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let source = "fn a() { client.send(); b(); }\nfn b() {}\n";
+        let mut spec = Spec::new(&[("a.rs", source)]);
+        spec.bindings = vec![bind("a", 0, "b"), bind("a", 1, "b")];
+        match mode {
             "stale" => spec.requested_version = "v2".into(),
             "missing" => spec.bindings.clear(),
             "failed" => {
@@ -412,21 +473,33 @@ fn sequence_uses_engine_boundary_precedence_and_warnings() {
             .sequence_at(&seed, pin, false)
             .unwrap()
             .unwrap();
+        assert_eq!(view.semantic.tier, trellis::behavior::EvidenceTier::Syntax);
+        assert_eq!(view.semantic.reason.as_deref(), Some(reason), "{mode}");
         let steps = sequence_steps(&view.steps);
         assert_eq!(steps.len(), 2, "{mode}");
         assert!(
-            steps.iter().all(|step| step.target.is_none()
-                && step.call_evidence.as_ref().unwrap().boundary_reason == reason),
+            steps
+                .iter()
+                .all(|step| step.target.is_none() && step.call_evidence.is_none()),
             "{mode}"
         );
-        let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
-        assert_eq!(view.semantic_warnings, graph.warnings, "{mode}");
-        assert!(
-            graph
-                .edges
-                .iter()
-                .all(|edge| edge.boundary_reason == reason)
-        );
+        // Exactly the syntax DTO: source-hint lanes and all.
+        let mut syntax = trellis::behavior::build_sequence(
+            pin,
+            &view.seed,
+            &publisher
+                .store
+                .source_at("a.rs", Some(pin))
+                .unwrap()
+                .unwrap()
+                .1,
+            &publisher.graph.as_ref().unwrap().calls,
+            false,
+        )
+        .unwrap();
+        syntax.semantic = view.semantic.clone();
+        assert!(syntax.participants.len() > 1, "{mode}");
+        assert_eq!(view, syntax, "{mode}");
     }
 }
 
@@ -537,9 +610,13 @@ fn sequence_outside_sole_producer_languages_preserves_plain_syntax() {
         .collect();
     assert!(syntax.iter().all(|view| view.participants.len() > 1));
     // Spec::new publishes a Rust-only producer alongside the JavaScript seed.
+    assert!(syntax.iter().all(
+        |view| view.semantic.reason.as_deref() == Some(trellis::graph_query::NO_PRODUCER_NOTE)
+    ));
     let semantic_pin = publisher.publish(&Spec::new(&files));
     for (show_all, mut expected) in [false, true].into_iter().zip(syntax) {
         expected.revision = semantic_pin;
+        expected.semantic.reason = Some(trellis::graph_query::LANGUAGE_NOTE.into());
         let actual = publisher
             .store
             .sequence_at(&seed, semantic_pin, show_all)
@@ -636,6 +713,103 @@ fn sequence_constructor_can_target_exact_class_declaration() {
         participant.declaration.as_ref().unwrap().kind,
         trellis::model::SymbolKind::Class
     );
+}
+
+/// #522: a direct callee whose body would take the view past 200 steps keeps its lane and
+/// arrow but is not expanded; the view says so and is truncated.
+#[test]
+fn sequence_expansion_respects_the_step_bound() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let body = "x(); ".repeat(200);
+    let source = format!("fn a() {{ big(); }}\nfn big() {{ {body}}}\nfn x() {{}}\n");
+    let mut spec = Spec::new(&[("a.rs", &source)]);
+    spec.bindings = vec![bind("a", 0, "big")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let big = syntax_id(publisher.native(), "big");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].target.as_deref(), Some(big.as_str()));
+    assert!(steps[0].children.is_empty());
+    assert!(view.truncated);
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w == "Sequence step limit reached; the body of big is not expanded.")
+    );
+}
+
+/// #522 review: a repository-defined `console.log` the JS adapter hides by spelling, bound
+/// by fresh exact direct evidence to its local method, is shown with its expanded body.
+#[test]
+fn sequence_resolved_local_call_is_not_hidden_by_a_spelling_heuristic() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = "const console = { log() { helper(); } };\nfunction helper() {}\nfunction visible() {}\nfunction a() { console.log(); visible(); }\n";
+    let mut spec = Spec::new(&[("a.js", source)]);
+    spec.languages = vec![s::Language::Javascript];
+    spec.bindings = vec![bind("a", 0, "log"), bind("log", 0, "helper")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let (log, helper) = (
+        syntax_id(publisher.native(), "log"),
+        syntax_id(publisher.native(), "helper"),
+    );
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let call = sequence_steps(&view.steps)
+        .into_iter()
+        .find(|step| step.target.as_deref() == Some(log.as_str()))
+        .expect("console.log resolves to the local method");
+    assert!(!call.hidden);
+    assert_eq!(call.children.len(), 1, "{view:?}");
+    assert_eq!(call.children[0].target.as_deref(), Some(helper.as_str()));
+    assert!(!call.children[0].hidden);
+    assert_eq!((view.hidden_steps, view.incidental_steps), (0, 0));
+}
+
+/// #522: a step the syntax adapter already hid (a standalone `console.log`) that is also
+/// bound external is incidental once, not hidden twice.
+#[test]
+fn sequence_incidental_step_already_hidden_is_counted_once() {
+    let (state, root) = workspace();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let mut spec = Spec::new(&[(
+        "a.js",
+        "function a() { console.log(1); b(); }\nfunction b() {}\n",
+    )]);
+    spec.languages = vec![s::Language::Javascript];
+    spec.bindings = vec![
+        Bind {
+            resolution: s::Resolution::External,
+            dispatch: Dispatch::Unknown,
+            ..bind("a", 0, "b")
+        },
+        bind("a", 1, "b"),
+    ];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "a");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    let steps = sequence_steps(&view.steps);
+    assert!(steps[0].hidden);
+    assert_eq!(
+        steps[0].call_evidence.as_ref().unwrap().boundary_reason,
+        BoundaryReason::External
+    );
+    assert_eq!((view.hidden_steps, view.incidental_steps), (1, 1));
 }
 
 #[test]

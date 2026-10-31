@@ -8,12 +8,12 @@ hidden entries and nested boundaries. Semantic enrichment never flattens or reor
 
 `SequenceView.revision` and `POST /api/sequence.expectedRevision` are `IndexPin` values,
 not integer revisions. All evidence and declaration targets are read inside the same
-selected SQLite transaction. No provider, filesystem read, index request or callee-body
-expansion is performed by enrichment.
+selected SQLite transaction. No provider, filesystem read or index request is performed
+by enrichment. Callee bodies are expanded only as described under #522 below.
 
 The store uses, at that selected snapshot, the sole published semantic producer whose
 profile covers the seed's language (owner ruling 2026-10-30, #483, amending #392). Zero
-producers preserves the syntax-only DTO. Multiple producers for the seed's language
+producers preserves the syntax-only DTO (with `semantic.reason`, #522). Multiple producers for the seed's language
 preserves syntax and adds `multiple semantic producers for <language>; showing syntax`; it
 never picks or merges producers. Published producers that do not cover the seed language
 also preserve the plain syntax-only DTO, including receiver hints, without semantic labels
@@ -48,6 +48,45 @@ messages also appear in `warnings`. Existing syntax warnings are preserved. No w
 code or resolution is invented by the browser. Bounds remain 200 steps, 20 participants
 and depth 24. If a resolved target cannot fit, its boundary is `nodeLimit`, its target is
 absent, and the view is truncated with an explicit participant-limit warning.
+
+### Participants, expansion and incidental calls (#522)
+
+This amends "no callee-body expansion" above, per #522 (owner's 2026-10-31 live review).
+Enrichment still performs no provider call, filesystem read or index request: every body
+it adds is read from the same selected snapshot.
+
+- `SequenceView.semantic` is `{tier, producerId?, reason?}`. `tier=semantic` names the sole
+  producer whose fresh bindings enriched the view. `tier=syntax` keeps the syntax-only DTO
+  (its source-hint lanes included) and gives the reason: the producer note (zero producers,
+  none covering the language, or several), the seed document's coverage not selected or not
+  `complete`/`partial`, or no measured call of the seed having a fresh selected binding
+  (stale or missing evidence). One fresh binding is enough to enrich; the seed's other calls
+  then keep their own `stale` or `missingEvidence` boundaries. A seed with no measured calls has nothing
+  to fall back from: it reports `tier=semantic` with the producer, and none of its steps
+  carries call evidence.
+- Each exact direct/constructor target (contract-v1 dispatch, #470) is a participant. The
+  first call to each function/method target has the target's own measured body expanded as
+  that call step's `children`. Expanded steps carry `lane` (the participant whose body they
+  belong to; absent for the seed's own steps) and IDs prefixed by the expanding step's ID.
+  They are enriched by the same engine rules, recursively. A target already on the expansion
+  path (recursion) or already expanded is drawn as an arrow only. A body that would exceed
+  200 steps or depth 24 in the whole view is not expanded, the view is truncated and a
+  warning names it. Other dispatch, ambiguous (#466, one edge), unresolved, external and
+  stale calls stay boundaries.
+- A syntax heuristic never hides a call with a fresh exact internal target (for example a
+  repository-defined JavaScript `console.log`); it and its expanded body stay visible.
+- A standalone call step whose boundary reason is `external` (the standard library or any
+  other package) is incidental. `incidentalSteps` counts them; unless `showAll`, they are
+  `hidden` and counted in `hiddenSteps`. A chain group whose calls are all hidden is hidden.
+- `callEvidence.semanticBasis` is the selected binding's captured basis, as MCP reports it.
+- Depth 24 bounds the step tree to 24 levels, as the browser renderers already did: a step
+  on the 24th level that still nests becomes one `boundary` ("Depth limit: behavior
+  omitted.") at its own range. The Rust adapter bounds its syntax
+  recursion separately, at 96 levels, so deep syntax that adds no steps keeps its calls.
+
+The browser draws an expanded step's arrows and notes from its `lane`, shows the tier and
+reason in the sequence status line, and offers a "Show/Hide N incidental calls" toggle
+(the same `showAll` request as Options → Show all steps).
 
 Typed integrity, busy and pin failures abort the entire response, never returning a
 partially enriched view. Lanes/arrows prove static declaration targets only: no runtime
