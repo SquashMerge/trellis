@@ -609,9 +609,11 @@ test("class controller uses authenticated API and clears pending source on navig
 
 test("unsupported class languages keep their ordinary file and method interactions", () => {
   const h=harness();h.context.window.TrellisClasses={showContextMenu(){throw new Error('unexpected menu');}};
-  h.run(`attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'});`);
+  h.run(`attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'}); attachClassMenu($('mjs-file'),{path:'web/a.mjs'});`);
   assert.equal(h.get('rust-file').listeners.contextmenu,undefined);
-  assert.equal(h.get('js-file').listeners.contextmenu,undefined);
+  // JavaScript classes are catalogued (#452): its files offer the class menu.
+  assert.equal(typeof h.get('js-file').listeners.contextmenu,'function');
+  assert.equal(typeof h.get('mjs-file').listeners.contextmenu,'function');
 });
 
 

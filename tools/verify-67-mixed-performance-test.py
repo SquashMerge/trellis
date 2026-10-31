@@ -243,7 +243,7 @@ class SchemaParity(unittest.TestCase):
             self.assertTrue(rows[table], table)
         return rows
 
-    def test_selected_view_normalizes_a_schema_29_batch_selection_identically_across_roots(self):
+    def test_selected_view_normalizes_a_schema_30_batch_selection_identically_across_roots(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             self.assertEqual(self.normalized_rows(first), self.normalized_rows(second))
 

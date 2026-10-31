@@ -50,20 +50,28 @@ fn index_db(state: &std::path::Path) -> std::path::PathBuf {
 fn cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
-fn setup_with(
-    source: &str,
-) -> (
+type Setup = (
     tempfile::TempDir,
     Store,
     Graph,
     Router,
     Arc<trellis::store::topology::WriterSession>,
-) {
+);
+fn setup_with(source: &str) -> Setup {
+    setup_files(&[
+        ("Types.java", source),
+        ("unsupported.rs", "struct Unsupported {}"),
+    ])
+}
+fn setup_files(files: &[(&str, &str)]) -> Setup {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    std::fs::write(workspace.join("Types.java"), source).unwrap();
-    std::fs::write(workspace.join("unsupported.js"), "class Unsupported {}").unwrap();
+    for (path, text) in files {
+        let path = workspace.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
     let options = IndexOptions::new(workspace.clone());
     let graph = index_workspace(&options, &cancel(), |_| {}).unwrap();
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
@@ -193,9 +201,118 @@ async fn search_pagination_literal_wildcards_and_supported_languages() {
         assert_eq!(status, 200);
         assert_eq!(page["items"], json!([]));
     }
-    let (_, unsupported) = call(&app, "GET", "/api/classes?path=unsupported.js", Value::Null).await;
+    let (_, unsupported) = call(&app, "GET", "/api/classes?path=unsupported.rs", Value::Null).await;
     assert_eq!(unsupported["items"], json!([]));
     assert!(!unsupported["warnings"].as_array().unwrap().is_empty());
+}
+/// A real-shaped browser module: exported ES classes across files, a class
+/// expression, an object literal and a prototype assignment (the last three out).
+pub const JS_WIDGETS: &str = r#"import { View } from "./view.js";
+export class Widget extends View {
+  #state = null;
+  label = "";
+  static instances = 0;
+  constructor(label) { super(); this.label = label; Widget.instances++; }
+  render(target) { target.textContent = this.label; }
+  static of(label) { return new Widget(label); }
+}
+export default class Panel extends Widget { open() {} }
+export const Dialog = class extends View {};
+export const helpers = { render() {} };
+View.prototype.legacy = function () {};
+"#;
+#[tokio::test]
+async fn javascript_classes_are_served_with_supported_languages_and_method_seeds() {
+    let (_dir, store, graph, app, _session) = setup_files(&[
+        ("web/widgets.js", JS_WIDGETS),
+        ("web/view.js", "export class View { mount() {} }\n"),
+    ]);
+    let pin = store.status().unwrap().revision;
+    let (status, page) = call(
+        &app,
+        "GET",
+        &format!("/api/classes?path=web/widgets.js&{}", pin_query(pin)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(
+        page["supportedLanguages"],
+        json!(["java", "python", "javascript"])
+    );
+    assert!(
+        page["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| !w.as_str().unwrap().contains("currently support")),
+        "{page}"
+    );
+    let items = page["items"].as_array().unwrap();
+    let names: Vec<_> = items
+        .iter()
+        .map(|c| c["qualifiedName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["web.widgets.Panel", "web.widgets.Widget"]);
+    let widget = &items[1];
+    assert_eq!(widget["language"], "javascript");
+    assert_eq!(widget["declarationKind"], "class");
+    let members = |key: &str| -> Vec<String> {
+        widget[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(members("fields"), ["#state", "label", "instances"]);
+    assert_eq!(members("methods"), ["constructor", "render", "of"]);
+    // A method seed resolves to its lexical ES class.
+    let render_id = widget["methods"][1]["symbolId"].as_str().unwrap();
+    let render = graph.nodes.iter().find(|n| n.id == render_id).unwrap();
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.name == "render" && n.id != render_id),
+        "the object-literal render() is a different, unclassed method"
+    );
+    let (status, diagram) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":render.id,"expectedRevision":pin,"includeHierarchy":true,"includeUnmatched":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{diagram}");
+    assert_eq!(diagram["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(diagram["nodes"][0]["label"], "web.widgets.Widget");
+    assert_eq!(diagram["edges"], json!([]), "extends stays a terminal hint");
+    let literal = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "render" && n.id != render_id)
+        .unwrap();
+    let (status, refused) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":literal.id,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an object-literal method has no class: {refused}"
+    );
+    let (_, search) = call(
+        &app,
+        "GET",
+        &format!("/api/classes?q=View&{}", pin_query(pin)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(search["items"].as_array().unwrap().len(), 1);
+    assert_eq!(search["items"][0]["qualifiedName"], "web.view.View");
 }
 #[tokio::test]
 async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
@@ -584,7 +701,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            29,
+            30,
             "native-v6-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
@@ -593,7 +710,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        29
+        30
     );
     assert!(
         store
@@ -1201,7 +1318,7 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_serve_it() {
     assert_eq!(call(&app, "GET", &source, Value::Null).await.0, 200);
     assert_eq!(call(&app, "GET", &classes, Value::Null).await.0, 200);
     let (_,unrelated): (String,Option<String>)=db.query_row(
-        "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.path='unsupported.js'",
+        "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.path='unsupported.rs'",
         [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert!(unrelated.is_none());
 }
