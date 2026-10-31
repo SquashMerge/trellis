@@ -211,7 +211,6 @@
                 <label><input id="treemap-hide-tests" type="checkbox" checked> Hide test files</label>
               </div></details>
               <details class="popover view-about"><summary aria-label="About this view" title="About this view"><span aria-hidden="true">ⓘ</span></summary><div class="popover-body"><h3>About this view</h3><p class="treemap-basis">Area: physical file lines · includes inline test lines. Heat: measured callable metrics, not runtime evidence.</p><p id="treemap-summary"></p></div></details>
-              <button id="treemap-refresh" type="button">Refresh treemap</button>
             </div>
             <nav id="treemap-breadcrumbs" aria-label="Treemap directory"></nav>
             <p id="treemap-state" role="status" aria-live="polite">Open Treemap to read indexed file lines and metrics.</p>
@@ -248,7 +247,7 @@
           <section id="files-inspector" hidden aria-label="Indexed symbol evidence">
             <p id="files-symbol-kind" class="detail">Indexed symbol</p><h3 id="files-symbol-title">Choose a symbol</h3>
             <p id="files-symbol-location" class="detail"></p><pre id="files-symbol-header"></pre><p id="files-symbol-return" class="detail"></p>
-            <section aria-labelledby="files-mini-title"><div class="bar"><h4 id="files-mini-title">Sequence · measured</h4><button id="files-open-full" type="button" disabled>Open full</button></div><p id="files-mini-state" role="status">Select a callable to preview its measured sequence.</p><div id="files-mini-sequence" class="sequence-scroll" tabindex="0" aria-label="Measured sequence preview"></div></section>
+            <section aria-labelledby="files-mini-title"><div class="bar view-toolbar"><h4 id="files-mini-title">Sequence · measured</h4><details id="files-mini-about" class="popover view-about"><summary aria-label="About this preview" title="About this preview"><span aria-hidden="true">ⓘ</span></summary><div class="popover-body"><h3>About this preview</h3><p>Measured source steps, not a runtime trace. Calls without a verified target stay labelled unverified.</p><ul id="files-mini-notes" class="plain"></ul></div></details><button id="files-open-full" type="button" disabled>Open full</button></div><p id="files-mini-state" role="status">Select a callable to preview its measured sequence.</p><div id="files-mini-sequence" class="sequence-scroll" tabindex="0" aria-label="Measured sequence preview"></div><p id="files-mini-floor" class="files-mini-floor" hidden>Too large to preview · <button id="files-mini-floor-open" type="button">Open full</button></p></section>
             <section aria-labelledby="files-matches-title"><h4 id="files-matches-title">References</h4><p class="detail">Syntax matches in the indexed revision · same spelling, not compiler-resolved. Homonyms and shadowing may refer to other declarations.</p><p id="files-matches-state" role="status"></p><ul id="files-matches" class="plain"></ul><button id="files-matches-more" type="button" hidden>More syntax matches</button><button id="files-matches-retry" type="button" hidden>Retry syntax matches</button></section>
           </section>
           <div id="inspector-empty" class="inspector-empty"><span class="inspector-symbol" aria-hidden="true">↗</span><h3>Nothing selected</h3><p>Select a call, module, edge or file to inspect its measured evidence.</p></div>

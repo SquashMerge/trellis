@@ -445,6 +445,8 @@ test("Architecture rejects a route-gated production response after all-callable 
     await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
     assert.match(await page.locator("#architecture-inspector-content").textContent(), /4 indexed callables/);
     await page.route(pattern, respond);
+    // The production read of this revision is cached on the page (#527); drop it so the gated read is real.
+    await page.evaluate(() => clearRevisionReads());
     await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").uncheck();
     await seen;
     assert.equal(await page.locator("#architecture-diagram svg").count(), 0, "changing role removes old heat before the blocked read");
@@ -843,6 +845,31 @@ test("Architecture preserves a conflicted draft, reloads explicitly and requires
 
 
 
+// #527: the summary is cached per revision, but rules are read live. A rules_conflict from a
+// detail read must make "Reload Architecture" read the current rules, not the cached summary.
+test("Architecture Reload after a detail rules_conflict reads the current rules, not the cached summary", {timeout:240000}, async () => published(rules, async selected => {
+  const {page, paths, requests} = selected;
+  await ready(page); await expandAll(page);
+  const summaries = () => requests.filter(row => row.url.pathname.endsWith("/architecture")).length;
+  const before = summaries();
+  writeFileSync(rulesPath(paths), `${rules}\n# ordinary external editor changed disk at the same revision\n`);
+  const statuses = [];
+  page.on("response", response => { if (new URL(response.url()).pathname.endsWith("/architecture/details")) statuses.push(response.status()); });
+  await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
+  const reload = page.locator("#architecture-inspector").getByRole("button", {name:"Reload Architecture", exact:true});
+  await reload.first().waitFor({timeout:30000}).catch(async error => assert.fail(`${error.message}: details ${JSON.stringify(statuses)} inspector ${await page.locator("#architecture-inspector").textContent()}`));
+  assert.ok(statuses.includes(409), `a detail read refused the old rules hash: ${JSON.stringify(statuses)}`);
+  assert.match(await page.locator("#architecture-inspector-content").textContent(), /Rules changed since this diagram was loaded/);
+  await reload.first().click();
+  for (const deadline = Date.now() + 60000; summaries() === before; await page.waitForTimeout(50)) assert.ok(Date.now() < deadline, "Reload Architecture reads the summary again");
+  await ready(page); await expandAll(page);
+  const details = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/architecture/details"));
+  await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
+  assert.equal((await details).status(), 200, "the reloaded summary carries the current rules hash");
+  await settled(page);
+  assert.doesNotMatch(await page.locator("#architecture-inspector-content").textContent(), /Rules changed since this diagram was loaded/);
+}));
+
 test("Architecture assigns a no-edge unassigned file through exact preview without indexing", {timeout:240000}, async () => published(rules, async selected => {
   const {page} = selected;
   await ready(page);
@@ -986,15 +1013,15 @@ test("Architecture opens an external package reference in the library catalog, w
     assert.ok(Date.now() < deadline && !["failed", "disabled"].includes(catalog.data.state), JSON.stringify(catalog.data));
     await new Promise(resolve => setTimeout(resolve, 250));
   }
+  // #527: the page reads the catalog only when an in-context entry needs it.
+  assert.equal(requests.some(row => row.url.pathname.endsWith("/dependencies")), false, "no eager catalog read");
   const catalogRead = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/dependencies"));
-  await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
-  assert.equal((await (await catalogRead).json()).state, "ready");
-  await ready(page);
   await page.locator("#architecture-notices > summary").click();
   await page.getByRole("button", {name:"Inspect same-layer and unassigned references", exact:true}).click(); await settled(page);
+  assert.equal((await (await catalogRead).json()).state, "ready");
   const pair = page.locator("#architecture-inspector-content details").filter({has:page.locator(":scope > summary", {hasText:/src\/uses_library\.rs → local[-_]library \(rust package\)/})}).first();
   await pair.locator(":scope > summary").click();
-  const open = pair.getByRole("button", {name:"Open in library", exact:true});
+  const open = pair.getByRole("button", {name:"Open in library", exact:true}); await open.waitFor();
   assert.equal(await open.count(), 1);
   assert.equal(await page.locator("#architecture-inspector-content button").filter({hasText:"Open in library"}).count(), 1, "only the catalogued package offers the library");
   await open.click();

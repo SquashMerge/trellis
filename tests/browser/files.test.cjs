@@ -33,8 +33,9 @@ ${Array.from({length:53}, (_, i) => `    watcher.measured(${i + 2});`).join("\n"
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
 
-async function published({git = false, width = 1440, sourceText = source} = {}, callback) {
+async function published({git = false, width = 1440, sourceText = source, files = {}} = {}, callback) {
   const paths = H.fixture(sourceText, "Watcher.java");
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(paths.workspace, name), text);
   writeFileSync(join(paths.workspace, "Uses.java"), uses);
   writeFileSync(join(paths.workspace, "clean.js"), "const clean = 1;\n");
   writeFileSync(join(paths.workspace, hostileName), "// <script>globalThis.sourceExecuted=true</script>\nconst safe = 'λ';\n");
@@ -125,9 +126,20 @@ async function openFile({page}, path) {
   await page.locator("#file-tree .file-pick").filter({hasText:path}).first().click();
   await page.waitForFunction(path => document.querySelector("#source-path")?.textContent.includes(path) && document.querySelector("#source .source-line"), path);
 }
+// #526: members are rows only under an expanded container; open every container.
+async function expandOutline(page) {
+  await page.locator(".files-symbol-pick").first().waitFor();
+  for (let guard = 0; guard < 50; guard++) {
+    const closed = page.locator('.files-symbol-toggle[aria-expanded="false"]');
+    if (!await closed.count()) return;
+    await closed.first().click();
+  }
+  assert.fail("outline containers did not stay expanded");
+}
 async function selectSymbol(page, item) {
   if (await page.locator("#explorer-toggle").isVisible() && await page.locator("#explorer-toggle").getAttribute("aria-expanded") !== "true") await page.locator("#explorer-toggle").click();
   const row = page.locator(`.files-symbol-pick[data-symbol-id="${item.symbol.id}"]`);
+  if (!await row.count()) await expandOutline(page);
   await row.waitFor(); await row.focus(); await page.keyboard.press("Enter");
   await page.waitForFunction(name => document.querySelector("#files-symbol-title")?.textContent.includes(name), item.symbol.name);
 }
@@ -147,7 +159,7 @@ async function assertNoOverflow(page) {
 }
 const flatten = steps => steps.flatMap(step => [step, ...flatten(step.children || []), ...flatten(step.alternate || [])]);
 
-test("published Files keeps original all-kind outline, UTF-8 syntax locations and mini/full sequence on one pin", {timeout:240000}, async () => published({}, async selected => {
+test("published Files outlines types and callables with members under an expanded type, UTF-8 syntax locations and mini/full sequence on one pin", {timeout:240000}, async () => published({}, async selected => {
   const {page, pin, requests} = selected;
   await enterFiles(selected);
   await openFile(selected, "Watcher.java");
@@ -155,14 +167,31 @@ test("published Files keeps original all-kind outline, UTF-8 syntax locations an
   assert.equal(file.text, source);
   const kinds = new Set(dto.items.map(item => item.nativeKind));
   for (const kind of ["type", "field", "constructor", "method", "parameter"]) assert.ok(kinds.has(kind), `real Java producer emits ${kind}`);
-  await page.waitForFunction(count => document.querySelectorAll(".files-symbol-pick[data-symbol-id]").length === count, dto.items.length);
-  assert.deepEqual(await page.locator(".files-symbol-pick").evaluateAll(rows => rows.map(row => row.dataset.symbolId)), dto.items.map(item => item.symbol.id));
-  for (const item of dto.items) {
+  const type = dto.items.find(item => item.nativeKind === "type"), method = dto.items.find(item => item.symbol.name === "measured");
+  assert.ok(type && method);
+  // #526: the collapsed outline is the file's types and callables; fields, constructors,
+  // methods and parameters are not top-level rows.
+  const rows = () => page.locator(".files-symbol-pick").evaluateAll(nodes => nodes.map(node => node.dataset.symbolId));
+  await page.locator(`.files-symbol-pick[data-symbol-id="${type.symbol.id}"]`).waitFor();
+  assert.deepEqual(await rows(), [type.symbol.id]);
+  const toggle = page.locator(".files-symbol-row").filter({has:page.locator(`.files-symbol-pick[data-symbol-id="${type.symbol.id}"]`)}).locator(".files-symbol-toggle");
+  assert.equal(await toggle.getAttribute("aria-expanded"), "false");
+  const members = dto.items.filter(item => item.symbol.parent === type.symbol.id && ["field", "constructor", "method"].includes(item.nativeKind));
+  assert.equal(await toggle.getAttribute("aria-label"), `Expand Watcher members (${members.length})`);
+  await toggle.click();
+  assert.equal(await toggle.evaluate(node => document.activeElement === node), true, "focus stays on the toggle");
+  assert.equal(await toggle.getAttribute("aria-expanded"), "true");
+  assert.deepEqual(await rows(), [type.symbol.id, ...members.map(item => item.symbol.id)], "members follow their type in source order");
+  assert.deepEqual(new Set(members.map(item => item.nativeKind)), new Set(["field", "constructor", "method"]));
+  for (const item of [type, ...members]) {
     const label = await page.locator(`.files-symbol-pick[data-symbol-id="${item.symbol.id}"]`).textContent();
     assert.ok(label.includes(item.symbol.name)); assert.ok(label.includes(item.nativeKind));
   }
-  const type = dto.items.find(item => item.nativeKind === "type"), method = dto.items.find(item => item.symbol.name === "measured");
-  assert.ok(type && method);
+  for (const parameter of dto.items.filter(item => item.nativeKind === "parameter")) {
+    assert.equal(await page.locator(`.files-symbol-pick[data-symbol-id="${parameter.symbol.id}"]`).count(), 0, "parameters are never outline rows");
+  }
+  await toggle.click();
+  assert.deepEqual(await rows(), [type.symbol.id], "collapsing hides the members again");
   const before = sequenceReads(requests);
   await selectSymbol(page, type);
   await assertSource(page, source, type.symbol.range);
@@ -310,9 +339,134 @@ test("Files Open full opens Sequence over a last-used Treemap; the mini fits, th
   await onSequence("Forward");
 }));
 
+// #526 and #514: the preview's caveats sit behind its ⓘ; the drawing scales to the inspector
+// and, when its scaled text would be under 9 px, says "Too large to preview · Open full".
+test("Files mini-sequence keeps caveats behind ⓘ, fits the inspector and floors unreadable text", {timeout:240000}, async () => published({}, async selected => {
+  const {page, pin} = selected;
+  await enterFiles(selected); await openFile(selected, "Watcher.java");
+  const method = (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "measured");
+  const view = await read(selected, "sequence", {seed:method.symbol.id, expectedRevision:pin, showAll:false});
+  await selectSymbol(page, method);
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false && document.querySelector("#files-mini-sequence")?.dataset.fit);
+  // One short status line; the sequence's warnings are notes behind the ⓘ.
+  const state = await page.locator("#files-mini-state").textContent();
+  assert.match(state, /^Indexed revision [0-9a-f]{8}:\d+ · \d+ incidental steps hidden/);
+  for (const warning of view.warnings) assert.ok(!state.includes(warning), `caveat stays out of the status line: ${warning}`);
+  const notes = await page.locator("#files-mini-notes li").allTextContents();
+  assert.deepEqual(notes.slice(0, view.warnings.length), view.warnings);
+  if (notes.length) assert.ok(state.endsWith(`· ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ`), state);
+  assert.equal(await page.locator("#files-mini-notes").isVisible(), false);
+  await page.locator("#files-mini-about > summary").click();
+  await page.waitForFunction(() => document.querySelector("#files-mini-about .popover-body")?.style.left);
+  assert.equal(await page.locator("#files-mini-about .popover-body").isVisible(), true);
+  const card = await page.locator("#files-mini-about .popover-body").evaluate(node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right, top:r.top}; });
+  assert.ok(card.left >= 0 && card.right <= 1440, `ⓘ opens inside the viewport: ${JSON.stringify(card)}`);
+  assert.match(await page.locator("#files-mini-about .popover-body").textContent(), /not a runtime trace/);
+  await page.keyboard.press("Escape");
+
+  // The fit is measured against the inspector: wide enough draws it, narrow floors it.
+  const fit = () => page.locator("#files-mini-sequence").evaluate(node => {
+    const svg = node.querySelector("svg"), box = node.getBoundingClientRect(), drawn = svg.getBoundingClientRect();
+    return {fit:node.dataset.fit, px:Number(node.dataset.textPx), shown:node.offsetParent !== null, floor:!document.querySelector("#files-mini-floor").hidden,
+      scrollWidth:node.scrollWidth, clientWidth:node.clientWidth, left:box.left, right:box.right, svgLeft:drawn.left, svgRight:drawn.right};
+  });
+  // The strict CSP admits no inline style sheet; the CSSOM sets the frame's columns.
+  const widen = width => page.evaluate(width => {
+    document.querySelector(".workspace-frame").style.setProperty("grid-template-columns", `200px minmax(0, 1fr) ${width}px`, "important");
+  }, width);
+  await widen(900);
+  await page.waitForFunction(() => document.querySelector("#files-mini-sequence")?.dataset.fit === "scaled", null, {timeout:10000})
+    .catch(async error => assert.fail(`${error.message}: ${JSON.stringify(await fit())} ${await page.locator("#files-mini-sequence").evaluate(node => [node.parentElement.clientWidth, node.querySelector("svg")?.getAttribute("viewBox")].join(" "))}`));
+  const wide = await fit();
+  assert.ok(wide.px >= 9 && wide.shown && !wide.floor, `a wide inspector draws readable text: ${JSON.stringify(wide)}`);
+  assert.ok(wide.scrollWidth <= wide.clientWidth, `no sideways scroll: ${JSON.stringify(wide)}`);
+  assert.ok(wide.svgLeft >= wide.left - 0.5 && wide.svgRight <= wide.right + 0.5, `the drawing, labels included, stays inside its box: ${JSON.stringify(wide)}`);
+  const clipped = await page.locator("#files-mini-sequence svg").evaluate(svg => {
+    const view = svg.viewBox.baseVal, box = svg.getBBox();
+    return box.x < view.x - 0.5 || box.y < view.y - 0.5 || box.x + box.width > view.x + view.width + 0.5 || box.y + box.height > view.y + view.height + 0.5;
+  });
+  assert.equal(clipped, false, "no label runs past the drawing's box");
+  // A simple return-only callable across ordinary column widths: whenever it is drawn, every label
+  // is at least 9 px on screen, measured from geometry (screen box over user box), not the estimate.
+  const rendered = () => page.locator("#files-mini-sequence").evaluate(node => {
+    const drawnNow = node.offsetParent !== null, svg = node.querySelector("svg");
+    if (!drawnNow || !svg) return {drawn:false, floor:!document.querySelector("#files-mini-floor").hidden};
+    let smallest = Infinity;
+    for (const text of svg.querySelectorAll("text")) {
+      if (!text.textContent.trim()) continue;
+      const user = text.getBBox(), screen = text.getBoundingClientRect();
+      if (!user.height || !screen.height) continue;
+      smallest = Math.min(smallest, parseFloat(getComputedStyle(text).fontSize) * screen.height / user.height);
+    }
+    return {drawn:true, floor:!document.querySelector("#files-mini-floor").hidden, smallest};
+  });
+  await selectSymbol(page, (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "helper"));
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false && document.querySelector("#files-mini-sequence")?.dataset.fit);
+  const states = new Set();
+  for (const width of [250, 284, 300, 320, 340, 360, 400, 450, 520, 640, 900]) {
+    await widen(width);
+    await page.waitForFunction(width => Math.abs(document.querySelector("#call-inspector").getBoundingClientRect().width - width) < 1, width);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const state = await rendered();
+    states.add(state.drawn);
+    if (state.drawn) assert.ok(state.smallest >= 8.95 && !state.floor, `drawn at ${width}px with readable text: ${JSON.stringify(state)}`);
+    else assert.ok(state.floor, `not drawn at ${width}px, so the floor shows: ${JSON.stringify(state)}`);
+  }
+  assert.deepEqual([...states].sort(), [false, true], "the sweep crosses the readable boundary");
+  await selectSymbol(page, method);
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false && document.querySelector("#files-mini-sequence")?.dataset.fit);
+  await widen(150);
+  await page.waitForFunction(() => document.querySelector("#files-mini-sequence")?.dataset.fit === "floor");
+  const narrow = await fit();
+  assert.ok(narrow.px < 9 && !narrow.shown && narrow.floor, `unreadable text is not drawn: ${JSON.stringify(narrow)}`);
+  assert.equal((await page.locator("#files-mini-floor").textContent()).replace(/\s+/g, " ").trim(), "Too large to preview · Open full");
+  await page.locator("#files-mini-floor-open").click();
+  await page.waitForFunction(() => !document.body.classList.contains("files-section") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  const route = new URLSearchParams((await page.evaluate(() => location.hash)).slice("#sequence?".length));
+  assert.equal(route.get("sid"), method.symbol.id);
+}));
+
+// #526: a binding whose initializer is a function is a callable row, measured from the real
+// JavaScript producer's ranges; a value that merely contains a closure is not.
+const bindings = `const handler = (value = loadDefault()) => value;
+const result = function () { return 2; }();
+const anon = function() { return 2; };
+const named = function inner() { return 3; };
+const arrow = (value) => value + 1;
+const callback = wrap(() => 4);
+const plain = 5;
+function wrap(f) { return f; }
+const matches = function(value) { return /[}]/.test(value); };
+const closing = function(value) { return /}/.test(value) ? 1 / 2 : 0; };
+const templated = function(name) { return \`}\${name}{\`; };
+const ratio = 4 / 2 / 1;
+`;
+test("Files outlines function-valued bindings and Rust impl targets from the parsed file, not values that contain a closure", {timeout:240000}, async () => published({files:{"bindings.js":bindings, "budget.rs":"pub struct Budget { held: usize }\nimpl Budget {\n    pub fn reserve(&self) -> bool { self.held > 0 }\n}\nimpl std::fmt::Display for crate::other::Remote {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }\n}\n"}}, async selected => {
+  const {page} = selected;
+  await enterFiles(selected); await openFile(selected, "bindings.js");
+  const dto = await outline(selected, "bindings.js");
+  const byName = name => dto.items.find(item => item.symbol.name === name);
+  for (const name of ["handler", "result", "anon", "named", "inner", "arrow", "callback", "plain", "wrap", "matches", "closing", "templated", "ratio"]) assert.ok(byName(name), `producer emits ${name}: ${JSON.stringify(dto.items.map(item => [item.symbol.name, item.nativeKind]))}`);
+  await page.locator(`.files-symbol-pick[data-symbol-id="${byName("anon").symbol.id}"]`).waitFor();
+  const rows = await page.locator(".files-symbol-pick").evaluateAll(nodes => nodes.map(node => node.querySelector(".files-symbol-name").textContent));
+  assert.deepEqual(rows, ["handler", "anon", "named", "arrow", "wrap", "matches", "closing", "templated"], "function-valued bindings (regex and template braces included) and declarations; no inner name, invoked function, closure-holding value or plain value");
+  // Rust impl blocks: the daemon names the implemented type from the parsed file.
+  await openFile(selected, "budget.rs");
+  const rust = await outline(selected, "budget.rs");
+  const type = rust.items.find(item => item.nativeKind === "type" && item.symbol.name === "Budget");
+  assert.deepEqual(rust.items.filter(item => item.nativeKind === "implementation").map(item => item.implTarget), ["Budget", "Remote"]);
+  await page.locator(`.files-symbol-pick[data-symbol-id="${type.symbol.id}"]`).waitFor();
+  assert.deepEqual(await page.locator(".files-symbol-pick .files-symbol-name").allTextContents(), ["Budget", "Remote"], "no <impl> rows; an impl of a type declared elsewhere is named by that type");
+  await page.locator(".files-symbol-row").filter({has:page.locator(`.files-symbol-pick[data-symbol-id="${type.symbol.id}"]`)}).locator(".files-symbol-toggle").click();
+  assert.deepEqual(await page.locator(".files-symbol-pick .files-symbol-name").allTextContents(), ["Budget", "held", "reserve", "Remote"]);
+}));
+
 // #426: icon plus name on one line, with kind and line right-aligned.
 async function assertOneLineRows(page, items) {
-  await page.waitForFunction(count => document.querySelectorAll(".files-symbol-pick[data-symbol-id]").length === count, items.length);
+  await expandOutline(page);
+  const shown = new Set(await page.locator(".files-symbol-pick").evaluateAll(nodes => nodes.map(node => node.dataset.symbolId)));
+  items = items.filter(item => shown.has(item.symbol.id));
+  assert.ok(items.length > 1, "the expanded outline shows a type and its members");
   for (const item of items) {
     const row = await page.locator(`.files-symbol-pick[data-symbol-id="${item.symbol.id}"]`).evaluate(node => {
       const style = getComputedStyle(node), box = node.getBoundingClientRect(), part = selector => {
@@ -679,7 +833,8 @@ test("390px Files keeps cached noncallable source, safe labels, no-Git reason an
   await assertSource(page, (await cached(selected, hostileName)).text);
   assert.equal(await page.locator("#file-tree img, #source-path img, #source script").count(), 0);
   assert.equal(await page.evaluate(() => globalThis.filenameExecuted || globalThis.sourceExecuted), undefined);
-  assert.equal(await page.locator(".files-symbol-pick").filter({hasText:"safe"}).count(), 1, "a file with no callables still has a measured variable outline");
+  assert.equal(await page.locator(".files-symbol-pick").filter({hasText:"safe"}).count(), 0, "a top-level variable is not an outline row (#526)");
+  assert.equal(await page.locator("#file-tree li.detail").filter({hasText:"No types or callables. Cached source remains readable."}).count(), 1);
   assert.equal(sequenceReads(requests), 0, "types and file selection never invent a callable sequence");
   await assertNoOverflow(page);
 }));

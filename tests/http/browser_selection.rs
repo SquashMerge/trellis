@@ -2856,3 +2856,85 @@ async fn dependency_refresh_is_fenced_to_its_configuration_version() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{value}");
     assert_eq!(value["error"]["code"], "configuration_changed");
 }
+
+// #527: the browser polls a fixed-size head digest instead of the full status, whose
+// diagnostics and statistics grow with the checkout.
+#[tokio::test]
+async fn selected_status_head_is_the_bounded_digest_of_the_same_status() {
+    use std::sync::Arc;
+    use trellis::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function step() { return 1; }\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let app = ProvisionedBrowser::new(
+        Arc::new(tokio::sync::Mutex::new(registry)),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let full = tokio::time::timeout(trellis::testing::HANG_BACKSTOP, async {
+        loop {
+            let (code, _, body) =
+                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            if code == axum::http::StatusCode::OK && body["catchingUp"] == false {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (code, headers, head) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/status/head"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{head}");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "false");
+    let mut keys: Vec<&str> = head
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["catchingUp", "indexedAt", "revision", "workspaceRoot"],
+        "{head}"
+    );
+    for key in keys {
+        assert_eq!(head[key], full[key], "{key}: {head} differs from status");
+    }
+    // Fixed fields only: statistics and diagnostics, which grow with the checkout, stay on status.
+    assert!(full.get("stats").is_some() && full.get("diagnostics").is_some());
+    let digest = serde_json::to_vec(&head).unwrap().len();
+    assert!(digest < 512, "digest {digest} bytes: {head}");
+    let (code, _, _) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/status/head?detail=1"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::BAD_REQUEST);
+    let (code, _, _) =
+        selected_json(app, "POST", &format!("{prefix}/status/head"), Value::Null).await;
+    assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
+}

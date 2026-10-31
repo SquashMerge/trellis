@@ -164,6 +164,8 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
         // The Files mini sequence uses the same exact target and navigation owner.
         await page.locator("#section-files").click();
         await page.waitForFunction(() => document.body.classList.contains("files-section"));
+        // A wide inspector draws the preview at a readable size; a narrow one shows the #514 floor instead.
+        await page.evaluate(() => document.querySelector(".workspace-frame").style.setProperty("grid-template-columns", "200px minmax(0, 1fr) 900px", "important"));
         await page.locator("#file-tree .file-pick").filter({hasText:"flow.rs"}).first().click();
         await page.locator(`.files-symbol-pick[data-symbol-id="${fixture.caller}"]`).click();
         const miniMessages = page.locator("#files-mini-sequence .pele-edge-label[data-trellis-call-id]");

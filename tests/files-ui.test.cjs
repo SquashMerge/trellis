@@ -24,7 +24,7 @@ function harness(windowOptions = {}) {
   const get = id => { if(!elements.has(id)) { const item=node(); item.id=id; elements.set(id,item); } return elements.get(id); };
   const document = {getElementById:get,createElement:node,createElementNS:(_,tag)=>node(tag),createTextNode:value=>({...node("#text"),textContent:value}),createDocumentFragment:()=>node("fragment"),body:node("body"),addEventListener(){}};
   let network = () => { throw new Error("Unexpected request"); };
-  const context = vm.createContext({document, window:{...windowOptions}, console, AbortController, DOMException, TextEncoder, URLSearchParams,
+  const context = vm.createContext({document, window:{...windowOptions}, console, AbortController, DOMException, TextEncoder, TextDecoder, URLSearchParams,
     setTimeout(fn){timers.set(++timer,fn);return timer;},clearTimeout(id){timers.delete(id);},
     fetch(url, options){ requests.push({url,options}); if(url === "/api/checkouts") return network(url,options); assert.ok(url.startsWith(`/api/checkouts/${ROOT}/`)); return network("/api/" + url.slice(`/api/checkouts/${ROOT}/`.length),options); }});
   const run = code => vm.runInContext(code, context); run(source);
@@ -33,13 +33,13 @@ function harness(windowOptions = {}) {
   return {get, run, context, requests, network(fn){network=fn;}};
 }
 function symbol(id, kind = "method", file = "main.java") { return {id,name:id,kind,path:file,range:{startByte:0,endByte:18,startLine:1,startColumn:1,endLine:2,endColumn:1}}; }
-function outline(id, kind = "method", file) { return {symbol:symbol(id,kind,file), nativeKind:kind, header:{kind,name:id,modifiers:["public"],typeParameters:[],parameters:[],resultType:"int",bases:[]}}; }
+function outline(id, kind = "method", file) { return {symbol:symbol(id,kind,file), nativeKind:kind === "class" ? "type" : kind, header:{kind,name:id,modifiers:["public"],typeParameters:[],parameters:[],resultType:"int",bases:[]}}; }
 const view = item => ({revision:pin, seed:item.symbol,participants:[{id:item.symbol.id,label:item.symbol.name,kind:"method"}],steps:[],hiddenSteps:0,truncated:false,warnings:[]});
 const matches = (item, items = [], extra = {}) => ({revision:pin,symbolId:item.symbol.id,evidenceKind:"syntaxMatches",scope:{sourceSetId:"production",language:"java",spelling:item.symbol.name},items,continuation:null,partial:false,truncated:false,warnings:[],...extra});
 function indexedNetwork(h, item = outline("measured"), extra = () => undefined) {
   h.network((url, options) => {
     const supplied = extra(url, options); if (supplied) return supplied;
-    if(url === "/api/status") return response({revision:pin,workspaceRoot:"/fixture"});
+    if(url === "/api/status/head") return response({revision:pin,workspaceRoot:"/fixture"});
     if(url.startsWith("/api/files?")) return response({revision:pin,items:[{path:item.symbol.path,language:"java",methodCount:1}],nextOffset:null});
     if(url === "/api/git") return response({git:{state:"unavailable",reason:"not_repository"},changes:null});
     if(url.startsWith("/api/symbols?")) return response({revision:pin,path:item.symbol.path,items:[item],nextOffset:null,truncated:false,warnings:[]});
@@ -57,7 +57,7 @@ test("Files opens pinned catalog without choosing source; explicit file reads ze
   assert.ok(h.requests.every(request=>!request.url.includes("/source?")&&!request.url.endsWith("/sequence")));
   assert.match(h.requests[0].url,/indexGeneration=.*indexRevision=1/);
   h.run('files[0].methodCount=0'); await h.run('selectFilesFile(files[0])');
-  assert.match(text(h.get("source")),/int measured/); assert.match(text(h.get("file-tree")),/◇ Holder class L1/);
+  assert.match(text(h.get("source")),/int measured/); assert.match(text(h.get("file-tree")),/◆ Holder type L1/);
   assert.equal(h.get("files-working").hidden,true); assert.match(h.get("files-git-state").textContent,/not_repository/);
   h.context.item=item; await h.run('selectFilesSymbol(item)');
   assert.match(h.get("files-mini-state").textContent,/noncallable/);
@@ -300,10 +300,10 @@ test("retained outline More and Retry intents cannot read a successor checkout/s
 test("selecting another file collapses previous outline; interrupted outline exposes retry on return", async () => {
   const h=harness(), first=outline("First","class"), second=outline("Second","class","other.java"); indexedNetwork(h,first);
   await h.run('setSection("files")'); await h.run('selectFilesFile(files[0])');
-  assert.match(text(h.get("file-tree")),/◇ First class L1/);
+  assert.match(text(h.get("file-tree")),/◆ First type L1/);
   h.context.secondFile={path:"other.java",methodCount:0}; h.run('files.push(secondFile)'); indexedNetwork(h,second);
-  await h.run('selectFilesFile(secondFile)'); assert.doesNotMatch(text(h.get("file-tree")),/◇ First class L1/);
-  assert.match(text(h.get("file-tree")),/◇ Second class L1/);
+  await h.run('selectFilesFile(secondFile)'); assert.doesNotMatch(text(h.get("file-tree")),/◆ First type L1/);
+  assert.match(text(h.get("file-tree")),/◆ Second type L1/);
   const held=deferred(); indexedNetwork(h,second,url=>url.startsWith("/api/symbols?")?held.promise:undefined);
   const pending=h.run('loadFilesOutline(secondFile)'); await h.run('setSection("diagrams")');
   held.resolve(response({revision:pin,path:"other.java",items:[second],nextOffset:null,truncated:false,warnings:[]})); await pending;
@@ -562,4 +562,72 @@ test("checkout-list retry restores the selected Working diff without indexed sou
   assert.doesNotMatch(text(h.get("files-diff")),/<old>/,"an unavailable list summary clears obsolete Working hunks");
   assert.equal(h.run("filesGitStatus"),null);
   assert.equal(h.get("files-working").hidden,true);
+});
+
+// #526: the outline lists types and callables; members only under an expanded container.
+test("outline tree keeps types and callables, nests members and lends Rust impl methods to their type", () => {
+  const h = harness();
+  const item = (id, nativeKind, parent, startLine, name = id) => ({symbol:{id, name, kind:"method", path:"src/watch.rs", parent, range:{startByte:startLine * 10, endByte:startLine * 10 + 5, startLine, startColumn:1, endLine:startLine, endColumn:2}}, nativeKind, header:{}});
+  const items = [
+    item("file", "module", null, 1, "src/watch.rs"),
+    item("LIMIT", "variable", "file", 2),
+    item("Budget", "type", "file", 3), item("Budget.held", "field", "Budget", 4, "held"),
+    {...item("impl1", "implementation", "file", 6, "<implementation@60>"), implTarget:"Budget"}, item("reserve", "method", "impl1", 7), item("bits", "parameter", "reserve", 7),
+    item("closure", "anonymousFunction", "reserve", 8, "<anonymousFunction@80>"),
+    {...item("impl2", "implementation", "file", 10, "<implementation@100>"), implTarget:"Remote"}, item("fmt", "method", "impl2", 11),
+    item("impl3", "implementation", "file", 13, "<implementation@130>"), item("unreadable", "method", "impl3", 14),
+    item("release", "function", "file", 16), item("Alias", "alias", "file", 17),
+    item("tests", "namespace", "file", 18), item("works", "function", "tests", 19),
+  ];
+  const lines = Array.from({length:20}, () => "");
+  lines[5] = "impl Budget {"; lines[9] = "impl<T> fmt::Display for crate::other::Remote<T> {"; lines[12] = "#[cfg(test)]";
+  h.context.items = items; h.context.sourceText = lines.join("\n"); h.context.toggled = [];
+  const tree = h.run("window.TrellisFiles.outlineTree(items)");
+  const shape = entries => entries.map(entry => [entry.label || entry.item.symbol.name, shape(entry.children)]);
+  assert.deepEqual(JSON.parse(JSON.stringify(shape(tree))), [
+    ["Budget", [["held", []], ["reserve", []]]],
+    ["Remote", [["fmt", []]]],
+    ["unreadable", []],
+    ["release", []],
+    ["tests", [["works", []]]],
+  ], "no fields, parameters, locals, aliases, closures or impl blocks at top level");
+  const render = (selected, expanded) => {
+    h.context.selected = selected; h.context.expanded = new Set(expanded);
+    const list = h.run("document.createElement('ul')"); h.context.list = list;
+    h.run("window.TrellisFiles.outline(list, items, selected, () => {}, () => true, {expanded, reveal:!!selected, toggle:(key, open) => toggled.push([key, open])})");
+    return list;
+  };
+  const labels = list => all(list).filter(node => node.className === "files-symbol-pick").map(node => node.attrs["aria-label"]);
+  const collapsed = render(null, []);
+  assert.deepEqual(labels(collapsed), ["Budget · type · L3", "Remote · impl · L10", "unreadable · method · L14", "release · function · L16", "tests · namespace · L18"], "collapsed containers hide members");
+  const toggle = all(collapsed).find(node => node.className === "files-symbol-toggle");
+  assert.equal(toggle.attrs["aria-expanded"], "false"); assert.equal(toggle.attrs["aria-label"], "Expand Budget members (2)");
+  toggle.listeners.click(); assert.deepEqual(JSON.parse(JSON.stringify(h.context.toggled)), [["Budget", true]]);
+  // An expanded container, or one revealing a new selection, shows its members.
+  const open = render({symbol:{id:"works"}}, ["Budget"]);
+  assert.deepEqual(labels(open), ["Budget · type · L3", "held · field · L4", "reserve · method · L7", "Remote · impl · L10", "unreadable · method · L14", "release · function · L16", "tests · namespace · L18", "works · function · L19"]);
+  assert.equal(all(open).find(node => node.attrs["data-symbol-id"] === "works").attrs["aria-pressed"], "true");
+});
+
+test("outline tree lists a binding only on the daemon's initializer evidence and attaches an impl to the type beside it", () => {
+  const h = harness();
+  const item = (id, nativeKind, parent, startLine, name = id) => ({symbol:{id, name, kind:"function", path:"src/a.rs", parent, range:{startByte:startLine * 10, endByte:startLine * 10 + 5, startLine, startColumn:1, endLine:startLine, endColumn:2}}, nativeKind, header:{}});
+  h.context.items = [
+    item("handler", "variable", null, 1), item("arrow", "anonymousFunction", "handler", 1, "<anonymousFunction@10>"),
+    item("LIMIT", "variable", null, 2),
+    item("a", "namespace", null, 3), item("a.X", "type", "a", 4, "X"),
+    item("b", "namespace", null, 5), item("b.X", "type", "b", 6, "X"), {...item("implB", "implementation", "b", 7, "<implementation@70>"), implTarget:"X"}, item("run", "method", "implB", 8),
+  ];
+  const lines = Array.from({length:10}, () => ""); lines[6] = "    impl X {";
+  h.context.sourceText = lines.join("\n");
+  const tree = h.run("window.TrellisFiles.outlineTree(items)");
+  const shape = entries => entries.map(entry => [entry.label || entry.item.symbol.id, shape(entry.children)]);
+  assert.deepEqual(JSON.parse(JSON.stringify(shape(tree))), [
+    ["a", [["a.X", []]]],
+    ["b", [["b.X", [["run", []]]]]],
+  ], "without the daemon's initializer evidence no variable is a callable, even with a function child; impl methods join the same-module type");
+  // The daemon marks a binding whose parsed initializer is a function.
+  h.context.marked = h.context.items.map(entry => entry.symbol.id === "handler" ? {...entry, callableInitializer:true} : entry);
+  const marked = h.run("window.TrellisFiles.outlineTree(marked)").map(entry => entry.item.symbol.id);
+  assert.deepEqual(JSON.parse(JSON.stringify(marked)), ["handler", "a", "b"]);
 });

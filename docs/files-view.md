@@ -39,7 +39,12 @@ is callable-only. `/methods` keeps its existing contract unchanged.
 `GET /api/checkouts/{rootKey}/symbols?path=...&indexGeneration=...&indexRevision=...&offset=0&limit=200`
 returns `{revision,path,items,nextOffset,truncated,warnings}`. Each item is
 `{symbol,nativeKind,header}`: `symbol` is the existing full measured `Symbol`, and `header` is
-the captured native `Header`. Source range and parent identity remain those of the original
+the captured native `Header`. Two optional facts come from parsing the cached file with the same
+grammars (#526), never from source regexes: `callableInitializer: true` on a JavaScript or Python
+binding whose whole initializer is a function or lambda, and `implTarget` on a Rust `impl` block,
+naming the last path segment of the type it implements. Both are absent when false, unknown, or
+when the file cannot be parsed within the Files budget; the outline then lists no binding as a
+callable and leaves the impl's methods at the top level. Source range and parent identity remain those of the original
 symbol. Nullable captured metadata, including `header.resultType`, stays nullable. Do not invent
 a return type, name or finer declaration kind from source regexes or optional SCIP labels. The
 default and maximum page size are 200. Order is source order, then original symbol ID; paging

@@ -74,20 +74,77 @@ const click = (container,label) => {
 async function ready(h) {h.context.fetch=async()=>response(catalog());await h.run("refreshDependencies()");}
 async function select(h) {await ready(h);h.context.fetch=async()=>response(symbols());await h.run(`selectDependencyPackage(${JSON.stringify(pkg)})`);}
 
-test("automatic workspace status refresh requests only catalog metadata; optional failures do not block",async()=>{
+// #527: status refresh never reads the catalog; the first in-context library entry reads it once per pin.
+test("status refresh reads no catalog; the first library entry reads catalog metadata once and failures do not block",async()=>{
  const h=harness(), requests=[];
- h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url==="/api/dependencies")return response(catalog());if(url.startsWith("/api/tree?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});throw Error(url);};
+ const pair={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
+ h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:pair,stats:{}});if(url==="/api/dependencies")return response(catalog());if(url.startsWith("/api/tree?"))return response({revision:pair,path:"",root:"/synthetic",items:[],nextOffset:null});throw Error(url);};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
- assert.deepEqual(requests,["/api/status","/api/tree?path=&offset=0&limit=200","/api/dependencies"]);
- // No tab lists packages (#450); status refresh only records the catalog for in-context entry.
+ assert.deepEqual(requests,["/api/status","/api/tree?path=&offset=0&limit=200"],"no catalog read at startup");
+ const slot=h.run("libraryButton({ecosystem:'rust',name:'thing',origin:'test'})");
+ assert.equal(slot.tagName,"span","before the catalog is read, an empty slot holds the place of the button");
+ assert.equal(slot.children.length,0);
+ h.run("libraryButton({ecosystem:'rust',name:'other',origin:'test'})");
+ await h.run("ensureDependencies()"); await new Promise(setImmediate);
+ assert.deepEqual(requests.filter(url=>url==="/api/dependencies"),["/api/dependencies"],"one read serves every pending entry");
+ // No tab lists packages (#450); the catalog is recorded for in-context entry.
  assert.equal(h.get("dependency-packages").children.length,0);
  assert.equal(h.run("dependencyCatalog.catalogId"),"catalog-1");
  assert.match(text(h.get("dependency-warnings")),/<b>not semantic<\/b>/);
  assert.equal(descendants(h.get("dependency-warnings")).some(n=>n.tagName==="b"),false);
- h.context.fetch=async url=>{if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url.startsWith("/api/tree?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});throw Error("old daemon");};
+ const open=h.run("libraryButton({ecosystem:'rust',name:'thing',origin:'test'})");
+ assert.equal(open.tagName,"button"); assert.equal(open.textContent,"Open in library");
+ assert.equal(h.run("libraryButton({ecosystem:'rust',name:'missing',origin:'test'})"),null,"an uncatalogued package offers no entry");
+ await h.run("ensureDependencies()");
+ assert.equal(requests.filter(url=>url==="/api/dependencies").length,1,"a ready catalog is read once per pin");
+ // A status refresh forgets the catalog; an unavailable catalog then offers nothing and does not block.
+ h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:pair,stats:{}});if(url.startsWith("/api/tree?"))return response({revision:pair,path:"",root:"/synthetic",items:[],nextOffset:null});throw Error("old daemon");};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
+ await h.run("ensureDependencies()"); await new Promise(setImmediate);
  assert.equal(h.run("dependencyCatalog"),null); assert.equal(h.get("error").hidden,true);
  assert.equal(h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),null,"an unavailable catalog offers no library entry");
+});
+test("a same-pin status refresh keeps an in-flight catalog read, so waiting entries are filled",async()=>{
+ const h=harness(), pending=deferred(), pair={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}; let reads=0;
+ h.context.fetch=async url=>{if(url==="/api/dependencies"){reads++;return pending.promise;}if(url==="/api/status")return response({revision:pair,stats:{}});if(url.startsWith("/api/tree?"))return response({revision:pair,path:"",root:"/synthetic",items:[],nextOffset:null});throw Error(url);};
+ h.run("status.workspaceRoot='/synthetic'"); const first=h.run("ensureDependencies()");
+ await h.run("refreshStatus()"); await new Promise(setImmediate);
+ const second=h.run("ensureDependencies()");
+ assert.equal(reads,1,"the refresh did not start a second read that would supersede the first");
+ pending.resolve(response(catalog())); await first; await second;
+ assert.equal(h.run("dependencyCatalog.catalogId"),"catalog-1");
+ assert.equal(typeof h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),"function");
+});
+test("a same-pin Refresh makes the next library entry read a ready catalog again",async()=>{
+ const h=harness(), pair={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}; let reads=0, id="catalog-1";
+ h.run("status.workspaceRoot='/synthetic'");
+ h.context.fetch=async url=>{if(url==="/api/dependencies"){reads++;return response(catalog(id));}if(url==="/api/status")return response({revision:pair,stats:{}});if(url.startsWith("/api/tree?"))return response({revision:pair,path:"",root:"/synthetic",items:[],nextOffset:null});throw Error(url);};
+ await h.run("ensureDependencies()");
+ assert.equal(h.run("libraryButton({ecosystem:'rust',name:'thing',origin:'test'})").tagName,"button","a catalog read since the last Refresh answers at once");
+ assert.equal(reads,1);
+ // Another local client refreshed the catalog; this page's Refresh must not keep the old one.
+ id="catalog-2";
+ await h.run("refreshStatus()"); await new Promise(setImmediate);
+ assert.equal(reads,1,"Refresh alone reads no catalog");
+ const slot=h.run("libraryButton({ecosystem:'rust',name:'thing',origin:'test'})");
+ assert.equal(slot.tagName,"span","after Refresh the entry waits for a fresh read");
+ await h.run("ensureDependencies()"); await new Promise(setImmediate);
+ assert.equal(reads,2); assert.equal(h.run("dependencyCatalog.catalogId"),"catalog-2");
+});
+test("a disabled catalog is final for the pin and is not read again",async()=>{
+ const h=harness(); let reads=0;
+ h.context.fetch=async()=>{reads++;return response({...catalog(),state:"disabled",catalogId:null,packages:[]});};
+ await h.run("ensureDependencies()"); await h.run("ensureDependencies()");
+ assert.equal(reads,1);
+});
+test("a catalog that is still loading is read again by the next library entry",async()=>{
+ const h=harness(); let reads=0;
+ h.context.fetch=async url=>{assert.equal(url,"/api/dependencies");reads++;return response(reads===1?{...catalog(),state:"loading",catalogId:null,packages:[]}:catalog());};
+ await h.run("ensureDependencies()"); await new Promise(setImmediate);
+ assert.equal(h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),null);
+ await h.run("ensureDependencies()"); await new Promise(setImmediate);
+ assert.equal(reads,2); assert.equal(typeof h.run("libraryAction({ecosystem:'rust',name:'thing',origin:'test'})"),"function");
+ await h.run("ensureDependencies()"); assert.equal(reads,2);
 });
 test("package, paged declaration filter, and explicit source browsing preserve the primary workspace",async()=>{
  const h=harness(), requests=[];
@@ -188,7 +245,7 @@ test("no Libraries tab or manual roots; the in-context library dock does not cla
  assert.match(html,/<button id="dock-library"[^>]*\bhidden/);
 });
 
-test("connect and completed workspace index automatically refresh metadata, never source",async()=>{
+test("connect and a completed workspace index refresh metadata without the catalog, never source",async()=>{
  const h=harness(),requests=[]; let revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
  h.context.fetch=async(url,opts)=>{requests.push([url,opts.method]);
  if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
@@ -203,9 +260,11 @@ test("connect and completed workspace index automatically refresh metadata, neve
  h.get("token").value="synthetic";h.get("connect-form").listeners.submit({preventDefault(){}});await new Promise(setImmediate);
  assert.equal(h.get("workspace").hidden,true,"authentication must not auto-select a checkout");
  h.get("checkout-select").value=ROOT;h.get("checkout-select").listeners.change({target:h.get("checkout-select")});await new Promise(setImmediate);
- assert.equal(h.get("workspace").hidden,false);assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,1);
+ assert.equal(h.get("workspace").hidden,false);assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,0);
  await h.get("index").listeners.click();const poll=[...h.timers.values()].find(t=>t.delay===700);assert.ok(poll);await poll.callback();await new Promise(setImmediate);
- assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,2);assert.equal(h.run("dependencyCatalog.workspaceRevision.indexRevision"),2);
+ assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,0);
+ await h.run("ensureDependencies()");
+ assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,1);assert.equal(h.run("dependencyCatalog.workspaceRevision.indexRevision"),2);
  assert.ok(requests.every(([url])=>!url.includes("/source?")&&!url.startsWith("/api/questions")));
 });
 test("old package results cannot replace a new filter page",async()=>{

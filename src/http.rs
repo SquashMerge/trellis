@@ -3941,6 +3941,7 @@ enum BrowserCoreRoute {
     RustSourceTree,
     RustSourceFile,
     Status,
+    StatusHead,
     Tree,
     Files,
     Methods,
@@ -3976,6 +3977,7 @@ impl BrowserCoreRoute {
             (&Method::GET, "rust-sources/tree") => Some(Self::RustSourceTree),
             (&Method::GET, "rust-sources/file") => Some(Self::RustSourceFile),
             (&Method::GET, "status") => Some(Self::Status),
+            (&Method::GET, "status/head") => Some(Self::StatusHead),
             (&Method::GET, "tree") => Some(Self::Tree),
             (&Method::GET, "files") => Some(Self::Files),
             (&Method::GET, "methods") => Some(Self::Methods),
@@ -5106,10 +5108,11 @@ async fn provisioned_core_answer(
             .await?;
             Ok((Json(file).into_response(), catching_up))
         }
-        BrowserCoreRoute::Status => {
+        BrowserCoreRoute::Status | BrowserCoreRoute::StatusHead => {
             if uri.query().is_some() {
                 return Err(invalid());
             }
+            let head = matches!(route, BrowserCoreRoute::StatusHead);
             let runtime = runtime.clone();
             let (status, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
@@ -5128,7 +5131,20 @@ async fn provisioned_core_answer(
                     "Operation failed",
                 )
             })??;
-            Ok((Json(status).into_response(), catching_up))
+            // The head digest (#527) is the fixed-size part of the same status read that
+            // the browser polls; diagnostics and statistics stay on `status`.
+            let body = if head {
+                Json(json!({
+                    "workspaceRoot": status.workspace_root,
+                    "revision": status.revision,
+                    "catchingUp": status.catching_up,
+                    "indexedAt": status.indexed_at,
+                }))
+                .into_response()
+            } else {
+                Json(status).into_response()
+            };
+            Ok((body, catching_up))
         }
         BrowserCoreRoute::Tree => {
             let Query(q) = Query::<TreeQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;

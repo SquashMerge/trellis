@@ -58,7 +58,7 @@ function observePinnedHead() {
       for (let attempt = 0; attempt < 2; attempt++) {
         observation.again = false;
         try {
-          const data = await api("/api/status", "GET", undefined, () => current() && headObservation === observation);
+          const data = await api("/api/status/head", "GET", undefined, () => current() && headObservation === observation);
           if (!current() || headObservation !== observation) return;
           if (data.workspaceRoot !== workspace || !data.revision) throw new Error("Head unavailable");
           const head = IndexPin.copy(data.revision);
@@ -303,7 +303,7 @@ function selectedUrl(path, method, root) {
   }
   const suffix = path.startsWith("/api/") ? path.slice(5) : "";
   const route = suffix.split("?", 1)[0];
-  const simple = new Set(["status", "git", "git/diff", "metrics", "architecture", "architecture/details", "architecture/rules", "architecture/rules/preview", "architecture/rules/apply", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  const simple = new Set(["status", "status/head", "git", "git/diff", "metrics", "architecture", "architecture/details", "architecture/rules", "architecture/rules/preview", "architecture/rules/apply", "index", "tree", "files", "methods", "symbols", "syntax-matches", "sequence", "classes", "class-diagram", "navigation", "source", "jobs/current", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
   if (route === "architecture/rules" && method !== "GET" || ["architecture/rules/preview", "architecture/rules/apply"].includes(route) && method !== "POST") throw new Error("Invalid rules request method.");
   if (route === "syntax-matches" && method !== "POST") throw new Error("Syntax match requests must be POST.");
   if (["git", "git/diff", "metrics", "architecture", "architecture/details", "symbols"].includes(route) && method !== "GET") throw new Error("Read-only API requests must be GET.");
@@ -464,8 +464,14 @@ async function refreshStatus(followup = false) {
   if (!nextPin) stale("Index not ready. Retry status after this checkout finishes indexing.");
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
   renderIndexStatus();
-  // A rejected optional catalog must not recursively request status when status is unchanged.
-  if (nextPin && (browseChanged || !pairRefreshPending)) void refreshDependencies();
+  // The library catalog loads on demand (#527). A status refresh forgets a loaded catalog, so the
+  // next in-context open reads it again, and revalidates a library that is open. A rejected
+  // catalog must not recursively request status while a pair refresh is pending.
+  // A read still in flight is already current; it is kept so waiting entries are filled.
+  if (nextPin && !pairRefreshPending) {
+    if (!dependencyLoad || dependencyLoad.settled) { dependencyLoad = null; if (dependencyCatalog) dependencyCatalog.stale = true; }
+    if (dependencyChoice) void ensureDependencies();
+  }
   } finally {
     statusRefreshDepth--;
     if (!statusRefreshDepth && pairRefreshQueued) {
@@ -873,7 +879,7 @@ async function showCachedSource(path, range, revision, callerCurrent = () => tru
   }
 }
 async function refreshView() {
-  resetHeadObservation();
+  resetHeadObservation(); clearRevisionReads();
   const revision = status?.revision, session = epoch, root = selectedRootKey;
   const file = filesFile, basis = filesBasis;
   clearSource(); filesDiffSerial++; filesDiff = null; $("files-diff")?.replaceChildren();
@@ -971,7 +977,7 @@ function filesGuard({symbol = false, basis = false} = {}) {
 }
 function clearFilesInspector() {
   filesMatchesSerial++; filesSymbol = null; filesMini = null; filesMatches = null;
-  for (const id of ["files-symbol-location", "files-symbol-header", "files-symbol-return", "files-mini-sequence", "files-matches", "files-matches-state"]) $(id)?.replaceChildren();
+  for (const id of ["files-symbol-location", "files-symbol-header", "files-symbol-return", "files-mini-sequence", "files-mini-notes", "files-matches", "files-matches-state"]) $(id)?.replaceChildren();
   if ($("files-symbol-title")) $("files-symbol-title").textContent = "Choose a symbol";
   if ($("files-symbol-kind")) $("files-symbol-kind").textContent = "Indexed symbol";
   if ($("files-matches-title")) $("files-matches-title").textContent = "References";
@@ -1058,8 +1064,22 @@ function appendFilesOutline(li, file) {
   if (state.outlineLoading) list.append(element("li", "Loading symbols…", "detail"));
   else if (state.outlineError) list.append(button(`Retry symbols · ${state.outlineError}`, () => { if (current()) return loadFilesOutline(file, 0); }));
   else {
-    window.TrellisFiles?.outline(list, state.outlineItems || [], filesSymbol, selectFilesSymbol, current);
+    // Types and callables; a container's members show when it is expanded (#526).
+    state.outlineExpanded ||= new Set();
+    // A newly selected member opens its containers once; the reader may close them again.
+    const reveal = !!filesSymbol && state.outlineRevealed !== filesSymbol;
+    if (reveal) state.outlineRevealed = filesSymbol;
+    const shown = window.TrellisFiles?.outline(list, state.outlineItems || [], filesSymbol, selectFilesSymbol, current, {
+      expanded:state.outlineExpanded, reveal,
+      toggle:(key, open) => {
+        if (open) state.outlineExpanded.add(key); else state.outlineExpanded.delete(key);
+        renderFiles();
+        const pick = Array.from($("file-tree").querySelectorAll(".files-symbol-pick")).find(node => node.getAttribute("data-symbol-id") === key);
+        pick?.parentElement?.querySelector(".files-symbol-toggle")?.focus();
+      },
+    });
     if (!state.outlineItems?.length) list.append(element("li", "No measured symbols. Cached source remains readable.", "detail"));
+    else if (!shown) list.append(element("li", "No types or callables. Cached source remains readable.", "detail"));
     if (state.outlineNext != null) { const next = state.outlineNext; list.append(button("More symbols", () => { if (current()) return loadFilesOutline(file, next); })); }
     for (const warning of state.outlineWarnings || []) list.append(element("li", warning, "warning"));
     if (state.outlineTruncated) list.append(element("li", "Outline continues on the next page.", "detail"));
@@ -1191,9 +1211,68 @@ async function renderFilesMini(current) {
   const outcome = window.TrellisPeleSequence ? await window.TrellisPeleSequence.render(container, data, readSource, expanded, options) : {status:"unsupported", reason:"Pele asset unavailable"};
   if (!current() || outcome.status === "stale") return;
   if (outcome.status !== "rendered") window.TrellisSequence.render(container, data, readSource, expanded, options);
-  $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}${outcome.status !== "rendered" ? " · Pele fell back: " + outcome.reason : ""}`;
+  // One short status line; the sequence's caveats and diagnostics live behind the ⓘ (#526).
+  const notes = [...(data.warnings || [])];
+  if (data.truncated) notes.push("Truncated by sequence limits; Open full shows the same bounded steps.");
+  if (outcome.status !== "rendered") notes.push(`Pele fell back: ${outcome.reason}`);
+  $("files-mini-notes").replaceChildren(...notes.map(note => element("li", note, "detail")));
+  $("files-mini-state").textContent = `Indexed revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps" : ""}${notes.length ? ` · ${notes.length} ${notes.length === 1 ? "note" : "notes"} in ⓘ` : ""}`;
+  fitFilesMini();
   $("files-open-full").disabled = false;
 }
+// The preview scales down to the inspector's width (#451). Text that overflows the drawing's
+// own box is included so nothing clips; when the smallest text as actually rendered would be
+// under FILES_MINI_MIN_TEXT_PX, the preview says so instead of drawing it (#514).
+const FILES_MINI_MIN_TEXT_PX = 9;
+// The smallest rendered text size: each label's font size times its own screen scale.
+function smallestTextPx(svg) {
+  let smallest = Infinity;
+  const labels = [...svg.querySelectorAll("text, foreignObject")].slice(0, 2000);
+  for (const label of labels) {
+    const styled = label.tagName.toLowerCase() === "foreignobject" ? label.querySelector("*") : label;
+    const matrix = label.getScreenCTM?.(), size = styled ? parseFloat(getComputedStyle(styled).fontSize) : NaN;
+    if (!matrix || !Number.isFinite(size) || !(label.textContent || "").trim()) continue;
+    smallest = Math.min(smallest, size * Math.hypot(matrix.a, matrix.b));
+  }
+  return smallest;
+}
+function fitFilesMini() {
+  const container = $("files-mini-sequence"), svg = container?.querySelector?.(":scope > svg");
+  const floor = $("files-mini-floor");
+  // Measure the drawing as it lays out in the inspector: shown, at its scaled size.
+  container?.removeAttribute?.("data-fit");
+  if (!svg || !container.clientWidth || typeof svg.getScreenCTM !== "function") { if (floor) floor.hidden = true; return; }
+  const view = svg.viewBox?.baseVal;
+  if (view?.width > 0 && view.height > 0 && typeof svg.getBBox === "function") {
+    try {
+      const drawn = svg.getBBox(), left = Math.min(view.x, drawn.x), top = Math.min(view.y, drawn.y);
+      const right = Math.max(view.x + view.width, drawn.x + drawn.width), bottom = Math.max(view.y + view.height, drawn.y + drawn.height);
+      if (left < view.x || top < view.y || right > view.x + view.width || bottom > view.y + view.height) {
+        svg.setAttribute("viewBox", `${left} ${top} ${right - left} ${bottom - top}`);
+        svg.setAttribute("width", String(right - left)); svg.setAttribute("height", String(bottom - top));
+      }
+    } catch (_) { /* An unrendered drawing keeps its own box. */ }
+  }
+  const smallest = smallestTextPx(svg);
+  const unreadable = smallest < FILES_MINI_MIN_TEXT_PX;
+  container.setAttribute("data-fit", unreadable ? "floor" : "scaled");
+  if (Number.isFinite(smallest)) container.setAttribute("data-text-px", smallest.toFixed(2)); else container.removeAttribute("data-text-px");
+  if (floor) floor.hidden = !unreadable;
+}
+if (typeof MutationObserver === "function" && $("files-mini-sequence")) {
+  // Pele redraws the preview in place when a group is toggled; fit each drawing.
+  new MutationObserver(() => fitFilesMini()).observe($("files-mini-sequence"), {childList:true});
+}
+if (typeof ResizeObserver === "function" && $("files-mini-sequence")?.parentElement) {
+  // Only a width change can change the fit; showing the floor changes the height alone.
+  let fittedWidth = null;
+  new ResizeObserver(entries => {
+    const width = Math.round(entries.at(-1)?.contentRect?.width || 0);
+    if (width === fittedWidth) return;
+    fittedWidth = width; fitFilesMini();
+  }).observe($("files-mini-sequence").parentElement);
+}
+$("files-mini-floor-open")?.addEventListener("click", () => perform(openFilesFull, $("files-mini-floor-open")));
 async function openFilesFull() {
   if (section !== "files" || !filesMini || !filesSymbol || !IndexPin.equal(filesMini.revision, status?.revision)) return;
   return navigateDiagram(filesSymbol.symbol, filesMini.revision, "sequence", filesMini);
@@ -1679,22 +1758,63 @@ async function refreshTree() {
   }
 }
 const compactDirectoryDepth = 32;
+// Architecture and metrics reads are cached per index revision on this page (#527): they are
+// derived from the revision and the reviewed rules file, so a revision change, Refresh, or a rules
+// edit applied here drops them. An in-flight read is shared; each caller gets its own copy.
+const revisionReads = new Map();
+let revisionReadsKey = null;
+let architectureRulesHash = null;
+function clearRevisionReads() { revisionReads.clear(); revisionReadsKey = null; architectureRulesHash = null; }
+async function revisionRead(path, current = () => true) {
+  const route = path.split("?", 1)[0];
+  if (!["/api/architecture", "/api/metrics"].includes(route) || !status?.revision) return api(path, "GET", undefined, current);
+  const key = `${epoch}:${selectedRootKey}:${IndexPin.key(status.revision)}`;
+  if (revisionReadsKey !== key) { revisionReads.clear(); revisionReadsKey = key; }
+  let entry = revisionReads.get(path);
+  const hit = !!entry;
+  if (!entry) {
+    entry = api(path, "GET", undefined);
+    revisionReads.set(path, entry);
+    entry.catch(() => { if (revisionReads.get(path) === entry) revisionReads.delete(path); });
+  }
+  const data = await entry;
+  if (!current()) throw aborted();
+  // A cached read still compares the shown revision with the head.
+  if (hit) observePinnedResponse(path, "GET", undefined, data);
+  return typeof structuredClone === "function" ? structuredClone(data) : data;
+}
 const viewerMetrics = window.TrellisMetrics?.create({
-  request: path => api(path),
+  request: path => revisionRead(path),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
   onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
   onChange: () => { renderFiles(); updateViewAvailability(); renderSequenceStart(); },
   onOpenCallable: (row, pin) => perform(() => openCallableSequence(row, pin)),
 });
 const treemap = window.TrellisTreemap?.create({
-  request: (path, current) => api(path, "GET", undefined, current),
+  request: (path, current) => revisionRead(path, current),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, workspaceRoot:status?.workspaceRoot}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   onConflict: () => unexpectedPair("Treemap snapshot changed. Refresh status before reopening Treemap."),
   onInspect: () => { viewerMetrics?.clearInspection(); architecture?.clearInspection(); clearSource(); },
 });
 const architecture = window.TrellisArchitecture?.create({
-  request: (path, current, options = {}) => api(path, options.method || "GET", options.body, current),
+  // The rules file is read live, so it can change at the same revision. Any sign that it did
+  // drops the cached reads, so "Reload Architecture" and every recovery read the current file:
+  // a rules_conflict from any read, a rules read whose hash differs from the cached summary's,
+  // and any rules preview or apply.
+  request: async (path, current, options = {}) => {
+    const route = path.split("?", 1)[0], method = options.method || "GET";
+    try {
+      const data = method === "GET" ? await revisionRead(path, current) : await api(path, method, options.body, current);
+      const hash = data?.payload?.rulesFile?.contentHash;
+      if (route === "/api/architecture" && hash) architectureRulesHash = hash;
+      else if (route === "/api/architecture/rules" && hash && architectureRulesHash && hash !== architectureRulesHash) clearRevisionReads();
+      return data;
+    } catch (error) {
+      if (error?.code === "rules_conflict") clearRevisionReads();
+      throw error;
+    } finally { if (method === "POST" && route.startsWith("/api/architecture/rules/")) clearRevisionReads(); }
+  },
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision}),
   readSource: (site, pin, current) => perform(() => showCachedSource(site.path, site.range, pin, current)),
   onConflict: () => unexpectedPair("Architecture snapshot changed. Refresh status before reopening Architecture."),
@@ -2009,7 +2129,7 @@ $("external-next")?.addEventListener("click", () => { if (!$("external-next").di
 // Metadata-only automatic library catalog. No source or provider request is implicit.
 let dependencyStatusSerial = 0, dependencySerial = 0, dependencySymbolsSerial = 0;
 let dependencyCatalog = null, dependencyPackage = null, dependencyOffset = 0, dependencyNext = null;
-let dependencyQuery = "", dependencyChoice = null;
+let dependencyQuery = "", dependencyChoice = null, dependencyLoad = null;
 function clearDependencySelection() {
   dependencySymbolsSerial++; dependencyPackage = null; dependencyOffset = 0; dependencyNext = null;
   dependencyQuery = "";
@@ -2026,7 +2146,7 @@ function clearDependencySelection() {
   }
 }
 function clearDependencyCatalog() {
-  dependencyStatusSerial++; dependencySerial++; dependencyCatalog = null; dependencyChoice = null;
+  dependencyStatusSerial++; dependencySerial++; dependencyCatalog = null; dependencyChoice = null; dependencyLoad = null;
   clearDependencySelection();
   $("dependency-packages").replaceChildren(); $("dependency-warnings").replaceChildren();
   $("dependency-state").textContent = "Open a library from an external call or reference.";
@@ -2034,6 +2154,19 @@ function clearDependencyCatalog() {
 function dependencyGuard() {
   const session = epoch, serial = dependencySerial, revision = status?.revision && IndexPin.copy(status.revision), workspace = status?.workspaceRoot;
   return () => session === epoch && serial === dependencySerial && IndexPin.equal(revision, status?.revision) && workspace === status?.workspaceRoot;
+}
+// One catalog read per pin, made when an in-context "Open in library" first needs it (#527).
+// A catalog that is still building, or a read that failed, is read again by the next request.
+function ensureDependencies() {
+  if (!token || !status?.revision) return Promise.resolve();
+  if (!dependencyLoad) {
+    const load = dependencyLoad = refreshDependencies().finally(() => {
+      load.settled = true;
+      // Only a catalog that is still building is read again; ready, disabled and failed are final for the pin.
+      if (dependencyLoad === load && (!dependencyCatalog || dependencyCatalog.state === "loading")) dependencyLoad = null;
+    });
+  }
+  return dependencyLoad;
 }
 async function refreshDependencies() {
   if (!token || !status) return;
@@ -2176,7 +2309,21 @@ async function openLibrary(packages, reference) {
   window.TrellisShell?.showSource("library");
   if (packages.length === 1) await selectDependencyPackage(packages[0]);
 }
+// Before the catalog is read, an empty slot holds the place of the button; it gains the
+// button only if the loaded catalog indexes the package.
 function libraryButton(reference) {
+  // A catalog read for this pin since the last Refresh answers at once; otherwise read it first.
+  if (dependencyCatalog?.state === "ready" && !dependencyCatalog.stale) return libraryNode(reference);
+  if (!libraryEcosystems[reference?.ecosystem] || typeof reference?.name !== "string" || !reference.name || !status?.revision) return null;
+  const slot = element("span", undefined, "library-slot"), session = epoch, pin = IndexPin.copy(status.revision);
+  void ensureDependencies().then(() => {
+    if (session !== epoch || !IndexPin.equal(pin, status?.revision) || !slot.isConnected) return;
+    const node = libraryNode(reference);
+    if (node) slot.replaceWith(node);
+  });
+  return slot;
+}
+function libraryNode(reference) {
   const open = libraryAction(reference);
   if (!open) return null;
   const node = element("button", "Open in library"); node.type = "button";

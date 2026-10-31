@@ -394,6 +394,8 @@ test("Treemap late production fetch cannot replace all-callable heat and late so
   const {page} = selected, dto = await metrics(selected);
   await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").check(); await ready(page);
   await holdFetch(page, {suffix:"/metrics", query:{scope:"revision", role:"production"}});
+  // The production read of this revision is cached on the page (#527); drop it so the held read is real.
+  await page.evaluate(() => clearRevisionReads());
   try {
     await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").uncheck();
     await page.waitForFunction(() => window.treemapFetchGate.entered);
@@ -474,7 +476,8 @@ for (const transition of ["generation", "revision", "checkout", "session"]) {
     });
     await holdFetch(page, {suffix:"/metrics", query:{scope:"revision", role:"production"}});
     try {
-      await page.locator("#treemap-refresh").click();
+      // The view has no Refresh button (#527); drop the page's cached read and refresh the view.
+      await page.evaluate(() => { clearRevisionReads(); void treemap.refresh(); });
       await page.waitForFunction(() => window.treemapFetchGate.entered);
       // These are the app owner's real sampled context values. Do not perform
       // a request at an invented checkout or pin; only release the old read.
@@ -644,6 +647,10 @@ test("Treemap keeps to its panel's width, grows only downward, and keeps its sum
   assert.equal(panel.sideways, false);
   assert.ok(panel.controls < 70, `one row of controls: ${JSON.stringify(panel)}`);
   assert.ok(panel.above < 200, `controls, breadcrumbs and legend leave the panel to the map: ${JSON.stringify(panel)}`);
+  // #527: no orphan Refresh or "All indexed files" buttons at the whole snapshot.
+  assert.equal(await page.locator("#treemap-refresh").count(), 0);
+  assert.equal(await page.locator("#treemap-panel button").filter({hasText:/^(Refresh treemap|All indexed files)$/}).count(), 0);
+  assert.equal(await page.locator("#treemap-breadcrumbs").isVisible(), false);
   // The ready summary is not a visible line; it sits behind ⓘ, which opens inside the viewport.
   assert.equal(await page.locator("#treemap-state").isVisible(), false);
   assert.equal(await page.locator("#treemap-state").getAttribute("data-state"), "ready");
@@ -666,3 +673,37 @@ test("Treemap keeps to its panel's width, grows only downward, and keeps its sum
   await page.locator("#treemap-path").fill(""); await ready(page);
   assert.equal(await page.locator("#treemap-state").isVisible(), false);
 }, bulk));
+
+// #527: startup reads the full status once and polls only its small head digest, reads the
+// library catalog only on demand, and reads architecture and metrics once per revision.
+test("Startup load: one full status, head digests, no eager library catalog, and per-revision architecture and metrics", {timeout:240000}, async () => published(async selected => {
+  const {page, requests} = selected;
+  const route = row => row.url.pathname.replace(/^\/api\/checkouts\/[0-9a-f]+\//, "");
+  const count = name => requests.filter(row => route(row) === name).length;
+  const treemapReads = () => requests.filter(row => route(row) === "metrics" && row.url.searchParams.get("scope") === "revision" && !row.url.searchParams.has("topCognitive")).length;
+  await page.locator("#view-architecture").click();
+  await page.waitForFunction(() => document.querySelector("#architecture-state")?.dataset.state === "ready" && document.querySelector("#architecture-diagram svg"));
+  await page.waitForTimeout(300);
+  assert.equal(count("status"), 1, "the full status is read once at startup");
+  assert.ok(count("status/head") >= 1, "pinned reads compare the shown revision with the head digest");
+  assert.equal(count("dependencies"), 0, "the library catalog is not read until an in-context entry needs it");
+  const digest = await page.evaluate(async () => (await api("/api/status/head")));
+  assert.deepEqual(Object.keys(digest).sort(), ["catchingUp", "indexedAt", "revision", "workspaceRoot"]);
+  const architectureReads = count("architecture"), metricsReads = treemapReads();
+  assert.equal(architectureReads, 1); assert.equal(metricsReads, 1);
+  for (let round = 0; round < 2; round++) {
+    await page.locator("#view-treemap").click(); await ready(page);
+    await page.locator("#view-architecture").click();
+    await page.waitForFunction(() => document.querySelector("#architecture-state")?.dataset.state === "ready" && document.querySelector("#architecture-diagram svg"));
+  }
+  assert.equal(count("architecture"), architectureReads, "returning to Architecture reuses this revision's read");
+  assert.equal(treemapReads(), metricsReads, "returning to Treemap reuses this revision's read");
+  assert.equal(count("status"), 1);
+  // Refresh drops the cached reads and reads the current view again.
+  await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
+  for (const deadline = Date.now() + 120000; count("architecture") === architectureReads; await page.waitForTimeout(50)) assert.ok(Date.now() < deadline, "Refresh reads Architecture again");
+  await page.waitForFunction(() => document.querySelector("#architecture-state")?.dataset.state === "ready" && document.querySelector("#architecture-diagram svg"));
+  assert.equal(count("architecture"), architectureReads + 1);
+  assert.equal(count("status"), 2, "an explicit Refresh reads the full status");
+  assert.equal(count("dependencies"), 0);
+}));
