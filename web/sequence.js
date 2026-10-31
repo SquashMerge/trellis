@@ -52,6 +52,12 @@ function sequenceBasisLabel(evidence) {
   if (!basis || typeof basis.producerId !== "string") return "";
   return `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`;
 }
+// A call that may return early carries its folded `?` and guards (#542); a chain group
+// shows it when one of its calls does. Server fields, never inferred from labels.
+function sequenceEarlyReturn(step) {
+  const folded = item => Array.isArray(item?.folded) && item.folded.length > 0;
+  return folded(step) || step?.kind === "group" && (step.children || []).some(folded) ? " · may return early" : "";
+}
 function sequenceEntry(step) {
   const children = step?.children || [];
   return step?.kind === "group" && !step.alternate?.length && children.length &&
@@ -229,7 +235,7 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
       (!options.isCurrent || options.isCurrent()) &&
       (typeof options.onSelect === "function" || typeof readSource === "function");
     const call = ["call", "boundary"].includes(evidence.kind) && evidence.callId, proof = call ? provenance(evidence) : null;
-    const fullLabel = tooltip(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
+    const fullLabel = tooltip(step) + sequenceEarlyReturn(step) + (evidence !== step ? ` · Entry preview only: ${tooltip(evidence)}` : "");
     const control = make("g", {class:"sequence-source", "data-source-step-id":step.id,
       ...(interactive ? {role:"button", tabindex:0, "aria-label":`${options.onSelect ? "Inspect" : "Read source"}: ${fullLabel}`, "aria-pressed":String(selection.id === step.id)} : {})});
     // Compact controls remain individual, ordered fragments. No matching guard
@@ -248,12 +254,14 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const tabWidth = operator ? Math.max(80, operator.length * 8 + 28) : 0;
     const labelX = operator ? x + tabWidth + 12 : x + 5;
     const capacity = Math.max(24, Math.floor((width-labelX-(proof && options.showDetails ? 145 : 35))/7.8));
-    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : capacity);
+    const early = sequenceEarlyReturn(step);
+    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : Math.max(12, capacity - early.length));
+    label += early;
     // Brackets are a presentation frame, not an inferred or rewritten predicate.
     if (operator) label = `[${label}]`;
     let labels = options.showDetails ? wrap(label, capacity) : [label];
     if (display.kind === "call chain" && !options.showDetails) {
-      const suffix = ` · +${step.children.length-1} calls collapsed (entry preview)`;
+      const suffix = ` · +${step.children.length-1} calls collapsed (entry preview)${early}`;
       // Keep the collapsed count and entry-only claim visible even when the
       // measured name is long. At deep indentation the annotation can wrap.
       labels = wrap((evidence.callEvidence ? `${sequenceEvidenceLabel(evidence, view)} · ` : "") + shorten(evidence.label, Math.max(12, capacity-suffix.length)) + suffix, capacity);
@@ -372,4 +380,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};

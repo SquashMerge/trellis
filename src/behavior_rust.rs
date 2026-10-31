@@ -6,7 +6,8 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
 
-const MAX_STEPS: usize = 200;
+// The work bound (#536): the visible bound is applied to the view this builds.
+const MAX_STEPS: usize = crate::behavior::MAX_WORK_STEPS;
 const MAX_PARTICIPANTS: usize = 20;
 const MAX_DEPTH: usize = 24;
 /// Bounds the recursion over nested Rust syntax. The step tree it produces is bounded to
@@ -70,8 +71,8 @@ impl Builder<'_> {
         }
     }
     fn limit(&mut self) {
-        self.view.truncated = true;
-        self.warn("Sequence bounds reached (200 steps, 20 participants, depth 24); omitted behavior is unknown.");
+        crate::behavior::adapter_limit(&mut self.view, self.count);
+        self.warn("Sequence bounds reached (2000 steps of work, 20 participants, depth 24); omitted behavior is unknown.");
     }
     fn step(&mut self, n: Node<'_>, kind: &str, label: impl AsRef<str>) -> Option<SequenceStep> {
         if self.count >= MAX_STEPS {
@@ -93,6 +94,7 @@ impl Builder<'_> {
             alternate: vec![],
             hidden: false,
             lane: None,
+            folded: vec![],
         })
     }
     fn boundary(&mut self, n: Node<'_>, message: &str) -> Flow {
@@ -109,13 +111,18 @@ impl Builder<'_> {
     }
     fn block(&mut self, nodes: &[Node<'_>], depth: usize) -> Flow {
         let mut out = Flow::empty();
+        // The statements after one that may exit are the children of a guard, unless the
+        // guard folds into the `?` call it guards against (#542). Unfolded guards nest one
+        // level per such statement: each level holds its steps and the guard after them.
+        let mut levels: Vec<(Vec<SequenceStep>, SequenceStep)> = vec![];
+        let mut current: Vec<SequenceStep> = vec![];
         for (i, &n) in nodes.iter().enumerate() {
             if self.count >= MAX_STEPS {
                 self.limit();
                 break;
             }
             let f = self.walk(n, depth + 1);
-            out.steps.extend(f.steps);
+            current.extend(f.steps);
             out.exits |= f.exits;
             if !f.continues {
                 out.continues = false;
@@ -126,24 +133,25 @@ impl Builder<'_> {
             }
             if f.exits && i + 1 < nodes.len() {
                 // Do not draw the suffix after a return/throw alternative as unconditional.
-                if depth >= MAX_AST_DEPTH {
+                if depth + levels.len() >= MAX_AST_DEPTH {
                     self.limit();
                     break;
                 }
-                if let Some(mut guard) = self.step(
-                    nodes[i + 1],
-                    "branch",
-                    "only if the preceding path continues normally",
-                ) {
-                    let rest = self.block(&nodes[i + 1..], depth + 1);
-                    guard.children = rest.steps;
-                    out.continues = rest.continues;
-                    out.exits |= rest.exits;
-                    out.steps.push(guard);
+                let Some(guard) = self.step(nodes[i + 1], "branch", CONTINUES_LABEL) else {
+                    break;
+                };
+                // After a `?` call the suffix stays at this level (#542).
+                if let Some(guard) = fold_guard(&mut current, guard) {
+                    levels.push((std::mem::take(&mut current), guard));
                 }
-                break;
             }
         }
+        while let Some((mut steps, mut guard)) = levels.pop() {
+            guard.children = current;
+            steps.push(guard);
+            current = steps;
+        }
+        out.steps = current;
         out
     }
 
@@ -153,11 +161,15 @@ impl Builder<'_> {
             return first;
         }
         if first.exits && !next.steps.is_empty() {
-            if let Some(mut guard) =
-                self.step(n, "branch", "only if the preceding path continues normally")
-            {
-                guard.children = next.steps;
-                first.steps.push(guard);
+            if let Some(guard) = self.step(n, "branch", CONTINUES_LABEL) {
+                match fold_guard(&mut first.steps, guard) {
+                    // After a `?` call the rest of the evaluation follows it (#542).
+                    None => first.steps.extend(next.steps),
+                    Some(mut guard) => {
+                        guard.children = next.steps;
+                        first.steps.push(guard);
+                    }
+                }
             }
         } else {
             first.steps.extend(next.steps);
@@ -249,9 +261,11 @@ impl Builder<'_> {
             "try_expression" => {
                 let value = self.children(n, depth);
                 let mut f = Flow::empty();
-                if let Some(mut s) = self.step(n, "branch", "?: continue only on success; otherwise early return") {
+                let mut value = value;
+                if let Some(mut s) = self.step(n, "branch", TRY_LABEL) {
                     s.alternate.extend(self.step(n, "return", "?: early return on residual; conversion not expanded"));
-                    f.steps.push(s);
+                    // The call it guards may return early (#542); `x?` keeps its branch.
+                    f.steps.extend(fold_try(&mut value.steps, s, try_operand(n)));
                 }
                 f.exits = true; self.then(value, f, n)
             }
@@ -561,7 +575,10 @@ fn receiver_call(n: Node<'_>) -> Option<Node<'_>> {
 }
 // Presentation only: no claim about purity, builder types, or object identity.
 // Run after measurement so grouping cannot change step IDs, limits, or guards.
+// Each group is a step: grouping stops, losing nothing, before the view's steps would
+// pass the work bound (#536).
 fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -> bool {
+    let mut room = MAX_STEPS.saturating_sub(crate::behavior::step_count(steps));
     let mut cursor = n.walk();
     let mut depth = 0;
     let mut budget = MAX_STEPS * MAX_DEPTH;
@@ -578,7 +595,12 @@ fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -
                 "macro_invocation" | "unsafe_block" | "const_block" | "async_block"
             );
         if !opaque {
-            wrap_syntax_chain(node, file, steps);
+            if room == 0 {
+                return true;
+            }
+            if wrap_syntax_chain(node, file, steps) {
+                room -= 1;
+            }
             if depth < MAX_DEPTH {
                 if cursor.goto_first_child() {
                     depth += 1;
@@ -600,13 +622,14 @@ fn group_chains(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -
         }
     }
 }
-fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) {
+/// Wraps the call chain at `n` into one group step; true when it did.
+fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceStep>) -> bool {
     if n.kind() == "call_expression" {
         let mut chain = vec![n];
         let mut receiver = n;
         while let Some(next) = receiver_call(receiver) {
             if chain.len() >= MAX_DEPTH {
-                return;
+                return false;
             }
             chain.push(next);
             receiver = next;
@@ -642,12 +665,13 @@ fn wrap_syntax_chain(n: Node<'_>, file: &SourceFile, steps: &mut Vec<SequenceSte
                 })
                 .collect();
             let label = format!("{} ({} calls)", labels.join(" → "), labels.len());
-            wrap_chain(n, &chain, &label, steps);
+            return wrap_chain(n, &chain, &label, steps);
         }
     }
+    false
 }
 
-fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<SequenceStep>) {
+fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<SequenceStep>) -> bool {
     // Only a flat, fully measured evaluation is eligible. Branches, opaque
     // boundaries, writes, suspension, and transfers conservatively prevent it.
     let first = steps
@@ -665,6 +689,9 @@ fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<Sequ
         if slice
             .iter()
             .all(|s| s.kind == "call" && s.call_id.is_some())
+            // Only the chain's last call may return early (`chain()?`, #542); an early
+            // return inside an argument stays visible.
+            && slice[..slice.len() - 1].iter().all(|s| s.folded.is_empty())
             && chain.iter().all(|c| {
                 slice.iter().any(|s| {
                     s.range.start_byte == c.start_byte() && s.range.end_byte == c.end_byte()
@@ -677,19 +704,97 @@ fn wrap_chain(n: Node<'_>, chain: &[Node<'_>], label: &str, steps: &mut Vec<Sequ
             group.label = bounded(label);
             group.range = range(n);
             group.call_id = None;
+            // A member that may return early keeps its own folded steps (#542).
+            group.folded.clear();
             group.children = steps.drain(first..end).collect();
             steps.insert(first, group);
-            return;
+            return true;
         }
     }
-    for step in steps {
-        // Do not wrap shorter subchains inside an already collapsed chain.
-        if step.kind != "group" {
-            wrap_chain(n, chain, label, &mut step.children);
-            wrap_chain(n, chain, label, &mut step.alternate);
+    // Do not wrap shorter subchains inside an already collapsed chain.
+    steps
+        .iter_mut()
+        .filter(|step| step.kind != "group")
+        .any(|step| {
+            wrap_chain(n, chain, label, &mut step.children)
+                || wrap_chain(n, chain, label, &mut step.alternate)
+        })
+}
+const TRY_LABEL: &str = "?: continue only on success; otherwise early return";
+const CONTINUES_LABEL: &str = "only if the preceding path continues normally";
+
+/// A call step that may carry a folded `?` (#542): a measured call, drawn as a call or, when
+/// its source-hint lanes were full, as a boundary.
+fn measured_call(step: &SequenceStep) -> bool {
+    matches!(step.kind.as_str(), "call" | "boundary")
+        && step.call_id.is_some()
+        && step.children.is_empty()
+        && step.alternate.is_empty()
+}
+
+/// The byte range of a `?`'s direct operand, through transparent parentheses, when that
+/// operand is a call (#542). A field, tuple index, await or other value is not.
+fn try_operand(n: Node<'_>) -> Option<(usize, usize)> {
+    let mut operand = n.named_child(0)?;
+    while operand.kind() == "parenthesized_expression" {
+        operand = operand.named_child(0)?;
+    }
+    (operand.kind() == "call_expression").then(|| (operand.start_byte(), operand.end_byte()))
+}
+
+/// Folds a `?` early-return branch into the measured call that is its direct operand
+/// (#542). That call is evaluated last: the last of `steps`, or the last under trailing
+/// "continues normally" guards (`outer(x?, y())?`). A `?` whose operand is not a call keeps
+/// its branch. Lossless: the branch, with its early return as `alternate`, is kept on the
+/// call's `folded`. Returns the branch when it could not be folded.
+fn fold_try(
+    steps: &mut [SequenceStep],
+    branch: SequenceStep,
+    operand: Option<(usize, usize)>,
+) -> Option<SequenceStep> {
+    fn find(steps: &mut [SequenceStep], start: usize, end: usize) -> Option<&mut SequenceStep> {
+        let step = steps.last_mut()?;
+        let exact =
+            measured_call(step) && step.range.start_byte == start && step.range.end_byte == end;
+        let guard =
+            step.kind == "branch" && step.label == CONTINUES_LABEL && step.alternate.is_empty();
+        if exact {
+            Some(step)
+        } else if guard {
+            find(&mut step.children, start, end)
+        } else {
+            None
         }
+    }
+    match operand.and_then(|(start, end)| find(steps, start, end)) {
+        Some(call) => {
+            call.folded.push(branch);
+            None
+        }
+        None => Some(branch),
     }
 }
+
+/// Folds a "continues normally" guard into the nearest call before it in `steps` that may
+/// return early (#542), when only plain calls, which cannot leave the path themselves, come
+/// between them: that `?` is the exit the guard guards against. The guard is kept on the
+/// call's `folded` (its label and range); its children, the guarded suffix, then follow the
+/// call at the same level. Returns the guard when it could not be folded.
+fn fold_guard(steps: &mut [SequenceStep], guard: SequenceStep) -> Option<SequenceStep> {
+    let call = steps
+        .iter_mut()
+        .rev()
+        .find(|step| !(measured_call(step) && step.folded.is_empty()))
+        .filter(|step| measured_call(step) && step.folded.iter().any(|f| f.label == TRY_LABEL));
+    match call {
+        Some(call) => {
+            call.folded.push(guard);
+            None
+        }
+        None => Some(guard),
+    }
+}
+
 pub fn build(
     revision: IndexPin,
     seed: &Symbol,
@@ -730,7 +835,7 @@ pub fn build(
     }
     let mut b = Builder { file, seed, calls, count: 0, view: SequenceView { semantic_warnings: vec![], semantic: Default::default(), incidental_steps: 0,
         revision, seed: seed.clone(), participants: vec![Participant { declaration: None, id: seed.id.clone(), label: bounded(&seed.name), kind: "method".into(), identification: "Selected source symbol.".into() }],
-        steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false,
+        steps: vec![], warnings: vec!["Static possible paths, not a runtime trace. Rust types, traits, dispatch, cfg/attributes, implicit drops, coercions and iterator protocols are not resolved. Async bodies describe possible execution when polled, not future construction. Calls may panic or diverge; those implicit paths are not expanded.".into()], hidden_steps: 0, truncated: false, truncated_by: vec![],
     }};
     let f = if !callable(node)
         || node.start_byte() != seed.range.start_byte

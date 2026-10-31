@@ -211,10 +211,27 @@ test("published import candidate keeps partial provenance and original source",{
  assert.equal(await page.locator("#source").evaluate(node => node === document.activeElement), true, "Inspector source menu returns focus to source");
 },"flow.js"));
 
+// #542: a `?` and the guard it implies fold into their call as "may return early"; the
+// inspector still shows both, with the early return, and the suffix follows at one level.
+test("folded ? marks its call and stays in the inspector",{timeout:240000},async()=>published("fn measured() -> Option<()> {\n    let _ = work()?;\n    after();\n    None\n}\n",async({page,dto})=>{
+ const [work,after]=dto.steps;
+ assert.equal(work.label,"work");assert.equal(after.label,"after");
+ assert.deepEqual(work.folded.map(f=>f.label),["?: continue only on success; otherwise early return","only if the preceding path continues normally"]);
+ assert.equal(work.folded[0].alternate[0].kind,"return");
+ const note=page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${work.id}"]`);
+ assert.match(await note.textContent(),/may return early/);
+ assert.doesNotMatch(await page.locator(`#sequence-diagram .pele-note[data-trellis-step-id="${after.id}"]`).textContent(),/may return early/);
+ await note.click();
+ const folded=page.locator("#inspector-detail details > summary").filter({hasText:"Folded control flow"});
+ assert.deepEqual(await folded.allTextContents(),["Folded control flow · branch: ?: continue only on success; otherwise early return","Folded control flow · branch: only if the preceding path continues normally"]);
+ assert.match(await page.locator("#inspector-detail").textContent(),/early return on residual/);
+}));
+
 const truncatedSource=`function measured() {\n${Array.from({length:202},(_,i)=>`  observed_${i}();\n`).join("")}}\n`;
 test("published truncated producer shows bound while retaining original call witness",{timeout:240000},async()=>published(truncatedSource,async({page,dto,pin})=>{
  assert.equal(dto.truncated,true,"the actual producer must reach its 200-step cap");
- assert.ok(dto.warnings.some(w=>w.includes("200 steps")));
+ assert.ok(dto.warnings.some(w=>w.includes("200 shown steps")));
+ assert.deepEqual(dto.truncatedBy,["visibleSteps"]);
  assert.match(await page.locator("#sequence-state").innerText(),/truncated/);
  assert.match(await page.locator("#sequence-state").innerText(),/Pele rendered/);
  const first=dto.steps.find(step=>step.kind==="call"&&step.label==="observed_0");

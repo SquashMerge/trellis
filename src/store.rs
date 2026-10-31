@@ -22223,7 +22223,9 @@ impl Store {
         let mut calls = document.graph_calls;
         calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
         let file = document.file;
-        let mut view = crate::behavior::build_sequence(revision, symbol, &file, &calls, show_all)?;
+        // Enrichment applies the visible step bound once incidental calls are hidden (#536).
+        let mut view =
+            crate::behavior::build_sequence_work(revision, symbol, &file, &calls, show_all)?;
         graph_read::sequence_calls(self, tx, &selected_revision, &mut view, show_all)?;
         Ok(Some(view))
     }

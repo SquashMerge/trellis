@@ -490,7 +490,7 @@ pub(super) fn sequence_calls(
     view: &mut crate::behavior::SequenceView,
     show_all: bool,
 ) -> Result<()> {
-    use crate::behavior::{EvidenceTier, SequenceSemantic};
+    use crate::behavior::{EvidenceTier, SequenceLimit, SequenceSemantic, cap_visible};
     use crate::graph_query::{self as engine, GraphNode};
     let (source_set_id, revision_id): (String, String) = db.query_row(
         "SELECT source_set_id,native_revision_id FROM native_revisions WHERE id=?1",
@@ -527,6 +527,7 @@ pub(super) fn sequence_calls(
                 .push(engine::multiple_producers_note(&key.language));
         }
         view.semantic = SequenceSemantic::syntax(defaults.note(&key.language));
+        cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     };
     let languages = defaults.languages();
@@ -538,6 +539,7 @@ pub(super) fn sequence_calls(
         .clone();
     let Some(semantic) = engine::semantic(Some(&languages), &document).map_err(engine_error)?
     else {
+        cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     };
     let seed_calls = document
@@ -547,6 +549,7 @@ pub(super) fn sequence_calls(
         .unwrap_or_default();
     if let Some(reason) = syntax_fallback(semantic, seed_calls, &key.path, &mut source)? {
         view.semantic = SequenceSemantic::syntax(Some(reason));
+        cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     }
     view.semantic = SequenceSemantic {
@@ -560,6 +563,31 @@ pub(super) fn sequence_calls(
     if let Some(participant) = view.participants.iter_mut().find(|p| p.id == view.seed.id) {
         participant.declaration = Some(view.seed.clone());
     }
+    // Hidden incidental calls do not count toward the visible bound (#536): hide them
+    // first, then bound what is shown. The work bound already holds every step built. A
+    // seed with a resolved target keeps room for the callee bodies it expands (#542).
+    let mut targets = BTreeSet::new();
+    let mut bodies = BTreeMap::new();
+    hide_incidental(
+        &mut source,
+        &languages,
+        show_all,
+        &mut view.steps,
+        &document,
+        &view.seed.id,
+        &mut targets,
+        &mut |id, key| expandable(store, db, selected, &mut bodies, id, key),
+    )?;
+    // The reserve applies only when a call that may expand is among the steps it keeps.
+    let reserve = shown_within(&view.steps, &targets, &mut { crate::behavior::SEED_STEPS });
+    cap_visible(
+        view,
+        if reserve {
+            crate::behavior::SEED_STEPS
+        } else {
+            crate::behavior::MAX_STEPS
+        },
+    );
     let mut enrichment = Enrichment {
         store,
         db,
@@ -577,11 +605,10 @@ pub(super) fn sequence_calls(
         edges: vec![],
         expanded: BTreeSet::new(),
         stack: vec![view.seed.id.clone()],
-        used: crate::behavior::step_count(&view.steps),
-        limited: false,
+        used: crate::behavior::visible_count(&view.steps),
+        work: crate::behavior::step_count(&view.steps),
         truncated: false,
-        hidden: 0,
-        revealed: 0,
+        limits: BTreeSet::new(),
         incidental: 0,
     };
     let seed_id = view.seed.id.clone();
@@ -589,19 +616,18 @@ pub(super) fn sequence_calls(
     let Enrichment {
         nodes,
         edges,
-        limited,
         truncated,
-        hidden,
-        revealed,
+        limits,
         incidental,
         ..
     } = enrichment;
-    view.hidden_steps = (view.hidden_steps + hidden).saturating_sub(revealed);
+    view.hidden_steps = crate::behavior::hidden_count(&view.steps);
     view.incidental_steps = incidental;
-    if truncated || limited {
-        view.truncated = true;
+    view.truncated |= truncated;
+    for limit in limits {
+        view.limit(limit);
     }
-    if limited {
+    if view.truncated_by.contains(&SequenceLimit::Participants) {
         view.warnings
             .push("Sequence participant limit reached; additional targets are not shown.".into());
     }
@@ -693,14 +719,146 @@ struct Enrichment<'a, 'b> {
     expanded: BTreeSet<String>,
     /// The owners on the current expansion path; a target on it is not re-entered.
     stack: Vec<String>,
-    /// Steps in the view so far, expanded bodies included.
+    /// Shown steps in the view so far, expanded bodies included: the visible bound (#536).
     used: usize,
-    limited: bool,
+    /// Every step built so far, hidden ones included: the work bound (#536).
+    work: usize,
+    /// Truncated by an adapter bound with no typed limit.
     truncated: bool,
-    hidden: usize,
-    /// Steps a syntax heuristic hid that resolved to an internal target, so are shown.
-    revealed: usize,
+    limits: BTreeSet<crate::behavior::SequenceLimit>,
     incidental: usize,
+}
+
+/// Sets which of `steps`, measured in `owner`'s body in `document`, are shown, before the
+/// visible bound is applied (#536). A standalone call bound to an external declaration is
+/// incidental and hidden unless `show_all`; a call with a fresh exact internal target is
+/// never hidden by a spelling heuristic (JavaScript `console.log`), nor is its body; a
+/// chain whose calls are all hidden is hidden. A call that may return early (#542) is
+/// control flow, so it is never incidental. Adds to `targets` the step IDs of calls with a
+/// resolved target other than `owner` itself, the calls that may expand a body (#542).
+#[allow(clippy::too_many_arguments)]
+fn hide_incidental(
+    source: &mut SnapshotGraphSource<'_>,
+    languages: &BTreeSet<String>,
+    show_all: bool,
+    steps: &mut [crate::behavior::SequenceStep],
+    document: &DocumentFacts,
+    owner: &str,
+    targets: &mut BTreeSet<String>,
+    expandable: &mut dyn FnMut(&str, &DocumentKey) -> Result<bool>,
+) -> Result<()> {
+    use crate::graph_query::{self as engine, BoundaryReason};
+    let semantic = engine::semantic(Some(languages), document).map_err(engine_error)?;
+    for step in steps {
+        source.check_work()?;
+        hide_incidental(
+            source,
+            languages,
+            show_all,
+            &mut step.children,
+            document,
+            owner,
+            targets,
+            expandable,
+        )?;
+        hide_incidental(
+            source,
+            languages,
+            show_all,
+            &mut step.alternate,
+            document,
+            owner,
+            targets,
+            expandable,
+        )?;
+        if step.kind == "group"
+            && !step.children.is_empty()
+            && step.children.iter().all(|child| child.hidden)
+        {
+            step.hidden = true;
+        }
+        let Some(call) = step
+            .call_id
+            .as_deref()
+            .and_then(|id| document.calls.get(owner)?.iter().find(|call| call.id == id))
+        else {
+            continue;
+        };
+        let disposition = engine::call_disposition(semantic, call, source).map_err(engine_error)?;
+        let reason = disposition.boundary_reason;
+        if reason == BoundaryReason::None {
+            step.hidden = false;
+            // Only a call `expand` could build reserves room: not recursion into the
+            // owner, nor a target that is not a function or method (a class constructor).
+            if let Some((id, key)) = disposition.exact_target
+                && id != owner
+                && expandable(id, key)?
+            {
+                targets.insert(step.id.clone());
+            }
+        } else if !show_all && is_incidental(step, reason) {
+            step.hidden = true;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `id` in `key` is a function or method, the targets `expand` can build (#542);
+/// `memo` holds each target document's such declarations, by path.
+fn expandable(
+    store: &Store,
+    db: &Connection,
+    selected: &ReadRevision,
+    memo: &mut BTreeMap<String, BTreeSet<String>>,
+    id: &str,
+    key: &DocumentKey,
+) -> Result<bool> {
+    if !memo.contains_key(&key.path) {
+        let document = store.selected_graph_document_for(db, &key.path, selected)?;
+        let callables = document
+            .nodes
+            .into_iter()
+            .filter(|node| matches!(node.kind, SymbolKind::Function | SymbolKind::Method))
+            .map(|node| node.id)
+            .collect();
+        memo.insert(key.path.clone(), callables);
+    }
+    Ok(memo[&key.path].contains(id))
+}
+
+/// Whether a step in `ids` is among the first `limit` shown steps of `steps`, in pre-order.
+fn shown_within(
+    steps: &[crate::behavior::SequenceStep],
+    ids: &BTreeSet<String>,
+    room: &mut usize,
+) -> bool {
+    for step in steps.iter().filter(|step| !step.hidden) {
+        if *room == 0 {
+            return false;
+        }
+        *room -= 1;
+        if ids.contains(&step.id)
+            || shown_within(&step.children, ids, room)
+            || shown_within(&step.alternate, ids, room)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Only a standalone call is incidental: one that already nests steps (an expanded body or
+/// a chain) keeps them visible. A measured call the syntax adapter drew as a boundary (its
+/// source-hint lanes were full) is still a call here: those hint lanes are not drawn.
+fn is_incidental(
+    step: &crate::behavior::SequenceStep,
+    reason: crate::graph_query::BoundaryReason,
+) -> bool {
+    reason == crate::graph_query::BoundaryReason::External
+        && matches!(step.kind.as_str(), "call" | "boundary")
+        && step.children.is_empty()
+        && step.alternate.is_empty()
+        && step.folded.is_empty()
 }
 
 impl Enrichment<'_, '_> {
@@ -724,13 +882,6 @@ impl Enrichment<'_, '_> {
             self.source.check_work()?;
             self.steps(&mut step.children, document, owner, depth + 1)?;
             self.steps(&mut step.alternate, document, owner, depth + 1)?;
-            if step.kind == "group"
-                && !step.children.is_empty()
-                && step.children.iter().all(|child| child.hidden)
-            {
-                // A chain of incidental calls folds away with its members.
-                step.hidden = true;
-            }
             let Some(call) = step
                 .call_id
                 .as_deref()
@@ -746,19 +897,14 @@ impl Enrichment<'_, '_> {
                 if !self.participants.iter().any(|p| &p.id == id) {
                     if self.participants.len() == 20 {
                         reason = BoundaryReason::NodeLimit;
-                        self.limited = true;
+                        self.limits
+                            .insert(crate::behavior::SequenceLimit::Participants);
                     } else {
                         self.participant(id, key)?;
                     }
                 }
                 if reason == BoundaryReason::None {
                     step.target = Some(id.clone());
-                    // A spelling heuristic (JavaScript `console.log`) never hides a call
-                    // with a fresh exact internal target, nor so its expanded body.
-                    if step.hidden {
-                        step.hidden = false;
-                        self.revealed += 1;
-                    }
                 }
             }
             let selected = disposition.selected;
@@ -791,20 +937,9 @@ impl Enrichment<'_, '_> {
                 },
                 boundary_reason: reason,
             });
-            // Only a standalone call is incidental: one that already nests steps (an
-            // expanded body or a chain) keeps them visible.
-            // A measured call the syntax adapter drew as a boundary (its source-hint lanes
-            // were full) is still a call here: those hint lanes are not drawn.
-            if reason == BoundaryReason::External
-                && matches!(step.kind.as_str(), "call" | "boundary")
-                && step.children.is_empty()
-                && step.alternate.is_empty()
-            {
+            // `hide_incidental` already hid it unless `show_all`.
+            if is_incidental(step, reason) {
                 self.incidental += 1;
-                if !self.show_all && !step.hidden {
-                    step.hidden = true;
-                    self.hidden += 1;
-                }
             }
             if let Some(target) = step.target.clone() {
                 self.expand(step, &target, depth)?;
@@ -848,14 +983,18 @@ impl Enrichment<'_, '_> {
     }
 
     /// Expands the measured body of `target` beneath `step`, once per target, when it fits
-    /// the step and depth bounds and is not already on the expansion path.
+    /// the visible step, work and depth bounds and is not already on the expansion path.
+    /// The body's incidental calls are hidden first, so they use no visible room (#536).
     fn expand(
         &mut self,
         step: &mut crate::behavior::SequenceStep,
         target: &str,
         depth: usize,
     ) -> Result<()> {
-        use crate::behavior::{MAX_STEP_DEPTH, MAX_STEPS, step_count, tree_depth};
+        use crate::behavior::{
+            MAX_STEP_DEPTH, MAX_STEPS, MAX_WORK_STEPS, SequenceLimit, step_count, tree_depth,
+            visible_count,
+        };
         if self.stack.iter().any(|owner| owner == target) || !self.expanded.insert(target.into()) {
             return Ok(());
         }
@@ -873,7 +1012,7 @@ impl Enrichment<'_, '_> {
                 .selected_graph_document_for(self.db, &symbol.path, self.selected)?;
         let mut calls = document.graph_calls;
         calls.sort_by(|a, b| (a.range.start_byte, &a.id).cmp(&(b.range.start_byte, &b.id)));
-        let mut body = crate::behavior::build_sequence(
+        let mut body = crate::behavior::build_sequence_work(
             self.revision,
             &symbol,
             &document.file,
@@ -883,9 +1022,33 @@ impl Enrichment<'_, '_> {
         if body.steps.is_empty() {
             return Ok(());
         }
-        let count = step_count(&body.steps);
-        if self.used + count > MAX_STEPS {
-            self.truncated = true;
+        let work = step_count(&body.steps);
+        if self.work + work > MAX_WORK_STEPS {
+            self.limits.insert(SequenceLimit::WorkSteps);
+            self.warn(format!(
+                "Sequence work limit reached; the body of {} is not expanded.",
+                symbol.name
+            ));
+            return Ok(());
+        }
+        let key = self
+            .source
+            .locate(target)?
+            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
+        let callee = self.source.document(&key)?;
+        hide_incidental(
+            self.source,
+            self.languages,
+            self.show_all,
+            &mut body.steps,
+            &callee,
+            target,
+            &mut BTreeSet::new(),
+            &mut |_, _| Ok(false),
+        )?;
+        let shown = visible_count(&body.steps);
+        if self.used + shown > MAX_STEPS {
+            self.limits.insert(SequenceLimit::VisibleSteps);
             self.warn(format!(
                 "Sequence step limit reached; the body of {} is not expanded.",
                 symbol.name
@@ -893,33 +1056,30 @@ impl Enrichment<'_, '_> {
             return Ok(());
         }
         if depth + 1 + tree_depth(&body.steps) >= MAX_STEP_DEPTH {
-            self.truncated = true;
+            self.limits.insert(SequenceLimit::Depth);
             self.warn(format!(
                 "Sequence depth limit reached; the body of {} is not expanded.",
                 symbol.name
             ));
             return Ok(());
         }
-        self.used += count;
+        self.used += shown;
+        self.work += work;
         fn relabel(steps: &mut [crate::behavior::SequenceStep], prefix: &str, lane: &str) {
             for step in steps {
                 step.id = format!("{prefix}>{}", step.id);
                 step.lane = Some(lane.to_owned());
                 relabel(&mut step.children, prefix, lane);
                 relabel(&mut step.alternate, prefix, lane);
+                relabel(&mut step.folded, prefix, lane);
             }
         }
         relabel(&mut body.steps, &step.id, target);
         for warning in std::mem::take(&mut body.warnings) {
             self.warn(warning);
         }
-        self.hidden += body.hidden_steps;
         self.truncated |= body.truncated;
-        let key = self
-            .source
-            .locate(target)?
-            .ok_or_else(|| SelectedIntegrity("selected sequence target missing".into()))?;
-        let callee = self.source.document(&key)?;
+        self.limits.extend(body.truncated_by);
         self.stack.push(target.to_owned());
         self.steps(&mut body.steps, &callee, target, depth + 1)?;
         self.stack.pop();
