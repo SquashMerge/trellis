@@ -161,7 +161,9 @@ jobs:
       - name: Build and archive the tests
         env:
           CARGO_TARGET_DIR: target-test-support
-        run: cargo nextest archive --locked --all-targets --features test-support --archive-file "$RUNNER_TEMP/tests-archive/tests.tar.zst"
+        run: |
+          mkdir -p "$RUNNER_TEMP/tests-archive"
+          cargo nextest archive --locked --all-targets --features test-support --archive-file "$RUNNER_TEMP/tests-archive/tests.tar.zst"
       # Record the full test list and each partition's share of it, and fail
       # unless the partitions are disjoint and together hold every test.
       - name: List the tests and their partitions
