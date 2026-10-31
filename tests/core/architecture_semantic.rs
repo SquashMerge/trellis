@@ -574,3 +574,35 @@ fn type_relationships_settle_implements_constraints() {
         json!(["type_relationship_absence_unproven"])
     );
 }
+
+#[test]
+fn corrupt_semantic_rows_fail_typed_after_reopen() {
+    for (column, value) in [("join_start", "-1"), ("dispatch", "'bogus'")] {
+        let (state, root, store, pin) = publish(&semantic());
+        drop(store);
+        let index = fs::read_dir(state.path().join("cache/indexes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("index.db");
+        let db = rusqlite::Connection::open(index).unwrap();
+        let changed = db
+            .execute(
+                &format!(
+                    "UPDATE semantic_call_bindings SET {column}={value} WHERE provenance_id='call-lower-0'"
+                ),
+                [],
+            )
+            .unwrap();
+        assert!(changed > 0, "{column}");
+        drop(db);
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let response = store.evidence_response().unwrap();
+        let error = response
+            .architecture_response("references", &json!({"expectedBasis":pin}), &mut || Ok(()))
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("corrupt semantic"), "{column}: {text}");
+    }
+}

@@ -747,3 +747,30 @@ test("a collapsed band draws one row of metric-coloured module chips, hottest fi
   assert.equal(chips[2].label, "2 more modules · open the band to see them");
   assert.equal(options.display.summary("UI", members, 10).length, 4, "everything fits when the row is wide enough");
 });
+
+test("#523: inspectors describe semantic evidence for mixed edges and bound rule instances", async () => {
+  // Shapes from the semantic fixture: a mixed low → high edge whose sites are partly bound.
+  const h = harness(), payload = authoringFixture();
+  payload.evidenceTier = "mixed";
+  Object.assign(payload.edges[0], {evidenceTier:"mixed", semanticSites:2,
+    coverage:{sites:3,mappedSites:3,unresolvedSites:0,semanticSites:2,complete:true}});
+  const binding = {document:{sourceSetId:"s",language:"rust",path:"src/a.rs"},revisionId:"r",range:{start:1,end:2},
+    kind:"semanticBinding",syntaxId:null,callId:null,provenanceId:"call-orphan-0"};
+  payload.rules.instances[0].evidence = [binding];
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  h.renders[0].options.onSelectEdge(payload.edges[0]); await flush();
+  const edgeText = text(h.get("architecture-inspector-content"));
+  assert.match(edgeText, /Syntax evidence and fresh semantic bindings · not semantically complete/);
+  assert.match(edgeText, /reference sites, 2 bound by semantic evidence/);
+  assert.doesNotMatch(edgeText, /not compiler-resolved calls/);
+  const rule = descendants(h.get("architecture-review-list")).find(item => item.tagName === "button" && item.textContent.startsWith("$layers · "));
+  assert.ok(rule); await rule.fire("click"); await flush();
+  const ruleText = text(h.get("architecture-inspector-content"));
+  assert.match(ruleText, /Semantic evidence names a fresh producer binding/);
+  assert.doesNotMatch(ruleText, /not destination symbol bindings/);
+  // A syntax-only snapshot keeps the syntax wording.
+  const plain = harness(), syntax = authoringFixture();
+  plain.setResponse(async () => ({payload:syntax})); await plain.controller.refresh();
+  plain.renders[0].options.onSelectEdge(syntax.edges[0]); await flush();
+  assert.match(text(plain.get("architecture-inspector-content")), /Syntax evidence · not compiler-resolved calls.*structural reference sites/s);
+});

@@ -767,9 +767,22 @@ pub(super) fn architecture_semantic(
             })
             .transpose()
     };
-    let range = |start: i64, end: i64| crate::native_evidence::Range {
-        start: usize::try_from(start).unwrap_or(usize::MAX),
-        end: usize::try_from(end).unwrap_or(0),
+    // Stored offsets are nonnegative and ordered; anything else is a corrupt row.
+    let range = |start: i64, end: i64| -> Result<crate::native_evidence::Range> {
+        match (usize::try_from(start), usize::try_from(end)) {
+            (Ok(start), Ok(end)) if start <= end => {
+                Ok(crate::native_evidence::Range { start, end })
+            }
+            _ => Err(SelectedIntegrity("corrupt semantic offset".into()).into()),
+        }
+    };
+    // The closed dispatch enum: direct and constructor calls are direct.
+    let direct = |dispatch: &str| -> Result<bool> {
+        match dispatch {
+            "direct" | "constructor" => Ok(true),
+            "virtual" | "interface" | "dynamic" | "unknown" => Ok(false),
+            _ => Err(SelectedIntegrity("corrupt semantic call dispatch".into()).into()),
+        }
     };
     let mut tuples = Vec::new();
     for language in defaults.by_language.keys() {
@@ -839,6 +852,9 @@ pub(super) fn architecture_semantic(
             let call_id = id_codec::decode_occ(row.get_ref(0)?.as_blob()?)
                 .map_err(|_| SelectedIntegrity("invalid semantic call ID".into()))?;
             let provenance_id: String = row.get(10)?;
+            // Every row's offsets and dispatch decode strictly, used or not.
+            let anchor_range = range(row.get(1)?, row.get(2)?)?;
+            let is_direct = direct(row.get_ref(8)?.as_str()?)?;
             if by_call
                 .get(&call_id)
                 .is_some_and(|(kept, _)| *kept <= provenance_id)
@@ -874,10 +890,10 @@ pub(super) fn architecture_semantic(
                 }
             };
             let anchor = SemanticAnchor {
-                range: range(row.get(1)?, row.get(2)?),
+                range: anchor_range,
                 call_id: Some(call_id.clone()),
                 type_role: false,
-                direct: matches!(row.get_ref(8)?.as_str()?, "direct" | "constructor"),
+                direct: is_direct,
                 outcome,
                 provenance_id: provenance_id.clone(),
             };
@@ -907,7 +923,7 @@ pub(super) fn architecture_semantic(
                 _ => return Err(SelectedIntegrity("corrupt semantic reference".into()).into()),
             };
             anchors.push(SemanticAnchor {
-                range: range(row.get(0)?, row.get(1)?),
+                range: range(row.get(0)?, row.get(1)?)?,
                 call_id: None,
                 type_role: row.get(7)?,
                 direct: false,
