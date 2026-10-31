@@ -4,6 +4,8 @@ A diagram-first code browser with native JavaScript, Rust, Java and Python index
 and an authenticated local inspector. Browse files, expand their functions/methods, and
 open source-linked static sequence diagrams. These are possible paths, not runtime traces.
 
+**New to Trellis?** Read the [quickstart](docs/quickstart.md) and the [known limitations](docs/known-limitations.md).
+
 ## Start here
 
 Requires stable Rust/Cargo and a native C toolchain (tree-sitter and bundled SQLite).
@@ -23,8 +25,8 @@ Open **http://127.0.0.1:8877/**. Paste the token or load the private token file 
 is printed by `serve`. Optional **Remember token on this browser** stores it locally;
 Disconnect forgets it. See [token storage](docs/browser-token.md).
 The workspace defaults to cwd; `--workspace PATH` changes both the browser and index roots.
-The daemon does not index automatically: use **Index workspace** after source changes.
-Stop the daemon with Ctrl-C.
+The daemon indexes the checkout and refreshes it when files change.
+Ctrl-C stops `serve`; the daemon keeps running until you [stop it](docs/quickstart.md#2-start-trellis-and-connect-the-web-app).
 
 Without SCIP, calls are visible as unresolved syntax; Trellis does not guess their targets.
 For the existing feature-factory snapshot with semantic resolution, see
@@ -98,7 +100,7 @@ See the [local model/cache guide](docs/semantic-search-local-cache.md) for readi
 ## What works
 
 - Native tree-sitter JavaScript (`.js`, `.mjs`, `.cjs`), Rust (`.rs`), Java (`.java`) and Python (`.py`) extraction.
-- Optional JavaScript SCIP import; Rust, Java and Python currently have syntax-only, unresolved call evidence.
+- Optional SCIP import for all four languages through `trellis producer`; without it, calls stay syntax-only and unresolved.
 - Source hashes, provenance, explicit unresolved boundaries, callbacks and control regions.
 - Atomic full-index publication to SQLite; background refresh, progress and cancellation.
 - Snapshot-consistent source reads and bounded, cycle-safe static call queries.
@@ -225,6 +227,8 @@ Candle/Voyage embedding adaptation retains its [upstream terms](src/search_embed
 
 ## Read more
 
+- [Quickstart](docs/quickstart.md)
+- [Known limitations](docs/known-limitations.md)
 - [Architecture and accepted direction](SPEC.md)
 - [MCP-first direct/ACP agent integration plan](docs/agent-integration-plan.md)
 - [Per-checkout index, stdio MCP and native refresh topology](docs/local-topology.md)
