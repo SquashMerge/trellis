@@ -12,9 +12,9 @@ real-workers = { max-threads = 4 }
 producer-e2e = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = '(kind(lib) & test(/^(http::(exceptional_recovery_tests|live_tests)|daemon::registry::selection_tests)::/)) | binary(=mcp_protocol)'
+filter = '(kind(lib) & test(/^(http::(exceptional_recovery_tests|live_tests)|daemon::registry::selection_tests)::/)) | (binary_id(trellis::mcp) & test(/^mcp_protocol::/))'
 test-group = 'real-workers'
 
 [[profile.default.overrides]]
-filter = 'binary(/^producer_e2e/)'
+filter = 'binary_id(trellis::producer) & test(/^producer_e2e(_java|_rust)?::/)'
 test-group = 'producer-e2e'

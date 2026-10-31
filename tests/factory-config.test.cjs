@@ -197,8 +197,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
       writeFileSync(command, fakeTool);
       chmodSync(command, 0o755);
     }
-    function runVerify(extraEnv = {}, timeout = undefined) {
-      const result = spawnSync(config.verify, [], {
+    function runVerify(extraEnv = {}, timeout = undefined, args = []) {
+      const result = spawnSync(config.verify, args, {
         cwd: ROOT,
         timeout,
         encoding: "utf8",
@@ -212,7 +212,8 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
           ...extraEnv,
         },
       });
-      const commands = readFileSync(log, "utf8").trimEnd().split("\n").map((line) => line.split("\t"));
+      const text = existsSync(log) ? readFileSync(log, "utf8").trimEnd() : "";
+      const commands = text === "" ? [] : text.split("\n").map((line) => line.split("\t"));
       return { result, commands, output: result.stdout + result.stderr };
     }
     // Lanes run concurrently; commands within a lane keep this order.
@@ -328,6 +329,35 @@ if [ "\${FAKE_VERIFY_FAIL_SEMANTIC:-0}" = 1 ] && [ "$1" = tools/semantic-contrac
     assert.equal(oldNextest.result.status, 127);
     assertRan(oldNextest.commands, { ...lanes, tests: lanes.tests.slice(0, 1) });
     assert.match(oldNextest.result.stdout, /cargo-nextest 0\.9\.148 is affected by GHSA-vc25-qg58-w57c/);
+    rmSync(log);
+    // CI runs lanes as separate jobs: --lane selects lanes, and the rust lane's
+    // halves (lint, then browser) can each run alone.
+    const [lint, browser] = [lanes.rust.slice(0, 3), lanes.rust.slice(3)];
+    const testsOnly = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" }, undefined, ["--lane", "tests"]);
+    assert.equal(testsOnly.result.status, 0, testsOnly.output);
+    // No browser suite, so no system package install.
+    assertRan(testsOnly.commands, { setup: lanes.setup, tests: lanes.tests });
+    assert.doesNotMatch(testsOnly.output, /==> verify lane (rust|semantic|cohorts|checks)/);
+    rmSync(log);
+    const split = runVerify({}, undefined, ["--lane", "lint", "--lane=semantic", "--lane", "cohorts", "--lane", "checks"]);
+    assert.equal(split.result.status, 0, split.output);
+    assertRan(split.commands, { setup: lanes.setup, lint, semantic: lanes.semantic, cohorts: lanes.cohorts, checks: lanes.checks });
+    rmSync(log);
+    const browserOnly = runVerify({ TRELLIS_BROWSER_SYSTEM_DEPS: "1" }, undefined, ["--lane", "browser"]);
+    assert.equal(browserOnly.result.status, 0, browserOnly.output);
+    assertRan(browserOnly.commands, { setup: lanes.setup, browser, deps: [deps] });
+    rmSync(log);
+    const failedHalf = runVerify({ FAKE_VERIFY_FAIL_CLIPPY: "1" }, undefined, ["--lane", "lint", "--lane", "tests"]);
+    assert.equal(failedHalf.result.status, 23);
+    assertRan(failedHalf.commands, { setup: lanes.setup, lint: lint.slice(0, 2), tests: lanes.tests });
+    assert.match(failedHalf.result.stderr, /failed lane\(s\): lint$/m);
+    rmSync(log);
+    // Bad selections fail before setup runs anything.
+    for (const args of [["--lane", "nope"], ["--lane"], ["--bogus"], ["--lane", "rust", "--lane", "lint"]]) {
+      const refused = runVerify({}, undefined, args);
+      assert.equal(refused.result.status, 2, `${args.join(" ")}: ${refused.output}`);
+      assert.deepEqual(refused.commands, [], args.join(" "));
+    }
   } finally {
     rmSync(fakeDir, { recursive: true, force: true });
   }
