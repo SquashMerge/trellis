@@ -120,7 +120,7 @@ test("class menu, members, method and member navigation act on original DTO reco
   await run.focus(); await page.keyboard.press("Shift+F10");
   const field = page.locator('.pele-member[data-trellis-member-kind="field"]');
   await field.click();
-  assert.deepEqual(await page.evaluate(() => window.harness.navigations), [{classId: "A", memberName: "run", startByte: 40, endByte: 90}, {classId: "A", memberName: "count", startByte: 20, endByte: 30}]);
+  assert.deepEqual(await page.evaluate(() => window.harness.navigations), [{classId: "A", memberName: "run", startByte: 40, endByte: 90, memberPath: "src/A.java"}, {classId: "A", memberName: "count", startByte: 20, endByte: 30, memberPath: "src/A.java"}]);
   await classMenu("A"); await page.getByRole("menuitem", {name: "Hide members"}).click();
   assert.equal(await page.locator(".pele-member").count(), 0);
   assert.deepEqual(cspErrors(), []);

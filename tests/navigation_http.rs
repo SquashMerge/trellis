@@ -33,6 +33,7 @@ fn setup(
     let root = dir.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
     for (path, text) in files {
+        std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
         std::fs::write(root.join(path), text).unwrap();
     }
     let options = IndexOptions::new(root.clone());
@@ -710,6 +711,16 @@ async fn unsupported_classes_never_become_class_targets_but_methods_remain_measu
     let (status, view) = call(&app, member(&dir, id(&_graph, "Supported"), "run", 0)).await;
     assert_eq!(status, 200, "{view}");
     assert_eq!(targets(&view, "declaration"), ["run"], "{view}");
+    // A Rust method merged from an impl block (#452) navigates to its measured
+    // declaration although its measured parent is the impl, not the struct.
+    let structure = _graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "Unsupported" && n.range.start_line == 1)
+        .unwrap();
+    let (status, view) = call(&app, member(&dir, &structure.id, "run", 0)).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(targets(&view, "declaration"), ["run"], "{view}");
 }
 
 #[tokio::test]
@@ -1381,4 +1392,75 @@ async fn retained_navigation_uses_selected_full_rewrite_source_nodes_and_class_p
         .collect_unreferenced(session.writer_guard().unwrap())
         .unwrap();
     assert_eq!(store.status().unwrap().revision, new_pin);
+}
+
+#[tokio::test]
+async fn rust_members_merged_from_other_files_navigate_by_their_own_document() {
+    let alt = "use crate::model::Account;\nimpl Account {\n    pub fn alt(&self) {}\n}\n";
+    let (dir, _store, graph, app, _session) = setup(&[
+        (
+            "src/lib.rs",
+            "pub mod model;\npub mod ops;\n#[cfg(unix)]\nmod a;\n#[cfg(not(unix))]\nmod b;\n",
+        ),
+        ("src/model.rs", "pub struct Account {\n    id: u64,\n}\n"),
+        (
+            "src/ops.rs",
+            "use crate::model::Account;\nimpl Account {\n    pub fn first(&self) {}\n}\n",
+        ),
+        // cfg alternatives: equal names and byte ranges in two documents.
+        ("src/a.rs", alt),
+        ("src/b.rs", alt),
+    ]);
+    let account = graph
+        .nodes
+        .iter()
+        .find(|n| n.name == "Account" && n.path == "src/model.rs")
+        .unwrap()
+        .id
+        .clone();
+    let recorded = |name: &str, path: &str| {
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.name == name && n.path == path)
+            .unwrap()
+            .clone()
+    };
+    let selector = |method: &Symbol, path: Option<&str>| {
+        let mut body = json!({"expectedRevision":pin(&dir),"classId":account,"memberName":method.name,
+            "startByte":method.range.start_byte,"endByte":method.range.end_byte});
+        if let Some(path) = path {
+            body["memberPath"] = json!(path);
+        }
+        body
+    };
+    let declared = |view: &Value| -> Vec<String> {
+        view["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["reason"] == "declaration")
+            .map(|t| t["symbol"]["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // The class lives in model.rs; its merged member's declaration in ops.rs.
+    let first = recorded("first", "src/ops.rs");
+    for path in [Some("src/ops.rs"), None] {
+        let (status, view) = call(&app, selector(&first, path)).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(declared(&view), std::slice::from_ref(&first.id), "{view}");
+    }
+    // Same name and range in two files: the path selects one, never a guess.
+    let a = recorded("alt", "src/a.rs");
+    let b = recorded("alt", "src/b.rs");
+    assert_eq!(a.range, b.range);
+    let (status, view) = call(&app, selector(&a, None)).await;
+    assert_eq!(status, 400, "{view}");
+    for chosen in [&a, &b] {
+        let (status, view) = call(&app, selector(chosen, Some(&chosen.path))).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(declared(&view), std::slice::from_ref(&chosen.id), "{view}");
+    }
+    let (status, view) = call(&app, selector(&a, Some("src/ops.rs"))).await;
+    assert_eq!(status, 400, "a wrong member path matches nothing: {view}");
 }

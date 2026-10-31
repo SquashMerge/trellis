@@ -616,7 +616,7 @@ fn old_disposable_format_rebuild_discards_stale_cards_and_regenerates_fts() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        30
+        31
     );
     assert_eq!(corpus(&db).len(), 1);
 }

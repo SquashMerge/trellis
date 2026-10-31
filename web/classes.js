@@ -303,12 +303,12 @@
     }
     reset();
   }
-  function unsupported(path) { return path && !/\.(java|py|pyi|js|mjs|cjs)$/i.test(path); }
+  function unsupported(path) { return path && !/\.(java|py|pyi|js|mjs|cjs|rs)$/i.test(path); }
   async function open(options = {}) {
     if (!ui) return;
     closeContextMenu(false);
     if (unsupported(options.path)) {
-      reset(); state("Class diagrams currently support Java, Python and JavaScript declarations. Sequence browsing is unchanged.", "unsupported"); return;
+      reset(); state("Class diagrams currently support Java, Python, JavaScript and Rust declarations. Sequence browsing is unchanged.", "unsupported"); return;
     }
     if (options.seed) {
       searchSerial++; ui.results.replaceChildren();
@@ -440,7 +440,8 @@
       if (!canNavigate || !isCurrent()) return;
       // Names and type hints are display text, never a global search selector.
       return api.navigateMember(event, {classId: definition.symbol.id, memberName: member.name,
-        startByte: member.range.startByte, endByte: member.range.endByte}, {isCurrent});
+        startByte: member.range.startByte, endByte: member.range.endByte,
+        ...(typeof member.path === "string" && member.path ? {memberPath: member.path} : {})}, {isCurrent});
     };
     return {label, select, navigate, canNavigate};
   }

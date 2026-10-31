@@ -61,7 +61,7 @@ type Setup = (
 fn setup_with(source: &str) -> Setup {
     setup_files(&[
         ("Types.java", source),
-        ("unsupported.rs", "struct Unsupported {}"),
+        ("unsupported.rs", "fn Unsupported() {}"),
     ])
 }
 fn setup_files(files: &[(&str, &str)]) -> Setup {
@@ -202,7 +202,7 @@ async fn search_pagination_literal_wildcards_and_supported_languages() {
         assert_eq!(status, 200);
         assert_eq!(page["items"], json!([]));
     }
-    let (_, unsupported) = call(&app, "GET", "/api/classes?path=unsupported.rs", Value::Null).await;
+    let (_, unsupported) = call(&app, "GET", "/api/classes?path=notes.txt", Value::Null).await;
     assert_eq!(unsupported["items"], json!([]));
     assert!(!unsupported["warnings"].as_array().unwrap().is_empty());
 }
@@ -239,7 +239,7 @@ async fn javascript_classes_are_served_with_supported_languages_and_method_seeds
     assert_eq!(status, 200, "{page}");
     assert_eq!(
         page["supportedLanguages"],
-        json!(["java", "python", "javascript"])
+        json!(["java", "python", "javascript", "rust"])
     );
     assert!(
         page["warnings"]
@@ -314,6 +314,122 @@ async fn javascript_classes_are_served_with_supported_languages_and_method_seeds
     .await;
     assert_eq!(search["items"].as_array().unwrap().len(), 1);
     assert_eq!(search["items"][0]["qualifiedName"], "web.view.View");
+}
+/// Real-shaped Rust: this repository's own `JoinIndex`/`JoinSink` traits and
+/// their implementations, at their real paths, read from the checkout.
+#[tokio::test]
+async fn rust_join_traits_and_impls_from_this_repository_are_served() {
+    let read = |path: &str| {
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+            .unwrap()
+    };
+    let paths = [
+        "src/semantic_import.rs",
+        "src/semantic_import/join_store.rs",
+        "src/semantic_import/memory.rs",
+        "src/semantic_import/staged/streaming.rs",
+    ];
+    let sources: Vec<_> = paths.iter().map(|p| (*p, read(p))).collect();
+    let files: Vec<_> = sources.iter().map(|(p, s)| (*p, s.as_str())).collect();
+    let (dir, store, graph, app, _session) = setup_files(&files);
+    let pin = store.status().unwrap().revision;
+    let page = |q: &str| {
+        let app = app.clone();
+        let q = q.to_owned();
+        async move {
+            let (status, page) = call(
+                &app,
+                "GET",
+                &format!("/api/classes?q={q}&{}", pin_query(pin)),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, 200, "{page}");
+            page
+        }
+    };
+    let found = |page: &Value, qualified: &str| -> Value {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["qualifiedName"] == qualified)
+            .unwrap_or_else(|| panic!("{qualified}: {page}"))
+            .clone()
+    };
+    let sinks = page("JoinSink").await;
+    assert_eq!(
+        sinks["supportedLanguages"],
+        json!(["java", "python", "javascript", "rust"])
+    );
+    let sink = found(&sinks, "semantic_import::join_store::JoinSink");
+    assert_eq!(sink["language"], "rust");
+    assert_eq!(sink["declarationKind"], "trait");
+    assert!(!sink["methods"].as_array().unwrap().is_empty());
+    let memory = found(&sinks, "semantic_import::memory::MemoryJoinSink");
+    assert_eq!(memory["declarationKind"], "struct");
+    let methods: Vec<_> = memory["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        methods.contains(&"into_facts"),
+        "inherent impl merged: {methods:?}"
+    );
+    let index = found(
+        &page("JoinIndex").await,
+        "semantic_import::join_store::JoinIndex",
+    );
+    assert_eq!(index["declarationKind"], "trait");
+    // implements/extends hints are stored with the owner's projection.
+    let db = rusqlite::Connection::open(index_db(&dir.path().join("state"))).unwrap();
+    let hints = |owner: &Value, kind: &str| -> Vec<String> {
+        db.prepare(
+            "SELECT json_extract(r.payload,'$.typeName') FROM class_relations r JOIN revision_documents m ON m.cid=r.cid
+             WHERE r.owner=?1 AND json_extract(r.payload,'$.kind')=?2 AND json_extract(r.payload,'$.matchKind')='unmatched' AND r.target IS NULL",
+        )
+        .unwrap()
+        .query_map(
+            rusqlite::params![sid_blob(owner["symbol"]["id"].as_str().unwrap()), kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    assert!(hints(&memory, "implements").contains(&"JoinSink".to_owned()));
+    assert!(hints(&index, "extends").contains(&"DocumentJoinState".to_owned()));
+    let streaming = found(
+        &page("DocumentSink").await,
+        "semantic_import::staged::streaming::DocumentSink",
+    );
+    assert!(hints(&streaming, "implements").contains(&"JoinSink".to_owned()));
+    // A method from an impl block seeds its type's diagram.
+    let into_facts = memory["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "into_facts")
+        .unwrap()["symbolId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(graph.nodes.iter().any(|n| n.id == into_facts));
+    let (status, diagram) = call(
+        &app,
+        "POST",
+        "/api/class-diagram",
+        json!({"seed":into_facts,"expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(status, 200, "{diagram}");
+    assert_eq!(
+        diagram["nodes"][0]["label"],
+        "semantic_import::memory::MemoryJoinSink"
+    );
+    assert_eq!(diagram["edges"], json!([]));
 }
 #[tokio::test]
 async fn one_hop_incoming_methods_terminal_hints_and_cached_only() {
@@ -702,7 +818,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            30,
+            31,
             "native-v6-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
@@ -711,7 +827,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        30
+        31
     );
     assert!(
         store
@@ -1321,7 +1437,10 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_serve_it() {
     let (_,unrelated): (String,Option<String>)=db.query_row(
         "SELECT class_extraction_state,class_extraction_payload FROM graph_projections g JOIN revision_documents m ON m.gid=g.gid WHERE m.path='unsupported.rs'",
         [],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-    assert!(unrelated.is_none());
+    // Rust is a catalog language (#452): a file without types stores an empty F.
+    let unrelated: trellis::model::FileExtraction =
+        serde_json::from_str(&unrelated.unwrap()).unwrap();
+    assert!(unrelated.classes.is_empty() && unrelated.impls.is_empty());
 }
 
 #[tokio::test]

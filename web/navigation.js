@@ -57,7 +57,7 @@
   function selectorBody(selector, revision) {
     if (!selector || typeof selector !== "object" || Array.isArray(selector)) return null;
     const source = Object.prototype.hasOwnProperty.call(selector, "path");
-    const allowed = source ? ["expectedRevision", "path", "line"] : ["expectedRevision", "classId", "memberName", "startByte", "endByte"];
+    const allowed = source ? ["expectedRevision", "path", "line"] : ["expectedRevision", "classId", "memberName", "startByte", "endByte", "memberPath"];
     if (Object.keys(selector).some(key => !allowed.includes(key))) return null;
     if (selector.expectedRevision !== undefined && !window.TrellisIndexPin.equal(selector.expectedRevision, revision)) return null;
     if (source) {
@@ -66,9 +66,11 @@
     }
     if (typeof selector.classId !== "string" || !selector.classId || selector.classId.length > 4096 ||
         typeof selector.memberName !== "string" || !selector.memberName || selector.memberName.length > 4096 ||
-        !natural(selector.startByte) || !natural(selector.endByte) || selector.endByte < selector.startByte) return null;
+        !natural(selector.startByte) || !natural(selector.endByte) || selector.endByte < selector.startByte ||
+        (selector.memberPath !== undefined && (typeof selector.memberPath !== "string" || !selector.memberPath || selector.memberPath.length > 4096))) return null;
+    // The member's own document: Rust classes record methods from impl blocks in other files (#452).
     return {expectedRevision: revision, classId: selector.classId, memberName: selector.memberName,
-      startByte: selector.startByte, endByte: selector.endByte};
+      startByte: selector.startByte, endByte: selector.endByte, ...(selector.memberPath ? {memberPath: selector.memberPath} : {})};
   }
   function callable(symbol) { return ["function", "method"].includes(symbol?.kind); }
   function sourceWitness(item) {
@@ -163,7 +165,7 @@
           const prefix = target.reason === "enclosing" ? "Sequence · enclosing · syntax" : target.reason === "call" ? "Sequence of callee · resolved" : "Sequence · syntax";
           actions.push({label: `${prefix} · ${label}`, run: run(owner.selectMethod)});
         }
-        if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py|js|mjs|cjs)$/i.test(symbol.path) && typeof owner.openClass === "function")
+        if (symbol.kind === "class" && target.action === "class" && /\.(?:java|py|js|mjs|cjs|rs)$/i.test(symbol.path) && typeof owner.openClass === "function")
           actions.push({label: `Class diagram · syntax · ${label}`, run: run(owner.openClass)});
         if (["declaration", "enclosing"].includes(target.reason) && typeof owner.inspectSymbol === "function")
           actions.push({label: `Inspect${target.reason === "enclosing" ? " enclosing declaration" : ""} · syntax · ${label}`, run: run(owner.inspectSymbol)});
