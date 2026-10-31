@@ -126,11 +126,11 @@ pub(crate) fn mark_with_operands(
 /// The IDs of the trivial accessors (#543) among `symbols`, all declared in `file`: each
 /// one's body is one statement that returns a field of `self`/`this` (Rust also `&self.f`,
 /// `&mut self.f`, `self.f.clone()`; Java also a bare name) or assigns a plain name to one
-/// with `=`. Constructors never qualify. Measured by syntax only; `file` is parsed once.
-pub(crate) fn trivial_accessors<'s>(
-    file: &SourceFile,
-    symbols: impl IntoIterator<Item = &'s Symbol>,
-) -> BTreeSet<String> {
+/// with `=`. Constructors never qualify. A Java bare name must be a field of the enclosing
+/// class in the native declarations, and not one of the method's parameters (#547). Measured
+/// by syntax and declarations only; `file` is parsed once.
+pub(crate) fn trivial_accessors(file: &SourceFile, nodes: &[Symbol]) -> BTreeSet<String> {
+    use crate::model::SymbolKind;
     let mut out = BTreeSet::new();
     // The same source bound as the language adapters' parse budgets.
     if file.text.len() > 4 * 1024 * 1024 {
@@ -150,12 +150,28 @@ pub(crate) fn trivial_accessors<'s>(
     let Some(tree) = parser.parse(&file.text, None) else {
         return out;
     };
-    for symbol in symbols {
+    let mut fields: std::collections::BTreeMap<&str, BTreeSet<&str>> = Default::default();
+    for node in nodes.iter().filter(|node| node.kind == SymbolKind::Field) {
+        if let Some(parent) = node.parent.as_deref() {
+            fields.entry(parent).or_default().insert(node.name.as_str());
+        }
+    }
+    let none = BTreeSet::new();
+    for symbol in nodes
+        .iter()
+        .filter(|node| matches!(node.kind, SymbolKind::Function | SymbolKind::Method))
+    {
+        let fields = symbol
+            .parent
+            .as_deref()
+            .and_then(|parent| fields.get(parent))
+            .unwrap_or(&none);
         if accessor_body(
             file,
             tree.root_node(),
             symbol.range.start_byte,
             symbol.range.end_byte,
+            fields,
         ) {
             out.insert(symbol.id.clone());
         }
@@ -164,7 +180,14 @@ pub(crate) fn trivial_accessors<'s>(
 }
 
 /// Whether the declaration spanning `start..end` of `file` has a trivial accessor body.
-fn accessor_body(file: &SourceFile, root: Node<'_>, start: usize, end: usize) -> bool {
+/// `fields` names the fields of its enclosing class, for Java's bare-name rule.
+fn accessor_body(
+    file: &SourceFile,
+    root: Node<'_>,
+    start: usize,
+    end: usize,
+    fields: &BTreeSet<&str>,
+) -> bool {
     let text = |n: Node<'_>| file.text.get(n.byte_range()).unwrap_or("");
     let Some(mut node) = root.descendant_for_byte_range(start, end) else {
         return false;
@@ -191,6 +214,22 @@ fn accessor_body(file: &SourceFile, root: Node<'_>, start: usize, end: usize) ->
     }
     let Some(body) = node.child_by_field_name("body") else {
         return false;
+    };
+    // Java: a bare name is the field only when no parameter shadows it.
+    let mut parameters = BTreeSet::new();
+    if let Some(list) = node.child_by_field_name("parameters") {
+        let mut cursor = list.walk();
+        for parameter in list.named_children(&mut cursor) {
+            if let Some(name) = parameter.child_by_field_name("name") {
+                parameters.insert(text(name));
+            }
+        }
+    }
+    let java_field = |n: Node<'_>| {
+        file.language == "java"
+            && n.kind() == "identifier"
+            && fields.contains(text(n))
+            && !parameters.contains(text(n))
     };
     let mut cursor = body.walk();
     let mut statements: Vec<Node<'_>> = body
@@ -229,7 +268,7 @@ fn accessor_body(file: &SourceFile, root: Node<'_>, start: usize, end: usize) ->
         }
     };
     let value = |n: Node<'_>| -> bool {
-        if field(n) || (file.language == "java" && n.kind() == "identifier") {
+        if field(n) || java_field(n) {
             return true;
         }
         match n.kind() {
@@ -255,7 +294,7 @@ fn accessor_body(file: &SourceFile, root: Node<'_>, start: usize, end: usize) ->
             && n.child_by_field_name("operator")
                 .is_none_or(|o| text(o) == "=")
             && n.child_by_field_name("left")
-                .is_some_and(|l| field(l) || (file.language == "java" && l.kind() == "identifier"))
+                .is_some_and(|l| field(l) || java_field(l))
             && n.child_by_field_name("right")
                 .is_some_and(|r| r.kind() == "identifier")
     };
@@ -298,7 +337,7 @@ mod tests {
             .set_language(&tree_sitter_java::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(class, None).unwrap();
-        accessor_body(&file, tree.root_node(), start, end)
+        accessor_body(&file, tree.root_node(), start, end, &["x"].into())
     }
 
     #[test]
@@ -308,6 +347,11 @@ mod tests {
         assert!(!java(class, "void add"));
         assert!(java(class, "void set"));
         assert!(java(class, "int get"));
+        // #547: a bare name is the field only when it is one and no parameter shadows it.
+        let class = "class S {\n  int x;\n  int id(int x) { return x; }\n  int other() { return y; }\n  void shadow(int x) { x = v; }\n}\n";
+        assert!(!java(class, "int id"));
+        assert!(!java(class, "int other"));
+        assert!(!java(class, "void shadow"));
     }
 
     #[test]

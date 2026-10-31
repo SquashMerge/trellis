@@ -744,13 +744,8 @@ fn accessor(
     if !memo.contains_key(&key.path) {
         // One read and one parse per target document.
         let document = store.selected_graph_document_for(db, &key.path, selected)?;
-        let accessors = crate::behavior_incidental::trivial_accessors(
-            &document.file,
-            document
-                .nodes
-                .iter()
-                .filter(|node| matches!(node.kind, SymbolKind::Function | SymbolKind::Method)),
-        );
+        let accessors =
+            crate::behavior_incidental::trivial_accessors(&document.file, &document.nodes);
         memo.insert(key.path.clone(), accessors);
     }
     Ok(memo[&key.path].contains(id))
@@ -941,7 +936,11 @@ impl Enrichment<'_, '_> {
             let disposition =
                 engine::call_disposition(semantic, call, self.source).map_err(engine_error)?;
             let mut reason = disposition.boundary_reason;
-            if reason == BoundaryReason::None {
+            // A hidden incidental step (an accessor, a logging call) takes no lane and has no
+            // target (#547); its call evidence keeps the binding. Show all, which shows it,
+            // gives it a lane.
+            let laneless = step.hidden && step.incidental.is_some();
+            if reason == BoundaryReason::None && !laneless {
                 let (id, key) = disposition.exact_target.expect("eligible target is exact");
                 if !self.participants.iter().any(|p| &p.id == id) {
                     if self.participants.len() == 20 {

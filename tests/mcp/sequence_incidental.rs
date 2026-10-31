@@ -255,3 +255,93 @@ fn more_logging_spellings_and_operand_containers() {
         assert_eq!(view.hidden_steps, if show_all { 0 } else { logged.len() });
     }
 }
+
+/// #547: hidden incidental steps take no lane, so accessor-heavy code stays under the
+/// 20-lane cap and its real callee still gets a lane and expands. Show all, which shows the
+/// accessors, gives them lanes up to the cap.
+#[test]
+fn hidden_accessors_take_no_lanes() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let getters: String = (0..25)
+        .map(|n| format!("  int getF{n}() {{ return this.f{n}; }}\n"))
+        .collect();
+    let calls: String = (0..25).map(|n| format!("getF{n}(); ")).collect();
+    let source = format!(
+        "class S {{\n{getters}  int compute() {{ return helper(); }}\n  int helper() {{ return 1; }}\n  void run() {{ {calls}compute(); }}\n}}\n"
+    );
+    let mut spec = Spec::new(&[("S.java", &source)]);
+    spec.languages = vec![s::Language::Java];
+    spec.bindings = (0..25)
+        .map(|n| bind("run", n, &format!("getF{n}")))
+        .chain([bind("run", 25, "compute")])
+        .collect();
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "run");
+    let compute = syntax_id(publisher.native(), "compute");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.participants.len(), 2, "the seed and compute only");
+    assert!(!view.truncated, "{:?}", view.warnings);
+    let hidden: Vec<_> = flatten(&view.steps)
+        .into_iter()
+        .filter(|step| step.hidden)
+        .collect();
+    assert_eq!(hidden.len(), 25);
+    assert!(hidden.iter().all(|step| {
+        step.target.is_none()
+            && step.incidental == Some(IncidentalReason::Accessor)
+            && step
+                .call_evidence
+                .as_ref()
+                .is_some_and(|e| e.boundary_reason == trellis::graph_query::BoundaryReason::None)
+    }));
+    let computed = step(&view, &source, "compute()");
+    assert_eq!(computed.target.as_deref(), Some(compute.as_str()));
+    assert!(!computed.children.is_empty());
+
+    let all = publisher
+        .store
+        .sequence_at(&seed, pin, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        all.participants.len(),
+        20,
+        "shown accessors get lanes up to the cap"
+    );
+    assert!(
+        all.truncated_by
+            .contains(&trellis::behavior::SequenceLimit::Participants)
+    );
+}
+
+/// #547: Java's bare-name getter must return a field of its class (native declarations),
+/// never a parameter: an identity method is not an accessor.
+#[test]
+fn java_bare_name_getter_must_return_a_field() {
+    let state = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut publisher = Publisher::open(state.path(), root.path());
+    let source = "class S {\n  private int x;\n  int getX() { return x; }\n  int id(int v) { return v; }\n  void run() { getX(); id(1); }\n}\n";
+    let mut spec = Spec::new(&[("S.java", source)]);
+    spec.languages = vec![s::Language::Java];
+    spec.bindings = vec![bind("run", 0, "getX"), bind("run", 1, "id")];
+    let pin = publisher.publish(&spec);
+    let seed = syntax_id(publisher.native(), "run");
+    let view = publisher
+        .store
+        .sequence_at(&seed, pin, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        step(&view, source, "getX()").incidental,
+        Some(IncidentalReason::Accessor)
+    );
+    let id = step(&view, source, "id(1)");
+    assert!(id.incidental.is_none() && !id.hidden);
+}

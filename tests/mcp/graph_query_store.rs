@@ -767,8 +767,15 @@ fn sequence_resolved_logging_wrapper_stays_hidden() {
             .unwrap();
         let call = sequence_steps(&view.steps)
             .into_iter()
-            .find(|step| step.target.as_deref() == Some(log.as_str()))
-            .expect("console.log resolves to the local method");
+            .find(|step| step.label == "console.log")
+            .unwrap();
+        assert_eq!(
+            call.call_evidence.as_ref().unwrap().boundary_reason,
+            BoundaryReason::None,
+            "console.log resolves to the local method"
+        );
+        // Hidden, it takes no lane (#547); shown, it has its lane and target.
+        assert_eq!(call.target.as_deref(), show_all.then_some(log.as_str()));
         assert_eq!(call.hidden, !show_all);
         assert_eq!(
             call.incidental,
