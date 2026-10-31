@@ -1547,6 +1547,13 @@ impl !Send for Item {}
             .count(),
         2
     );
+    // An unattributed blanket impl is a notice, not a limit: nothing was cut.
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w == "src/lib.rs: blanket or non-path impl not attributed to a class")
+    );
+    assert!(!c.truncated, "{:?}", c.warnings);
 }
 #[test]
 fn rust_impl_contributions_charge_detail_budgets_in_their_own_file() {
@@ -1605,4 +1612,46 @@ fn rust_recovered_syntax_and_macros_are_bounded_and_reported() {
     assert!(c.truncated);
     assert!(c.warnings.iter().any(|w| w.contains("recovered syntax")));
     assert!(c.classes.iter().all(|k| k.qualified_name != "Made"));
+}
+#[test]
+fn rust_impls_of_one_type_from_byte_identical_files_keep_distinct_relations() {
+    let body = "use crate::Foo;\nimpl From<u8> for Foo {\n    fn from(_: u8) -> Self {\n        Foo\n    }\n}\n";
+    let (_, c) = index(&[
+        ("src/lib.rs", "pub struct Foo;\nmod a;\nmod b;\n"),
+        ("src/a.rs", body),
+        ("src/b.rs", body),
+    ]);
+    assert_eq!(
+        rel(&c, "Foo"),
+        [
+            ("implements", "From", "src/a.rs"),
+            ("implements", "From", "src/b.rs")
+        ]
+    );
+    let ids: std::collections::BTreeSet<_> = c.relations.iter().map(|r| &r.id).collect();
+    assert_eq!(ids.len(), c.relations.len());
+}
+#[test]
+fn rust_glob_graphs_resolve_within_a_bounded_work_budget() {
+    // Twenty inline modules that glob each other: an unbounded search would
+    // take about 19^8 resolutions per impl.
+    let mut text = String::new();
+    for i in 0..20 {
+        text.push_str(&format!("mod m{i} {{\n"));
+        for j in (0..20).filter(|j| *j != i) {
+            text.push_str(&format!("    use super::m{j}::*;\n"));
+        }
+        text.push_str("    impl Missing {\n        fn f(&self) {}\n    }\n}\n");
+    }
+    let started = std::time::Instant::now();
+    let (_, c) = index(&[("src/lib.rs", text.as_str())]);
+    assert!(c.classes.is_empty());
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w.contains("impl path resolution work limit reached")),
+        "{:?}",
+        c.warnings
+    );
 }

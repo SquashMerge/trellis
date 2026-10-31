@@ -100,7 +100,10 @@ struct ModScope {
     children: BTreeMap<usize, usize>,
 }
 
-struct Scopes(Vec<ModScope>);
+/// Per-file resolution work bound. Globs can point at each other, so every
+/// resolution step is counted; past the bound nothing more resolves.
+const RESOLVE_STEPS: usize = 10_000;
+struct Scopes(Vec<ModScope>, std::cell::Cell<usize>);
 impl Scopes {
     /// Absolute module path plus final name, or `None` when the spelling is
     /// external, ambiguous, an alias or otherwise not provable from this file.
@@ -111,7 +114,8 @@ impl Scopes {
         module: bool,
         depth: usize,
     ) -> Option<Vec<String>> {
-        if depth > 8 || segs.is_empty() {
+        self.1.set(self.1.get() + 1);
+        if depth > 8 || segs.is_empty() || self.1.get() > RESOLVE_STEPS {
             return None;
         }
         let s = &self.0[scope];
@@ -216,7 +220,7 @@ fn type_path(ex: &Extractor<'_, '_>, n: Node<'_>) -> Option<Vec<String>> {
 impl Extractor<'_, '_> {
     pub(super) fn rust_file(&mut self, root: Node<'_>) -> Result<()> {
         let (krate, module) = crate_module(&self.file.path);
-        let mut scopes = Scopes(Vec::new());
+        let mut scopes = Scopes(Vec::new(), std::cell::Cell::new(0));
         self.rust_collect(root, module, &mut scopes, 0)?;
         if !self.exhausted {
             self.rust_items(root, 0, &krate, &scopes, 0)?;
@@ -634,13 +638,20 @@ impl Extractor<'_, '_> {
             .filter(|segs| !segs.first().is_some_and(|s| blocked.contains(s)));
         let Some(segs) = segs else {
             // `impl<T: X> Y for T`, `impl Y for &T`, `dyn` or tuple self types.
-            self.b.limit(&format!(
+            self.b.notice(&format!(
                 "{}: blanket or non-path impl not attributed to a class",
                 self.file.path
             ));
             return Ok(());
         };
-        let Some(path) = scopes.resolve(scope, &segs, false, 0) else {
+        let resolved = scopes.resolve(scope, &segs, false, 0);
+        if scopes.1.get() > RESOLVE_STEPS {
+            self.b.limit(&format!(
+                "{}: impl path resolution work limit reached ({RESOLVE_STEPS}); later impls not attributed",
+                self.file.path
+            ));
+        }
+        let Some(path) = resolved else {
             return Ok(()); // External, re-exported, aliased or ambiguous: no guess.
         };
         let Some((name, module)) = path.split_last() else {

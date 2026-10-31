@@ -4797,8 +4797,18 @@ fn resolve_class_id(
     selected: &ReadRevision,
 ) -> Result<String> {
     let lexical = lexical_class_id(store, db, id, selected);
-    if lexical.is_ok() {
-        return lexical;
+    match &lexical {
+        Ok(_) => return lexical,
+        // Only a missing class ancestor falls back; storage and integrity
+        // failures stay what they are.
+        Err(error)
+            if error
+                .downcast_ref::<crate::class_diagram::InvalidRequest>()
+                .is_none() =>
+        {
+            return lexical;
+        }
+        Err(_) => {}
     }
     // A Rust method's measured parent is its `impl` block, which is not a class.
     // Composition recorded the method on exactly one class (#452): use it.

@@ -46,15 +46,16 @@ and one `implements` relation per `impl Trait for Type`. `target` is the qualifi
 type resolves to through that file's own `mod`/`use` scopes only: declared types of the same module,
 `use` bindings (`as`, lists, `self`), `crate`/`self`/`super` paths, and `use super::*`-style globs into a
 module of the same file. Unbound names, other globs, re-exports, aliases and extern paths do not resolve;
-a self type that is a generic parameter, a reference, tuple or trait object is a blanket/non-path impl
+resolution steps are capped per file (10,000), so glob graphs cannot blow up; a self type that is a generic parameter, a reference, tuple or trait object is a blanket/non-path impl
 and adds the per-file notice `"{path}: blanket or non-path impl not attributed to a class"`. Negative
 impls declare nothing; macro-generated items and derived impls are not attributed. `F` therefore still
 depends only on its own file, and impl items charge the same per-file and detail budgets.
 
-Composition (the global step) charges each impl item in its file's walk position under the Decision 0004
-detail rules, then attaches each admitted item to the one admitted Rust class whose qualified name equals
+Composition (the global step) charges a file's impl items after that file's own class items, in source
+order, under the Decision 0004 detail rules; a refused item marks its target class `truncated`. It then attaches each admitted item to the one admitted Rust class whose qualified name equals
 `target`: methods are appended (class member limit 256; excess marks the class truncated), relations get
-that class as owner and id `class-ref:{owner}:{start}:{end}:{kind}:{typeName}`. No match or several
+that class as owner and id `class-ref:{owner}:{path}:{start}:{end}:{kind}:{typeName}` (the path keeps ids
+unique within the owner's projection when several files implement it). No match or several
 (cfg duplicates) leave it unattributed. Relations are ordered by owner document, then `(path, start_byte,
 id)`, and stored with the owner's class projection. Because another document's class rows depend on an
 impl, a local publication that changes, removes or recovers a Rust document recomposes the revision from

@@ -323,6 +323,10 @@ impl CatalogComposer {
             // Charged in this file's walk position, like any detail item.
             if self.admit_detail(item.records, item.text) {
                 self.merged.push((item.target.clone(), item.value.clone()));
+            } else {
+                // Decision 0004: a class that loses an item is truncated.
+                self.merged
+                    .push((item.target.clone(), DetailValue::ScopeText));
             }
         }
         true
@@ -411,9 +415,12 @@ fn attach_impls(result: &mut Catalog, merged: Vec<(String, DetailValue)>, member
             }
             DetailValue::Relation(mut relation) => {
                 relation.owner = class.symbol.id.clone();
+                // Byte offsets are unique only within one file, and impl relations
+                // from several files share their owner's projection: name the path.
                 relation.id = format!(
-                    "class-ref:{}:{}:{}:{}:{}",
+                    "class-ref:{}:{}:{}:{}:{}:{}",
                     relation.owner,
+                    relation.path,
                     relation.range.start_byte,
                     relation.range.end_byte,
                     relation.kind,
@@ -421,7 +428,9 @@ fn attach_impls(result: &mut Catalog, merged: Vec<(String, DetailValue)>, member
                 );
                 result.relations.push(relation);
             }
-            DetailValue::Field(_) | DetailValue::ScopeText => {}
+            // A contribution refused by a detail cap.
+            DetailValue::ScopeText => class.truncated = true,
+            DetailValue::Field(_) => {}
         }
     }
 }
@@ -757,6 +766,10 @@ impl Builder<'_> {
     }
     fn limit(&mut self, message: &str) {
         self.catalog.truncated = true;
+        self.notice(message);
+    }
+    /// A per-file warning that is not a limit: output is complete as specified.
+    fn notice(&mut self, message: &str) {
         if self.catalog.warnings.len() < 100 && !self.catalog.warnings.iter().any(|s| s == message)
         {
             self.catalog
