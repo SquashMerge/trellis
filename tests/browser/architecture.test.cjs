@@ -1231,3 +1231,47 @@ test("Classes counts application layers only: tools/*.py alone does not qualify 
     await page.locator("#view-classes").waitFor({state:"visible"});
   }, tools, app);
 });
+
+// Live rules can hide a layer at the same code pin: an explicit Refresh re-reads the
+// application population even while tests and fixtures are included in the heat.
+test("An explicit Refresh re-reads the application layers after a same-pin rules change, tests included", {timeout:240000}, async () => {
+  await published(`${rules}${toolingLayer(false)}`, async ({page, paths, requests}) => {
+    await page.waitForFunction(() => /Indexed snapshot/.test(document.querySelector("#metrics-state")?.textContent || ""));
+    await H.reveal(page, "#metric-include-tests"); await page.locator("#metric-include-tests").check();
+    await page.waitForFunction(() => /all indexed callables/.test(document.querySelector("#metrics-state")?.textContent || ""));
+    const before = await startPaths(page);
+    assert.equal(before[0], "tools/gen.py", "visible tooling is an application layer and leads the list");
+    const config = readFileSync(rulesPath(paths), "utf8");
+    writeFileSync(rulesPath(paths), config.replace("[layers.tooling]\norder = 1\n", "[layers.tooling]\norder = 1\ndisplay = \"hidden\"\n"));
+    const revisionReads = () => requests.filter(row => row.url.pathname.endsWith("/metrics") && row.url.searchParams.get("scope") === "revision").length;
+    const reads = revisionReads();
+    const production = page.waitForResponse(response => {
+      const url = new URL(response.url());
+      return url.pathname.endsWith("/metrics") && url.searchParams.get("scope") === "revision" && url.searchParams.get("role") === "production";
+    });
+    await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
+    await production;
+    await page.waitForFunction(() => /all indexed callables/.test(document.querySelector("#metrics-state")?.textContent || ""));
+    assert.ok(revisionReads() >= reads + 2, "the refresh reads the heat population and the application population");
+    const after = await page.locator("#sequence-start-list button").evaluateAll(nodes => nodes.map(node => node.querySelector(".detail").textContent.split(" · ")[0]));
+    assert.ok(after.length > 0 && after.every(path => path.startsWith("src/")), `the newly hidden tooling leaves the list: ${JSON.stringify(after)}`);
+  }, new Map([["tools/gen.py", toolingPython]]));
+});
+
+// A selectable note (files without metrics, files past the size cap) keeps keyboard focus
+// and its selection through a resize re-layout.
+test("Architecture keeps a focused, selected note through a resize re-layout", {timeout:240000}, async () => {
+  const config = layoutRules.replace("[layers.top]\norder = 1\n", "[layers.top]\norder = 1\ndisplay = \"expanded\"\n");
+  await published(config, async ({page}) => {
+    await ready(page);
+    const note = page.locator('#architecture-diagram [data-trellis-note-id]').filter({hasText:/no metrics/}).first();
+    const id = await note.getAttribute("data-trellis-note-id");
+    assert.equal(id, JSON.stringify(["top", 0]), "src/lib.rs has no callables: the open top band notes it");
+    await note.focus(); await page.keyboard.press("Enter"); await settled(page);
+    assert.equal(await page.locator("#architecture-inspector-title").textContent(), "top");
+    await laidOutAt(page, 1100);
+    const state = await page.evaluate(() => ({focus:document.activeElement?.getAttribute("data-trellis-note-id"),
+      pressed:[...document.querySelectorAll("#architecture-diagram [data-trellis-note-id]")].filter(node => node.getAttribute("aria-pressed") === "true").map(node => node.getAttribute("data-trellis-note-id"))}));
+    assert.deepEqual(state, {focus:id, pressed:[id]}, "focus and selection stay on the note");
+  }, layoutFiles);
+});

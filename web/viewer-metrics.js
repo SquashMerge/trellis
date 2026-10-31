@@ -92,10 +92,13 @@
       text(id, error?.message || "Metrics unavailable. Try again.");
       if (error?.status === 409 && error.code === "revision_conflict") onConflict(error);
     }
-    async function refresh() {
+    // `keepApplication`: a heat-only change (role, aggregate) at the same rules keeps the application population.
+    async function refresh({keepApplication = false} = {}) {
       const serial = ++refreshSerial, guard = capture();
       inspectionSerial++;
-      projection = null; projectionGuard = null; clearDecorations();
+      // Every read re-derives the application population: live rules can change which layers
+      // are hidden at the same code pin, so an explicit refresh never keeps the old one.
+      projection = null; projectionGuard = null; if (!keepApplication) application = null; clearDecorations();
       loading = !!guard.rootKey && !!guard.pin;
       text("metrics-state", loading ? "Loading indexed snapshot metrics…" : "Indexed snapshot metrics unavailable.");
       if (selected) inspectionState(selected, loading ? "Loading indexed snapshot metrics…" : "Metrics unavailable.");
@@ -254,14 +257,14 @@
     get("metric-include-tests")?.addEventListener("change", event => {
       const next = event.target.checked ? "all" : "production";
       if (next === role) return;
-      role = next; clearInspection(); void refresh();
+      role = next; clearInspection(); void refresh({keepApplication:true});
     });
     get("metric-color")?.addEventListener("change", event => {
       metric = event.target.value; clearDecorations(); onChange();
     });
     get("metric-aggregate")?.addEventListener("change", event => {
       if (!["max", "sum", "mean"].includes(event.target.value) || aggregate === event.target.value) return;
-      aggregate = event.target.value; void refresh();
+      aggregate = event.target.value; void refresh({keepApplication:true});
     });
     // Application layers (#524): the default production workbench population, which leaves
     // out fixture roots, stored test callables and authored hidden layers such as tooling.

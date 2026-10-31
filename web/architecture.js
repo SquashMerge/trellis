@@ -53,7 +53,7 @@
     }
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }
-  function create({request, context, readSource, openTreemap, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}}) {
+  function create({request, context, readSource, openTreemap, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
@@ -354,7 +354,7 @@
       hiddenNames.textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
     }
     // A drawn node's stable identity (its data attribute), so a new drawing can find it again.
-    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned"];
+    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned", "data-trellis-note-id"];
     function nodeKey(node) {
       if (!node) return null;
       if (node === hiddenToggle) return ["id", hiddenToggle.id];
@@ -364,7 +364,13 @@
     function findNode(key) {
       if (!key) return null;
       if (key[0] === "id") return hiddenToggle;
-      return [...(get("architecture-diagram").querySelectorAll?.(`[${key[0]}]`) || [])].find(node => node.getAttribute(key[0]) === key[1]) || null;
+      const find = (name, value) => [...(get("architecture-diagram").querySelectorAll?.(`[${name}]`) || [])].find(node => node.getAttribute(name) === value) || null;
+      const found = find(key[0], key[1]);
+      if (found || key[0] !== "data-trellis-note-id") return found;
+      // A note the new drawing no longer has falls back to its owning band (or the unassigned row).
+      let layer = null;
+      try { [layer] = JSON.parse(key[1]); } catch { return null; }
+      return typeof layer === "string" ? find("data-trellis-layer-id", layer) : find("data-trellis-unassigned", "true");
     }
     const pressedNode = () => [...(get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || [])][0] || null;
     function refocus(target) {
@@ -457,6 +463,7 @@
             if (!active()) return;
             const layer = payload.layers.find(item => item.name === entry?.layerKey);
             if (layer) inspect("layer", layer); else inspect("unknown", null);
+            pressed = nodeKey(pressedNode());
           },
         });
         if (!active()) return false;
@@ -464,7 +471,12 @@
         laidOut = drawnFor; if (canvas.dataset) canvas.dataset.layoutWidth = String(drawnFor);
         // The hidden-layer note is part of the drawing's layout, right under it (#525).
         canvas.append(hiddenNote);
-        if (keepSelection) { findNode(pressed)?.setAttribute("aria-pressed", "true"); findNode(focused)?.focus(); }
+        if (keepSelection) {
+          // Only a selectable node is re-pressed; a band that stands in for a removed note only takes focus.
+          const again = findNode(pressed);
+          if (again?.hasAttribute("aria-pressed")) again.setAttribute("aria-pressed", "true");
+          findNode(focused)?.focus();
+        }
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
         // The counts live behind the ⓘ with the heat exclusions; nothing but the drawing sits above it (#449, #525).
@@ -819,6 +831,8 @@
         if (!p || !window.TrellisIndexPin.equal(p,c.pin) || p.rulesFile?.contentHash !== owned.payload.proposedHash || !["committed","durability_uncertain"].includes(p.mutationOutcome)) throw new Error("Unrecognized write outcome. Reload rules to inspect disk before trying again.");
         const message = p.mutationOutcome === "durability_uncertain" ? "Rules were written, but crash durability is uncertain. " : "Rules committed. ";
         invalidatePreview(); draft = null; get("architecture-editor").hidden = true;
+        // Written rules can hide or show layers at the same code pin; other views re-read their population.
+        onRulesChanged();
         await refresh();
         const now = context();
         if (now.rootKey !== c.rootKey || now.session !== c.session || !window.TrellisIndexPin.equal(now.pin, c.pin)) return;

@@ -498,6 +498,13 @@
         if (palette[attr.value]) node.setAttribute(attr.name,palette[attr.value]);
         if (attr.name === "rx" && attr.value === "var(--_r)") node.setAttribute("rx","4");
       }
+      // A note's stable identity across re-layouts: its layer (null when unassigned) and its
+      // ordinal among that layer's notes in projection order.
+      const noteIds = new Map(), noteCounts = new Map();
+      for (const item of [...projection.nodes.values()].filter(node => node.kind === "N").sort((a,b) => parseInt(a.id.slice(1),36) - parseInt(b.id.slice(1),36))) {
+        const layer = typeof item.record?.layerKey === "string" ? item.record.layerKey : null, n = noteCounts.get(layer) || 0;
+        noteCounts.set(layer, n + 1); noteIds.set(item.id, JSON.stringify([layer, n]));
+      }
       for (const {node,label,item,path} of controls.values()) {
         replaceLabel(label,item);
         let callback, expanded = null;
@@ -540,6 +547,7 @@
         if (item.kind === "L") node.setAttribute("data-trellis-layer-id",item.record.name);
         if (item.kind === "D") node.setAttribute("data-trellis-directory-id",item.record.key);
         if (item.kind === "U") node.setAttribute("data-trellis-unassigned","true");
+        if (item.kind === "N") node.setAttribute("data-trellis-note-id",noteIds.get(item.id));
         if (item.kind === "E") node.setAttribute("data-trellis-edge-id",edgeKey(item.record));
         const select = event => {
           event?.stopPropagation();

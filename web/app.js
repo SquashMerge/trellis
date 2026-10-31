@@ -1691,6 +1691,8 @@ const architecture = window.TrellisArchitecture?.create({
   },
   libraryButton: identity => identity.standardLibrary ? null : libraryButton({ecosystem:identity.language, name:identity.package, origin:"Architecture reference"}),
   onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
+  // A rules edit can change which layers are application layers (#524).
+  onRulesChanged: () => { void viewerMetrics?.refresh(); },
 });
 window.TrellisShell?.setViewCallback?.(name => {
   if (!routeViewChange && name !== "sequence") {
