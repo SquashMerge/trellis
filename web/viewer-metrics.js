@@ -24,7 +24,7 @@
   const START_CALLABLES = 8;
   function create({request, context, onConflict = () => {}, onChange = () => {}, onOpenCallable = null}) {
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, epoch = 0, refreshSerial = 0, inspectionSerial = 0;
-    let projection = null, projectionGuard = null, selected = null, loading = false;
+    let projection = null, projectionGuard = null, selected = null, loading = false, application = null;
     let decorations = [];
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
@@ -51,7 +51,7 @@
     }
     function reset() {
       epoch++; refreshSerial++; inspectionSerial++;
-      projection = null; projectionGuard = null; loading = false;
+      projection = null; projectionGuard = null; loading = false; application = null;
       clearDecorations(); clearInspection(); text("metrics-state", "");
       onChange();
     }
@@ -104,7 +104,16 @@
       try {
         const data = await request(url("revision", guard));
         if (!current(guard) || serial !== refreshSerial) return;
-        projection = payloadOf(data, guard, "revision"); projectionGuard = guard; loading = false;
+        const payload = payloadOf(data, guard, "revision");
+        if (guard.role === "production") remember(payload, guard);
+        else if (!applicationCurrent()) {
+          // Tests and fixtures are included: read the application population once for this pin.
+          const production = {...guard, role:"production"};
+          const own = payloadOf(await request(url("revision", production)), production, "revision");
+          if (!current(guard) || serial !== refreshSerial) return;
+          remember(own, production);
+        }
+        projection = payload; projectionGuard = guard; loading = false;
         text("metrics-state", `Indexed snapshot · ${aggregate} · ${population()} · ${exclusions(projection.files)}${data.catchingUp ? " · index catching up" : ""}${projection.layerExclusionsWarning ? ` · ${projection.layerExclusionsWarning}` : ""}`);
         onChange();
         if (selected) await inspect(selected);
@@ -254,15 +263,25 @@
       if (!["max", "sum", "mean"].includes(event.target.value) || aggregate === event.target.value) return;
       aggregate = event.target.value; void refresh();
     });
-    // Languages with production callables outside excluded paths, from the current
-    // projection's stored roles; null until that projection is usable.
-    function productionLanguages() {
-      if (!usable()) return null;
-      return new Set(projection.files.filter(row => !row.excludedReason && row.roleCounts?.production > 0).map(row => row.language));
+    // Application layers (#524): the default production workbench population, which leaves
+    // out fixture roots, stored test callables and authored hidden layers such as tooling.
+    // It is kept per pin, so including tests and fixtures in the heat never changes it.
+    function applicationCurrent() {
+      const now = context();
+      return !!application && application.rootKey === now.rootKey && application.session === now.session && equalPair(application.pin, pair(now.pin));
     }
-    // The projection's highest-cognitive callables with their pin; null until usable.
+    function remember(payload, guard) {
+      application = {rootKey:guard.rootKey, session:guard.session, pin:guard.pin,
+        languages:new Set(payload.files.filter(row => !row.excludedReason && row.roleCounts?.production > 0).map(row => row.language)),
+        top:Array.isArray(payload.topCognitive) ? payload.topCognitive : null};
+    }
+    // Languages with production callables in application layers; null until known for this pin.
+    function productionLanguages() {
+      return applicationCurrent() ? application.languages : null;
+    }
+    // The application layers' highest-cognitive callables with their pin; null until known.
     function topCallables() {
-      return usable() && Array.isArray(projection.topCognitive) ? {rows:projection.topCognitive, pin:projectionGuard.pin, population:population()} : null;
+      return applicationCurrent() && application.top ? {rows:application.top, pin:application.pin, population:"production callables"} : null;
     }
     return {reset, refresh, inspect, clearInspection, decorate, renderLegend, indexedDirectory, productionLanguages, topCallables};
   }

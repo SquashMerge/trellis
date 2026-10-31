@@ -98,8 +98,8 @@ display = "hidden" # "expanded" | "collapsed" | "hidden"
 - `"expanded"` draws the band open on its module chips on first view.
 - `"collapsed"` draws a summary band (header, count chips and one row of module chips
   coloured by metric, or a short stack in a shared box, #449) until the viewer opens it. This is the same as no `display` field.
-- `"hidden"` leaves the band out of the diagram and lists it in a footer line
-  (`N hidden layers · M files · E edges`) from which the viewer can show it.
+- `"hidden"` leaves the band out of the diagram and lists it in the hidden-layer note under
+  the drawing (`N hidden layers · M files · E production edges`), from which the viewer can show it.
 
 **Developer tooling is hidden** ([owner ruling 2026-10-31](https://github.com/SquashMerge/trellis/issues/524)):
 scripts, build helpers, examples and other tooling are not runtime architecture, so their
@@ -127,7 +127,7 @@ Without the field a band starts collapsed (#391 ruling). Every other layer is dr
 including one with no cross-layer references: the full stack (#449).
 Under the default production metrics population, a test or fixture layer **without**
 a `display` field (#424: every file is under a fixture root or holds only stored test
-callables) joins the hidden footer until **Include tests and fixtures** is on. An
+callables) joins the hidden-layer note until **Include tests and fixtures** is on. An
 authored `display` hint on such a layer always wins.
 Assignment, verdicts, reference counts, exceptions and every check, explain,
 references and MCP result are unchanged. The Architecture layer inventory carries

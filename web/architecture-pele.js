@@ -21,6 +21,9 @@
   // Lines one wrapped label line may take before its last is clipped: a bound for
   // pathological repository names only; ordinary paths and layer names wrap whole.
   const MAX_LINES = 12;
+  // Count-tag search: the farthest a tag may sit from its connector, and the connector
+  // points tried (#525). The far bound keeps a tag beside its own arrow in a crowded drawing.
+  const TAG_REACH = 200, TAG_POINTS = 48;
   // Chip columns for the ordered stack: the canvas width less one column per shared box.
   function chipColumns(width, shared) {
     if (!Number.isFinite(width) || width <= 0) return CHIP_COLUMNS;
@@ -38,17 +41,19 @@
       if (current.trim()) lines.push(current.trimEnd());
       current = token.trimStart();
       while (!fits(current)) {
+        // Split by code point, so a surrogate pair never straddles two lines.
+        const chars = Array.from(current);
         let cut = 1;
-        while (cut < current.length && fits(current.slice(0, cut + 1))) cut++;
-        lines.push(current.slice(0, cut)); current = current.slice(cut);
+        while (cut < chars.length && fits(chars.slice(0, cut + 1).join(""))) cut++;
+        lines.push(chars.slice(0, cut).join("")); current = chars.slice(cut).join("");
       }
     }
     if (current.trim() || !lines.length) lines.push(current.trimEnd());
     if (lines.length <= maxLines) return lines;
     const kept = lines.slice(0, maxLines);
-    let last = kept[maxLines - 1];
-    while (last && measure(`${last}…`) > width) last = last.slice(0, -1);
-    kept[maxLines - 1] = `${last}…`;
+    let last = Array.from(kept[maxLines - 1]);
+    while (last.length && measure(`${last.join("")}…`) > width) last.pop();
+    kept[maxLines - 1] = `${last.join("")}…`;
     return kept;
   }
   // Stat chips grouped into header lines no wider than `width` once drawn.
@@ -405,7 +410,7 @@
         if (!skip || Math.abs(dx) > skip || Math.abs(dy) > skip) list.push([dx, dy]);
       return list.sort((a, b) => Math.hypot(a[0], a[1]) - Math.hypot(b[0], b[1]) || a[1] - b[1] || a[0] - b[0]);
     };
-    const offsets = [...ring(96, 4, 3, 0), ...ring(320, 8, 6, 96)];
+    const offsets = [...ring(96, 4, 3, 0), ...ring(TAG_REACH, 8, 6, 96)];
     // Wider tags choose first, while there is most room; ties keep a stable order.
     const tagWidth = control => Number(control.node.querySelector("rect")?.getAttribute("width")) || 0;
     const tags = [...controls.values()].filter(control => control.item.kind === "E" && control.path)
@@ -416,7 +421,9 @@
       const points = pathPoints(path.querySelector("path")?.getAttribute("d") || "");
       if (![box.x, box.y, box.w, box.h].every(Number.isFinite)) continue;
       if (!points.length) { add(box); continue; }
-      const middle = (points.length - 1) / 2, order = points.map((point, i) => [point, Math.abs(i - middle)]).sort((a, b) => a[1] - b[1]).map(([point]) => point);
+      // At most TAG_POINTS evenly spaced connector points bound the search on a long connector.
+      const stride = Math.max(1, Math.ceil(points.length / TAG_POINTS)), sampled = points.filter((_, i) => i % stride === 0);
+      const middle = (sampled.length - 1) / 2, order = sampled.map((point, i) => [point, Math.abs(i - middle)]).sort((a, b) => a[1] - b[1]).map(([point]) => point);
       let chosen = null;
       for (const [dx, dy] of offsets) {
         for (const [px, py] of order) {
@@ -459,7 +466,7 @@
         if (!fit) break;
         const drawnWidth = Number(/^<svg\b[^>]*?\swidth="([0-9.]+)"/.exec(raw)?.[1]), cells = columns + sharedCount;
         const fits = drawnWidth <= options.width;
-        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw};
+        if (!best || (fits && (!best.fits || drawnWidth > best.drawnWidth)) || (!fits && !best.fits && drawnWidth < best.drawnWidth)) best = {fits,drawnWidth,projection,raw,columns,chipWidth};
         if (attempt >= 12) break;
         let next;
         if (fits) {
@@ -477,7 +484,12 @@
         if (low !== null && high !== null && high - low <= 1) break;
         chipWidth = next;
       }
-      if (best) ({projection,raw} = best);
+      // Projecting charges the caller's chip budget, so the chosen layout is projected again
+      // when it was not the last attempt; the same inputs give the same source and ids.
+      if (best && best.projection !== projection) {
+        projection = project(view,{...options,columns:best.columns,chipWidth:best.chipWidth,measureText:measure});
+        raw = best.raw;
+      }
       if (!current()) return {status:"stale"};
       const {root,controls} = validatedSvg(raw,projection);
       root.classList.add("trellis-architecture-svg"); root.setAttribute("font-size","14"); root.setAttribute("font-family","Inter, sans-serif");

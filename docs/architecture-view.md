@@ -52,13 +52,15 @@ name longer than twelve wrapped lines is clipped, and the accessible name always
 whole text. A band's count chips wrap onto further header lines when they do not fit one.
 Arrow count tags are placed on or beside their own arrow, at the nearest spot that clears
 every header line, count chip, module chip and other tag (crossing an arrow or a band
-border is allowed). When the panel width changes (window resize, inspector shown or
-hidden), the drawing is laid out again after a short quiet period (150 ms), from the same
-response, keeping the size cap, the inspector and the selected node. The hidden-layer note
+border is allowed), within 200 units of its arrow; a tag with no such spot keeps Pele's own
+place. When the panel width changes (window resize, inspector shown or hidden), the drawing
+is laid out again after a short quiet period (150 ms), from the same response with no new
+read, keeping the size cap, the inspector, the selected node and keyboard focus. The hidden-layer note
 (`N hidden layers · M files · E production edges`, with its toggle) is laid out inside the
 canvas directly under the drawing.
 
-Nothing but the toolbar sits above the drawing. The heat legend and the arrow key sit
+Nothing but the toolbar sits above the drawing, apart from loading and error states and the
+one-line outcome of a rules edit. The heat legend and the arrow key sit
 under it, with the coverage sentence said once (see below). The snapshot counts (`N file
 modules · production / test-only cross-layer sites · Metrics`), the files not drawn under
 the size cap, the heat exclusions and the rule-instance counts are behind the ⓘ.
@@ -110,7 +112,7 @@ the whole diagram, counting every note. The rest of a list becomes one visible "
 not drawn" note that opens the layer's complete file list in the inspector. Once the
 budget is spent, further bands and modules stay folded and no more notes are added; the
 ⓘ reports the total not drawn. Test and fixture layers without a `display`
-hint stay in the hidden footer until **Include tests and fixtures in metrics** is on.
+hint stay in the hidden-layer note until **Include tests and fixtures in metrics** is on.
 
 Click a module or select it with Enter/Space to inspect its identity, layer, captured
 physical file lines, callable count, every metric, and its incident references and rule
@@ -240,7 +242,7 @@ aggregate, not a mean of file means. Heat uses the shared
 totals. **Relative**, off by default, uses modules in the admitted layers and the
 unassigned inventory (drawn as chips even when collapsed), after measured filtering. Collapsed
 layer/directory summaries include their member modules in that basis; expanding them does not
-move the cuts. The hidden-layer footer can change the Relative basis. Maintainability reverses severity, not values.
+move the cuts. The hidden-layer note can change the Relative basis. Maintainability reverses severity, not values.
 Browser requests set `workbench=true`; stored tests, fixture roots, authored hidden layers and
 `web/vendor/` do not contribute default heat. Counts report excluded callables and files.
 Include tests and fixtures restores tests/fixtures/hidden-layer metrics, but not vendor metrics.

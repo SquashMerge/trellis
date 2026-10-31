@@ -353,7 +353,22 @@
       toggle.setAttribute("aria-expanded", String(shown.hidden));
       hiddenNames.textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
     }
+    // A drawn node's stable identity (its data attribute), so a new drawing can find it again.
+    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned"];
+    function nodeKey(node) {
+      if (!node) return null;
+      if (node === hiddenToggle) return ["id", hiddenToggle.id];
+      const name = NODE_KEYS.find(key => node.hasAttribute?.(key));
+      return name ? [name, node.getAttribute(name)] : null;
+    }
+    function findNode(key) {
+      if (!key) return null;
+      if (key[0] === "id") return hiddenToggle;
+      return [...(get("architecture-diagram").querySelectorAll?.(`[${key[0]}]`) || [])].find(node => node.getAttribute(key[0]) === key[1]) || null;
+    }
+    const pressedNode = () => [...(get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || [])][0] || null;
     function refocus(target) {
+      if (target.hidden) { hiddenToggle.focus?.(); return; }
       for (const node of get("architecture-diagram").querySelectorAll?.("[role=button]") || []) {
         if ((target.layer !== undefined && node.getAttribute("data-trellis-layer-id") === target.layer) ||
             (target.directory !== undefined && node.getAttribute("data-trellis-directory-id") === target.directory) ||
@@ -409,8 +424,11 @@
       displayState(payload, layout);
       get("architecture-coverage").textContent = coverageSummary(payload);
       const unassigned = payload.modules.filter(module => module.layer === null).length, budget = {left:BOX_CAP, truncated:0};
-      // The canvas's inner width; the adapter fits that many chip columns.
-      const canvas = get("architecture-diagram"), style = window.getComputedStyle?.(canvas), padding = style ? parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) : 0;
+      // The canvas's inner width; the adapter fits that many chip columns. A re-layout
+      // returns keyboard focus to the same band, chip, arrow or toggle afterwards.
+      const canvas = get("architecture-diagram"), drawnFor = canvas.clientWidth;
+      const focused = keepSelection && canvas.contains?.(document.activeElement) ? nodeKey(document.activeElement) : null;
+      const style = window.getComputedStyle?.(canvas), padding = style ? parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) : 0;
       try {
         if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
         const outcome = await window.TrellisArchitecturePele.render(canvas, payload, {
@@ -422,8 +440,8 @@
             summary:(key, modules, columns) => summaryChips(key, modules, columns, scale, budget),
             edge:() => true,
             unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
-          onSelectModule:module => { if (active() && payload.modules.includes(module)) { inspect("module", module); pressed = ["data-trellis-module-id", window.TrellisArchitecturePele.identity(module)]; } },
-          onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) { inspect("edge", edge); pressed = ["data-trellis-edge-id", window.TrellisArchitecturePele.edgeKey(edge)]; } },
+          onSelectModule:module => { if (active() && payload.modules.includes(module)) { inspect("module", module); pressed = nodeKey(pressedNode()); } },
+          onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) { inspect("edge", edge); pressed = nodeKey(pressedNode()); } },
           onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },
           onToggleLayer:layer => {
             if (!active() || !payload.layers.includes(layer)) return;
@@ -443,10 +461,10 @@
         });
         if (!active()) return false;
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
-        laidOut = canvas.clientWidth;
+        laidOut = drawnFor; if (canvas.dataset) canvas.dataset.layoutWidth = String(drawnFor);
         // The hidden-layer note is part of the drawing's layout, right under it (#525).
         canvas.append(hiddenNote);
-        if (keepSelection && pressed) for (const node of canvas.querySelectorAll(`[${pressed[0]}]`)) if (node.getAttribute(pressed[0]) === pressed[1]) node.setAttribute("aria-pressed", "true");
+        if (keepSelection) { findNode(pressed)?.setAttribute("aria-pressed", "true"); findNode(focused)?.focus(); }
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
         // The counts live behind the ⓘ with the heat exclusions; nothing but the drawing sits above it (#449, #525).
@@ -919,18 +937,22 @@
     });
     hiddenToggle.addEventListener("click", () => {
       if (!usable()) return;
-      shown.hidden = !shown.hidden; saveDisplay(); return rerender({});
+      shown.hidden = !shown.hidden; saveDisplay(); return rerender({hidden:true});
     });
     // A changed panel width (window resize, inspector toggle) re-lays out the drawing,
     // debounced, keeping the size cap, the inspector and the selection (#515, #525).
     // A hidden panel has no width and waits until it is shown again.
-    let resizeTimer = null;
+    let resizeTimer = null, resizeSerial = 0;
     if (typeof window.ResizeObserver === "function") new window.ResizeObserver(() => {
+      const canvas = get("architecture-diagram"), ticket = ++resizeSerial;
       window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(() => {
-        const width = get("architecture-diagram").clientWidth;
-        if (!width || laidOut === null || Math.abs(width - laidOut) < RESIZE_SLACK || !usable() || view.state !== "ready") return;
-        void render({keepSelection:true});
+      // Tests and tools can tell a pending re-layout from a settled drawing.
+      canvas.dataset.layout = "pending";
+      resizeTimer = window.setTimeout(async () => {
+        const width = canvas.clientWidth;
+        if (width && laidOut !== null && Math.abs(width - laidOut) >= RESIZE_SLACK && usable() && view.state === "ready") await render({keepSelection:true});
+        // Settled unless a newer width change scheduled another re-layout meanwhile.
+        if (ticket === resizeSerial) delete canvas.dataset.layout;
       }, RESIZE_DEBOUNCE_MS);
     }).observe(get("architecture-diagram"));
     get("architecture-color").addEventListener("change", event => { metric = event.target.value; return render(); });

@@ -71,7 +71,7 @@ test("display projection: module chips, a folded band as a short composite, stat
   const p=adapter.project(view,{display,measureText:text=>Array.from(text).length*7,layerStats:layer=>layer.name==="Store"?[{text:"↑7",label:"7 upward deviation production sites",tone:"error"}]:[]});
   const store=[...p.nodes.values()].find(n=>n.kind==="L"&&n.record.name==="Store");
   assert.equal(store.composite,true,"a folded band is a composite, so its row is not as tall as the stack");
-  assert.equal(store.display[store.statsLine],"↑7");assert.match(store.full,/7 upward deviation production sites/);
+  assert.equal(store.display[store.statLines[0].line],"↑7");assert.match(store.full,/7 upward deviation production sites/);
   const folded=[...p.nodes.values()].find(n=>n.kind==="S");assert.equal(folded.owner,store);assert.equal(folded.full,"8 files folded");
   const chip=[...p.nodes.values()].find(n=>n.kind==="M");assert.equal(chip.display[0],"module_0");assert.equal(chip.full.split("\n")[0],"src/module_0.rs");
   const up=[...p.edges.values()].find(e=>e.record.sourceLayer==="Store");assert.deepEqual([...up.display],["↑7"]);assert.equal(up.full,"7 production sites · upward\ndeviation");

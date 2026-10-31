@@ -55,8 +55,6 @@
 .architecture-status { display: flex; flex: none; flex-wrap: wrap; column-gap: 12px; }
 .architecture-status p { margin-right: 0; }
 #architecture-legend p { margin: 0; }
-.architecture-display-footers { display: flex; flex: none; flex-wrap: wrap; min-width: 0; }
-.architecture-display-footers > div { flex: 1 1 auto; max-width: 100%; }
 
 /* Compact arrow key and measured coverage under the canvas (#449). */
 .architecture-edge-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; }
