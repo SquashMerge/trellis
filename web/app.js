@@ -177,7 +177,7 @@ async function restoreSourceEntry(entry, current) {
   $("method-source").disabled = !selectedMethod;
   if ($("method-class")) $("method-class").disabled = !selectedMethod || !classLanguage(selectedMethod.path);
   workspaceSource = entry.source;
-  await setSection(entry.section);
+  await setSection(entry.section, entry.section === "diagrams" ? entry.view : null);
   if (!current()) return;
   diagramSequence = entry.diagram;
   if (entry.section === "diagrams" && entry.view === "sequence" && entry.diagram && entry.method) {
@@ -235,7 +235,7 @@ async function readNavigationLocation(force = false) {
       $("error").hidden = true;
       if (entry.kind === "source") return await restoreSourceEntry(entry, current);
       clearSource(); diagramSequence = null;
-      await setSection("diagrams");
+      await setSection("diagrams", entry.kind === "class" ? "classes" : "sequence");
       if (!current()) return;
       if (entry.kind === "class") return await openClasses({seed:entry.symbol.id});
       $("all-steps").checked = entry.showAll;
@@ -1005,7 +1005,12 @@ async function setSection(name, view = null) {
   window.TrellisShell?.setSection(name);
   if (name !== "files") {
     // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
-    if (view) showNavigationView(view);
+    if (view) {
+      // The shell focused the last-used tab on entry; keep focus on the tab that is now shown.
+      const tabFocused = document.activeElement?.closest?.("#diagram-tabs");
+      showNavigationView(view);
+      if (tabFocused) $(`view-${view}`)?.focus();
+    }
     $("source").hidden = false; $("files-diff").hidden = true;
     if (!workspaceSource) window.TrellisShell?.closeSource();
     renderFiles();

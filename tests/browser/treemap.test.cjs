@@ -403,7 +403,7 @@ test("Treemap late production fetch cannot replace all-callable heat and late so
     const latest = await page.locator("#treemap-diagram").innerHTML();
     await releaseFetch(page);
     assert.equal(await page.locator("#treemap-diagram").innerHTML(), latest);
-    assert.match(await page.locator("#treemap-state").textContent(), /all indexed callables/);
+    assert.match(await page.locator("#treemap-summary").textContent(), /all indexed callables/);
   } finally { await restoreFetch(page); }
   await holdFetch(page, {suffix:"/metrics", query:{scope:"revision", aggregate:"sum"}});
   try {
@@ -414,7 +414,7 @@ test("Treemap late production fetch cannot replace all-callable heat and late so
     const latest = await page.locator("#treemap-diagram").innerHTML();
     await releaseFetch(page);
     assert.equal(await page.locator("#treemap-diagram").innerHTML(), latest);
-    assert.match(await page.locator("#treemap-state").textContent(), /mean/);
+    assert.match(await page.locator("#treemap-summary").textContent(), /mean/);
   } finally { await restoreFetch(page); }
   await holdFetch(page, {suffix:"/source", query:{path:"src/last.rs"}});
   try {

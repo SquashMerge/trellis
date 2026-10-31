@@ -830,8 +830,9 @@ test("invalid rules keep Explorer and Treemap heat with a warning while Architec
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   await page.waitForFunction(() => document.querySelector("#treemap-state")?.dataset.state === "ready" &&
     document.querySelector("#treemap-diagram")?.dataset.layout === "settled");
-  // #451: the ready summary, with its warning, sits behind the view's ⓘ.
-  assert.equal(await page.locator("#treemap-state").isVisible(), false);
+  // #451: the ready summary sits behind the view's ⓘ; only the warning stays in view.
+  assert.ok(await page.locator("#treemap-state").isVisible());
+  assert.equal(await page.locator("#treemap-state").textContent(), warning);
   await H.reveal(page, "#treemap-summary");
   assert.ok(await page.locator("#treemap-summary").isVisible());
   assert.ok((await page.locator("#treemap-summary").textContent()).includes(warning));

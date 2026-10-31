@@ -75,7 +75,9 @@ resize relayouts the same admitted files once it settles, only when the layout
 size changes, keeping the selection and without another metrics read. Large
 diagrams scroll down within the canvas rather than shrinking all text. The toolbar is one row;
 the ready summary (file and line counts, population, exclusions and warnings) sits behind the
-view's ⓘ, while loading, empty and error states stay visible (#451). Desktop panes
+view's ⓘ, while loading, empty and error states, and a rules warning, stay visible (#451).
+Below a 640 px box (narrow windows and mobile) the 640 px minimum still scrolls sideways
+inside the canvas. Desktop panes
 and mobile Explorer/Inspector drawers keep existing ownership.
 
 The root section and its breadcrumb show the checkout directory's name from the

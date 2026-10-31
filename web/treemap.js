@@ -34,9 +34,10 @@
     };
     const population = () => role === "all" ? "all indexed callables" : "production callables";
     // Loading, empty and error states stay in view; the ready summary lives behind the view's ⓘ (#451).
-    const state = (message, kind = "ready") => {
-      const node = get("treemap-state"); node.textContent = message; node.dataset.state = kind; node.hidden = kind === "ready";
-      get("treemap-summary").textContent = kind === "ready" ? message : "";
+    const state = (message, kind = "ready", warning = "") => {
+      const node = get("treemap-state"), ready = kind === "ready";
+      node.textContent = ready ? warning : message; node.dataset.state = kind; node.hidden = ready && !warning;
+      get("treemap-summary").textContent = ready ? message : "";
     };
     const paragraph = (target, message) => target.append(make("p", message));
     function capture() {
@@ -219,7 +220,7 @@
         }
         const total = files.reduce((sum, file) => sum + file.physicalLines, 0);
         const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.";
-        state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty");
+        state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty", payload.layerExclusionsWarning || "");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
         // Resizes during the first paint had no relayout to call; reconcile with the box once.
         const reconciled = relayout?.();

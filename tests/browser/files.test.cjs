@@ -270,23 +270,44 @@ test("Files Open full opens Sequence over a last-used Treemap; the mini fits, th
   assert.ok(mini.drawn <= mini.natural, "the preview scales down, never up past its drawn size");
 
   // Open full: the last-used Treemap neither shows nor refreshes on the way to Sequence.
-  const metricsBefore = requests.filter(row => row.url.pathname.endsWith("/metrics")).length;
-  await page.evaluate(() => {
-    window.treemapShown = false;
-    const panel = document.querySelector("#treemap-panel");
-    new MutationObserver(() => { if (!panel.hidden) window.treemapShown = true; }).observe(panel, {attributes:true, attributeFilter:["hidden"]});
+  let metricsBefore = requests.filter(row => row.url.pathname.endsWith("/metrics")).length;
+  // A Treemap refresh publishes "loading" across its metrics read; record any.
+  const watchTreemap = () => page.evaluate(() => {
+    window.treemapLoaded = false;
+    const state = document.querySelector("#treemap-state");
+    window.treemapWatch?.disconnect();
+    window.treemapWatch = new MutationObserver(() => { if (state.dataset.state === "loading") window.treemapLoaded = true; });
+    window.treemapWatch.observe(state, {attributes:true, attributeFilter:["data-state"]});
   });
+  async function onSequence(message) {
+    await page.waitForFunction(() => !document.body.classList.contains("files-section") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+    assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true", message);
+    assert.equal(await page.locator("#view-treemap").getAttribute("aria-selected"), "false", message);
+    assert.equal(await page.locator("#sequence-panel").isVisible(), true, message);
+    assert.equal(await page.locator("#treemap-panel").isVisible(), false, message);
+    assert.equal(await page.evaluate(() => window.treemapLoaded), false, `${message}: Treemap did not refresh`);
+    assert.equal(requests.filter(row => row.url.pathname.endsWith("/metrics")).length, metricsBefore, `${message}: no metrics read for the last-used Treemap`);
+    assert.notEqual(await page.evaluate(() => document.activeElement?.id), "view-treemap", `${message}: focus is not left on the hidden tab`);
+  }
+  await watchTreemap();
   await page.locator("#files-open-full").click();
-  await page.waitForFunction(() => !document.body.classList.contains("files-section") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
-  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
-  assert.equal(await page.locator("#view-treemap").getAttribute("aria-selected"), "false");
-  assert.equal(await page.locator("#sequence-panel").isVisible(), true);
-  assert.equal(await page.locator("#treemap-panel").isVisible(), false);
-  assert.equal(await page.evaluate(() => window.treemapShown), false, "Treemap never showed during Open full");
-  assert.equal(requests.filter(row => row.url.pathname.endsWith("/metrics")).length, metricsBefore, "Open full does not refresh the last-used Treemap");
+  await onSequence("Open full");
   const route = new URLSearchParams((await page.evaluate(() => location.hash)).slice("#sequence?".length));
   assert.equal(route.get("sid"), method.symbol.id); assert.equal(route.get("indexRevision"), String(pin.indexRevision));
   await assertNoOverflow(page);
+
+  // Back to Files, Treemap becomes the last-used tab again, then Forward to the Sequence entry.
+  await page.goBack();
+  await page.waitForFunction(() => document.body.classList.contains("files-section") && document.querySelector("#files-symbol-title")?.textContent === "measured");
+  await page.locator("#section-diagrams").click();
+  await page.locator("#view-treemap").click();
+  await page.waitForFunction(() => document.querySelector("#treemap-state")?.dataset.state === "ready" && document.querySelector("#treemap-diagram svg"));
+  await page.locator("#section-files").click();
+  await page.waitForFunction(() => document.body.classList.contains("files-section"));
+  metricsBefore = requests.filter(row => row.url.pathname.endsWith("/metrics")).length;
+  await watchTreemap();
+  await page.goForward();
+  await onSequence("Forward");
 }));
 
 // #426: icon plus name on one line, with kind and line right-aligned.
@@ -346,9 +367,12 @@ test("Files symbol rows are one line and source lines get subtle text-only synta
   await assertSource(page, usesText, long.symbol.range);
   assert.equal(await selectedRow.getAttribute("aria-pressed"), "true");
   assert.deepEqual(await selectedRow.evaluate(node => [...node.children].map(child => getComputedStyle(child).color)), Array(4).fill(await selectedRow.evaluate(node => getComputedStyle(node).color)), "selected rows keep ink text on the selection fill");
-  const highlighted = await page.locator("#source .source-line.highlight").evaluateAll(rows => rows.map(row => getComputedStyle(row).color));
-  assert.ok(highlighted.length && highlighted.every(color => color !== colours.gold && color !== colours.secondary), "the selected range keeps its own contrast");
-  assert.equal((await syntaxClasses(page))[annotation].kind, "attribute", "selection keeps the line class and only changes its colour");
+  // #451: the quiet raised selection keeps the subtle syntax colouring.
+  const selectedLines = await syntaxClasses(page);
+  assert.equal(selectedLines[annotation].kind, "attribute", "selection keeps the line class");
+  const highlightedRows = await page.locator("#source .source-line.highlight").evaluateAll(rows => rows.map(row => ({attribute:row.classList.contains("syntax-attribute"), color:getComputedStyle(row).color})));
+  assert.ok(highlightedRows.length);
+  for (const row of highlightedRows) assert.equal(row.color, row.attribute ? colours.gold : colours.ink);
 
   await openFile(selected, hostileName);
   lines = await syntaxClasses(page);
