@@ -144,7 +144,7 @@ fn both_full_routes_persist_summaries_and_unchanged_copies_completeness() {
         ))).unwrap() {
             let (language, extraction, summary, complete) = row.unwrap();
             assert!(complete);
-            if matches!(language.as_str(), "java" | "python") {
+            if crate::classes::supports_language(&language) {
                 ready += 1;
                 let extraction: FileExtraction = serde_json::from_str(&extraction.unwrap()).unwrap();
                 let summary: crate::classes::FileSummary = serde_json::from_str(&summary.unwrap()).unwrap();
@@ -247,7 +247,7 @@ fn select_clipped_catalog(store: &Store, pin: IndexPin, limits: Limits) -> Catal
         .prepare(
             "SELECT m.path,m.gid,g.graph_hash FROM revision_documents m
          JOIN graph_projections g ON g.gid=m.gid WHERE m.revision_id=?1
-         AND m.language IN ('java','python') ORDER BY m.path",
+         AND m.language IN ('java','python','javascript') ORDER BY m.path",
         )
         .unwrap()
         .query_map([&selected.key], |row| {

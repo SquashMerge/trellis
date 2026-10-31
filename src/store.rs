@@ -674,11 +674,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 29;
+const DATABASE_SCHEMA_VERSION: u32 = 30;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
 const CACHE_SCHEMA_V29: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=29), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=30), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -697,7 +697,7 @@ CREATE UNIQUE INDEX native_revisions_pin ON native_revisions(published_index_rev
 CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);
 CREATE TABLE revision_capture_inputs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,input_key TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(revision_id,input_key));
 CREATE TABLE document_versions(vid INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,language TEXT NOT NULL,path TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64),extraction_context TEXT NOT NULL CHECK(length(extraction_context)=64),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,byte_length INTEGER NOT NULL CHECK(byte_length>=0 AND byte_length=length(source_bytes)),source_bytes BLOB NOT NULL,native_witness TEXT NOT NULL CHECK(length(native_witness)=64),UNIQUE(language,path,content_hash,extraction_context,producer_id,producer_version),UNIQUE(vid,language,path),UNIQUE(vid,language),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
-CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,class_summary_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((class_extraction_state='ready')=(class_summary_payload IS NOT NULL)),CHECK((language IN ('java','python'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE graph_projections(gid INTEGER PRIMARY KEY,vid INTEGER NOT NULL,language TEXT NOT NULL,graph_hash TEXT NOT NULL UNIQUE CHECK(length(graph_hash)=64),state TEXT NOT NULL CHECK(state IN ('staged','ready','unavailable')),class_extraction_state TEXT NOT NULL CHECK(class_extraction_state IN ('notApplicable','ready')),class_extraction_payload TEXT,class_summary_payload TEXT,CHECK((class_extraction_state='ready')=(class_extraction_payload IS NOT NULL)),CHECK((class_extraction_state='ready')=(class_summary_payload IS NOT NULL)),CHECK((language IN ('java','python','javascript'))=(class_extraction_state IN ('ready'))),UNIQUE(vid,graph_hash),UNIQUE(gid,vid),FOREIGN KEY(vid,language) REFERENCES document_versions(vid,language) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE graph_nodes(gid INTEGER NOT NULL REFERENCES graph_projections(gid) DEFERRABLE INITIALLY DEFERRED,id BLOB NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(gid,id));
 CREATE INDEX graph_nodes_search_name ON graph_nodes(name COLLATE BINARY,id,gid);
 CREATE INDEX graph_nodes_search_folded ON graph_nodes(lower(name),name COLLATE BINARY,id,gid);
@@ -4810,7 +4810,7 @@ fn resolve_class_id(
                 document
                     .as_ref()
                     .is_some_and(|doc| doc.nodes.iter().any(|node| node.id == current)),
-                InvalidRequest("Choose an indexed Java or Python class or method.")
+                InvalidRequest("Choose an indexed class or method.")
             );
         }
         if db.query_row(
@@ -4832,12 +4832,10 @@ fn resolve_class_id(
         let symbol = document
             .as_ref()
             .and_then(|doc| doc.nodes.iter().find(|node| node.id == current))
-            .ok_or(InvalidRequest(
-                "Choose an indexed Java or Python class or method.",
-            ))?;
+            .ok_or(InvalidRequest("Choose an indexed class or method."))?;
         ensure!(
             depth > 0 || matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function),
-            InvalidRequest("Choose an indexed Java or Python class or method.")
+            InvalidRequest("Choose an indexed class or method.")
         );
         current = symbol.parent.clone().ok_or(InvalidRequest(
             "The selected method has no supported enclosing class.",
@@ -10241,7 +10239,7 @@ fn write_native(
                     file.language,
                     ids.graph_hash,
                     "ready",
-                    if matches!(file.language.as_str(), "java" | "python") {
+                    if crate::classes::supports_language(&file.language) {
                         "ready"
                     } else {
                         "notApplicable"
@@ -10290,7 +10288,7 @@ fn write_native(
                 coverage.state,
                 coverage.diagnostic,
                 ordinal as i64,
-                class_complete || !matches!(file.language.as_str(), "java" | "python"),
+                class_complete || !crate::classes::supports_language(&file.language),
             ],
         )?;
         for (kind, roles) in [
@@ -17162,7 +17160,7 @@ impl Store {
                 selected_ensure!(matches!(class_complete, 0 | 1),
                     "incompatible_index: invalid class selection completeness");
                 prior_class_complete.insert(path.clone(), class_complete == 1);
-                selected_ensure!(summary.is_some() == matches!(language.as_str(), "java" | "python"),
+                selected_ensure!(summary.is_some() == crate::classes::supports_language(&language),
                     "incompatible_index: class summary missing or unexpected");
                 if let Some(payload) = summary {
                     prior_summaries.insert(path.clone(), serde_json::from_str(&payload).context(SelectedIntegrity("incompatible_index: stored class summary decode failed".into()))?);
@@ -17791,7 +17789,7 @@ impl Store {
         let mut summaries = Vec::new();
         for index in replay {
             let document = &spool.header().revision.documents[index];
-            if matches!(document.key.language.as_str(), "java" | "python") {
+            if crate::classes::supports_language(&document.key.language) {
                 check_cancel(cancel)?;
                 let extraction = spool
                     .read_extraction(index)
@@ -17942,7 +17940,7 @@ impl Store {
                             !reused.native || prior_witness.is_some(),
                             "incompatible_index: reusable native version absent"
                         );
-                        let extraction = if matches!(file.language.as_str(), "java" | "python") {
+                        let extraction = if crate::classes::supports_language(&file.language) {
                             Some(spool.read_extraction(index).map_err(native_spool_read_failure)?)
                         } else {
                             None
@@ -18113,7 +18111,7 @@ impl Store {
             let class_paths: BTreeSet<_> = graph
                 .files
                 .iter()
-                .filter(|f| matches!(f.language.as_str(), "java" | "python"))
+                .filter(|f| crate::classes::supports_language(&f.language))
                 .map(|f| f.path.as_str())
                 .collect();
             // Class extraction only consumes class/method/function symbols. Supply
@@ -18524,7 +18522,7 @@ impl Store {
                             max_graph_json_bytes,
                         )?;
                         let selected_classes = stream_document_classes(&classes, &file.path);
-                        let extractions = if matches!(file.language.as_str(), "java" | "python") {
+                        let extractions = if crate::classes::supports_language(&file.language) {
                             BTreeMap::from([(
                                 file.path.clone(),
                                 spool
@@ -20117,7 +20115,7 @@ impl Store {
                 && class_projection_state.as_deref() == Some("ready")
                 && class_hash.is_some()
                 && class_id.len() <= 16 * 1024
-                && (if matches!(language.as_str(), "java" | "python") {
+                && (if crate::classes::supports_language(&language) {
                     f_length.is_some_and(|n| (0..=64 * 1024 * 1024).contains(&n))
                 } else {
                     f_length.is_none()
@@ -20125,10 +20123,8 @@ impl Store {
             "incompatible_index: selected class projection invalid"
         );
         selected_ensure!(
-            matches!(
-                (language.as_str(), class_state.as_str()),
-                ("java" | "python", "ready") | ("javascript" | "rust", "notApplicable")
-            ),
+            (class_state == "ready") == crate::classes::supports_language(&language)
+                && matches!(class_state.as_str(), "ready" | "notApplicable"),
             "incompatible_index: class extraction state invalid"
         );
         let key = DocumentKey {
@@ -21060,11 +21056,14 @@ impl Store {
         }
         let truncated = truncated || byte_limited;
         if let Some(path) = path
-            && !path.ends_with(".java")
-            && !path.ends_with(".py")
+            && ![".java", ".py", ".js", ".mjs", ".cjs"]
+                .iter()
+                .any(|ext| path.ends_with(ext))
         {
-            warnings
-                .push("Class diagrams currently support Java and Python declarations only.".into());
+            warnings.push(
+                "Class diagrams currently support Java, Python and JavaScript declarations only."
+                    .into(),
+            );
         }
         Ok(ClassPage {
             revision,
@@ -21073,6 +21072,10 @@ impl Store {
             truncated,
             warnings,
             require_index: false,
+            supported_languages: crate::classes::SUPPORTED_LANGUAGES
+                .iter()
+                .map(|language| (*language).to_owned())
+                .collect(),
         })
     }
 

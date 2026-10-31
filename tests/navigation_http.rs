@@ -674,9 +674,14 @@ async fn cached_java_source_budget_and_unproven_member_shape_do_not_guess() {
 
 #[tokio::test]
 async fn unsupported_classes_never_become_class_targets_but_methods_remain_measured() {
-    let (dir, _store, _graph, app, _session) =
-        setup(&[("app.js", "class Unsupported { run() { return 1; } }\n")]);
-    let (_, view) = call(&app, source("app.js", 1, &dir)).await;
+    let (dir, _store, _graph, app, _session) = setup(&[
+        (
+            "app.rs",
+            "struct Unsupported;\nimpl Unsupported { fn run() -> u8 { 1 } }\n",
+        ),
+        ("app.js", "class Supported { run() { return 1; } }\n"),
+    ]);
+    let (_, view) = call(&app, source("app.rs", 2, &dir)).await;
     assert!(
         view["targets"]
             .as_array()
@@ -686,6 +691,21 @@ async fn unsupported_classes_never_become_class_targets_but_methods_remain_measu
     );
     assert_eq!(targets(&view, "declaration"), ["run"]);
     assert_eq!(view["requireIndex"], false);
+    // A catalogued JavaScript class is a class target for its own line.
+    let (_, view) = call(&app, source("app.js", 1, &dir)).await;
+    let actions: Vec<_> = view["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["symbol"]["name"].as_str().unwrap(),
+                t["action"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(actions.contains(&("Supported", "class")), "{actions:?}");
+    assert!(actions.contains(&("run", "sequence")), "{actions:?}");
 }
 
 #[tokio::test]

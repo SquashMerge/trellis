@@ -1458,7 +1458,7 @@ fn prepare_spooled_document(
         &|_| {},
     )?;
     crate::indexer::validate_native_graph_records(&graph, &facts, cancel)?;
-    let extraction = if matches!(file.language.as_str(), "java" | "python") {
+    let extraction = if crate::classes::supports_language(&file.language) {
         let symbols: Vec<_> = graph
             .nodes
             .iter()
