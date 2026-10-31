@@ -171,9 +171,9 @@ jobs:
           CARGO_TARGET_DIR: target-test-support
         run: |
           lists=$RUNNER_TEMP/tests-archive
-          cargo nextest list --locked --all-targets --features test-support --message-format oneline >"$lists/all.txt"
+          cargo nextest list --locked --all-targets --features test-support --color never --message-format oneline >"$lists/all.txt"
           for part in 1 2; do
-            cargo nextest list --locked --all-targets --features test-support --message-format oneline --partition "count:$part/2" >"$lists/partition-$part.txt"
+            cargo nextest list --locked --all-targets --features test-support --color never --message-format oneline --partition "count:$part/2" >"$lists/partition-$part.txt"
           done
           python3 tools/ci-test-partitions.py split "$lists/all.txt" "$lists/partition-1.txt" "$lists/partition-2.txt" | tee -a "$GITHUB_STEP_SUMMARY"
       # The archive is already zstd-compressed.
@@ -235,18 +235,22 @@ jobs:
           name: tests-archive
           path: ${{ runner.temp }}/tests-archive
       # The tests were compiled with absolute paths into the checkout's
-      # `target-test-support` (CARGO_BIN_EXE_trellis, for one), so that path
-      # links to the extracted target directory. --workspace-remap points
-      # CARGO_MANIFEST_DIR, and so the fixtures, at this checkout. The `ci`
-      # profile is the default profile plus a JUnit report.
+      # `target-test-support` (CARGO_BIN_EXE_trellis, for one), and the daemon
+      # compares its resolved executable path with the client's, so the
+      # archive's target directory is unpacked at exactly that path (a symlink
+      # fails with daemon_command_mismatch). nextest then runs from the
+      # unpacked metadata; --workspace-remap points CARGO_MANIFEST_DIR, and so
+      # the fixtures, at this checkout. The `ci` profile is the default profile
+      # plus a JUnit report.
       - name: Run partition ${{ matrix.partition }} of the tests
         env:
           PARTITION: ${{ matrix.partition }}
         run: |
           extract=$RUNNER_TEMP/tests-extract
           mkdir -p "$extract"
-          ln -s "$extract/target" target-test-support
-          cargo nextest run --archive-file "$RUNNER_TEMP/tests-archive/tests.tar.zst" --extract-to "$extract" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --no-fail-fast --partition "count:$PARTITION/2"
+          tar --zstd -xf "$RUNNER_TEMP/tests-archive/tests.tar.zst" -C "$extract"
+          mv "$extract/target" target-test-support
+          cargo nextest run --binaries-metadata target-test-support/nextest/binaries-metadata.json --cargo-metadata target-test-support/nextest/cargo-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target-test-support" --profile ci --no-fail-fast --partition "count:$PARTITION/2"
       # A run from an archive writes its report under the remapped workspace's
       # `target`.
       - name: Check partition ${{ matrix.partition }} ran its share of the tests
