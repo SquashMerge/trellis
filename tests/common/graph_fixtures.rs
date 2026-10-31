@@ -475,6 +475,7 @@ fn evidence(
             observed_roles,
             diagnostic: (!matches!(state, s::CoverageState::Complete))
                 .then(|| format!("{state:?} fixture")),
+            reasons: None,
         });
     }
     let mut requested = producer.clone();

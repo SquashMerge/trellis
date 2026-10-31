@@ -676,11 +676,11 @@ SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+(
 UNION ALL
 SELECT (SELECT length(content_hash)+20 FROM class_projections WHERE cid=x.cid)+COALESCE(length(CAST(x.id AS BLOB)),0)+39+(CASE WHEN x.target IS NULL THEN 0 ELSE 39 END)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.cid=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 32;
+const DATABASE_SCHEMA_VERSION: u32 = 33;
 const EXTRACTOR_VERSION: &str = "native-v6-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const CACHE_SCHEMA_V32: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=32), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
+const CACHE_SCHEMA_V33: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=33), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v6-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -756,6 +756,7 @@ CREATE TABLE semantic_requested_producer_languages(revision_id TEXT NOT NULL,id 
 CREATE TABLE semantic_coverage(tuple_id INTEGER PRIMARY KEY,revision_id TEXT NOT NULL,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,path TEXT NOT NULL,requested INTEGER NOT NULL CHECK(requested IN (0,1)),selected INTEGER NOT NULL CHECK(selected IN (0,1)),state TEXT NOT NULL CHECK(state IN ('notRequested','omitted','unsupported','failed','partial','complete')),diagnostic TEXT,UNIQUE(revision_id,producer_id,language,path),UNIQUE(tuple_id,revision_id),FOREIGN KEY(revision_id) REFERENCES native_revisions(id),FOREIGN KEY(producer_id,producer_version,language) REFERENCES semantic_producer_languages(id,version,language),FOREIGN KEY(revision_id,producer_id,producer_version) REFERENCES semantic_revision_producers(revision_id,id,version),FOREIGN KEY(revision_id,language,path) REFERENCES revision_documents(revision_id,language,path));
 CREATE INDEX semantic_coverage_history ON semantic_coverage(producer_id,language,path,revision_id);
 CREATE TABLE semantic_coverage_roles(tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id),kind TEXT NOT NULL CHECK(kind IN ('supported','observed')),ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),role TEXT NOT NULL CHECK(role IN ('definition','read','write','call','type','import','alias')),PRIMARY KEY(tuple_id,kind,ordinal),UNIQUE(tuple_id,kind,role));
+CREATE TABLE semantic_coverage_reasons(tuple_id INTEGER PRIMARY KEY REFERENCES semantic_coverage(tuple_id),macro_invocation INTEGER NOT NULL CHECK(macro_invocation BETWEEN 0 AND 9007199254740991),attribute_item INTEGER NOT NULL CHECK(attribute_item BETWEEN 0 AND 9007199254740991),macro_definition INTEGER NOT NULL CHECK(macro_definition BETWEEN 0 AND 9007199254740991),other INTEGER NOT NULL CHECK(other BETWEEN 0 AND 9007199254740991),capped INTEGER NOT NULL CHECK(capped IN (0,1)),omitted INTEGER NOT NULL CHECK(omitted IN (0,1)),captured_diagnostics INTEGER NOT NULL CHECK(captured_diagnostics IN (0,1)));
 CREATE TABLE semantic_basis(basis_id INTEGER PRIMARY KEY,tuple_id INTEGER NOT NULL REFERENCES semantic_coverage(tuple_id),producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,producer_hash TEXT NOT NULL,artifact_hash TEXT NOT NULL,language TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_native_revision_id TEXT NOT NULL,source_manifest_hash TEXT NOT NULL,toolchain_hash TEXT NOT NULL,config_hash TEXT NOT NULL,dependency_hash TEXT NOT NULL,UNIQUE(tuple_id,basis_id));
 CREATE TABLE semantic_basis_lookup_dependencies(basis_id INTEGER NOT NULL REFERENCES semantic_basis(basis_id),ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),lookup_key TEXT NOT NULL,PRIMARY KEY(basis_id,ordinal),UNIQUE(basis_id,lookup_key));
 CREATE TABLE semantic_raw_batches(batch_id INTEGER PRIMARY KEY,producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,profile_id TEXT NOT NULL,source_set_id TEXT NOT NULL,captured_revision TEXT NOT NULL,source_manifest_hash TEXT NOT NULL CHECK(length(source_manifest_hash)=64),descriptor_sha256 TEXT NOT NULL CHECK(length(descriptor_sha256)=64),descriptor_bytes BLOB NOT NULL,decoder_version TEXT NOT NULL,UNIQUE(producer_id,descriptor_sha256,captured_revision));
@@ -3735,7 +3736,7 @@ fn expected_cache_objects() -> Result<&'static Vec<CacheObject>> {
     #[cfg(test)]
     EXPECTED_CACHE_SHAPE_BUILDS.with(|count| count.set(count.get() + 1));
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CACHE_SCHEMA_V32)?;
+    expected.execute_batch(CACHE_SCHEMA_V33)?;
     let built = cache_objects(&expected)?;
     Ok(EXPECTED.get_or_init(|| built))
 }
@@ -3759,7 +3760,7 @@ mod cache_shape_once_tests {
 
     fn current_schema_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(CACHE_SCHEMA_V32).unwrap();
+        db.execute_batch(CACHE_SCHEMA_V33).unwrap();
         db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
             .unwrap();
         db
@@ -6372,6 +6373,8 @@ fn copy_semantic_rows_filtered(
             )?;
             continue;
         }
+        // An exact copy keeps its partial state, so it keeps the reasons recorded for it.
+        copy_semantic_table(db, "semantic_coverage_reasons", "tuple_id", old, tuple)?;
         let mut basis_ids = BTreeMap::new();
         for basis in semantic_table_ids(db, "semantic_basis", "tuple_id", old)? {
             let new = copy_semantic_surrogate(
@@ -6837,6 +6840,40 @@ fn semantic_candidate_ids(
     Ok(ids)
 }
 
+/// The import-time partial reasons stored for one coverage tuple (#520).
+fn read_coverage_reasons(
+    db: &Connection,
+    tuple: i64,
+) -> Result<Option<crate::semantic_evidence::CoverageReasons>> {
+    let row: Option<([i64; 4], [bool; 3])> = db
+        .prepare_cached(
+            "SELECT macro_invocation,attribute_item,macro_definition,other,capped,omitted,captured_diagnostics
+             FROM semantic_coverage_reasons WHERE tuple_id=?1",
+        )?
+        .query_row([tuple], |r| {
+            Ok((
+                [r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?],
+                [r.get(4)?, r.get(5)?, r.get(6)?],
+            ))
+        })
+        .optional()?;
+    row.map(|(gaps, [capped, omitted, diagnostics])| {
+        let mut counts = [0u64; 4];
+        for (count, stored) in counts.iter_mut().zip(gaps) {
+            *count = u64::try_from(stored).context(SelectedIntegrity(
+                "incompatible_index: invalid stored coverage reason count".into(),
+            ))?;
+        }
+        Ok(crate::semantic_evidence::CoverageReasons::new(
+            counts,
+            capped,
+            omitted,
+            diagnostics,
+        ))
+    })
+    .transpose()
+}
+
 fn read_semantic(db: &Connection, key: &str) -> Result<crate::semantic_evidence::SemanticSnapshot> {
     read_semantic_tuple(db, key, None, None, false)
 }
@@ -6925,6 +6962,13 @@ fn read_semantic_tuple_for_call(
             supported_roles,
             observed_roles,
             diagnostic,
+            // A whole-revision snapshot carries each tuple's import-time reasons (#520); the
+            // tuple reads behind graph results and history do not.
+            reasons: if selected_tuple.is_none() {
+                read_coverage_reasons(db, tuple)?
+            } else {
+                None
+            },
         });
         let document = DocumentKey {
             source_set_id: source_set.clone(),
@@ -9459,6 +9503,7 @@ fn selected_native_rejoin_once(
                                 diagnostic: requested
                                     .contains(&doc.key)
                                     .then(|| diagnostic.clone()),
+                                reasons: None,
                             })
                     })
                     .collect();
@@ -9683,6 +9728,23 @@ fn write_semantic_tuple(
     publication: &crate::semantic_evidence::SemanticPublication,
 ) -> Result<()> {
     use crate::semantic_evidence as sem;
+    if let Some(reasons) = &coverage.reasons {
+        let gaps = reasons.gaps();
+        execute_cached(
+            db,
+            "INSERT INTO semantic_coverage_reasons VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                tuple,
+                i64::try_from(gaps[0])?,
+                i64::try_from(gaps[1])?,
+                i64::try_from(gaps[2])?,
+                i64::try_from(gaps[3])?,
+                reasons.capped,
+                reasons.omitted,
+                reasons.captured_diagnostics
+            ],
+        )?;
+    }
     let matches = |p: &sem::Provenance| {
         p.producer_id == coverage.producer_id
             && p.document.language == semantic_variant(&coverage.language).unwrap_or_default()
@@ -10091,6 +10153,7 @@ fn release_semantic_tuple(db: &Connection, revision: &str) -> Result<bool> {
         ),
         ("semantic_basis", "tuple_id=?1"),
         ("semantic_coverage_roles", "tuple_id=?1"),
+        ("semantic_coverage_reasons", "tuple_id=?1"),
     ] {
         let removed = db.execute(&format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {scope} LIMIT 64)"),[tuple])?;
         if removed > 0 {
@@ -10748,7 +10811,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V32 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V33 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -10791,6 +10854,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         "semantic_requested_producer_languages",
         "semantic_coverage",
         "semantic_coverage_roles",
+        "semantic_coverage_reasons",
         "semantic_basis",
         "semantic_basis_lookup_dependencies",
         "semantic_provenance",
@@ -13413,7 +13477,7 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V32)?;
+                db.execute_batch(CACHE_SCHEMA_V33)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -18601,7 +18665,7 @@ impl Store {
             if rebaseline {
                 // An incompatible/corrupt generation is explicitly replaced, never served.
                 // Only compatible same-generation publication appends history.
-                tx.execute_batch("DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_revision_raw_selections; DELETE FROM semantic_raw_proofs; DELETE FROM semantic_raw_captures; DELETE FROM semantic_raw_exclusions; DELETE FROM semantic_raw_batches; DELETE FROM semantic_import_reports; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
+                tx.execute_batch("DELETE FROM semantic_reference_roles; DELETE FROM semantic_reference_candidates; DELETE FROM semantic_symbol_targets; DELETE FROM semantic_declaration_binding_symbols; DELETE FROM semantic_declaration_join_candidates; DELETE FROM semantic_call_candidates; DELETE FROM semantic_call_possible_dispatch; DELETE FROM semantic_call_join_candidates; DELETE FROM semantic_type_relationships; DELETE FROM semantic_references; DELETE FROM semantic_symbols; DELETE FROM semantic_declaration_bindings; DELETE FROM semantic_call_bindings; DELETE FROM semantic_provenance; DELETE FROM semantic_revision_raw_selections; DELETE FROM semantic_raw_proofs; DELETE FROM semantic_raw_captures; DELETE FROM semantic_raw_exclusions; DELETE FROM semantic_raw_batches; DELETE FROM semantic_import_reports; DELETE FROM semantic_basis_lookup_dependencies; DELETE FROM semantic_basis; DELETE FROM semantic_coverage_roles; DELETE FROM semantic_coverage_reasons; DELETE FROM semantic_coverage; DELETE FROM semantic_requested_producer_languages; DELETE FROM semantic_requested_producers; DELETE FROM semantic_revision_producers; DELETE FROM semantic_producer_languages; DELETE FROM semantic_producers; DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
                 DELETE FROM native_version_references; DELETE FROM native_version_capability_gaps; DELETE FROM native_version_macro_expansions;
                 DELETE FROM native_version_capability_families;
                 DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
@@ -22370,7 +22434,7 @@ impl Store {
 #[test]
 fn selected_ancillary_budget_matches_main_text_key_bytes() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V32).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V33).unwrap();
     // The aggregate needs only synthetic child rows; FK behavior is covered by
     // publication/retention tests, not this isolated budget-SQL fixture.
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
@@ -22506,7 +22570,7 @@ fn selected_ancillary_budget_matches_main_text_key_bytes() {
 #[test]
 fn immutable_reference_slot_rejects_changed_payload() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(CACHE_SCHEMA_V32).unwrap();
+    db.execute_batch(CACHE_SCHEMA_V33).unwrap();
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     let owner = [0x11u8; 16];
     let original = [0x22u8; 16];

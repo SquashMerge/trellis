@@ -214,6 +214,7 @@ fn evidence(
             supported_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
             observed_roles: vec![s::Role::Definition, s::Role::Call, s::Role::Type],
             diagnostic: None,
+            reasons: None,
         }],
         provenance: vec![
             proof("bind", s::EvidenceKind::DeclarationBinding),

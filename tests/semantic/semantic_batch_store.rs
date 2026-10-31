@@ -6384,6 +6384,191 @@ fn real_rust_analyzer_over_cap_document_is_admitted_partial_with_its_reason() {
     );
 }
 
+/// A Rust document with an attribute, a macro invocation hiding a definition and an ordinary
+/// call: seven occurrences, four of them definitions.
+const GAPS_RS: &str = "#[derive(Debug)]\npub struct Point;\n\nmy_macro! { fn hidden() {} }\n\npub fn run() { helper(); }\npub fn helper() {}\n";
+
+fn gaps_doc() -> DocSpec {
+    DocSpec::new("src/lib.rs")
+        .occurrence(&[0, 9, 14], &[], "external pkg Debug#", 0)
+        .occurrence(&[1, 11, 16], &[], "pkg Point#", 1)
+        .occurrence(&[3, 0, 8], &[], "external pkg my_macro.", 0)
+        .occurrence(&[3, 15, 21], &[], "pkg hidden.", 1)
+        .occurrence(&[5, 7, 10], &[], "pkg run.", 1)
+        .occurrence(&[5, 15, 21], &[5, 15, 23], "pkg helper.", 0)
+        .occurrence(&[6, 7, 13], &[], "pkg helper.", 1)
+        .symbol("pkg run.", 17, &[])
+        .symbol("pkg helper.", 17, &[])
+}
+
+/// #520: a partial document records every reason, not only the diagnostic's. Under the
+/// per-document cap the macro-hidden definition still counts as a native gap, so the row is
+/// `unsupported_native_gap` and capped at once. Both join paths, the stored row, the import
+/// report and status agree.
+#[test]
+fn partial_document_records_a_native_gap_and_the_cap_together() {
+    use trellis::semantic_evidence::{CoverageReasons, CoverageState};
+    let world = world(|root| {
+        write_files(
+            root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"gaps\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("src/lib.rs", GAPS_RS),
+            ],
+        )
+    });
+    let mut fixture = world.fixture();
+    fixture.artifact("rust", vec![gaps_doc()]);
+    let descriptor = world.write(&fixture);
+    let capped_limits = BatchLimits {
+        document_occurrences: 5,
+        ..BatchLimits::PRODUCTION
+    };
+    let cases = [
+        (
+            BatchLimits::PRODUCTION,
+            "uncapped",
+            CoverageReasons::new([2, 1, 0, 0], false, false, false),
+            "partial: 1 · native macro/attribute gaps only",
+        ),
+        (
+            capped_limits,
+            "capped",
+            CoverageReasons::new([1, 0, 0, 0], true, false, false),
+            "partial: 1 · native gaps 1, occurrence cap 1",
+        ),
+    ];
+    for (limits, case, expected, summary) in cases {
+        let (mut admitted, joined, _) = world
+            .join_with(&descriptor, &limits, DestinationMutations::default())
+            .unwrap();
+        let staged = testing::staged_publication(&mut admitted).unwrap();
+        let rejoined = world
+            .memory_rejoin_with(&descriptor, DestinationMutations::default(), &limits)
+            .unwrap();
+        assert_same_publication(&staged, &rejoined.publication, case);
+        let row = coverage_of(&staged, "src/lib.rs");
+        assert_eq!(row.state, CoverageState::Partial, "{case}");
+        assert_eq!(
+            row.diagnostic.as_deref(),
+            Some("unsupported_native_gap"),
+            "{case}"
+        );
+        assert_eq!(row.reasons, Some(expected.clone()), "{case}");
+        // The report gives the same reasons on both paths.
+        let reasons = &joined.report()["languages"][0]["partialReasons"];
+        assert_eq!(
+            reasons, &rejoined.report["languages"][0]["partialReasons"],
+            "{case}"
+        );
+        assert_eq!(reasons["documents"], 1, "{case}");
+        assert_eq!(reasons["capped"], u64::from(expected.capped), "{case}");
+        assert_eq!(
+            reasons["unsupportedOccurrences"],
+            json!({"macroInvocation": expected.macro_invocation,
+                   "attributeItem": expected.attribute_item, "macroDefinition": 0, "other": 0}),
+            "{case}"
+        );
+        assert_eq!(
+            reasons["listed"],
+            json!([{"path": "src/lib.rs", "diagnostic": "unsupported_native_gap",
+                    "reasons": serde_json::to_value(&expected).unwrap()}]),
+            "{case}"
+        );
+        assert_eq!(reasons["unlisted"], 0, "{case}");
+        // Publication stores the reasons, and status summarizes them for the language.
+        let leader = world.store.publication_for_tests().unwrap();
+        let pin = world
+            .store
+            .publish_semantic_batch(
+                &joined,
+                admitted.stage_mut(),
+                joined.destination_pin(),
+                &leader,
+                &world.cancel,
+            )
+            .unwrap();
+        drop(leader);
+        let published = world.store.semantic_at(pin).unwrap();
+        assert_eq!(
+            published
+                .coverage
+                .iter()
+                .find(|row| row.document_path == "src/lib.rs")
+                .unwrap()
+                .reasons,
+            Some(expected.clone()),
+            "{case}"
+        );
+        let status = world.store.status().unwrap();
+        let coverage = language_row(&status, "rust").coverage.clone().unwrap();
+        assert_eq!(
+            (coverage.complete, coverage.partial, coverage.failed),
+            (0, 1, 0),
+            "{case}"
+        );
+        assert_eq!(coverage.summary.as_deref(), Some(summary), "{case}");
+        assert_eq!(
+            coverage.partial_reasons.capped,
+            usize::from(expected.capped),
+            "{case}"
+        );
+        assert_eq!(
+            coverage
+                .partial_reasons
+                .unsupported_occurrences
+                .macro_invocation,
+            expected.macro_invocation,
+            "{case}"
+        );
+    }
+    // A later native revision rejoins the selected batch, under production limits, and records
+    // the rejoined tuple's reasons again.
+    write_files(&world.root, &[("src/other.rs", "pub fn other() {}\n")]);
+    world.republish_with_rejoin();
+    let head = world.store.index_baseline().unwrap();
+    let carried = world.store.semantic_at(head).unwrap();
+    assert_eq!(
+        carried
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/lib.rs")
+            .unwrap()
+            .reasons,
+        Some(CoverageReasons::new([2, 1, 0, 0], false, false, false))
+    );
+    let status = world.store.status().unwrap();
+    assert_eq!(
+        language_row(&status, "rust")
+            .coverage
+            .as_ref()
+            .unwrap()
+            .summary
+            .as_deref(),
+        Some("partial: 1 · native macro/attribute gaps only")
+    );
+    // MCP describe reads the same summary for the language's selected producer.
+    let tiers = world
+        .store
+        .evidence_response()
+        .unwrap()
+        .mcp_language_tiers()
+        .unwrap();
+    let rust = tiers[1].partial_reasons.as_ref().unwrap();
+    assert_eq!(
+        rust.summary.as_deref(),
+        Some("partial: 1 · native macro/attribute gaps only")
+    );
+    assert_eq!(
+        rust.partial_reasons.unsupported_occurrences.attribute_item,
+        1
+    );
+    assert!(tiers[0].partial_reasons.is_none());
+}
+
 /// The aggregate candidate cap still fails typed and atomically on both paths (#394, a).
 #[test]
 fn real_rust_analyzer_aggregate_candidate_cap_fails_typed_and_atomically() {

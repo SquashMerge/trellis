@@ -327,6 +327,80 @@ pub struct LanguageSemantic {
     pub external: usize,
     pub ambiguous: usize,
     pub unresolved: usize,
+    /// The producer's coverage tuples for the language by state, and why the partial ones are
+    /// partial (#520). Absent when no producer is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<SemanticCoverageSummary>,
+}
+/// One language's semantic coverage tuples at a revision, by state (#520).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticCoverageSummary {
+    pub complete: usize,
+    pub partial: usize,
+    pub failed: usize,
+    /// Omitted, unsupported and not-requested tuples.
+    pub unselected: usize,
+    pub partial_reasons: PartialReasons,
+    /// One line for people, such as `partial: 243 · native macro/attribute gaps only`; absent
+    /// when no tuple is partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+/// Why a language's partial tuples are partial (#520). Each count is of partial documents
+/// with that reason; one document can have several. `unrecorded` counts partial tuples no
+/// import recorded reasons for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialReasons {
+    pub native_gaps: usize,
+    pub native_gaps_only: usize,
+    pub capped: usize,
+    pub omitted: usize,
+    pub captured_diagnostics: usize,
+    pub unrecorded: usize,
+    /// Unsupported occurrences under a native gap, by gap kind.
+    pub unsupported_occurrences: GapOccurrences,
+}
+/// Unsupported occurrences by the kind of native gap that hid them (#520).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GapOccurrences {
+    pub macro_invocation: u64,
+    pub attribute_item: u64,
+    pub macro_definition: u64,
+    pub other: u64,
+}
+impl SemanticCoverageSummary {
+    /// `partial: N · <reasons>`: "native macro/attribute gaps only" when every partial tuple
+    /// is partial only for gaps of those kinds, else each reason with its document count.
+    pub fn describe(&self) -> Option<String> {
+        if self.partial == 0 {
+            return None;
+        }
+        let reasons = &self.partial_reasons;
+        let detail = if reasons.native_gaps_only == self.partial {
+            if reasons.unsupported_occurrences.other == 0 {
+                "native macro/attribute gaps only".to_owned()
+            } else {
+                "native gaps only".to_owned()
+            }
+        } else {
+            [
+                ("native gaps", reasons.native_gaps),
+                ("occurrence cap", reasons.capped),
+                ("omitted dependents", reasons.omitted),
+                ("captured diagnostics", reasons.captured_diagnostics),
+                ("unrecorded", reasons.unrecorded),
+            ]
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(reason, count)| format!("{reason} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+        };
+        Some(format!("partial: {} · {detail}", self.partial))
+    }
 }
 /// Bytes allowed in a requested semantic producer ID.
 pub const SEMANTIC_PRODUCER_ID_BYTES: usize = 512;
