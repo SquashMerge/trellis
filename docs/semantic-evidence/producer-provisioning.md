@@ -51,4 +51,4 @@ The real-producer tests are the `producer_e2e`, `producer_e2e_java` and `produce
 
 ## Re-pinning
 
-Changing a pin follows [Decision 0017](decisions/0017-conformance-corpus-storage-and-producers.md) item 5: update the profile row (version, `installMethod`, hashes), then this table, and re-run the strict variants. A new version is never accepted by loosening detection.
+Changing a pin follows [Decision 0017](decisions/0017-conformance-corpus-storage-and-producers.md) item 5: update the profile row (version, `installMethod`, hashes), then this table, and re-run the strict variants. A rust-analyzer re-pin records every target in `targetPins`, as [Amendment 6](decisions/0017-conformance-corpus-storage-and-producers.md#amendment-6-2026-10-31-one-rust-analyzer-pin-per-target) requires. A new version is never accepted by loosening detection.
