@@ -455,3 +455,32 @@ fn hostile_macro_input_is_bounded_and_never_fails_the_document() {
         assert!(artifact.calls.is_empty(), "{body}");
     }
 }
+
+#[test]
+fn qualified_paths_with_whitespace_and_comments_are_allowlisted() {
+    let text = "fn g() -> i32 { 1 }\nfn f(w: &mut String) -> anyhow::Result<()> {\n    std :: assert!(g() > 0);\n    core::/* c */assert_eq!(g(), 1);\n    ::alloc\n        ::vec![g()];\n    anyhow:: ensure!(g() > 0);\n    std::write!(w, \"{}\", g())?;\n    std::other!(g());\n    Ok(())\n}\n";
+    let artifact = measure(&rust("src/paths.rs", text), true);
+    let calls = artifact
+        .calls
+        .iter()
+        .filter(|c| c.spelling.as_deref() == Some("g"))
+        .count();
+    assert_eq!(calls, 5);
+    assert_eq!(artifact.capability_reports[0].macro_expansions.len(), 5);
+    assert_eq!(gaps(&artifact).len(), 1, "only std::other! stays opaque");
+}
+
+#[test]
+fn escaped_format_braces_keep_the_capture_gap() {
+    let text = "fn run() -> String { let value = 1; format!(\"\\u{07b}value}\") }\n";
+    let artifact = measure(&rust("src/escaped.rs", text), true);
+    let literal = span(text, "\"\\u{07b}value}\"");
+    assert_eq!(
+        gaps(&artifact)
+            .iter()
+            .map(|g| g.range.clone())
+            .collect::<Vec<_>>(),
+        vec![literal]
+    );
+    assert_eq!(artifact.coverage[0].state, "partial");
+}

@@ -28,14 +28,14 @@ pub(crate) fn expression_macro(n: Node<'_>, text: &str) -> Option<MacroForm> {
     if !matches!(path.kind(), "identifier" | "scoped_identifier") {
         return None;
     }
-    let spelled = text.get(path.byte_range())?;
-    let (prefix, name) = match spelled.rsplit_once("::") {
-        Some((prefix, name)) => (Some(prefix), name),
-        None => (None, spelled),
-    };
-    let std = prefix
-        .is_none_or(|p| matches!(p, "std" | "core" | "alloc" | "::std" | "::core" | "::alloc"));
-    let anyhow = prefix.is_none_or(|p| matches!(p, "anyhow" | "::anyhow"));
+    // Match parsed path components, so whitespace or comments between segments do not matter.
+    let mut segments = Vec::new();
+    path_segments(path, text, &mut segments)?;
+    let (name, prefix) = segments.split_last()?;
+    let prefix = (!prefix.is_empty()).then_some(prefix);
+    let std = prefix.is_none_or(|p| matches!(p, ["std" | "core" | "alloc"]));
+    let anyhow = prefix.is_none_or(|p| matches!(p, ["anyhow"]));
+    let name = *name;
     let format = |index| Some(MacroForm::Arguments { format: index });
     match name {
         "vec" if std => Some(MacroForm::Array),
@@ -52,6 +52,26 @@ pub(crate) fn expression_macro(n: Node<'_>, text: &str) -> Option<MacroForm> {
         "bail" | "anyhow" if anyhow => format(Some(0)),
         _ => None,
     }
+}
+
+/// The identifier segments of a macro path; a leading `::` adds none. `None` for any
+/// other path form (`crate`, `self`, `super`, generics), which stays outside the allowlist.
+fn path_segments<'t>(n: Node<'_>, text: &'t str, out: &mut Vec<&'t str>) -> Option<()> {
+    match n.kind() {
+        "identifier" => out.push(text.get(n.byte_range())?),
+        "scoped_identifier" => {
+            if let Some(path) = n.child_by_field_name("path") {
+                path_segments(path, text, out)?;
+            }
+            let name = n.child_by_field_name("name")?;
+            if name.kind() != "identifier" {
+                return None;
+            }
+            out.push(text.get(name.byte_range())?);
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 /// The macro's delimited token tree.
@@ -158,36 +178,33 @@ pub(crate) fn extent(n: Node<'_>, limit: usize) -> Option<(usize, usize)> {
 }
 
 /// Whether a format-string literal names an argument: an implicit `{name}` capture, a
-/// `{name}` named argument, or a `name$` width or precision. Such names stay opaque.
+/// `{name}` named argument, or a `name$` width or precision. Such names stay opaque. A
+/// non-raw literal is judged by its decoded value, since an escape such as `\u{7b}` is a
+/// format brace after unescaping; an escape that does not decode keeps it opaque.
 pub(crate) fn names_arguments(literal: &str, raw: bool) -> bool {
-    // An escaped `{` (`\x7b`, `\u{7b}`) is a format brace after unescaping; stay opaque.
-    let lower = literal.to_ascii_lowercase();
-    if !raw
-        && ["\\x7b", "\\u{7b}", "\\u{007b}"]
-            .iter()
-            .any(|e| lower.contains(e))
-    {
-        return true;
-    }
-    let bytes = literal.as_bytes();
+    let decoded;
+    let value = if raw {
+        literal
+    } else {
+        match unescape(literal) {
+            Some(text) => {
+                decoded = text;
+                decoded.as_str()
+            }
+            None => return true,
+        }
+    };
+    let bytes = value.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            // `\u{...}` is an escape, never a placeholder.
-            b'\\' if !raw && bytes.get(i + 1) == Some(&b'u') && bytes.get(i + 2) == Some(&b'{') => {
-                i = bytes[i..]
-                    .iter()
-                    .position(|&b| b == b'}')
-                    .map_or(bytes.len(), |p| i + p + 1);
-            }
-            b'\\' if !raw => i += 2,
             b'{' if bytes.get(i + 1) == Some(&b'{') => i += 2,
             b'{' => {
                 let close = bytes[i + 1..]
                     .iter()
                     .position(|&b| b == b'}')
                     .map_or(bytes.len(), |p| i + 1 + p);
-                if placeholder_names_argument(&literal[i + 1..close]) {
+                if placeholder_names_argument(&value[i + 1..close]) {
                     return true;
                 }
                 i = close + 1;
@@ -196,6 +213,54 @@ pub(crate) fn names_arguments(literal: &str, raw: bool) -> bool {
         }
     }
     false
+}
+
+/// The value of a non-raw Rust string literal's escapes; `None` for an escape it cannot decode.
+fn unescape(literal: &str) -> Option<String> {
+    let mut out = String::with_capacity(literal.len());
+    let mut chars = literal.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '0' => out.push('\0'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            'x' => {
+                let hex: String = [chars.next()?, chars.next()?].iter().collect();
+                out.push(char::from(u8::from_str_radix(&hex, 16).ok()?));
+            }
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let mut hex = String::new();
+                loop {
+                    match chars.next()? {
+                        '}' => break,
+                        '_' => {}
+                        digit if digit.is_ascii_hexdigit() && hex.len() < 6 => hex.push(digit),
+                        _ => return None,
+                    }
+                }
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            // A line continuation skips the newline and the following whitespace.
+            '\n' | '\r' => {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn identifier_start(c: char) -> bool {
@@ -245,7 +310,18 @@ mod tests {
             assert!(!names_arguments(literal, false), "{literal}");
         }
         assert!(names_arguments(r#"r"\u{a}""#, true));
-        assert!(names_arguments(r#""\x7bx}""#, false));
-        assert!(names_arguments(r#""\u{7B}x}""#, false));
+        // Escaped opening braces are braces after unescaping (#532 review).
+        for literal in [
+            r#""\x7bx}""#,
+            r#""\u{7B}x}""#,
+            r#""\u{07b}value}""#,
+            r#""\u{00007b}value}""#,
+            r#""\u{7_b}value}""#,
+        ] {
+            assert!(names_arguments(literal, false), "{literal}");
+        }
+        // Escaped `{{` stays a literal brace, and a raw string never unescapes.
+        assert!(!names_arguments(r#""\u{7b}{x}}""#, false));
+        assert!(!names_arguments(r#"r"\u{7b}x}""#, true));
     }
 }
