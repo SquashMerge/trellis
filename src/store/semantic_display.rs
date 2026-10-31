@@ -744,6 +744,8 @@ pub struct LanguageTier {
     pub counts: [u64; 5],
     /// `fresh`, `possiblyStale` or `stale` over the usable tuples' proofs, else `unavailable`.
     pub freshness: &'static str,
+    /// Why the producer's partial tuples are partial (#520), when any is.
+    pub partial_reasons: Option<crate::model::SemanticCoverageSummary>,
 }
 
 impl LanguageTier {
@@ -822,6 +824,14 @@ impl EvidenceResponse {
                     }
                     None => tier.counts[4] += count,
                 }
+            }
+            if tier.counts[2] > 0 {
+                tier.partial_reasons = Some(coverage_summary(
+                    &self.db,
+                    &selected.key,
+                    producer,
+                    language,
+                )?);
             }
             if tier.counts[1] + tier.counts[2] == 0 {
                 continue;

@@ -77,6 +77,23 @@ fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
         .collect()
 }
 
+/// Describe's `LanguageStatus` rows: each semantic block also says why its partial tuples
+/// are partial (#520), or `null` when none is.
+fn describe_language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
+    let mut languages = language_status(rows, tiers);
+    for (status, tier) in languages.iter_mut().zip(tiers) {
+        status["semantic"]["partialReasons"] = tier.partial_reasons.as_ref().map_or(
+            Value::Null,
+            |summary| {
+                let mut reasons = json!(summary.partial_reasons);
+                reasons["summary"] = json!(summary.summary);
+                reasons
+            },
+        );
+    }
+    languages
+}
+
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
 
 /// The `syntaxOnly` warning for `languages` (#528). It says the answer itself is
@@ -117,7 +134,7 @@ pub fn describe(
     });
     let languages: Vec<Value> = counts
         .as_ref()
-        .map_or_else(Vec::new, |(rows, tiers)| language_status(rows, tiers));
+        .map_or_else(Vec::new, |(rows, tiers)| describe_language_status(rows, tiers));
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
@@ -215,6 +232,57 @@ mod tests {
     /// #528: a fresh selected import reports the semantic tier beside native coverage;
     /// partial semantic coverage stays partial, and stale evidence stays syntax.
     #[test]
+    fn describe_names_why_semantic_tuples_are_partial() {
+        use crate::model::{GapOccurrences, PartialReasons, SemanticCoverageSummary};
+        let mut tiers = rust_semantic("fresh", [355, 300, 55, 0, 0]);
+        let mut summary = SemanticCoverageSummary {
+            complete: 300,
+            partial: 55,
+            partial_reasons: PartialReasons {
+                native_gaps: 54,
+                native_gaps_only: 53,
+                capped: 2,
+                unsupported_occurrences: GapOccurrences {
+                    macro_invocation: 900,
+                    attribute_item: 40,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        summary.summary = summary.describe();
+        tiers[1].partial_reasons = Some(summary);
+        let described = describe(
+            &json!(1),
+            "project",
+            "ready",
+            None,
+            Some(([[0; 5], [355, 300, 55, 0, 0], [0; 5], [0; 5]], tiers.clone())),
+            None,
+            false,
+        );
+        assert_eq!(
+            described["data"]["languages"][1]["semantic"]["partialReasons"],
+            json!({"nativeGaps":54,"nativeGapsOnly":53,"capped":2,"omitted":0,
+                "capturedDiagnostics":0,"unrecorded":0,
+                "unsupportedOccurrences":{"macroInvocation":900,"attributeItem":40,
+                    "macroDefinition":0,"other":0},
+                "summary":"partial: 55 · native gaps 54, occurrence cap 2"})
+        );
+        assert_eq!(
+            described["data"]["languages"][0]["semantic"]["partialReasons"],
+            Value::Null
+        );
+        // Only describe carries the reasons; scope coverage keeps its compact shape.
+        assert!(
+            language_status(&[[0; 5]; 4], &tiers)[1]["semantic"]
+                .get("partialReasons")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn describe_reports_the_imported_semantic_tier_per_language() {
         let rows = [[1, 1, 0, 0, 0], [355, 22, 333, 0, 0], [0; 5], [0; 5]];
         let basis =
@@ -238,7 +306,8 @@ mod tests {
         assert_eq!(
             rust["semantic"],
             json!({"available":true,"producerId":"rust-analyzer","freshness":"fresh","note":null,
-                "coverage":{"selected":355,"complete":300,"partial":55,"failed":0,"unselected":0}})
+                "coverage":{"selected":355,"complete":300,"partial":55,"failed":0,"unselected":0},
+                "partialReasons":null})
         );
         assert_eq!(
             fresh["data"]["languages"][0]["semantic"]["available"],

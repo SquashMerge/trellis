@@ -6550,6 +6550,20 @@ fn partial_document_records_a_native_gap_and_the_cap_together() {
             .as_deref(),
         Some("partial: 1 · native macro/attribute gaps only")
     );
+    // MCP describe reads the same summary for the language's selected producer.
+    let tiers = world
+        .store
+        .evidence_response()
+        .unwrap()
+        .mcp_language_tiers()
+        .unwrap();
+    let rust = tiers[1].partial_reasons.as_ref().unwrap();
+    assert_eq!(
+        rust.summary.as_deref(),
+        Some("partial: 1 · native macro/attribute gaps only")
+    );
+    assert_eq!(rust.partial_reasons.unsupported_occurrences.attribute_item, 1);
+    assert!(tiers[0].partial_reasons.is_none());
 }
 
 /// The aggregate candidate cap still fails typed and atomically on both paths (#394, a).

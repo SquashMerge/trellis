@@ -240,6 +240,74 @@
                       "type": "null"
                     }
                   ]
+                },
+                "partialReasons": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "nativeGaps": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "nativeGapsOnly": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "capped": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "omitted": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "capturedDiagnostics": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "unrecorded": {
+                          "$ref": "#/$defs/UInt"
+                        },
+                        "unsupportedOccurrences": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "macroInvocation": {
+                              "$ref": "#/$defs/UInt"
+                            },
+                            "attributeItem": {
+                              "$ref": "#/$defs/UInt"
+                            },
+                            "macroDefinition": {
+                              "$ref": "#/$defs/UInt"
+                            },
+                            "other": {
+                              "$ref": "#/$defs/UInt"
+                            }
+                          },
+                          "required": [
+                            "macroInvocation",
+                            "attributeItem",
+                            "macroDefinition",
+                            "other"
+                          ],
+                          "type": "object"
+                        },
+                        "summary": {
+                          "$ref": "#/$defs/Text"
+                        }
+                      },
+                      "required": [
+                        "nativeGaps",
+                        "nativeGapsOnly",
+                        "capped",
+                        "omitted",
+                        "capturedDiagnostics",
+                        "unrecorded",
+                        "unsupportedOccurrences",
+                        "summary"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "required": [
@@ -247,7 +315,8 @@
                 "producerId",
                 "freshness",
                 "coverage",
-                "note"
+                "note",
+                "partialReasons"
               ],
               "type": "object"
             }
