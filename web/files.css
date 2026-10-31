@@ -22,8 +22,20 @@ body.files-section #source { margin: 0; padding: 10px 0; font-size: 12px; }
 /* The preview scales down to the inspector's width (#451); Open full shows it at full size. */
 #files-mini-sequence { max-height: 300px; overflow: hidden auto; background: var(--rail); }
 #files-mini-sequence svg, #files-mini-sequence svg.pele.trellis-pele { display: block; width: auto; max-width: 100%; height: auto; flex: none; font: 12px var(--mono); }
+/* Below a readable text size the preview is not drawn (#514). */
+#files-mini-sequence[data-fit=floor] { display: none; }
+.files-mini-floor { margin: 8px 0 0; padding: 12px; background: var(--rail); font-size: 12px; color: var(--secondary); }
+.files-mini-floor button { margin-left: 4px; font-size: 12px; }
+#files-mini-about .popover-body { width: 300px; }
+#files-mini-notes li { margin: 0; color: var(--secondary); font-size: 13px; }
 #files-mini-state, #files-matches-state { font-size: 12px; color: var(--secondary); }
-.files-symbol-pick { display: flex; align-items: baseline; gap: 6px; width: 100%; padding: 5px 7px; border: 0; text-align: left; font: 12px/1.5 var(--mono); white-space: nowrap; }
+/* Types and callables; a container's members indent under it when expanded (#526). */
+.files-symbol-row { display: flex; align-items: stretch; min-width: 0; }
+.files-symbol-members { margin: 0; padding: 0 0 0 12px; list-style: none; }
+.files-symbol-toggle, .files-symbol-toggle-space { flex: none; width: 14px; }
+.files-symbol-toggle { padding: 0; border: 0; background: none; color: var(--secondary); font: 12px/1.5 var(--mono); min-height: 0; }
+.files-symbol-toggle:hover { color: var(--ink); }
+.files-symbol-pick { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 6px; width: 100%; padding: 5px 7px; border: 0; text-align: left; font: 12px/1.5 var(--mono); white-space: nowrap; }
 .files-symbol-icon { flex: none; color: var(--secondary); }
 .files-symbol-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .files-symbol-kind, .files-symbol-line { flex: none; color: var(--secondary); }

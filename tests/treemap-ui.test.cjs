@@ -109,10 +109,14 @@ test("keyboard-equivalent list selects exact duplicate paths including zero-area
 
 test("directory drills use exact source sets, breadcrumbs go up, language/path filters recompute area", async () => {
   const h = harness(); await h.controller.refresh();
+  // #527: at the whole snapshot there is no orphan "All indexed files" button.
+  assert.equal(h.get("treemap-breadcrumbs").hidden, true); assert.equal(h.get("treemap-breadcrumbs").children.length, 0);
   await h.renders[0].options.onSelectDirectory({sourceSetId:"workspace", path:"src"});
   assert.equal(h.renders.at(-1).files.length, 2); assert.match(h.get("treemap-summary").textContent, /11 physical file lines/);
+  assert.equal(h.get("treemap-breadcrumbs").hidden, false);
   assert.deepEqual(h.get("treemap-breadcrumbs").children.map(node => node.textContent), ["All indexed files", "workspace", "src"]);
   await h.get("treemap-breadcrumbs").children[0].fire("click");
+  assert.equal(h.get("treemap-breadcrumbs").hidden, true); assert.equal(h.get("treemap-breadcrumbs").children.length, 0);
   h.get("treemap-language").value = "python"; await h.get("treemap-language").fire("change");
   assert.equal(h.renders.at(-1).files.length, 1); assert.match(h.get("treemap-summary").textContent, /2 physical file lines/);
   h.get("treemap-path").value = "missing"; await h.get("treemap-path").fire("input");
@@ -143,13 +147,14 @@ test("full payload echoes and metadata reject atomically; same-pin aggregate rel
   h.setResponse(async () => ({payload:{...fixture("mean"),indexGeneration:"other"}}));await h.controller.refresh();assert.equal(h.conflicts.length,1);
 });
 
+// #527: the view has no Refresh button; the app's Refresh calls the controller's refresh.
 test("role, aggregate, refresh and local filters invalidate selected source and old render callbacks", async () => {
-  for (const change of ["treemap-metric-tests","treemap-aggregate","treemap-hide-tests","treemap-color","treemap-language","treemap-path","treemap-refresh"]) {
+  for (const change of ["treemap-metric-tests","treemap-aggregate","treemap-hide-tests","treemap-color","treemap-language","treemap-path","refresh"]) {
     const h=harness();await h.controller.refresh();const old=h.renders[0];old.options.onSelectFile(old.files.find(file => file.declarationCount));
     const button=h.button("Read indexed file source");await button.fire("click");assert.equal(h.reads[0].current(),true);
     const control=h.get(change);control.checked=!control.checked;control.value=({"treemap-aggregate":"sum","treemap-color":"role","treemap-language":"python","treemap-path":"src"})[change] || "";
     h.setResponse(async () => ({payload:fixture(change==="treemap-aggregate"?"sum":"max",change==="treemap-metric-tests"?"all":"production")}));
-    await control.fire(change==="treemap-path"?"input":change==="treemap-refresh"?"click":"change");
+    if (change==="refresh") await h.controller.refresh(); else await control.fire(change==="treemap-path"?"input":"change");
     assert.equal(h.reads[0].current(),false,change);await button.fire("click");assert.equal(h.reads.length,1,change);
     assert.equal(old.options.isCurrent(),false,change);old.options.onSelectFile(old.files[0]);assert.equal(h.get("treemap-inspector").hidden,true,change);
   }
@@ -166,10 +171,10 @@ test("late full-pin/root/session fetches cannot repaint or report conflicts", as
 });
 
 test("same-pin role/aggregate and refresh request serials fence late success and failure", async () => {
-  for (const control of ["treemap-metric-tests","treemap-aggregate","treemap-refresh"]) for (const reject of [false,true]) {
+  for (const control of ["treemap-metric-tests","treemap-aggregate","refresh"]) for (const reject of [false,true]) {
     const h=harness(), pending=deferred();h.setResponse(() => pending.promise);const loading=h.controller.refresh();
     h.setResponse(async () => ({payload:fixture(control==="treemap-aggregate"?"sum":"max",control==="treemap-metric-tests"?"all":"production")}));
-    h.get(control).checked=true;h.get(control).value="sum";await h.get(control).fire(control==="treemap-refresh"?"click":"change");const state=h.get("treemap-state").textContent;
+    h.get(control).checked=true;h.get(control).value="sum";if(control==="refresh")await h.controller.refresh();else await h.get(control).fire("change");const state=h.get("treemap-state").textContent;
     if(reject)pending.reject(Object.assign(new Error("old"),{status:409,code:"revision_conflict"}));else pending.resolve({payload:fixture()});await loading;
     assert.equal(h.renders.length,1);assert.equal(h.calls[0].current(),false);assert.equal(h.conflicts.length,0);assert.equal(h.get("treemap-state").textContent,state);
   }

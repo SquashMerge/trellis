@@ -7,21 +7,122 @@
     if (cls) node.className = cls;
     return node;
   };
-  function outline(list, items, selected, choose, current) {
-    list.replaceChildren();
-    for (const item of items) {
-      const symbol = item.symbol, row = make("li"), line = `L${symbol.range.startLine}`;
-      // One row: icon and name, then kind and line right-aligned. Names truncate, with the full text as a tooltip.
-      const pick = make("button", undefined, "files-symbol-pick"), icon = make("span", "◇", "files-symbol-icon");
-      icon.setAttribute("aria-hidden", "true");
-      const name = make("span", symbol.name, "files-symbol-name"); name.title = symbol.name;
-      pick.append(icon, name, make("span", item.nativeKind, "files-symbol-kind"), make("span", line, "files-symbol-line"));
-      pick.setAttribute("aria-label", `${symbol.name} · ${item.nativeKind} · ${line}`);
-      pick.type = "button"; pick.setAttribute("data-symbol-id", symbol.id);
-      pick.setAttribute("aria-pressed", String(selected?.symbol.id === symbol.id));
-      pick.addEventListener("click", () => { if (current()) return choose(item); });
-      row.append(pick); list.append(row);
+  // The outline lists types and callables (#526). Fields and nested types or callables are a
+  // container's members, shown when it is expanded; parameters, locals, aliases, closures and
+  // implementation blocks are not rows. A Rust `impl` block lends its methods to the type it
+  // names in this file (read from the impl's own first source line), or else becomes a row
+  // named by that type. An impl whose target cannot be read lends its methods to the top level.
+  const CONTAINERS = new Set(["type", "namespace"]);
+  const CALLABLES = new Set(["function", "method", "constructor"]);
+  const MEMBERS = new Set(["field"]);
+  function implTarget(item, sourceText) {
+    if (typeof sourceText !== "string" || !Number.isSafeInteger(item.symbol.range?.startLine)) return null;
+    // Bounded: only the impl's first line, up to its body.
+    let start = 0;
+    for (let line = 1; line < item.symbol.range.startLine; line++) {
+      const next = sourceText.indexOf("\n", start);
+      if (next === -1) return null;
+      start = next + 1;
     }
+    const end = sourceText.indexOf("\n", start), head = sourceText.slice(start, end === -1 ? undefined : Math.min(end, start + 512));
+    const match = /^\s*(?:(?:pub(?:\([^)]*\))?|unsafe|default)\s+)*impl\b\s*(?:<[^{]*?>\s*)?(?:[^{]*?\bfor\s+)?(?:&\s*)?(?:dyn\s+)?([A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*)/.exec(head);
+    return match ? match[1].split("::").at(-1) : null;
+  }
+  function outlineTree(items, sourceText) {
+    const byId = new Map(items.map(item => [item.symbol.id, item]));
+    const nodes = new Map(), roots = [];
+    const node = item => { let entry = nodes.get(item.symbol.id); if (!entry) { entry = {item, children:[]}; nodes.set(item.symbol.id, entry); } return entry; };
+    // An impl names its type; prefer the type declared beside it (same parent), then any of that name.
+    const typesByName = new Map();
+    for (const item of items) if (item.nativeKind === "type") typesByName.set(item.symbol.name, [...(typesByName.get(item.symbol.name) || []), item]);
+    const typeFor = (name, impl) => { const types = typesByName.get(name) || []; return types.find(type => type.symbol.parent === impl.symbol.parent) || types[0]; };
+    // A variable bound to a function (`const f = () => {}`, `f = lambda: …`) is a callable row.
+    const boundFunctions = new Set();
+    for (const item of items) {
+      const parent = byId.get(item.symbol.parent);
+      if (item.nativeKind === "anonymousFunction" && parent?.nativeKind === "variable") boundFunctions.add(parent.symbol.id);
+    }
+    const callable = item => CALLABLES.has(item.nativeKind) || boundFunctions.has(item.symbol.id);
+    // A named impl container per target type that is not declared in this file.
+    const implRows = new Map(), implOwner = new Map();
+    for (const item of items) {
+      if (item.nativeKind !== "implementation") continue;
+      const target = implTarget(item, sourceText);
+      if (!target) continue;
+      const type = typeFor(target, item);
+      if (type) { implOwner.set(item.symbol.id, node(type)); continue; }
+      let row = implRows.get(target);
+      if (!row) { row = {item, label:target, children:[]}; implRows.set(target, row); nodes.set(item.symbol.id, row); }
+      implOwner.set(item.symbol.id, row);
+    }
+    // The nearest shown ancestor owns an item; hidden kinds are walked through, except that
+    // anything inside a callable belongs to that callable's body and is not listed.
+    function owner(item) {
+      const seen = new Set();
+      for (let parent = byId.get(item.symbol.parent); parent && !seen.has(parent.symbol.id); parent = byId.get(parent.symbol.parent)) {
+        seen.add(parent.symbol.id);
+        if (callable(parent) || parent.nativeKind === "anonymousFunction") return false;
+        if (CONTAINERS.has(parent.nativeKind)) return node(parent);
+        if (parent.nativeKind === "implementation") return implOwner.get(parent.symbol.id) || null;
+      }
+      return null;
+    }
+    for (const row of implRows.values()) roots.push(row);
+    for (const item of items) {
+      const kind = item.nativeKind;
+      if (!CONTAINERS.has(kind) && !callable(item) && !MEMBERS.has(kind)) continue;
+      const parent = owner(item);
+      if (parent === false) continue;
+      if (!parent) { if (!MEMBERS.has(kind)) roots.push(node(item)); continue; }
+      parent.children.push(node(item));
+    }
+    const order = (a, b) => (a.item.symbol.range.startByte ?? 0) - (b.item.symbol.range.startByte ?? 0) || a.item.symbol.range.startLine - b.item.symbol.range.startLine;
+    const sort = list => { list.sort(order); for (const entry of list) sort(entry.children); return list; };
+    return sort(roots);
+  }
+  // The outline rows that contain `id`, outermost first: what must open to show it.
+  function containersOf(tree, id) {
+    for (const entry of tree) {
+      if (entry.item.symbol.id === id) return [];
+      const inner = containersOf(entry.children, id);
+      if (inner) return [entry.item.symbol.id, ...inner];
+    }
+    return null;
+  }
+  function outline(list, items, selected, choose, current, options = {}) {
+    list.replaceChildren();
+    const expanded = options.expanded || new Set(), toggle = options.toggle || (() => {});
+    const tree = outlineTree(items, options.sourceText);
+    // A newly selected member opens its containers once; the reader may close them again.
+    if (selected && options.reveal) for (const key of containersOf(tree, selected.symbol.id) || []) expanded.add(key);
+    function rows(target, entries) {
+      for (const entry of entries) {
+        const {item} = entry, symbol = item.symbol, row = make("li"), line = `L${symbol.range.startLine}`;
+        const label = entry.label || symbol.name, kind = entry.label ? "impl" : item.nativeKind;
+        const key = symbol.id, open = entry.children.length > 0 && expanded.has(key);
+        const head = make("div", undefined, "files-symbol-row");
+        if (entry.children.length) {
+          const twist = make("button", open ? "▾" : "▸", "files-symbol-toggle"); twist.type = "button";
+          twist.setAttribute("aria-expanded", String(open));
+          twist.setAttribute("aria-label", `${open ? "Collapse" : "Expand"} ${label} members (${entry.children.length})`);
+          twist.addEventListener("click", () => { if (current()) toggle(key, !open); });
+          head.append(twist);
+        } else head.append(make("span", undefined, "files-symbol-toggle-space"));
+        // One row: icon and name, then kind and line right-aligned. Names truncate, with the full text as a tooltip.
+        const pick = make("button", undefined, "files-symbol-pick"), icon = make("span", CONTAINERS.has(kind) || kind === "impl" ? "◆" : "◇", "files-symbol-icon");
+        icon.setAttribute("aria-hidden", "true");
+        const name = make("span", label, "files-symbol-name"); name.title = label;
+        pick.append(icon, name, make("span", kind, "files-symbol-kind"), make("span", line, "files-symbol-line"));
+        pick.setAttribute("aria-label", `${label} · ${kind} · ${line}`);
+        pick.type = "button"; pick.setAttribute("data-symbol-id", symbol.id);
+        pick.setAttribute("aria-pressed", String(selected?.symbol.id === symbol.id));
+        pick.addEventListener("click", () => { if (current()) return choose(item); });
+        head.append(pick); row.append(head); target.append(row);
+        if (open) { const members = make("ul", undefined, "files-symbol-members"); rows(members, entry.children); row.append(members); }
+      }
+    }
+    rows(list, tree);
+    return tree.length;
   }
   function headerText(header) {
     if (!header) return "Measured header unavailable";
@@ -82,5 +183,5 @@
     if (C_COMMENT_LANGUAGES.includes(language) && /^(\/\/|\/\*|\*\/|\*(\s|$))/.test(head)) return "syntax-comment";
     return "";
   }
-  window.TrellisFiles = {outline, headerText, matches, diff, lineClass, SYNTAX_LINE_LIMIT};
+  window.TrellisFiles = {outline, outlineTree, headerText, matches, diff, lineClass, SYNTAX_LINE_LIMIT};
 })();

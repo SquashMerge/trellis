@@ -71,7 +71,7 @@ test("checkout selection and refresh load only retained services and keep curren
   assert.equal(h.get("checkout-state").textContent,"");
   assert.deepEqual(h.requests.map(({url})=>url),[
     "/api/checkouts","/api/daemon/status",`${SCOPED}/git`,`${SCOPED}/status`,
-    `${SCOPED}/tree?path=&offset=0&limit=200`,`${SCOPED}/dependencies`,`${SCOPED}/jobs/current`
+    `${SCOPED}/tree?path=&offset=0&limit=200`,`${SCOPED}/jobs/current`
   ]);
   h.get("refresh").listeners.click();await flush();
   assert.equal(h.get("error").hidden,true);

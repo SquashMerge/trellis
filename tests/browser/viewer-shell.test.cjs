@@ -423,6 +423,8 @@ test("Viewer rejects a proven late production response after include-tests wins 
     await page.locator('.file-pick[title="roles/mixed.rs"]').click();
     await page.waitForFunction(() => document.querySelector("#metric-inspector-values dt"));
     await page.route(pattern, respond);
+    // The production read of this revision is cached on the page (#527); drop it so the gated read is real.
+    await page.evaluate(() => clearRevisionReads());
     await H.reveal(page, "#metric-include-tests"); await page.locator("#metric-include-tests").uncheck();
     await seen;
     assert.equal(await page.locator("#metric-inspector-values dt").count(), 0, "changing role clears inspection before a response exists");

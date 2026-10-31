@@ -104,14 +104,16 @@
     function visibleFiles() {
       return view.files.filter(included).sort((a, b) => identity(a) < identity(b) ? -1 : identity(a) > identity(b) ? 1 : 0);
     }
+    // Breadcrumbs appear only inside a directory; at the whole snapshot there is nothing to go back to (#527).
     function breadcrumbs(active) {
       const target = get("treemap-breadcrumbs"); target.replaceChildren();
+      target.hidden = !scope;
+      if (!scope) return;
       const crumb = (label, next) => {
         const button = make("button", label); button.type = "button";
         button.addEventListener("click", () => { if (!active()) return; navigationSerial++; scope = next; return render(); }); target.append(button);
       };
       crumb("All indexed files", null);
-      if (!scope) return;
       crumb(rootLabel(scope.sourceSetId), {sourceSetId:scope.sourceSetId, path:""});
       const parts = scope.path ? scope.path.split("/") : [];
       parts.forEach((part, index) => crumb(part, {sourceSetId:scope.sourceSetId, path:parts.slice(0, index + 1).join("/")}));
@@ -219,7 +221,7 @@
           button.addEventListener("click", () => inspect(file, interactive)); get("treemap-files").append(button);
         }
         const total = files.reduce((sum, file) => sum + file.physicalLines, 0);
-        const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : "No indexed files match this scope and filters. Change the filters or use All indexed files.";
+        const message = files.length ? `${files.length} of ${payload.files.length} indexed files · ${total} physical file lines · ${aggregate} · ${population()} · test files ${hideTests ? "hidden" : "shown"} · ${exclusions(payload.files)}.` : `No indexed files match this scope and filters. Change the filters${scope ? " or use All indexed files" : ""}.`;
         state(`${message}${payload.layerExclusionsWarning ? ` · ${payload.layerExclusionsWarning}` : ""}`, files.length ? "ready" : "empty", payload.layerExclusionsWarning || "");
         if (select) { const file = files.find(item => identity(item) === select); if (file) inspect(file, interactive); }
         // Resizes during the first paint had no relayout to call; reconcile with the box once.
@@ -283,7 +285,6 @@
     get("treemap-color").value = metric; get("treemap-aggregate").value = aggregate;
     get("treemap-metric-tests").checked = false; get("treemap-hide-tests").checked = true;
     get("treemap-path").value = ""; get("treemap-language").value = "";
-    get("treemap-refresh").addEventListener("click", refresh);
     get("treemap-color").addEventListener("change", event => { if (!metrics.has(event.target.value)) return; navigationSerial++; metric = event.target.value; return render(); });
     get("treemap-hide-tests").addEventListener("change", event => { navigationSerial++; hideTests = event.target.checked; return render(); });
     get("treemap-path").addEventListener("input", event => { navigationSerial++; path = event.target.value; return render(); });

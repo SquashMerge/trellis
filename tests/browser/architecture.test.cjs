@@ -445,6 +445,8 @@ test("Architecture rejects a route-gated production response after all-callable 
     await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
     assert.match(await page.locator("#architecture-inspector-content").textContent(), /4 indexed callables/);
     await page.route(pattern, respond);
+    // The production read of this revision is cached on the page (#527); drop it so the gated read is real.
+    await page.evaluate(() => clearRevisionReads());
     await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").uncheck();
     await seen;
     assert.equal(await page.locator("#architecture-diagram svg").count(), 0, "changing role removes old heat before the blocked read");
@@ -981,15 +983,15 @@ test("Architecture opens an external package reference in the library catalog, w
     assert.ok(Date.now() < deadline && !["failed", "disabled"].includes(catalog.data.state), JSON.stringify(catalog.data));
     await new Promise(resolve => setTimeout(resolve, 250));
   }
+  // #527: the page reads the catalog only when an in-context entry needs it.
+  assert.equal(requests.some(row => row.url.pathname.endsWith("/dependencies")), false, "no eager catalog read");
   const catalogRead = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/dependencies"));
-  await H.reveal(page, "#refresh"); await page.locator("#refresh").click();
-  assert.equal((await (await catalogRead).json()).state, "ready");
-  await ready(page);
   await page.locator("#architecture-notices > summary").click();
   await page.getByRole("button", {name:"Inspect same-layer and unassigned references", exact:true}).click(); await settled(page);
+  assert.equal((await (await catalogRead).json()).state, "ready");
   const pair = page.locator("#architecture-inspector-content details").filter({has:page.locator(":scope > summary", {hasText:/src\/uses_library\.rs → local[-_]library \(rust package\)/})}).first();
   await pair.locator(":scope > summary").click();
-  const open = pair.getByRole("button", {name:"Open in library", exact:true});
+  const open = pair.getByRole("button", {name:"Open in library", exact:true}); await open.waitFor();
   assert.equal(await open.count(), 1);
   assert.equal(await page.locator("#architecture-inspector-content button").filter({hasText:"Open in library"}).count(), 1, "only the catalogued package offers the library");
   await open.click();

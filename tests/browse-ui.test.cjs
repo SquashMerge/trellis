@@ -1180,7 +1180,7 @@ for (const [method, route] of pinnedRoutes) test(`successful retained-pin ${meth
   const returned = ["metrics","architecture"].includes(route) ? {payload:retainedPin} : {revision:retainedPin};
   h.context.fetch = async (request, options) => {
     requests.push({request,method:options.method,body:options.body});
-    if (request === "/api/status") return response({workspaceRoot:"/synthetic",revision:newerHead,catchingUp:true});
+    if (request === "/api/status/head") return response({workspaceRoot:"/synthetic",revision:newerHead,catchingUp:true});
     if (request.split("?",1)[0] === `/api/${route}`) return response(returned);
     throw new Error("Unexpected " + request);
   };
@@ -1190,7 +1190,7 @@ for (const [method, route] of pinnedRoutes) test(`successful retained-pin ${meth
   assert.deepEqual(JSON.parse(JSON.stringify(result)),returned);
   assert.equal(requests.length,2);
   assert.equal(requests[0].method,method);
-  assert.equal(requests[1].request,"/api/status"); assert.equal(requests[1].method,"GET");
+  assert.equal(requests[1].request,"/api/status/head"); assert.equal(requests[1].method,"GET");
   assertRetained(h);
   assert.equal(h.get("retained-pin-status").hidden,false);
   assert.match(h.get("retained-pin-label").textContent,/Viewing revision 12345678:1 · Older than head 12345678:2/);
@@ -1225,7 +1225,7 @@ test("equal head hides the indication, later reads discover newer head and lower
   assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
   h.run("observePinnedHead()"); await settleHead();
   assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/);
-  assert.deepEqual(requests,["/api/status","/api/status","/api/status"]);
+  assert.deepEqual(requests,["/api/status/head","/api/status/head","/api/status/head"]);
   assertRetained(h); assert.equal(h.timers.size,0);
 });
 
@@ -1252,7 +1252,7 @@ for (const failure of ["network","http","json","workspace","invalid-pin"]) test(
   assert.match(h.get("retained-pin-label").textContent,/Head comparison unavailable/);
   assertRetained(h); assert.equal(h.get("error").hidden,true);
   h.run("observePinnedHead()"); await settleHead();
-  assert.deepEqual(requests,["/api/status","/api/status"]);
+  assert.deepEqual(requests,["/api/status/head","/api/status/head"]);
   assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
 });
 
@@ -1273,15 +1273,15 @@ test("overlapping reads coalesce to one pending observation and one follow-up", 
   const h = retainedHarness(), first = deferred(), second = deferred(), requests = [];
   h.context.fetch = request => { requests.push(request); return requests.length === 1 ? first.promise : second.promise; };
   h.run("observePinnedHead(); observePinnedHead(); observePinnedHead()");
-  assert.deepEqual(requests,["/api/status"]);
+  assert.deepEqual(requests,["/api/status/head"]);
   first.resolve(response({workspaceRoot:"/synthetic",revision:retainedPin})); await settleHead();
-  assert.deepEqual(requests,["/api/status","/api/status"]); assert.equal(h.get("retained-pin-status").hidden,true);
+  assert.deepEqual(requests,["/api/status/head","/api/status/head"]); assert.equal(h.get("retained-pin-status").hidden,true);
   h.run("observePinnedHead(); observePinnedHead()");
   second.resolve(response({workspaceRoot:"/synthetic",revision:newerHead})); await settleHead();
-  assert.deepEqual(requests,["/api/status","/api/status"]);
+  assert.deepEqual(requests,["/api/status/head","/api/status/head"]);
   assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
   h.run("observePinnedHead()"); await settleHead();
-  assert.deepEqual(requests,["/api/status","/api/status","/api/status"],"a later idle read starts a fresh comparison");
+  assert.deepEqual(requests,["/api/status/head","/api/status/head","/api/status/head"],"a later idle read starts a fresh comparison");
 });
 
 test("an obsolete observation cannot erase a successor's completed comparison", async () => {
@@ -1298,7 +1298,7 @@ test("cached source reads compare head without refetching or replacing retained 
   h.run(`sourceCache.set(IndexPin.key(status.revision)+':src/a.js',{revision:status.revision,file:{path:'src/a.js',text:'retained cached bytes'}})`);
   h.context.fetch = async request => { requests.push(request); return response({workspaceRoot:"/synthetic",revision:newerHead}); };
   await h.run("showCachedSource('src/a.js',{startLine:1,endLine:1},status.revision)"); await settleHead();
-  assert.deepEqual(requests,["/api/status"]);
+  assert.deepEqual(requests,["/api/status/head"]);
   assert.match(text(h.get("source")),/retained cached bytes/);
   assert.deepEqual(JSON.parse(JSON.stringify(h.run("workspaceSource.data.revision"))),retainedPin);
   assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),retainedPin);
@@ -1314,14 +1314,15 @@ test("Reload at head reads actual current status and clears old selection, sourc
     requests.push(request);
     if (request === "/api/git") return response({git:null});
     if (request === "/api/status") return response({workspaceRoot:"/synthetic",revision:actualHead,stats:{}});
+    if (request === "/api/status/head") return response({workspaceRoot:"/synthetic",revision:actualHead,catchingUp:false});
     if (request.startsWith("/api/files?")) return response({revision:actualHead,items:[{path:"src/a.js",methodCount:1}],nextOffset:null});
-    if (request === "/api/dependencies") return response({state:"disabled",workspaceRevision:actualHead,catalogId:null,packages:[],warnings:[]});
     throw new Error("Unexpected " + request);
   };
   h.get("reload-head").listeners.click(); await settleHead();
   const routes = requests.map(request => request.split("?",1)[0]);
-  assert.equal(routes.filter(route => route === "/api/status").length,3,"initial comparison, explicit refresh and at-head comparison");
-  assert.deepEqual(routes.filter(route => route !== "/api/status").sort(),["/api/dependencies","/api/files","/api/git"]);
+  assert.equal(routes.filter(route => route === "/api/status").length,1,"the explicit refresh reads the full status");
+  assert.equal(routes.filter(route => route === "/api/status/head").length,2,"initial and at-head comparisons read the digest");
+  assert.deepEqual(routes.filter(route => !route.startsWith("/api/status")).sort(),["/api/files","/api/git"],"the library catalog is read on demand, not on reload");
   assert.equal(requests.some(request => /source|symbols|sequence|index|provider/.test(request.split("?",1)[0])),false,"reload does not reuse old source or symbol identities");
   assert.deepEqual(JSON.parse(JSON.stringify(h.run("status.revision"))),actualHead);
   assert.equal(h.run("selectedMethod"),null); assert.equal(h.run("filesSymbol"),null); assert.equal(h.run("filesFile"),null);
@@ -1346,7 +1347,7 @@ test("a failed later comparison keeps an already known older head and retained e
 for (const statusCode of [401,403]) test(`head comparison ${statusCode} preserves authoritative authentication invalidation`, async () => {
   const h = retainedHarness();
   h.context.fetch = async request => {
-    assert.equal(request,"/api/status");
+    assert.equal(request,"/api/status/head");
     return {ok:false,status:statusCode,json:async()=>({error:{code:"unauthorized",message:"Authentication required"}})};
   };
   h.run("observePinnedHead()"); await settleHead();
@@ -1375,7 +1376,7 @@ test("a pinned read queued at comparison completion starts the next head observa
     return response({workspaceRoot:"/synthetic",revision:requests.length === 1 ? retainedPin : newerHead});
   };
   h.run("observePinnedHead()"); await settleHead();
-  assert.deepEqual(requests,["/api/status","/api/status"]);
+  assert.deepEqual(requests,["/api/status/head","/api/status/head"]);
   assert.match(h.get("retained-pin-label").textContent,/Older than head 12345678:2/); assertRetained(h);
 });
 
@@ -1719,4 +1720,40 @@ test("an unavailable class catalog keeps Classes hidden", async () => {
   };
   await h.run("viewerMetrics.refresh()"); await new Promise(resolve => setImmediate(resolve));
   assert.equal(h.get("view-classes").hidden, true);
+});
+
+// #527: architecture and metrics are read once per revision on this page.
+test("architecture and metrics reads are cached per revision, shared in flight and dropped by a new pin or Refresh", async () => {
+  const h = harness(), reads = [], pending = deferred();
+  const pinA = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1}, pinB = {...pinA, indexRevision:2};
+  h.context.fetch = async request => {
+    const route = request.split("?", 1)[0];
+    if (route === "/api/status/head") return response({workspaceRoot:"/synthetic", revision:h.run("status.revision")});
+    reads.push(request);
+    if (route === "/api/architecture/rules/apply") return response({applied:true});
+    if (reads.length === 1) await pending.promise;
+    return response({payload:{...h.run("status.revision")}, request});
+  };
+  const path = pin => `/api/architecture?indexGeneration=${pin.indexGeneration}&indexRevision=${pin.indexRevision}`;
+  h.context.pathA = path(pinA);
+  const first = h.run("revisionRead(pathA)"), second = h.run("revisionRead(pathA)");
+  pending.resolve();
+  const [a, b] = await Promise.all([first, second]);
+  assert.deepEqual(reads, [path(pinA)], "an in-flight read is shared");
+  assert.deepEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)));
+  await h.run("revisionRead(pathA)"); assert.equal(reads.length, 1, "a cached read is not fetched again");
+  await h.run("revisionRead('/api/metrics?scope=revision&'+IndexPin.query(status.revision))"); assert.equal(reads.length, 2, "each path is its own read");
+  await assert.rejects(h.run("revisionRead(pathA, () => false)"), error => error.name === "AbortError", "a superseded caller gets no data");
+  h.run(`status = {revision:${JSON.stringify(pinB)}, workspaceRoot:"/synthetic"}`);
+  h.context.pathB = path(pinB);
+  await h.run("revisionRead(pathB)"); assert.equal(reads.length, 3, "a new revision reads again");
+  await h.run("revisionRead(pathB)"); assert.equal(reads.length, 3);
+  await h.run("clearRevisionReads(); revisionRead(pathB)"); assert.equal(reads.length, 4, "Refresh drops cached reads");
+  const failing = deferred();
+  h.context.fetch = async request => { reads.push(request); if (request.startsWith("/api/architecture?")) return failing.promise; return response({}); };
+  h.run("clearRevisionReads()");
+  const failed = h.run("revisionRead(pathB)"); failing.resolve({ok:false, status:503, json:async () => ({error:{code:"storage_busy", message:"busy"}})});
+  await assert.rejects(failed, /busy/);
+  h.context.fetch = async request => { if (!request.startsWith("/api/status")) reads.push(request); return response({payload:{...h.run("status.revision")}}); };
+  const count = reads.length; await h.run("revisionRead(pathB)"); assert.equal(reads.length, count + 1, "a failed read is not cached");
 });
