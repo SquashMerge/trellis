@@ -646,6 +646,9 @@ test("enclosing callable and supported class actions use measured identity, not 
   await h.nav.open(h.event(),{path:cls.path,line:4});
   const diagram=h.latest.actions.find(a=>a.label.startsWith("Class diagram"));assert.ok(diagram);
   diagram.run();assert.equal(h.classes[0],cls);
+  h.request=async()=>response([{symbol:{...cls,path:"web/a.mjs"},reason:"declaration",matchKind:"measured",action:"class"}]);
+  await h.nav.open(h.event(),{path:"web/a.mjs",line:4});
+  assert.ok(h.latest.actions.find(a=>a.label.startsWith("Class diagram")),"JavaScript classes are catalogued (#452)");
   h.request=async()=>response([{symbol:{...cls,path:"src/A.rs"},reason:"declaration",matchKind:"measured",action:"class"}]);
   await h.nav.open(h.event(),{path:"src/A.rs",line:4});
   assert.equal(h.latest.actions.some(a=>a.label.startsWith("Class diagram")),false);
