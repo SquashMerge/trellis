@@ -176,7 +176,9 @@ test("published Files keeps original all-kind outline, UTF-8 syntax locations an
   assert.equal(matches.evidenceKind, "syntaxMatches"); assert.equal(matches.scope.spelling, "measured");
   assert.equal(matches.items.length, 50); assert.ok(matches.continuation);
   await page.waitForFunction(count => document.querySelectorAll("#files-matches .files-match").length === count, matches.items.length);
-  assert.match(await page.locator("#files-matches-title").textContent(), /same spelling, not compiler-resolved/);
+  // #451: a references list, honestly labelled; a page with more to read is a lower bound.
+  assert.equal(await page.locator("#files-matches-title").textContent(), "References to measured · ≥50");
+  assert.match(await page.locator("#files-matches-title + .detail").textContent(), /^Syntax matches in the indexed revision · same spelling, not compiler-resolved\./);
   assert.match(await page.locator("#files-inspector").textContent(), /homonym|shadow/i);
   const matchedSources = new Map();
   for (const path of new Set(matches.items.map(match => match.path))) matchedSources.set(path, await cached(selected, path));
@@ -194,6 +196,7 @@ test("published Files keeps original all-kind outline, UTF-8 syntax locations an
   assert.equal(remaining.continuation, null); assert.equal(matches.items.length + remaining.items.length, 55);
   await page.locator("#files-matches-more").click();
   await page.waitForFunction(count => document.querySelectorAll("#files-matches .files-match").length === count, 55);
+  assert.equal(await page.locator("#files-matches-title").textContent(), "References to measured · 55", "the last page makes the count complete");
   const continuationRequest = requests.filter(row => row.url.pathname.endsWith("/syntax-matches") && row.body.continuation).at(-1);
   assert.deepEqual(continuationRequest.body.continuation, matches.continuation, "UI echoes the exact opaque continuation");
   assert.equal(await page.locator("#files-matches img").count(), 0);
@@ -224,6 +227,67 @@ test("published Files keeps original all-kind outline, UTF-8 syntax locations an
   await assertNoOverflow(page);
 }));
 
+
+// #451: Open full lands on Sequence even when Treemap was the last diagram tab, and the
+// inspector previews, selects and labels without heavy fills or opaque IDs.
+test("Files Open full opens Sequence over a last-used Treemap; the mini fits, the range is quiet and labels carry no IDs", {timeout:240000}, async () => published({}, async selected => {
+  const {page, pin, requests} = selected;
+  await page.locator("#view-treemap").click();
+  await page.waitForFunction(() => document.querySelector("#treemap-state")?.dataset.state === "ready" && document.querySelector("#treemap-diagram svg"));
+  await enterFiles(selected); await openFile(selected, "Watcher.java");
+  const method = (await outline(selected, "Watcher.java")).items.find(item => item.symbol.name === "measured");
+  assert.ok(method); await selectSymbol(page, method); await assertSource(page, source, method.symbol.range);
+
+  // Selected range: raised surface with a lavender left bar, readable ink text.
+  const tokens = await page.evaluate(() => { const probe = document.createElement("span"); document.body.append(probe);
+    const read = (property, value) => { probe.style[property] = value; return getComputedStyle(probe)[property]; };
+    const out = {raised:read("backgroundColor", "var(--sm-raised)"), lavender:read("color", "var(--sm-lavender)"), ink:read("color", "var(--ink)")}; probe.remove(); return out; });
+  const rows = await page.locator("#source .source-line.highlight").evaluateAll(nodes => nodes.map(node => { const style = getComputedStyle(node); return {background:style.backgroundColor, shadow:style.boxShadow, color:style.color}; }));
+  assert.ok(rows.length > 1);
+  for (const row of rows) {
+    assert.equal(row.background, tokens.raised, JSON.stringify(row)); assert.equal(row.color, tokens.ink);
+    assert.ok(row.shadow.includes(tokens.lavender) && /inset/.test(row.shadow), `lavender left bar: ${row.shadow}`);
+  }
+
+  // Source-margin actions name the declaration, never its opaque ID.
+  const action = page.locator(`.source-diagram-action[data-symbol-id="${method.symbol.id}"]`);
+  await action.waitFor({state:"attached"});
+  assert.equal(await action.getAttribute("aria-label"), "Sequence for measured · syntax");
+  assert.equal(await action.getAttribute("title"), "Sequence · syntax · measured");
+  for (const label of await page.locator(".source-diagram-action").evaluateAll(nodes => nodes.flatMap(node => [node.getAttribute("aria-label"), node.title]))) {
+    assert.doesNotMatch(label, /sid:|:v1:/, label);
+  }
+
+  // The mini-sequence scales to the inspector's width: no sideways scroll.
+  await page.waitForFunction(() => document.querySelector("#files-open-full")?.disabled === false && document.querySelector("#files-mini-sequence svg"));
+  const mini = await page.locator("#files-mini-sequence").evaluate(node => {
+    const svg = node.querySelector("svg"), box = node.getBoundingClientRect(), drawn = svg.getBoundingClientRect();
+    return {scrollWidth:node.scrollWidth, clientWidth:node.clientWidth, left:box.left, right:box.right, svgLeft:drawn.left, svgRight:drawn.right,
+      natural:Number(svg.viewBox.baseVal.width), drawn:drawn.width};
+  });
+  assert.ok(mini.scrollWidth <= mini.clientWidth, `mini fits: ${JSON.stringify(mini)}`);
+  assert.ok(mini.svgLeft >= mini.left - 0.5 && mini.svgRight <= mini.right + 0.5, `mini drawn inside its box: ${JSON.stringify(mini)}`);
+  assert.ok(mini.drawn <= mini.natural, "the preview scales down, never up past its drawn size");
+
+  // Open full: the last-used Treemap neither shows nor refreshes on the way to Sequence.
+  const metricsBefore = requests.filter(row => row.url.pathname.endsWith("/metrics")).length;
+  await page.evaluate(() => {
+    window.treemapShown = false;
+    const panel = document.querySelector("#treemap-panel");
+    new MutationObserver(() => { if (!panel.hidden) window.treemapShown = true; }).observe(panel, {attributes:true, attributeFilter:["hidden"]});
+  });
+  await page.locator("#files-open-full").click();
+  await page.waitForFunction(() => !document.body.classList.contains("files-section") && document.querySelector("#sequence-state")?.textContent.includes("Pele rendered"));
+  assert.equal(await page.locator("#view-sequence").getAttribute("aria-selected"), "true");
+  assert.equal(await page.locator("#view-treemap").getAttribute("aria-selected"), "false");
+  assert.equal(await page.locator("#sequence-panel").isVisible(), true);
+  assert.equal(await page.locator("#treemap-panel").isVisible(), false);
+  assert.equal(await page.evaluate(() => window.treemapShown), false, "Treemap never showed during Open full");
+  assert.equal(requests.filter(row => row.url.pathname.endsWith("/metrics")).length, metricsBefore, "Open full does not refresh the last-used Treemap");
+  const route = new URLSearchParams((await page.evaluate(() => location.hash)).slice("#sequence?".length));
+  assert.equal(route.get("sid"), method.symbol.id); assert.equal(route.get("indexRevision"), String(pin.indexRevision));
+  await assertNoOverflow(page);
+}));
 
 // #426: icon plus name on one line, with kind and line right-aligned.
 async function assertOneLineRows(page, items) {

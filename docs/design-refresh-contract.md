@@ -6,7 +6,8 @@ The approved layout and interaction reference is the user-provided UI reference.
 SquashMerge brand supersedes only its palette, typography and logo treatment, as specified in
 [DESIGN.md](../DESIGN.md#visual-tokens). Use ink/surface/raised backgrounds, decorative line and
 meaningful control boundaries, and white/muted text. Primary actions use amber fill with ink text;
-selection uses purple fill with ink text. Links are lavender and underlined; keyboard focus is a
+selection uses purple fill with ink text, except a selected source range, which uses the raised
+surface with a lavender left bar (#451). Links are lavender and underlined; keyboard focus is a
 2px lavender outline with a 3px offset. Status always combines a word and a shape with its color.
 Heat uses line → gold → amber → orange, with a legend and ink text on warm fills, reversed for
 Maintainability; this amendment adds no metric view or threshold policy.

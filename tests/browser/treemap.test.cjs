@@ -95,9 +95,9 @@ async function sourceText(page) {
 }
 test.before(async () => H.setup(), {timeout:960000});
 test.after(async () => H.cleanup());
-async function published(callback) {
+async function published(callback, extra = new Map()) {
   const paths = H.fixture("", "placeholder.txt"); rmSync(paths.source);
-  for (const [path, text] of sources) {
+  for (const [path, text] of [...sources, ...extra]) {
     const target = join(paths.workspace, path); mkdirSync(dirname(target), {recursive:true}); writeFileSync(target, text);
   }
   for (const path of unsupportedFiles) writeFileSync(join(paths.workspace, path), "not indexed source\n");
@@ -500,8 +500,8 @@ for (const transition of ["generation", "revision", "checkout", "session"]) {
 async function layout(page) {
   return page.locator("#treemap-diagram").evaluate(node => {
     const style = getComputedStyle(node), svg = node.querySelector("svg");
-    return {width:node.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
-      height:node.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+    return {width:node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+      height:node.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
       svgWidth:Number(svg?.getAttribute("width")), svgHeight:Number(svg?.getAttribute("height")),
       overflowX:node.scrollWidth > node.clientWidth, overflowY:node.scrollHeight > node.clientHeight};
   });
@@ -512,7 +512,7 @@ async function filled(page) {
   await page.waitForFunction(() => {
     const node = document.querySelector("#treemap-diagram"), svg = node?.querySelector("svg"), style = node && getComputedStyle(node);
     if (!svg) return false;
-    const width = node.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight), height = node.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const width = node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight), height = node.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
     const dx = width - Number(svg.getAttribute("width")), dy = height - Number(svg.getAttribute("height"));
     return dx >= 0 && dx < 1 && dy >= 0 && dy < 1;
   });
@@ -626,3 +626,41 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
   assert.ok(list.max > 0 && list.height <= list.max + 1 && list.overflow === "auto", JSON.stringify(list));
   assert.ok(fills(await filled(page)), "the diagram still fills its box with the list open");
 }));
+
+// #451: 400 one-line files need more than the panel's area at 2500 px² each.
+const bulk = new Map(Array.from({length:400}, (_, i) => [`bulk/f${String(i).padStart(3, "0")}.js`, `function f${i}() { return ${i}; }\n`]));
+test("Treemap keeps to its panel's width, grows only downward, and keeps its summary behind the view's ⓘ (#451)", {timeout:240000}, async () => published(async selected => {
+  const {page} = selected;
+  await page.setViewportSize({width:1440, height:900}); await ready(page);
+  const box = await layout(page);
+  const canvas = await page.locator("#treemap-diagram").evaluate(node => ({scrollWidth:node.scrollWidth, clientWidth:node.clientWidth, scrollHeight:node.scrollHeight, clientHeight:node.clientHeight}));
+  assert.ok(box.svgWidth <= box.width && box.width - box.svgWidth < 1, `the layout takes the panel's width: ${JSON.stringify(box)}`);
+  assert.ok(canvas.scrollWidth <= canvas.clientWidth, `no sideways scroll: ${JSON.stringify(canvas)}`);
+  assert.ok(box.svgHeight > box.height && canvas.scrollHeight > canvas.clientHeight, `a dense layout grows downward only: ${JSON.stringify({box, canvas})}`);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  const panel = await page.locator("#treemap-panel").evaluate(node => ({sideways:node.scrollWidth > node.clientWidth,
+    above:document.querySelector("#treemap-diagram").getBoundingClientRect().top - node.getBoundingClientRect().top,
+    controls:node.querySelector(".treemap-controls").getBoundingClientRect().height}));
+  assert.equal(panel.sideways, false);
+  assert.ok(panel.controls < 70, `one row of controls: ${JSON.stringify(panel)}`);
+  assert.ok(panel.above < 200, `controls, breadcrumbs and legend leave the panel to the map: ${JSON.stringify(panel)}`);
+  // The ready summary is not a visible line; it sits behind ⓘ, which opens inside the viewport.
+  assert.equal(await page.locator("#treemap-state").isVisible(), false);
+  assert.equal(await page.locator("#treemap-state").getAttribute("data-state"), "ready");
+  assert.equal(await page.locator("#treemap-summary").isVisible(), false);
+  await page.locator("#treemap-panel .view-about > summary").click();
+  const summary = page.locator("#treemap-summary");
+  assert.equal(await summary.isVisible(), true);
+  assert.match(await summary.textContent(), /^\d+ of \d+ indexed files · \d+ physical file lines · max · production callables · test files hidden/);
+  const card = await page.locator("#treemap-panel .view-about .popover-body").evaluate(node => { const r = node.getBoundingClientRect(); return {left:r.left, right:r.right}; });
+  assert.ok(card.left >= 0 && card.right <= 1440, `ⓘ opens inside the viewport: ${JSON.stringify(card)}`);
+  await capture(page, "treemap-fit-about");
+  await page.keyboard.press("Escape");
+  // Loading, empty and error states stay in view, and the summary clears with them.
+  await page.locator("#treemap-path").fill("no-matching-files");
+  await page.locator("#treemap-state[data-state=empty]").waitFor();
+  assert.equal(await page.locator("#treemap-state").isVisible(), true);
+  assert.equal(await summary.textContent(), "");
+  await page.locator("#treemap-path").fill(""); await ready(page);
+  assert.equal(await page.locator("#treemap-state").isVisible(), false);
+}, bulk));

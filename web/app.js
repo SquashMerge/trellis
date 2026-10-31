@@ -162,7 +162,7 @@ async function navigateDiagram(symbol, revision, kind = "sequence", admitted = n
   rememberNavigation({kind, symbol, admitted, showAll:false}, false, kind === "sequence" ? sequenceHash(symbol.id, revision) : "#classes");
   window.TrellisClasses?.reset();
   clearSource(); diagramSequence = null;
-  await setSection("diagrams");
+  await setSection("diagrams", kind === "class" ? "classes" : "sequence");
   if (!current()) return;
   $("all-steps").checked = false;
   if (kind === "class") return openClasses({seed:symbol.id});
@@ -261,7 +261,7 @@ async function readNavigationLocation(force = false) {
       if (!IndexPin.equal(requested, revision)) throw new Error("Sequence link is stale for the selected index snapshot. Reload or select a current link.");
     }
     clearSource(); diagramSequence = null;
-    await setSection("diagrams");
+    await setSection("diagrams", "sequence");
     if (!current()) return;
     window.TrellisShell?.showView("sequence");
     $("sequence-state").textContent = "Loading sequence link…";
@@ -973,6 +973,7 @@ function clearFilesInspector() {
   for (const id of ["files-symbol-location", "files-symbol-header", "files-symbol-return", "files-mini-sequence", "files-matches", "files-matches-state"]) $(id)?.replaceChildren();
   if ($("files-symbol-title")) $("files-symbol-title").textContent = "Choose a symbol";
   if ($("files-symbol-kind")) $("files-symbol-kind").textContent = "Indexed symbol";
+  if ($("files-matches-title")) $("files-matches-title").textContent = "References";
   if ($("files-mini-state")) $("files-mini-state").textContent = "Select a callable to preview its measured sequence.";
   if ($("files-open-full")) $("files-open-full").disabled = true;
   for (const id of ["files-matches-more", "files-matches-retry"]) if ($(id)) $(id).hidden = true;
@@ -988,7 +989,7 @@ function filesFailure(error, target, current) {
   if (["revision_conflict", "pin_expired", "root_changed"].includes(error.code)) { unexpectedPair("Indexed evidence is stale. Refresh status before selecting again."); return; }
   if ($(target)) $(target).textContent = error.message;
 }
-async function setSection(name) {
+async function setSection(name, view = null) {
   if (!["files", "diagrams"].includes(name) || !selectedRootKey) return;
   if (section === name) {
     const target = name === "files" ? filesBasis === "working" ? $("files-diff") : workspaceSource ? $("source") : $("file-filter") : $("view-sequence");
@@ -1003,6 +1004,8 @@ async function setSection(name) {
   window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
   window.TrellisShell?.setSection(name);
   if (name !== "files") {
+    // A navigation names its target view: the last-used tab neither shows nor refreshes (#451).
+    if (view) showNavigationView(view);
     $("source").hidden = false; $("files-diff").hidden = true;
     if (!workspaceSource) window.TrellisShell?.closeSource();
     renderFiles();
@@ -1115,19 +1118,26 @@ async function loadFilesMatches(continuation = null) {
   const item = filesSymbol, pin = IndexPin.copy(status.revision), guard = filesGuard({symbol:true}), serial = ++filesMatchesSerial;
   const current = () => guard() && serial === filesMatchesSerial;
   $("files-matches-state").textContent = "Loading syntax matches…"; $("files-matches-more").hidden = true; $("files-matches-retry").hidden = true;
+  if (!continuation) $("files-matches-title").textContent = `References to ${item.symbol.name} · …`;
   try {
     const data = await api("/api/syntax-matches", "POST", {expectedRevision:pin, symbolId:item.symbol.id, ...(continuation ? {continuation} : {})}, current);
     if (!current()) return;
     if (!IndexPin.equal(data.revision, pin)) { unexpectedPair(undefined, data.revision); return; }
     if (data.symbolId !== item.symbol.id || data.evidenceKind !== "syntaxMatches") throw new Error("Syntax match provenance mismatch. Nothing displayed.");
     filesMatches = {...data, items:continuation ? [...(filesMatches?.items || []), ...data.items] : data.items}; renderFilesMatches();
-  } catch (error) { filesFailure(error, "files-matches-state", current); if (current()) $("files-matches-retry").hidden = false; }
+  } catch (error) {
+    filesFailure(error, "files-matches-state", current);
+    if (current()) { $("files-matches-retry").hidden = false; if (!continuation) $("files-matches-title").textContent = `References to ${item.symbol.name}`; }
+  }
 }
 function renderFilesMatches() {
   $("files-matches").replaceChildren();
   if (!filesMatches || !filesSymbol) return;
   const data = filesMatches, pin = IndexPin.copy(data.revision), current = filesGuard({symbol:true});
   window.TrellisFiles?.matches($("files-matches"), data.items, item => openFilesLocation(item, pin), current);
+  // A page is not a total: more pages or incomplete coverage make the count a lower bound.
+  const count = !data.scope?.spelling ? "unavailable" : `${data.continuation != null || data.partial ? "≥" : ""}${data.items.length}`;
+  $("files-matches-title").textContent = `References to ${data.scope?.spelling || filesSymbol.symbol.name} · ${count}`;
   $("files-matches-state").textContent = `${data.items.length} shown · ${data.scope?.language || "language unavailable"} · source set ${data.scope?.sourceSetId || "unavailable"}${data.scope?.spelling ? " · " + data.scope.spelling : " · spelling unavailable"}${data.partial ? " · Incomplete coverage (skipped files or work budget)" : ""}${data.truncated ? " · more available" : ""}${!data.items.length ? " · No matches returned in the scanned scope; not proof of no references." : ""}${data.warnings?.length ? " · " + data.warnings.join(" · ") : ""}`;
   $("files-matches-more").hidden = data.continuation == null;
 }
