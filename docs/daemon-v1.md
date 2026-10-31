@@ -115,7 +115,8 @@ reason), `capped`, `omitted`, `capturedDiagnostics` and `unrecorded` (partial tu
 recorded reasons). One document can count under several reasons.
 `unsupportedOccurrences` sums the occurrences by gap kind: `{macroInvocation, attributeItem,
 macroDefinition, other}`. `summary` is one line, present when any tuple is partial, for example
-`partial: 243 · native macro/attribute gaps only` (or `native gaps only` when some gap is of
+`partial: 243 · native macro/attribute gaps only`, where every partial document is partial only
+for macro invocation, attribute or macro definition gaps (`native gaps only` when some gap is of
 kind `other`). When the partial documents have other reasons,
 it lists each reason with its document count, such as
 `partial: 3 · native gaps 2, occurrence cap 1`.

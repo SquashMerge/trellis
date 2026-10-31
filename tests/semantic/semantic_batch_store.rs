@@ -6440,6 +6440,31 @@ fn partial_document_records_a_native_gap_and_the_cap_together() {
             "{case}"
         );
     }
+    // A later native revision rejoins the selected batch, under production limits, and records
+    // the rejoined tuple's reasons again.
+    write_files(&world.root, &[("src/other.rs", "pub fn other() {}\n")]);
+    world.republish_with_rejoin();
+    let head = world.store.index_baseline().unwrap();
+    let carried = world.store.semantic_at(head).unwrap();
+    assert_eq!(
+        carried
+            .coverage
+            .iter()
+            .find(|row| row.document_path == "src/lib.rs")
+            .unwrap()
+            .reasons,
+        Some(CoverageReasons::new([2, 1, 0, 0], false, false, false))
+    );
+    let status = world.store.status().unwrap();
+    assert_eq!(
+        language_row(&status, "rust")
+            .coverage
+            .as_ref()
+            .unwrap()
+            .summary
+            .as_deref(),
+        Some("partial: 1 · native macro/attribute gaps only")
+    );
 }
 
 /// The aggregate candidate cap still fails typed and atomically on both paths (#394, a).

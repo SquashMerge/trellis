@@ -4877,3 +4877,49 @@ mod walk_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod language_reason_tests {
+    use super::*;
+
+    fn partial(path: String) -> semantic::Coverage {
+        semantic::Coverage {
+            producer_id: "p".into(),
+            language: semantic::Language::Rust,
+            source_set_id: "s".into(),
+            document_path: path,
+            revision_id: "r".into(),
+            requested: true,
+            selected: true,
+            state: semantic::CoverageState::Partial,
+            supported_roles: vec![],
+            observed_roles: vec![],
+            diagnostic: Some("unsupported_native_gap".into()),
+            reasons: Some(semantic::CoverageReasons::new(
+                [2, 1, 0, 0],
+                false,
+                false,
+                false,
+            )),
+        }
+    }
+
+    /// The listed documents stop at the byte bound; every partial document is still counted.
+    #[test]
+    fn report_lists_partial_documents_up_to_its_byte_bound() {
+        let mut reasons = LanguageReasons::default();
+        for i in 0..2000 {
+            reasons.add(&partial(format!("src/module_{i:04}.rs")));
+        }
+        let json = reasons.json();
+        let listed = json["listed"].as_array().unwrap();
+        assert!(listed.len() < 2000 && !listed.is_empty());
+        assert!(json["listed"].to_string().len() <= REPORT_PARTIAL_DOCUMENT_BYTES);
+        assert_eq!(json["unlisted"], 2000 - listed.len() as u64);
+        assert_eq!(listed[0]["path"], "src/module_0000.rs");
+        assert_eq!(json["documents"], 2000);
+        assert_eq!(json["nativeGapsOnly"], 2000);
+        assert_eq!(json["unsupportedOccurrences"]["macroInvocation"], 4000);
+        assert_eq!(json["unsupportedOccurrences"]["attributeItem"], 2000);
+    }
+}
