@@ -52,6 +52,12 @@ function sequenceBasisLabel(evidence) {
   if (!basis || typeof basis.producerId !== "string") return "";
   return `basis ${basis.producerId}${typeof basis.producerVersion === "string" ? " " + basis.producerVersion : ""}`;
 }
+// A call that may return early carries its folded `?` and guards (#542); a chain group
+// shows it when one of its calls does. Server fields, never inferred from labels.
+function sequenceEarlyReturn(step) {
+  const folded = item => Array.isArray(item?.folded) && item.folded.length > 0;
+  return folded(step) || step?.kind === "group" && (step.children || []).some(folded) ? " · may return early" : "";
+}
 function sequenceEntry(step) {
   const children = step?.children || [];
   return step?.kind === "group" && !step.alternate?.length && children.length &&
@@ -248,7 +254,9 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
     const tabWidth = operator ? Math.max(80, operator.length * 8 + 28) : 0;
     const labelX = operator ? x + tabWidth + 12 : x + 5;
     const capacity = Math.max(24, Math.floor((width-labelX-(proof && options.showDetails ? 145 : 35))/7.8));
-    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : capacity);
+    const early = sequenceEarlyReturn(step);
+    if (!options.showDetails) label = shorten(label.replace(/\s+/g, " "), isControl ? Math.min(56, capacity - (operator ? 2 : 0)) : Math.max(12, capacity - early.length));
+    label += early;
     // Brackets are a presentation frame, not an inferred or rewritten predicate.
     if (operator) label = `[${label}]`;
     let labels = options.showDetails ? wrap(label, capacity) : [label];
@@ -372,4 +380,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};
+window.TrellisSequence = {render: renderSequence, target:sequenceTarget, evidenceLabel:sequenceEvidenceLabel, evidenceSummary:sequenceEvidenceSummary, basisLabel:sequenceBasisLabel, entry:sequenceEntry, earlyReturn:sequenceEarlyReturn, beginRender:beginSequenceRender, targetActionLabel:sequenceTargetActionLabel};

@@ -287,8 +287,10 @@
       const disclosure = make("details");
       disclosure.append(make("summary", `${label ? label + " · " : ""}${item.kind || "step"}: ${item.label || item.id || "Details"}`));
       disclosure.append(make("p", `${location(item)} · ${targetText(item, view)}`));
-      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate"].includes(key)));
+      const fields = Object.fromEntries(Object.entries(item).filter(([key]) => !["children", "alternate", "folded"].includes(key)));
       disclosure.append(make("pre", JSON.stringify(fields, null, 2)));
+      // A `?` early return and its guards folded into this call stay inspectable (#542).
+      for (const child of item.folded || []) evidence(child, disclosure, "Folded control flow");
       for (const child of item.children || []) evidence(child, disclosure, "Child");
       for (const child of item.alternate || []) evidence(child, disclosure, "Alternate");
       parent.append(disclosure);

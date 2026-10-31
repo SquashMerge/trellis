@@ -10,7 +10,7 @@ for(const count of [80,180])test(`indexed ${count}-call cohort uses Pele and mea
  const calls=steps.filter(step=>step.kind==="call");assert.equal(calls.length,count,`actual indexed producer must emit ${count} calls; got ${calls.length}`);
  assert.ok(steps.some(step=>step.kind==="branch"&&step.alternate.length),"measured branch and alternate required");
  assert.ok(steps.some(step=>step.kind==="loop"),"measured loop required");
- assert.ok(steps.some(step=>step.label.includes("?")&&step.alternate.length),"measured ? early-return distinction required");
+ assert.ok(steps.some(step=>step.folded?.some(f=>f.label.includes("?")&&f.alternate.length)),"measured ? early-return distinction required (folded into its call, #542)");
  assert.ok(steps.some(step=>step.kind==="group"&&step.children.length>=3),"measured flat call group required");
  assert.ok(calls.some(step=>step.label.includes("unresolved_external_7")),"explicit unknown target call required");
  assert.ok(dto.participants.some(participant=>participant.kind==="unresolvedCallee"),"unknown target must remain unresolved");
@@ -32,7 +32,7 @@ for(const count of [80,180])test(`indexed ${count}-call cohort uses Pele and mea
    const branch=steps.find(s=>s.kind==="branch"&&s.alternate.length),first=branch.children.find(s=>s.kind==="call"),alternate=branch.alternate.find(s=>s.kind==="call");
    assert.ok(first&&alternate);assert.ok(notes.findIndex(n=>n.id===branch.id)<notes.findIndex(n=>n.id===first.id));
    assert.ok(notes.findIndex(n=>n.id===first.id)<notes.findIndex(n=>n.id===alternate.id));
-   assert.ok(notes.some(n=>n.text.includes("continue only on success")),"? early-return alternate remains distinct");
+   assert.ok(notes.some(n=>n.text.includes("may return early")),"? early-return remains distinct on its call (#542)");
    assert.ok(await page.locator(".pele-frame-alt").count()>=2);
    assert.ok(await page.locator(".pele-frame-loop").count()>=1);
    assert.equal(await page.locator(".pele-message").count(),0,"unknown target must not become a fabricated arrow");

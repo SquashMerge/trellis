@@ -62,7 +62,7 @@
         displayLabel = label;
       }
       const marker = `[${String(ordinal).padStart(3, "0")}]`;
-      const display = `${marker} ${step.kind} ${displayLabel}`;
+      const display = `${marker} ${step.kind} ${displayLabel}${window.TrellisSequence.earlyReturn?.(step) || ""}`;
       const evidence = preview || step, target = targetFor(evidence), lane = target && laneFor(target, evidence);
       // An expanded callee body runs on the callee's lane, opened by the call before it (#522).
       const owner = step.lane == null ? lanes[0] : lanes.find(item => item.id === step.lane);

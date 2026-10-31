@@ -527,7 +527,7 @@ pub(super) fn sequence_calls(
                 .push(engine::multiple_producers_note(&key.language));
         }
         view.semantic = SequenceSemantic::syntax(defaults.note(&key.language));
-        cap_visible(view);
+        cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     };
     let languages = defaults.languages();
@@ -539,7 +539,7 @@ pub(super) fn sequence_calls(
         .clone();
     let Some(semantic) = engine::semantic(Some(&languages), &document).map_err(engine_error)?
     else {
-        cap_visible(view);
+        cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     };
     let seed_calls = document
@@ -549,7 +549,7 @@ pub(super) fn sequence_calls(
         .unwrap_or_default();
     if let Some(reason) = syntax_fallback(semantic, seed_calls, &key.path, &mut source)? {
         view.semantic = SequenceSemantic::syntax(Some(reason));
-        cap_visible(view);
+        cap_visible(view, crate::behavior::MAX_STEPS);
         return Ok(());
     }
     view.semantic = SequenceSemantic {
@@ -564,8 +564,9 @@ pub(super) fn sequence_calls(
         participant.declaration = Some(view.seed.clone());
     }
     // Hidden incidental calls do not count toward the visible bound (#536): hide them
-    // first, then bound what is shown. The work bound already holds every step built.
-    hide_incidental(
+    // first, then bound what is shown. The work bound already holds every step built. A
+    // seed with a resolved target keeps room for the callee bodies it expands (#542).
+    let targets = hide_incidental(
         &mut source,
         &languages,
         show_all,
@@ -573,7 +574,14 @@ pub(super) fn sequence_calls(
         &document,
         &view.seed.id,
     )?;
-    cap_visible(view);
+    cap_visible(
+        view,
+        if targets {
+            crate::behavior::SEED_STEPS
+        } else {
+            crate::behavior::MAX_STEPS
+        },
+    );
     let mut enrichment = Enrichment {
         store,
         db,
@@ -719,7 +727,8 @@ struct Enrichment<'a, 'b> {
 /// visible bound is applied (#536). A standalone call bound to an external declaration is
 /// incidental and hidden unless `show_all`; a call with a fresh exact internal target is
 /// never hidden by a spelling heuristic (JavaScript `console.log`), nor is its body; a
-/// chain whose calls are all hidden is hidden.
+/// chain whose calls are all hidden is hidden. A call that may return early (#542) is
+/// control flow, so it is never incidental. Returns whether any call has a resolved target.
 fn hide_incidental(
     source: &mut SnapshotGraphSource<'_>,
     languages: &BTreeSet<String>,
@@ -727,12 +736,13 @@ fn hide_incidental(
     steps: &mut [crate::behavior::SequenceStep],
     document: &DocumentFacts,
     owner: &str,
-) -> Result<()> {
+) -> Result<bool> {
     use crate::graph_query::{self as engine, BoundaryReason};
     let semantic = engine::semantic(Some(languages), document).map_err(engine_error)?;
+    let mut targets = false;
     for step in steps {
         source.check_work()?;
-        hide_incidental(
+        targets |= hide_incidental(
             source,
             languages,
             show_all,
@@ -740,7 +750,7 @@ fn hide_incidental(
             document,
             owner,
         )?;
-        hide_incidental(
+        targets |= hide_incidental(
             source,
             languages,
             show_all,
@@ -766,11 +776,12 @@ fn hide_incidental(
             .boundary_reason;
         if reason == BoundaryReason::None {
             step.hidden = false;
+            targets = true;
         } else if !show_all && is_incidental(step, reason) {
             step.hidden = true;
         }
     }
-    Ok(())
+    Ok(targets)
 }
 
 /// Only a standalone call is incidental: one that already nests steps (an expanded body or
@@ -784,6 +795,7 @@ fn is_incidental(
         && matches!(step.kind.as_str(), "call" | "boundary")
         && step.children.is_empty()
         && step.alternate.is_empty()
+        && step.folded.is_empty()
 }
 
 impl Enrichment<'_, '_> {
