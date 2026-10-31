@@ -1,11 +1,11 @@
 #![cfg(feature = "test-support")]
 //! Architecture references and rules use fresh selected semantic bindings (#523).
-use crate::graph_fixtures::{Bind, PRODUCER, Publisher, Spec, bind};
+use crate::graph_fixtures::{Bind, PRODUCER, Publisher, Spec, add_second_producer, bind};
 use serde_json::{Value, json};
 use std::fs;
 use trellis::{
     model::IndexPin,
-    semantic_evidence::{Dispatch, Resolution},
+    semantic_evidence::{self as s, CoverageState, Dispatch, Resolution},
     store::{MetricsOptions, Store},
 };
 
@@ -70,13 +70,24 @@ fn bindings() -> Vec<Bind> {
     ]
 }
 
-fn publish(spec: &Spec) -> (tempfile::TempDir, tempfile::TempDir, Store, IndexPin) {
+type Published = (tempfile::TempDir, tempfile::TempDir, Store, IndexPin);
+
+fn publish(spec: &Spec) -> Published {
+    publish_with(spec, RULES, |_, _| {})
+}
+
+/// Publishes `spec`, adjusting its evidence before the validator admits it.
+fn publish_with(
+    spec: &Spec,
+    rules: &str,
+    transform: impl FnOnce(&mut s::SemanticPublication, &mut s::CapturedComponents),
+) -> Published {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let mut publisher = Publisher::open(state.path(), root.path());
-    let pin = publisher.publish(spec);
+    let pin = publisher.publish_with_semantic(spec, transform);
     fs::create_dir_all(root.path().join(".trellis")).unwrap();
-    fs::write(root.path().join(".trellis/rules.toml"), RULES).unwrap();
+    fs::write(root.path().join(".trellis/rules.toml"), rules).unwrap();
     (state, root, publisher.store, pin)
 }
 
@@ -337,17 +348,19 @@ fn stale_unusable_and_unbound_evidence_reverts_to_structural() {
         let low = edge(&references, "src/low.rs", "src/high.rs").unwrap();
         assert_eq!(low["count"], 1);
         assert_eq!(low["evidenceTier"], "syntax");
-        // The unbound method call is an explicit unresolved semantic site.
-        let reason = if resolution == Resolution::Unresolved {
-            "call_binding_unresolved"
-        } else {
-            "call_binding_ambiguous"
-        };
-        assert!(references["unresolved"].as_array().unwrap().iter().any(
-            |row| row["source"]["path"] == "src/low.rs"
-                && row["reason"] == reason
-                && row["site"]["relationKind"] == "call"
-        ));
+        // A call without a known target is not a site, like a call without a binding; the
+        // orphan's structural site stays unresolved.
+        let unresolved = references["unresolved"].as_array().unwrap();
+        assert!(
+            !unresolved
+                .iter()
+                .any(|row| row["site"]["relationKind"] == "call")
+        );
+        assert!(
+            unresolved
+                .iter()
+                .any(|row| row["source"]["path"] == "src/orphan.rs")
+        );
         let check = read(&store, "check", json!({"expectedBasis":pin}));
         let row = instance(&check, "orphan-calls-upper", "src/orphan.rs", None);
         assert_eq!(row["status"], "unknown");
@@ -424,4 +437,140 @@ fn semantic_sites_keep_sample_and_summary_bounds() {
     // The summary carries no per-site arrays beyond the pair samples.
     assert!(summary["references"].get("unresolved").is_none());
     assert!(serde_json::to_vec(&summary).unwrap().len() < 256 * 1024);
+}
+
+#[test]
+fn partial_tuples_and_unselected_producers_fall_back() {
+    // A partial tuple still proves a required call, but never a forbidden call's absence.
+    let mut partial = semantic();
+    partial
+        .states
+        .insert("src/orphan.rs".into(), CoverageState::Partial);
+    let (_state, _root, store, pin) = publish(&partial);
+    let check = read(&store, "check", json!({"expectedBasis":pin}));
+    assert_eq!(
+        instance(&check, "orphan-calls-upper", "src/orphan.rs", None)["status"],
+        "conforms"
+    );
+    let forbidden = instance(&check, "orphan-never-goes", "src/orphan.rs", None);
+    assert_eq!(forbidden["status"], "unknown");
+    assert_eq!(
+        forbidden["constraints"][0]["unresolved"],
+        json!(["call_binding_incomplete"])
+    );
+
+    // Two producers covering Rust select neither: syntax only, as without an import.
+    let (_state, _root, store, pin) = publish_with(&semantic(), RULES, add_second_producer);
+    assert_syntax_only(&store, pin);
+    let references = read(&store, "references", json!({"expectedBasis":pin}));
+    assert_eq!(references["semanticProducers"], json!([]));
+}
+
+#[test]
+fn calls_within_one_module_add_no_self_edge() {
+    let mut spec = Spec::new(&[
+        ("src/lib.rs", "pub mod low;\n"),
+        ("src/low.rs", "pub fn a() {\n    b();\n}\npub fn b() {}\n"),
+    ]);
+    spec.bindings = vec![bind("a", 0, "b")];
+    let (_state, _root, store, pin) = publish(&spec);
+    let references = read(&store, "references", json!({"expectedBasis":pin}));
+    assert!(edge(&references, "src/low.rs", "src/low.rs").is_none());
+}
+
+const SHAPES: &[(&str, &str)] = &[
+    ("src/lib.rs", "pub mod high;\npub mod low;\n"),
+    ("src/high.rs", "pub trait Shape {}\n"),
+    (
+        "src/low.rs",
+        "pub struct Square;\nimpl crate::high::Shape for Square {}\n",
+    ),
+];
+
+const SHAPE_RULES: &str = r#"version = 1
+[roles.square]
+select = { name = "Square" }
+[roles.shape]
+select = { name = "Shape" }
+[[rules]]
+id = "squares-are-shapes"
+for_each = "square"
+require = [{ implements = "shape" }]
+[[rules]]
+id = "squares-are-not-shapes"
+for_each = "square"
+forbid = [{ implements = "shape" }]
+"#;
+
+#[test]
+fn type_relationships_settle_implements_constraints() {
+    let mut spec = Spec::new(SHAPES);
+    spec.declaration_bindings = vec!["Square".into(), "Shape".into()];
+    let (_state, _root, store, pin) = publish_with(&spec, SHAPE_RULES, |semantic, _| {
+        let target = |name: &str| {
+            semantic
+                .symbols
+                .iter()
+                .find(|symbol| symbol.display_name.as_deref() == Some(name))
+                .unwrap()
+                .declarations[0]
+                .clone()
+        };
+        let (square, shape) = (target("Square"), target("Shape"));
+        let mut proof = semantic
+            .provenance
+            .iter()
+            .find(|proof| proof.id == "decl-Square")
+            .unwrap()
+            .clone();
+        proof.id = "rel-square".into();
+        proof.evidence_kind = s::EvidenceKind::TypeRelationship;
+        let document = proof.document.clone();
+        semantic.provenance.push(proof);
+        semantic.provenance.sort_by(|a, b| a.id.cmp(&b.id));
+        semantic.type_relationships.push(s::TypeRelationship {
+            kind: s::RelationshipKind::Implements,
+            source: square,
+            target: shape,
+            provenance_id: "rel-square".into(),
+        });
+        for coverage in &mut semantic.coverage {
+            coverage.supported_roles.push(s::Role::Type);
+            if coverage.document_path == document.path {
+                coverage.observed_roles.push(s::Role::Type);
+            }
+        }
+    });
+    let check = read(&store, "check", json!({"expectedBasis":pin}));
+    let required = instance(&check, "squares-are-shapes", "src/low.rs", None);
+    assert_eq!(required["status"], "conforms");
+    assert!(
+        required["constraints"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "typeRelationship" && e["provenanceId"] == "rel-square")
+    );
+    assert_eq!(
+        instance(&check, "squares-are-not-shapes", "src/low.rs", None)["status"],
+        "deviates"
+    );
+
+    // Without the relationship, neither constraint is settled.
+    let mut spec = Spec::new(SHAPES);
+    spec.declaration_bindings = vec!["Square".into(), "Shape".into()];
+    let (_state, _root, store, pin) = publish_with(&spec, SHAPE_RULES, |_, _| {});
+    let check = read(&store, "check", json!({"expectedBasis":pin}));
+    let required = instance(&check, "squares-are-shapes", "src/low.rs", None);
+    assert_eq!(required["status"], "unknown");
+    assert_eq!(
+        required["constraints"][0]["unresolved"],
+        json!(["type_relationship_absent"])
+    );
+    let forbidden = instance(&check, "squares-are-not-shapes", "src/low.rs", None);
+    assert_eq!(forbidden["status"], "unknown");
+    assert_eq!(
+        forbidden["constraints"][0]["unresolved"],
+        json!(["type_relationship_absence_unproven"])
+    );
 }

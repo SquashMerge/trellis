@@ -128,7 +128,8 @@ detail. On this repository it went from about 35 MB to about 0.75 MB. Its fields
 - `references.coverage` (#449): one row per source layer (null when unassigned) and
   stored site role, `{layer, role, sites, mappedSites, unresolvedSites, semanticSites}`. `sites` counts
   every scanned reference site once, structural or semantic; a site with at least one mapped target is mapped,
-  and one with a residual reason is unresolved, so a site can be both. `semanticSites`
+  and one with a residual reason is unresolved, so a site can be both; one an external
+  semantic binding resolved is neither. `semanticSites`
   counts sites a fresh binding mapped or bound outside the checkout. The rows sum to
   `counts.mappedSites`, `counts.unresolvedSites` and `counts.semanticSites`, and there are at most two per layer;
 - `exceptionCount`: the authored `[[exceptions]]` entries (null without a rules file);

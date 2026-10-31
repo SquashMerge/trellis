@@ -441,8 +441,6 @@ fn project_inner(
             let doc = docs[source];
             request.check()?;
             merge_work(&mut rust.work, work.used, check)?;
-            site_count = site_count.saturating_add(sites.len());
-            ensure!(site_count <= SITES, "bounded_work: reference site count");
             emitted_modules.insert(source);
             scanned += 1;
             for PreparedSite {
@@ -491,6 +489,12 @@ fn project_inner(
                 let semantic = anchor
                     .and_then(|anchor| semantic_resolution(anchor, structural.as_ref(), &locate));
                 let resolution = match (semantic, structural) {
+                    // A semantic-only site inside its own module adds no module edge.
+                    (Some(resolution), None)
+                        if resolution.targets.contains(&Target::Native(source)) =>
+                    {
+                        continue;
+                    }
                     (Some(resolution), _) => {
                         let anchor = anchor.expect("semantic resolution has an anchor");
                         site.mapping = "semantic";
@@ -501,6 +505,8 @@ fn project_inner(
                     // A semantic-only site whose binding is not usable here is not a site.
                     (None, None) => continue,
                 };
+                site_count += 1;
+                ensure!(site_count <= SITES, "bounded_work: reference site count");
                 let role = site.role;
                 let covered = coverage
                     .entry((doc.key.path.clone(), role == Some("test")))
@@ -625,12 +631,8 @@ fn semantic_resolution(
         SemanticOutcome::External => structural
             .is_none_or(|resolution| resolution.targets.is_empty())
             .then(SiteResolution::default),
-        SemanticOutcome::Ambiguous => structural
-            .is_none()
-            .then(|| SiteResolution::unknown("call_binding_ambiguous")),
-        SemanticOutcome::Unresolved => structural
-            .is_none()
-            .then(|| SiteResolution::unknown("call_binding_unresolved")),
+        // An unknown target keeps the structural result; it never makes a site of its own.
+        SemanticOutcome::Ambiguous | SemanticOutcome::Unresolved => None,
     }
 }
 
@@ -736,8 +738,10 @@ fn prepare_file(
             .filter_map(|(i, b)| (b == b'\n').then_some(i))
             .collect(),
     };
-    // Semantic anchors by end offset: a structural site is bound by an anchor that ends
-    // where it ends, i.e. its final name or its callee (#523).
+    // Semantic anchors by start offset (#523). A structural site consumes every anchor
+    // inside it, and a call joined on its whole invocation that starts with it; it is
+    // bound by the anchor that ends where it ends (its final name or callee, a call
+    // first), else by such an invocation.
     let anchors = &doc.semantic.anchors;
     let usable = |anchor: &SemanticAnchor| {
         anchor.range.start < anchor.range.end
@@ -747,12 +751,12 @@ fn prepare_file(
                 .get(anchor.range.start..anchor.range.end)
                 .is_some()
     };
-    let mut anchors_by_end: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut anchors_by_start: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (index, anchor) in anchors.iter().enumerate() {
         owner_step(&mut work, check)?;
         if usable(anchor) {
-            anchors_by_end
-                .entry(anchor.range.end)
+            anchors_by_start
+                .entry(anchor.range.start)
                 .or_default()
                 .push(index);
         }
@@ -774,60 +778,69 @@ fn prepare_file(
             &mut work,
             check,
         )?;
-        // A call binding wins over a name binding at the same end; then the innermost name.
         let mut anchor: Option<usize> = None;
-        for &index in anchors_by_end.get(&item.end).into_iter().flatten() {
-            owner_step(&mut work, check)?;
-            let candidate = &anchors[index];
-            if candidate.range.start < item.start {
-                continue;
-            }
-            consumed[index] = true;
-            if anchor.is_none_or(|best| {
-                let best = &anchors[best];
-                (candidate.call_id.is_some(), candidate.range.start)
-                    > (best.call_id.is_some(), best.range.start)
-            }) {
-                anchor = Some(index);
+        let mut invocation: Option<usize> = None;
+        for (_, indexes) in anchors_by_start.range(item.start..item.end) {
+            for &index in indexes {
+                owner_step(&mut work, check)?;
+                let candidate = &anchors[index];
+                if candidate.range.end <= item.end {
+                    consumed[index] = true;
+                } else if candidate.call_id.is_some() && candidate.range.start == item.start {
+                    consumed[index] = true;
+                    invocation = invocation.or(Some(index));
+                    continue;
+                } else {
+                    continue;
+                }
+                if candidate.range.end == item.end
+                    && anchor.is_none_or(|best| {
+                        let best = &anchors[best];
+                        (candidate.call_id.is_some(), candidate.range.start)
+                            > (best.call_id.is_some(), best.range.start)
+                    })
+                {
+                    anchor = Some(index);
+                }
             }
         }
         sites.push(PreparedSite {
             raw: Some(item),
             site,
-            anchor,
+            anchor: anchor.or(invocation),
         });
     }
-    // Calls and internal type references no structural site covers are sites of their own.
-    // A binding outside the checkout adds no module site.
-    for (index, anchor) in anchors.iter().enumerate() {
-        check()?;
-        let own = match (&anchor.call_id, &anchor.outcome) {
-            (_, SemanticOutcome::External) => false,
-            (Some(_), _) => true,
-            (None, SemanticOutcome::Internal(..)) => anchor.type_role,
-            (None, _) => false,
-        };
-        if consumed[index] || !own || !usable(anchor) {
-            continue;
+    // Calls and type references with an internal target that no structural site covers
+    // are sites of their own, one per range (a call first). Unbound, ambiguous,
+    // unresolved and external bindings add no site.
+    let mut covered = BTreeSet::new();
+    for calls_first in [true, false] {
+        for (index, anchor) in anchors.iter().enumerate() {
+            check()?;
+            if anchor.call_id.is_some() != calls_first
+                || consumed[index]
+                || !usable(anchor)
+                || !matches!(anchor.outcome, SemanticOutcome::Internal(..))
+                || (anchor.call_id.is_none() && !anchor.type_role)
+                || !covered.insert((anchor.range.start, anchor.range.end))
+            {
+                continue;
+            }
+            let site = context.site(
+                anchor.range.start,
+                anchor.range.end,
+                if calls_first { "call" } else { "type" },
+                doc.file.text[anchor.range.start..anchor.range.end].to_owned(),
+                anchor.call_id.clone(),
+                &mut work,
+                check,
+            )?;
+            sites.push(PreparedSite {
+                raw: None,
+                site,
+                anchor: Some(index),
+            });
         }
-        let site = context.site(
-            anchor.range.start,
-            anchor.range.end,
-            if anchor.call_id.is_some() {
-                "call"
-            } else {
-                "type"
-            },
-            doc.file.text[anchor.range.start..anchor.range.end].to_owned(),
-            anchor.call_id.clone(),
-            &mut work,
-            check,
-        )?;
-        sites.push(PreparedSite {
-            raw: None,
-            site,
-            anchor: Some(index),
-        });
     }
     Ok(PreparedFile {
         source,

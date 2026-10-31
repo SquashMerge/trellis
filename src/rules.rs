@@ -1534,6 +1534,8 @@ fn constraint(
             ("conforms", None)
         }
         _ if uncertain > 0 || (calls && !doc.semantic.complete) => ("unknown", Some(incomplete)),
+        // Only a forbidden type relationship reaches here: absence is not proof.
+        ("forbid", ..) => ("unknown", Some("type_relationship_absence_unproven")),
         _ => ("unknown", Some(absent)),
     };
     Ok((status, reason, evidence))

@@ -224,9 +224,11 @@ role selects (`typeRelationship` evidence). Then:
 
 Unbound, stale, ambiguous, unresolved and dispatched (virtual, interface, dynamic or
 unknown dispatch) calls, and targets a role selects only by `extends`/`implements`
-selector, are uncertain. A rule instance deviates when any constraint deviates,
-conforms when its declaration is certainly selected and every constraint conforms,
-and is otherwise unknown.
+selector, are uncertain. A rule instance whose declaration is certainly selected
+deviates when any constraint deviates and conforms when every constraint conforms;
+otherwise, including whenever its selection is uncertain, it is unknown. A forbidden
+type relationship without a counted one stays unknown with
+`type_relationship_absence_unproven`.
 
 An instance is `conforms`, `deviates` or `unknown`. A proven deviation wins over
 uncertainty, but uncertainty remains in the details. Instances deduplicate by
@@ -576,19 +578,26 @@ producer's **fresh** evidence for the document, from a selected `complete` or
 use-site semantic references, and `extends`/`implements` relationships. Rows whose
 proof is not `fresh`, and internal call targets not confirmed current
 (`staleTarget` not `false`), are left out, so stale evidence reverts to structural
-evidence. An internal target must be a declaration of this snapshot; its module
-is the declaration's file.
+evidence. A call is represented by its lowest-provenance binding, as in the call
+graph; when that one is unusable the call has no binding. Any internal target must
+be a declaration of this snapshot (semantic references carry no separate
+current-target flag); its module is the declaration's file.
 
-- A structural site is bound by the binding that ends where it ends (its callee or
-  final name; a call binding wins over a name). A resolved internal binding maps
-  the site to its target's module; an external binding resolves the site without a
-  destination unless structural evidence proved a package. An ambiguous or
-  unresolved binding keeps the structural result.
-- A measured call no structural site spells (a method call, say) becomes a `call`
-  site; a resolved internal `type` reference becomes a `type` site. An ambiguous or
-  unresolved call binding makes its call site unresolved
-  (`call_binding_ambiguous`, `call_binding_unresolved`); a call with an external
-  binding, or none, adds no site.
+- A structural site takes in every binding inside its range, and a call joined on a
+  whole invocation that starts with it. It is bound by the binding that ends where
+  it ends (its callee or final name; a call binding wins over a name), else by such
+  an invocation. A resolved internal binding maps the site to its target's module;
+  an external binding resolves the site without a destination unless structural
+  evidence proved a package. An ambiguous or unresolved binding keeps the
+  structural result.
+- A measured call with a resolved internal binding that no structural site covers
+  (a method call, say) becomes a `call` site, and a resolved internal `type`
+  reference likewise a `type` site; one site per range, a call first. A target in
+  the site's own module adds no site. Calls whose binding is external, ambiguous,
+  unresolved, stale or missing add no site: they are not counted, as without an
+  import.
+- A site an external binding resolved is neither mapped nor unresolved, so `sites`
+  can exceed `mappedSites + unresolvedSites`.
 - A site mapped or resolved by a binding has `mapping:"semantic"` and its binding's
   `provenanceId`; other sites are `structural` with a null `provenanceId`.
   `counts.semanticSites` counts semantic sites with no residual. An edge's

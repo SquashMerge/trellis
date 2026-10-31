@@ -731,12 +731,17 @@ pub(super) fn architecture_semantic(
     use crate::references::{SemanticAnchor, SemanticOutcome, SemanticRelationship};
     let defaults = default_producers(db, revision_key)?;
     // Snapshot documents by language, then path.
+    // A revision has one source set; its documents are keyed by language and path.
     let mut index: HashMap<String, HashMap<String, usize>> = HashMap::new();
     for (i, doc) in documents.iter().enumerate() {
-        index
-            .entry(doc.key.language.clone())
-            .or_default()
-            .insert(doc.key.path.clone(), i);
+        ensure!(
+            index
+                .entry(doc.key.language.clone())
+                .or_default()
+                .insert(doc.key.path.clone(), i)
+                .is_none(),
+            SelectedIntegrity("duplicate architecture document".into())
+        );
     }
     let locate = |language: Option<&str>, path: Option<&str>| {
         index
@@ -825,7 +830,9 @@ pub(super) fn architecture_semantic(
             documents[i].key.path.clone(),
         );
         // One binding per measured call: the lowest provenance, as the call graph selects.
-        let mut by_call: BTreeMap<String, SemanticAnchor> = BTreeMap::new();
+        // The lowest provenance represents a call, as in the call graph; an unusable one
+        // (stale, or outside this snapshot) leaves the call without a binding.
+        let mut by_call: BTreeMap<String, (String, Option<SemanticAnchor>)> = BTreeMap::new();
         let mut cursor = calls.query(params![tuple, language, path])?;
         while let Some(row) = cursor.next()? {
             admit()?;
@@ -834,7 +841,7 @@ pub(super) fn architecture_semantic(
             let provenance_id: String = row.get(10)?;
             if by_call
                 .get(&call_id)
-                .is_some_and(|kept| kept.provenance_id <= provenance_id)
+                .is_some_and(|(kept, _)| *kept <= provenance_id)
             {
                 continue;
             }
@@ -853,7 +860,10 @@ pub(super) fn architecture_semantic(
                         (Some(0), Some(target_doc)) => {
                             SemanticOutcome::Internal(target_doc, target)
                         }
-                        _ => continue,
+                        _ => {
+                            by_call.insert(call_id, (provenance_id, None));
+                            continue;
+                        }
                     }
                 }
                 ("external", ..) => SemanticOutcome::External,
@@ -869,12 +879,15 @@ pub(super) fn architecture_semantic(
                 type_role: false,
                 direct: matches!(row.get_ref(8)?.as_str()?, "direct" | "constructor"),
                 outcome,
-                provenance_id,
+                provenance_id: provenance_id.clone(),
             };
-            by_call.insert(call_id, anchor);
+            by_call.insert(call_id, (provenance_id, Some(anchor)));
         }
         drop(cursor);
-        let mut anchors: Vec<SemanticAnchor> = by_call.into_values().collect();
+        let mut anchors: Vec<SemanticAnchor> = by_call
+            .into_values()
+            .filter_map(|(_, anchor)| anchor)
+            .collect();
         // Resolved and external use-site references: the names a site spells.
         let mut cursor = references.query([tuple])?;
         while let Some(row) = cursor.next()? {
