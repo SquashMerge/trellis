@@ -1,7 +1,7 @@
 # Viewer shell
 
-The Viewer has Diagrams and Files sections within one checkout/session frame. Diagrams keeps
-Sequence, Architecture, Classes and Libraries and its collapsible source dock. Architecture shows
+The Viewer has Diagrams and Files sections within one checkout/session frame. Diagrams has
+Architecture, Treemap, Sequence and Classes tabs and its collapsible source dock. Architecture shows
 authored layer bands over pinned structural-reference evidence; see the
 [Architecture contract](architecture-view.md) for counts, stored roles, metrics and limits. Files is a primary cached-source
 surface with a pinned indexed-file catalog, all-symbol outline and declaration evidence, as
@@ -11,6 +11,35 @@ Files may separately show the existing net HEAD-to-working-tree Git diff; it is 
 not indexed, never a replacement for cached source or its navigation basis.
 There are no remote-machine groups, future diagram tabs, agent/terminal controls or gated actions.
 The existing Git summary remains independent of index freshness; upstream counts are as of last fetch.
+
+## Tabs that earn their place (#450)
+
+Owner decisions of 2026-10-29:
+
+- **Classes** appears only when the checkout has production code in a language the class
+  catalog extracts. The browser joins the current metrics projection's stored roles (files
+  with production callables, outside vendored, fixture and hidden-layer exclusions) with
+  `GET /api/classes` `supportedLanguages`, read once per pin after production code is known.
+  While either is unknown, or if either read fails, the tab stays hidden. An explicit class
+  menu or **Class diagram** action still opens Classes; its tab then shows while it is active.
+  Test-only code never earns the tab, including with **Include tests and fixtures in metrics**.
+- **Sequence** opens from a method: the tree, the source margin, or the inspector (resolved call
+  targets and the metric inspector's highest-cognitive callables). With no method selected it
+  lists up to five named highest-cognitive callables of the current metrics projection
+  (`topCognitive=8`, anonymous rows skipped) as text buttons. Choosing one posts its exact sid
+  at the projection's pin to `POST /api/sequence`; a seed mismatch displays nothing.
+- **Libraries** is not a tab and has no route. The automatic catalog backend is unchanged and is
+  reached in context: **Open in library** appears on an Architecture reference pair whose target
+  is an external package, and in the step inspector for an `external` call whose
+  `callEvidence.externalPackage` (the package field of the binding's SCIP symbol) names it. The
+  action appears only when the ready catalog indexes a package of that ecosystem with that exact
+  name, Cargo crate spelling (`-`/`_`) or alias; a named version is preferred, and several
+  matching versions offer a choice. Standard-library identities and unsupported ecosystems get
+  no action. It opens the source dock's **Library** tab (hidden until first used) with the
+  package's indexed definitions and explicit candidate source; the selected method, diagram and
+  inspection stay. Library candidate IDs never seed workspace sequences or navigation. The
+  manual Rust source-root browser was Libraries-tab-only UI and is removed from the browser;
+  its endpoints remain.
 
 ## Checkout observation
 
@@ -94,7 +123,7 @@ has been deleted. That catalog is not a claim about the current filesystem or Gi
 The inspector shows every metric leaf at the named aggregate. Null stays `—`; explicit unavailable
 reasons, including fan-in, stay visible. Highest-cognitive rows use raw callable scores and native
 nullable names, kinds and byte ranges. Anonymous functions are not assigned invented names.
-These rows are informational, not guessed native-SID-to-source links. Labels and highest-cognitive
+A named row's exact sid opens its sequence at the same pin (#450); anonymous rows stay text. Labels and highest-cognitive
 rankings follow the selected role. Test-only files have unavailable production heat, not zero.
 Callable-range LOC/SLOC may overlap and are not production physical file lines. Per-file
 `roleCounts` describe all measured production/test callables at the pin, not physical line coverage.

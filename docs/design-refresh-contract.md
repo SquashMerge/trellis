@@ -18,8 +18,8 @@ The full logo lockup is Connect-only, with clear space. App headers use the prov
 symbol plus “Trellis by SquashMerge”; no favicon ships before a reviewed compact mark exists.
 The Tools tab is retired by the [owner ruling 2026-10-24, #305](https://github.com/SquashMerge/trellis/issues/305#issuecomment-6394175295). This does not add unshipped tabs or authorize fictional compiler, agent or terminal capabilities. Gated capabilities remain hidden until accepted.
 
-The explorer stays beside the sequence canvas on desktop. Classes and Libraries have their
-own tabs. Selected calls and controls populate the inspector. Explicit source actions open
+The explorer stays beside the sequence canvas on desktop. Classes has its own tab when earned;
+libraries open in the source dock from external calls and references (#450). Selected calls and controls populate the inspector. Explicit source actions open
 a source dock. Small screens use exclusive explorer/inspector drawers and scroll diagrams
 inside the canvas. Selecting a method or opening source closes obstructing drawers.
 
@@ -32,15 +32,14 @@ checks. Font licenses ship under `web/fonts/`.
 `window.TrellisShell` is presentation-only. It never fetches, indexes or calls a provider:
 
 - `setConnected(bool)`, `updateWorkspace(status)`
-- `showView("sequence" | "classes" | "libraries")`
+- `showView("architecture" | "treemap" | "sequence" | "classes")`, `setViewAvailable(name, bool)`
 - `showSource("workspace" | "library")`
 - `selectStep(step, view, openSourceCallback)`
 - `resetInspector()`, `reset()`
 
 Application hooks are optional for legacy harnesses. Source callbacks retain the application's
 session, revision and selected-method guards. Disconnect/revision/method changes clear stale
-inspector callbacks. Pending/failed library reads remain visible in Libraries even if the dock
-is closed. Successful reads reveal the selected cached source and highlighted range.
+inspector callbacks. Pending/failed library reads remain visible in the Library dock tab. Successful reads reveal the selected cached source and highlighted range.
 
 ## Renderer interface
 

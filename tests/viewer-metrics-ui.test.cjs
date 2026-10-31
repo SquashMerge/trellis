@@ -6,7 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const generation = "12345678-1234-4123-8123-123456789abc";
 const pin = {indexGeneration:generation, indexRevision:1};
-function harness() {
+function harness(options = {}) {
   const elements = new Map(), requests = [], conflicts = [];
   let changes = 0, shown = 0, cleared = 0;
   const state = {rootKey:"checkout-a", session:1, pin:{...pin}, treeRoot:"/repo", indexedWorkspace:"/repo"};
@@ -26,7 +26,7 @@ function harness() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, "../web/viewer-metrics.js"), "utf8"), context);
   const controller = window.TrellisMetrics.create({context:() => state, request(url) {
     return new Promise((resolve, reject) => requests.push({url, resolve, reject}));
-  }, onChange() { changes++; }, onConflict(error) { conflicts.push(error); }});
+  }, onChange() { changes++; }, onConflict(error) { conflicts.push(error); }, onOpenCallable:options.onOpenCallable});
   const change = (id, value) => {
     if (typeof value === "boolean") get(id).checked = value; else get(id).value = value;
     get(id).listeners.change({target:get(id)});
@@ -311,4 +311,42 @@ test("each explorer swatch's tooltip names the metric, population, value and fix
   const maintainability = ["two.js"].map(path => h.controller.decorate(h.node("button"), {scope:"file", path}));
   h.controller.renderLegend(maintainability);
   assert.match(maintainability[0].node.title, /^Maintainability · max .*higher is better/);
+});
+
+// #450: the revision projection also supplies Sequence starting points and the
+// production languages that gate Classes.
+test("revision projection requests eight top callables and reports production languages from stored roles", async () => {
+  const h = harness();
+  assert.equal(h.controller.productionLanguages(), null, "unknown before a projection");
+  assert.equal(h.controller.topCallables(), null);
+  const top = [{sourceSetId:"s", language:"java", path:"A.java", sid:"sid:v1:a", range:{start:0,end:4}, name:"run", kind:"method", role:"production", metrics:{cognitive:9,cyclomatic:3,maxNesting:2}}];
+  await publish(h, [row("app.js", 1), row("tests/a.py", 1, {language:"python", roleCounts:{production:0, test:2}}),
+    row("tests/fixtures/B.java", 1, {language:"java", excludedReason:"fixture"}), row("lib.rs", 2, {language:"rust", roleCounts:{production:3, test:1}})], {topCognitive:top});
+  assert.equal(new URL(h.requests[0].url, "http://local").searchParams.get("topCognitive"), "8");
+  assert.deepEqual([...h.controller.productionLanguages()].sort(), ["javascript", "rust"], "test-only and excluded rows do not count");
+  const callables = h.controller.topCallables();
+  assert.equal(callables.rows[0].sid, "sid:v1:a"); assert.deepEqual({...callables.pin}, pin);
+  assert.match(callables.population, /production callables/);
+  h.state.pin = {indexGeneration:generation, indexRevision:2};
+  assert.equal(h.controller.productionLanguages(), null, "another pin is not usable");
+  assert.equal(h.controller.topCallables(), null);
+});
+test("named highest-cognitive rows open their sequence; anonymous rows stay text", async () => {
+  const opened = [], h = harness({onOpenCallable:(row, at) => opened.push([row.sid, at])});
+  const file = row("a.js", 3); await publish(h, [file]);
+  const work = h.controller.inspect({scope:"file", path:"a.js"});
+  const named = {...file, role:"production", name:"<b>run</b>", kind:"function", sid:"sid:v1:named", range:{start:0,end:9}, metrics:{cognitive:3,cyclomatic:2,maxNesting:1}};
+  h.requests.at(-1).resolve(payload([file], {scope:"file", topCognitive:[named, {...named, name:null, sid:"sid:v1:anon"}]})); await work;
+  const items = h.get("metric-inspector-top").children;
+  const button = items[1].children[0], anonymous = items[2].children[0];
+  assert.equal(button.tagName, "button"); assert.equal(button.textContent, "<b>run</b>");
+  assert.equal(anonymous.tagName, "strong"); assert.equal(anonymous.textContent, "Anonymous function");
+  button.listeners.click();
+  assert.deepEqual(opened.map(([sid, at]) => [sid, {...at}]), [["sid:v1:named", pin]]);
+  h.state.pin = {indexGeneration:generation, indexRevision:2};
+  button.listeners.click(); assert.equal(opened.length, 1, "a stale row is inert");
+  const plain = harness(); await publish(plain, [file]);
+  const inspection = plain.controller.inspect({scope:"file", path:"a.js"});
+  plain.requests.at(-1).resolve(payload([file], {scope:"file", topCognitive:[named]})); await inspection;
+  assert.equal(plain.get("metric-inspector-top").children[1].children[0].tagName, "strong", "without an opener rows stay informational");
 });

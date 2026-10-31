@@ -6,7 +6,11 @@
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
+  const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel"};
+  // Views whose tab is hidden because the checkout has nothing for them (#450). An
+  // explicitly opened view keeps its tab while it is active. Classes stays hidden until
+  // the app shows the checkout has code the class catalog supports.
+  const unavailableViews = new Set(["classes"]);
   let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "architecture", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
@@ -142,13 +146,24 @@
       tab?.setAttribute("aria-selected", String(key === name));
       if (tab) tab.tabIndex = key === name ? 0 : -1;
     }
+    syncViewTabs();
     viewCallback?.(name);
+  }
+  function syncViewTabs() {
+    for (const key of Object.keys(views)) hide(`view-${key}`, unavailableViews.has(key) && key !== activeView);
+  }
+  function setViewAvailable(name, available) {
+    if (!Object.hasOwn(views, name)) return;
+    if (available) unavailableViews.delete(name); else unavailableViews.add(name);
+    syncViewTabs();
   }
   function showSource(name) {
     if (!["workspace", "library"].includes(name)) return;
     if (name === "library" && document.body.classList.contains("files-section")) showDiagrams();
     if (!document.body.classList.contains("files-section") && !get("source-dock")?.contains?.(document.activeElement)) sourceReturnFocus = document.activeElement;
     hide("source-dock", false);
+    // The Library dock tab exists only once a library was opened in context (#450).
+    if (name === "library") hide("dock-library", false);
     for (const key of ["workspace", "library"]) {
       hide(`${key}-source-panel`, key !== name);
       get(`dock-${key}`)?.setAttribute("aria-selected", String(key === name));
@@ -171,18 +186,20 @@
     target?.focus(); sourceReturnFocus = null;
   }
   function wireTabs(names, prefix, select) {
-    names.forEach((name, index) => {
+    names.forEach(name => {
       const tab = get(prefix + name);
       tab?.addEventListener("click", () => { if (!tab.disabled) select(name); });
       tab?.addEventListener("keydown", event => {
         if (names.some(other => get(prefix + other)?.disabled)) return;
+        // Hidden tabs are skipped; the focused tab is always in the rotation.
+        const shown = names.filter(other => other === name || !get(prefix + other)?.hidden), at = shown.indexOf(name);
         let next;
-        if (event.key === "ArrowRight") next = (index + 1) % names.length;
-        else if (event.key === "ArrowLeft") next = (index + names.length - 1) % names.length;
+        if (event.key === "ArrowRight") next = (at + 1) % shown.length;
+        else if (event.key === "ArrowLeft") next = (at + shown.length - 1) % shown.length;
         else if (event.key === "Home") next = 0;
-        else if (event.key === "End") next = names.length - 1;
+        else if (event.key === "End") next = shown.length - 1;
         else return;
-        event.preventDefault(); select(names[next]); get(prefix + names[next])?.focus();
+        event.preventDefault(); select(shown[next]); get(prefix + shown[next])?.focus();
       });
     });
   }
@@ -333,7 +350,7 @@
 
   }
   function reset() {
-    setSection("diagrams"); resetInspector(); showView("architecture"); closePopovers(); hide("source-dock", true); sourceReturnFocus = null;
+    setSection("diagrams"); resetInspector(); showView("architecture"); closePopovers(); hide("source-dock", true); hide("dock-library", true); sourceReturnFocus = null;
     drawer("explorer", false); drawer("inspector", false); updateCheckout(null, null); updateWorkspace(null);
   }
   function setConnected(connected) {
@@ -417,6 +434,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {setIndexAvailable, closePopovers, showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
+  window.TrellisShell = {setIndexAvailable, setViewAvailable, closePopovers, showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();

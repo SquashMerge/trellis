@@ -384,7 +384,7 @@ test("cold checkout keeps its explicit selection and never invents evidence", as
   assert.equal(h.run("status"),null);
   assert.match(h.get("checkout-state").textContent,/Index not ready/i);
   assert.equal(h.get("index").hidden,false,"Index workspace is offered when there is no usable index");
-  for (const view of ["architecture","treemap","sequence","classes","libraries"]) assert.equal(h.get(`view-${view}`).disabled,true,`${view} is greyed out without an index`);
+  for (const view of ["architecture","treemap","sequence","classes"]) assert.equal(h.get(`view-${view}`).disabled,true,`${view} is greyed out without an index`);
   assert.equal(h.get("section-files").disabled,true);
   assert.equal(h.get("checkout-root").textContent.includes("/synthetic"),false,"unverified display path is not evidence");
   assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status",`${SCOPED}/git`,`${SCOPED}/status`,`${SCOPED}/git`]);

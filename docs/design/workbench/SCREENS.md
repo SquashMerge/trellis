@@ -75,7 +75,7 @@ Diagrams only, no terminal.
   - A note that any agent can still use these indexes through `trellis mcp`.
   - A **Files** tree with a filter input. Each folder and file has a metric swatch and value for the current color-by metric.
 - **Center:**
-  - Diagram tabs (Architecture / Treemap / Sequence / Class / Libraries / C4) with a "Mermaid → Pele 1.6.0" tag. There is no Tools tab (retired) and no ERD tab (dropped).
+  - Diagram tabs (Architecture / Treemap / Sequence / Class / C4) with a "Mermaid → Pele 1.6.0" tag. Class shows only for production code in a class-catalog language, and Libraries is not a tab (owner 2026-10-29, #450). There is no Tools tab (retired) and no ERD tab (dropped).
   - Architecture is shown: layer bands of module chips colored by metric, with each band's max and its refs down/up counts. Upward refs are boxed in the error color.
 - **Right: inspector** for the selected module.
   - Every metric with its aggregation, with the active metric highlighted.
@@ -180,12 +180,14 @@ All diagram views share:
   - Collapsed chains preview only the first measured call and its proven target. Hidden or folded later calls do not introduce lanes. Full and Files mini sequences use the same targets and history owner.
   - No invented returns or activations.
   - Every guard and alternate is preserved.
+- **Entry (#450):** a method from the tree, the source margin or the inspector. With no method selected, the tab lists up to five named most-complex methods of the current metrics projection to start from.
 - **Needs:** the existing SequenceView DTO (`docs/sequence-slice-contract.md`).
 
 ### Class — `#Class` · `screens/09-class.png` · `Class.dc.html`
 
 - A one-hop view seeded on `WatcherWitness`, with expand-neighbors on nodes.
 - Respect the size cap; collapse the frontier into package nodes.
+- **Shown only (#450)** when the checkout has production code in a language `GET /api/classes` reports in `supportedLanguages`; hidden otherwise.
 - **Needs:** the class diagram DTO (`docs/class-diagram-contract.md`).
 
 ### C4 — `#C4` · `screens/10-c4.png` · `C4.dc.html`
@@ -196,13 +198,12 @@ All diagram views share:
 - The inspector lists relationships.
 - **Mockup bug:** a few edge labels collide or clip ("Launches owned child · real PTY" over the boundary title, "Authentic…"). Pele layout replaces this.
 
-### Libraries — `#Libraries` · `screens/11-libraries.png` · `Libraries.dc.html`
+### Libraries — in context, not a tab (#450) · `screens/11-libraries.png` · `Libraries.dc.html`
 
-- Today's Libraries tab (`web/index.html` `#dependency-library`) in the new shell: the local declaration catalog, Rust/Cargo first.
-- **Left:** packages with version and state as a word plus a shape (Indexed, Not cached), and folded library diagnostics.
-- **Center:** indexed definitions for the selected package (kind, name, location) with a filter, and the badges **Syntax candidates · Terminal library boundary**: declarations don't prove resolved types, callees or dispatch.
-- **Refresh library status** re-reads the catalog. No downloads or project commands.
-- **Needs:** the existing `/api/dependencies*` routes.
+- **Owner decision 2026-10-29:** the Libraries board is no longer a tab (reversing the 2026-10-24 ruling). The board shows the catalog's content, which now opens in the source dock's **Library** tab.
+- **Entry:** **Open in library** on an Architecture reference pair whose target is an external package, and in the Sequence step inspector for an external call whose SCIP symbol names a package. It appears only when the local catalog indexes that package; several versions offer a choice.
+- **Dock:** the package with version, source and index state as words, folded library diagnostics, indexed definitions with a filter and paging, and the badges **Syntax candidates · Terminal library boundary**: declarations don't prove resolved types, callees or dispatch. Selecting a definition reads its candidate source explicitly. No downloads or project commands.
+- **Needs:** `GET /api/dependencies`, `/dependencies/symbols`, `/dependencies/source` (unchanged) and `callEvidence.externalPackage` on sequence steps.
 
 ### ERD (removed)
 

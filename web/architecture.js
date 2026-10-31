@@ -51,7 +51,7 @@
     }
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }
-  function create({request, context, readSource, openTreemap, onConflict = () => {}, onInspect = () => {}}) {
+  function create({request, context, readSource, openTreemap, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
@@ -488,6 +488,9 @@
         if (external(pair.target)) {
           const descriptor = view.references.externalPackages.find(item => same(item.identity, pair.target));
           disclosure(details, "External package evidence", descriptor);
+          // In-context library entry (#450); null unless the catalog indexes this package.
+          const open = libraryButton(pair.target);
+          if (open) details.append(open);
         }
         for (const site of pair.sites) {
           const sample = make("details"); sample.append(make("summary", `${site.role} · ${site.relationKind} · ${site.spelling}`));

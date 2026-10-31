@@ -309,7 +309,7 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .metric-value { margin-left: 4px; color: var(--secondary); font: 11px/1.5 var(--mono); }
 .metric-legend .metric-swatch { width: 18px; }
 .file-metric { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; color: var(--secondary); font: 11px/1.5 var(--mono); }
-.view-panel, #dependency-library { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; }
+.view-panel { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; }
 #sequence-panel { display: flex; flex-direction: column; overflow: hidden; }
 .sequence-toolbar { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 14px 18px 8px; }
 .sequence-toolbar h2 { margin-right: auto; }
@@ -400,18 +400,21 @@ body:not(.daemon-connected) .connection-footer-brand { margin-right: auto; }
 .line-number { display: inline-block; width: 5em; text-align: right; padding-right: 1.5em; color: var(--muted); user-select: none; }
 #external-definitions { max-height: 130px; overflow: auto; }
 #external-filter { margin: 6px; }
-/* Libraries are a separate catalog, not inferred runtime participants. */
-#dependency-library { padding: 18px; }
-#dependency-library > .detail { max-width: 75ch; }
-#dependency-library .warning-disclosure { margin: 14px 0; padding: 8px 0; background: var(--clear); }
+/* Libraries are a separate catalog opened in context (#450), not inferred runtime participants. */
+#library-source-panel > .detail { max-width: 75ch; }
+#library-source-panel .warning-disclosure { margin: 8px 0; padding: 6px 0; background: var(--clear); }
 .dependency-layout { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(0, 2fr); gap: 20px; }
 .dependency-layout > div { min-width: 0; }
+#dependency-packages:empty { display: none; }
 #dependency-packages, #dependency-symbols { max-height: 360px; overflow: auto; }
 #dependency-packages button, #dependency-symbols button { width: calc(100% - 6px); overflow-wrap: anywhere; }
 #dependency-filter { width: 160px; }
-#external-sources { margin: 20px 0; padding: 12px 0; border-top: 1px solid var(--line); }
-.external-tree ul { margin-left: 12px; }
-.external-tree button, #external-definitions button { text-align: left; overflow-wrap: anywhere; }
+#external-definitions button { text-align: left; overflow-wrap: anywhere; }
+#sequence-start { padding: 4px 18px 12px; }
+#sequence-start h3 { font-size: 12px; margin: 6px 0; color: var(--secondary); }
+#sequence-start-list { display: grid; gap: 4px; max-width: 80ch; }
+#sequence-start-list button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+#sequence-start-list .detail { margin-left: 8px; font: 11px/1.5 var(--mono); }
 footer { display: flex; flex: none; justify-content: space-between; align-items: center; gap: 14px; padding: 5px 16px; border-top: 1px solid var(--line); background: var(--rail); color: var(--muted); font-size: 11px; }
 .local-indicator::before { content: ''; display: inline-block; width: 5px; height: 5px; border-radius: 50%; margin-right: 7px; background: var(--muted); vertical-align: middle; }
 footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(520px, calc(100vw - 24px)); padding: 16px; margin: 0; background: var(--card); border: 1px solid var(--line-strong); color: var(--secondary); z-index: 20; }
@@ -458,7 +461,6 @@ footer details > p { position: absolute; bottom: 30px; right: 12px; width: min(5
   .sequence-toolbar .bar { gap: 9px; }
   #sequence-state { padding: 0 12px; }
   .sequence-scroll { padding: 8px 0; }
-  #dependency-library { padding: 14px 12px; }
   .dependency-layout { grid-template-columns: 1fr; gap: 8px; }
   .source-dock-bar { padding: 0 4px; }
   .dock-tabs button { padding: 8px; }

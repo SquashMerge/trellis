@@ -45,6 +45,10 @@ pub fn publish(root: &Path, mode: &str) -> Result<Value> {
     if mode == "stale" {
         spec.requested_version = "v2".into();
     }
+    // An external call into a package the browser's library catalog can open (#450).
+    if mode == "library" {
+        spec.external_symbol = "rust-analyzer cargo local-library 0.1.0 candidate_only().".into();
+    }
     for nth in 0..if sequence { 2 } else { 1 } {
         let mut binding = bind("measured", nth, "actual_target");
         if sequence {
@@ -56,7 +60,7 @@ pub fn publish(root: &Path, mode: &str) -> Result<Value> {
             "ambiguous" => binding.resolution = Resolution::Ambiguous,
             "dispatch" => binding.dispatch = Dispatch::Virtual,
             "constructor" => binding.dispatch = Dispatch::Constructor,
-            "external" => binding.resolution = Resolution::External,
+            "external" | "library" => binding.resolution = Resolution::External,
             "missing" => continue,
             _ => {}
         }

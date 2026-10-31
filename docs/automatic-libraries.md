@@ -17,14 +17,16 @@ See [the workbench contract](design-refresh-contract.md) and
 
 ## Use it
 
-Connect and open **Libraries**. Packages and declarations load without entering library paths or
-knowing source filenames. Select a package, filter its indexed definitions, and select a definition
-to open its source. Source reads are explicit, hash-checked and separate from your workspace source
+Libraries is not a tab (owner decision 2026-10-29, #450). Choose **Open in library** on an
+Architecture reference into an external package, or in the step inspector of an external call
+whose SCIP symbol names a catalogued package. The source dock's **Library** tab shows that
+package's indexed definitions without entering library paths or knowing source filenames.
+Filter them and select a definition to open its source. Source reads are explicit, hash-checked and separate from your workspace source
 pane. The source window shows at most 600 lines; Previous/Next uses the cached text.
 
-The catalog builds in the background at startup and after Index. If it is still loading, use
-**Refresh library status**. If a method was already selected when the catalog changed, reselect it
-to update its candidate lanes. This does not call a model.
+The catalog builds in the background at startup and after Index, and the browser re-reads its
+status with the workspace status (header ⋯ → Refresh). **Open in library** appears only once the
+catalog is ready and indexes the package. This does not call a model.
 
 `src/acp.rs → check_file_with_unlinked` is the primary example: its fluent OpenOptions chain can be
 collapsed or expanded. A collapsed chain retains an arrow for its first measured call and labels
@@ -48,7 +50,7 @@ semantic evidence. Show all restores the original measured steps.
   custom source replacement, unsupported git sources, outside-workspace path dependencies,
   custom library roots and generated code are not silently guessed.
 - Memory catalog snapshots rebuild on startup; there is no disk catalog cache or file watcher yet.
-- The manual Rust source browser is a fallback, not the automatic library workflow.
+- The manual Rust source-root endpoints remain a fallback API; the browser no longer offers them (#450).
 
 ## Trusted toolchain configuration
 

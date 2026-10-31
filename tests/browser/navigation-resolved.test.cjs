@@ -215,3 +215,44 @@ for (const mode of ["sole", "constructor", "zero", "multiple", "unresolved", "am
     }
   });
 }
+
+// #450: an external call carries the package its SCIP symbol names, for in-context
+// library lookup. It still has no target lane or declaration. This fixture's index never
+// reaches a ready library catalog, so the inspector honestly offers no library action;
+// the catalogued path is covered by the Architecture browser test and browse-ui.
+test("an external call names its SCIP package and offers no library action without a catalog", {timeout:240000}, async () => {
+  const paths = H.fixture("", "placeholder.txt");
+  rmSync(paths.source);
+  let server, browser, context;
+  try {
+    const seeded = await H.run(H.binary, ["navigation-fixture", "--workspace", paths.workspace, "--mode", "sequence-library"], {env:paths.env});
+    const fixture = seeded.json(), pin = fixture.revision;
+    server = await H.startDaemon(paths, pin.indexRevision);
+    browser = await chromium.launch();
+    context = await browser.newContext({viewport:{width:1440, height:900}});
+    const page = await context.newPage(), errors = [];
+    page.on("pageerror", error => errors.push(error.message));
+    await H.connect(page, server, paths.token);
+    await page.locator(".file-pick").filter({hasText:"flow.rs"}).first().click();
+    const selected = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/sequence") && response.request().postDataJSON()?.seed === fixture.caller);
+    await page.locator(".method-pick").filter({hasText:"measured"}).first().click();
+    const dto = await (await selected).json();
+    const calls = sequenceSteps(dto.steps).filter(step => fixture.calls.includes(step.callId));
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      assert.equal(call.callEvidence.boundaryReason, "external");
+      assert.deepEqual(call.callEvidence.externalPackage, {manager:"cargo", name:"local-library", version:"0.1.0"});
+      assert.equal(call.target, undefined);
+    }
+    assert.ok(dto.participants.every(row => !row.declaration || row.id === fixture.caller), "no external declaration lane");
+    await page.locator("#sequence-diagram svg.pele").waitFor();
+    await page.locator(`#sequence-diagram [role=button][data-trellis-call-id="${fixture.calls[0]}"]`).first().click();
+    await page.waitForFunction(() => /External boundary/.test(document.querySelector("#inspector-target")?.textContent || ""));
+    assert.equal(await page.locator("#inspector-detail").getByRole("button", {name:"Open in library"}).count(), 0);
+    assert.equal(await page.locator("#dock-library").isVisible(), false);
+    assert.deepEqual(errors, []);
+  } finally {
+    await context?.close(); await browser?.close(); await H.stopDaemon(server);
+    rmSync(paths.temp, {recursive:true, force:true, maxRetries:10, retryDelay:100});
+  }
+});

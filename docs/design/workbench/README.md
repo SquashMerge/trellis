@@ -234,7 +234,7 @@ Item numbers in brackets refer to the gap list above.
 - ~~In Without-Herdr mode, what does "Design a change" produce?~~ Settled 2026-10-29: **copy to clipboard**. The copied text carries the context (checkout, revision, the diagram and selection it came from) and a **structured change request** (the typed change from the structural comparison, per the design-handoff ruling), not a Mermaid text diff. It is not saved as a request for `trellis mcp`.
 - ~~How does "Follow active tab" behave when the tab's cwd isn't an indexed checkout?~~ Settled 2026-10-29: tabs whose cwd has **no Trellis index are shown greyed out and can't be clicked through to**. Following such a tab doesn't switch the view.
 
-- **Libraries tab:** keep it as a tab (2026-10-24 ruling), or reach it from external calls and references only (gap item 7)?
+- ~~**Libraries tab:** keep it as a tab (2026-10-24 ruling), or reach it from external calls and references only (gap item 7)?~~ Settled 2026-10-29: **remove the tab**; reach the catalog in context ("open in library" from a call or reference into an external package). Built in #450.
 
 ## Owner rulings on the packet (2026-10-24)
 
@@ -251,5 +251,5 @@ These answer the review of this packet against the ratified docs. Where they con
 - **ERD:** the measured-from-`CREATE TABLE` view is dropped. A live ERD from configured databases (SPEC §10) is a future feature.
 - **Shared layer:** drawn as a vertical box beside the layer stack, holding utilities and other code usable from any layer. In `.trellis/rules.toml` (#129) it's a layer that any layer may call, with no `order`.
 - **Layer order:** each layer carries an explicit `order` number; equal numbers are peers (for example web resources and event listeners both at 1). Calls between peers are deviations unless excepted (proposed default, #129).
-- **Tools:** retired. **Libraries:** kept as a diagram-row tab (`#Libraries`).
+- **Tools:** retired. **Libraries:** kept as a diagram-row tab (`#Libraries`). *Superseded 2026-10-29: Libraries left the tab row and opens in context (#450).*
 - **Mockup update (2026-10-24):** the boards above now show these rulings: numbered layers with a peer pair and the Shared box (Architecture, Viewer), Git state (Viewer, Main, Files), machines grouped with SSH machines and an unreachable one (Viewer, Main), the Files working-tree diff, the Libraries board, Later badges, and no ERD.

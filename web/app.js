@@ -136,7 +136,7 @@ function captureSourceEntry() {
   const action = focus?.closest?.(".source-diagram-action");
   const offsets = id => ({top:$(id)?.scrollTop || 0, left:$(id)?.scrollLeft || 0});
   return {kind:"source", source:workspaceSource, sourceNavigation:workspaceSource.navigation?.snapshot?.(), section, method:selectedMethod, diagram:diagramSequence,
-    view:["sequence", "classes", "architecture", "treemap", "libraries"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence",
+    view:["sequence", "classes", "architecture", "treemap"].find(name => $("view-" + name)?.getAttribute?.("aria-selected") === "true") || "sequence",
     showAll:!!$("all-steps").checked, inspector:sourceInspector,
     file:filesFile, symbol:filesSymbol, basis:filesBasis, mini:filesMini, matches:filesMatches,
     line:Number($("source").dataset?.navigationLine) || workspaceSource.range?.startLine || 1,
@@ -1437,6 +1437,7 @@ async function selectMethod(symbol, admitted = null, callerCurrent = null) {
   window.TrellisShell?.showView("sequence");
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
   selectedMethod = symbol; $("method-source").disabled = false;
+  renderSequenceStart();
   clearSource(); renderFiles();
   await loadSequence(admitted, false, callerCurrent);
   if (callerCurrent() && selectedMethod === symbol && window.matchMedia?.("(max-width: 900px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
@@ -1470,7 +1471,11 @@ async function loadSequence(admitted = null, preserveSource = false, callerCurre
       $("sequence-state").textContent = $("sequence-state").textContent.replace(/ · Pele rendered$/, ` · Pele fell back: ${reason}`);
     };
     if (window.TrellisShell) options.onSelect = step => {
-      if (current()) { sourceInspector = {symbol:step, sequence:data}; viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step), options.onOpenTarget); }
+      if (!current()) return;
+      sourceInspector = {symbol:step, sequence:data}; viewerMetrics?.clearInspection(); window.TrellisShell?.selectStep(step, data, () => readSource(step), options.onOpenTarget);
+      const entry = window.TrellisSequence?.entry(step) || step, evidence = entry.callEvidence, pkg = evidence?.externalPackage;
+      const open = evidence?.boundaryReason === "external" && pkg && libraryButton({ecosystem:pkg.manager, name:pkg.name, version:pkg.version, origin:`external call ${entry.label}`});
+      if (open) $("inspector-detail")?.prepend(open);
     };
     const diagram = $("sequence-diagram");
     const expanded = new Set();
@@ -1648,7 +1653,8 @@ const viewerMetrics = window.TrellisMetrics?.create({
   request: path => api(path),
   context: () => ({rootKey:selectedRootKey, session:epoch, pin:status?.revision, treeRoot, indexedWorkspace}),
   onConflict: pin => unexpectedPair("Index changed. Refresh status before inspecting metrics.", pin),
-  onChange: () => renderFiles(),
+  onChange: () => { renderFiles(); updateViewAvailability(); renderSequenceStart(); },
+  onOpenCallable: (row, pin) => perform(() => openCallableSequence(row, pin)),
 });
 const treemap = window.TrellisTreemap?.create({
   request: (path, current) => api(path, "GET", undefined, current),
@@ -1667,6 +1673,7 @@ const architecture = window.TrellisArchitecture?.create({
     window.TrellisShell?.showView("treemap");
     void treemap?.openFile(identity, pin);
   },
+  libraryButton: identity => identity.standardLibrary ? null : libraryButton({ecosystem:identity.language, name:identity.package, origin:"Architecture reference"}),
   onInspect: () => { viewerMetrics?.clearInspection(); clearSource(); },
 });
 window.TrellisShell?.setViewCallback?.(name => {
@@ -1892,13 +1899,10 @@ function resetExternalWindow() {
 }
 function clearExternalSources() {
   externalSerial++; externalFileSerial++; externalSnapshot = null; externalCatalogId = null; resetExternalWindow();
-  $("external-sources").open = false;
-  $("external-roots").replaceChildren(); $("external-definitions").replaceChildren();
+  $("external-definitions").replaceChildren();
   $("external-source").replaceChildren(); $("external-warnings").replaceChildren();
-  $("external-source-path").textContent = "Choose an indexed definition or a manual source file to read a candidate snapshot.";
-  $("external-state").textContent = "Not loaded. Load configured roots to browse.";
+  $("external-source-path").textContent = "Choose an indexed definition to read a candidate snapshot.";
   $("external-filter").value = ""; $("external-filter").disabled = true;
-  $("external-load").disabled = false;
 }
 function externalButton(text, action) {
   const node = element("button", text); node.type = "button";
@@ -1908,90 +1912,6 @@ function externalButton(text, action) {
 function externalGuard() {
   const session = epoch, serial = externalSerial;
   return () => session === epoch && serial === externalSerial;
-}
-async function loadExternalRoots() {
-  if (!token) return;
-  clearExternalSources(); $("external-sources").open = true;
-  const current = externalGuard();
-  $("external-load").disabled = true; $("external-state").textContent = "Loading configured roots…";
-  try {
-    const data = await api("/api/rust-sources");
-    if (!current()) return;
-    $("external-state").textContent = data.roots.length ? "Candidate sources only. Browse a root; select a file to load its text." : "No external Rust source roots configured. Ask the daemon operator to configure --rust-source-root. Browsing is unavailable.";
-    for (const root of data.roots) {
-      const li = element("li"), list = element("ul", undefined, "plain external-tree");
-      const state = {root, path:"", list, open:false, serial:0, items:[], loaded:false};
-      const pick = externalButton(`Browse ${root.label}`, () => toggleExternalDirectory(state));
-      state.pick = pick; pick.setAttribute("aria-expanded", "false"); list.hidden = true;
-      li.append(element("p", `${root.label} · ${root.path}`, "detail"), pick, list);
-      $("external-roots").append(li);
-    }
-  } catch (error) {
-    if (current() && error.name !== "AbortError") $("external-state").textContent = error.message;
-  } finally { if (current()) $("external-load").disabled = false; }
-}
-async function toggleExternalDirectory(state) {
-  state.open = !state.open; state.list.hidden = !state.open;
-  state.pick.setAttribute("aria-expanded", String(state.open));
-  if (!state.open) { state.serial++; return; }
-  if (!state.loaded) await loadExternalDirectory(state, 0);
-}
-async function loadExternalDirectory(state, offset) {
-  const guard = externalGuard(), serial = ++state.serial;
-  const current = () => guard() && state.serial === serial && state.open;
-  state.loaded = false;
-  state.list.replaceChildren(element("li", "Loading directory metadata…"));
-  try {
-    const data = await api(`/api/rust-sources/tree?root=${encodeURIComponent(state.root.id)}&path=${encodeURIComponent(state.path)}&offset=${offset}&limit=200`);
-    if (!current()) return;
-    state.items = offset ? state.items.concat(data.items) : data.items; state.loaded = true;
-    state.list.replaceChildren();
-    for (const item of state.items) {
-      const li = element("li");
-      if (item.kind === "directory") {
-        const list = element("ul", undefined, "plain external-tree"); list.hidden = true;
-        const child = {root:state.root, path:item.path, list, open:false, serial:0, items:[], loaded:false};
-        child.pick = externalButton(item.name + "/", () => toggleExternalDirectory(child));
-        child.pick.setAttribute("aria-expanded", "false"); li.append(child.pick, list);
-      } else if (item.kind === "file" && item.path.endsWith(".rs")) {
-        li.append(externalButton(item.name, () => loadExternalFile(state.root, item.path)));
-      } else { li.append(element("span", item.name + " · not a readable Rust source file", "muted")); }
-      state.list.append(li);
-    }
-    if (!state.items.length) state.list.append(element("li", "No entries in this directory."));
-    if (data.truncated) state.list.append(element("li", "Directory scan truncated; some entries may be omitted.", "warning"));
-    if (data.nextOffset != null) state.list.append(externalButton("Load more entries", () => loadExternalDirectory(state, data.nextOffset)));
-  } catch (error) {
-    if (!current() || error.name === "AbortError") return;
-    state.loaded = false;
-    state.list.replaceChildren(element("li", error.message, "warning"), externalButton("Retry directory", () => loadExternalDirectory(state, offset)));
-  }
-}
-async function loadExternalFile(root, path) {
-  externalCatalogId = null;
-  const guard = externalGuard(), serial = ++externalFileSerial;
-  const current = () => guard() && serial === externalFileSerial;
-  externalSnapshot = null; resetExternalWindow(); $("external-source").replaceChildren(); $("external-definitions").replaceChildren();
-  $("external-warnings").replaceChildren(); $("external-filter").disabled = true;
-  $("external-source-path").textContent = `Loading candidate ${root.label} · ${path}…`;
-  $("external-state").textContent = `Loading candidate ${root.label} · ${path}…`;
-  try {
-    const data = await api(`/api/rust-sources/file?root=${encodeURIComponent(root.id)}&path=${encodeURIComponent(path)}`);
-    if (!current()) return;
-    if (data.rootId !== root.id || data.path !== path) throw new Error("Candidate source provenance mismatch. Nothing displayed.");
-    externalSnapshot = data;
-    $("external-source-path").textContent = `${data.rootLabel} · ${data.path} · hash ${data.hash} · immutable candidate snapshot`;
-    for (const warning of data.warnings || []) $("external-warnings").append(element("li", warning, "warning"));
-    $("external-filter").disabled = false; $("external-filter").value = "";
-    $("external-state").textContent = `Candidate snapshot opened: ${data.rootLabel} · ${data.path}. Not workspace evidence.`;
-    window.TrellisShell?.showSource("library");
-    renderExternalDefinitions(); renderExternalSource();
-  } catch (error) {
-    if (current() && error.name !== "AbortError") {
-      $("external-source-path").textContent = error.message;
-      $("external-state").textContent = `Candidate source failed: ${error.message}`;
-    }
-  }
 }
 function renderExternalDefinitions() {
   $("external-definitions").replaceChildren();
@@ -2049,7 +1969,6 @@ function renderExternalSource(range = externalSelectedRange, windowStart) {
     }
   }
 }
-$("external-load")?.addEventListener("click", loadExternalRoots);
 $("external-filter")?.addEventListener("input", renderExternalDefinitions);
 
 $("external-previous")?.addEventListener("click", () => { if (!$("external-previous").disabled) renderExternalSource(externalSelectedRange, externalWindowStart - 600); });
@@ -2058,7 +1977,7 @@ $("external-next")?.addEventListener("click", () => { if (!$("external-next").di
 // Metadata-only automatic library catalog. No source or provider request is implicit.
 let dependencyStatusSerial = 0, dependencySerial = 0, dependencySymbolsSerial = 0;
 let dependencyCatalog = null, dependencyPackage = null, dependencyOffset = 0, dependencyNext = null;
-let dependencyQuery = "";
+let dependencyQuery = "", dependencyChoice = null;
 function clearDependencySelection() {
   dependencySymbolsSerial++; dependencyPackage = null; dependencyOffset = 0; dependencyNext = null;
   dependencyQuery = "";
@@ -2075,10 +1994,10 @@ function clearDependencySelection() {
   }
 }
 function clearDependencyCatalog() {
-  dependencyStatusSerial++; dependencySerial++; dependencyCatalog = null;
+  dependencyStatusSerial++; dependencySerial++; dependencyCatalog = null; dependencyChoice = null;
   clearDependencySelection();
   $("dependency-packages").replaceChildren(); $("dependency-warnings").replaceChildren();
-  $("dependency-state").textContent = "Library status not loaded.";
+  $("dependency-state").textContent = "Open a library from an external call or reference.";
 }
 function dependencyGuard() {
   const session = epoch, serial = dependencySerial, revision = status?.revision && IndexPin.copy(status.revision), workspace = status?.workspaceRoot;
@@ -2088,7 +2007,6 @@ async function refreshDependencies() {
   if (!token || !status) return;
   const serial = ++dependencyStatusSerial, guard = dependencyGuard();
   const current = () => guard() && serial === dependencyStatusSerial;
-  $("dependency-state").textContent = "Loading library status…";
   try {
     const data = await api("/api/dependencies");
     if (!current()) return;
@@ -2098,33 +2016,34 @@ async function refreshDependencies() {
     if (catalogChanged || data.state !== "ready") {
       dependencySerial++; clearDependencySelection();
     }
+    if (catalogChanged && dependencyChoice) { dependencyChoice = null; $("dependency-state").textContent = "Library catalog changed. Open the library again from its call or reference."; }
     dependencyCatalog = data;
-    const detail = data.state === "loading" ? "Indexing local declarations. Use Refresh library status to check again." : data.state === "disabled" ? "Automatic library catalog is disabled. Manual roots remain available below." : data.state === "failed" ? "Library indexing failed. Check warnings; refresh status after the next workspace index." : `${data.packages.length} packages · ${data.symbolCount} indexed declarations. Select a package to browse.`;
-    $("dependency-state").textContent = `${data.state} · ${detail}`
-      + (data.state === "ready" && catalogChanged && selectedMethod ? " Library catalog updated. Reselect the workspace method to refresh syntax-candidate lanes in its diagram." : "");
     $("dependency-warnings").replaceChildren();
     for (const warning of data.warnings || []) $("dependency-warnings").append(element("li", warning, "warning"));
     renderDependencyPackages();
   } catch (error) {
     if ((!current() && !/Library catalog belongs/.test(error.message)) || error.name === "AbortError") return;
     clearDependencyCatalog();
-    $("dependency-state").textContent = `Library catalog unavailable. ${error.message} Use Refresh library status to retry. Manual roots remain available below.`;
   }
 }
 function renderDependencyPackages() {
   $("dependency-packages").replaceChildren();
-  for (const pkg of dependencyCatalog?.packages || []) {
+  // Only the packages an in-context reference matched; several versions need a choice.
+  for (const pkg of dependencyChoice || []) {
     const li = element("li"), pick = externalButton(`${pkg.name} ${pkg.version}`, () => selectDependencyPackage(pkg));
     pick.disabled = dependencyCatalog.state !== "ready" || !dependencyCatalog.catalogId;
     pick.setAttribute("aria-pressed", String(dependencyPackage?.id === pkg.id));
     if (dependencyPackage?.id === pkg.id) pick.className = "selected";
     pick.append(element("span", `${pkg.ecosystem} · ${pkg.source} · source: ${pkg.sourceState} · index: ${pkg.indexState}`, "detail"));
     li.append(pick);
-    if (pkg.aliases?.length) li.append(element("span", `Aliases: ${pkg.aliases.join(", ")}`, "detail"));
-    for (const warning of pkg.warnings || []) li.append(element("p", warning, "detail"));
+    // Package notes stay folded so the definitions remain in view.
+    const notes = element("details");
+    notes.append(element("summary", `Package notes (${(pkg.warnings || []).length})`));
+    if (pkg.aliases?.length) notes.append(element("p", `Aliases: ${pkg.aliases.join(", ")}`, "detail"));
+    for (const warning of pkg.warnings || []) notes.append(element("p", warning, "detail"));
+    li.append(notes);
     $("dependency-packages").append(li);
   }
-  if (dependencyCatalog?.state === "ready" && !dependencyCatalog.packages.length) $("dependency-packages").append(element("li", "No supported library packages found in this workspace."));
 }
 async function selectDependencyPackage(pkg) {
   if (dependencyCatalog?.state !== "ready" || !dependencyCatalog.packages.some(item => item.id === pkg.id)) return;
@@ -2189,11 +2108,103 @@ async function loadDependencySource(symbol) {
     }
   }
 }
-$("dependency-refresh")?.addEventListener("click", refreshDependencies);
+// In-context library entry (#450). A reference or external call names a package; the
+// catalog offers it only when that exact name (or Cargo alias) is indexed and ready.
+const libraryEcosystems = {rust:"cargo", cargo:"cargo"};
+function libraryPackages(reference) {
+  const ecosystem = libraryEcosystems[reference?.ecosystem], name = reference?.name;
+  if (!ecosystem || typeof name !== "string" || !name || dependencyCatalog?.state !== "ready" || !dependencyCatalog.catalogId) return [];
+  const crate = value => value.replaceAll("-", "_");
+  const matches = dependencyCatalog.packages.filter(pkg => pkg.ecosystem === ecosystem && pkg.indexState !== "missing" &&
+    (pkg.name === name || crate(pkg.name) === crate(name) || (pkg.aliases || []).includes(crate(name))));
+  const exact = reference.version ? matches.filter(pkg => pkg.version === reference.version) : [];
+  return exact.length ? exact : matches;
+}
+function libraryAction(reference) {
+  const packages = libraryPackages(reference);
+  if (!packages.length) return null;
+  const catalogId = dependencyCatalog.catalogId, guard = dependencyGuard();
+  return () => {
+    if (!guard() || dependencyCatalog?.catalogId !== catalogId) return;
+    return perform(() => openLibrary(packages, reference));
+  };
+}
+async function openLibrary(packages, reference) {
+  dependencyChoice = packages;
+  clearDependencySelection();
+  $("dependency-state").textContent = packages.length === 1
+    ? `${packages[0].name} ${packages[0].version} · source ${packages[0].sourceState} · index ${packages[0].indexState} · from ${reference.origin}`
+    : `${packages.length} indexed packages match ${reference.name} · from ${reference.origin}. Choose a version.`;
+  $("dependency-symbol-state").textContent = packages.length === 1 ? "" : "Select a package version.";
+  renderDependencyPackages();
+  window.TrellisShell?.showSource("library");
+  if (packages.length === 1) await selectDependencyPackage(packages[0]);
+}
+function libraryButton(reference) {
+  const open = libraryAction(reference);
+  if (!open) return null;
+  const node = element("button", "Open in library"); node.type = "button";
+  node.title = `Indexed declarations of ${reference.name}: syntax candidates, not a resolved target.`;
+  node.addEventListener("click", open);
+  return node;
+}
 $("dependency-search-form")?.addEventListener("submit", event => { event.preventDefault(); return loadDependencySymbols(0, $("dependency-filter").value.trim()); });
 $("dependency-previous")?.addEventListener("click", () => { if (!$("dependency-previous").disabled) return loadDependencySymbols(Math.max(0, dependencyOffset - 100)); });
 $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next").disabled && dependencyNext != null) return loadDependencySymbols(dependencyNext); });
 
+
+// Classes is shown only when the checkout has production code in a language the class
+// catalog extracts (#450): the metrics projection's stored roles joined with the
+// catalog's supportedLanguages, read once per pin after production code is known.
+// Unknown (loading or failed) hides the tab; explicit class menus still work.
+let classSupport = null;
+async function refreshClassSupport(pin) {
+  const guard = browseGuard(), attempt = {pin, languages:null};
+  classSupport = attempt;
+  try {
+    const query = new URLSearchParams({q:"", limit:"1", indexGeneration:pin.indexGeneration, indexRevision:String(pin.indexRevision)});
+    const data = await api(`/api/classes?${query}`);
+    if (!guard() || classSupport !== attempt || !IndexPin.equal(data?.revision, pin) || !Array.isArray(data.supportedLanguages)) return;
+    attempt.languages = new Set(data.supportedLanguages.filter(language => typeof language === "string"));
+  } catch (_) { return; }
+  updateViewAvailability();
+}
+function updateViewAvailability() {
+  const languages = viewerMetrics?.productionLanguages?.(), pin = status?.revision;
+  const known = classSupport && IndexPin.equal(classSupport.pin, pin);
+  if (languages?.size && pin && token && !known) void refreshClassSupport(IndexPin.copy(pin));
+  const supported = known ? classSupport.languages : null;
+  window.TrellisShell?.setViewAvailable?.("classes", !!languages && !!supported && [...supported].some(language => languages.has(language)));
+}
+// With no method selected, Sequence offers the highest-cognitive named callables of the
+// current metrics projection as starting points (#450). Repository text stays text.
+const SEQUENCE_STARTS = 5;
+function renderSequenceStart() {
+  const top = !selectedMethod && token && status ? viewerMetrics?.topCallables?.() : null;
+  const rows = (top?.rows || []).filter(row => typeof row.name === "string" && row.name && typeof row.sid === "string").slice(0, SEQUENCE_STARTS);
+  $("sequence-start-list")?.replaceChildren();
+  if ($("sequence-start")) $("sequence-start").hidden = !rows.length;
+  if (!rows.length) return;
+  $("sequence-start-note").textContent = `Highest cognitive complexity · ${top.population}. Or select a method in the tree, the source margin or the inspector.`;
+  for (const row of rows) {
+    const item = element("li"), pick = element("button", row.name); pick.type = "button";
+    pick.append(element("span", `${row.path} · ${row.kind} · cognitive ${row.metrics?.cognitive ?? "—"}`, "detail"));
+    pick.addEventListener("click", () => perform(() => openCallableSequence(row, top.pin)));
+    item.append(pick); $("sequence-start-list").append(item);
+  }
+}
+// A metrics row names an exact native sid at a pin; the sequence API admits it or fails.
+async function openCallableSequence(row, pin) {
+  if (!token || !IndexPin.equal(pin, status?.revision)) throw new Error("Metrics snapshot changed. Refresh status.");
+  const context = navigationContext(), ticket = ++navigationSerial;
+  const current = () => ticket === navigationSerial && navigationCurrent(context);
+  $("sequence-state").textContent = `Loading ${row.name}…`;
+  const data = await api("/api/sequence", "POST", {seed:row.sid, expectedRevision:pin, showAll:false}, current);
+  if (!current()) return;
+  if (!IndexPin.equal(data?.revision, pin) || data?.seed?.id !== row.sid) throw new Error("Sequence provenance mismatch. Nothing displayed.");
+  $("all-steps").checked = false;
+  await selectMethod(data.seed, data, current);
+}
 
 // Class diagrams are an independent, cached-source projection. They never infer
 // a sequence participant's type or call a provider.
