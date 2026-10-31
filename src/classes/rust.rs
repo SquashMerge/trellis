@@ -194,18 +194,10 @@ enum Owner {
     Impl(String),
 }
 
-fn type_params(ex: &Extractor<'_, '_>, n: Node<'_>, blocked: &mut BTreeSet<String>) {
-    let Some(params) = n.child_by_field_name("type_parameters") else {
-        return;
-    };
-    let mut cursor = params.walk();
-    for p in params.named_children(&mut cursor) {
-        if matches!(p.kind(), "type_parameter" | "const_parameter")
-            && let Some(name) = p.child_by_field_name("name")
-        {
-            blocked.insert(ex.text(name).to_owned());
-        }
-    }
+/// Identity spelling of an identifier: `r#type` and `type` name the same item.
+/// Measured names and ranges keep their source spelling for display.
+fn unraw(name: &str) -> String {
+    name.strip_prefix("r#").unwrap_or(name).to_owned()
 }
 
 /// The named path of a type, without generic arguments.
@@ -218,6 +210,42 @@ fn type_path(ex: &Extractor<'_, '_>, n: Node<'_>) -> Option<Vec<String>> {
 }
 
 impl Extractor<'_, '_> {
+    /// Declared type and const parameter names of `n`, added to `scope`. `None`
+    /// when a parameter list or the resulting scope exceeds the Decision 0004
+    /// type-parameter limits (`members` per declaration and per scope); the
+    /// caller reports that and omits what depends on the scope.
+    fn type_params(
+        &mut self,
+        n: Node<'_>,
+        scope: &BTreeSet<String>,
+        depth: usize,
+    ) -> Result<Option<BTreeSet<String>>> {
+        let limit = self.b.limits.members;
+        let Some(params) = n.child_by_field_name("type_parameters") else {
+            return Ok(Some(scope.clone()));
+        };
+        let mut own = BTreeSet::new();
+        for p in self.children(params, depth)? {
+            if matches!(p.kind(), "type_parameter" | "const_parameter")
+                && let Some(name) = p.child_by_field_name("name")
+            {
+                own.insert(unraw(self.text(name)));
+                if own.len() > limit {
+                    return Ok(None);
+                }
+            }
+        }
+        let inherited = scope.iter().filter(|name| *name != "Self").count();
+        if self.exhausted || inherited.saturating_add(own.len()) > limit {
+            return Ok(None);
+        }
+        self.b
+            .reserve_text(own.iter().map(String::len).sum::<usize>() * 2);
+        let mut all = scope.clone();
+        all.extend(own);
+        Ok(Some(all))
+    }
+
     pub(super) fn rust_file(&mut self, root: Node<'_>) -> Result<()> {
         let (krate, module) = crate_module(&self.file.path);
         let mut scopes = Scopes(Vec::new(), std::cell::Cell::new(0));
@@ -290,7 +318,7 @@ impl Extractor<'_, '_> {
                 ) else {
                     return Ok(());
                 };
-                let alias = self.text(alias).to_owned();
+                let alias = unraw(self.text(alias));
                 if alias == "_" {
                     return Ok(());
                 }
@@ -359,7 +387,7 @@ impl Extractor<'_, '_> {
         for item in self.children(n, depth)? {
             let name = item
                 .child_by_field_name("name")
-                .map(|name| self.text(name).to_owned());
+                .map(|name| unraw(self.text(name)));
             match (item.kind(), name) {
                 ("struct_item" | "enum_item" | "union_item" | "trait_item", Some(name)) => {
                     self.b.reserve_text(name.len());
@@ -387,7 +415,7 @@ impl Extractor<'_, '_> {
                         .child_by_field_name("alias")
                         .or_else(|| item.child_by_field_name("name"));
                     if let Some(alias) = alias {
-                        let alias = self.text(alias).to_owned();
+                        let alias = unraw(self.text(alias));
                         self.bind_use(scopes, scope, alias, None);
                     }
                 }
@@ -485,10 +513,7 @@ impl Extractor<'_, '_> {
             ));
             return Ok(());
         };
-        let Some(name) = n
-            .child_by_field_name("name")
-            .map(|n| self.text(n).to_owned())
-        else {
+        let Some(name) = n.child_by_field_name("name").map(|n| unraw(self.text(n))) else {
             return Ok(());
         };
         let qualified = qualified(krate, &scopes.0[scope].path, &name);
@@ -500,8 +525,14 @@ impl Extractor<'_, '_> {
                 .registry_limit("Class qualified name exceeds 2048 bytes");
             return Ok(());
         }
-        let mut blocked = BTreeSet::from(["Self".to_owned()]);
-        type_params(self, n, &mut blocked);
+        let Some(blocked) = self.type_params(n, &BTreeSet::from(["Self".to_owned()]), depth + 1)?
+        else {
+            self.b.registry_limit(&format!(
+                "Class type parameter limit reached ({}/declaration)",
+                self.b.limits.members
+            ));
+            return Ok(());
+        };
         let index = self.b.catalog.classes.len();
         self.classes += 1;
         self.b.catalog.classes.push(ClassDefinition {
@@ -629,8 +660,15 @@ impl Extractor<'_, '_> {
         if n.children(&mut cursor).any(|c| c.kind() == "!") {
             return Ok(()); // A negative impl declares nothing.
         }
-        let mut blocked = BTreeSet::from(["Self".to_owned()]);
-        type_params(self, n, &mut blocked);
+        let Some(blocked) = self.type_params(n, &BTreeSet::from(["Self".to_owned()]), depth + 1)?
+        else {
+            // The impl cannot be attributed without its parameter scope.
+            self.b.registry_limit(&format!(
+                "{}: impl type parameter limit reached ({}/declaration); impl not attributed",
+                self.file.path, self.b.limits.members
+            ));
+            return Ok(());
+        };
         let segs = n
             .child_by_field_name("type")
             .and_then(|ty| type_path(self, ty))
@@ -693,11 +731,23 @@ impl Extractor<'_, '_> {
             .map(|s| s.id);
         let hint = ret.map(|r| self.text(r).to_owned());
         self.rust_member(owner, n, self.text(name).to_owned(), hint, symbol, true)?;
-        let mut blocked = outer.clone();
-        type_params(self, n, &mut blocked);
-        if blocked.len() > self.b.limits.members {
+        let Some(blocked) = self.type_params(n, outer, depth + 1)? else {
+            match owner {
+                Owner::Class(index) => self.b.catalog.classes[*index].truncated = true,
+                // Composition marks the target class truncated.
+                Owner::Impl(target) => self.b.impls.push(ImplItem {
+                    target: target.clone(),
+                    records: 0,
+                    text: 0,
+                    value: DetailValue::ScopeText,
+                }),
+            }
+            self.b.limit(&format!(
+                "Method type parameter detail limit reached ({}); method references omitted",
+                self.b.limits.members
+            ));
             return Ok(());
-        }
+        };
         if let Some(ret) = ret {
             self.rust_types(ret, owner, "returns", &blocked, depth + 1)?;
         }

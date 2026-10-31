@@ -20997,14 +20997,45 @@ impl Store {
         let selected_path: Option<String> = match request {
             crate::navigation::NavigationRequest::Source(s) => Some(s.path.clone()),
             crate::navigation::NavigationRequest::Member(s) => {
-                // Locate the selected document by identity, not the
-                // materialized kind.
-                tx.query_row(
-                    "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1 LIMIT 1",
-                    params![id_codec::encode_sid(&s.class_id), selected.key],
-                    |row| row.get(0),
-                )
-                .optional()?
+                // The member's measured declaration lives in the member's own
+                // document, which a Rust impl merge (#452) can make another file
+                // than the class's. Read it from the one recorded member row.
+                let paths: Vec<String> = tx
+                    .prepare(
+                        "SELECT DISTINCT json_extract(m.value,'$.path') FROM classes c
+                         JOIN revision_documents d ON d.revision_id=?5 AND d.cid=c.cid,
+                         json_each(c.payload) a, json_each(a.value) m
+                         WHERE c.id=?1 AND a.key IN ('fields','methods')
+                         AND json_extract(m.value,'$.name')=?2
+                         AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4
+                         AND (?6 IS NULL OR json_extract(m.value,'$.path')=?6) LIMIT 2",
+                    )?
+                    .query_map(
+                        params![
+                            id_codec::encode_sid(&s.class_id),
+                            s.member_name,
+                            s.start_byte as i64,
+                            s.end_byte as i64,
+                            selected.key,
+                            s.member_path
+                        ],
+                        |row| row.get::<_, Option<String>>(0),
+                    )?
+                    .filter_map(|row| row.transpose())
+                    .collect::<rusqlite::Result<_>>()?;
+                if let [path] = paths.as_slice() {
+                    Some(path.clone())
+                } else {
+                    // Locate the class document by identity, not the
+                    // materialized kind; `member` then refuses an absent or
+                    // ambiguous selector.
+                    tx.query_row(
+                        "SELECT m.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.gid=n.gid WHERE n.id=?1 LIMIT 1",
+                        params![id_codec::encode_sid(&s.class_id), selected.key],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                }
             }
         };
         let mut selected_document = None;

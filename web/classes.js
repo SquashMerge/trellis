@@ -440,7 +440,8 @@
       if (!canNavigate || !isCurrent()) return;
       // Names and type hints are display text, never a global search selector.
       return api.navigateMember(event, {classId: definition.symbol.id, memberName: member.name,
-        startByte: member.range.startByte, endByte: member.range.endByte}, {isCurrent});
+        startByte: member.range.startByte, endByte: member.range.endByte,
+        ...(typeof member.path === "string" && member.path ? {memberPath: member.path} : {})}, {isCurrent});
     };
     return {label, select, navigate, canNavigate};
   }

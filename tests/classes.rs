@@ -1682,3 +1682,98 @@ fn rust_glob_graphs_resolve_within_a_bounded_work_budget() {
         c.warnings
     );
 }
+#[test]
+fn rust_raw_identifiers_bind_declarations_aliases_and_generic_blockers() {
+    let (_, c) = index(&[
+        (
+            "src/lib.rs",
+            "pub mod r#match;\npub struct r#type {\n    value: i32,\n}\nimpl r#type {\n    fn first(&self) {}\n}\nimpl type {\n    fn plain_spelling(&self) {}\n}\npub struct Plain;\nimpl Plain {\n    fn second(&self) {}\n}\npub struct Item;\npub trait Show {}\nimpl<r#Item> Show for Item {}\npub struct Holder<r#Item> {\n    value: Item,\n}\n",
+        ),
+        (
+            "src/match.rs",
+            "use crate::r#type as Alias;\nimpl Alias {\n    fn via_alias(&self) {}\n}\nimpl crate::r#type {\n    fn via_path(&self) {}\n}\n",
+        ),
+    ]);
+    let raw = class(&c, "type");
+    assert_eq!(
+        names(&raw.methods),
+        ["first", "plain_spelling", "via_alias", "via_path"],
+        "raw and plain spellings name one item"
+    );
+    assert_eq!(names(&class(&c, "Plain").methods), ["second"]);
+    assert!(
+        rel(&c, "Item").is_empty(),
+        "`impl<r#Item> Show for Item` is a blanket impl over the parameter"
+    );
+    assert!(
+        rel(&c, "Holder").is_empty(),
+        "a field typed by the raw-named parameter is not a reference"
+    );
+    assert!(!c.truncated, "{:?}", c.warnings);
+}
+#[test]
+fn rust_type_parameter_limits_are_enforced_and_reported() {
+    use trellis::classes::Limits;
+    let params = |n: usize| {
+        (0..n)
+            .map(|i| format!("T{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let limit = Limits::default().members;
+    // At the limit: the trait, an impl and a method all keep their output.
+    let (_, at) = index(&[(
+        "src/lib.rs",
+        format!(
+            "pub trait Wide<{}> {{\n    fn run(&self) -> Out;\n}}\npub struct Out;\npub struct Host;\nimpl<{}> Host {{\n    fn plain(&self) -> Out {{ Out }}\n}}\nimpl Host {{\n    fn generic<{}>(&self) -> Out {{ Out }}\n}}\n",
+            params(limit),
+            params(limit),
+            params(limit)
+        )
+        .as_str(),
+    )]);
+    assert_eq!(names(&class(&at, "Wide").methods), ["run"]);
+    let host = class(&at, "Host");
+    assert_eq!(names(&host.methods), ["plain", "generic"]);
+    assert!(!host.truncated && !at.truncated, "{:?}", at.warnings);
+    assert_eq!(
+        rel(&at, "Host"),
+        [
+            ("returns", "Out", "src/lib.rs"),
+            ("returns", "Out", "src/lib.rs")
+        ]
+    );
+    // One over: the declaration is skipped and the registry marked incomplete;
+    // an over-limit impl is not attributed; an over-limit method is omitted.
+    let (_, over) = index(&[(
+        "src/lib.rs",
+        format!(
+            "pub trait Wide<{}> {{\n    fn run(&self);\n}}\npub struct Host;\nimpl<{}> Host {{\n    fn lost(&self) {{}}\n}}\nimpl Host {{\n    fn kept(&self) {{}}\n    fn generic<{}>(&self) -> Host {{ Host }}\n}}\n",
+            params(limit + 1),
+            params(limit + 1),
+            params(limit + 1)
+        )
+        .as_str(),
+    )]);
+    assert!(over.classes.iter().all(|k| k.qualified_name != "Wide"));
+    let host = class(&over, "Host");
+    assert_eq!(names(&host.methods), ["kept", "generic"]);
+    assert!(host.truncated);
+    assert!(over.truncated);
+    for warning in [
+        "Class type parameter limit reached (256/declaration)",
+        "src/lib.rs: impl type parameter limit reached (256/declaration); impl not attributed",
+        "Method type parameter detail limit reached (256); method references omitted",
+        "Incomplete class declaration registry: some declarations may be absent.",
+    ] {
+        assert!(
+            over.warnings.iter().any(|w| w == warning),
+            "{warning}: {:?}",
+            over.warnings
+        );
+    }
+    assert!(
+        rel(&over, "Host").is_empty(),
+        "the over-limit method's return type is omitted"
+    );
+}

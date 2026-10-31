@@ -94,6 +94,9 @@ test("only exact member selectors are submitted; invalid and mixed boundaries ne
   for(const bad of [null,{},[],{...selector,line:0},{...selector,line:-1},{...selector,line:1.5},{...selector,line:Number.MAX_SAFE_INTEGER+1},{...selector,path:""},{...selector,path:"x".repeat(4097)},{...selector,classId:"A"},{...selector,typeHint:"A"},{...selector,expectedRevision:2},
     {classId:"A",memberName:"run",startByte:-1,endByte:5},{classId:"A",memberName:"run",startByte:4,endByte:3},{classId:"A",memberName:"run",startByte:1.2,endByte:5},{classId:"A",memberName:"",startByte:0,endByte:5}]) await h.nav.open(h.event(),bad);
   assert.equal(h.calls.length,0);
+  await h.nav.open(h.event(),{classId:"A",memberName:"m",startByte:0,endByte:16,memberPath:"src/ops.rs"});
+  assert.equal(h.calls.at(-1).options.body.memberPath,"src/ops.rs","a merged member names its own document (#452)");
+  h.calls.length=0;
   await h.nav.open(h.event(),{classId:"A",memberName:"méthode",startByte:0,endByte:16});
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].options.body)),{expectedRevision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},classId:"A",memberName:"méthode",startByte:0,endByte:16});
 });

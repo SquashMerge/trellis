@@ -63,6 +63,11 @@ pub struct MemberSelector {
     pub member_name: String,
     pub start_byte: usize,
     pub end_byte: usize,
+    /// The recorded member's own document. A Rust class records methods merged
+    /// from `impl` blocks in other files (#452), where name and byte range alone
+    /// are no longer unique.
+    #[serde(default)]
+    pub member_path: Option<String>,
 }
 impl NavigationRequest {
     pub fn expected_revision(&self) -> IndexPin {
@@ -93,6 +98,9 @@ impl NavigationRequest {
             Self::Member(s) => ensure!(
                 text(&s.class_id, 8192)
                     && text(&s.member_name, 2048)
+                    && s.member_path.as_deref().is_none_or(|p| text(p, 8192)
+                        && !p.contains(['\\', ':'])
+                        && !p.split('/').any(|p| p.is_empty() || p == "." || p == ".."))
                     && s.start_byte < s.end_byte
                     && s.end_byte <= i64::MAX as usize,
                 InvalidRequest("Choose a recorded class member by name and exact byte range.")
@@ -365,8 +373,9 @@ impl Reader<'_> {
             "SELECT count(*) FROM (SELECT 1 FROM classes c JOIN revision_documents d ON d.revision_id=?5 AND d.cid=c.cid, json_each(c.payload) a, json_each(a.value) m
              WHERE c.id=?1 AND a.key IN ('fields','methods')
              AND json_extract(m.value,'$.name')=?2
-             AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4 LIMIT 2)",
-            params![id_codec::encode_sid(&s.class_id), s.member_name, s.start_byte as i64, s.end_byte as i64, self.revision_key], |r| r.get(0))?;
+             AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4
+             AND (?6 IS NULL OR json_extract(m.value,'$.path')=?6) LIMIT 2)",
+            params![id_codec::encode_sid(&s.class_id), s.member_name, s.start_byte as i64, s.end_byte as i64, self.revision_key, s.member_path], |r| r.get(0))?;
         ensure!(
             matches == 1,
             InvalidRequest("The selector does not match one recorded class member.")
@@ -377,8 +386,9 @@ impl Reader<'_> {
              FROM classes c JOIN revision_documents d ON d.revision_id=?6 AND d.cid=c.cid, json_each(c.payload) a, json_each(a.value) m
              WHERE c.id=?1 AND a.key IN ('fields','methods')
              AND json_extract(m.value,'$.name')=?2
-             AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4 LIMIT 2",
-            params![id_codec::encode_sid(&s.class_id), s.member_name, s.start_byte as i64, s.end_byte as i64, RECORD_BYTES, revision_key])?;
+             AND json_extract(m.value,'$.range.startByte')=?3 AND json_extract(m.value,'$.range.endByte')=?4
+             AND (?7 IS NULL OR json_extract(m.value,'$.path')=?7) LIMIT 2",
+            params![id_codec::encode_sid(&s.class_id), s.member_name, s.start_byte as i64, s.end_byte as i64, RECORD_BYTES, revision_key, s.member_path])?;
         let Some(member) = members.first() else {
             self.warn("The recorded member exceeds the navigation evidence budget.");
             return Ok(());

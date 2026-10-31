@@ -62,6 +62,20 @@ impl, a local publication that changes, removes or recovers a Rust document reco
 all stored `F` instead of reusing per-document projections. A method seed whose lexical ancestry has no
 class (a Rust method's parent is its impl block) resolves to the one Rust class recording that method.
 
+Raw identifiers are one identity: `r#type` and `type` bind, resolve and qualify identically (declared
+names, `mod`/`use` aliases, generic parameters and paths), while recorded names and ranges keep their
+source spelling. Type and const parameters follow the Decision 0004 limits: at most 256 per declaration
+and per scope (outer impl or trait parameters plus a method's own; `Self` is not counted). An over-limit
+type or trait is skipped with `Class type parameter limit reached (256/declaration)` and an incomplete
+registry; an over-limit impl is not attributed (`{path}: impl type parameter limit reached …`); an
+over-limit method keeps its member but omits its signature hints and truncates its class (`Method type
+parameter detail limit reached (256); method references omitted`).
+
+The member navigation selector accepts an optional `memberPath` (the recorded member's `path`). Name and
+byte range are unique only within one file, and a Rust class can record members from several files, so
+the browser sends it. Navigation reads the member's own document; a selector matching more than one
+recorded member, or none, is refused.
+
 Backend core owner: src/classes.rs + tests/classes.rs only. Public serde camelCase DTOs:
 ClassMember {name:String, type_hint:Option<String>, symbol_id:Option<String>, path:String, range:SourceRange}
 ClassDefinition {symbol:Symbol, qualified_name:String, language:String, declaration_kind:String,

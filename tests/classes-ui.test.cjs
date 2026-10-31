@@ -352,7 +352,7 @@ test("type hint and member menu pass only exact recorded owner/name/byte selecto
  const [field,one,two]=memberRows(h);await field.querySelector(".classes-member-type").fire("click");
  await one.querySelector(".classes-member-menu").fire("click");await two.querySelector(".classes-member-type").fire("click");
  assert.deepEqual(h.navigations.map(n=>JSON.parse(JSON.stringify(n.selector))),[
- {classId:"A",memberName:"数据",startByte:13,endByte:39},{classId:"A",memberName:"运行",startByte:40,endByte:70},{classId:"A",memberName:"运行",startByte:75,endByte:115}]);
+ {classId:"A",memberName:"数据",startByte:13,endByte:39,memberPath:"src/A.java"},{classId:"A",memberName:"运行",startByte:40,endByte:70,memberPath:"src/A.java"},{classId:"A",memberName:"运行",startByte:75,endByte:115,memberPath:"src/A.java"}]);
  for(const item of h.navigations)assert.equal(item.scope.isCurrent(),true);
  await one.querySelector(".classes-member-name").fire("click");await two.querySelector(".classes-member-name").fire("click");
  assert.deepEqual(h.methods.map(m=>m.id),["A.运行#1","A.运行#2"]);
