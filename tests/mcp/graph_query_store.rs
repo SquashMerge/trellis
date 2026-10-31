@@ -363,9 +363,6 @@ fn sequence_uses_engine_boundary_precedence_and_warnings() {
         ("unresolved", BoundaryReason::Unresolved),
         ("external", BoundaryReason::External),
         ("dispatch", BoundaryReason::Dispatch),
-        ("stale", BoundaryReason::Stale),
-        ("missing", BoundaryReason::MissingEvidence),
-        ("failed", BoundaryReason::MissingEvidence),
     ] {
         let (state, root) = workspace();
         let mut publisher = Publisher::open(state.path(), root.path());
@@ -398,6 +395,70 @@ fn sequence_uses_engine_boundary_precedence_and_warnings() {
                     b.possible = vec!["b".into()];
                 }
             }
+            _ => unreachable!(),
+        }
+        let pin = publisher.publish(&spec);
+        let seed = syntax_id(publisher.native(), "a");
+        let view = publisher
+            .store
+            .sequence_at(&seed, pin, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            view.semantic.tier,
+            trellis::behavior::EvidenceTier::Semantic,
+            "{mode}"
+        );
+        let steps = sequence_steps(&view.steps);
+        assert_eq!(steps.len(), 2, "{mode}");
+        // External calls are incidental (#522): kept with their evidence, but hidden.
+        let external = mode == "external";
+        assert_eq!(
+            (view.hidden_steps, view.incidental_steps),
+            if external { (2, 2) } else { (0, 0) },
+            "{mode}"
+        );
+        assert!(steps.iter().all(|step| step.hidden == external), "{mode}");
+        assert!(
+            steps.iter().all(|step| step.target.is_none()
+                && step.call_evidence.as_ref().unwrap().boundary_reason == reason),
+            "{mode}"
+        );
+        let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
+        assert_eq!(view.semantic_warnings, graph.warnings, "{mode}");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.boundary_reason == reason)
+        );
+    }
+}
+
+/// #522: a seed whose calls have no fresh selected binding keeps the syntax view (its
+/// source-hint lanes included), and says why, instead of drawing every call as a boundary.
+#[test]
+fn sequence_without_fresh_bindings_falls_back_to_syntax_with_its_reason() {
+    for (mode, reason) in [
+        (
+            "stale",
+            "Semantic evidence for a.rs is stale: it was imported for an earlier version of the file. Showing syntax.",
+        ),
+        (
+            "missing",
+            "No semantic binding covers this method's calls; showing syntax.",
+        ),
+        (
+            "failed",
+            "Semantic coverage of a.rs is failed; showing syntax.",
+        ),
+    ] {
+        let (state, root) = workspace();
+        let mut publisher = Publisher::open(state.path(), root.path());
+        let source = "fn a() { client.send(); b(); }\nfn b() {}\n";
+        let mut spec = Spec::new(&[("a.rs", source)]);
+        spec.bindings = vec![bind("a", 0, "b"), bind("a", 1, "b")];
+        match mode {
             "stale" => spec.requested_version = "v2".into(),
             "missing" => spec.bindings.clear(),
             "failed" => {
@@ -412,21 +473,33 @@ fn sequence_uses_engine_boundary_precedence_and_warnings() {
             .sequence_at(&seed, pin, false)
             .unwrap()
             .unwrap();
+        assert_eq!(view.semantic.tier, trellis::behavior::EvidenceTier::Syntax);
+        assert_eq!(view.semantic.reason.as_deref(), Some(reason), "{mode}");
         let steps = sequence_steps(&view.steps);
         assert_eq!(steps.len(), 2, "{mode}");
         assert!(
-            steps.iter().all(|step| step.target.is_none()
-                && step.call_evidence.as_ref().unwrap().boundary_reason == reason),
+            steps
+                .iter()
+                .all(|step| step.target.is_none() && step.call_evidence.is_none()),
             "{mode}"
         );
-        let graph = result(run(&publisher.store, &query(&seed, true)).unwrap());
-        assert_eq!(view.semantic_warnings, graph.warnings, "{mode}");
-        assert!(
-            graph
-                .edges
-                .iter()
-                .all(|edge| edge.boundary_reason == reason)
-        );
+        // Exactly the syntax DTO: source-hint lanes and all.
+        let mut syntax = trellis::behavior::build_sequence(
+            pin,
+            &view.seed,
+            &publisher
+                .store
+                .source_at("a.rs", Some(pin))
+                .unwrap()
+                .unwrap()
+                .1,
+            &publisher.graph.as_ref().unwrap().calls,
+            false,
+        )
+        .unwrap();
+        syntax.semantic = view.semantic.clone();
+        assert!(syntax.participants.len() > 1, "{mode}");
+        assert_eq!(view, syntax, "{mode}");
     }
 }
 
@@ -537,9 +610,13 @@ fn sequence_outside_sole_producer_languages_preserves_plain_syntax() {
         .collect();
     assert!(syntax.iter().all(|view| view.participants.len() > 1));
     // Spec::new publishes a Rust-only producer alongside the JavaScript seed.
+    assert!(syntax.iter().all(
+        |view| view.semantic.reason.as_deref() == Some(trellis::graph_query::NO_PRODUCER_NOTE)
+    ));
     let semantic_pin = publisher.publish(&Spec::new(&files));
     for (show_all, mut expected) in [false, true].into_iter().zip(syntax) {
         expected.revision = semantic_pin;
+        expected.semantic.reason = Some(trellis::graph_query::LANGUAGE_NOTE.into());
         let actual = publisher
             .store
             .sequence_at(&seed, semantic_pin, show_all)

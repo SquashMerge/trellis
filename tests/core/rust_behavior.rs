@@ -280,10 +280,54 @@ fn method_fixture_covers_larger_guarded_workflow() {
 }
 #[test]
 fn depth_limit_is_explicit() {
-    let source = format!("fn run() {{ {}work(){}; }}", "(".repeat(50), ")".repeat(50));
+    let source = format!(
+        "fn run() {{ {}work(){}; }}",
+        "(".repeat(110),
+        ")".repeat(110)
+    );
     let (_, view) = fixture(&source, "run");
     assert!(view.truncated);
     assert!(view.warnings.iter().any(|w| w.contains("Depth limit")));
+}
+/// #522: syntax nesting that adds no steps no longer exhausts the step-depth bound, so a
+/// long function's deeply nested main loop keeps its calls.
+#[test]
+fn deep_syntax_without_nested_steps_keeps_its_calls() {
+    let source = format!(
+        "fn run() {{ {}work();{} }}",
+        "{ ".repeat(30),
+        " }".repeat(30)
+    );
+    let (_, view) = fixture(&source, "run");
+    assert_eq!(calls(&view.steps), ["work"]);
+    assert!(!view.truncated, "{:?}", view.warnings);
+}
+/// #522: the step tree itself stays within depth 24; a step at the bound that still nests
+/// becomes one explicit boundary at its own source range.
+#[test]
+fn step_tree_depth_is_capped_with_an_explicit_boundary() {
+    fn depth(steps: &[SequenceStep]) -> usize {
+        steps
+            .iter()
+            .map(|s| 1 + depth(&s.children).max(depth(&s.alternate)))
+            .max()
+            .unwrap_or(0)
+    }
+    let source = format!(
+        "fn run(a: bool) {{ {}work();{} }}",
+        "if a { ".repeat(28),
+        " }".repeat(28)
+    );
+    let (_, view) = fixture(&source, "run");
+    assert!(view.truncated);
+    assert_eq!(depth(&view.steps), 25);
+    let boundary = flatten(&view.steps)
+        .into_iter()
+        .find(|s| s.label == "Depth limit: behavior omitted.")
+        .unwrap();
+    assert_eq!(boundary.kind, "boundary");
+    assert!(boundary.children.is_empty() && boundary.call_id.is_none());
+    assert!(calls(&view.steps).is_empty());
 }
 #[test]
 fn participant_limit_preserves_call_evidence() {

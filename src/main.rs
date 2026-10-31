@@ -91,7 +91,7 @@ struct NavigationFixtureArgs {
         "zero", "sole", "multiple", "unresolved",
         "sequence-sole", "sequence-zero", "sequence-multiple", "sequence-unresolved",
         "sequence-ambiguous", "sequence-stale", "sequence-dispatch", "sequence-external",
-        "sequence-missing", "sequence-constructor", "sequence-library"
+        "sequence-missing", "sequence-constructor", "sequence-library", "sequence-expand"
     ])]
     mode: String,
 }
