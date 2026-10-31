@@ -4,10 +4,8 @@
 //! prints an `E2E-EVIDENCE` line on pass. Nothing is installed.
 #![cfg(feature = "test-support")]
 
-#[path = "support/real_producers.rs"]
-mod real;
-#[path = "support/producer.rs"]
-mod support;
+use crate::real;
+use crate::support;
 use real::{Availability, Case};
 
 const TYPESCRIPT: Case = Case {

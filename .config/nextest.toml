@@ -16,5 +16,5 @@ filter = '(kind(lib) & test(/^(http::(exceptional_recovery_tests|live_tests)|dae
 test-group = 'real-workers'
 
 [[profile.default.overrides]]
-filter = 'binary(/^producer_e2e/)'
+filter = 'binary_id(trellis::producer) & test(/^producer_e2e(_java|_rust)?::/)'
 test-group = 'producer-e2e'

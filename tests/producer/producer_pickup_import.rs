@@ -5,15 +5,13 @@
 use serde_json::Value;
 use std::{fs, path::Path, process::Output};
 
-#[path = "support/producer.rs"]
-mod support;
+use crate::support;
 use support::{
     Checkout, cache_dir, start_checkout, state_dir, stop_daemon, tripwire_dir,
     workspace_tree_digest,
 };
 
-#[path = "support/semantic_batch.rs"]
-mod semantic_batch_support;
+use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, edit_scip, uniform_workspace};
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];

@@ -18,15 +18,13 @@ use trellis::store::{
     topology::{TopologyRoots, WorkspaceIdentity},
 };
 
-#[path = "support/producer.rs"]
-mod support;
+use crate::support;
 use support::{
     Checkout, cache_dir, data_dir, start_checkout, state_dir, stop_daemon, stub_env, tripwire_dir,
     write_mode,
 };
 
-#[path = "support/semantic_batch.rs"]
-mod semantic_batch_support;
+use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, sha256, uniform_workspace};
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];

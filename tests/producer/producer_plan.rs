@@ -4,8 +4,7 @@
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Output};
 
-#[path = "support/producer.rs"]
-mod support;
+use crate::support;
 use support::{Checkout, fake_npm_install, pinned_version, start_checkout, stub_env, tripwire_dir};
 
 const PRODUCERS: [&str; 4] = [

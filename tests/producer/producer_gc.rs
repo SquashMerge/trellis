@@ -1,6 +1,6 @@
 //! GC of producer state with its index, and the orphan rule (D2).
 #![cfg(feature = "test-support")]
-mod common;
+use crate::common;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 use tempfile::TempDir;
 use trellis::{

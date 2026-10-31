@@ -44,10 +44,10 @@ CI provisions none of these producers. Each real-producer test has a default var
 Each producer has a strict `#[ignore]` variant (`..._strict`) that fails with the typed reason instead of skipping and prints one `E2E-EVIDENCE` line after its assertions pass: the pinned version, `verification=verified`, `state=done`, the published revision, the document and fact counts, and `treeDigestUnchanged=true`. Run them on the reference host holding `/tmp/trellis-factory-verify.lock`, with `TRELLIS_SEARCH_MODEL`, `TRELLIS_SEARCH_BACKEND` and `TRELLIS_INDEX_DIAGNOSTICS` unset, and archive the output outside `/tmp`:
 
 ```
-cargo nextest run --locked --features test-support --no-fail-fast --run-ignored only --success-output immediate --test producer_e2e --test producer_e2e_java --test producer_e2e_rust
+cargo nextest run --locked --features test-support --no-fail-fast --run-ignored only --success-output immediate --test producer -E 'test(/^producer_e2e(_java|_rust)?::/)'
 ```
 
-Omit a binary that does not exist yet. A strict failure such as `producer_unavailable` is a host provisioning problem: fix the host, never the test.
+The real-producer tests are the `producer_e2e`, `producer_e2e_java` and `producer_e2e_rust` modules of the `producer` test binary. A strict failure such as `producer_unavailable` is a host provisioning problem: fix the host, never the test.
 
 ## Re-pinning
 

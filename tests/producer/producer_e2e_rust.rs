@@ -4,10 +4,7 @@
 //! `E2E-EVIDENCE` line on pass. Build output goes to the run directory. Nothing is installed.
 #![cfg(feature = "test-support")]
 
-#[path = "support/real_producers.rs"]
-mod real;
-#[path = "support/producer.rs"]
-mod support;
+use crate::real;
 use real::{Availability, Case};
 
 const RUST: Case = Case {

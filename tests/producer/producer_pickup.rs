@@ -15,15 +15,13 @@ use std::{
 };
 use tempfile::Builder;
 
-#[path = "support/producer.rs"]
-mod support;
+use crate::support;
 use support::{
     Checkout, cache_dir, data_dir, pickup_entry, request_rows, start_checkout, stop_daemon,
     tripwire_dir,
 };
 
-#[path = "support/semantic_batch.rs"]
-mod semantic_batch_support;
+use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, edit_scip, sha256, uniform_workspace};
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];

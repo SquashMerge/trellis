@@ -11,8 +11,7 @@ use std::{
 use tempfile::{Builder, TempDir};
 use trellis::store::topology::TopologyRoots;
 
-#[path = "support/semantic_batch.rs"]
-mod semantic_batch_support;
+use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, edit_descriptor, uniform_workspace};
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];

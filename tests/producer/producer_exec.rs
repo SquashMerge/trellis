@@ -13,8 +13,7 @@ use trellis::producer::exec::{
     Ending, Hooks, LimitKind, Limits, ProcessOutcome, ProducerSpec, TAIL_BYTES, spawn_producer,
 };
 
-#[path = "support/producer.rs"]
-mod support;
+use crate::support;
 use support::{stub_path, write_mode};
 
 struct Run {

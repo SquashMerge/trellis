@@ -18,8 +18,7 @@ use trellis::producer::{
     worktree::write_bin_links,
 };
 
-#[path = "support/producer.rs"]
-mod support;
+use crate::support;
 use support::{stub_path, write_mode};
 
 const CANARIES: [&str; 10] = [

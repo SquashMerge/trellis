@@ -7,14 +7,19 @@
 #[cfg(feature = "test-support")]
 #[path = "../support/semantic_batch.rs"]
 mod semantic_batch_support;
+#[cfg(feature = "test-support")]
+#[path = "../support/producer.rs"]
+mod support;
 
 mod java_semantic_import;
 mod semantic_batch_queue;
 mod semantic_batch_store;
 mod semantic_evidence;
+mod semantic_generated_import;
 mod semantic_history;
 mod semantic_import;
 mod semantic_import_queue;
+mod semantic_import_typed_errors;
 mod semantic_native_publication;
 mod semantic_publication_paths;
 mod semantic_rejoin;

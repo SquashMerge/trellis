@@ -12,14 +12,12 @@ use std::{
 };
 use tempfile::TempDir;
 
-#[path = "support/producer.rs"]
-mod support;
+use crate::support;
 use support::{
     Checkout, cache_dir, start_checkout, state_dir, stub_env, workspace_tree_digest, write_mode,
 };
 
-#[path = "support/semantic_batch.rs"]
-mod semantic_batch_support;
+use crate::semantic_batch_support;
 use semantic_batch_support::{BatchFixture, edit_scip, uniform_workspace};
 
 const STUB: &str = "trellis-synthetic-scip";
