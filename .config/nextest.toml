@@ -18,3 +18,8 @@ test-group = 'real-workers'
 [[profile.default.overrides]]
 filter = 'binary_id(trellis::producer) & test(/^producer_e2e(_java|_rust)?::/)'
 test-group = 'producer-e2e'
+
+# CI's Linux test partitions (#495): the default profile plus a JUnit report,
+# which each partition job checks against its share of the test list.
+[profile.ci.junit]
+path = "junit.xml"

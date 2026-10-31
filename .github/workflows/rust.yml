@@ -11,7 +11,9 @@ permissions:
 jobs:
   # verify's lanes run as separate jobs, so the slowest lane, not their sum on
   # one runner, sets the wall time. Every lane runs on both platforms; locally,
-  # ./tools/verify with no arguments still runs them all.
+  # ./tools/verify with no arguments still runs them all. On Linux the tests
+  # lane is split further (#495): tests-build builds and archives the test
+  # binaries once, and two tests-partition jobs run half of them each.
   verify:
     name: ${{ matrix.job }} (${{ matrix.os }})
     strategy:
@@ -20,6 +22,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         job: [browser, tests, checks]
+        # Linux runs the tests lane as tests-build plus tests-partition below.
+        exclude:
+          - os: ubuntu-latest
+            job: tests
         include:
           # The browser half of the rust lane: debug binaries, the query
           # performance smoke and the browser suite. Owns `target`.
@@ -116,3 +122,133 @@ jobs:
             echo "mold linked all $count ELF files built in this job, e.g. $example:"
             readelf -p .comment "$example"
           fi
+
+  # The Linux tests lane, part one: build the test binaries as
+  # `./tools/verify --lane tests` does (same target directory, features and
+  # filters) and archive them for the partition jobs.
+  tests-build:
+    name: tests build (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Keep in step with rust-toolchain.toml, which every local build uses.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+        with:
+          mold-version: 2.42.1
+      # As in the verify job: mold instead of the bundled rust-lld. This is set
+      # before rust-cache, so it is part of the cache key.
+      - name: Link Rust with mold
+        run: echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-nextest@0.9.150
+      # This shared key spells the key the verify job's Linux tests entry had
+      # (`key: tests` plus the job id `verify`), with the same workspace, so the
+      # tests cache carries over rather than starting cold.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests-verify
+          workspaces: . -> target-test-support
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feature-')) }}
+      - name: Mark the start of this job's builds
+        run: touch "$RUNNER_TEMP/build-start"
+      # The tests lane's build: `cargo nextest run --locked --all-targets
+      # --features test-support` in `target-test-support`.
+      - name: Build and archive the tests
+        env:
+          CARGO_TARGET_DIR: target-test-support
+        run: cargo nextest archive --locked --all-targets --features test-support --archive-file "$RUNNER_TEMP/tests-archive/tests.tar.zst"
+      # Record the full test list and each partition's share of it, and fail
+      # unless the partitions are disjoint and together hold every test.
+      - name: List the tests and their partitions
+        env:
+          CARGO_TARGET_DIR: target-test-support
+        run: |
+          lists=$RUNNER_TEMP/tests-archive
+          cargo nextest list --locked --all-targets --features test-support --message-format oneline >"$lists/all.txt"
+          for part in 1 2; do
+            cargo nextest list --locked --all-targets --features test-support --message-format oneline --partition "count:$part/2" >"$lists/partition-$part.txt"
+          done
+          python3 tools/ci-test-partitions.py split "$lists/all.txt" "$lists/partition-1.txt" "$lists/partition-2.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+      # The archive is already zstd-compressed.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tests-archive
+          path: ${{ runner.temp }}/tests-archive
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      # Every ELF executable or shared object this job linked must name mold in
+      # its .comment section (rust-lld would name LLD instead).
+      - name: Confirm mold linked this job's binaries
+        run: |
+          count=0
+          for file in $(find target-test-support -type f -perm -u+x -newer "$RUNNER_TEMP/build-start" 2>/dev/null); do
+            readelf -h "$file" >/dev/null 2>&1 || continue
+            comment=$(readelf -p .comment "$file" 2>&1 || true)
+            case $comment in
+              *mold*) ;;
+              *) printf 'not linked by mold: %s\n%s\n' "$file" "$comment" >&2; exit 1 ;;
+            esac
+            count=$((count + 1))
+            example=$file
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "no ELF files were linked in this job"
+          else
+            echo "mold linked all $count ELF files built in this job, e.g. $example:"
+            readelf -p .comment "$example"
+          fi
+
+  # The Linux tests lane, part two: each job runs half of the archived tests in
+  # the tests lane's runtime environment (the checkout, Node with tests/mcp's
+  # packages, the pinned toolchain), then checks it ran exactly its share.
+  tests-partition:
+    name: tests ${{ matrix.partition }}/2 (ubuntu-latest)
+    needs: tests-build
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci --prefix tests/mcp --ignore-scripts
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-nextest@0.9.150
+      - uses: actions/download-artifact@v8
+        with:
+          name: tests-archive
+          path: ${{ runner.temp }}/tests-archive
+      # The tests were compiled with absolute paths into the checkout's
+      # `target-test-support` (CARGO_BIN_EXE_trellis, for one), so that path
+      # links to the extracted target directory. --workspace-remap points
+      # CARGO_MANIFEST_DIR, and so the fixtures, at this checkout. The `ci`
+      # profile is the default profile plus a JUnit report.
+      - name: Run partition ${{ matrix.partition }} of the tests
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: |
+          extract=$RUNNER_TEMP/tests-extract
+          mkdir -p "$extract"
+          ln -s "$extract/target" target-test-support
+          cargo nextest run --archive-file "$RUNNER_TEMP/tests-archive/tests.tar.zst" --extract-to "$extract" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --no-fail-fast --partition "count:$PARTITION/2"
+      # A run from an archive writes its report under the remapped workspace's
+      # `target`.
+      - name: Check partition ${{ matrix.partition }} ran its share of the tests
+        if: ${{ !cancelled() }}
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: python3 tools/ci-test-partitions.py junit target/nextest/ci/junit.xml "$RUNNER_TEMP/tests-archive/partition-$PARTITION.txt" "$RUNNER_TEMP/tests-archive/all.txt" | tee -a "$GITHUB_STEP_SUMMARY"
