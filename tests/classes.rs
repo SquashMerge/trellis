@@ -394,6 +394,33 @@ fn javascript_recovered_syntax_is_bounded_and_reported() {
     assert!(c.relations.iter().all(|r| r.target.is_none()));
 }
 #[test]
+fn javascript_dotted_extends_ignore_whitespace_and_comments_but_not_other_expressions() {
+    let source = "class A extends ns . Base {}\nclass B extends ns /*c*/ . deep\n  . Base {}\nclass C extends ns?.Base {}\nclass D extends ns[\"Base\"] {}\nclass E extends make().Base {}\nclass F extends /* lead */ Base {}\n";
+    let (_, c) = index(&[("w.js", source)]);
+    let mut found: Vec<_> = c
+        .relations
+        .iter()
+        .map(|r| {
+            let owner = c.classes.iter().find(|k| k.symbol.id == r.owner).unwrap();
+            (
+                owner.symbol.name.as_str(),
+                r.type_name.as_str(),
+                &source[r.range.start_byte..r.range.end_byte],
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("A", "ns.Base", "ns . Base"),
+            ("B", "ns.deep.Base", "ns /*c*/ . deep\n  . Base"),
+            ("F", "Base", "Base"),
+        ],
+        "canonical spelling with the source range; optional, computed and call heritage stay out"
+    );
+}
+#[test]
 fn missing_measured_symbols_and_member_limits_are_explicit() {
     let (g, _) = fixture(&[("a.py", "class A: pass\n")]);
     let c = Catalog::build(&g.files, &[], &Arc::new(AtomicBool::new(false))).unwrap();

@@ -1396,8 +1396,7 @@ impl Extractor<'_, '_> {
             // other expressions are values, not declared names.
             match n.kind() {
                 "identifier" | "member_expression" => {
-                    let text = self.text(n).to_owned();
-                    if dotted(&text) {
+                    if let Some(text) = self.js_dotted(n).filter(|text| dotted(text)) {
                         self.reference(n, &text, index, kind)?;
                     }
                 }
@@ -1516,6 +1515,38 @@ impl Extractor<'_, '_> {
             }
         }
         Ok(())
+    }
+    /// Canonical `a.b.C` spelling of a JavaScript identifier or plain member
+    /// chain, independent of whitespace and comments. Optional chains, computed
+    /// members, calls and other expressions are not names.
+    fn js_dotted(&self, n: Node<'_>) -> Option<String> {
+        let mut parts = Vec::new();
+        let mut node = n;
+        for _ in 0..self.b.limits.depth {
+            match node.kind() {
+                "identifier" => {
+                    parts.push(self.text(node));
+                    parts.reverse();
+                    return Some(parts.join("."));
+                }
+                "member_expression" => {
+                    let mut cursor = node.walk();
+                    if node
+                        .children(&mut cursor)
+                        .any(|c| c.kind() == "optional_chain")
+                    {
+                        return None;
+                    }
+                    let property = node
+                        .child_by_field_name("property")
+                        .filter(|p| p.kind() == "property_identifier")?;
+                    parts.push(self.text(property));
+                    node = node.child_by_field_name("object")?;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
     fn reference(&mut self, n: Node<'_>, name: &str, index: usize, kind: &str) -> Result<()> {
         if !self.details(index)? {
