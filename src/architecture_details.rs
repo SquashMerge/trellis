@@ -247,6 +247,7 @@ pub fn summary(references: &Value, rules: &Value, layers: &Layers<'_>) -> Result
         "indexRevision": references["indexRevision"],
         "evidenceTier": references["evidenceTier"],
         "semanticComplete": references["semanticComplete"],
+        "semanticProducers": references["semanticProducers"],
         "counts": references["counts"],
         "limitations": references["limitations"],
         "externalPackages": packages,
