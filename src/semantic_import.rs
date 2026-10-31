@@ -1396,6 +1396,14 @@ fn measure_occurrence<S: JoinStore>(
             .is_some_and(|kind| match candidate.kind.as_str() {
                 _ if kind == 0 => true,
                 "type" => matches!(kind, 7 | 11 | 21),
+                // Native JavaScript represents a class constructor as a method. SCIP can
+                // state either its constructor semantics or its method declaration shape.
+                "method"
+                    if candidate.document.language == "javascript"
+                        && candidate.name.as_deref() == Some("constructor") =>
+                {
+                    matches!(kind, 9 | 26)
+                }
                 "method" => kind == 26,
                 _ => true,
             });
