@@ -24,6 +24,8 @@
     ["shared", "→shared ", "into shared"], ["allowed", "allowed ", "allowed by policy"], ["excepted", "excepted ", "excepted"], ["unknown", "unknown ", "unknown"]];
   // SPEC §9 size cap: chips per band or open module, and in the whole diagram.
   const ENTRY_CAP = 40, BOX_CAP = 150;
+  // Resize re-layout: the quiet period, and the width change that is worth a new drawing.
+  const RESIZE_DEBOUNCE_MS = 150, RESIZE_SLACK = 8;
   const stem = name => { const dot = name.lastIndexOf("."); return dot > 0 ? name.slice(0, dot) : name; };
   // A directory module's own root file: shown first when it opens, never as a "mod" chip.
   const ROOT_FILES = new Set(["mod.rs", "__init__.py"]);
@@ -51,12 +53,16 @@
     }
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }
-  function create({request, context, readSource, openTreemap, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}}) {
+  function create({request, context, readSource, openTreemap, libraryButton = () => null, onConflict = () => {}, onInspect = () => {}, onRulesChanged = () => {}}) {
     let serial = 0, renderSerial = 0, selectionSerial = 0, reviewSerial = 0, view = null, basis = null;
     let metric = "cognitive", aggregate = "max", role = "production", relative = false, showTests = false;
     let reviewScope = null, reviewMode = "rules", selected = new Map(), draft = null, preview = null, editSerial = 0, editBusy = false, busyOwner = 0;
     const callables = () => role === "all" ? "indexed callables" : "production callables";
     const population = () => role === "all" ? "all indexed callables" : callables();
+    // The hidden-layer note moves into the canvas after each drawing, so keep its nodes.
+    const hiddenNote = get("architecture-hidden"), hiddenToggle = get("architecture-hidden-toggle"), hiddenNames = get("architecture-hidden-names");
+    // The selected node's identity, re-pressed after a resize re-layout; the width last laid out.
+    let pressed = null, laidOut = null;
     const state = (message, kind = "ready") => { get("architecture-state").textContent = message; get("architecture-state").dataset.state = kind; };
     function capture() {
       const c = context();
@@ -69,7 +75,7 @@
     }
     function usable() { return view && current(basis) && view.rulesFile?.contentHash === basis.rulesHash; }
     function clearInspection() {
-      selectionSerial++;
+      selectionSerial++; pressed = null;
       window.TrellisShell?.clearArchitectureInspector();
     }
     function reset(message = "Open Architecture to read the indexed snapshot and reviewed rules.", keepDraft = false) {
@@ -81,7 +87,7 @@
       get("architecture-diagram").replaceChildren(); get("architecture-diagram").setAttribute("aria-busy", "false");
       get("architecture-legend").replaceChildren(); get("architecture-notice-content").replaceChildren();
       get("architecture-notices").open = false;
-      get("architecture-hidden").hidden = true; get("architecture-coverage").textContent = ""; get("architecture-exclusions").textContent = "";
+      hiddenNote.hidden = true; get("architecture-summary").textContent = ""; get("architecture-coverage").textContent = ""; get("architecture-exclusions").textContent = "";
       state(message, "empty");
     }
     function payloadOf(data, c) {
@@ -107,6 +113,7 @@
       paragraph(target, `Code ${window.TrellisIndexPin.label(view)} · rules ${view.rulesFile.contentHash} · ${aggregate} · ${population()}.`);
       const references = view.references;
       paragraph(target, `${references?.counts?.mappedSites ?? 0} mapped reference sites · ${references?.counts?.semanticSites ?? 0} bound by semantic evidence · ${references?.counts?.unresolvedSites ?? 0} unresolved. Missing sites do not prove absence.`);
+      if (ruleCounts(view)) paragraph(target, ruleCounts(view));
       for (const limitation of references?.limitations || []) paragraph(target, limitation);
       const unassigned = view.modules.filter(module => module.layer === null);
       paragraph(target, view.state === "no_layers" ? "No layer graph or file assignment inventory is available until layers are configured." : `${unassigned.length} unassigned native file modules remain unknown.`);
@@ -344,13 +351,34 @@
     }
     function displayState(payload, layout) {
       const files = layers => payload.modules.filter(module => layers.some(layer => layer.name === module.layer)).length;
-      get("architecture-hidden").hidden = !layout.hidden.length;
-      const toggle = get("architecture-hidden-toggle");
+      hiddenNote.hidden = !layout.hidden.length;
+      const toggle = hiddenToggle;
       toggle.textContent = `${shown.hidden ? "▾" : "▸"} ${plural(layout.hidden.length, "hidden layer")} · ${plural(files(layout.hidden), "file")} · ${plural(layout.hiddenEdges, "production edge")}`;
       toggle.setAttribute("aria-expanded", String(shown.hidden));
-      get("architecture-hidden-names").textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
+      hiddenNames.textContent = layout.hidden.map(layer => layout.tests.has(layer.name) ? `${layer.name} (tests/fixtures; include them to show)` : layer.name).join(", ");
     }
+    // A drawn node's stable identity (its data attribute), so a new drawing can find it again.
+    const NODE_KEYS = ["data-trellis-module-id", "data-trellis-edge-id", "data-trellis-layer-id", "data-trellis-directory-id", "data-trellis-unassigned", "data-trellis-note-id"];
+    function nodeKey(node) {
+      if (!node) return null;
+      if (node === hiddenToggle) return ["id", hiddenToggle.id];
+      const name = NODE_KEYS.find(key => node.hasAttribute?.(key));
+      return name ? [name, node.getAttribute(name)] : null;
+    }
+    function findNode(key) {
+      if (!key) return null;
+      if (key[0] === "id") return hiddenToggle;
+      const find = (name, value) => [...(get("architecture-diagram").querySelectorAll?.(`[${name}]`) || [])].find(node => node.getAttribute(name) === value) || null;
+      const found = find(key[0], key[1]);
+      if (found || key[0] !== "data-trellis-note-id") return found;
+      // A note the new drawing no longer has falls back to its owning band (or the unassigned row).
+      let layer = null;
+      try { [layer] = JSON.parse(key[1]); } catch { return null; }
+      return typeof layer === "string" ? find("data-trellis-layer-id", layer) : find("data-trellis-unassigned", "true");
+    }
+    const pressedNode = () => [...(get("architecture-diagram").querySelectorAll?.('[aria-pressed="true"]') || [])][0] || null;
     function refocus(target) {
+      if (target.hidden) { hiddenToggle.focus?.(); return; }
       for (const node of get("architecture-diagram").querySelectorAll?.("[role=button]") || []) {
         if ((target.layer !== undefined && node.getAttribute("data-trellis-layer-id") === target.layer) ||
             (target.directory !== undefined && node.getAttribute("data-trellis-directory-id") === target.directory) ||
@@ -373,22 +401,28 @@
       }
       if (relative) target.append(make("span", "Low heat → high heat · ties stay together · — unavailable"));
     }
-    // Measured coverage beside the arrow key: drawn counts are lower bounds (#449).
+    // Measured coverage beside the arrow key, the one place it is said (#449, #525):
+    // drawn counts are lower bounds. Rule-instance counts live behind the ⓘ.
     function coverageSummary(payload) {
       const rows = payload.references?.coverage || [];
       const sites = rows.reduce((sum, row) => sum + row.sites, 0), mapped = rows.reduce((sum, row) => sum + row.mappedSites, 0);
-      const counts = payload.rules?.counts;
       const parts = [`${mapped.toLocaleString("en-US")} of ${sites.toLocaleString("en-US")} reference sites mapped to a module (${percent(mapped, sites)})`];
       if (rows.some(row => row.unresolvedSites > 0)) parts.push("≥ counts are lower bounds");
-      if (counts && Number.isSafeInteger(counts.unknown)) parts.push(`${counts.unknown.toLocaleString("en-US")} of ${counts.comparable.toLocaleString("en-US")} production rule instances unknown`);
       return parts.join(" · ");
     }
-    async function render() {
+    function ruleCounts(payload) {
+      const counts = payload.rules?.counts;
+      return counts && Number.isSafeInteger(counts.unknown) && Number.isSafeInteger(counts.comparable)
+        ? `${counts.unknown.toLocaleString("en-US")} of ${counts.comparable.toLocaleString("en-US")} production rule instances unknown.` : "";
+    }
+    // `keepSelection` re-lays out the same view for a new panel width (#515, #525): the
+    // inspector and the selected node stay; the drawing is swapped in place.
+    async function render({keepSelection = false} = {}) {
       if (!usable() || view.state !== "ready") return false;
       const c = basis, payload = view, ticket = ++renderSerial;
       const active = () => current(c) && view === payload && ticket === renderSerial && payload.rulesFile.contentHash === c.rulesHash;
       // The inspector's review overview opens before measuring, so the drawing fits the width it gets.
-      clearInspection(); overview(); get("architecture-diagram").replaceChildren();
+      if (!keepSelection) { clearInspection(); overview(); get("architecture-diagram").replaceChildren(); }
       const layout = summary(payload);
       // Collapsing layers or directories changes representation, not their module population. The
       // unassigned row is always drawn (as metric chips when collapsed, #449), so it is always in the scale.
@@ -400,8 +434,11 @@
       displayState(payload, layout);
       get("architecture-coverage").textContent = coverageSummary(payload);
       const unassigned = payload.modules.filter(module => module.layer === null).length, budget = {left:BOX_CAP, truncated:0};
-      // The canvas's inner width; the adapter fits that many chip columns.
-      const canvas = get("architecture-diagram"), style = window.getComputedStyle?.(canvas), padding = style ? parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) : 0;
+      // The canvas's inner width; the adapter fits that many chip columns. A re-layout
+      // returns keyboard focus to the same band, chip, arrow or toggle afterwards.
+      const canvas = get("architecture-diagram"), drawnFor = canvas.clientWidth;
+      const focused = keepSelection && canvas.contains?.(document.activeElement) ? nodeKey(document.activeElement) : null;
+      const style = window.getComputedStyle?.(canvas), padding = style ? parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) : 0;
       try {
         if (!window.TrellisArchitecturePele) throw new Error("Architecture renderer unavailable. Nothing displayed.");
         const outcome = await window.TrellisArchitecturePele.render(canvas, payload, {
@@ -413,8 +450,8 @@
             summary:(key, modules, columns) => summaryChips(key, modules, columns, scale, budget),
             edge:() => true,
             unassigned:{label:`Unassigned / unknown\n${plural(unassigned, "file")} · no layer`, get expanded() { return shown.unassigned && budget.left > 0; }}},
-          onSelectModule:module => { if (active() && payload.modules.includes(module)) inspect("module", module); },
-          onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) inspect("edge", edge); },
+          onSelectModule:module => { if (active() && payload.modules.includes(module)) { inspect("module", module); pressed = nodeKey(pressedNode()); } },
+          onSelectEdge:edge => { if (active() && payload.edges.includes(edge)) { inspect("edge", edge); pressed = nodeKey(pressedNode()); } },
           onSelectLayer:layer => { if (active() && payload.layers.includes(layer)) inspect("layer", layer); },
           onToggleLayer:layer => {
             if (!active() || !payload.layers.includes(layer)) return;
@@ -430,14 +467,25 @@
             if (!active()) return;
             const layer = payload.layers.find(item => item.name === entry?.layerKey);
             if (layer) inspect("layer", layer); else inspect("unknown", null);
+            pressed = nodeKey(pressedNode());
           },
         });
         if (!active()) return false;
         if (outcome?.status !== "ready") throw new Error(outcome?.reason || outcome?.error?.message || "Architecture mapping failed. Nothing displayed.");
+        laidOut = drawnFor; if (canvas.dataset) canvas.dataset.layoutWidth = String(drawnFor);
+        // The hidden-layer note is part of the drawing's layout, right under it (#525).
+        canvas.append(hiddenNote);
+        if (keepSelection) {
+          // Only a selectable node is re-pressed; a band that stands in for a removed note only takes focus.
+          const again = findNode(pressed);
+          if (again?.hasAttribute("aria-pressed")) again.setAttribute("aria-pressed", "true");
+          findNode(focused)?.focus();
+        }
         const production = payload.edges.filter(edge => edge.role === "production").reduce((sum, edge) => sum + edge.count, 0);
         const tests = payload.edges.filter(edge => edge.role === "test").reduce((sum, edge) => sum + edge.count, 0);
-        // One status line; heat exclusions move to the coverage notices (#449).
-        state(`${payload.modules.length} file modules · ${production} production / ${tests} test-only cross-layer sites${showTests ? "" : " (tests hidden)"}${budget.truncated ? ` · ${plural(budget.truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""} · Metrics: ${aggregate}, ${population()}`, "ready");
+        // The counts live behind the ⓘ with the heat exclusions; nothing but the drawing sits above it (#449, #525).
+        get("architecture-summary").textContent = `${payload.modules.length} file modules · ${production} production / ${tests} test-only cross-layer sites${showTests ? "" : " (tests hidden)"}${budget.truncated ? ` · ${plural(budget.truncated, "file")} not drawn (size cap ${BOX_CAP} chips)` : ""} · Metrics: ${aggregate}, ${population()}.`;
+        state("", "ready");
         get("architecture-exclusions").textContent = `Heat: ${exclusions(payload.modules)}.`;
         return true;
       } catch (error) {
@@ -543,7 +591,6 @@
       get("architecture-inspector-title").textContent = "Architecture review";
       const target = get("architecture-inspector-content"); target.replaceChildren();
       reviewChips(target);
-      if (view.state === "ready") paragraph(target, coverageSummary(view), "detail");
       paragraph(target, view.state === "ready" ? "Select a band, module chip or arrow to inspect its evidence." : "Authored exceptions stay editable without layers.", "detail");
     }
     // Evidence wording follows what the selection rests on (#523); never semantically complete.
@@ -806,6 +853,8 @@
         if (!p || !window.TrellisIndexPin.equal(p,c.pin) || p.rulesFile?.contentHash !== owned.payload.proposedHash || !["committed","durability_uncertain"].includes(p.mutationOutcome)) throw new Error("Unrecognized write outcome. Reload rules to inspect disk before trying again.");
         const message = p.mutationOutcome === "durability_uncertain" ? "Rules were written, but crash durability is uncertain. " : "Rules committed. ";
         invalidatePreview(); draft = null; get("architecture-editor").hidden = true;
+        // Written rules can hide or show layers at the same code pin; other views re-read their population.
+        onRulesChanged();
         await refresh();
         const now = context();
         if (now.rootKey !== c.rootKey || now.session !== c.session || !window.TrellisIndexPin.equal(now.pin, c.pin)) return;
@@ -922,10 +971,26 @@
       if (next === role) return;
       role = next; return refresh();
     });
-    get("architecture-hidden-toggle").addEventListener("click", () => {
+    hiddenToggle.addEventListener("click", () => {
       if (!usable()) return;
-      shown.hidden = !shown.hidden; saveDisplay(); return rerender({});
+      shown.hidden = !shown.hidden; saveDisplay(); return rerender({hidden:true});
     });
+    // A changed panel width (window resize, inspector toggle) re-lays out the drawing,
+    // debounced, keeping the size cap, the inspector and the selection (#515, #525).
+    // A hidden panel has no width and waits until it is shown again.
+    let resizeTimer = null, resizeSerial = 0;
+    if (typeof window.ResizeObserver === "function") new window.ResizeObserver(() => {
+      const canvas = get("architecture-diagram"), ticket = ++resizeSerial;
+      window.clearTimeout(resizeTimer);
+      // Tests and tools can tell a pending re-layout from a settled drawing.
+      canvas.dataset.layout = "pending";
+      resizeTimer = window.setTimeout(async () => {
+        const width = canvas.clientWidth;
+        if (width && laidOut !== null && Math.abs(width - laidOut) >= RESIZE_SLACK && usable() && view.state === "ready") await render({keepSelection:true});
+        // Settled unless a newer width change scheduled another re-layout meanwhile.
+        if (ticket === resizeSerial) delete canvas.dataset.layout;
+      }, RESIZE_DEBOUNCE_MS);
+    }).observe(get("architecture-diagram"));
     get("architecture-color").addEventListener("change", event => { metric = event.target.value; return render(); });
     get("architecture-tests").addEventListener("change", event => { showTests = event.target.checked; return render(); });
     get("architecture-aggregate").addEventListener("change", event => {

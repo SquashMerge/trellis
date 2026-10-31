@@ -110,9 +110,9 @@ test("init is inert; one owned pin/digest supplies metric values and explicit sa
 });
 
 test("test toggle and metric recolor only owned data; aggregate reloads the same pin", async () => {
-  const h=harness();await h.controller.refresh();const initial=h.get("architecture-state").textContent;
+  const h=harness();await h.controller.refresh();const initial=h.get("architecture-summary").textContent;
   h.get("architecture-tests").checked=true;await h.get("architecture-tests").fire("change");
-  assert.equal(h.calls.length,1);assert.equal(h.renders.at(-1).options.showTests,true);assert.match(h.get("architecture-state").textContent,/7 production \/ 2 test-only/);
+  assert.equal(h.calls.length,1);assert.equal(h.renders.at(-1).options.showTests,true);assert.match(h.get("architecture-summary").textContent,/7 production \/ 2 test-only/);
   assert.match(initial,/7 production \/ 2 test-only/);
   h.get("architecture-color").value="layer";await h.get("architecture-color").fire("change");
   assert.equal(h.renders.at(-1).options.moduleBand(h.renders.at(-1).view.modules[0]),null);
@@ -172,7 +172,7 @@ test("metric role is independent of test-reference overlay and fences old source
   assert.equal(h.renders.at(-1).options.showTests, true);
   assert.equal(first.options.isCurrent(), false);
   assert.match(text(h.get("architecture-legend")), /all indexed callables/);
-  assert.match(h.get("architecture-state").textContent, /7 production \/ 2 test-only cross-layer sites · Metrics: max, all indexed callables$/);
+  assert.match(h.get("architecture-summary").textContent, /7 production \/ 2 test-only cross-layer sites · Metrics: max, all indexed callables\.$/);
   const current = h.renders.at(-1); current.options.onSelectModule(current.view.modules[0]);
   assert.match(text(h.get("architecture-inspector-content")), /metrics:v1 · all indexed callables/);
   h.setResponse(async () => ({payload:fixture()})); h.get("architecture-metric-tests").checked = false;
@@ -186,11 +186,11 @@ test("same-pin role changes fence both late request outcomes and async Pele comp
     const old = h.controller.refresh();
     h.setResponse(async () => ({payload:fixture("max", "rules-one", "all")}));
     h.get("architecture-metric-tests").checked = true; await h.get("architecture-metric-tests").fire("change");
-    const state = h.get("architecture-state").textContent;
+    const state = h.get("architecture-summary").textContent;
     if (reject) pending.reject(Object.assign(new Error("old role conflict"), {status:409, code:"revision_conflict"}));
     else pending.resolve({payload:fixture()});
     await old;
-    assert.equal(h.renders.length, 1); assert.equal(h.get("architecture-state").textContent, state);
+    assert.equal(h.renders.length, 1); assert.equal(h.get("architecture-summary").textContent, state);
     assert.equal(h.conflicts.length, 0); assert.equal(h.calls[0].current(), false);
   }
   const h = harness(), renderer = deferred(), entered = deferred();
@@ -201,10 +201,10 @@ test("same-pin role changes fence both late request outcomes and async Pele comp
   h.setRenderer(async () => ({status:"ready"}));
   h.setResponse(async () => ({payload:fixture("max", "rules-one", "all")}));
   h.get("architecture-metric-tests").checked = true; await h.get("architecture-metric-tests").fire("change");
-  const state = h.get("architecture-state").textContent;
+  const state = h.get("architecture-summary").textContent;
   assert.equal(oldOptions.isCurrent(), false);
   renderer.resolve({status:"error", reason:"late production render"}); await oldRender;
-  assert.equal(h.get("architecture-state").textContent, state);
+  assert.equal(h.get("architecture-summary").textContent, state);
   assert.match(state, /all indexed callables/);
 });
 
@@ -501,7 +501,7 @@ test("layer stats chip only non-zero production counts by verdict, with deviatio
   assert.deepEqual(JSON.parse(JSON.stringify(options.edgeText(up))), {bound:true, label:"lower bound; 90% of 80 production reference sites from Storage mapped to a module", note:"90% mapped"});
   assert.deepEqual(JSON.parse(JSON.stringify(options.edgeText(down))), {bound:false, label:"100% of 7 production reference sites from UI mapped to a module", note:""});
   assert.equal(options.display.edge(down), true, "allowed arrows stay drawn");
-  assert.match(h.get("architecture-coverage").textContent, /^81 of 89 reference sites mapped to a module \(91%\) · ≥ counts are lower bounds · 0 of 0 production rule instances unknown$/);
+  assert.match(h.get("architecture-coverage").textContent, /^81 of 89 reference sites mapped to a module \(91%\) · ≥ counts are lower bounds$/); assert.match(text(h.get("architecture-notice-content")), /0 of 0 production rule instances unknown/);
 });
 
 test("#523: an arrow's own coverage decides its lower bound and names its evidence tier", async () => {
@@ -679,7 +679,8 @@ test("the full stack stays drawn with deviations, and counted review chips open 
   const chips = () => descendants(h.get("architecture-inspector-content")).filter(item => item.className === "architecture-chip");
   assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "156 unassigned", "0 exceptions"]);
   assert.equal(chips()[0].dataset.tone, "error");
-  assert.match(text(h.get("architecture-inspector-content")), /563 of 897 production rule instances unknown/);
+  assert.doesNotMatch(text(h.get("architecture-inspector-content")), /reference sites mapped/, "#525: the coverage sentence is said once, under the arrow key");
+  assert.match(text(h.get("architecture-notice-content")), /563 of 897 production rule instances unknown/, "rule counts sit behind the ⓘ");
   await h.get("architecture-review").fire("click"); await flush();
   assert.equal(h.get("architecture-review-panel").hidden, false);
   assert.equal(h.get("architecture-review-role").value, "production"); assert.equal(h.get("architecture-review-state").value, "deviates");

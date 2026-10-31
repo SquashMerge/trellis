@@ -224,6 +224,9 @@ test("role change clears inspection and heat, and fences late same-pin refresh a
     assert.equal(decoration.node.parent, null); assert.ok(h.counts().cleared > cleared);
     assert.equal(new URL(h.requests[3].url, "http://local").searchParams.get("role"), "all");
     h.requests[3].resolve(payload([row("mixed.rs", 9, {roleCounts:{production:1,test:1}})], {role:"all"})); await settle();
+    // The explicit refresh above dropped the application population (#524); the all-role read re-reads it once.
+    assert.equal(new URL(h.requests[4].url, "http://local").searchParams.get("role"), "production");
+    h.requests[4].resolve(payload([row("mixed.rs", 2, {roleCounts:{production:1,test:1}})])); await settle();
     const before = {changes:h.counts().changes, shown:h.counts().shown, state:text(h.get("metrics-state"))};
     for (const index of [1, 2]) {
       if (reject) h.requests[index].reject(Object.assign(new Error("late production conflict"), {status:409, code:"revision_conflict"}));
@@ -231,16 +234,16 @@ test("role change clears inspection and heat, and fences late same-pin refresh a
     }
     await Promise.all([inspection, old]);
     assert.deepEqual({changes:h.counts().changes, shown:h.counts().shown, state:text(h.get("metrics-state"))}, before);
-    assert.equal(h.conflicts.length, 0); assert.equal(h.requests.length, 4);
+    assert.equal(h.conflicts.length, 0); assert.equal(h.requests.length, 5);
     assert.match(before.state, /all indexed callables/);
     const work = h.controller.inspect({scope:"file", path:"mixed.rs"});
-    assert.match(h.requests[4].url, /role=all/);
-    h.requests[4].resolve(payload([row("mixed.rs", 9)], {role:"all", scope:"file", topCognitive:[]})); await work;
+    assert.match(h.requests[5].url, /role=all/);
+    h.requests[5].resolve(payload([row("mixed.rs", 9)], {role:"all", scope:"file", topCognitive:[]})); await work;
     assert.match(text(h.get("metric-inspector-scope")), /all indexed callables/);
     assert.match(text(h.get("metric-inspector-values")), /Cognitive\s+9/);
     h.change("metric-include-tests", false);
-    assert.match(h.requests[5].url, /role=production/);
-    h.requests[5].resolve(payload([])); await settle();
+    assert.match(h.requests[6].url, /role=production/);
+    h.requests[6].resolve(payload([])); await settle();
   }
 });
 
