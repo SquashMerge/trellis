@@ -28,22 +28,56 @@
     const match = /^\s*(?:(?:pub(?:\([^)]*\))?|unsafe|default)\s+)*impl\b\s*(?:<[^{]*?>\s*)?(?:[^{]*?\bfor\s+)?(?:&\s*)?(?:dyn\s+)?([A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*)/.exec(head);
     return match ? match[1].split("::").at(-1) : null;
   }
-  // The initializer is read from the binding's own measured byte range: the text after its
-  // first assignment `=`. Without source, a function child that ends where the binding ends is
-  // its initializer (a closure passed as an argument ends before the call's `)`).
-  const FUNCTION_INITIALIZER = /^\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)|^\s*lambda\b/;
+  // A binding is a callable when its initializer, the whole of it, is a function. The initializer
+  // runs from after the binding's assignment `=` (whitespace trimmed) to the binding's end.
+  // - A measured function child (arrow, lambda, named function expression) must span exactly that
+  //   range, so a closure passed as an argument, or a function called on the spot, does not count.
+  // - The producer measures no node for an unnamed `function () {}`; its text must then be one
+  //   function expression whose body's closing brace ends the initializer.
+  // Without source, a function child that ends where the binding ends is taken as its initializer.
+  const FUNCTION_KINDS = ["function", "anonymousFunction"];
   let encoded = {text:null, bytes:null};
-  function functionValued(item, items, sourceText) {
-    const range = item.symbol.range;
-    if (typeof sourceText === "string" && Number.isSafeInteger(range?.startByte) && Number.isSafeInteger(range?.endByte)) {
-      if (encoded.text !== sourceText) encoded = {text:sourceText, bytes:new TextEncoder().encode(sourceText)};
-      const end = Math.min(range.endByte, range.startByte + 512, encoded.bytes.length);
-      const text = new TextDecoder().decode(encoded.bytes.subarray(range.startByte, end));
-      const assign = /(?<![=!<>])=(?![=>])/.exec(text);
-      return !!assign && FUNCTION_INITIALIZER.test(text.slice(assign.index + 1));
+  const INITIALIZER_LIMIT = 1 << 20;
+  // The end index of the balanced group opening at `text[at]`, skipping strings and comments.
+  function balanced(text, at) {
+    const open = text[at], close = {"(":")", "{":"}"}[open];
+    let depth = 0;
+    for (let i = at; i < text.length; i++) {
+      const c = text[i];
+      if (c === "\"" || c === "'" || c === "`") {
+        for (i++; i < text.length && text[i] !== c; i++) if (text[i] === "\\") i++;
+      } else if (c === "/" && text[i + 1] === "/") { const end = text.indexOf("\n", i); if (end === -1) return -1; i = end; }
+      else if (c === "/" && text[i + 1] === "*") { const end = text.indexOf("*/", i + 2); if (end === -1) return -1; i = end + 1; }
+      else if (c === open) depth++;
+      else if (c === close && --depth === 0) return i;
     }
-    return items.some(child => child.symbol.parent === item.symbol.id && ["function", "anonymousFunction"].includes(child.nativeKind) &&
-      Number.isSafeInteger(range?.endByte) && child.symbol.range?.endByte === range.endByte);
+    return -1;
+  }
+  function wholeFunctionExpression(text) {
+    const head = /^(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z_$][\w$]*\s*)?/.exec(text);
+    if (!head || text[head[0].length] !== "(") return false;
+    const params = balanced(text, head[0].length);
+    if (params < 0) return false;
+    const body = text.slice(params + 1).search(/\S/) + params + 1;
+    if (text[body] !== "{") return false;
+    const end = balanced(text, body);
+    return end >= 0 && /^\s*;?\s*$/.test(text.slice(end + 1));
+  }
+  function functionValued(item, items, sourceText) {
+    const range = item.symbol.range, children = items.filter(child => child.symbol.parent === item.symbol.id && FUNCTION_KINDS.includes(child.nativeKind));
+    if (!Number.isSafeInteger(range?.startByte) || !Number.isSafeInteger(range?.endByte)) return false;
+    if (typeof sourceText !== "string") return children.some(child => child.symbol.range?.endByte === range.endByte);
+    if (encoded.text !== sourceText) encoded = {text:sourceText, bytes:new TextEncoder().encode(sourceText)};
+    const bytes = encoded.bytes.subarray(range.startByte, Math.min(range.endByte, range.startByte + INITIALIZER_LIMIT, encoded.bytes.length));
+    const text = new TextDecoder().decode(bytes), assign = /(?<![=!<>])=(?![=>])/.exec(text);
+    if (!assign) return false;
+    const lead = text.slice(assign.index + 1).search(/\S/);
+    if (lead < 0) return false;
+    const initializer = text.slice(assign.index + 1 + lead).replace(/\s*;?\s*$/, "");
+    const start = range.startByte + new TextEncoder().encode(text.slice(0, assign.index + 1 + lead)).length;
+    const end = start + new TextEncoder().encode(initializer).length;
+    if (children.some(child => child.symbol.range?.startByte === start && child.symbol.range?.endByte === end)) return true;
+    return !children.some(child => child.symbol.range?.startByte === start) && wholeFunctionExpression(initializer);
   }
   function outlineTree(items, sourceText) {
     const byId = new Map(items.map(item => [item.symbol.id, item]));

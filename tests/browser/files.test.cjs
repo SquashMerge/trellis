@@ -428,7 +428,9 @@ test("Files mini-sequence keeps caveats behind ⓘ, fits the inspector and floor
 
 // #526: a binding whose initializer is a function is a callable row, measured from the real
 // JavaScript producer's ranges; a value that merely contains a closure is not.
-const bindings = `const anon = function() { return 2; };
+const bindings = `const handler = (value = loadDefault()) => value;
+const result = function () { return 2; }();
+const anon = function() { return 2; };
 const named = function inner() { return 3; };
 const arrow = (value) => value + 1;
 const callback = wrap(() => 4);
@@ -440,10 +442,10 @@ test("Files outlines function-valued bindings from the real producer, not values
   await enterFiles(selected); await openFile(selected, "bindings.js");
   const dto = await outline(selected, "bindings.js");
   const byName = name => dto.items.find(item => item.symbol.name === name);
-  for (const name of ["anon", "named", "inner", "arrow", "callback", "plain", "wrap"]) assert.ok(byName(name), `producer emits ${name}: ${JSON.stringify(dto.items.map(item => [item.symbol.name, item.nativeKind]))}`);
+  for (const name of ["handler", "result", "anon", "named", "inner", "arrow", "callback", "plain", "wrap"]) assert.ok(byName(name), `producer emits ${name}: ${JSON.stringify(dto.items.map(item => [item.symbol.name, item.nativeKind]))}`);
   await page.locator(`.files-symbol-pick[data-symbol-id="${byName("anon").symbol.id}"]`).waitFor();
   const rows = await page.locator(".files-symbol-pick").evaluateAll(nodes => nodes.map(node => node.querySelector(".files-symbol-name").textContent));
-  assert.deepEqual(rows, ["anon", "named", "arrow", "wrap"], "function-valued bindings and declarations; no inner name, closure-holding value or plain value");
+  assert.deepEqual(rows, ["handler", "anon", "named", "arrow", "wrap"], "function-valued bindings and declarations; no inner name, invoked function, closure-holding value or plain value");
 }));
 
 // #426: icon plus name on one line, with kind and line right-aligned.
