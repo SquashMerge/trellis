@@ -291,9 +291,19 @@ async function connect(page, server, token) {
   await page.locator("#token").fill(token);
   await page.locator("#connect-form button[type=submit]").click();
   await page.locator("#checkout-select").waitFor({state:"visible",timeout:15000});
-  await page.locator("#checkout-select").selectOption(rootKey);
+  // Arrival opens the only checkout (#447); each suite fixture has exactly one.
+  await page.waitForFunction(key => document.querySelector("#checkout-select")?.value === key, rootKey, {timeout:15000});
   await page.locator("#workspace").waitFor({state:"visible",timeout:15000});
   await page.waitForFunction(() => document.querySelector("#status")?.textContent?.includes("Revision"),null,{timeout:15000});
+}
+// Opens the closed popovers (menus, Options, About) that hold a control, so it can be used.
+async function reveal(page, selector) {
+  await page.locator(selector).first().evaluate(node => {
+    const chain = [];
+    let start = node.tagName === "SUMMARY" ? node.parentElement : node;
+    for (let details = start.parentElement?.closest("details"); details; details = details.parentElement?.closest("details")) chain.unshift(details);
+    for (const details of chain) details.open = true;
+  });
 }
 async function setup() {
   const built = await builtBinary();
@@ -317,4 +327,4 @@ function cleanup() {
   }
   return cleanupPromise;
 }
-module.exports = {setup,cleanup,fixture,run,startDaemon,stopDaemon,api,scoped,connect,seedId,indexThroughApi,chromiumPath:undefined,get binary(){return binary;}};
+module.exports = {reveal,setup,cleanup,fixture,run,startDaemon,stopDaemon,api,scoped,connect,seedId,indexThroughApi,chromiumPath:undefined,get binary(){return binary;}};

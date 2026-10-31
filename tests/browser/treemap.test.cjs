@@ -174,7 +174,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   assert.match(legend, /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
   assert.equal(await page.locator("#treemap-relative").isChecked(), false);
   const beforeRelative = metricRequests(selected).length;
-  await page.locator("#treemap-relative").check(); await ready(page);
+  await H.reveal(page, "#treemap-relative"); await page.locator("#treemap-relative").check(); await ready(page);
   assert.equal(metricRequests(selected).length, beforeRelative);
   const relativeLegend = await page.locator("#treemap-legend").textContent();
   assert.match(relativeLegend, /Relative to visible set/);
@@ -184,7 +184,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
     const value = visible.find(row => fileKey(row) === leaf.key).metrics.cognitive;
     assert.equal(leaf.fill, value === null ? "#343644" : colors[quartiles.filter(cut => value > cut).length]);
   }
-  await page.locator("#treemap-relative").uncheck(); await ready(page);
+  await H.reveal(page, "#treemap-relative"); await page.locator("#treemap-relative").uncheck(); await ready(page);
   await page.locator("#treemap-path").fill("src/mixed.rs"); await ready(page);
   const filtered = await page.locator("#treemap-diagram g.pele-leaf[data-trellis-file-id] rect").first().getAttribute("fill");
   assert.equal(filtered, native.find(leaf => JSON.parse(leaf.key)[2] === "src/mixed.rs").fill, "fixed heat survives path filtering");
@@ -214,7 +214,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   await selectFile(page, comment, {keyboard:"Space"});
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /—/);
   const sourceSet = new Set(visible.map(fileKey)), beforeReads = metricRequests(selected).length;
-  await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
+  await H.reveal(page, "#treemap-hide-tests"); await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
   assert.equal(metricRequests(selected).length, beforeReads, "file visibility is local, not a metric-role read");
   assert.equal(await page.locator("#treemap-metric-tests").isChecked(), false);
   assert.deepEqual(await listKeys(page), dto.files.map(fileKey).sort());
@@ -222,8 +222,8 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /—|unavailable/i);
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /test.only|no production callables/i);
   assert.match(await onlyControl.locator("rect").first().getAttribute("stroke-dasharray"), /\d/, "test-only file has a non-color distinction");
-  await page.locator("#treemap-hide-tests").check(); await ready(page);
-  await page.locator("#treemap-metric-tests").check(); await ready(page);
+  await H.reveal(page, "#treemap-hide-tests"); await page.locator("#treemap-hide-tests").check(); await ready(page);
+  await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").check(); await ready(page);
   assert.equal(await page.locator("#treemap-hide-tests").isChecked(), true);
   assert.deepEqual(new Set(await listKeys(page)), sourceSet, "including tests in heat cannot reveal hidden files");
   const all = await metrics(selected, "max", "all");
@@ -234,7 +234,7 @@ test("Treemap renders exact pinned Pele, physical area and independent callable/
   assert.ok(rowAt(all, "src/mixed.rs").metrics.cognitive > mixed.metrics.cognitive);
   await selectFile(page, rowAt(all, "src/mixed.rs"));
   assert.match(await page.locator("#treemap-inspector-content").textContent(), /indexed callables|all.*callables/i);
-  await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
+  await H.reveal(page, "#treemap-hide-tests"); await page.locator("#treemap-hide-tests").uncheck(); await ready(page);
   await selectFile(page, rowAt(all, "src/only.rs"));
   assert.ok(rowAt(all, "src/only.rs").metrics.cognitive > 0);
   await page.locator("#treemap-color").selectOption("role"); await ready(page);
@@ -393,14 +393,14 @@ async function restoreFetch(page) {
 
 test("Treemap late production fetch cannot replace all-callable heat and late source cannot navigate after controls change", {timeout:240000}, async () => published(async selected => {
   const {page} = selected, dto = await metrics(selected);
-  await page.locator("#treemap-metric-tests").check(); await ready(page);
+  await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").check(); await ready(page);
   await holdFetch(page, {suffix:"/metrics", query:{scope:"revision", role:"production"}});
   try {
-    await page.locator("#treemap-metric-tests").uncheck();
+    await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").uncheck();
     await page.waitForFunction(() => window.treemapFetchGate.entered);
     assert.equal(await page.locator("#treemap-diagram svg").count(), 0);
     assert.equal(await page.locator("#treemap-inspector-content").textContent(), "");
-    await page.locator("#treemap-metric-tests").check(); await ready(page);
+    await H.reveal(page, "#treemap-metric-tests"); await page.locator("#treemap-metric-tests").check(); await ready(page);
     const latest = await page.locator("#treemap-diagram").innerHTML();
     await releaseFetch(page);
     assert.equal(await page.locator("#treemap-diagram").innerHTML(), latest);
@@ -601,11 +601,16 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
   assert.equal(await tree.locator("li.unsupported-files").nth(1).locator("summary").textContent(), "2 files · unsupported source type · not indexed");
   assert.doesNotMatch(await tree.textContent(), /Unsupported source type/, "no per-file unsupported rows");
 
-  const legend = page.locator("#explorer-metric-legend");
-  assert.equal(await legend.isVisible(), true, "the explorer legend is visible beside its numbers in Treemap");
-  assert.match(await legend.textContent(), /Numbers: Cognitive · max · production callables · Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
+  // #447: the rail legend is a tooltip on each swatch; the full legend sits in the rail menu.
+  assert.equal(await page.locator("#explorer-metric-legend").count(), 0);
+  await H.reveal(page, "#metric-legend");
+  const legend = page.locator("#metric-legend");
+  assert.equal(await legend.isVisible(), true, "the explorer legend is one click away in Treemap");
+  assert.match(await legend.textContent(), /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
   assert.deepEqual(await legend.locator(".metric-legend-entry .metric-swatch").evaluateAll(nodes => nodes.map(node => getComputedStyle(node).backgroundColor)),
     ["rgb(52, 54, 68)", "rgb(255, 194, 10)", "rgb(255, 170, 16)", "rgb(255, 122, 0)"], "legend uses the shared heat tokens");
+  await page.keyboard.press("Escape");
+  assert.match(await page.locator('.directory-pick[title="src/"] .metric-value').getAttribute("title"), /^Cognitive · max · production callables · .*Fixed per-callable bands/);
   const folder = await page.locator('.directory-pick[title="src/"]').evaluate(pick => {
     const value = pick.querySelector(".metric-value"), swatch = value?.querySelector(".metric-swatch");
     return {number:value?.querySelector("span:last-child")?.textContent, swatch:swatch?.className, gap:pick.getBoundingClientRect().right - value.getBoundingClientRect().right};
@@ -614,7 +619,7 @@ test("Treemap root is the checkout name and fills its panel across resizes; expl
   assert.ok(Number.isFinite(value), "src/ has a measured folder number");
   assert.equal(folder.swatch, `metric-swatch heat-${[5, 15, 30].filter(cut => value > cut).length}`, "folder swatch uses the legend's fixed band");
   assert.ok(folder.gap >= 0 && folder.gap < 12, "folder number is right-aligned in its row");
-  assert.equal(await legend.getAttribute("role"), "group"); assert.equal(await page.locator("#treemap-legend").getAttribute("role"), "group");
+  assert.equal(await page.locator("#treemap-legend").getAttribute("role"), "group");
   await capture(page, "treemap-explorer-legend");
   // An open file list scrolls inside its own capped box instead of squeezing the diagram.
   await page.locator(".treemap-file-list > summary").click();

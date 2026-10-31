@@ -7,7 +7,7 @@
 #architecture-legend { flex: none; padding: 0 18px 8px; font-size: 12px; }
 #architecture-diagram { flex: 1; min-height: 120px; min-width: 0; overflow: auto; overscroll-behavior: contain; padding: 12px; }
 #architecture-diagram svg { display: block; max-width: none; font-family: var(--sans); }
-#architecture-notices { max-height: 25vh; }
+.popover-body .architecture-basis { margin: 0; }
 #architecture-notice-content { overflow-wrap: anywhere; white-space: pre-wrap; }
 #architecture-inspector { padding-top: 14px; font-size: 12px; overflow-wrap: anywhere; }
 #architecture-inspector-title { margin-top: 0; font: 13px/1.6 var(--mono); }

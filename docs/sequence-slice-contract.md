@@ -87,6 +87,7 @@ This dispatcheslanguage to behavior_js::build(...sameargs)->Result<SequenceView>
 
 Catalog/API workerowns src/store.rs src/http.rs tests/browse_http.rs (notexistingtests unlessneeded).
 GET /api/files?revision=N&offset=0&limit=200 -> {revision,items:[{path,language,methodCount}],nextOffset:number|null}.
+Optional `q` (1–256 bytes, no control characters) keeps only paths containing it, ASCII case-insensitive, across the whole pinned catalog before paging (#447).
 GET /api/methods?revision=N&path=... -> {revision,items:[{symbol:Symbol,consequential:bool,reason:String}],truncated:bool}.
 Methods = indexed Function/Method includingnestedmethods labeled bynames/path ranges; no class/moduleasmethod.
 Conservativeheuristic only hide accessor/trivialreturnliteral/identifier methods ifdemonstrablytrivial; otherwise

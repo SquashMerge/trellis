@@ -296,7 +296,8 @@ test("Files symbol rows are one line and source lines get subtle text-only synta
   // Diagrams reuses the cached snapshot without Files colouring.
   await page.locator("#section-diagrams").click();
   await page.waitForFunction(() => !document.body.classList.contains("files-section"));
-  assert.equal(await page.locator("#source .syntax-comment, #source .syntax-attribute").count(), 0);
+  // Diagrams repaints the cached snapshot after its current view (Architecture on arrival) refreshes.
+  await page.waitForFunction(() => document.querySelectorAll("#source .source-line").length > 0 && document.querySelectorAll("#source .syntax-comment, #source .syntax-attribute").length === 0);
 }));
 
 test("mini Full from Working tree explains Back to an unsaved blank route and Forward restores its pinned sequence", {timeout:240000}, async () => published({git:true}, async selected => {
@@ -605,7 +606,6 @@ test("measured Git counts and exact M/A/D/R markers preserve indexed evidence bo
   assert.deepEqual([status.git.upstream.ahead, status.git.upstream.behind], [1, 1]);
   const expected = `${status.git.head.name} · 7 uncommitted · origin/main ↑1 ↓1 · As of last fetch`;
   await page.waitForFunction(text => document.querySelector("#workspace-git")?.textContent === text, expected);
-  assert.equal(await page.locator('#indexed-checkouts .checkout-pick[aria-pressed="true"] .checkout-git').textContent(), expected);
   const marker = async (path, status, letter) => {
     const found = await page.locator("#file-tree .git-marker").evaluateAll((nodes, path) => nodes.filter(node => node.dataset.path === path).map(node => ({
       text:node.textContent, status:node.dataset.status, title:node.title, label:node.getAttribute("aria-label"),

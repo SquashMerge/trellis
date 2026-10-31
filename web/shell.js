@@ -7,7 +7,7 @@
   const make = (tag, value) => { const node = document.createElement(tag); if (value !== undefined) node.textContent = value; return node; };
   const describe = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
   const views = {architecture:"architecture-panel", treemap:"treemap-panel", sequence:"sequence-panel", classes:"classes-panel", libraries:"dependency-library"};
-  let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "sequence", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
+  let openSource = null, targetSelection = null, sourceReturnFocus = null, activeView = "architecture", inspectorClearCallback = null, sectionCallback = null, viewCallback = null;
   function setSection(name) {
     const files = name === "files";
     window.TrellisNavigation?.reset(); window.TrellisClasses?.closeContextMenu?.();
@@ -17,7 +17,8 @@
     get("section-files")?.setAttribute("aria-current", files ? "page" : "false");
     get("section-diagrams")?.setAttribute("aria-current", files ? "false" : "page");
     hide("diagram-tabs", files);
-    hide("diagram-metrics", files || ["architecture", "treemap"].includes(activeView));
+    // Explorer heat options live in the rail menu; Files has no explorer heat.
+    hide("diagram-metrics", files);
     for (const [key, panel] of Object.entries(views)) hide(panel, files || key !== activeView);
     hide("files-inspector", !files); hide("files-source-toolbar", !files);
     for (const id of ["inspector-empty", "inspector-content", "metric-inspector", "architecture-inspector", "treemap-inspector"]) {
@@ -131,7 +132,6 @@
     if (!Object.hasOwn(views, name)) return;
     if (document.body.classList.contains("files-section")) showDiagrams();
     activeView = name;
-    hide("diagram-metrics", ["architecture", "treemap"].includes(name));
     document.body.classList.toggle("classes-view", name === "classes");
     window.TrellisClasses?.closeContextMenu?.();
     if (name === "sequence" || name === "classes" || ["architecture", "treemap"].includes(name)) drawer("explorer", false);
@@ -172,8 +172,9 @@
   function wireTabs(names, prefix, select) {
     names.forEach((name, index) => {
       const tab = get(prefix + name);
-      tab?.addEventListener("click", () => select(name));
+      tab?.addEventListener("click", () => { if (!tab.disabled) select(name); });
       tab?.addEventListener("keydown", event => {
+        if (names.some(other => get(prefix + other)?.disabled)) return;
         let next;
         if (event.key === "ArrowRight") next = (index + 1) % names.length;
         else if (event.key === "ArrowLeft") next = (index + names.length - 1) % names.length;
@@ -331,14 +332,38 @@
 
   }
   function reset() {
-    setSection("diagrams"); resetInspector(); showView("sequence"); hide("source-dock", true); sourceReturnFocus = null;
+    setSection("diagrams"); resetInspector(); showView("architecture"); closePopovers(); hide("source-dock", true); sourceReturnFocus = null;
     drawer("explorer", false); drawer("inspector", false); updateCheckout(null, null); updateWorkspace(null);
   }
   function setConnected(connected) {
     document.body.classList.toggle("connected", !!connected);
     for (const id of ["section-diagrams", "section-files"]) if (get(id)) get(id).disabled = !connected;
-    if (!connected) reset();
+    // Checkout-scoped header controls exist only while a checkout is selected.
+    for (const id of ["header-status", "refresh", "workspace-details"]) hide(id, !connected);
+    if (!connected) { setIndexAvailable(true); reset(); }
   }
+  // Without a usable index no view has anything to show: tabs are greyed out and inert.
+  function setIndexAvailable(available) {
+    for (const key of Object.keys(views)) if (get(`view-${key}`)) get(`view-${key}`).disabled = !available;
+    if (get("section-files") && document.body.classList.contains("connected")) get("section-files").disabled = !available;
+    document.body.classList.toggle("no-index", !available);
+  }
+  // Menus, Options and "About this view" are <details> popovers: one open at a time,
+  // closed by an outside click, by Escape, or (menus) by choosing an action.
+  function openPopovers() { return [...document.querySelectorAll?.("details.popover[open]") || []]; }
+  function closePopovers(except) {
+    for (const node of openPopovers()) if (!except || !node.contains(except)) node.open = false;
+  }
+  document.addEventListener("click", event => {
+    const target = event.target;
+    if (!target?.closest) return;
+    closePopovers(target);
+    const action = target.closest(".popover.menu .menu-body > button");
+    if (action) action.closest(".popover.menu").open = false;
+  });
+  document.addEventListener("toggle", event => {
+    if (event.target?.classList?.contains("popover") && event.target.open) closePopovers(event.target);
+  }, true);
   wireTabs(Object.keys(views), "view-", showView);
   wireTabs(["workspace", "library"], "dock-", showSource);
   get("inspector-open-source")?.addEventListener("click", () => { if (openSource) return openSource(); });
@@ -353,11 +378,19 @@
   get("inspector-collapse")?.addEventListener("click", () => collapseInspector(true));
   document.addEventListener("keydown", event => {
     if (event.key !== "Escape") return;
+    const open = openPopovers();
+    if (open.length) {
+      const outer = open.find(node => !node.parentElement?.closest("details.popover[open]")) || open[0];
+      const focusInside = outer.contains(document.activeElement);
+      closePopovers();
+      if (focusInside) outer.querySelector(":scope > summary")?.focus();
+      return;
+    }
     const mobile = window.matchMedia?.("(max-width: 900px)").matches;
     if (mobile && document.body.classList.contains("inspector-open")) { drawer("inspector", false); get("inspector-toggle")?.focus(); }
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.TrellisShell = {showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
+  window.TrellisShell = {setIndexAvailable, closePopovers, showTreemapInspector, clearTreemapInspector,showArchitectureInspector, clearArchitectureInspector, setViewCallback, setSection, setSectionCallback, setConnected, updateCheckout, formatGit, checkoutLabel, rootName, updateWorkspace, showView, showSource, closeSource, showFiles, showDiagrams, showMetricInspector, clearMetricInspector, setInspectorClearCallback, inspectSymbol, selectStep, resetInspector, reset};
   reset();
 })();

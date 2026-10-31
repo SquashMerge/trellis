@@ -81,10 +81,11 @@ const response = data => ({ok:true,status:200,json:async()=>data});
 function descendants(node) { return [node, ...node.children.flatMap(descendants)]; }
 function text(node) { return descendants(node).map(n=>n.textContent).join(" "); }
 
-test("file tree expands methods inline, backend flags filter conservatively, pagination and local path filter", async () => {
+test("file tree expands methods inline, backend flags filter conservatively, pagination and whole-catalog path filter", async () => {
   const h = harness(), paths = [];
   h.context.fetch = async (path) => {
     paths.push(path);
+    if (path.startsWith("/api/files") && path.includes("&q=")) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:"deep/unopened/lib/c.js",methodCount:1}],nextOffset:null});
     if (path.startsWith("/api/files")) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:paths.length===1?"src/a.js":"lib/b.js",methodCount:2}],nextOffset:paths.length===1?1:null});
     return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{symbol:symbol("check"),consequential:true,reason:"validation"},{symbol:symbol("getter"),consequential:false,reason:"trivial"}],truncated:false});
   };
@@ -94,7 +95,12 @@ test("file tree expands methods inline, backend flags filter conservatively, pag
   assert.equal(descendants(h.get("file-tree")).filter(n=>n.tagName==="summary")[0].textContent,"src");
   h.get("all-methods").checked=true; h.run("renderFiles()"); assert.match(text(h.get("file-tree")), /getter/);
   await h.run("loadFiles()"); assert.match(paths.at(-1), /offset=1/);
-  h.get("file-filter").value="lib/"; h.run("renderFiles()"); assert.doesNotMatch(text(h.get("file-tree")), /a.js/); assert.match(text(h.get("file-tree")), /b.js/);
+  // The filter asks the server to search the whole pinned catalog, not the loaded pages.
+  h.get("file-filter").value=" Lib/ "; await h.run("searchFiles()");
+  assert.match(paths.at(-1), /&q=Lib%2F&offset=0&limit=200$/); assert.match(paths.at(-1), /indexGeneration=12345678/);
+  assert.doesNotMatch(text(h.get("file-tree")), /a\.js|b\.js/); assert.match(text(h.get("file-tree")), /c\.js/);
+  assert.match(h.get("files-state").textContent, /^1 matching indexed file$/);
+  h.get("file-filter").value=""; h.get("file-filter").listeners.input(); assert.match(text(h.get("file-tree")), /b\.js/);
   assert.ok(paths.every(p=>p.startsWith("/api/files")||p.startsWith("/api/methods")));
 });
 
@@ -186,7 +192,7 @@ test("folders show files without a search and keep explicit collapse through rer
 test("filter auto-open and detached native toggle events cannot change folder preference", () => {
   const h = harness(); h.run("files=[{path:'src/a.js',methodCount:1}]; renderFiles()");
   const old = directory(h); old.open = false; old.listeners.toggle();
-  h.get("file-filter").value = "a.js"; h.run("renderFiles()");
+  h.get("file-filter").value = "a.js"; h.run("filterResults={query:'a.js',items:files,next:null}; renderFiles()");
   assert.equal(directory(h).open, true); directory(h).listeners.toggle();
   old.open = true; old.listeners.toggle();
   h.get("file-filter").value = ""; h.run("renderFiles()");
@@ -212,10 +218,30 @@ for (const fail of [false,true]) test(`obsolete catalog ${fail ? 'failure' : 'su
   assert.equal(h.run("files.length"), 1); assert.equal(h.run("files[0].path"), "new.js");
   assert.match(h.get("files-state").textContent, /loaded files/);
 });
-test("empty paths explain indexing and unmatched filter explains loaded-only scope", async () => {
+test("empty paths explain indexing and an unmatched filter says no indexed file matches", async () => {
   const h = harness(); h.run("renderFiles()"); assert.match(text(h.get("file-tree")), /Index workspace/);
   h.run("files=[{path:'src/a.js',methodCount:0}]"); h.get("file-filter").value = "missing"; h.run("renderFiles()");
-  assert.match(text(h.get("file-tree")), /Clear the filter or load more/);
+  assert.match(h.get("files-state").textContent, /Searching indexed files/);
+  assert.doesNotMatch(text(h.get("file-tree")), /a\.js/, "loaded pages never stand in for whole-catalog results");
+  h.run("filterResults={query:'missing',items:[],next:null}; renderFiles()");
+  assert.match(text(h.get("file-tree")), /No indexed files match/);
+});
+test("filter results page, stale responses are dropped and failures are typed text", async () => {
+  const h = harness(), pages = [], slow = deferred();
+  h.context.fetch = async path => { pages.push(path); return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:`m${pages.length}.js`,methodCount:0}],nextOffset:pages.length === 1 ? 200 : null}); };
+  h.get("file-filter").value = "m"; await h.run("searchFiles()");
+  assert.equal(h.get("more-files").hidden, false); assert.match(h.get("files-state").textContent, /more available/);
+  await h.get("more-files").listeners.click();
+  assert.match(pages.at(-1), /&offset=200&/); assert.match(text(h.get("file-tree")), /m1\.js[\s\S]*m2\.js/);
+  h.context.fetch = () => slow.promise; const pending = h.run("searchFiles()");
+  h.get("file-filter").value = "other";
+  slow.resolve(response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:"stale.js",methodCount:0}],nextOffset:null})); await pending;
+  assert.doesNotMatch(text(h.get("file-tree")), /stale\.js/, "a response for an older query never paints");
+  h.context.fetch = async () => ({ok:false,status:400,json:async()=>({error:{code:"invalid_request",message:"<b>bad</b>"}})});
+  await h.run("searchFiles()");
+  assert.equal(h.get("files-state").textContent, "Filter unavailable: <b>bad</b>");
+  h.get("file-filter").value = "é".repeat(129); await h.run("searchFiles()");
+  assert.equal(h.get("files-state").textContent, "Filter is too long.");
 });
 test("catalog errors have an explicit retry and successful retry clears it", async () => {
   const h = harness(); h.context.fetch = async () => { throw new Error('offline'); };
@@ -444,13 +470,43 @@ test("folder pagination and refresh retain loaded pages and collapse state", asy
 test("folder failure offers retry and no matches explains unloaded folders", async () => {
   const h=harness(); h.context.fetch=async()=>{throw new Error('Permission denied');}; await h.run('loadTreeRoot()');
   assert.match(text(h.get('file-tree')),/Permission denied/); assert.match(text(h.get('file-tree')),/Retry folder/);
-  h.get('file-filter').value='missing'; h.run('renderFiles()'); assert.match(h.get('files-state').textContent,/unopened folders are not searched/);
+  h.get('file-filter').value='missing'; h.run('renderFiles()'); assert.match(h.get('files-state').textContent,/Searching indexed files/);
 });
 
-test("filter reveals loaded descendants without changing collapsed folder preference", async () => {
+test("folder loads and refreshes under a filter keep showing only catalog matches", async () => {
+  const h=harness(); h.context.fetch=async path=>response(path.startsWith('/api/tree')?treePage('',[folder('src'),treeFile('README.md')]):{revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:'deep/match.js',methodCount:1}],nextOffset:null});
+  h.get('file-filter').value='match'; await h.run('searchFiles()');
+  await h.run('loadTreeRoot()'); await h.run('refreshTree()');
+  assert.match(text(h.get('file-tree')),/match\.js/); assert.doesNotMatch(text(h.get('file-tree')),/README/);
+});
+test("filter states are terminal without an index, on a stale pin and after a failed later page", async () => {
+  const h=harness(); h.get('file-filter').value='a';
+  h.run('status=null'); await h.run('searchFiles()');
+  assert.equal(h.get('files-state').textContent,'No usable index to search.');
+  h.run("status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}}");
+  h.context.fetch=async()=>response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{path:'a.js',methodCount:0}],nextOffset:200});
+  await h.run('searchFiles()');
+  h.context.fetch=async()=>({ok:false,status:500,json:async()=>({error:{code:'storage_io',message:'later page failed'}})});
+  await h.run('searchFiles(200)');
+  assert.match(text(h.get('file-tree')),/a\.js/,'matches already shown stay');
+  assert.equal(h.get('files-state').textContent,'Filter unavailable: later page failed');
+  let statusReads=0;
+  h.context.fetch=async path=>{ if(path==='/api/status'){statusReads++; return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2},workspaceRoot:'/synthetic'});} return {ok:false,status:409,json:async()=>({error:{code:'revision_conflict',message:'stale'}})}; };
+  await h.run('searchFiles()'); for(let i=0;i<5;i++) await new Promise(r=>setImmediate(r));
+  assert.ok(statusReads>=1,'a stale pin re-reads status like other browse reads');
+});
+test("Index workspace hides while this page waits on an accepted first index", () => {
+  const h=harness(); h.run('indexNotReady=true; renderIndexStatus()');
+  assert.equal(h.get('index').hidden,false);
+  h.run("job={id:'j',state:'running',progress:{}}; waitingForJob=true; renderIndexStatus()");
+  assert.equal(h.get('index').hidden,true);
+  h.run('waitingForJob=false; renderIndexStatus()');
+  assert.equal(h.get('index').hidden,false);
+});
+test("filter reveals catalog matches without changing collapsed folder preference", async () => {
   const h=harness(); h.context.fetch=async path=>response(path.includes('path=src')?treePage('src',[treeFile('src/a.js')]):treePage('',[folder('src')]));
   await h.run('loadTreeRoot()'); await h.run("toggleDirectory('src')"); await h.run("toggleDirectory('src')");
-  h.get('file-filter').value='a.js'; h.run('renderFiles()'); assert.match(text(h.get('file-tree')),/a.js/);
+  h.get('file-filter').value='a.js'; h.run("filterResults={query:'a.js',items:[{path:'src/a.js',methodCount:1}],next:null}; renderFiles()"); assert.match(text(h.get('file-tree')),/a.js/);
   h.get('file-filter').value=''; h.run('renderFiles()'); assert.doesNotMatch(text(h.get('file-tree')),/a.js/);
   assert.equal(h.run("directories.get('src').open"),false);
 });
@@ -475,12 +531,12 @@ test("successful reconnect clears an earlier authentication error", async () => 
   assert.equal(h.get('workspace').hidden,false);
 });
 
-test("file browser keeps filtering visible, display options collapsed and mobile tree space reserved", () => {
+test("file browser keeps a one-line filter, options in a closed menu and mobile tree space reserved", () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'),'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'),'utf8');
-  assert.match(html, /<label class="file-filter-label" for="file-filter">Filter loaded entries<\/label><input id="file-filter"/);
-  assert.match(html, /<details class="browse-options"><summary>Display options<\/summary>/);
-  assert.doesNotMatch(html, /<details class="browse-options" open/);
+  assert.match(html, /<input id="file-filter" type="search" placeholder="Filter files…" aria-label="Filter files" maxlength="256"/);
+  assert.match(html, /<details id="rail-menu" class="popover menu">\s*<summary class="menu-toggle" aria-label="File tree options"/);
+  assert.doesNotMatch(html, /indexed-checkouts|browse-scope|Filter loaded entries|explorer-metric-legend/);
   assert.match(css, /@media\s*\(max-width:\s*900px\)/);
   assert.match(css, /\.file-browser,\s*\.call-inspector\s*\{[^}]*position:\s*absolute;[^}]*top:\s*0;[^}]*bottom:\s*0;[^}]*width:\s*min\(310px,\s*88%\)/);
   assert.match(css, /body\.explorer-open \.file-browser[^}]*display:\s*flex/);
@@ -1280,7 +1336,7 @@ test("dot entries and indexed-snapshot folders without files stay hidden until S
   let rendered = text(h.get('file-tree'));
   assert.match(rendered, /src\//); assert.match(rendered, /README\.md/);
   assert.doesNotMatch(rendered, /\.git|\.env|build/);
-  assert.match(h.get('files-state').textContent, /3 hidden or unindexed entries not shown/);
+  assert.match(h.get('files-state').textContent, /^3 hidden or unindexed entries · ⋯ to show$/);
   const toggle = h.get('show-hidden-files');
   toggle.checked = true; toggle.listeners.change({target:toggle});
   rendered = text(h.get('file-tree'));
@@ -1419,7 +1475,7 @@ test("live Git markers use exact checkout paths, accessible meanings and no inve
   assert.doesNotMatch(h.get("workspace-git").textContent,/4 uncommitted|clean|main/);
 });
 
-test("newer selected Git observation protects header and list from older checkout discovery", async () => {
+test("newer selected Git observation protects header and picker from older checkout discovery", async () => {
   const h=harness(), held=deferred();
   h.run('selectedWorkspaceRoot="/synthetic"');
   h.context.fetch=()=>held.promise;
@@ -1429,11 +1485,8 @@ test("newer selected Git observation protects header and list from older checkou
   held.resolve(response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",git:measuredGit(1,"old-branch")},{rootKey:"b".repeat(64),workspaceRoot:"/other",state:"available",git:measuredGit(2,"other-branch")}]}));
   await pending;
   assert.match(h.get("workspace-git").textContent,/new-branch.*5 uncommitted/);
-  const rows=descendants(h.get("indexed-checkouts")).filter(node=>node.className==="checkout-git");
-  assert.match(rows[0].textContent,/new-branch.*5 uncommitted/);
-  assert.match(rows[1].textContent,/other-branch.*2 uncommitted/);
-  assert.doesNotMatch(text(h.get("indexed-checkouts")),/old-branch|1 uncommitted/);
   assert.match(h.get("checkout-select").children.find(node=>node.value===ROOT).textContent,/new-branch/);
+  assert.match(h.get("checkout-select").children.find(node=>node.value==="b".repeat(64)).textContent,/other-branch/);
 });
 
 for (const cold of [false,true]) test(`selection reads Git independently after ${cold ? "cold reset" : "unavailable index status"}`, async () => {

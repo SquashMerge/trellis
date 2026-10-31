@@ -148,7 +148,7 @@ test("published JavaScript nested try/handler/exit retains order and original so
  assert.ok(dto.hiddenSteps>0,"producer-hidden incidental call required");
  assert.match(await page.locator("#sequence-state").textContent(),/incidental steps hidden/);
  const serverRequests=[];page.on("request",r=>{if(new URL(r.url()).pathname.endsWith("/sequence"))serverRequests.push(r.postDataJSON());});
- await page.locator("#all-steps").check();
+ await H.reveal(page, "#all-steps"); await page.locator("#all-steps").check();
  await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele rendered")&&document.querySelector("#sequence-state")?.textContent?.includes("0 incidental steps hidden"));
  assert.ok(serverRequests.some(body=>body.showAll===true&&body.expectedRevision.indexGeneration===pin.indexGeneration&&body.expectedRevision.indexRevision===pin.indexRevision));
  assert.ok((await page.locator(".pele-note[data-trellis-step-id]").allTextContents()).some(text=>text.includes("console.log")));
@@ -290,10 +290,12 @@ test("published app visibly falls back for malformed target evidence, depth, Mer
      // This actual app control invokes loadSequence and consumes the routed,
      // published-pinned response. Show all is required to retain large labels.
      const checked=await page.locator("#all-steps").isChecked();
+     await H.reveal(page, "#all-steps");
      if(checked) await page.locator("#all-steps").uncheck();
      else await page.locator("#all-steps").check();
-     if(scenario==="mermaid" && !await page.locator("#all-steps").isChecked())
-       await page.locator("#all-steps").check();
+     if(scenario==="mermaid" && !await page.locator("#all-steps").isChecked()){
+       await H.reveal(page, "#all-steps"); await page.locator("#all-steps").check();
+     }
      await page.waitForFunction(()=>document.querySelector("#sequence-state")?.textContent?.includes("Pele fell back:"),null,{timeout:15000})
        .catch(async error=>{throw new Error(`${scenario}: ${error.message}; state=${await page.locator("#sequence-state").textContent()}; responses=${JSON.stringify(responseRequests)}; pageErrors=${JSON.stringify(await page.evaluate(()=>({text:document.querySelector("#sequence-diagram")?.textContent?.slice(0,500),nodes:window.__testPeleNodes})))}`);});
      const state=await page.locator("#sequence-state").textContent();

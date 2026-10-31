@@ -144,7 +144,7 @@ async function rerendered(page, action) {
 // Summary-first display (#391): open every band, footer and directory to reach file chips.
 async function expandAll(page) {
   const focus = page.locator("#architecture-deviations-only");
-  if (await focus.isChecked()) await rerendered(page, () => focus.uncheck());
+  if (await focus.isChecked()) await rerendered(page, async () => { await H.reveal(page, "#architecture-deviations-only"); return focus.uncheck(); });
   for (const id of ["quiet", "hidden"]) {
     const toggle = page.locator(`#architecture-${id}-toggle`);
     if (await toggle.isVisible() && await toggle.getAttribute("aria-expanded") === "false") await rerendered(page, () => toggle.click());
@@ -292,12 +292,12 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(await page.locator("#architecture-relative").isChecked(), false);
   assert.match(await page.locator("#architecture-legend").textContent(), /Fixed per-callable bands.*≤5.*>5–15.*>15–30.*>30/);
   const metricReads = selected.requests.filter(row => row.url.pathname.endsWith("/architecture")).length;
-  await rerendered(page, () => page.locator("#architecture-relative").check());
+  await rerendered(page, async () => { await H.reveal(page, "#architecture-relative"); return page.locator("#architecture-relative").check(); });
   assert.match(await page.locator("#architecture-legend").textContent(), /Relative to visible set/);
   assert.equal(selected.requests.filter(row => row.url.pathname.endsWith("/architecture")).length, metricReads);
-  await rerendered(page, () => page.locator("#architecture-relative").uncheck());
+  await rerendered(page, async () => { await H.reveal(page, "#architecture-relative"); return page.locator("#architecture-relative").uncheck(); });
   const heat = await module.locator("rect").first().getAttribute("fill"), legend = await page.locator("#architecture-legend").textContent();
-  await page.locator("#architecture-tests").check();
+  await H.reveal(page, "#architecture-tests"); await page.locator("#architecture-tests").check();
   await page.waitForFunction(count => [...document.querySelectorAll('#architecture-diagram [role=button]')].filter(node => node.getAttribute("aria-label")?.includes("test sites")).length === count, dto.edges.filter(edge => edge.role === "test").length);
   assert.deepEqual(await page.locator('#architecture-diagram [role=button][aria-label*="production sites"]').evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-label")).sort()), beforeProduction);
   assert.deepEqual(await page.locator("#architecture-diagram [data-trellis-edge-id]").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-trellis-edge-id")).sort()), dto.edges.map(summaryKey).sort(), "test toggle preserves complete exact summary mapping");
@@ -316,7 +316,9 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await capture(page, "architecture-production-desktop");
   await page.setViewportSize({width:390, height:844});
   if (await page.locator("#inspector-toggle").getAttribute("aria-expanded") === "true") await page.locator("#inspector-toggle").click();
-  assert.equal(await page.locator("#architecture-metric-tests").isVisible(), true);
+  await H.reveal(page, "#architecture-metric-tests");
+  assert.equal(await page.locator("#architecture-metric-tests").isVisible(), true, "Options stay reachable at 390px");
+  await page.keyboard.press("Escape");
   await capture(page, "architecture-production-mobile");
   await page.locator("#inspector-toggle").click();
   await capture(page, "architecture-production-mobile-inspector");
@@ -331,7 +333,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   assert.equal(allLow.metrics.cognitive, 3, "two nested test ifs contribute 1 + 2, while low and test-support stay production");
   assert.deepEqual(all.edges, dto.edges, "metric population cannot change reference roles, counts or policy");
   assert.equal(all.modules.find(row => row.identity.path === "src/only.rs").metrics.cognitive, 1);
-  await page.locator("#architecture-metric-tests").check();
+  await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
   await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
   await ready(page);
   await expandAll(page);
@@ -345,20 +347,22 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await capture(page, "architecture-all-desktop");
   await page.setViewportSize({width:390, height:844});
   if (await page.locator("#inspector-toggle").getAttribute("aria-expanded") === "true") await page.locator("#inspector-toggle").click();
-  assert.equal(await page.locator("#architecture-metric-tests").isVisible(), true);
+  await H.reveal(page, "#architecture-metric-tests");
+  assert.equal(await page.locator("#architecture-metric-tests").isVisible(), true, "Options stay reachable at 390px");
+  await page.keyboard.press("Escape");
   await capture(page, "architecture-all-mobile");
   await page.locator("#inspector-toggle").click();
   await capture(page, "architecture-all-mobile-inspector");
   await page.setViewportSize({width:1440, height:1000});
   const allHeat = await module.locator("rect").first().getAttribute("fill"), allLegend = await page.locator("#architecture-legend").textContent();
-  await page.locator("#architecture-tests").uncheck();
+  await H.reveal(page, "#architecture-tests"); await page.locator("#architecture-tests").uncheck();
   await page.waitForFunction(() => ![...document.querySelectorAll('#architecture-diagram [role=button]')].some(node => node.getAttribute("aria-label")?.includes("test sites")));
   assert.equal(await page.locator("#architecture-metric-tests").isChecked(), true);
   assert.equal(await module.locator("rect").first().getAttribute("fill"), allHeat);
   assert.equal(await page.locator("#architecture-legend").textContent(), allLegend);
-  await page.locator("#architecture-tests").check();
+  await H.reveal(page, "#architecture-tests"); await page.locator("#architecture-tests").check();
   await ready(page);
-  await page.locator("#architecture-metric-tests").uncheck();
+  await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").uncheck();
   await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, production callables"));
   await ready(page);
   assert.equal(await page.locator("#architecture-tests").isChecked(), true);
@@ -367,7 +371,7 @@ test("Architecture uses real pinned structural sites, authored native-file layer
   await testEdge.focus(); await page.keyboard.press("Enter");
   assert.equal(await page.locator("#architecture-inspector-title").textContent(), "low → top");
   assert.match(await page.locator("#architecture-inspector-content").textContent(), /2 exact test structural reference sites.*hypothetical policy only/is);
-  await page.locator("#architecture-tests").uncheck();
+  await H.reveal(page, "#architecture-tests"); await page.locator("#architecture-tests").uncheck();
   await page.waitForFunction(() => ![...document.querySelectorAll('#architecture-diagram [role=button]')].some(node => node.getAttribute("aria-label")?.includes("test sites")));
   const edge = page.locator("#architecture-diagram").getByRole("button", {name:/^2 production sites · upward\s+deviation$/});
   await edge.click();
@@ -437,18 +441,18 @@ test("Architecture rejects a route-gated production response after all-callable 
     };
   });
   try {
-    await page.locator("#architecture-metric-tests").check();
+    await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
     await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
     await ready(page);
     await expandAll(page);
     await page.locator("#architecture-diagram").getByRole("button", {name:/^src\/low\.rs(?:\s|$)/}).click();
     assert.match(await page.locator("#architecture-inspector-content").textContent(), /4 indexed callables/);
     await page.route(pattern, respond);
-    await page.locator("#architecture-metric-tests").uncheck();
+    await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").uncheck();
     await seen;
     assert.equal(await page.locator("#architecture-diagram svg").count(), 0, "changing role removes old heat before the blocked read");
     assert.equal(await page.locator("#architecture-inspector-content").textContent(), "");
-    await page.locator("#architecture-metric-tests").check();
+    await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
     await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("Metrics: max, all indexed callables"));
     await ready(page);
     const allCanvas = await page.locator("#architecture-diagram").textContent();
@@ -538,7 +542,7 @@ test("Architecture draws module chips per band, count chips matching rules check
   const [height, viewport] = await page.locator("#architecture-diagram").evaluate(node => [node.scrollHeight, node.clientHeight]);
   assert.ok(height < 4 * viewport, `the module picture stays a few canvases tall, not a poster (${height}px in ${viewport}px)`);
 
-  await rerendered(page, () => page.locator("#architecture-deviations-only").uncheck());
+  await rerendered(page, async () => { await H.reveal(page, "#architecture-deviations-only"); return page.locator("#architecture-deviations-only").uncheck(); });
   const lowGroup = `#architecture-diagram [data-trellis-directory-id='${JSON.stringify(["low", "src/low"])}']`;
   assert.match(await page.locator(lowGroup).getAttribute("aria-label"), /^low\n2 files · max \d+\nsrc\/low$/, "low.rs and low/ form one module chip");
   assert.match(await page.locator(lowGroup).locator("text").textContent(), /^low\d+ · 2 files$/);
@@ -582,8 +586,8 @@ test("Architecture hides test and fixture layers until tests and fixtures are in
     assert.ok(!(await bandStates(page)).some(([name]) => name === "fixtures"), "the fixture layer is not drawn first, or at all, by default");
     assert.match(await page.locator("#architecture-hidden-toggle").textContent(), /1 hidden layer · 1 file/);
     assert.equal(await page.locator("#architecture-hidden-names").textContent(), "fixtures (tests/fixtures; include them to show)");
-    await rerendered(page, () => page.locator("#architecture-deviations-only").uncheck());
-    await page.locator("#architecture-metric-tests").check();
+    await rerendered(page, async () => { await H.reveal(page, "#architecture-deviations-only"); return page.locator("#architecture-deviations-only").uncheck(); });
+    await H.reveal(page, "#architecture-metric-tests"); await page.locator("#architecture-metric-tests").check();
     await page.waitForFunction(() => document.querySelector("#architecture-state")?.textContent.includes("all indexed callables"));
     await ready(page);
     assert.equal(await page.locator("#architecture-hidden").isVisible(), false);
@@ -611,7 +615,7 @@ test("Architecture applies authored display hints without changing evaluation", 
     assert.deepEqual(await bandStates(page), [["low", "false"], ["mid", "false"], ["shared", "false"], ["top", "true"]], "hidden is in the footer; expanded starts open");
     assert.equal(await page.locator("#architecture-hidden-toggle").textContent(), "▸ 1 hidden layer · 1 file · 1 production edge");
     assert.equal(await page.locator("#architecture-quiet").isVisible(), false, "an explicit display opts the empty layer out of automatic quiet collapse");
-    await rerendered(page, () => page.locator("#architecture-deviations-only").uncheck());
+    await rerendered(page, async () => { await H.reveal(page, "#architecture-deviations-only"); return page.locator("#architecture-deviations-only").uncheck(); });
     assert.ok((await bandStates(page)).some(([name, expanded]) => name === hostileLayer && expanded === "false"), "collapsed draws a summary band");
     await rerendered(page, () => page.locator("#architecture-hidden-toggle").click());
     assert.ok((await bandStates(page)).some(([name]) => name === "peer"), "a hidden layer is shown from the footer");

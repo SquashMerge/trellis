@@ -23,7 +23,8 @@ source or partially update the inspector. Existing authentication and stale-pin 
 
 ## Cached file catalog and all-symbol outline
 
-Files uses the pinned indexed `files` catalog for its tree. The Diagrams Explorer remains a
+Files uses the pinned indexed `files` catalog for its tree. A non-empty filter asks the same
+catalog for matching paths (`q`, at most 256 bytes) instead of filtering loaded pages. The Diagrams Explorer remains a
 live filesystem metadata browser; it is not the Files catalog. This distinction keeps captured
 files reachable after live deletion and prevents a directory listing from silently changing the
 indexed basis. A cached path need not exist on disk now. Conversely, a live-only or Git-only path
