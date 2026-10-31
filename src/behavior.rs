@@ -92,8 +92,8 @@ impl ExternalPackage {
             } else {
                 fields.push(std::mem::take(&mut field));
                 if fields.len() == 4 {
-                    // Descriptors must follow the package.
-                    if at + 1 >= symbol.len() {
+                    // One or more well-formed descriptors must follow the package.
+                    if !scip_descriptors(&symbol[at + 1..]) {
                         return None;
                     }
                     let present =
@@ -111,6 +111,67 @@ impl ExternalPackage {
         }
         None
     }
+}
+/// Whether `tail` is one or more SCIP descriptors and nothing else:
+/// `name/` `name#` `name.` `name:` `name!` `name(disambiguator?).` `[name]` `(name)`,
+/// where a name is `[_+$A-Za-z0-9-]+` or a backtick-quoted identifier with `` `` `` for a
+/// backtick. Linear in `tail`; never panics.
+fn scip_descriptors(tail: &str) -> bool {
+    fn simple(bytes: &[u8], mut at: usize) -> Option<usize> {
+        let start = at;
+        while at < bytes.len()
+            && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'+' | b'-' | b'$'))
+        {
+            at += 1;
+        }
+        (at > start).then_some(at)
+    }
+    fn name(bytes: &[u8], at: usize) -> Option<usize> {
+        if bytes.get(at) != Some(&b'`') {
+            return simple(bytes, at);
+        }
+        let mut at = at + 1;
+        let mut empty = true;
+        loop {
+            match bytes.get(at)? {
+                b'`' if bytes.get(at + 1) == Some(&b'`') => at += 2,
+                b'`' => return (!empty).then_some(at + 1),
+                _ => at += 1,
+            }
+            empty = false;
+        }
+    }
+    let bytes = tail.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        at = match bytes[at] {
+            b'[' => match name(bytes, at + 1) {
+                Some(end) if bytes.get(end) == Some(&b']') => end + 1,
+                _ => return false,
+            },
+            b'(' => match name(bytes, at + 1) {
+                Some(end) if bytes.get(end) == Some(&b')') => end + 1,
+                _ => return false,
+            },
+            _ => {
+                let Some(end) = name(bytes, at) else {
+                    return false;
+                };
+                match bytes.get(end) {
+                    Some(b'/' | b'#' | b'.' | b':' | b'!') => end + 1,
+                    Some(b'(') => {
+                        let close = simple(bytes, end + 1).unwrap_or(end + 1);
+                        if bytes.get(close..close + 2) != Some(b").") {
+                            return false;
+                        }
+                        close + 2
+                    }
+                    _ => return false,
+                }
+            }
+        };
+    }
+    at > 0
 }
 pub fn build_sequence(
     revision: IndexPin,
@@ -150,6 +211,22 @@ mod external_package_tests {
             ExternalPackage::from_scip("scip-java maven com.google  guava . Lists#"),
             package("maven", "com.google guava", None)
         );
+        // Every descriptor kind, escaped names and method disambiguators.
+        for tail in [
+            "candidate_only().",
+            "std/io/Read#read(+1).",
+            "Vec#[T]push().(value)",
+            "`impl Foo for Bar`#meta:mac!",
+            "`a``b`#",
+        ] {
+            assert_eq!(
+                ExternalPackage::from_scip(&format!(
+                    "rust-analyzer cargo local-library 0.1.0 {tail}"
+                )),
+                package("cargo", "local-library", Some("0.1.0")),
+                "{tail}"
+            );
+        }
     }
 
     #[test]
@@ -162,6 +239,14 @@ mod external_package_tests {
             "rust-analyzer . serde 1.0 x().",
             "rust-analyzer cargo . 1.0 x().",
             " cargo serde 1.0 x().",
+            // Descriptor tails must be complete SCIP descriptors (#508 review).
+            "rust-analyzer cargo local-library 0.1.0 definitely-not-a-descriptor",
+            "rust-analyzer cargo local-library 0.1.0 x().@",
+            "rust-analyzer cargo local-library 0.1.0 x(",
+            "rust-analyzer cargo local-library 0.1.0 [T",
+            "rust-analyzer cargo local-library 0.1.0 ``#",
+            "rust-analyzer cargo local-library 0.1.0 `open.",
+            "rust-analyzer cargo local-library 0.1.0 a/ b#",
             "",
         ] {
             assert_eq!(ExternalPackage::from_scip(symbol), None, "{symbol:?}");
