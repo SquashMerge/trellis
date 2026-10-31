@@ -42,7 +42,7 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
     };
     let producer = n::Producer {
         id: "trellis.native.syntax".into(),
-        version: "native-v11".into(),
+        version: "native-v12".into(),
         executable_hash: h(b"native"),
         kind: "native".into(),
         languages: vec!["rust".into()],
@@ -143,6 +143,7 @@ fn fixture() -> (s::SemanticPublication, n::Artifact, s::CapturedComponents) {
                 gaps: vec![],
             })
             .collect(),
+            macro_expansions: vec![],
         }],
     };
     let semantic_producer = s::Producer {

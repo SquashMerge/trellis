@@ -27,7 +27,7 @@ import importlib.util
 
 REPO = Path(__file__).resolve().parents[1]
 DECODER_VERSION = "scip-0.10.0/CapturedScipFactV1/2"
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 PINNED = REPO / "tools/synthetic-cohorts/manifest-v2.json"
 GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 BATCH_MODULE = REPO / "tools/semantic-contract/semantic_batch.py"
@@ -644,7 +644,7 @@ def class_output(db, revision, path):
 
 
 # Port of tests/index/index_atomic.rs::sqlite_snapshot: all selected evidence columns,
-# schema-31 tables, immutable surrogate keys, and current pin normalization.
+# schema-32 tables, immutable surrogate keys, and current pin normalization.
 # Match tests/daemon/cli.rs: check FTS shadow inventory, compare logical corpus cells.
 REQUIRED_TABLES = set("""
 native_producers native_producer_languages native_producer_inputs
@@ -656,7 +656,7 @@ revision_documents native_version_coverage_roles native_version_declarations
 native_version_search_cards head_search_fts
 native_version_declaration_ancestors native_version_own_signature_types native_version_ancestor_signature_types
 native_version_headers native_version_header_items native_version_parameters
-native_version_references native_version_capability_families native_version_capability_gaps
+native_version_references native_version_capability_families native_version_capability_gaps native_version_macro_expansions
 native_version_calls native_version_control_regions native_version_call_regions
 native_revision_release_debt native_release_candidate_versions native_release_candidate_graphs
 native_release_candidate_classes semantic_producers semantic_producer_languages
@@ -801,7 +801,8 @@ def parity_digest(db, revision, physical_root):
     # every input table above retains every selected row and column.
     closures = {
         "document_version_id": ("document_versions", "native_version_coverage_roles",
-            "native_version_capability_families", "native_version_capability_gaps"),
+            "native_version_capability_families", "native_version_capability_gaps",
+            "native_version_macro_expansions"),
         "extraction_context": ("native_producers", "native_producer_languages",
             "native_producer_inputs", "native_revisions", "revision_capture_inputs"),
         "native_witness": tuple(sorted(name for name in output if name.startswith("native_version_")))
@@ -1047,7 +1048,7 @@ def seed_workspace(binary, corpus, workspace, daemon, size, edited=None):
 
 
 class SelectedView:
-    """Closed schema-31 view retaining all selected columns plus input-closure digests."""
+    """Closed schema-32 view retaining all selected columns plus input-closure digests."""
     def __init__(self, db, revision, physical_root):
         self.db, self.revision = db, revision
         self.physical_root = physical_root.resolve(strict=True)
