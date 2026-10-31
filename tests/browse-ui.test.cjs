@@ -278,6 +278,27 @@ test("reveal from the filter loads unopened live ancestors, across pages and the
   slow.resolve(); await pending;
   assert.equal(h.run("directories.get('sample/src')?.open ?? false"), false, 'a superseded reveal opens nothing further');
 });
+for (const preloaded of [false, true]) test(`reveal pages the containing folder until the file appears${preloaded ? " after an earlier page was loaded" : ""}`, async () => {
+  const h = harness(), requests = [];
+  h.context.method = {...symbol('z'), path:'src/z.js'};
+  const first = Array.from({length:200}, (_, i) => treeFile(`sample/src/a${String(i).padStart(3, '0')}.js`, `src/a${String(i).padStart(3, '0')}.js`));
+  h.context.fetch = async path => {
+    requests.push(path);
+    if (path.startsWith('/api/methods')) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},items:[{symbol:h.context.method,consequential:true}],truncated:false});
+    const query = new URLSearchParams(path.split('?')[1]), dir = query.get('path'), offset = query.get('offset');
+    if (dir === '') return response(treePage('', [folder('sample')]));
+    if (dir === 'sample') return response(treePage('sample', [folder('sample/src')]));
+    return response(offset === '0' ? treePage('sample/src', first, 200) : treePage('sample/src', [treeFile('sample/src/z.js', 'src/z.js')]));
+  };
+  await h.run('loadTreeRoot()');
+  if (preloaded) { await h.run("toggleDirectory('sample')"); await h.run("toggleDirectory('sample/src')"); }
+  h.run('selectedMethod=method');
+  await h.get('reveal-method').listeners.click();
+  assert.ok(requests.some(path => path.includes('path=sample%2Fsrc&offset=200&')), 'the later file page is requested');
+  assert.ok(h.run("directories.get('sample/src').items.some(item => item.path === 'sample/src/z.js')"));
+  assert.equal(h.run("fileStates.get('src/z.js').open"), true);
+  assert.ok(descendants(h.get('file-tree')).some(n => n.attrs?.['aria-pressed'] === 'true'), 'the selected method is revealed');
+});
 test("reveal selected method clears filter and reopens its folder and file", async () => {
   const h = harness(); h.context.method = symbol('selected');
   h.run("files=[{path:'src/a.js',methodCount:1}]; selectedMethod=method; fileStates.set('src/a.js',{open:false,items:[{symbol:method,consequential:false}]}); closedDirectories.add('src/')");

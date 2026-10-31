@@ -1551,24 +1551,28 @@ async function revealSelectedMethod() {
   // Without a known root pair, an already-listed entry still names its live path.
   const listed = () => { for (const state of directories.values()) { const entry = state.items?.find(item => item.indexedPath === method.path); if (entry) return entry.path; } return null; };
   const relative = treeMode ? treePathOf(method.path) ?? listed() : null;
+  // Page a folder's listing until it holds `path`, or the listing ends or fails.
+  const pageUntil = async (folder, path) => {
+    const state = directoryState(folder, true);
+    while (!state.items?.some(item => item.path === path) && (state.items === null || state.nextOffset != null)) {
+      const before = state.items?.length ?? -1;
+      await loadDirectory(folder, state.items === null);
+      if (!current()) return false;
+      if (state.error || (state.items?.length ?? -1) === before) break;
+    }
+    return true;
+  };
   if (relative) {
     let parent = "";
     directoryState("", true).open = true;
     for (const part of relative.split("/").slice(0, -1)) {
       const path = parent ? `${parent}/${part}` : part;
-      const above = directoryState(parent, true);
-      // The folder may sit on a later page of its parent listing.
-      while (!above.items?.some(item => item.path === path) && (above.items === null || above.nextOffset != null)) {
-        const before = above.items?.length ?? -1;
-        await loadDirectory(parent, above.items === null);
-        if (!current()) return;
-        if (above.error || (above.items?.length ?? -1) === before) break;
-      }
+      if (!await pageUntil(parent, path)) return;
       directoryState(path, true).open = true;
       parent = path;
     }
-    const last = directoryState(parent, true);
-    if (last.items === null) { await loadDirectory(parent, true); if (!current()) return; }
+    // The file itself may be on a later page of its folder, loaded or not.
+    if (!await pageUntil(parent, relative)) return;
   }
   const parts = method.path.split("/"); let directory = "";
   for (const part of parts.slice(0, -1)) { directory += part + "/"; closedDirectories.delete(directory); }
