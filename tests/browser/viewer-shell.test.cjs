@@ -996,11 +996,11 @@ test("view toolbars are one row with Options and an About popover; Sequence and 
   }
   await page.setViewportSize({width:1440, height:900});
   await page.locator("#view-architecture").click();
-  for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests", "architecture-deviations-only"]) {
+  for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests"]) {
     assert.equal(await page.locator(`#${id}`).isVisible(), false, `${id} waits in Options`);
   }
   await page.locator("#architecture-panel .view-options > summary").click();
-  for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests", "architecture-deviations-only"]) assert.equal(await page.locator(`#${id}`).isVisible(), true);
+  for (const id of ["architecture-metric-tests", "architecture-relative", "architecture-tests"]) assert.equal(await page.locator(`#${id}`).isVisible(), true);
   await capture(page, "toolbar-architecture-options");
   await page.keyboard.press("Escape");
   assert.equal(await page.locator(".architecture-basis").isVisible(), false, "caveats are behind the ⓘ");

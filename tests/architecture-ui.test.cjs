@@ -22,7 +22,7 @@ function fixture(aggregate = "max", hash = "rules-one", role = "production") {
       {identity:b,layer:"Storage",physicalLines:8,declarationCount:0,roleCounts:{production:0,test:2},metrics:{cognitive:null,cyclomatic:null},revisionId:"revision-b",contentHash:"hash-b",provenanceId:"native"}],
     edges:[{sourceLayer:"UI",destinationLayer:"Storage",role:"production",count:7,status:"conforms",excepted:false,exceptionReason:null,pairs:[pair]},
       {sourceLayer:"Storage",destinationLayer:"UI",role:"test",count:2,status:"deviates",excepted:false,exceptionReason:null,pairs:[]}],
-    references:{production:[pair],tests:[],unresolved:[],counts:{mappedSites:9,unresolvedSites:0},limitations:["Structural mapping is not binding."]},rules:{instances:[],testOnly:[]}};
+    references:{production:[pair],tests:[],unresolved:[],counts:{mappedSites:9,unresolvedSites:0},coverage:[{layer:"UI",role:"production",sites:7,mappedSites:7,unresolvedSites:0},{layer:"Storage",role:"test",sites:2,mappedSites:2,unresolvedSites:0}],limitations:["Structural mapping is not binding."]},rules:{instances:[],testOnly:[],counts:{comparable:0,conforms:0,deviates:0,unknown:0,excepted:0},unassignedCount:0},exceptionCount:0};
 }
 // The daemon's paged detail route (#448), answered from the last full fixture. The
 // controller receives only the summary (the harness strips the detail arrays).
@@ -55,8 +55,14 @@ function emulateDetails(full, url) {
 }
 function harness() {
   const elements = new Map(), calls = [], detailCalls = [], renders = [], reads = [], conflicts = [];
-  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null;
-  const document = {getElementById:id => {if (!elements.has(id)) elements.set(id, node(id)); return elements.get(id);},createElement:tag => node(tag)};
+  let context = {rootKey:"checkout-one",session:1,pin}, response = async () => ({payload:fixture(),catchingUp:false}), full = null, detailError = null;
+  // Created nodes with an id (the inspector's review chips, #449) resolve by that id; the newest wins.
+  const created = [];
+  const document = {getElementById:id => {
+    const made = created.findLast(item => item.id === id);
+    if (made) return made;
+    if (!elements.has(id)) elements.set(id, node(id)); return elements.get(id);
+  },createElement:tag => { const item = node(tag); created.push(item); return item; }};
   function node(tagName) {
     return {tagName,textContent:"",children:[],dataset:{},attrs:{},listeners:{},hidden:false,value:"",checked:false,
       append(...items) {this.children.push(...items);},replaceChildren(...items) {this.children = [...items];this.textContent="";},
@@ -72,7 +78,7 @@ function harness() {
   }};
   vm.runInNewContext(pinSource + "\n" + fs.readFileSync(path.join(__dirname, "../web/metric-heat.js"), "utf8") + "\n" + source, {window,document,URLSearchParams,console});
   const controller = window.TrellisArchitecture.create({request:async (url,current,options) => {
-    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); return emulateDetails(full, url); }
+    if (url.startsWith("/api/architecture/details?")) { detailCalls.push({url,current}); if (detailError) throw detailError; return emulateDetails(full, url); }
     calls.push({url,current,options}); const data = await response(url,options);
     if (!url.startsWith("/api/architecture?") || !data?.payload?.references) return data;
     // The daemon sends the summary; only the detail emulation sees the full arrays.
@@ -83,7 +89,7 @@ function harness() {
   },context:() => context,
     readSource:(site,revision,current) => reads.push({site,revision,current}),onConflict:() => conflicts.push(true)});
   const button = label => {const found = descendants(get("architecture-inspector-content")).find(item => item.tagName === "button" && item.textContent === label);assert.ok(found, `Missing ${label}`);return found;};
-  return {window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;}};
+  return {window,controller,calls,detailCalls,renders,reads,conflicts,get,button,setContext:value => {context=value;},setResponse:fn => {response=fn;},setRenderer:fn => {renderer=fn;},setDetailError:error => {detailError=error;}};
 }
 
 test("init is inert; one owned pin/digest supplies metric values and explicit sampled source actions", async () => {
@@ -92,7 +98,7 @@ test("init is inert; one owned pin/digest supplies metric values and explicit sa
   assert.equal(query.get("workbench"),"true");assert.equal(query.get("role"),"production");assert.equal(h.get("architecture-metric-tests").checked,false);
   assert.equal(query.get("aggregate"),"max");assert.equal(query.get("indexGeneration"),pin.indexGeneration);assert.equal(query.get("indexRevision"),"1");
   const {view,options} = h.renders[0];assert.equal(options.moduleValue(view.modules[0]),3);assert.equal(options.moduleValue(view.modules[1]),null);
-  assert.equal(options.layerLabel(view.layers[0]),"1 · UI · 1 file · max cognitive (max) 3");
+  assert.equal(options.layerLabel(view.layers[0]),"1 · UI · 1 file · max 3");
   assert.deepEqual([...options.layerStats(view.layers[0])].map(stat => [stat.text, stat.tone]),[["↓7","neutral"]],"only non-zero counts become chips");
   assert.equal(h.reads.length,0);assert.equal(h.detailCalls.length,0,"the summary load reads no details");options.onSelectModule(view.modules[0]);await flush();
   assert.match(text(h.get("architecture-inspector-content")),/4 physical file lines · 2 production callables/);
@@ -166,7 +172,7 @@ test("metric role is independent of test-reference overlay and fences old source
   assert.equal(h.renders.at(-1).options.showTests, true);
   assert.equal(first.options.isCurrent(), false);
   assert.match(text(h.get("architecture-legend")), /all indexed callables/);
-  assert.match(h.get("architecture-state").textContent, /tests shown.*all indexed callables/);
+  assert.match(h.get("architecture-state").textContent, /7 production \/ 2 test-only cross-layer sites · Metrics: max, all indexed callables$/);
   const current = h.renders.at(-1); current.options.onSelectModule(current.view.modules[0]);
   assert.match(text(h.get("architecture-inspector-content")), /metrics:v1 · all indexed callables/);
   h.setResponse(async () => ({payload:fixture()})); h.get("architecture-metric-tests").checked = false;
@@ -285,6 +291,8 @@ function editorResponse(hash = "rules-one") {
 test("review filters independent role/state, edge instances and no-edge unassigned assignments", async () => {
   const h=harness(),payload=authoringFixture();h.setResponse(async () => ({payload}));await h.controller.refresh();
   await h.get("architecture-review").fire("click");await flush();
+  assert.equal(ruleRows(h),2,"the deviations chip lists the production deviations it counts");
+  h.get("architecture-review-role").value="all";await h.get("architecture-review-role").fire("change");await flush();
   assert.equal(ruleRows(h),3,"two production deviations plus test-only row");
   const testCheckbox=descendants(h.get("architecture-review-list")).filter(item=>item.tagName==="input").at(-1);assert.equal(testCheckbox.disabled,true);
   h.get("architecture-review-role").value="test";await h.get("architecture-review-role").fire("change");await flush();assert.equal(ruleRows(h),1);
@@ -429,7 +437,7 @@ test("no_layers keeps a rules-hash-qualified authoring basis for orphan edits an
       if(url.endsWith("/preview")) return editorResponse();
       if(url.endsWith("/apply")) {hash="rules-proposed";return {payload:{...pin,rulesFile:{contentHash:hash},mutationOutcome:"committed"}};}
       if(url.includes("/rules?")) return {payload:{...pin,rulesFile:{contentHash:hash},layers:[],exceptions:[{index:2,rule:"orphan-rule",target:{path:"orphan.rs"},reason:"Original reason"}]}};
-      return {payload:{...fixture("max",hash),state:"no_layers",layers:[],modules:[],edges:[],references:null,rules:null}};
+      return {payload:{...fixture("max",hash),state:"no_layers",layers:[],modules:[],edges:[],references:null,rules:null,exceptionCount:1}};
     });
     await h.controller.refresh();assert.equal(h.renders.length,0);assert.match(h.get("architecture-state").textContent,/Existing authored exceptions/);
     await h.get("architecture-color").fire("change");assert.equal(h.renders.length,0);
@@ -439,7 +447,8 @@ test("no_layers keeps a rules-hash-qualified authoring basis for orphan edits an
     await h.get("architecture-preview").fire("click");const body=h.calls.at(-1).options.body;
     assert.equal(body.baseHash,"rules-one");assert.equal(body.operations[0].index,2);assert.equal(body.operations[0].type,mode==="Edit reason" ? "editException" : "removeException");
     await h.get("architecture-confirm").fire("click");assert.match(h.get("architecture-state").textContent,/Rules committed/);assert.equal(h.renders.length,0);
-    await h.get("architecture-unassigned").fire("click");assert.match(text(h.get("architecture-review-list")),/File assignment inventory is unavailable/);
+    const chips=descendants(h.get("architecture-inspector-content")).filter(item=>item.className==="architecture-chip").map(item=>item.textContent);
+    assert.deepEqual(chips,["1 exception"],"without layers only the authored-exceptions count is measured");
   }
 });
 
@@ -458,7 +467,7 @@ test("Relative uses admitted display modules, collapsed representation is stable
   assert.match(text(h.get("architecture-legend")), /≤7.*>7–7/); assert.equal(h.calls.length, 1);
   h.get("architecture-relative").checked = false; await h.get("architecture-relative").fire("change");
   assert.equal(h.renders.at(-1).options.moduleBand(module), 1);
-  assert.match(h.get("architecture-state").textContent, /6 callables excluded from heat.*1 authored hidden-layer files/);
+  assert.match(h.get("architecture-exclusions").textContent, /6 callables excluded from heat.*1 authored hidden-layer files/, "heat exclusions move out of the status line");
   h.setResponse(async () => ({payload:fixture("sum")})); h.get("architecture-aggregate").value = "sum"; await h.get("architecture-aggregate").fire("change");
   const rendered = h.renders.at(-1); assert.equal(rendered.options.moduleBand(rendered.view.modules[0]), null);
   assert.match(text(h.get("architecture-legend")), /relative totals/);
@@ -474,13 +483,25 @@ test("layer stats chip only non-zero production counts by verdict, with deviatio
   dto.edges = [edge("UI","Storage",7), edge("Storage","UI",56,"deviates"), edge("Storage","UI",4,"deviates",{excepted:true,exceptionReason:"Reviewed"}),
     edge("Storage","Peer",3,"deviates"), edge("Storage","Shared",9), edge("Shared","UI",2,"deviates"),
     {...edge("Storage","UI",11,"deviates"),role:"test"}];
+  // Storage has unresolved production sites, so its counts are lower bounds (#449).
+  dto.references.coverage = [{layer:"UI",role:"production",sites:7,mappedSites:7,unresolvedSites:0},{layer:"Storage",role:"production",sites:80,mappedSites:72,unresolvedSites:9},
+    {layer:"Shared",role:"production",sites:2,mappedSites:2,unresolvedSites:0}];
   h.setResponse(async () => ({payload:dto})); await h.controller.refresh();
   const {options} = h.renders[0], stats = name => JSON.parse(JSON.stringify(options.layerStats(dto.layers.find(layer => layer.name === name)).map(stat => [stat.text, stat.tone])));
-  assert.deepEqual(stats("Storage"), [["↑56","error"],["⇄3","error"],["→shared 9","neutral"],["excepted 4","neutral"]], "test-only sites never count; excepted sites are not deviations");
+  assert.deepEqual(stats("Storage"), [["↑≥56","error"],["⇄≥3","error"],["→shared ≥9","neutral"],["excepted ≥4","neutral"]], "test-only sites never count; excepted sites are not deviations");
   assert.deepEqual(stats("UI"), [["↓7","neutral"]]);
   assert.deepEqual(stats("Shared"), [["⇄2","error"]], "shared outbound is a deviation, not upward");
   assert.deepEqual(stats("Peer"), [], "a layer without outgoing references has no chips");
-  assert.match(options.layerStats(dto.layers[1])[0].label, /^56 outgoing production reference sites · upward deviation$/);
+  assert.match(options.layerStats(dto.layers[1])[0].label, /^at least 56 outgoing production reference sites · upward deviation$/);
+  // Arrows: deviations highlighted with the source layer's measured coverage; allowed arrows dimmed.
+  const up = dto.edges[1], down = dto.edges[0];
+  assert.equal(options.edgeTone(up), "deviation"); assert.equal(options.edgeTone(down), "allowed");
+  assert.equal(options.edgeTone(dto.edges[2]), "allowed", "an excepted deviation is dimmed with the allowed arrows");
+  assert.equal(options.edgeTone(dto.edges[6]), "neutral", "test-only arrows are neither highlighted nor counted");
+  assert.deepEqual(JSON.parse(JSON.stringify(options.edgeText(up))), {bound:true, label:"lower bound; 90% of 80 production reference sites from Storage mapped to a module", note:"90% mapped"});
+  assert.deepEqual(JSON.parse(JSON.stringify(options.edgeText(down))), {bound:false, label:"100% of 7 production reference sites from UI mapped to a module", note:""});
+  assert.equal(options.display.edge(down), true, "allowed arrows stay drawn");
+  assert.match(h.get("architecture-coverage").textContent, /^81 of 89 reference sites mapped to a module \(91%\) · ≥ counts are lower bounds · 0 of 0 production rule instances unknown$/);
 });
 
 test("one chip per module: a file and its same-named directory form one module that opens to files", async () => {
@@ -620,4 +641,88 @@ test("details load on demand at the view's pin and rules hash, page with Show mo
   conflicted.setContext({rootKey:"checkout-one",session:1,pin:{...pin,indexRevision:2}});
   options.onSelectModule(view.modules[0]); await flush();
   assert.equal(conflicted.detailCalls.length, 0, "an outdated view never reads details");
+});
+
+// #449: the full stack is drawn with allowed arrows dimmed; counted chips head the inspector.
+test("the full stack stays drawn with deviations, and counted review chips open their lists", async () => {
+  const h = harness(), payload = authoringFixture();
+  payload.layers.push({name:"Quiet",order:3,shared:false}, {name:"Shared",order:null,shared:true});
+  payload.rules.counts = {comparable:897, conforms:311, deviates:23, unknown:563, excepted:0}; payload.rules.unassignedCount = 156; payload.exceptionCount = 0;
+  payload.modules[1].roleCounts = {production:1, test:0};
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  const {options} = h.renders[0];
+  assert.deepEqual([...options.display.layers].sort(), ["Quiet", "Shared", "Storage", "UI"], "no layer is dropped for having no deviations or edges");
+  assert.equal(payload.edges.every(edge => options.display.edge(edge)), true);
+  assert.equal(h.get("architecture-inspector").hidden, false, "the review overview rests in the inspector");
+  assert.equal(h.get("architecture-inspector-title").textContent, "Architecture review");
+  const chips = () => descendants(h.get("architecture-inspector-content")).filter(item => item.className === "architecture-chip");
+  assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "156 unassigned", "0 exceptions"]);
+  assert.equal(chips()[0].dataset.tone, "error");
+  assert.match(text(h.get("architecture-inspector-content")), /563 of 897 production rule instances unknown/);
+  await h.get("architecture-review").fire("click"); await flush();
+  assert.equal(h.get("architecture-review-panel").hidden, false);
+  assert.equal(h.get("architecture-review-role").value, "production"); assert.equal(h.get("architecture-review-state").value, "deviates");
+  const query = new URL(h.detailCalls.at(-1).url, "http://local").searchParams;
+  assert.equal(query.get("role"), "production"); assert.equal(query.get("status"), "deviates"); assert.equal(query.get("excepted"), "false");
+  options.onSelectModule(payload.modules[0]); await flush();
+  assert.equal(h.get("architecture-inspector-title").textContent, "src/a.rs");
+  assert.deepEqual(chips().map(item => item.textContent), ["23 deviations", "156 unassigned", "0 exceptions"], "every inspection keeps the counted chips");
+  await h.get("architecture-unassigned").fire("click");
+  assert.match(text(h.get("architecture-review-list")), /src\/no-edges.rs/);
+});
+
+// #449 review (P2): the collapsed unassigned row draws metric chips, so its measured modules
+// belong to the heat scale whether or not the row is open.
+test("an all-unassigned view colours its collapsed chips with fixed heat, not 'No measured values'", async () => {
+  const h = harness(), payload = fixture();
+  payload.modules = [["src/hot.rs", 40], ["src/mild.rs", 3]].map(([path, cognitive]) => ({...payload.modules[0], layer:null, identity:identity(path), metrics:{cognitive}}));
+  payload.edges = [];
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  const {options} = h.renders.at(-1);
+  assert.equal(options.display.unassigned.expanded, false, "the unassigned row starts collapsed");
+  assert.doesNotMatch(text(h.get("architecture-legend")), /No measured values/);
+  assert.deepEqual(payload.modules.map(options.moduleBand), [3, 0]);
+  options.display.reset();
+  assert.deepEqual(JSON.parse(JSON.stringify(options.display.summary(null, payload.modules, 4))).map(chip => [chip.shown, chip.band]), [["hot\n40", 3], ["mild\n3", 0]]);
+});
+
+test("Relative cuts include the collapsed unassigned row and stay stable when it opens", async () => {
+  const h = harness(), payload = fixture();
+  payload.modules = [...payload.modules.filter(module => module.layer === "UI"),
+    ...[["src/x.rs", 50], ["src/y.rs", 20], ["src/z.rs", 9]].map(([path, cognitive]) => ({...payload.modules[0], layer:null, identity:identity(path), metrics:{cognitive}}))];
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  h.get("architecture-relative").checked = true; await h.get("architecture-relative").fire("change");
+  const before = h.renders.at(-1), legend = text(h.get("architecture-legend")), bands = payload.modules.map(before.options.moduleBand);
+  assert.match(legend, /Relative to visible set.*>20–50|Relative to visible set.*50/, "the unassigned values set the cuts while the row is collapsed");
+  await before.options.onToggleUnassigned(); await flush();
+  const after = h.renders.at(-1);
+  assert.notEqual(after, before); assert.equal(after.options.display.unassigned.expanded, true);
+  assert.equal(text(h.get("architecture-legend")), legend, "opening the row does not move the cuts");
+  assert.deepEqual(payload.modules.map(after.options.moduleBand), bands);
+});
+
+test("without a refresh button, a rules conflict in a detail list offers an explicit Reload Architecture", async () => {
+  const h = harness(); await h.controller.refresh();
+  const error = new Error("rules changed"); error.code = "rules_conflict"; error.status = 409; h.setDetailError(error);
+  h.renders[0].options.onSelectModule(h.renders[0].view.modules[0]); await flush();
+  assert.match(text(h.get("architecture-inspector-content")), /Rules changed since this diagram was loaded\./);
+  assert.equal(h.calls.length, 1);
+  h.setDetailError(null); await h.button("Reload Architecture").fire("click");
+  assert.equal(h.calls.length, 2, "the button re-reads the summary at the same pin");
+  assert.match(h.calls[1].url, /^\/api\/architecture\?/);
+});
+
+test("a collapsed band draws one row of metric-coloured module chips, hottest first, within the size cap", async () => {
+  const h = harness(), payload = fixture();
+  payload.modules = ["src/cold.rs", "src/hot.rs", "src/warm.rs", "src/warm/inner.rs", "src/extra.rs", "src/none.rs"].map((path, i) =>
+    ({...payload.modules[0], identity:identity(path), declarationCount:path === "src/none.rs" ? 0 : 1, metrics:{cognitive:[1, 40, 12, 20, 2, null][i]}}));
+  h.setResponse(async () => ({payload})); await h.controller.refresh();
+  const {options} = h.renders[0], members = payload.modules.filter(module => module.layer === "UI");
+  options.display.reset();
+  const chips = JSON.parse(JSON.stringify(options.display.summary("UI", members, 3)));
+  assert.deepEqual(chips.map(chip => chip.shown), ["hot\n40", "warm\n20", "+2 more\nopen band"], "measured modules only; a file and its directory are one chip");
+  assert.deepEqual(chips.map(chip => chip.band), [3, 2, null]);
+  assert.equal(chips[1].label, "warm · 2 files · cognitive 20");
+  assert.equal(chips[2].label, "2 more modules · open the band to see them");
+  assert.equal(options.display.summary("UI", members, 10).length, 4, "everything fits when the row is wide enough");
 });
