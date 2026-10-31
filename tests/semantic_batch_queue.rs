@@ -757,7 +757,7 @@ fn claim_time_causes_map_to_stable_terminal_codes() {
 }
 
 #[test]
-fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_completes() {
+fn queued_version_one_row_at_startup_settles_invalid_request_and_later_request_completes() {
     let world = World::new(four_language_workspace, &[]);
     world.stop_daemon();
     let log = world._temp.path().join("daemon.log");
@@ -787,10 +787,10 @@ fn queued_version_one_row_at_startup_settles_index_failed_and_later_request_comp
     assert_eq!(world.head(), published);
     let queue = world.queue();
     let old = queue.iter().find(|row| row.0 == v1.id).unwrap();
-    // An untyped cause records only the fixed generic reason, never its text.
+    // The typed `invalid_request` cause records only its closed-list reason, never its text.
     assert_eq!(
         (old.1.as_str(), old.2.as_deref()),
-        ("failed", Some("index_failed: internal error"))
+        ("failed", Some("invalid_request: semantic import options"))
     );
     trellis::testing::wait_until("v1 diagnostic cause", || {
         fs::read_to_string(&log).is_ok_and(|text| {
@@ -831,6 +831,7 @@ fn assert_terminal_error(cause: &str, stored: Option<&str>, stderr: &[u8]) {
         "invalid_request:",
         "invalid_artifact:",
         "limit_exceeded:",
+        "capture_unavailable:",
         "storage_full:",
     ]
     .iter()

@@ -65,7 +65,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(batch.DESCRIPTOR_KEYS, {
             "formatVersion", "trustOrigin", "profileId", "decoderVersion", "producer", "sourceSet",
             "sourceRevision", "sourceManifestHash", "components", "metadata", "completion", "totals",
-            "pages", "artifacts"})
+            "pages", "artifacts", "generation"})
 
 
 class WriteBatchTests(unittest.TestCase):
@@ -85,6 +85,7 @@ class WriteBatchTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(data).hexdigest(), digest)
         descriptor = json.loads(data)
         self.assertEqual(set(descriptor), batch.DESCRIPTOR_KEYS)
+        self.assertIsNone(descriptor["generation"])
         self.assertEqual(descriptor["completion"], "complete")
         self.assertEqual(descriptor["totals"], {
             "sourceDocuments": 3, "coveredDocuments": 3, "excludedDocuments": 0,

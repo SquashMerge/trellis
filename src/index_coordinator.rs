@@ -1494,8 +1494,8 @@ fn drain_requests_observed_with_cancel(
                 // native publication. Read the selected overlay for integrity,
                 // but never infer a terminal result from the pin alone.
                 let _ = store.semantic_at(selected)?;
-                let options = request.semantic_options()?;
-                let _ = store.semantic_batch_report_at(selected, &options.descriptor_sha256)?;
+                let job = request.semantic_job()?;
+                let _ = store.semantic_batch_report_at(selected, job.descriptor_sha256())?;
             }
             store.requeue_busy_claim(session, &request, before)?;
             return Ok(completed);
@@ -1548,7 +1548,7 @@ fn open_semantic_input_before_open(
     before_open: impl FnOnce(),
 ) -> Result<(std::fs::File, u64)> {
     crate::scip_admission::validate_selected_role(root, path)
-        .map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("invalid_request: {}", error.detail()))?;
     let metadata = std::fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_file(),
@@ -1669,6 +1669,16 @@ mod semantic_input_tests {
 
     fn read_semantic_input(root: &Path, path: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
         read_semantic_input_before_open(root, path, max, || {})
+    }
+
+    #[test]
+    fn input_outside_root_reports_bare_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = elsewhere.path().join("selected.scip");
+        std::fs::write(&path, b"abc").unwrap();
+        let error = super::open_semantic_input(root.path(), &path).unwrap_err();
+        assert_eq!(error.to_string(), "invalid_request: role outside root");
     }
 
     #[test]
@@ -1801,12 +1811,27 @@ fn run_semantic_batch_request(
     before_publish: &mut Option<Option<IndexPin>>,
 ) -> Result<IndexPin> {
     use crate::{
-        semantic_batch::{BatchCounters, BatchLimits, LookupBudget, StageOwner, stage_batch},
+        semantic_batch::{
+            BatchCounters, BatchLimits, LookupBudget, StageInput, StageOwner, stage_batch,
+        },
         semantic_import::{DestinationMutations, join_staged},
+        store::requests::SemanticImportJob,
     };
     use std::path::Path;
-    let options = request.semantic_options()?;
+    let job = request.semantic_job()?;
     let root = Path::new(store.workspace_root());
+    // The worker derives the input root. An external import reads the workspace; a generated
+    // one reads its private generation directory, never a caller-supplied path.
+    let input = match &job {
+        SemanticImportJob::External(_) => StageInput::external(root),
+        SemanticImportJob::Generated(options) => {
+            let dir = store
+                .producer_generation_dir(options.origin, &options.generation_id)
+                .map_err(batch_error)?;
+            StageInput::generated(root, options.origin, &options.generation_id, &dir)
+        }
+    }
+    .map_err(|error| batch_error(error.into()))?;
     let limits =
         BatchLimits::effective().map_err(|error| anyhow::anyhow!("invalid_request: {error}"))?;
     // One budget serves every attempt below, so a destination change cannot spend it twice.
@@ -1815,13 +1840,13 @@ fn run_semantic_batch_request(
     let incarnation = session.incarnation().to_string();
     let mut admitted = stage_batch(
         store,
-        root,
+        &input,
         StageOwner {
             request_id: &request.id,
             incarnation: &incarnation,
         },
-        Path::new(&options.descriptor),
-        &options.descriptor_sha256,
+        Path::new(job.descriptor()),
+        job.descriptor_sha256(),
         &limits,
         &mut counters,
         cancel,
@@ -1889,6 +1914,15 @@ fn run_semantic_batch_request(
         }
         if store.index_baseline()? != destination_pin {
             continue;
+        }
+        // A generated batch is bound to the revision its generator read, so a head that moved
+        // before or at the cutoff is terminal. Repeated on every revision-conflict retry.
+        if matches!(job, SemanticImportJob::Generated(_))
+            && store.with_native_reader(destination_pin, |reader| {
+                Ok(reader.header()?.revision.id != admitted.descriptor().source_revision)
+            })?
+        {
+            anyhow::bail!("stale_basis: head revision changed");
         }
         let generation = watcher.and_then(|watcher| {
             watcher
@@ -2112,6 +2146,9 @@ fn sweep_abandoned_semantic_stages(store: &Store) {
     if let Ok(index_dir) = store.semantic_stage_parent() {
         crate::semantic_batch::staging::remove_abandoned_semantic_stages(&index_dir);
     }
+    // Producer runs and pickup directories a crashed daemon left, except those a queued or
+    // running generated import still names (D2). Nothing is importing yet at this point.
+    crate::producer::run::sweep_state(store, false);
 }
 
 #[cfg(test)]

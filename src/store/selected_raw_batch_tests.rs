@@ -23,6 +23,7 @@ fn batch() -> SelectedRawBatch {
         "totals": {"sourceDocuments": 3, "coveredDocuments": 1, "excludedDocuments": 0, "pageBytes": 0, "artifactBytes": 3},
         "pages": [],
         "artifacts": [artifact(0, "java"), artifact(1, "javascript"), artifact(2, "javascript")],
+        "generation": null,
     });
     let descriptor: Descriptor = serde_json::from_value(descriptor).unwrap();
     let captures = descriptor

@@ -6,7 +6,8 @@ fn busy_result_can_never_become_terminal_index_failed() {
         "storage_busy: cached claim changed",
     ] {
         assert!(
-            CompletionOutcome::from_result(Err(anyhow::anyhow!(reason))).is_err(),
+            CompletionOutcome::from_result(RequestKind::Index, Err(anyhow::anyhow!(reason)))
+                .is_err(),
             "neither transient busy nor invariant busy may mint terminal failure"
         );
     }
