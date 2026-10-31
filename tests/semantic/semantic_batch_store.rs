@@ -6562,7 +6562,10 @@ fn partial_document_records_a_native_gap_and_the_cap_together() {
         rust.summary.as_deref(),
         Some("partial: 1 · native macro/attribute gaps only")
     );
-    assert_eq!(rust.partial_reasons.unsupported_occurrences.attribute_item, 1);
+    assert_eq!(
+        rust.partial_reasons.unsupported_occurrences.attribute_item,
+        1
+    );
     assert!(tiers[0].partial_reasons.is_none());
 }
 

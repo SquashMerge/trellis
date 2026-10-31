@@ -82,14 +82,14 @@ fn language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
 fn describe_language_status(rows: &[[u64; 5]; 4], tiers: &Tiers) -> Vec<Value> {
     let mut languages = language_status(rows, tiers);
     for (status, tier) in languages.iter_mut().zip(tiers) {
-        status["semantic"]["partialReasons"] = tier.partial_reasons.as_ref().map_or(
-            Value::Null,
-            |summary| {
-                let mut reasons = json!(summary.partial_reasons);
-                reasons["summary"] = json!(summary.summary);
-                reasons
-            },
-        );
+        status["semantic"]["partialReasons"] =
+            tier.partial_reasons
+                .as_ref()
+                .map_or(Value::Null, |summary| {
+                    let mut reasons = json!(summary.partial_reasons);
+                    reasons["summary"] = json!(summary.summary);
+                    reasons
+                });
     }
     languages
 }
@@ -132,9 +132,9 @@ pub fn describe(
             .chain(tiers.iter().map(|tier| &tier.counts))
             .any(|row| row[2] != 0 || row[3] != 0)
     });
-    let languages: Vec<Value> = counts
-        .as_ref()
-        .map_or_else(Vec::new, |(rows, tiers)| describe_language_status(rows, tiers));
+    let languages: Vec<Value> = counts.as_ref().map_or_else(Vec::new, |(rows, tiers)| {
+        describe_language_status(rows, tiers)
+    });
     let deadline_ms = u64::try_from(super::CALL_DEADLINE.as_millis()).unwrap_or(u64::MAX);
     json!({"schemaVersion":1,"requestId":id,"evidenceBasis":basis,
       "data":{"workspaceLabel":label,"indexState":state,"progress":progress,
@@ -258,7 +258,10 @@ mod tests {
             "project",
             "ready",
             None,
-            Some(([[0; 5], [355, 300, 55, 0, 0], [0; 5], [0; 5]], tiers.clone())),
+            Some((
+                [[0; 5], [355, 300, 55, 0, 0], [0; 5], [0; 5]],
+                tiers.clone(),
+            )),
             None,
             false,
         );
