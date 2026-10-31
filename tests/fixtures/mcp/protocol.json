@@ -60,7 +60,7 @@
         },
         "watcherDegraded": false,
         "languages": [],
-        "toolVersion": 2,
+        "toolVersion": 3,
         "schemaVersion": 1,
         "limits": {
           "requestBytes": 16384,
@@ -68,7 +68,9 @@
           "sourceBytes": 16384,
           "sourceLines": 200,
           "defaultLimit": 20,
+          "callDefaultLimit": 6,
           "maxLimit": 50,
+          "pageBytes": 24576,
           "calleeTextBytes": 1024,
           "hintWorkMs": 1000,
           "deadlineMs": 5000,

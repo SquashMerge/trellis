@@ -673,7 +673,133 @@ impl McpSemantic {
     }
 }
 
+/// One language's selected imported evidence at the admitted head (#528): its default
+/// producer (#483), that producer's coverage tuple counts and its worst proof freshness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LanguageTier {
+    pub producer_id: Option<String>,
+    /// Why the language shows syntax only, when no producer is selected.
+    pub note: Option<String>,
+    /// Tuple counts `[selected, complete, partial, failed, unselected]`, as native ones.
+    pub counts: [u64; 5],
+    /// `fresh`, `possiblyStale` or `stale` over the usable tuples' proofs, else `unavailable`.
+    pub freshness: &'static str,
+}
+
+impl LanguageTier {
+    /// Semantic evidence is selected, fresh and covers at least one document (complete or
+    /// partial). Partial coverage stays visible in `counts`; it does not demote the tier.
+    pub fn semantic(&self) -> bool {
+        self.producer_id.is_some()
+            && self.freshness == "fresh"
+            && self.counts[1] + self.counts[2] > 0
+    }
+}
+
+/// The four MCP languages in #22 order.
+pub const MCP_LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
+
 impl EvidenceResponse {
+    /// Each MCP language's selected semantic evidence at the admitted head, in #22 order
+    /// (#528). Uses the per-language default producer, as status and the call tools do.
+    pub fn mcp_language_tiers(&self) -> Result<[LanguageTier; 4]> {
+        let selected = self.selected(None)?;
+        let defaults = default_producers(&self.db, &selected.key)?;
+        let mut tiers: [LanguageTier; 4] = Default::default();
+        for (tier, language) in tiers.iter_mut().zip(MCP_LANGUAGES) {
+            tier.freshness = "unavailable";
+            tier.note = defaults.note(language);
+            let Some(producer) = defaults.producer(language) else {
+                continue;
+            };
+            tier.producer_id = Some(producer.to_owned());
+            // Closed enums decode strictly: a malformed stored value is typed corruption,
+            // never healthy availability (#528 review).
+            let corrupt = |what: &str| -> anyhow::Error {
+                SelectedIntegrity(format!(
+                    "store_unavailable: invalid selected semantic {what}"
+                ))
+                .into()
+            };
+            let mut statement = self.db.prepare_cached(
+                "SELECT selected,state,count(*) FROM semantic_coverage
+                 WHERE revision_id=?1 AND producer_id=?2 AND language=?3 GROUP BY selected,state",
+            )?;
+            for row in statement.query_map(params![selected.key, producer, language], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })? {
+                let (chosen, state, count) = row?;
+                let count = u64::try_from(count).map_err(|_| corrupt("coverage count"))?;
+                if !matches!(chosen, 0 | 1)
+                    || !matches!(
+                        state.as_str(),
+                        "notRequested"
+                            | "omitted"
+                            | "unsupported"
+                            | "failed"
+                            | "partial"
+                            | "complete"
+                    )
+                {
+                    return Err(corrupt("coverage state"));
+                }
+                // Unselected tuples, and selected ones not requested or unsupported, count as
+                // unselected, as native `scopeCoverage` does.
+                let bucket = match (chosen, state.as_str()) {
+                    (1, "complete") => Some(1),
+                    (1, "partial") => Some(2),
+                    (1, "failed") => Some(3),
+                    _ => None,
+                };
+                match bucket {
+                    Some(bucket) => {
+                        tier.counts[0] += count;
+                        tier.counts[bucket] += count;
+                    }
+                    None => tier.counts[4] += count,
+                }
+            }
+            if tier.counts[1] + tier.counts[2] == 0 {
+                continue;
+            }
+            // Publication derives a proof's freshness from its document and that document's
+            // captured basis only, so every proof of one tuple shares it: one proof per
+            // tuple is exact for what Trellis published (#261), and avoids scanning the
+            // hundreds of thousands of proofs a language can hold on every read. A tuple
+            // without proofs (an empty fact set) is valid and adds nothing.
+            let mut statement = self.db.prepare_cached(
+                "SELECT (SELECT p.freshness FROM semantic_provenance p
+                         WHERE p.tuple_id=c.tuple_id LIMIT 1)
+                 FROM semantic_coverage c
+                 WHERE c.revision_id=?1 AND c.producer_id=?2 AND c.language=?3 AND c.selected=1
+                   AND c.state IN ('complete','partial')",
+            )?;
+            let mut worst = 0;
+            for freshness in statement
+                .query_map(params![selected.key, producer, language], |row| {
+                    row.get::<_, Option<String>>(0)
+                })?
+            {
+                worst = worst.max(match freshness?.as_deref() {
+                    None | Some("fresh") => 0,
+                    Some("possiblyStale") => 1,
+                    Some("stale") => 2,
+                    Some(_) => return Err(corrupt("proof freshness")),
+                });
+            }
+            tier.freshness = match worst {
+                2 => "stale",
+                1 => "possiblyStale",
+                _ => "fresh",
+            };
+        }
+        Ok(tiers)
+    }
+
     /// Bindings for measured calls of the admitted head, each under its document language's
     /// producer (#483). `language` is the selected declaration's, which names the producer
     /// and, without calls, the note.

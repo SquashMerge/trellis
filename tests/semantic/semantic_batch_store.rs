@@ -5555,7 +5555,42 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
             helper["binding"]["declaredTarget"]["syntaxId"],
             ids["helper"]
         );
-        assert_eq!(helper["semanticBasis"]["producerId"], producer.as_str());
+        // #528: the basis is emitted once per response and referenced by index.
+        let bases = outgoing["data"]["semanticBases"].as_array().unwrap();
+        assert_eq!(bases.len(), 1, "{outgoing}");
+        assert_eq!(helper["semanticBasisRef"], 0);
+        assert_eq!(bases[0]["ref"], 0);
+        assert_eq!(bases[0]["producerId"], producer.as_str());
+        assert!(helper.get("semanticBasis").is_none());
+        for proof in outgoing["data"]["provenance"].as_array().unwrap() {
+            assert!(proof.get("basis").is_none(), "{proof}");
+            let semantic = proof["producerId"] == producer.as_str();
+            assert_eq!(
+                proof["basisRef"],
+                if semantic { json!(0) } else { Value::Null }
+            );
+        }
+        // Compact keeps the answer and drops the proof detail.
+        let mut compact_arguments =
+            json!({"schemaVersion":1,"symbolId":ids["caller"],"compact":true});
+        if let Some(producer) = explicit {
+            compact_arguments["semanticProducerId"] = json!(producer);
+        }
+        let compact = mcp.call("trellis_outgoing_calls", compact_arguments);
+        for field in ["coverage", "provenance", "semanticBases"] {
+            assert!(compact["data"].get(field).is_none(), "{compact}");
+        }
+        let compact_helper = compact["data"]["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["calleeText"] == "helper")
+            .unwrap();
+        assert_eq!(compact_helper["targetId"], ids["helper"]);
+        assert_eq!(compact_helper["evidenceTier"], "semantic");
+        assert!(compact_helper.get("binding").is_none());
+        assert_eq!(compact["warnings"], outgoing["warnings"]);
+        assert_eq!(compact["partial"], outgoing["partial"]);
         // A resolved member call has unknown dispatch, so it keeps a dispatch boundary.
         let run = calls.iter().find(|c| c["calleeText"] == "run").unwrap();
         assert_eq!(run["disposition"], "resolved", "{run}");
@@ -5603,6 +5638,56 @@ async fn real_typescript_bindings_show_in_query_mcp_status_and_methods() {
     assert_eq!(callers[0]["targetId"], ids["helper"]);
     assert_eq!(callers[0]["disposition"], "resolved");
     assert_eq!(callers[0]["evidenceTier"], "semantic");
+    assert_eq!(callers[0]["semanticBasisRef"], 0);
+    // #528: describe and scopeCoverage report the imported JavaScript evidence beside the
+    // native coverage, which keeps its syntax tier; other languages have no producer.
+    let describe = mcp.call("trellis_workspace_describe", json!({"schemaVersion":1}));
+    assert_eq!(describe["data"]["toolVersion"], 3);
+    for (scope, rows) in [
+        ("describe", &describe["data"]["languages"]),
+        ("incoming", &incoming["data"]["scopeCoverage"]),
+    ] {
+        let rows = rows.as_array().unwrap();
+        let javascript = &rows[3];
+        assert_eq!(javascript["language"], "javascript", "{scope}");
+        assert_eq!(javascript["evidenceTier"], "syntax", "{scope}");
+        assert_eq!(
+            javascript["semantic"]["available"], true,
+            "{scope}: {javascript}"
+        );
+        assert_eq!(javascript["semantic"]["producerId"], producer.as_str());
+        assert_eq!(javascript["semantic"]["freshness"], "fresh");
+        assert!(
+            javascript["semantic"]["coverage"]["selected"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let rust = &rows[1];
+        assert_eq!(rust["semantic"]["available"], false, "{scope}");
+        assert_eq!(rust["semantic"]["producerId"], Value::Null);
+        assert_eq!(rust["semantic"]["freshness"], "unavailable");
+        assert!(rust["semantic"]["note"].is_string());
+    }
+    // Find returns native declarations; with fresh JavaScript evidence selected it no
+    // longer warns syntaxOnly for them.
+    let found = mcp.call(
+        "trellis_find_symbols",
+        json!({"schemaVersion":1,"query":"helper"}),
+    );
+    assert!(
+        !found["data"]["symbols"].as_array().unwrap().is_empty(),
+        "{found}"
+    );
+    assert!(
+        !found["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "syntaxOnly"),
+        "{found}"
+    );
+    assert_eq!(found["data"]["symbols"][0]["evidenceTier"], "syntax");
     // An explicit producer this revision does not publish, or a malformed one, is typed.
     for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
         let failure = mcp.call(

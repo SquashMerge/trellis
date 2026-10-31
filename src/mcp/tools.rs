@@ -158,6 +158,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "symbolId",
                 "limit",
                 "semanticProducerId",
+                "compact",
                 "expectedBasis",
                 "workspace",
             ],
@@ -266,6 +267,9 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             if name != "trellis_declaration" {
                 semantic_producer(o)?;
+                if o.get("compact").is_some_and(|value| !value.is_boolean()) {
+                    return Err("invalid_request");
+                }
                 limit(o)
             } else {
                 Ok(())
@@ -422,9 +426,17 @@ pub fn selection_failure(id: &Value, error: SelectionError, value: &Value) -> Va
 /// A `too_many_requests` or `deadline_exceeded` decided before read admission
 /// sampled `catchingUp` (Decision 0009 §7): no answering workspace, only the
 /// bounded attempted one (the selection, or the launch workspace path).
+/// A `too_many_requests` refusal names the per-connection call limit (#528), whether
+/// the relay or the daemon session refuses; the daemon-wide worker limit overrides it.
 pub fn admission_failure(id: &Value, code: &str, attempted_workspace: &Value) -> Value {
     debug_assert!(matches!(code, "too_many_requests" | "deadline_exceeded"));
     let mut envelope = failure(id, code);
+    if code == "too_many_requests" {
+        envelope["error"]["message"] = json!(format!(
+            "Too many concurrent tool calls on this connection (limit {}); wait for one to finish",
+            super::MAX_CONNECTION_CALLS
+        ));
+    }
     envelope["error"]["attemptedWorkspace"] = attempted(attempted_workspace);
     envelope
 }
@@ -948,9 +960,9 @@ mod tests {
             json!(-9007199254740991_i64),
         ];
         let describe_expected = json!({"schemaVersion":1,"requestId":7,"evidenceBasis":null,"data":{
-            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":2,"schemaVersion":1,
+            "workspaceLabel":"selected","indexState":"unavailable","progress":null,"watcherDegraded":false,"languages":[],"toolVersion":3,"schemaVersion":1,
             "searchIndex":{"backend":null,"unavailableReason":null},
-            "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
+            "limits":{"requestBytes":16384,"responseBytes":65536,"sourceBytes":16384,"sourceLines":200,"defaultLimit":20,"callDefaultLimit":6,"maxLimit":50,"pageBytes":24576,"calleeTextBytes":1024,"hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
             "warnings":[],"partial":true,"truncated":false,"truncationReason":null});
         assert_eq!(describe(&json!(7), workspace.label()), describe_expected);
         for modern in [false, true] {
@@ -1262,6 +1274,30 @@ mod tests {
                 valid["semanticProducerId"] = producer;
                 check(name, &valid, "invalid_request");
             }
+        }
+    }
+    /// #528: `compact` is an optional boolean on the two call tools only.
+    #[test]
+    fn compact_is_a_closed_boolean_on_the_call_tools() {
+        for name in ["trellis_outgoing_calls", "trellis_incoming_calls"] {
+            let mut valid = good(name);
+            for compact in [json!(true), json!(false)] {
+                valid["compact"] = compact;
+                assert_eq!(validate(name, Some(&valid)), Ok(()), "{name}");
+            }
+            for compact in [Value::Null, json!(1), json!("true"), json!([true])] {
+                valid["compact"] = compact;
+                check(name, &valid, "invalid_request");
+            }
+        }
+        for name in [
+            "trellis_find_symbols",
+            "trellis_declaration",
+            "trellis_call_graph",
+        ] {
+            let mut other = good(name);
+            other["compact"] = json!(true);
+            check(name, &other, "invalid_request");
         }
     }
     #[test]
